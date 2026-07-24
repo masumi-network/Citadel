@@ -9,6 +9,25 @@ verified locally; every claim below is grounded in code or a command that was ru
 Findings are tracked as GitHub issues #100–#106. Fixes landed on
 `feat/agent-search-hardening`.
 
+## Deployment status
+
+All fixes are **merged to `main` and live in production**, verified end-to-end on
+the hosted node:
+
+- MCP hotfixes: **#107** (`json_response`) + **#108** (in-process role
+  resolution) — `tools/list` **~91s → 0.2s**, `application/json`, 13 role-filtered
+  tools for a writer seat.
+- Client troubleshooting doc: **#110**.
+- The full change set (agent search, attested trust model, security + CLI/UAT
+  fixes): **#109**, merged as `d2fa9a0`.
+- Post-deploy verification: `/healthz` 200, auth 200 (writer/sarthi), `tools/list`
+  0.2s, a warm `/search` returned hits carrying the new envelope fields
+  (`content_hint`, `trust_tier: unattested`) — confirming ADR-0012 is live.
+
+Still open by design: **#104** (provenance at ingest — needs a cognee spike),
+**#105** (event-loop starvation — search recall is ~8s warm; fix needs
+cognee/staging validation), **#106** (cross-dataset ordering — a UX decision).
+
 ## Resolution status
 
 | # | Finding | Severity | Status |
