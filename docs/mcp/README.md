@@ -620,6 +620,37 @@ Citadel stores only the SHA-256 hash. The raw token is shown once at creation.
 
 ## Troubleshooting
 
+### "Connected" but tools fail, and clicking reconnect does nothing
+
+The most common teammate report — and the server is almost always fine. This is a
+client **launch-environment** issue.
+
+`.mcp.json` authenticates with `Bearer ${CITADEL_MCP_ACCESS_TOKEN}`, and the MCP
+client expands that placeholder **once, from the environment it was launched in**.
+If that variable was empty or held a stale/revoked token at launch, every request
+carries a bad token (→ 401), so the panel shows failed. Crucially, **`/mcp` →
+reconnect re-reads the config but NOT your shell environment** — it keeps sending
+the same captured token, so it looks like "nothing happens."
+
+A reconnect cannot fix this; you need a fresh process:
+
+1. In a **new terminal**, confirm a valid token is exported:
+   `printf '%s' "$CITADEL_MCP_ACCESS_TOKEN" | tail -c 5` should show your token's
+   last 4 characters. If it's empty, `source ~/.zshrc` (or open a new terminal).
+2. Confirm the token actually works: `citadel status --json` → `auth.ok: true`.
+   (A `401` here means the token is stale/revoked — mint a fresh seat token and
+   update your rc; do not put a literal token in the git-tracked `.mcp.json`.)
+3. **Fully quit** the client — exit the CLI, or Cmd-Q the app; *not* `/mcp`
+   reconnect — and **relaunch it from that terminal** so it recaptures the env.
+
+**macOS:** apps launched from the Dock/Spotlight do **not** inherit `~/.zshrc`, so
+the placeholder resolves to empty. Launch from a terminal, or set the token in the
+GUI login environment: `launchctl setenv CITADEL_MCP_ACCESS_TOKEN <token>`.
+
+`citadel doctor` flags the common case (token in rc but missing from the current
+env). This is distinct from **connected but zero tools** — see
+[Claude Code (local + cloud)](#claude-code-local--cloud) for that.
+
 ### Server won't start
 
 ```bash

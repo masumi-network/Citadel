@@ -93,6 +93,41 @@ def test_record_feedback_does_not_require_qa_id() -> None:
     assert "qa_id" in schema["properties"]
 
 
+def test_tools_list_session_resolved_in_process_not_via_self_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tools/list must resolve the caller's role in-process, never by a sync
+    GET /api/session self-call.
+
+    The self-call runs on the same event loop that must serve it, so after the
+    HTTP client's 3 retries (30s each) tools/list took ~90s and clients
+    registered zero tools (#100). access_key_identity reads the access store
+    in-process and returns in milliseconds.
+    """
+    from types import SimpleNamespace
+
+    import kb.server as server_mod
+
+    monkeypatch.setattr(
+        server_mod,
+        "access_key_identity",
+        lambda token: (SimpleNamespace(role="reader", seat_slug="sarthi"), "cookie"),
+    )
+
+    session = mcp_server._session_from_token_inprocess("ctdl_x")
+    assert session == {"ok": True, "role": "reader", "seat_slug": "sarthi"}
+
+    # Fails open (no tool list blanking) when the store lookup errors or misses.
+    def boom(token: str) -> Any:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(server_mod, "access_key_identity", boom)
+    assert mcp_server._session_from_token_inprocess("ctdl_x") is None
+
+    monkeypatch.setattr(server_mod, "access_key_identity", lambda token: None)
+    assert mcp_server._session_from_token_inprocess("ctdl_x") is None
+
+
 def test_streamable_http_uses_json_response_not_sse() -> None:
     """tools/list must return an immediate application/json body, not an SSE stream.
 

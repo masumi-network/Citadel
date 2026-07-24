@@ -1287,13 +1287,14 @@ def create_mcp_server(
     async def _role_filtered_list_tools() -> list[Any]:
         """Hide tools the caller cannot use from tools/list (#33).
 
-        Resolves the caller's role + seat in-process (preferred) or via a short
+        Resolves the caller's role + seat IN-PROCESS (preferred) or via a short
         threaded HTTP fallback — never with a sync self-call on the event loop.
-        A nested blocking GET /api/session deadlocks hosted streamable-HTTP and
-        is why Cursor can show mcp_auth success with zero citadel_* tools.
-        Server-side 403s remain the real enforcement; this only stops 403
-        trial-and-error and fails OPEN on any resolution error so a transient
-        session lookup never blanks the tool list.
+        A nested blocking ``GET /api/session`` self-deadlocks the hosted
+        streamable-HTTP transport: it runs on the same loop that must serve it,
+        so after the HTTP client's retries tools/list takes ~90s and clients
+        register zero tools. Server-side 403s remain the real enforcement; this
+        only stops 403 trial-and-error and fails OPEN on any resolution error so
+        a transient lookup never blanks the tool list. (#100)
         """
         all_tools = await mcp.list_tools()
         try:
@@ -1317,9 +1318,7 @@ def create_mcp_server(
                     timeout=_TOOLS_LIST_SESSION_WAIT,
                 )
             except Exception as exc:  # noqa: BLE001 - fail open for availability
-                logger.warning(
-                    "tools/list role filter could not resolve session: %s", exc
-                )
+                logger.warning("tools/list role filter could not resolve session: %s", exc)
                 return all_tools
         return _filter_tools_for_session(all_tools, session)
 
