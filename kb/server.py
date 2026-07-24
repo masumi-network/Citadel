@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
@@ -54,13 +55,32 @@ from kb.learning import LearningOutcome, LearningProcess
 from kb.session_trace import enrich_shared_trace, force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
-from kb.mcp_server import TOOL_POLICIES, _max_ingest_bytes, create_mcp_server
+from kb.mcp_server import (
+    TOOL_POLICIES,
+    _max_ingest_bytes,
+    create_mcp_server,
+    set_tools_list_session_resolver,
+)
 from kb.mesh import MeshState
 from kb.models import FeedbackRequest
 from kb.obsidian_sync import ObsidianSyncStore, SyncPushDocument, normalize_path
 from kb.promotion import PromotionEngine
 from kb.promotion_queue import APPROVED_STATUS, PENDING_STATUS, REJECTED_STATUS
 from kb.repo_content_sync import RepoContentSyncer
+from kb.search_feedback import build_search_telemetry, presence_only_telemetry
+from kb.search_format import (
+    CODE_TIMEOUT,
+    DOC_TYPE_TRACE,
+    apply_query_ranking,
+    compact_search_filters,
+    filter_hits,
+    infer_content_hint,
+    infer_doc_type,
+    infer_trust_tier,
+    is_docs_mode_query,
+    is_spec_mode_query,
+    token_asset_authority_warning,
+)
 from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
 from kb.self_improve import SelfImprovement
 from kb.service import Citadel
@@ -489,6 +509,44 @@ class SearchBody(BaseModel):
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)
+    # Client/MCP filters — applied after retrieval so telemetry sees the same view.
+    types: list[str] | None = None
+    repo: str | None = Field(default=None, max_length=200)
+    path: str | None = Field(default=None, max_length=400)
+    canonical_only: bool = False
+    exclude_ambient: bool = False
+    mode: str | None = Field(default=None, max_length=32)
+
+    def cleaned_types(self) -> list[str] | None:
+        if not self.types:
+            return None
+        cleaned = [str(item).strip()[:64] for item in self.types if str(item).strip()]
+        return cleaned[:20] or None
+
+    def cleaned_mode(self) -> str | None:
+        if not isinstance(self.mode, str) or not self.mode.strip():
+            return None
+        normalized = self.mode.strip().lower()
+        return normalized if normalized in {"docs"} else None
+
+    def filter_kwargs(self) -> dict[str, Any]:
+        mode = self.cleaned_mode()
+        exclude_ambient = bool(self.exclude_ambient) or mode == "docs"
+        return {
+            "types": self.cleaned_types(),
+            "repo": self.repo.strip() if isinstance(self.repo, str) and self.repo.strip() else None,
+            "path": self.path.strip() if isinstance(self.path, str) and self.path.strip() else None,
+            "canonical_only": bool(self.canonical_only),
+            "exclude_ambient": exclude_ambient,
+        }
+
+    def telemetry_filters(self) -> dict[str, Any]:
+        return compact_search_filters(
+            **self.filter_kwargs(),
+            mode=self.cleaned_mode(),
+            dataset=self.dataset,
+            top_k=self.top_k,
+        )
 
 
 class ShareSessionBody(BaseModel):
@@ -503,11 +561,29 @@ class ShareSessionBody(BaseModel):
 
 
 class FeedbackBody(BaseModel):
-    qa_id: str = Field(min_length=1)
+    qa_id: str | None = Field(default=None, min_length=1)
+    result_id: str | None = Field(default=None, min_length=1)
     score: int | None = Field(default=None, ge=-1, le=1)
     text: str | None = None
     session_id: str | None = None
     dataset: str | None = None
+    # Optional thumbs helper: true→1, false→-1 (overridden by explicit score).
+    correct: bool | None = None
+
+    def resolved_qa_id(self) -> str:
+        value = (self.qa_id or self.result_id or "").strip()
+        if not value:
+            raise ValueError("qa_id or result_id is required")
+        return value
+
+    def resolved_score(self) -> int | None:
+        if self.score is not None:
+            return self.score
+        if self.correct is True:
+            return 1
+        if self.correct is False:
+            return -1
+        return None
 
 
 class ImproveBody(BaseModel):
@@ -808,6 +884,18 @@ def access_key_identity(access_key: str) -> tuple[AccessIdentity, str] | None:
             hash_api_token(access_key),
         )
     return None
+
+
+def _mcp_tools_list_session(token: str) -> dict[str, Any] | None:
+    """In-process token→session for MCP tools/list (no nested HTTP / no deadlock)."""
+    pair = access_key_identity(token)
+    if not pair:
+        return None
+    identity, _ = pair
+    return {"ok": True, "role": identity.role, "seat_slug": identity.seat_slug}
+
+
+set_tools_list_session_resolver(_mcp_tools_list_session)
 
 
 def session_identity(request: Request) -> AccessIdentity | None:
@@ -1345,6 +1433,10 @@ def resolve_write_dataset(
     return resolve_write_targets(identity, requested, [], config)[0].dataset
 
 
+# Private marker set during cross-dataset merge; never emitted to callers.
+SHARED_TRACE_MARKER = "_citadel_shared_trace"
+
+
 def search_result_dedup_key(result: Any) -> str:
     if isinstance(result, dict):
         text = first_string(
@@ -1400,6 +1492,17 @@ async def search_across_datasets(
 
     merged: list[tuple[str, Any]] = []
     seen: set[str] = set()
+    # A volunteered trace is dual-written to the author's Node and to
+    # session-traces (resolve_write_targets_for_share). The Node copy wins dedup
+    # below, and ``reference-only`` is stamped off the dataset alone — so without
+    # this the author's own dead-end trace comes back as ordinary knowledge.
+    # Carry the marker across the dedup so the lower trust always survives.
+    trace_keys = {
+        search_result_dedup_key(result)
+        for dataset, results in per_dataset
+        if dataset == SESSION_TRACES_DATASET
+        for result in results
+    }
 
     def take(dataset: str, results: list[Any], budget: int) -> None:
         for result in results:
@@ -1409,6 +1512,12 @@ async def search_across_datasets(
             if key in seen:
                 continue
             seen.add(key)
+            if (
+                dataset != SESSION_TRACES_DATASET
+                and key in trace_keys
+                and isinstance(result, dict)
+            ):
+                result = {**result, SHARED_TRACE_MARKER: True}
             merged.append((dataset, result))
             budget -= 1
 
@@ -1625,6 +1734,65 @@ def mcp_tool_name(request: Request) -> str | None:
     if tool_name not in TOOL_POLICIES:
         return None
     return tool_name
+
+
+async def capture_search_feedback(
+    *,
+    mesh_state: MeshState,
+    config: CitadelConfig,
+    request: Request,
+    actor: AccessIdentity,
+    query: str,
+    results: list[Any],
+    search_datasets: list[str],
+    primary_dataset: str,
+    top_k: int,
+    latency_ms: float,
+    timed_out: bool,
+    session_id: str | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Best-effort implicit search telemetry into the feedback mesh index.
+
+    Never raises — search UX must not depend on feedback write success.
+    """
+    try:
+        client_hint = (request.headers.get("user-agent") or "").strip()[:80] or None
+        telemetry = build_search_telemetry(
+            query=query,
+            results=results,
+            datasets=search_datasets,
+            primary_dataset=primary_dataset,
+            top_k=top_k,
+            latency_ms=latency_ms,
+            timed_out=timed_out,
+            truncated=timed_out,
+            tool_name=mcp_tool_name(request),
+            client_hint=client_hint,
+            seat_slug=actor.seat_slug,
+            actor_id=actor.actor_id,
+            session_id=session_id,
+            filters=filters,
+        )
+        # ADR-0009 (presence for all, content per caller): the row lands on the
+        # caller's own Node when they have one, so query text and hit ids stay
+        # private to them. A row that has to land on a shared dataset — a
+        # seat-less token, or a seat narrowing with an explicit ``dataset=`` —
+        # is written presence-only. Scoping is by ``details.dataset`` alone
+        # (mesh.timeline / scope_mesh_snapshot), so tagging a seat's search with
+        # Central would publish their query to every reader.
+        node_dataset = (
+            actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
+        )
+        await mesh_state.record_search_telemetry(
+            config,
+            telemetry=telemetry if node_dataset else presence_only_telemetry(telemetry),
+            dataset=node_dataset or primary_dataset,
+        )
+        return telemetry
+    except Exception as exc:  # noqa: BLE001 - feedback must never fail search
+        logger.warning("search telemetry write failed: %s", exc)
+        return None
 
 
 def record_mcp_audit(
@@ -1885,6 +2053,12 @@ def with_result_metadata(
     """
     if not isinstance(result, dict):
         return result
+    # Set when this hit is the Node-side copy of a volunteered session trace that
+    # won dedup against the shared one (search_across_datasets). Strip it before
+    # hashing so the content hash stays stable across both copies.
+    shared_trace = bool(result.get(SHARED_TRACE_MARKER))
+    if shared_trace:
+        result = {key: value for key, value in result.items() if key != SHARED_TRACE_MARKER}
     normalized = with_result_id(result)
     result_id = str(normalized["id"])
     document_endpoint = document_endpoint_for_result(result_id)
@@ -1908,7 +2082,7 @@ def with_result_metadata(
     }
     if drilldown_available:
         metadata["document_endpoint"] = document_endpoint
-    if dataset == SESSION_TRACES_DATASET:
+    if dataset == SESSION_TRACES_DATASET or shared_trace:
         metadata["trust"] = "reference-only"
         author_seat = _trace_author_seat(normalized)
         if author_seat:
@@ -1916,6 +2090,18 @@ def with_result_metadata(
         created_at = _trace_created_at(normalized)
         if created_at:
             metadata["created_at"] = created_at
+    # Infer against in-progress metadata so dataset/trust are visible
+    # (raw hits do not yet carry ``_citadel``).
+    preview = {**normalized, "_citadel": metadata}
+    # ``reference-only`` is attested by the dataset, so it outranks anything the
+    # body text would suggest — otherwise a trace whose text mentions /skills/
+    # classifies as a skill doc and reads as verified knowledge.
+    doc_type = (
+        DOC_TYPE_TRACE if metadata.get("trust") == "reference-only" else infer_doc_type(preview)
+    )
+    metadata["doc_type"] = doc_type
+    metadata["content_hint"] = infer_content_hint(preview, doc_type)
+    metadata["trust_tier"] = infer_trust_tier(preview, doc_type)
     return {**normalized, "_citadel": metadata}
 
 
@@ -4677,6 +4863,7 @@ async def knowledge(
     search_sessions = resolve_search_sessions(identity, None, search_datasets)
     max_concurrency = citadel.config.search_max_concurrency
     timed_out = False
+    started = time.perf_counter()
     with _SearchSlot(max_concurrency) as slot:  # 429 here if at capacity
         response.headers["X-RateLimit-Limit"] = str(max_concurrency)
         response.headers["X-RateLimit-Remaining"] = str(slot.remaining)
@@ -4691,6 +4878,7 @@ async def knowledge(
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
             await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+    latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset, _ in merged:
         await mesh_state.record_search(
             citadel.config,
@@ -4699,15 +4887,36 @@ async def knowledge(
             result_count=sum(1 for ds, _ in merged if ds == search_dataset),
         )
     primary_dataset = search_datasets[0]
-    return jsonable_encoder(
-        {
-            "ok": True,
-            "query": query,
-            "dataset": primary_dataset,
-            "datasets": search_datasets if len(search_datasets) > 1 else None,
-            "results": [flat_knowledge_result(result) for _, result in merged],
-        }
+    flat_results = [flat_knowledge_result(result) for _, result in merged]
+    telemetry = await capture_search_feedback(
+        mesh_state=mesh_state,
+        config=citadel.config,
+        request=request,
+        actor=identity,
+        query=query,
+        results=flat_results,
+        search_datasets=search_datasets,
+        primary_dataset=primary_dataset,
+        top_k=limit,
+        latency_ms=latency_ms,
+        timed_out=timed_out,
+        filters={"limit": limit, "dataset": dataset} if dataset else {"limit": limit},
     )
+    payload: dict[str, Any] = {
+        "ok": True,
+        "query": query,
+        "dataset": primary_dataset,
+        "datasets": search_datasets if len(search_datasets) > 1 else None,
+        "results": flat_results,
+    }
+    if telemetry:
+        payload["search_id"] = telemetry.get("search_id")
+        payload["feedback"] = {
+            "automatic": True,
+            "kind": "search_telemetry",
+            "explicit_tool": "citadel_record_feedback",
+        }
+    return jsonable_encoder(payload)
 
 
 @app.post("/api/learning-agent/optimize")
@@ -4761,6 +4970,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     search_sessions = resolve_search_sessions(actor, body.session_id, search_datasets)
     limit = citadel.config.search_max_concurrency
     timed_out = False
+    started = time.perf_counter()
     with _SearchSlot(limit) as slot:  # 429 here if at capacity
         response.headers["X-RateLimit-Limit"] = str(limit)
         response.headers["X-RateLimit-Remaining"] = str(slot.remaining)
@@ -4787,6 +4997,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 },
             )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+    latency_ms = (time.perf_counter() - started) * 1000.0
     if timed_out:
         await mesh_state.record_error(
             citadel.config, operation="search", error="search budget exceeded"
@@ -4812,6 +5023,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             "top_k": body.top_k,
             "datasets": search_datasets,
             "scope_override": scope_override_active(actor, search_datasets),
+            "latency_ms": round(latency_ms, 1),
+            "timed_out": timed_out,
         },
     )
     # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
@@ -4873,9 +5086,35 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         )
         for index, (dataset, result) in enumerate(merged)
     ]
+    if is_docs_mode_query(body.query, mode=body.cleaned_mode()) or is_spec_mode_query(body.query):
+        normalized = apply_query_ranking(normalized, body.query, mode=body.cleaned_mode())
+    filter_kw = body.filter_kwargs()
+    if any(filter_kw.values()):
+        dict_hits = [item for item in normalized if isinstance(item, dict)]
+        other = [item for item in normalized if not isinstance(item, dict)]
+        normalized = filter_hits(dict_hits, **filter_kw) + other
+    # Refresh rank numbers after re-order / filter so agents see consistent ordering.
+    for index, item in enumerate(normalized):
+        if isinstance(item, dict) and isinstance(item.get("_citadel"), dict):
+            item["_citadel"]["rank"] = index + 1
     primary_dataset = search_datasets[0]
     node_dataset = (
         actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
+    )
+    telemetry = await capture_search_feedback(
+        mesh_state=mesh_state,
+        config=citadel.config,
+        request=request,
+        actor=actor,
+        query=body.query,
+        results=normalized,
+        search_datasets=search_datasets,
+        primary_dataset=primary_dataset,
+        top_k=body.top_k,
+        latency_ms=latency_ms,
+        timed_out=timed_out,
+        session_id=body.session_id,
+        filters=body.telemetry_filters(),
     )
     payload: dict[str, Any] = {
         "results": normalized,
@@ -4891,21 +5130,45 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     if timed_out:
         payload["note"] = (
             f"Search exceeded the {citadel.config.search_timeout_seconds:.0f}s budget; "
-            "returning empty results — retry or narrow the query."
+            "returning truncated results — retry or narrow the query."
         )
         payload["timed_out"] = True
+        payload["truncated"] = True
+        payload["code"] = CODE_TIMEOUT
     elif not normalized and body.dataset is None:
         payload["note"] = (
             "No results in the default dataset. Pass an explicit \"dataset\" to search a "
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)
+    authority = token_asset_authority_warning(body.query)
+    if authority:
+        payload.setdefault("warnings", [])
+        if isinstance(payload["warnings"], list):
+            payload["warnings"].append(authority)
+    if telemetry:
+        payload["search_id"] = telemetry.get("search_id")
+        payload["feedback"] = {
+            "automatic": True,
+            "kind": "search_telemetry",
+            "explicit_tool": "citadel_record_feedback",
+            "hint": (
+                "Automatic search telemetry was recorded. After reading hits, optionally "
+                "call citadel_record_feedback with qa_id=<hit id or search_id> and "
+                "score 1 (useful) or -1 (not useful)."
+            ),
+        }
     return jsonable_encoder(payload)
 
 
 @app.post("/feedback")
 async def feedback(body: FeedbackBody, request: Request) -> Any:
     actor = require_access(request, "writer", "kb:feedback")
+    try:
+        qa_id = body.resolved_qa_id()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    score = body.resolved_score()
     # Feedback text lands in durable storage on a cache miss, so it needs the same
     # byte cap as /ingest — FeedbackBody.text carries no max_length of its own.
     if body.text:
@@ -4922,8 +5185,8 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
     try:
         result = await citadel.feedback(
             FeedbackRequest(
-                qa_id=body.qa_id,
-                score=body.score,
+                qa_id=qa_id,
+                score=score,
                 text=body.text,
                 session_id=session_id,
                 dataset=dataset,
@@ -4942,7 +5205,7 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
 
     await mesh_state.record_feedback(
         citadel.config,
-        qa_id=body.qa_id,
+        qa_id=qa_id,
         dataset=dataset,
         result=result,
     )
@@ -4953,11 +5216,12 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
         dataset=dataset,
         detail={
             "operation": "feedback",
-            "qa_id_sha256": hashlib.sha256(body.qa_id.encode("utf-8")).hexdigest(),
-            "score": body.score,
+            "qa_id_sha256": hashlib.sha256(qa_id.encode("utf-8")).hexdigest(),
+            "score": score,
             "has_text": bool(body.text),
             "recorded": result.recorded,
             "improved": result.improved,
+            "kind": "explicit",
         },
     )
     return jsonable_encoder(result)

@@ -5,6 +5,9 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import urllib.error
+
+from typing import Any
 
 import pytest
 
@@ -115,6 +118,49 @@ def test_doctor_fix_installs_missing_local_setup(tmp_path: Path, monkeypatch, ca
     assert (tmp_path / ".mcp.json").exists()
 
 
+def test_doctor_needs_auth_not_false_green(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Hosted HTTP without a token must stay unresolved under doctor --fix."""
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("CITADEL_CURSOR_MCP_PATH", str(tmp_path / "no-cursor.json"))
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "citadel": {
+                        "type": "http",
+                        "url": "https://citadel.example/mcp/",
+                    }
+                }
+            }
+        )
+    )
+    from kb import status as status_mod
+
+    mcp = status_mod.assess_mcp_setup(tmp_path)
+    assert mcp.data["state"] == status_mod.MCP_STATE_NEEDS_AUTH
+    checks = [
+        Check("node", True, "healthy"),
+        Check("auth", True, "valid"),
+        mcp,
+        Check("pre_push_hook", True, "ok"),
+        Check("session_hook", True, "ok"),
+    ]
+    monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks))
+    args = argparse.Namespace(
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url="https://node.example",
+        json=True,
+        fix=True,
+    )
+    rc = asyncio.run(_doctor(args))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert out["resolved"] is False
+    assert any("needsAuth" in i["problem"] for i in out["issues"])
+    assert "MCP server" not in out["fixed"]
+
+
 def test_search_http_renders_results(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     payload = {
@@ -130,12 +176,111 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     args = argparse.Namespace(
         query="hi", top_k=10, json=True, node_url="https://node.example",
         local=False, dataset=None, session=None,
+        type=None, repo=None, path=None, canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None, budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["sections"]["central"][0]["text"] == "hello vault"
     assert out["results"][0]["text"] == "hello vault"
+    assert out["results"][0]["snippet"] == "hello vault"
+    assert out["ok"] is True
+
+
+def _search_args(**kw):
+    base = dict(
+        query="hi", top_k=10, json=True, node_url="https://node.example",
+        local=False, dataset=None, session=None,
+        type=None, repo=None, path=None, canonical_only=False,
+        exclude_ambient=False, mode=None, timeout=None, budget_ms=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_search_dataset_without_local_is_rejected(monkeypatch, capsys) -> None:
+    # --dataset used to be silently dropped on the HTTP path, so a scoped search
+    # quietly returned everything. It must now error instead of running.
+    called = {"n": 0}
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.search_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"results": []},
+    )
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(_search(_search_args(dataset="masumi-network")))
+    assert exc.value.code == 2
+    assert called["n"] == 0  # never reached the Node
+    assert "requires --local" in capsys.readouterr().err
+
+
+def test_ingest_session_without_local_is_rejected(monkeypatch, capsys) -> None:
+    called = {"n": 0}
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"accepted": True},
+    )
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(_ingest(_ingest_args(session="s1")))
+    assert exc.value.code == 2
+    assert called["n"] == 0
+    assert "requires --local" in capsys.readouterr().err
+
+
+def test_search_local_still_accepts_dataset(monkeypatch) -> None:
+    # The guard must not touch the --local path, where --dataset is valid.
+    seen = {}
+
+    async def fake_local(args):
+        seen["dataset"] = args.dataset
+        return 0
+
+    monkeypatch.setattr("kb.cli._search_local", fake_local)
+    rc = asyncio.run(_search(_search_args(local=True, dataset="seat:alice")))
+    assert rc == 0
+    assert seen["dataset"] == "seat:alice"
+
+
+def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    captured: dict[str, Any] = {}
+
+    def fake_search(_base, _token, query, top_k=10, **kwargs):
+        captured["query"] = query
+        captured["top_k"] = top_k
+        captured.update(kwargs)
+        return {"results": [], "sections": {}, "dataset": "notes"}
+
+    monkeypatch.setattr("kb.status.search_node", fake_search)
+    args = argparse.Namespace(
+        query="endpoint schema",
+        top_k=7,
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type="spec,skill",
+        repo="masumi-network/agent",
+        path="docs/MIP-003",
+        canonical_only=True,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None,
+        budget_ms=None,
+    )
+    rc = asyncio.run(_search(args))
+    assert rc == 0
+    assert captured["query"] == "endpoint schema"
+    assert captured["top_k"] == 7
+    assert captured["types"] == ["spec", "skill"]
+    assert captured["repo"] == "masumi-network/agent"
+    assert captured["path"] == "docs/MIP-003"
+    assert captured["canonical_only"] is True
 
 
 def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
@@ -157,6 +302,10 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     args = argparse.Namespace(
         query="kuzu", top_k=10, json=False, node_url="https://node.example",
         local=False, dataset=None, session=None,
+        type=None, repo=None, path=None, canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None, budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 0
@@ -172,10 +321,228 @@ def test_search_no_token_exits_one(monkeypatch, capsys) -> None:
     args = argparse.Namespace(
         query="hi", top_k=10, json=False, node_url=None,
         local=False, dataset=None, session=None,
+        type=None, repo=None, path=None, canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None, budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 1
     assert "no token" in capsys.readouterr().err
+
+
+def test_search_no_token_json_auth_required(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: None)
+    args = argparse.Namespace(
+        query="hi", top_k=10, json=True, node_url=None,
+        local=False, dataset=None, session=None,
+        type=None, repo=None, path=None, canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None, budget_ms=None,
+    )
+    rc = asyncio.run(_search(args))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "AUTH_REQUIRED"
+
+
+def test_search_json_connection_error_emits_json(monkeypatch, capsys) -> None:
+    # A non-timeout network failure under --json used to print to stderr and
+    # leave stdout empty, so a scripted caller got nothing to parse.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    rc = asyncio.run(_search(_search_args(query="hi")))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "NODE_UNREACHABLE"
+
+
+def test_search_json_http_error_emits_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.HTTPError("https://node.example", 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    rc = asyncio.run(_search(_search_args(query="hi")))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "HTTP_ERROR"
+    assert out["http_status"] == 503
+
+
+def test_ingest_json_connection_error_emits_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args()))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "NODE_UNREACHABLE"
+
+
+def test_search_timeout_returns_truncated_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    args = argparse.Namespace(
+        query="MIP-003 endpoint schema",
+        top_k=5,
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=2.0,
+        budget_ms=None,
+    )
+    rc = asyncio.run(_search(args))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["timed_out"] is True
+    assert out["truncated"] is True
+    assert out["ok"] is True
+    assert out["code"] == "TIMEOUT"
+    assert out["results"] == []
+
+
+def test_search_urlerror_timeout_deduped(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError("timed out")
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    args = argparse.Namespace(
+        query="x",
+        top_k=5,
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None,
+        budget_ms=1500,
+    )
+    rc = asyncio.run(_search(args))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["truncated"] is True and out["timed_out"] is True
+
+
+def test_search_human_spec_mode_flattens_ranked(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    digest = {"text": "GitHub org daily digest", "score": 0.99}
+    mip = {"title": "MIP-003", "path": "MIPs/MIP-003/MIP-003.md", "score": 0.4, "text": "statuses"}
+    payload = {
+        "results": [digest, mip],
+        "sections": {"central": [digest, mip], "session_traces": [], "node": []},
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
+    args = argparse.Namespace(
+        query="MIP-003 endpoint schema",
+        top_k=10,
+        json=False,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None,
+        budget_ms=None,
+    )
+    rc = asyncio.run(_search(args))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Central" not in out  # flattened for spec-mode ranking
+    assert out.index("MIP-003") < out.index("daily digest")
+
+
+def test_verify_and_prepare_pr_context(monkeypatch, tmp_path, capsys) -> None:
+    from kb.cli import _prepare_pr_context, _verify
+
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    ref = tmp_path / "payment-service.md"
+    ref.write_text("# payment MIP-003 endpoint schema\nUse /purchase status enum\n")
+
+    payload = {
+        "results": [
+            {
+                "title": "MIP-003",
+                "path": "MIPs/MIP-003/MIP-003.md",
+                "url": "https://github.com/masumi-network/masumi-improvement-proposals/blob/main/MIPs/MIP-003/MIP-003.md",
+                "text": "Agent statuses and purchase request body",
+                "score": 0.8,
+            },
+            {
+                "text": "GitHub org daily digest mentioning cardano-dev-skills",
+                "score": 0.99,
+            },
+        ]
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
+
+    v_args = argparse.Namespace(
+        file=str(ref),
+        query=None,
+        top_k=10,
+        node_url="https://node.example",
+        timeout=None,
+        budget_ms=None,
+    )
+    assert asyncio.run(_verify(v_args)) == 0
+    verify_out = json.loads(capsys.readouterr().out)
+    assert verify_out["ok"] is True
+    assert verify_out["doc_shaped_sources"]
+    assert verify_out["doc_shaped_sources"][0]["trust_tier"] == "unattested"
+    assert "agent_instruction" in verify_out
+
+    p_args = argparse.Namespace(
+        repo="cardano-dev-skills",
+        topic="masumi",
+        top_k=10,
+        node_url="https://node.example",
+        timeout=None,
+        budget_ms=None,
+    )
+    assert asyncio.run(_prepare_pr_context(p_args)) == 0
+    brief = json.loads(capsys.readouterr().out)
+    assert brief["ok"] is True
+    assert brief["repo"] == "cardano-dev-skills"
+    assert brief["doc_shaped_sources"] or brief["org_context"]
+    assert "agent_instruction" in brief
 
 
 def test_ingest_http_accepted(monkeypatch, capsys) -> None:

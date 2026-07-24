@@ -45,7 +45,11 @@ def force_shared_trace_author_seat(data: str, seat_slug: str) -> str:
     """Pin Author-Seat metadata to the authenticated seat (never caller-supplied)."""
     line = f"Author-Seat: {seat_slug.strip()}"
     if _AUTHOR_SEAT_LINE.search(data):
-        return _AUTHOR_SEAT_LINE.sub(line, data, count=1)
+        # Rewrite EVERY occurrence, not just the first. The document is chunked
+        # downstream and author_seat is re-read per chunk, so a second
+        # "Author-Seat:" line further down survives into a tail chunk and
+        # attributes the trace to whichever seat the author typed there.
+        return _AUTHOR_SEAT_LINE.sub(line, data)
     lines = data.splitlines()
     if lines and lines[0].strip() == "# Shared Session Trace":
         return "\n".join([lines[0], line, *lines[1:]])

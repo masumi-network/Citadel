@@ -14,6 +14,7 @@ import kb.mcp_server as mcp_server
 from kb.mcp_server import (
     MAX_AUDIT_LIMIT,
     MAX_SEARCH_TOP_K,
+    MCP_AGENT_INSTRUCTIONS,
     TOOL_POLICIES,
     CitadelHttpClient,
     CitadelMcpError,
@@ -75,6 +76,21 @@ def run_tool(server: Any, name: str, *args: Any, **kwargs: Any) -> Any:
     if inspect.isawaitable(result):
         return asyncio.run(result)
     return result
+
+
+def test_record_feedback_does_not_require_qa_id() -> None:
+    """The documented flow is "pass qa_id OR result_id".
+
+    qa_id had no default, so FastMCP generated it as a REQUIRED parameter and
+    the documented result_id-only call failed schema validation before it ever
+    reached the server — which does accept result_id alone.
+    """
+    server = create_mcp_server(FakeHttpClient())
+
+    schema = server._tool_manager.get_tool("citadel_record_feedback").parameters
+
+    assert "qa_id" not in (schema.get("required") or [])
+    assert "qa_id" in schema["properties"]
 
 
 def test_tools_list_session_resolved_in_process_not_via_self_call(
@@ -296,6 +312,29 @@ def test_search_clamps_top_k_and_tracks_tool_name() -> None:
     assert client.posts[0]["path"] == "/search"
 
 
+def test_search_forwards_filter_args_to_server() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(
+        server,
+        "citadel_search",
+        " MIP payment schema ",
+        None,
+        types=["spec", "skill"],
+        repo="masumi-network/agent",
+        path="docs/MIP-003",
+        canonical_only=True,
+    )
+
+    assert result["payload"]["query"] == "MIP payment schema"
+    assert result["payload"]["types"] == ["spec", "skill"]
+    assert result["payload"]["repo"] == "masumi-network/agent"
+    assert result["payload"]["path"] == "docs/MIP-003"
+    assert result["payload"]["canonical_only"] is True
+    assert "canonical_only" in client.posts[0]["payload"]
+
+
 def test_search_omits_dataset_for_server_side_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CITADEL_MCP_DEFAULT_DATASET", "masumi-network")
     client = FakeHttpClient()
@@ -340,7 +379,8 @@ def test_audit_tool_uses_bounded_server_view() -> None:
 
 
 def test_write_tools_reject_empty_or_oversized_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
-    server = create_mcp_server(FakeHttpClient())
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
 
     with pytest.raises(ToolError, match="data must not be empty"):
         run_tool(server, "citadel_ingest", "   ", None)
@@ -349,8 +389,22 @@ def test_write_tools_reject_empty_or_oversized_payloads(monkeypatch: pytest.Monk
     with pytest.raises(ToolError, match="payload is 5 bytes"):
         run_tool(server, "citadel_ingest", "12345", None)
 
-    with pytest.raises(ToolError, match="qa_id must not be empty"):
-        run_tool(server, "citadel_record_feedback", "", None)
+    with pytest.raises(ToolError, match="pass qa_id or result_id"):
+        run_tool(server, "citadel_record_feedback", None, "")
+
+    rated = run_tool(
+        server,
+        "citadel_record_feedback",
+        None,
+        result_id="hit-1",
+        correct=True,
+        text="useful hit",
+    )
+    assert rated["ok"] is True
+    feedback_post = next(p for p in client.posts if p["path"] == "/feedback")
+    assert feedback_post["payload"]["qa_id"] == "hit-1"
+    assert feedback_post["payload"]["result_id"] == "hit-1"
+    assert feedback_post["payload"]["correct"] is True
 
 
 def test_ingest_tool_requests_inline_cognify_by_default() -> None:
@@ -514,6 +568,24 @@ def test_citadel_search_tool_description_nudges_task_start() -> None:
     assert "before editing code" in search.description.lower()
 
 
+def test_mcp_agent_instructions_cli_fallback_and_no_false_vault_authority() -> None:
+    # When Cursor only shows mcp_auth / needsAuth, instructions must steer agents
+    # to CLI (then official docs) — never invent vault-backed authority.
+    text = MCP_AGENT_INSTRUCTIONS.lower()
+    assert "mcp_auth" in text
+    assert "citadel status" in text
+    assert "citadel search" in text
+    assert "citadel doctor" in text
+    assert "openapi" in text or "mip" in text
+    assert "vault-backed" in text
+    assert "successful search hit" in text
+    assert "citadel confirms" in text
+    assert "usdcx" in text or "asset id" in text or "payment token" in text
+    assert "no authoritative hit" in text
+    assert "do not invent vault citations" in text or "not invent vault citations" in text
+    assert "readiness" in text or "search is unavailable" in text
+
+
 def test_promotion_decision_tools_require_admin_in_policy() -> None:
     # #48: discovery metadata must match the server's admin/sources:sync gate so an
     # agent doesn't read "writer" and try (then 403) approve/reject.
@@ -528,12 +600,50 @@ def test_tools_list_protocol_handler_applies_role_filter(
 ) -> None:
     # #33: prove the override is wired into the live tools/list protocol handler
     # (not just the pure helper) and resolves the caller's session to filter.
+    # Must not use a sync self-HTTP call (event-loop deadlock → Cursor mcp_auth-only).
     from mcp import types as mcp_types
 
     server = create_mcp_server(FakeHttpClient())
 
     monkeypatch.setattr(server, "get_context", lambda: object())
     monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: "ctdl_tok")
+    mcp_server.set_tools_list_session_resolver(
+        lambda token: {"role": "writer", "seat_slug": "sarthi"} if token else None
+    )
+
+    http_calls: list[str] = []
+
+    class _SessionClient:
+        def __init__(self, **_: Any) -> None: ...
+
+        def get(self, path: str, **_: Any) -> dict[str, Any]:
+            http_calls.append(path)
+            raise AssertionError("tools/list must not fall back to HTTP when resolver works")
+
+    monkeypatch.setattr(mcp_server, "CitadelHttpClient", _SessionClient)
+
+    try:
+        handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+        result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
+        names = {t.name for t in result.root.tools}
+
+        assert not (_ADMIN_TOOLS & names)
+        assert "citadel_contribute" not in names  # seat writer
+        assert "citadel_ingest" in names
+        assert http_calls == []
+    finally:
+        mcp_server.set_tools_list_session_resolver(None)
+
+
+def test_tools_list_uses_threaded_http_fallback_when_resolver_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp import types as mcp_types
+
+    server = create_mcp_server(FakeHttpClient())
+    monkeypatch.setattr(server, "get_context", lambda: object())
+    monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: "ctdl_tok")
+    mcp_server.set_tools_list_session_resolver(lambda _token: None)
 
     class _SessionClient:
         def __init__(self, **_: Any) -> None: ...
@@ -543,14 +653,14 @@ def test_tools_list_protocol_handler_applies_role_filter(
             return {"role": "writer", "seat_slug": "sarthi"}
 
     monkeypatch.setattr(mcp_server, "CitadelHttpClient", _SessionClient)
-
-    handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
-    result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
-    names = {t.name for t in result.root.tools}
-
-    assert not (_ADMIN_TOOLS & names)
-    assert "citadel_contribute" not in names  # seat writer
-    assert "citadel_ingest" in names
+    try:
+        handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+        result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
+        names = {t.name for t in result.root.tools}
+        assert "citadel_ingest" in names
+        assert not (_ADMIN_TOOLS & names)
+    finally:
+        mcp_server.set_tools_list_session_resolver(None)
 
 
 def test_tools_list_protocol_handler_fails_open_without_context() -> None:

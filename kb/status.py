@@ -30,12 +30,43 @@ TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 MCP_SERVER_NAME = "citadel"
 SESSION_HOOK_MARKER = "kb.hooks.sync_session"
 _TIMEOUT = 8.0
-_SEARCH_TIMEOUT = 20.0  # full vault search (`citadel search`); cognee cold-start is slow
+# Full vault search. The server caps its own recall at ``search_timeout_seconds``
+# (config default 20s) and then answers HTTP 200 with a structured
+# ``{timed_out:true, code:"TIMEOUT"}`` envelope. The client budget MUST sit above
+# that server budget plus the server's post-recall work (drilldown, telemetry,
+# mesh, audit) plus network, or the client aborts at the exact moment the server
+# is about to return — turning a recoverable soft-timeout into a hard client
+# failure, and killing normal 13-20s searches just before they'd return. 35s
+# leaves ~15s of slack over the 20s server budget.
+_SEARCH_TIMEOUT = 35.0
 # Status smoke must not inherit the full search budget — search never gates
-# `healthy`, so a 20s hang was pure wall-time tax on every `citadel status`.
-_SMOKE_SEARCH_TIMEOUT = 3.0
+# `healthy`. But 3s sat below the FLOOR of real cognee recall latency (6-12s), so
+# `--check-search` reported "timed out — node warming up" on every healthy node.
+# 15s clears typical latency while staying under the server's 20s soft cap.
+_SMOKE_SEARCH_TIMEOUT = 15.0
 _INGEST_TIMEOUT = 60.0  # /ingest does real write work (and cold nodes are slow)
 _SMOKE_QUERY = "citadel status connectivity smoke"
+
+# Distinguishes MCP wiring for agents (P0 discovery clarity).
+MCP_STATE_MISSING = "missing"
+MCP_STATE_NEEDS_AUTH = "needsAuth"
+MCP_STATE_READY_BUT_UNCONFIGURED = "readyButUnconfigured"
+MCP_STATE_READY = "ready"
+MCP_REMEDIATION = "citadel mcp add cursor"
+# Shown when MCP is not ready — agents must not invent vault authority.
+MCP_AGENT_FALLBACK = (
+    "Until MCP works: `citadel status` then `citadel search` / `citadel doctor`; "
+    "never claim vault-backed authority without a successful search hit; "
+    "never claim “Citadel confirms X” without a retrieved title + snippet. "
+    "If CLI is unhealthy: official/canonical docs (live OpenAPI, MIP, DevHub). "
+    "Mainnet asset IDs / payment tokens (USDCx, USDM, …): prefer official Masumi docs "
+    "/ skills/masumi — Citadel is not sole authority."
+)
+
+# Structured codes for agent readiness / error payloads (CLI JSON + check data).
+CODE_AUTH_REQUIRED = "AUTH_REQUIRED"
+CODE_SEARCH_UNAVAILABLE = "SEARCH_UNAVAILABLE"
+CODE_TIMEOUT = "TIMEOUT"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -102,6 +133,42 @@ class StatusReport:
     recent: list[dict[str, Any]]
     repo: str | None = None
 
+    def readiness(self) -> dict[str, Any]:
+        """Compact agent probe: ``{authenticated, search, reason}`` (+ ``code``)."""
+        by_name = {c.name: c for c in self.checks}
+        auth = by_name.get("auth")
+        search = by_name.get("search")
+        mcp = by_name.get("mcp")
+        authenticated = bool(auth and auth.ok)
+        search_probed = search is not None
+        search_ok = bool(search and search.ok)
+        code: str | None = None
+        if not authenticated:
+            code = CODE_AUTH_REQUIRED
+            detail = (auth.detail if auth else "not authenticated") or "not authenticated"
+            reason = detail
+        elif not search_probed:
+            reason = "search not probed; pass --check-search"
+        elif (search.data or {}).get("timed_out") or (search.data or {}).get("code") == CODE_TIMEOUT:
+            code = CODE_TIMEOUT
+            reason = search.detail or "search timed out"
+        elif not search_ok:
+            code = CODE_SEARCH_UNAVAILABLE
+            reason = search.detail or "search unavailable"
+        else:
+            reason = "ok"
+        out: dict[str, Any] = {
+            "authenticated": authenticated,
+            "search": search_ok,
+            "search_probed": search_probed,
+            "reason": reason,
+        }
+        if code:
+            out["code"] = code
+        if mcp and isinstance(mcp.data, dict) and mcp.data.get("state"):
+            out["mcp_state"] = mcp.data["state"]
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "node_url": self.node_url,
@@ -110,6 +177,7 @@ class StatusReport:
             "checks": [asdict(c) for c in self.checks],
             "recent": self.recent,
             "repo": self.repo,
+            "readiness": self.readiness(),
         }
 
 
@@ -134,14 +202,20 @@ def check_node_health(base_url: str, *, timeout: float = _TIMEOUT) -> Check:
 
 def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> Check:
     if not token:
-        return Check("auth", ok=False, detail="no token (CITADEL_MCP_ACCESS_TOKEN unset)")
+        return Check(
+            "auth",
+            ok=False,
+            detail="no token (CITADEL_MCP_ACCESS_TOKEN unset)",
+            data={"code": CODE_AUTH_REQUIRED},
+        )
     started = time.monotonic()
     try:
         data = _request(
             "GET", f"{base_url.rstrip('/')}/api/session", token=token, timeout=timeout
         )
     except Exception as exc:
-        return Check("auth", ok=False, detail=_humanize_net_error(exc))
+        detail = _humanize_net_error(exc)
+        return Check("auth", ok=False, detail=detail, data={"code": CODE_AUTH_REQUIRED})
     latency = int((time.monotonic() - started) * 1000)
     identity = {
         "seat_slug": data.get("seat_slug"),
@@ -150,14 +224,23 @@ def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         "capabilities": data.get("capabilities", {}),
         "actor": (data.get("actor") or {}).get("name"),
     }
-    return Check("auth", ok=bool(data.get("ok")), detail="valid", latency_ms=latency, data=identity)
+    ok = bool(data.get("ok"))
+    auth_data: dict[str, Any] = dict(identity)
+    if not ok:
+        auth_data["code"] = CODE_AUTH_REQUIRED
+    return Check("auth", ok=ok, detail="valid" if ok else "invalid session", latency_ms=latency, data=auth_data)
 
 
 def check_search(
     base_url: str, token: str | None, *, timeout: float = _SMOKE_SEARCH_TIMEOUT
 ) -> Check:
     if not token:
-        return Check("search", ok=False, detail="skipped (no token)")
+        return Check(
+            "search",
+            ok=False,
+            detail="skipped (no token)",
+            data={"code": CODE_AUTH_REQUIRED},
+        )
     started = time.monotonic()
     try:
         data = _request(
@@ -172,7 +255,7 @@ def check_search(
             "search",
             ok=False,
             detail=f"timed out after {timeout:g}s — node warming up",
-            data={"timed_out": True},
+            data={"timed_out": True, "code": CODE_TIMEOUT},
         )
     except Exception as exc:
         # urllib may wrap a socket timeout as URLError("timed out") — treat like
@@ -182,9 +265,14 @@ def check_search(
                 "search",
                 ok=False,
                 detail=f"timed out after {timeout:g}s — node warming up",
-                data={"timed_out": True},
+                data={"timed_out": True, "code": CODE_TIMEOUT},
             )
-        return Check("search", ok=False, detail=_humanize_net_error(exc))
+        return Check(
+            "search",
+            ok=False,
+            detail=_humanize_net_error(exc),
+            data={"code": CODE_SEARCH_UNAVAILABLE},
+        )
     latency = int((time.monotonic() - started) * 1000)
     results = data.get("results")
     if results is None:
@@ -192,7 +280,16 @@ def check_search(
     count = len(results) if isinstance(results, list) else 0
     # A zero-result smoke search means the read path is up but the data plane is
     # empty/broken — report it honestly instead of always-green (#27).
-    return Check("search", ok=count > 0, detail=f"{count} result(s)", latency_ms=latency, data={"count": count})
+    search_data: dict[str, Any] = {"count": count}
+    if count <= 0:
+        search_data["code"] = CODE_SEARCH_UNAVAILABLE
+    return Check(
+        "search",
+        ok=count > 0,
+        detail=f"{count} result(s)",
+        latency_ms=latency,
+        data=search_data,
+    )
 
 
 def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> Check | None:
@@ -234,18 +331,48 @@ def search_node(
     top_k: int = 10,
     *,
     timeout: float = _SEARCH_TIMEOUT,
+    dataset: str | None = None,
+    session_id: str | None = None,
+    types: list[str] | None = None,
+    repo: str | None = None,
+    path: str | None = None,
+    canonical_only: bool = False,
+    exclude_ambient: bool = False,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """POST a query to the Node's /search (the same endpoint MCP citadel_search uses).
 
-    Zero-dep, HTTPS-only. The Node resolves the dataset from the token's seat, so
-    callers pass only query + top_k. Returns the full search payload (``results``,
-    ``sections``, ``dataset``, …) like MCP ``citadel_search`` — not a flattened list.
+    Zero-dep, HTTPS-only. The Node resolves the dataset from the token's seat by
+    default. Optional filter fields (``types`` / ``repo`` / ``path`` /
+    ``canonical_only`` / ``exclude_ambient`` / ``mode``) are forwarded so
+    server-side telemetry sees the same narrowing the CLI applies. Returns the
+    full search payload (``results``, ``sections``, ``dataset``, …) like MCP
+    ``citadel_search`` — not a flattened list.
     """
+    payload: dict[str, Any] = {"query": query, "top_k": top_k}
+    if dataset:
+        payload["dataset"] = dataset
+    if session_id:
+        payload["session_id"] = session_id
+    if types:
+        cleaned = [str(item).strip() for item in types if str(item).strip()]
+        if cleaned:
+            payload["types"] = cleaned
+    if repo and str(repo).strip():
+        payload["repo"] = str(repo).strip()
+    if path and str(path).strip():
+        payload["path"] = str(path).strip()
+    if canonical_only:
+        payload["canonical_only"] = True
+    if exclude_ambient:
+        payload["exclude_ambient"] = True
+    if mode and str(mode).strip():
+        payload["mode"] = str(mode).strip().lower()
     data = _request(
         "POST",
         f"{base_url.rstrip('/')}/search",
         token=token,
-        payload={"query": query, "top_k": top_k},
+        payload=payload,
         timeout=timeout,
     )
     results = data.get("results")
@@ -305,8 +432,10 @@ def fetch_mesh(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         return {}
     try:
         data = _request("GET", f"{base_url.rstrip('/')}/api/mesh", token=token, timeout=timeout)
-    except Exception:
-        return {}
+    except Exception as exc:
+        # A network failure is NOT an empty vault — mark it so the renderer says
+        # "couldn't reach the Node" instead of silently showing nothing (#101).
+        return {"error": _humanize_net_error(exc)}
     return data if isinstance(data, dict) else {}
 
 
@@ -333,8 +462,8 @@ def fetch_events(
         data = _request(
             "GET", f"{base_url.rstrip('/')}/api/knowledge/events?{query}", token=token, timeout=timeout
         )
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {"error": _humanize_net_error(exc)}
     return data if isinstance(data, dict) else {}
 
 
@@ -354,8 +483,8 @@ def fetch_presence(base_url: str, token: str | None, *, timeout: float = _TIMEOU
         data = _request(
             "GET", f"{base_url.rstrip('/')}/api/mesh/graph?limit=1", token=token, timeout=timeout
         )
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {"error": _humanize_net_error(exc)}
     if not isinstance(data, dict):
         return {}
     seats: list[dict[str, Any]] = []
@@ -371,21 +500,124 @@ def fetch_presence(base_url: str, token: str | None, *, timeout: float = _TIMEOU
     return {"seats": seats}
 
 
+def _mcp_block_from_path(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        servers = json.loads(path.read_text()).get("mcpServers") or {}
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(servers, dict):
+        return None
+    block = servers.get(MCP_SERVER_NAME)
+    return block if isinstance(block, dict) else None
+
+
+def _mcp_block_usable(block: dict[str, Any] | None) -> bool:
+    """True when the block is hosted HTTP Citadel (Cursor/Claude-compatible)."""
+    if not block:
+        return False
+    from kb.onboard import is_http_citadel_mcp_block, is_legacy_stdio_mcp_block
+
+    if is_legacy_stdio_mcp_block(block):
+        return False
+    return is_http_citadel_mcp_block(block) or bool(
+        (block.get("url") or block.get("serverUrl") or "").strip()
+    )
+
+
+def _cursor_mcp_path() -> Path:
+    override = (os.getenv("CITADEL_CURSOR_MCP_PATH") or "").strip()
+    if override:
+        return Path(override)
+    return Path("~/.cursor/mcp.json").expanduser()
+
+
+def assess_mcp_setup(repo: Path) -> Check:
+    """Classify local MCP wiring: missing | needsAuth | readyButUnconfigured | ready.
+
+    ``ok`` is true only for ``ready`` (hosted HTTP citadel entry + seat token in env).
+    Ordering matters for agent remediation:
+
+    1. **missing** — no citadel MCP block at all
+    2. **readyButUnconfigured** — a block exists but is not hosted HTTP (e.g. legacy
+       stdio). Checked *before* token so stdio-only + no token does not look like
+       a mere auth gap.
+    3. **needsAuth** — HTTP bridge is wired but ``CITADEL_MCP_ACCESS_TOKEN`` is unset
+    4. **ready** — HTTP + token
+
+    A bare ``.mcp.json`` presence is no longer enough — that was a false green
+    when Cursor still only exposed mcp_auth.
+    """
+    token_present = bool((os.getenv(TOKEN_ENV) or "").strip())
+    project_block = _mcp_block_from_path(repo / ".mcp.json")
+    cursor_block = _mcp_block_from_path(_cursor_mcp_path())
+    project_ok = _mcp_block_usable(project_block)
+    cursor_ok = _mcp_block_usable(cursor_block)
+    any_block = project_block is not None or cursor_block is not None
+    any_usable = project_ok or cursor_ok
+
+    if not any_block:
+        state = MCP_STATE_MISSING
+        detail = f"not configured — run `{MCP_REMEDIATION}` (or CLI search)"
+        next_step: str | None = MCP_REMEDIATION
+        ok = False
+    elif not any_usable:
+        # Prefer this over needsAuth when only legacy stdio is present — setting a
+        # token alone will not expose hosted tools.
+        state = MCP_STATE_READY_BUT_UNCONFIGURED
+        token_hint = "" if token_present else f" (also set {TOKEN_ENV} after)"
+        detail = (
+            f"citadel entry present but not hosted HTTP — run `{MCP_REMEDIATION}` "
+            f"(or `citadel doctor --fix`){token_hint}; else CLI search"
+        )
+        next_step = MCP_REMEDIATION
+        ok = False
+    elif not token_present:
+        state = MCP_STATE_NEEDS_AUTH
+        detail = (
+            f"hosted MCP wired but {TOKEN_ENV} unset — set token then restart Cursor; "
+            "else CLI search (no vault authority without a hit)"
+        )
+        # Wiring is fine; doctor --fix cannot mint a token.
+        next_step = f"export {TOKEN_ENV}=… then restart Cursor"
+        ok = False
+    else:
+        state = MCP_STATE_READY
+        where = []
+        if project_ok:
+            where.append("project .mcp.json")
+        if cursor_ok:
+            where.append("Cursor ~/.cursor/mcp.json")
+        detail = f"ready ({', '.join(where)})"
+        next_step = None
+        ok = True
+
+    data: dict[str, Any] = {
+        "state": state,
+        "configured": any_usable and token_present,
+        "project_mcp": project_ok,
+        "cursor_mcp": cursor_ok,
+        "token_present": token_present,
+        "next": next_step,
+    }
+    if not ok:
+        data["fallback"] = MCP_AGENT_FALLBACK
+
+    return Check(
+        "mcp",
+        ok=ok,
+        detail=detail,
+        data=data,
+    )
+
+
 def check_local_setup(repo: Path, config_path: Path | None = None) -> list[Check]:
     checks: list[Check] = []
     checks.append(
         Check("token", ok=bool(os.getenv(TOKEN_ENV)), detail=_mask(os.getenv(TOKEN_ENV)))
     )
-
-    mcp_path = repo / ".mcp.json"
-    mcp_ok = False
-    if mcp_path.exists():
-        try:
-            servers = (json.loads(mcp_path.read_text()).get("mcpServers") or {})
-            mcp_ok = MCP_SERVER_NAME in servers
-        except ValueError:
-            mcp_ok = False
-    checks.append(Check("mcp", ok=mcp_ok, detail="citadel server present" if mcp_ok else "not configured"))
+    checks.append(assess_mcp_setup(repo))
 
     pre_push = repo / ".git" / "hooks" / "pre-push"
     checks.append(
@@ -532,7 +764,13 @@ def render_text(report: StatusReport, *, color: bool = False, verdict: bool = Tr
         identity_line,
         paint(f"node: {report.node_url}", "dim", enable=color),
     ]
-    seat_hint = seatless_token_hint(ident)
+    # Only claim "no seat" when auth actually SUCCEEDED. On a timeout/unreachable
+    # node check_auth returns an identity with no seat_slug, which used to trip the
+    # seatless hint and tell a user with a working token to go ask an admin (#101).
+    # The Auth row below already shows the real failure, so stay silent here.
+    auth_check = next((c for c in report.checks if c.name == "auth"), None)
+    auth_ok = auth_check.ok if auth_check is not None else True
+    seat_hint = seatless_token_hint(ident) if auth_ok else None
     if seat_hint:
         lines.append(paint(f"  hint: {seat_hint}", "yellow", enable=color))
     lines.append("")

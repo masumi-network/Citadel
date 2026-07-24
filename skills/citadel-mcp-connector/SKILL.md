@@ -240,8 +240,12 @@ write tools. The server also runs a secret/sensitivity scan on every write.
 | `citadel_recent_contributions` | reader | Recent vault contributions (`mine=true` for yours) |
 | `citadel_ingest` | writer | Add durable context |
 | `citadel_contribute` | writer | Add a titled Vault Contribution (enrichment + conflict detection) |
-| `citadel_record_feedback` | writer | Record feedback on a QA result |
+| `citadel_record_feedback` | writer | Record feedback on a search hit or QA result (pass `qa_id` **or** `result_id`) |
+| `citadel_share_session` | writer | Volunteer a Shared Session Trace (dead ends) — **explicit user approval only** |
 | `citadel_run_learning_agent` | admin | Run source learning |
+| `citadel_promotion_pending` | admin | List contributions awaiting promotion to Central |
+| `citadel_promotion_approve` | admin | Promote a pending contribution to Central |
+| `citadel_promotion_reject` | admin | Reject a pending contribution |
 | `citadel_run_repo_content_sync` | admin | Sync READMEs, skills, and docs from allowlisted repos through cognify |
 | `citadel_backup_mirror_status` | admin | Inspect backup mirror manifest status |
 | `citadel_run_backup_mirror` | admin | Run backup mirror manifest export |
@@ -251,8 +255,10 @@ write tools. The server also runs a secret/sensitivity scan on every write.
 ## Safety rules
 
 - **Always ask the user before any write tool** (`citadel_ingest`, `citadel_contribute`,
-  `citadel_record_feedback`). Configure your MCP client to require approval for
-  those tools (see `docs/mcp/codex-hosted.config.toml`).
+  `citadel_record_feedback`, `citadel_share_session`). Configure your MCP client to
+  require approval for those tools (see `docs/mcp/codex-hosted.config.toml`).
+  `citadel_share_session` publishes a trace to teammates — never call it on your
+  own initiative.
 - **Seat-writer tokens:** MCP writes land in the personal node only. Central is
   read-only from MCP; org sync and selective promotion update Central.
 - Do not commit tokens to git or paste them into PRs/issues.
@@ -271,8 +277,12 @@ header. It does not install background hooks by itself. Trust boundary:
 - The token stays in env / client secret store — never in tracked git files.
 - Prefer native HTTP MCP (`type: http`) over `mcp-remote`; when a stdio bridge
   is required, pin `mcp-remote@0.1.38` and pass the token via env expansion.
-- If no `citadel_*` tools register, fall back to the CLI (`citadel search`,
-  `citadel status`, `citadel doctor`) instead of re-authing MCP forever.
+- If no `citadel_*` tools register, fall back to the CLI (`citadel status`, then
+  `citadel search` / `citadel doctor`) instead of re-authing MCP forever. If CLI
+  is unhealthy, use official/canonical docs and do not claim vault-backed authority.
+  Never claim “Citadel confirms X” without a retrieved title + snippet. Never use
+  Citadel as sole authority for Mainnet payment token units (USDCx / USDM / policy
+  hex) — prefer official Masumi docs / `skills/masumi`.
 
 ## Troubleshooting
 
@@ -284,7 +294,7 @@ header. It does not install background hooks by itself. Trust boundary:
 | Tools missing after config | Restart the MCP host |
 | Client can't send headers | Use the `mcp-remote` stdio bridge above |
 | Endpoint unreachable | Check `…/healthz`; confirm the `…/mcp/` URL |
-| No `citadel_*` tools at all | Use CLI fallback: `citadel search`, `citadel status`, `citadel doctor` |
+| No `citadel_*` tools at all | CLI: `citadel status`, then `citadel search` / `citadel doctor`. If CLI unhealthy: official docs (OpenAPI, MIP, DevHub) — never claim vault-backed authority without a search hit |
 
 ## Reference
 

@@ -223,7 +223,12 @@ def test_agent_policy_section_matches_session_start() -> None:
     assert "citadel_search" in section
     assert "reference-only" in section
     assert "citadel_share_session" in section
-
+    assert "vault-backed" in section
+    assert "official/canonical" in section
+    assert "USDCx" in section
+    assert "skills/masumi" in section
+    assert "no authoritative hit" in section
+    assert "Citadel confirms" in section
 
 def test_cursor_agent_policy_rule_matches_session_start() -> None:
     text = cursor_agent_policy_rule_text()

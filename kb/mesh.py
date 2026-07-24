@@ -338,27 +338,95 @@ class MeshState:
         query: str,
         dataset: str,
         result_count: int,
+        telemetry: dict[str, Any] | None = None,
     ) -> None:
         async with self._lock:
             self._ensure_base_graph(config)
             query_id = stable_id("query", f"{dataset}:{query}:{self.searches}")
+            metadata: dict[str, Any] = {"dataset": dataset, "results": result_count}
+            if telemetry:
+                # Keep node metadata compact — full payload lives on the event.
+                for key in ("search_id", "empty", "low_score", "timed_out", "tool_name"):
+                    if key in telemetry:
+                        metadata[key] = telemetry[key]
             self.nodes[query_id] = {
                 "id": query_id,
                 "label": query[:80],
                 "type": "query",
                 "status": "complete",
                 "size": 24,
-                "metadata": {"dataset": dataset, "results": result_count},
+                "metadata": metadata,
             }
             self._edge(query_id, self._dataset_node(dataset), "searched")
             self._edge(query_id, "index:vector", "retrieved")
             self._edge(query_id, "index:graph", "traversed")
             self.searches += 1
+            details: dict[str, Any] = {"dataset": dataset, "results": result_count}
+            if telemetry:
+                details["telemetry"] = telemetry
+                if isinstance(telemetry.get("latency_ms"), (int, float)):
+                    details["latency_ms"] = telemetry["latency_ms"]
             await self._record_event(
                 "search",
                 "Search completed",
-                {"dataset": dataset, "results": result_count},
+                details,
             )
+
+    async def record_search_telemetry(
+        self,
+        config: CitadelConfig,
+        *,
+        telemetry: dict[str, Any],
+        dataset: str | None = None,
+    ) -> str:
+        """Write implicit search telemetry into the feedback index (non-Cognee).
+
+        Returns the feedback node id. Callers must treat failures as non-fatal.
+        """
+        async with self._lock:
+            self._ensure_base_graph(config)
+            target_dataset = (
+                dataset
+                or telemetry.get("primary_dataset")
+                or config.default_dataset
+            )
+            search_id = str(telemetry.get("search_id") or f"search:{self.feedback_items}")
+            feedback_id = stable_id(
+                "feedback", f"search_telemetry:{target_dataset}:{search_id}:{self.feedback_items}"
+            )
+            self.nodes[feedback_id] = {
+                "id": feedback_id,
+                "label": f"Search {search_id[-8:]}",
+                "type": "feedback",
+                "status": "telemetry",
+                "size": 18,
+                "metadata": {
+                    "dataset": target_dataset,
+                    "kind": "search_telemetry",
+                    "search_id": search_id,
+                    "result_count": telemetry.get("result_count"),
+                    "empty": telemetry.get("empty"),
+                    "low_score": telemetry.get("low_score"),
+                    "tool_name": telemetry.get("tool_name"),
+                    "latency_ms": telemetry.get("latency_ms"),
+                },
+            }
+            self._edge(feedback_id, "index:feedback", "updates")
+            self._edge(feedback_id, self._dataset_node(str(target_dataset)), "teaches")
+            self.feedback_items += 1
+            await self._record_event(
+                "feedback",
+                "Search telemetry recorded",
+                {
+                    "dataset": target_dataset,
+                    "qa_id": search_id,
+                    "kind": "search_telemetry",
+                    "improved": False,
+                    "telemetry": telemetry,
+                    "results": telemetry.get("result_count"),
+                },
+            )
+            return feedback_id
 
     async def record_feedback(
         self,
@@ -377,7 +445,12 @@ class MeshState:
                 "type": "feedback",
                 "status": "improved" if result.improved else "recorded",
                 "size": 22,
-                "metadata": {"dataset": dataset, "qa_id": qa_id, "improved": result.improved},
+                "metadata": {
+                    "dataset": dataset,
+                    "qa_id": qa_id,
+                    "kind": "explicit",
+                    "improved": result.improved,
+                },
             }
             self._edge(feedback_id, "index:feedback", "updates")
             self._edge(feedback_id, self._dataset_node(dataset), "teaches")
@@ -385,7 +458,12 @@ class MeshState:
             await self._record_event(
                 "feedback",
                 "Feedback recorded",
-                {"dataset": dataset, "qa_id": qa_id, "improved": result.improved},
+                {
+                    "dataset": dataset,
+                    "qa_id": qa_id,
+                    "kind": "explicit",
+                    "improved": result.improved,
+                },
             )
 
     async def record_upgrade(
@@ -810,6 +888,7 @@ class MeshState:
             "conflicts",
             "reviewed",
             "optimized",
+            "latency_ms",
         }
         metrics: dict[str, int | float] = {}
         for key in metric_keys:

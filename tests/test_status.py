@@ -53,7 +53,20 @@ def test_request_refuses_non_https() -> None:
 
 def test_check_local_setup(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_local_token_123")
-    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"citadel": {"type": "http"}}}))
+    monkeypatch.setenv("CITADEL_CURSOR_MCP_PATH", str(tmp_path / "no-cursor-mcp.json"))
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "citadel": {
+                        "type": "http",
+                        "url": "https://citadel.example/mcp/",
+                        "headers": {"Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"},
+                    }
+                }
+            }
+        )
+    )
     (tmp_path / ".git" / "hooks").mkdir(parents=True)
     (tmp_path / ".git" / "hooks" / "pre-push").write_text("#!/bin/sh\n")
     # Session hook lives in user-scope ~/.claude/settings.json (#38), isolated via
@@ -71,9 +84,71 @@ def test_check_local_setup(tmp_path: Path, monkeypatch) -> None:
     checks = {c.name: c for c in check_local_setup(tmp_path, cfg)}
     assert checks["token"].ok
     assert checks["mcp"].ok
+    assert checks["mcp"].data["state"] == status_mod.MCP_STATE_READY
     assert checks["pre_push_hook"].ok
     assert checks["session_hook"].ok
     assert checks["capture_roots"].data["count"] == 1
+
+
+def test_assess_mcp_setup_states(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("CITADEL_CURSOR_MCP_PATH", str(tmp_path / "no-cursor-mcp.json"))
+    missing = status_mod.assess_mcp_setup(tmp_path)
+    assert missing.data["state"] == status_mod.MCP_STATE_MISSING
+    assert missing.data["next"] == status_mod.MCP_REMEDIATION
+    assert missing.data["fallback"] == status_mod.MCP_AGENT_FALLBACK
+    assert "vault-backed" in status_mod.MCP_AGENT_FALLBACK
+    assert "citadel search" in status_mod.MCP_AGENT_FALLBACK
+
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "citadel": {
+                        "type": "http",
+                        "url": "https://citadel.example/mcp/",
+                    }
+                }
+            }
+        )
+    )
+    needs_auth = status_mod.assess_mcp_setup(tmp_path)
+    assert needs_auth.data["state"] == status_mod.MCP_STATE_NEEDS_AUTH
+    assert not needs_auth.ok
+    assert "CITADEL_MCP_ACCESS_TOKEN" in (needs_auth.data.get("next") or "")
+    assert needs_auth.data["next"] != status_mod.MCP_REMEDIATION
+    assert needs_auth.data["fallback"] == status_mod.MCP_AGENT_FALLBACK
+    assert "CLI search" in needs_auth.detail
+
+    # Legacy stdio without a token must be readyButUnconfigured (not needsAuth) —
+    # a token alone will not expose hosted tools.
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"citadel": {"command": "python", "args": ["-m", "kb.mcp_server"]}}})
+    )
+    unconfigured_no_token = status_mod.assess_mcp_setup(tmp_path)
+    assert unconfigured_no_token.data["state"] == status_mod.MCP_STATE_READY_BUT_UNCONFIGURED
+    assert "not hosted HTTP" in unconfigured_no_token.detail
+
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_x")
+    unconfigured = status_mod.assess_mcp_setup(tmp_path)
+    assert unconfigured.data["state"] == status_mod.MCP_STATE_READY_BUT_UNCONFIGURED
+    assert not unconfigured.ok
+
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "citadel": {"type": "http", "url": "https://citadel.example/mcp/"}
+                }
+            }
+        )
+    )
+    ready = status_mod.assess_mcp_setup(tmp_path)
+    assert ready.ok
+    assert ready.data["state"] == status_mod.MCP_STATE_READY
+    assert ready.data["next"] is None
+    assert "fallback" not in ready.data
 
 
 def test_check_local_setup_all_missing(tmp_path: Path, monkeypatch) -> None:
@@ -157,6 +232,57 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
     names = {c.name: c.ok for c in report.checks}
     assert names["node"] and names["auth"] and names["search"]
     assert report.recent[0]["title"] == "feat: x"
+    readiness = report.readiness()
+    assert readiness["authenticated"] is True
+    assert readiness["search"] is True
+    assert readiness["search_probed"] is True
+    assert readiness["reason"] == "ok"
+    assert "code" not in readiness
+    assert report.to_dict()["readiness"]["search"] is True
+
+
+def test_readiness_auth_required_and_search_codes(tmp_path: Path) -> None:
+    report = StatusReport(
+        node_url="https://node.example",
+        healthy=False,
+        identity={},
+        checks=[
+            Check("auth", ok=False, detail="no token", data={"code": status_mod.CODE_AUTH_REQUIRED}),
+            Check("search", ok=False, detail="skipped", data={"code": status_mod.CODE_AUTH_REQUIRED}),
+        ],
+        recent=[],
+        repo=str(tmp_path),
+    )
+    r = report.readiness()
+    assert r["authenticated"] is False
+    assert r["search"] is False
+    assert r["code"] == status_mod.CODE_AUTH_REQUIRED
+
+    timeout_report = StatusReport(
+        node_url="https://node.example",
+        healthy=True,
+        identity={"seat_slug": "a"},
+        checks=[
+            Check("auth", ok=True, detail="valid"),
+            Check(
+                "search",
+                ok=False,
+                detail="timed out",
+                data={"timed_out": True, "code": status_mod.CODE_TIMEOUT},
+            ),
+        ],
+        recent=[],
+    )
+    tr = timeout_report.readiness()
+    assert tr["authenticated"] is True
+    assert tr["search"] is False
+    assert tr["code"] == status_mod.CODE_TIMEOUT
+
+
+def test_auth_no_token_sets_code() -> None:
+    auth = status_mod.check_auth("https://node.example", None)
+    assert auth.ok is False
+    assert auth.data.get("code") == status_mod.CODE_AUTH_REQUIRED
 
 
 def test_check_local_setup_corrupt_config_does_not_raise(tmp_path: Path) -> None:
@@ -173,6 +299,7 @@ def test_check_search_empty_list_is_zero(monkeypatch) -> None:
     # #27: a zero-result smoke search is RED (read path up but data plane empty),
     # not always-green.
     assert check.ok is False and check.data["count"] == 0
+    assert check.data.get("code") == status_mod.CODE_SEARCH_UNAVAILABLE
     assert "0 result(s)" in check.detail
 
 
@@ -310,6 +437,35 @@ def test_search_node_returns_full_payload(monkeypatch) -> None:
     assert out["results"][0]["id"] == "1"
 
 
+def test_search_node_forwards_filter_fields(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode())
+        return _FakeResp({"results": [], "sections": {}})
+
+    monkeypatch.setattr(status_mod._OPENER, "open", fake_open)
+    status_mod.search_node(
+        "https://node.example",
+        "ctdl_tok",
+        "schema",
+        8,
+        types=["spec", "skill"],
+        repo="masumi-network/agent",
+        path="docs/MIP",
+        canonical_only=True,
+    )
+    assert captured["body"] == {
+        "query": "schema",
+        "top_k": 8,
+        "types": ["spec", "skill"],
+        "repo": "masumi-network/agent",
+        "path": "docs/MIP",
+        "canonical_only": True,
+    }
+
+
 def test_humanize_net_error_translates_dns_noise() -> None:
     # Raw urllib reasons read like C errno dumps — humans get words.
     exc = OSError("<urlopen error [Errno 8] nodename nor servname provided, or not known>")
@@ -388,12 +544,18 @@ def test_fetch_events_builds_scoped_url_and_parses(monkeypatch) -> None:
     assert data["latest_event_id"] == 7
 
 
-def test_fetch_events_swallows_errors(monkeypatch) -> None:
+def test_fetch_events_marks_network_failure(monkeypatch) -> None:
+    # A network failure must be distinguishable from an empty feed (#101), so the
+    # renderer can say "couldn't reach the Node" instead of "No recent activity".
     def boom(request: Any, timeout: float | None = None) -> _FakeResp:
         raise RuntimeError("network down")
 
     monkeypatch.setattr(status_mod._OPENER, "open", boom)
-    assert status_mod.fetch_events("https://node.example", "ctdl_tok") == {}
+    result = status_mod.fetch_events("https://node.example", "ctdl_tok")
+    assert result.get("error")
+    assert "events" not in result
+    # A missing token is a genuinely-empty state, NOT a failure.
+    assert status_mod.fetch_events("https://node.example", None) == {}
 
 
 def test_render_event_line() -> None:
@@ -440,6 +602,48 @@ def test_fetch_presence_extracts_only_seat_hubs_no_content(monkeypatch) -> None:
 
 def test_fetch_presence_empty_without_token() -> None:
     assert status_mod.fetch_presence("https://node.example", None) == {}
+
+
+def test_fetch_presence_marks_network_failure(monkeypatch) -> None:
+    # "No seats visible." must not be printed for a timed-out node (#101).
+    def boom(request: Any, timeout: float | None = None) -> _FakeResp:
+        raise RuntimeError("timed out")
+
+    monkeypatch.setattr(status_mod._OPENER, "open", boom)
+    board = status_mod.fetch_presence("https://node.example", "ctdl_tok")
+    assert board.get("error")
+    assert "seats" not in board
+
+
+def test_seat_hint_suppressed_when_auth_failed() -> None:
+    # A timed-out /api/session leaves no seat_slug; the seatless hint used to fire
+    # and tell a working token to go ask an admin for a seat (#101).
+    from kb.status import Check, StatusReport, render_text
+
+    failed = StatusReport(
+        node_url="https://node.example",
+        healthy=False,
+        identity={"code": "AUTH_REQUIRED"},
+        checks=[
+            Check("node", ok=False, detail="unreachable (timed out)"),
+            Check("auth", ok=False, detail="unreachable (timed out)", data={"code": "AUTH_REQUIRED"}),
+        ],
+        recent=[],
+    )
+    assert "has no seat" not in render_text(failed, color=False)
+
+    # A genuinely seatless but VALID token still gets the warning.
+    seatless = StatusReport(
+        node_url="https://node.example",
+        healthy=True,
+        identity={"seat_slug": None, "role": "writer"},
+        checks=[
+            Check("node", ok=True, detail="healthy"),
+            Check("auth", ok=True, detail="valid", data={"role": "writer"}),
+        ],
+        recent=[],
+    )
+    assert "has no seat" in render_text(seatless, color=False)
 
 
 def test_render_presence_board_sorts_by_count() -> None:

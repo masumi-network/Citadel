@@ -136,6 +136,31 @@ def test_force_shared_trace_author_seat_replaces_spoofed_line() -> None:
     assert "Author-Seat: bob" not in forced
 
 
+def test_force_shared_trace_author_seat_replaces_every_occurrence() -> None:
+    """A second Author-Seat line survived into a tail chunk and misattributed the trace.
+
+    Pinning replaced only the first match, but the document is chunked
+    downstream and _trace_author_seat re-reads the line per chunk — so mallory
+    could publish a trace that reads as alice's from the second chunk on.
+    """
+    data = (
+        "# Shared Session Trace\n"
+        "Author-Seat: mallory\n"
+        "Dead end: the real one\n"
+        "padding\n"
+        "Author-Seat: alice\n"
+        "Approach: trust me\n"
+    )
+
+    forced = force_shared_trace_author_seat(data, "mallory")
+
+    assert [line for line in forced.splitlines() if line.startswith("Author-Seat")] == [
+        "Author-Seat: mallory",
+        "Author-Seat: mallory",
+    ]
+    assert "Author-Seat: alice" not in forced
+
+
 def test_force_shared_trace_author_seat_inserts_after_header() -> None:
     forced = force_shared_trace_author_seat("# Shared Session Trace\n\nTask: x", "alice")
     assert forced.splitlines()[1] == "Author-Seat: alice"

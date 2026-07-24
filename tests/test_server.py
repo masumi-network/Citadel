@@ -406,7 +406,8 @@ def test_api_uses_configured_citadel_service() -> None:
     assert feedback.status_code == 200
     assert feedback.json() == {"recorded": True, "improved": True, "ok": True, "reason": None}
     assert updated_mesh.status_code == 200
-    assert updated_mesh.json()["stats"]["feedback"] == 1
+    # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
+    assert updated_mesh.json()["stats"]["feedback"] >= 2
     assert upgrade.status_code == 200
 
 
@@ -480,8 +481,10 @@ def test_knowledge_events_api_returns_resumable_timeline() -> None:
     assert timeline_body["ok"] is True
     assert timeline_body["latest_event_id"] == timeline_body["stats"]["latest_event_id"]
     assert timeline_body["stats"]["indexed_chunks"] == 1
-    assert timeline_body["events"][0]["type"] == "search"
-    assert timeline_body["events"][0]["timeline"] == {
+    # Implicit search telemetry also lands on the timeline, so locate the search
+    # event by type rather than assuming it is the newest one.
+    search_event = next(e for e in timeline_body["events"] if e["type"] == "search")
+    assert search_event["timeline"] == {
         "kind": "retrieval_served",
         "status": "searched",
         "dataset": "notes",
@@ -489,7 +492,11 @@ def test_knowledge_events_api_returns_resumable_timeline() -> None:
         "metrics": {"results": 1},
     }
     assert resumed.status_code == 200
-    assert [event["id"] for event in resumed.json()["events"]] == [2]
+    # Resuming from id 1 yields the next event, newest first — assert the cursor
+    # advances rather than pinning how many events one search now produces.
+    resumed_ids = [event["id"] for event in resumed.json()["events"]]
+    assert len(resumed_ids) == 1
+    assert resumed_ids[0] > 1
     assert chunked.status_code == 200
     assert [event["id"] for event in chunked.json()["events"]] == [1]
     assert typed.status_code == 200
@@ -1786,6 +1793,7 @@ def test_search_degrades_to_empty_on_timeout_budget() -> None:
     body = r.json()
     assert body["results"] == []
     assert body.get("timed_out") is True
+    assert body.get("truncated") is True
     assert "budget" in body["note"]
 
 
@@ -4325,6 +4333,8 @@ def test_share_session_trace_visible_to_other_seat(tmp_path: Any) -> None:
     trace_hits = payload["sections"]["session_traces"]
     assert trace_hits
     assert trace_hits[0]["_citadel"]["trust"] == "reference-only"
+    assert trace_hits[0]["_citadel"]["doc_type"] == "session-trace"
+    assert trace_hits[0]["_citadel"]["trust_tier"] == "reference-only"
     assert trace_hits[0]["_citadel"]["author_seat"] == "alice"
     assert payload["sections"]["node"] == []
     assert "seat:alice" not in {hit.get("dataset") for hit in payload["results"]}
@@ -4589,3 +4599,5 @@ def test_search_marks_session_trace_hits_reference_only(tmp_path: Any) -> None:
     ]
     assert trace_hits
     assert trace_hits[0]["_citadel"]["trust"] == "reference-only"
+    assert trace_hits[0]["_citadel"]["doc_type"] == "session-trace"
+    assert trace_hits[0]["_citadel"]["trust_tier"] == "reference-only"

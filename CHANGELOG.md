@@ -8,6 +8,17 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Added
 
+- **Agent-facing search shaping + feedback.** Search hits carry a stable schema
+  (`doc_type`, `content_hint`, `trust_tier`, `rank`, provenance) with
+  spec/docs/asset-ID ranking and `canonical_only` / `exclude_ambient` /
+  `types` / `repo` / `path` filters, shared by the CLI (`citadel search
+  --json`) and the MCP `citadel_search` tool. Every search records non-blocking
+  telemetry to the caller's **own seat Node** (a seat-less caller writes a
+  presence-only row); `citadel_record_feedback` / `citadel feedback` add an
+  explicit 1/-1 signal. New `citadel verify` / `citadel prepare-pr-context`
+  helpers return `doc_shaped_sources` (hits that read like documentation — a
+  starting point to verify, never an authority). See
+  [ADR-0012](docs/adr/0012-attested-trust-vs-content-hint.md).
 - **Public `/info` "State of the Vault" page + `GET /api/state`.** A node-served
   report at `/info` (`kb/static/info.html` + `info.css` + `info.js`): current
   metrics, shipped releases (v0.2 → v0.4), an architecture diagram, a
@@ -28,6 +39,61 @@ All notable changes to `citadel-archive` are documented here. Format follows
   sentence case), a neutral ramp + a single Iris-magenta `#FF51FF` accent, flat
   elevation, and the signature segmented-line section headers. The layout widens
   on large screens while running text stays at a comfortable measure.
+
+### Fixed
+
+- **Hosted MCP `tools/list` hung ~91s → "connected · tools fetch failed"
+  (#100).** Two layers. (1) The streamable-HTTP transport answered over an SSE
+  stream that the Railway proxy buffered — now `json_response=True` returns an
+  immediate `application/json` body (our tools stream nothing). (2) The real
+  ~91s: the tools/list role filter ran a *synchronous* `GET /api/session`
+  self-call on the event loop, which must be served by the same loop it blocks,
+  so it timed out (30s) and retried 3× ≈ 90s. It now resolves the caller's role
+  **in-process** (`access_key_identity`, ~0.2s) with a bounded off-loop fallback,
+  so the handler never blocks on the self-deadlock.
+- **`citadel status` / `activity --global` rendered swallowed timeouts as facts
+  (#101).** A slow Node made the CLI print "No seats visible." (with 12 seats)
+  and "This token has no seat" for a working token. `fetch_presence` /
+  `fetch_events` / `fetch_mesh` now return an error marker on network failure
+  (distinct from a genuinely-empty result), the seatless hint is gated on the
+  auth check succeeding, and renderers say "Couldn't reach the Node".
+- **`citadel search` aborted just before results and `--check-search` never
+  passed (#102).** The client search budget (20s) equalled the server's own
+  soft-timeout budget, so the client killed a normal 13–20s search at the exact
+  moment the server would have returned; the 3s smoke budget sat below real
+  latency. Client budgets raised to 35s / 15s so the client prefers the server's
+  recoverable timeout envelope.
+- **`--json` emitted nothing on failure (#102).** Network/HTTP errors in
+  `citadel search` / `ingest` printed only to stderr; scripted callers now get
+  `{ok:false, error, code}` on stdout on every failure path.
+- **`--dataset` / `--session` silently ignored without `--local` (#103).** They
+  were accepted then dropped on the HTTP path, so a scoped search quietly
+  returned everything. They now error with exit 2 unless `--local` is set.
+- **`citadel_record_feedback` rejected the documented call.** `qa_id` had no
+  default, so it was schema-required and the documented `result_id`-only call
+  failed validation before reaching the server (which accepts `result_id`
+  alone).
+
+### Security
+
+- **`trust_tier` is now attested-only; body-derived shape moved to
+  `content_hint` (ADR-0012).** It was computed by grepping a hit's own body, so
+  any ingested text could mint its own authority — a public-repo GitHub issue
+  title reached the org digest and flipped it to `canonical`, and
+  `canonical_only` (which agents are told to trust) kept it. `trust_tier` now
+  reports only what the server attests (`reference-only` / `unattested`);
+  `content_hint` (`looks-like-spec`, …) carries the steerable shape and makes no
+  authority claim; `canonical_only` filters on shape, not trust.
+- **Cross-seat search-telemetry leak closed and guarded.** Telemetry rows were
+  tagged with `primary_dataset`, so a seat passing an explicit `dataset` exposed
+  its query text, `seat_slug`, and `actor_id` to every other seat (ADR-0009
+  violation). Rows now land on the caller's own seat; a regression test proves
+  it by reverting the fix.
+- **Session-trace attribution hardened.** Dedup no longer strips `reference-only`
+  from a volunteered trace (a dead end was coming back to its author as
+  `verified` knowledge); `Author-Seat` pinning rewrites every line (a tail chunk
+  could attribute a trace to a colleague); and the dataset name no longer
+  satisfies `repo=` / `path=` scoping (Central is named after the org).
 
 ## [0.4.0] — 2026-07-22
 

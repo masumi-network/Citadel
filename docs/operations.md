@@ -54,6 +54,27 @@ Enable pgvector before production ingest:
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
+### Redeploy after a code change
+
+From a machine with Railway CLI linked to the **Citadel Archive** project
+(service that serves `https://citadel-archive-production.up.railway.app`):
+
+```bash
+# Confirm link
+railway status
+railway service   # pick the web/Citadel-Archive service if prompted
+
+# Deploy current git HEAD (commit first — Railway builds from git / linked root)
+git status        # ensure intended commits are pushed if deploy tracks remote
+railway up --service Citadel-Archive
+# or, if the project auto-deploys from GitHub main:
+git push origin main
+```
+
+Do not paste seat tokens or DB URLs into chat. Env vars stay in Railway
+(`railway variables --service Citadel-Archive`). After deploy, restart Cursor so
+MCP re-fetches `tools/list` from the new Node.
+
 ### Promotion Agent (ADR-0007 P5/P6)
 
 After the promotion code is deployed, enable the governed Node→Central path on the
@@ -240,8 +261,19 @@ Exposed tools include `citadel_discovery`, `citadel_session`, `citadel_search`,
 `citadel_backup_mirror_status`, `citadel_run_backup_mirror`, `citadel_audit_events`,
 and `citadel_improve`. `citadel_search` hits carry an additive `_citadel`
 provenance envelope (`rank`, `dataset`, `result_id`, `content_sha256`,
-`provenance`, `retrieval`); `citadel_get_document` takes the `id` from a hit when
-`_citadel.retrieval.document_drilldown_available` is true.
+`provenance`, `retrieval`, `doc_type`, `content_hint`, `trust_tier`);
+`citadel_get_document` takes the `id` from a hit when
+`_citadel.retrieval.document_drilldown_available` is true. `content_hint`
+describes what the hit's text looks like and is body-derived, so it is a
+relevance signal only; `trust_tier` reports attested provenance
+(`reference-only` or `unattested`) and is never derived from content — see
+[ADR-0012](adr/0012-attested-trust-vs-content-hint.md). Every search also
+records **implicit search telemetry** into the mesh feedback index (query,
+filters, top hit ids/doc_types/trust_tiers/scores, latency, empty/low-score
+flags, MCP tool name when present) — non-blocking and approval-free. Telemetry
+rows land on the caller's own seat Node; a caller without a seat writes a
+presence-only row. Writers may still call `citadel_record_feedback` after
+reading hits for explicit scores (pass `qa_id` **or** `result_id`).
 
 ## GitHub organization sync
 

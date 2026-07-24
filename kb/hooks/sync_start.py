@@ -42,11 +42,29 @@ RECENT_LIMIT = 8
 # Static agent policy — no cross-seat content; always injected (digest is optional).
 AGENT_POLICY_REMINDER = (
     "# Citadel — agent policy\n"
-    "- At task start: run `citadel_search` before coding (Central + your Node + Shared Session Traces).\n"
-    "- If no `citadel_*` MCP tools are available: use the CLI fallback "
-    "(`citadel search`, `citadel status`, `citadel doctor`).\n"
+    "- At task start: prefer MCP `citadel_search` when present and working "
+    "(Central + your Node + Shared Session Traces).\n"
+    "- Fallback: MCP `citadel_*` → CLI (`citadel status`, then `citadel search` / "
+    "`citadel doctor`) → else official/canonical docs (live OpenAPI, MIP, DevHub); "
+    "say when the vault was unavailable.\n"
+    "- Never claim vault-backed / Citadel authority without a successful search hit "
+    "(MCP or CLI) in this session.\n"
+    "- Never claim “Citadel confirms X” without a retrieved note title + snippet from that hit.\n"
+    "- Never use Citadel as sole authority for Mainnet asset IDs / payment token units "
+    "(USDCx, USDM, tUSDM, policy+asset hex) — prefer official Masumi docs / `skills/masumi` "
+    "(or masumi skill refs). For token/asset-ID queries: official docs / skill first, "
+    "or immediately after an empty vault.\n"
+    "- If the vault has no durable token/asset note, say so honestly (“no authoritative hit”) "
+    "rather than inventing IDs or citations.\n"
+    "- If the user asks to use Citadel / the vault, search is in-scope "
+    "(allowlist: vault read via MCP or `citadel search`).\n"
     "- Trace hits carry `_citadel.trust: reference-only` — verify before acting; Central stays org-authoritative.\n"
-    "- Share dead-end routes with `citadel_share_session` only after explicit user approval."
+    "- `content_hint` describes what a hit's text looks like (relevance, not authority);\n"
+    "  `trust_tier` reports attested provenance only (`reference-only` or `unattested`).\n"
+    "  Verify API/spec claims against live MIP/OpenAPI regardless of either field.\n"
+    "- Share dead-end routes with `citadel_share_session` only after explicit user approval.\n"
+    "- Search telemetry is automatic (non-blocking) on every `citadel_search`; optionally rate hits "
+    "with `citadel_record_feedback` (writer) using hit `id` / `search_id` and score 1|-1."
 )
 
 

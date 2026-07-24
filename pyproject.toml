@@ -75,3 +75,7 @@ line-length = 100
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "canary: agent-feedback acceptance canary (unit mocks)",
+    "live: optional live Node probe (needs CITADEL_CANARY_LIVE=1 + token)",
+]

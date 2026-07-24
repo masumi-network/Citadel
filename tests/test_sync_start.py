@@ -14,8 +14,23 @@ def test_no_token_still_injects_agent_policy(monkeypatch, capsys) -> None:
     out = capsys.readouterr().out
     assert "Citadel vault — recent activity" not in out  # digest gated on token
     assert out.strip() == sync_start.AGENT_POLICY_REMINDER.strip()
-    assert "CLI fallback" in out
+    assert "CLI" in out
+    assert "vault-backed" in out
+    assert "official/canonical" in out
+    assert "Citadel confirms" in out
+    assert "USDCx" in out
+    assert "skills/masumi" in out
+    assert "no authoritative hit" in out
 
+
+def test_agent_policy_token_authority_lines() -> None:
+    text = sync_start.AGENT_POLICY_REMINDER
+    assert "Never claim “Citadel confirms X”" in text or 'Never claim "Citadel confirms X"' in text
+    assert "Never use Citadel as sole authority for Mainnet asset IDs" in text
+    assert "USDCx" in text and "USDM" in text
+    assert "skills/masumi" in text
+    assert "no authoritative hit" in text
+    assert "official docs / skill first" in text
 
 def test_empty_recent_still_injects_agent_policy(monkeypatch, capsys) -> None:
     monkeypatch.setenv(sync_start.TOKEN_ENV, "ctdl_x")
@@ -25,7 +40,8 @@ def test_empty_recent_still_injects_agent_policy(monkeypatch, capsys) -> None:
     out = capsys.readouterr().out
     assert "Citadel vault — recent activity" not in out
     assert "citadel_search" in out
-    assert "CLI fallback" in out
+    assert "CLI" in out
+    assert "vault-backed" in out
     assert "reference-only" in out
     assert "citadel_share_session" in out
 
