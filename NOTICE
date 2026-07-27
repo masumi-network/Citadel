@@ -1,0 +1,30 @@
+Citadel Archive
+Copyright 2026 Masumi Network
+
+This product includes software developed at Masumi Network
+(https://github.com/masumi-network).
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License in the LICENSE file distributed with this work, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------------
+
+Citadel builds a governance, access-control and retrieval layer on top of
+Cognee, which it uses as a knowledge index engine. Cognee source code is NOT
+vendored in this repository; it is installed as a normal package dependency
+via the optional `server` extra.
+
+    Cognee
+    Developed by Topoteretes UG
+    Licensed under the Apache License, Version 2.0
+    https://github.com/topoteretes/cognee
+
+Other dependencies are declared in `pyproject.toml` and are distributed under
+their own licenses by their respective authors. Installing Citadel's `server`
+extra pulls those packages from PyPI; this repository redistributes none of
+their source.
