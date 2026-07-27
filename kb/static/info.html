@@ -40,7 +40,8 @@
         <a href="#live">03 · What's live</a>
         <a href="#releases">04 · Releases</a>
         <a href="#next">05 · What's next</a>
-        <a href="#start">06 · Get started</a>
+        <a href="#opensource">06 · Open source</a>
+        <a href="#start">07 · Get started</a>
       </nav>
     </header>
 
@@ -221,8 +222,20 @@
       </div>
     </section>
 
+    <section id="opensource">
+      <div class="sechead"><span class="kicker">06 — Open source</span><h2>Citadel is open to contributions</h2></div>
+      <p class="lede">The application is <b>Apache-2.0</b> and public. The vault it serves is not — and that separation is the point. You can read every line, run the full test suite offline, and send a pull request without ever touching org memory.</p>
+      <div class="pillars">
+        <div class="card"><h3><span class="dot"></span>Apache-2.0</h3><p>Licensed under Apache-2.0, including the patent grant. Contributions come in under the same terms via <b>DCO sign-off</b> (<code>git commit -s</code>) — there is no CLA to sign.</p><span class="tag">inbound = outbound · no CLA</span></div>
+        <div class="card"><h3><span class="dot"></span>Public app, private vault</h3><p>Contributors work on the application only. No <code>ctdl_</code> token is issued and none is needed: the suite runs with no token, no network and no database, so every change is reviewable without vault access.</p><span class="tag">shielded by design</span></div>
+        <div class="card"><h3><span class="dot"></span>Checked on every PR</h3><p>Tests on Python 3.11 and 3.12, ruff, a dependency audit, CodeQL, licence review, DCO, and a gitleaks secret scan carrying a rule for <code>ctdl_</code> tokens. One <code>CI gate</code> check guards <code>main</code>.</p><span class="tag">automated · fail-closed</span></div>
+        <div class="card"><h3><span class="dot"></span>Tracked in the open</h3><p>Work is labelled by <code>type</code>, <code>area</code>, <code>priority</code> and <code>status</code>. New issues land in <code>status/needs-triage</code>; newcomers start at <code>good first issue</code>. Vulnerabilities go to a private advisory, never a public issue.</p><span class="tag">triaged · never silent</span></div>
+      </div>
+      <p class="verified"><span class="vdot"></span>Start with <a href="https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — setup, the label taxonomy, commit conventions, and exactly what you can and cannot run locally.</p>
+    </section>
+
     <section id="start">
-      <div class="sechead"><span class="kicker">06 — Join in</span><h2>Get started in one command</h2></div>
+      <div class="sechead"><span class="kicker">07 — Join in</span><h2>Get started in one command</h2></div>
       <p class="lede">Onboarding wires your seat token, autosync hooks, MCP, and agent policy in a single pass. Ask an admin for a <b>seat-bound</b> token first — a seat-less one authenticates but can't search.</p>
       <div class="cmd"><span class="p">$ </span>pip install citadel-archive &amp;&amp; citadel onboard</div>
       <footer>
