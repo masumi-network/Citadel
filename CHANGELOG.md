@@ -8,6 +8,55 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Added
 
+- **Open-source governance.** The repository is now set up to take outside
+  contributions. `LICENSE` (Apache-2.0, Copyright 2026 Masumi Network) and
+  `NOTICE` were added — previously the project declared Apache-2.0 in
+  `pyproject.toml` and shipped to PyPI with no licence text at all, which
+  Apache-2.0 section 4(a) requires. Both files now travel in the sdist and
+  wheel. Added `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant
+  2.1), issue forms, a pull-request template, and `CODEOWNERS` over the paths
+  that reach CI, secrets or production. Contributions are accepted under
+  Apache-2.0 section 5 via **DCO sign-off** (`git commit -s`); there is no CLA.
+- **CI and security workflows.** `test.yml` gained a real 3.11/3.12 matrix (the
+  repo's `.python-version` pin would otherwise have silently collapsed every
+  leg to 3.12) and a single stable `CI gate` aggregate check. New workflows:
+  DCO verification, CodeQL, dependency review (which also blocks
+  strong-copyleft licences incompatible with Apache-2.0 redistribution),
+  gitleaks secret scanning with a Citadel-specific `ctdl_` token rule,
+  pull-request hygiene, path-based labelling, stale triage, newcomer welcome,
+  and a label-driven `agent:explore` investigation workflow. Dependabot now
+  tracks Actions and pip.
+- **Live `/info` page** gained an "Open source" section covering the licence,
+  the public-app / private-vault separation, what runs on every pull request,
+  and how work is tracked.
+
+### Fixed
+
+- **`requires-python` declared Python 3.10 support that never existed.** Seven
+  `kb/` modules import `datetime.UTC` (added in 3.11) and the test suite
+  imports `tomllib` (3.11 stdlib). Verified against a real 3.10 interpreter:
+  `kb.cli` imports, but `kb.mesh`, `kb.backup_mirror`, `kb.conflicts`,
+  `kb.repository_update`, `kb.github_sync`, `kb.linear_sync` and
+  `kb.obsidian_sync` all raise `ImportError`, and `kb/cli.py` reaches
+  `github_sync` from a live command path. A 3.10 user could install
+  successfully and then fail at runtime. **Breaking for 3.10 users**, who now
+  get a clear refusal from pip instead of a broken install. `install.sh` gated
+  on the same wrong version and was updated to match.
+
+### Security
+
+- Enabled private vulnerability reporting, secret scanning with push
+  protection, and Dependabot alerts and security updates. Default
+  `GITHUB_TOKEN` permissions dropped to read-only; workflows declare their own.
+  A `main` ruleset now requires a pull request, one approving review, code
+  owner review, and passing `CI gate` and `DCO sign-off` checks, and blocks
+  force-pushes and branch deletion.
+- `.gitignore` now blocks database files, dumps and vault exports, plus
+  `.cursor/` and `.windsurf/` agent configs — Cursor writes MCP server configs
+  containing live bearer tokens to `.cursor/mcp.json`, and gitleaks cannot
+  inspect binary formats, so path rules are the only control for that class.
+  Nothing sensitive was tracked; this is preventive.
+
 - **Agent-facing search shaping + feedback.** Search hits carry a stable schema
   (`doc_type`, `content_hint`, `trust_tier`, `rank`, provenance) with
   spec/docs/asset-ID ranking and `canonical_only` / `exclude_ambient` /
