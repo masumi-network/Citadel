@@ -1,7 +1,7 @@
 #!/bin/sh
 # Citadel bootstrap installer.
 #
-# Ensures Python 3.10+ and pipx are present — offering to install Python if it
+# Ensures Python 3.11+ and pipx are present — offering to install Python if it
 # isn't — then installs the `citadel` CLI from PyPI. Runs without Python (it is
 # the thing that puts Python there), so it's the entry point for a fresh machine.
 #
@@ -46,7 +46,7 @@ ask() {
 PYTHON=""
 detect_python() {
   for py in python3 python; do
-    if have "$py" && "$py" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
+    if have "$py" && "$py" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null; then
       PYTHON="$py"
       return 0
     fi
@@ -59,21 +59,21 @@ install_python() {
   case "$os" in
     Darwin)
       if have brew; then run "brew install python@3.12"
-      else warn "Homebrew not found. Install it from https://brew.sh (or Python 3.10+ from https://python.org), then re-run."; return 1; fi ;;
+      else warn "Homebrew not found. Install it from https://brew.sh (or Python 3.11+ from https://python.org), then re-run."; return 1; fi ;;
     Linux)
       if have apt-get; then run "sudo apt-get update" && run "sudo apt-get install -y python3 python3-pip python3-venv"
       elif have dnf; then run "sudo dnf install -y python3 python3-pip"
       elif have pacman; then run "sudo pacman -S --noconfirm python python-pip"
-      else warn "No supported package manager (apt/dnf/pacman). Install Python 3.10+ manually."; return 1; fi ;;
+      else warn "No supported package manager (apt/dnf/pacman). Install Python 3.11+ manually."; return 1; fi ;;
     *)
-      warn "Unsupported OS '$os'. Install Python 3.10+ from https://python.org, then re-run."; return 1 ;;
+      warn "Unsupported OS '$os'. Install Python 3.11+ from https://python.org, then re-run."; return 1 ;;
   esac
 }
 
 say "Citadel installer"
 
 if ! detect_python; then
-  say "Python 3.10+ is required but was not found on this system."
+  say "Python 3.11+ is required but was not found on this system."
   if ask "Install Python now?"; then
     install_python || { warn "Could not install Python automatically — see the message above."; exit 1; }
     if [ "$DRY_RUN" != 1 ] && ! detect_python; then
@@ -81,7 +81,7 @@ if ! detect_python; then
       exit 1
     fi
   else
-    say "Okay — install Python 3.10+ yourself, then re-run this installer."
+    say "Okay — install Python 3.11+ yourself, then re-run this installer."
     exit 1
   fi
 fi

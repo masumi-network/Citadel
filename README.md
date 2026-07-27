@@ -8,7 +8,7 @@
 
 [![State of the Vault](https://img.shields.io/badge/live-state%20of%20the%20vault-FF51FF?style=flat&labelColor=0a0a0a)](https://citadel-archive-production.up.railway.app/info)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Client](https://img.shields.io/badge/cli-zero--dependency-green)
 ![MCP](https://img.shields.io/badge/MCP-hosted-7c3aed)
 
@@ -89,7 +89,7 @@ citadel doctor                        # diagnose setup; --fix repairs hooks + .m
 citadel activity                      # what your Node is doing — captures, syncs, promotions
 ```
 
-> **No Python yet?** The bootstrap installer checks for Python 3.10+, **asks before installing it** if missing, then sets up pipx + the CLI:
+> **No Python yet?** The bootstrap installer checks for Python 3.11+, **asks before installing it** if missing, then sets up pipx + the CLI:
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel-Archive/main/install.sh | sh
 > ```

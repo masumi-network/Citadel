@@ -64,7 +64,7 @@ These two commands are what CI runs against your code, on both 3.11 and 3.12. If
 
 **The real floor is Python 3.11.** Several `kb/` modules import `datetime.UTC` (3.11+) and `tests/test_railway_entrypoint.py` imports `tomllib` (3.11 stdlib). CI runs the suite on **3.11 and 3.12**; the repo pins `.python-version` to 3.12 for local work.
 
-`pyproject.toml` currently declares `requires-python = ">=3.10"`. That is a known bug and is tracked as an issue — do not treat it as permission to write 3.10-compatible code, and do not "fix" it in an unrelated PR.
+`pyproject.toml` declares `requires-python = ">=3.11"`, which matches what the code actually needs. You can rely on 3.11 language and stdlib features.
 
 ### Formatting
 

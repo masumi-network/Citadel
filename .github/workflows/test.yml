@@ -36,11 +36,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 is the REAL floor: seven kb/ modules do `from datetime import UTC`,
+        # 3.11 is the floor: seven kb/ modules do `from datetime import UTC`,
         # which landed in 3.11, and tests/test_railway_entrypoint.py imports
-        # `tomllib` (3.11 stdlib). pyproject.toml still declares
-        # requires-python = ">=3.10"; that mismatch is tracked as a bug issue.
-        # Add "3.10" back to this list only once that issue is resolved.
+        # `tomllib` (3.11 stdlib). This matches requires-python in pyproject.toml
+        # and the gate in install.sh — keep all three in step.
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
