@@ -36,7 +36,7 @@ Boundary detail: `https://citadel-archive-production.up.railway.app/skills/bound
 
 - Connect (this skill): `https://citadel-archive-production.up.railway.app/skills/connect`
 - After MCP works: `https://citadel-archive-production.up.railway.app/skills/vault`
-- Full repo skill install: `npx skills add masumi-network/citadel-archive --skill citadel-archive`
+- Full repo skill install: `npx skills add masumi-network/citadel --skill citadel`
 
 If the user shares the `npx skills add` command, install the `citadel-archive`
 skill first (optionally `--skill '*'` for all bundled skills), then continue

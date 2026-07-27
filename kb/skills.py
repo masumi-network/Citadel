@@ -11,8 +11,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Short public paths → bundled agent skills (no auth required).
 # These live in the top-level ``skills/`` directory so they are discoverable both
 # by the hosted ``/skills`` endpoint and by skills.sh
-# (``npx skills add masumi-network/citadel-archive --skill …``).
-# The primary skill is ``skills/citadel-archive/SKILL.md`` (not a repo-root file —
+# (``npx skills add masumi-network/citadel --skill …``).
+# The primary skill is ``skills/citadel/SKILL.md`` (not a repo-root file —
 # a root SKILL.md would shadow ``skills/*`` in the skills CLI).
 SKILL_FILES: dict[str, Path] = {
     "connect": REPO_ROOT / "skills/citadel-mcp-connector/SKILL.md",

@@ -1,5 +1,5 @@
 ---
-name: citadel-archive
+name: citadel
 description: Use when a user asks project, architecture, source, or operational questions that may be answered from the Citadel Organization Vault; wants to persist durable project knowledge; needs to connect an agent to Citadel; asks about organization memory, vault search, knowledge mesh, source-learning status, or wants to set up the Citadel MCP plugin for Claude Code, Codex, Cursor, or any MCP-capable coding agent. Triggers include "search citadel", "check citadel", "ask citadel", "add to citadel", "ingest into citadel", "citadel vault", "organization vault", "citadel mcp", "connect citadel", "citadel archive", "organization memory", "knowledge mesh", or any task requiring access to shared company/project memory.
 ---
 
@@ -101,12 +101,12 @@ citadel onboard --non-interactive --token ctdl_...
 For Codex-compatible agents, install the public Citadel skill first:
 
 ```bash
-npx skills add masumi-network/citadel-archive --skill citadel-archive
-# equivalent (GitHub casing): npx skills add masumi-network/Citadel-Archive --skill citadel-archive
-# all bundled skills:         npx skills add masumi-network/citadel-archive --skill '*'
+npx skills add masumi-network/citadel --skill citadel
+# equivalent (GitHub casing): npx skills add masumi-network/Citadel --skill citadel
+# all bundled skills:         npx skills add masumi-network/citadel --skill '*'
 ```
 
-This installs `skills/citadel-archive` (and optionally the sibling skills under
+This installs `skills/citadel` (and optionally the sibling skills under
 `skills/`). The root skill points agents to the hosted connector, vault usage,
 and data-boundary skills. Then provide a per-agent `ctdl_...` token. Do not
 share one token across multiple users or agents, and rotate any token that was
