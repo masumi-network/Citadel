@@ -288,7 +288,7 @@ PID`, green verify canary).**
 - **#50 (search latency)** — backpressure/429 done; raw ~6–9s is cognee's per-search
   pipeline (Q&A caching + possibly remote embedding), needs node profiling.
 
-**Action: rotate `CITADEL_ADMIN_KEY`** (surfaced in-session during ops).
+**Action:** credential rotation — tracked privately in the ops runbook.
 
 ## 2026-06-29 — v0.2.0 + v0.2.1: CLI DX overhaul shipped (PyPI + Railway)
 
@@ -366,8 +366,9 @@ The remaining release tasks are done (verified via the live admin key through
   empty — nothing queued to approve).
 - **Graph served** — `/api/mesh/graph` returns **200 nodes / 369 edges**,
   `fallback:false` (200 = the `mesh_graph_max_nodes` display cap; actual 280).
-- **Security reminder still open:** rotate `CITADEL_ADMIN_KEY`, the GitHub PAT,
-  the OpenRouter key, and the Postgres password (surfaced in-session during ops).
+- **Security follow-up:** credential rotation is tracked privately in the ops
+  runbook, not here — operational credential state does not belong in a public
+  repository.
 
 ## 2026-06-29 — Stable-release pass: PyPI v0.1.3, evolve scheduler, repopulation (cognify-blocked)
 

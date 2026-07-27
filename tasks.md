@@ -214,8 +214,8 @@ Full change list: [`CHANGELOG.md` § 0.2.2](CHANGELOG.md).
       cause: seat `sarthi` has **0 active tokens** in the prod access store.
       Mint fresh: `railway run -- citadel seat token sarthi` then
       `citadel token set <token>` (admin key stays in Railway env)
-- [ ] Release gates from the read-side sprint: rotate secrets · verify #69 on
-      the node · profile #50
+- [ ] Release gates from the read-side sprint: credential rotation (tracked
+      privately) · verify #69 on the node · profile #50
 - [ ] Deferred CLI refactors: global `--json`/`--node-url` parent-parser,
       did-you-mean for subparser typos
 - [ ] Event-driven sync (GitHub/Linear webhooks → per-event ingest +
@@ -255,7 +255,7 @@ Still open (root-caused; need node-testable fixes, not blind deploys):
 - [ ] #50 — search latency: backpressure/429 done; raw ~6–9s is cognee's per-search pipeline
       (Q&A caching + possibly remote embedding), needs node profiling.
 
-**Action:** rotate `CITADEL_ADMIN_KEY` (surfaced in-session during ops).
+**Action:** credential rotation — tracked privately in the ops runbook.
 
 ## ADR-0007 execution — seat capture, promotion, write policy (~100% — shipped)
 
@@ -635,9 +635,9 @@ evolve scheduler. Only operational remainder: each dev runs `citadel onboard`.
 - ~~**Linear rollout**~~ — DONE (2026-06-29). Key set, 200 issues synced to Central,
   recurring via the evolve scheduler's `linear_sync` stage. (Optional: map Linear
   users → seats via `CITADEL_LINEAR_USER_MAP` to populate Seat-Scoped Mirrors.)
-- **Rotate secrets (open)** — `CITADEL_ADMIN_KEY`, the GitHub PAT, the OpenRouter
-  key, and the Postgres password were surfaced in-session during ops; rotate them.
-  They live in plaintext Railway env.
+- **Credential rotation** — tracked privately, not in this public repository.
+  Operational credential state does not belong in a public repo; see the private
+  ops runbook.
 - OpenRouter model/key config (done):
   - `OPENROUTER_API_KEY` set on `Citadel-Archive`; `Citadel-GitHub-Sync` references
     the same key; Citadel maps it to Cognee's `LLM_API_KEY` at runtime.
@@ -694,7 +694,7 @@ evolve scheduler. Only operational remainder: each dev runs `citadel onboard`.
 ## Next
 
 ADR-0007 + Phase 2 are shipped. Remaining is operational/optional:
-- **Rotate secrets** (admin key, GitHub PAT, OpenRouter key, Postgres password).
+- **Credential rotation** — tracked privately in the ops runbook, not here.
 - **Per-dev rollout:** each teammate runs `citadel onboard`. See
   [`docs/onboarding/teammate-rollout.md`](docs/onboarding/teammate-rollout.md).
 - **Optional:** `CITADEL_LINEAR_USER_MAP` for Linear→seat mirrors; remove the
