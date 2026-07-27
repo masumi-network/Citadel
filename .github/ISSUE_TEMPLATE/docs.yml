@@ -1,0 +1,58 @@
+name: Documentation
+description: Something in the docs is wrong, missing or unclear
+title: "docs: <what is wrong or missing>"
+labels: ["type/docs", "status/needs-triage"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Documentation problems are real problems. If you hit something
+        confusing while getting started, that is worth reporting — the
+        onboarding path is the one most likely to be wrong.
+
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: File path or URL. If it is a missing doc, say where you looked.
+      placeholder: "CONTRIBUTING.md, or docs/mcp/README.md line 40"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem
+      options:
+        - Incorrect — it says something that is not true
+        - Outdated — it was true once but no longer is
+        - Missing — the thing is not documented at all
+        - Unclear — technically correct but hard to follow
+        - Broken link or example that does not run
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: What is wrong
+      description: >
+        For incorrect or outdated docs, say what the text claims and what
+        actually happens.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording
+      description: Optional. A concrete replacement is the fastest path to a fix.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true

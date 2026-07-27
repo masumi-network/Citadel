@@ -1,0 +1,23 @@
+# Routes anything that must NOT become a public issue away from the issue form.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/masumi-network/Citadel/security/advisories/new
+    about: >
+      Never open a public issue for an unpatched vulnerability. This repository
+      is public and the vault it talks to is not. Use GitHub's private
+      vulnerability reporting and a maintainer will respond privately.
+
+  - name: Question or idea
+    url: https://github.com/masumi-network/Citadel/discussions
+    about: >
+      For open-ended questions, design discussion, or an idea that is not yet a
+      concrete piece of work. Bug reports and defined features belong in an
+      issue.
+
+  - name: Read the contributing guide first
+    url: https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md
+    about: >
+      Setup, the label taxonomy, commit conventions, DCO sign-off, and what
+      outside contributors can and cannot test locally.
