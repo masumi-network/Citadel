@@ -1,0 +1,107 @@
+name: PR hygiene
+
+# Teaches and enforces the two conventions this repository already follows by
+# hand: Conventional Commit pull-request titles, and every PR pointing at an
+# issue so the backlog stays the source of truth.
+#
+# Implemented as inline shell rather than a third-party action: it is a regex
+# and an API read, and a public repository should not take a supply-chain
+# dependency for that.
+#
+# This check is deliberately NOT part of the required `CI gate`. A newcomer's
+# first contribution should not be blocked from merging by a title format —
+# the check explains the convention and turns red until fixed, but a maintainer
+# can still merge.
+
+on:
+  pull_request_target:
+    # `pull_request_target` is safe HERE and only here: this job never checks
+    # out or executes pull-request code. It reads metadata through the API.
+    # Do not add a checkout step to this workflow.
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  title:
+    name: conventional title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Types taken from this repository's own git history.
+          TYPES='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+          # <type>[(optional scope)][!]: <description>
+          PATTERN="^(${TYPES})(\([a-z0-9._/-]+\))?!?: .{3,}$"
+
+          echo "Title: ${TITLE}"
+
+          if printf '%s' "${TITLE}" | grep -qE "${PATTERN}"; then
+            echo "Conventional Commit title: ok"
+            exit 0
+          fi
+
+          echo "::error::Pull request title is not a Conventional Commit."
+          cat <<EOF
+
+          Expected:  <type>(<optional scope>): <description>
+          Allowed types: ${TYPES//|/, }
+
+          Examples from this repository's history:
+            fix(mcp): resolve tools/list role in-process (#100)
+            feat(dashboard): Masumi magenta accent + light mode
+            docs: record UAT findings as merged + verified in production
+
+          Edit the pull request title and this check will re-run automatically.
+          See CONTRIBUTING.md.
+          EOF
+          exit 1
+
+  linked-issue:
+    name: linked issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a linked issue
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          TITLE: ${{ github.event.pull_request.title }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # Escape hatch for genuinely trivial changes: apply the `no-issue`
+          # label and this check passes.
+          case ",${LABELS}," in
+            *,no-issue,*)
+              echo "Labelled 'no-issue' — skipping the linked-issue requirement."
+              exit 0
+              ;;
+          esac
+
+          if printf '%s\n%s' "${TITLE}" "${BODY}" \
+               | grep -qiE '(close[sd]?|fixe?[sd]?|resolve[sd]?|refs?|relates to|part of)[[:space:]]*:?[[:space:]]*#[0-9]+|#[0-9]+'; then
+            echo "Linked issue reference found: ok"
+            exit 0
+          fi
+
+          echo "::error::This pull request does not reference an issue."
+          cat <<'EOF'
+
+          Add a reference to the issue this PR addresses, for example:
+
+            Fixes #123        (closes the issue when the PR merges)
+            Refs #123         (links without closing)
+
+          Citadel tracks all work through issues so the backlog stays accurate.
+          If the change genuinely has no issue — a typo fix, for instance — a
+          maintainer can apply the `no-issue` label to skip this check.
+
+          See CONTRIBUTING.md.
+          EOF
+          exit 1

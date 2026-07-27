@@ -1,7 +1,14 @@
 name: Test
 
-# Runs the test suite + lint on every PR and push. A merge to main auto-deploys
-# to the Railway node, so this is the gate between a bad merge and production.
+# The merge gate for this repository.
+#
+# A merge to `main` auto-deploys to the Railway node, so a red run here is the
+# only thing standing between a bad merge and a bad production deploy.
+#
+# Everything below also runs locally — see CONTRIBUTING.md:
+#   uv sync --all-extras --dev
+#   uv run ruff check .
+#   uv run pytest tests/ -q
 
 on:
   pull_request:
@@ -9,26 +16,105 @@ on:
     branches:
       - main
 
+# A superseded run proves nothing, so cancel outdated PR runs. Never cancel a
+# run on `main`: each of those is the record for a commit that may deploy.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege. This workflow only ever reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
+    # Matrix legs surface as "pytest + ruff (3.11)", "pytest + ruff (3.12)".
+    # Branch protection requires the aggregate `CI gate` job below instead, so
+    # the required check name stays stable when this matrix changes.
     name: pytest + ruff
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the REAL floor: seven kb/ modules do `from datetime import UTC`,
+        # which landed in 3.11, and tests/test_railway_entrypoint.py imports
+        # `tomllib` (3.11 stdlib). pyproject.toml still declares
+        # requires-python = ">=3.10"; that mismatch is tracked as a bug issue.
+        # Add "3.10" back to this list only once that issue is resolved.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
-      - name: Set up Python
-        run: uv python install 3.12
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Select Python ${{ matrix.python-version }}
+        # The repo ships a `.python-version` pin of 3.12. Without this pin step
+        # every matrix leg would silently resolve to 3.12 and the matrix would
+        # be decorative. `uv python pin` rewrites it for this runner only.
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv python pin ${{ matrix.python-version }}
+
       - name: Install dependencies
         # --all-extras pulls in the `server` optional-dependency group
         # (fastapi, mcp, cognee, …); the test suite imports kb.server and the
         # MCP module, so a base-only sync fails collection with ModuleNotFound.
         run: uv sync --all-extras --dev
+
+      - name: Confirm the interpreter actually under test
+        run: uv run python -c "import sys; print(sys.version)"
+
       - name: Lint
         run: uv run ruff check .
-      - name: Dependency audit
+
+      - name: Run tests
+        run: uv run pytest tests/ -q
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: pip-audit
+        # PYSEC-2026-2447 is ignored pending an upstream fix. CVEs that already
+        # have a fixed release are pinned out via [tool.uv] override-dependencies
+        # in pyproject.toml rather than ignored here.
         run: |
           uv run pip-audit --cache-dir .pip-audit-cache \
             --ignore-vuln PYSEC-2026-2447
-      - name: Run tests
-        run: uv run pytest tests/ -q
+
+  gate:
+    name: CI gate
+    # The single required status check for `main`.
+    #
+    # Keeping one stable name here means the matrix above can grow, shrink or be
+    # renamed without an admin editing the branch ruleset. `if: always()` ensures
+    # this job still runs — and fails — when a job it depends on fails.
+    if: always()
+    needs: [test, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every required job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::One or more required jobs did not succeed."
+          echo '${{ toJSON(needs) }}'
+          exit 1
+
+      - name: All clear
+        run: echo "All required checks passed."

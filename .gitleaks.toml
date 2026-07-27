@@ -1,0 +1,102 @@
+# gitleaks configuration for Citadel.
+#
+# Used by .github/workflows/secret-scan.yml. Extends the upstream default rule
+# set (AWS keys, GitHub PATs, private keys, …) and adds the credential formats
+# that are specific to this project.
+#
+# This repository is PUBLIC and the live vault is not. A leaked `ctdl_` token
+# authenticates against the production node, so it is treated as a hard stop.
+#
+# Verified against gitleaks 8.30.1: a full-history scan of this repository
+# (351 commits) reports zero findings with this configuration.
+
+title = "Citadel gitleaks config"
+
+[extend]
+# Inherit every rule shipped with gitleaks, then add our own below.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Citadel-specific credential formats
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "citadel-access-token"
+description = "Citadel seat/admin access token (ctdl_)"
+# kb/access.py:168 -> f"ctdl_{secrets.token_urlsafe(32)}"
+# token_urlsafe(32) yields 43 URL-safe base64 characters; the bounds below are
+# deliberately loose so a future token length change still trips the rule.
+regex = '''ctdl_[A-Za-z0-9_-]{32,64}'''
+keywords = ["ctdl_"]
+
+[[rules]]
+id = "citadel-admin-key"
+description = "Citadel admin access key assigned in config or env"
+regex = '''(?i)\b(CITADEL_ADMIN_KEY|CITADEL_ACCESS_KEY|CITADEL_MCP_ACCESS_TOKEN)\b\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?'''
+keywords = ["citadel_admin_key", "citadel_access_key", "citadel_mcp_access_token"]
+
+# ---------------------------------------------------------------------------
+# Allowlists
+# ---------------------------------------------------------------------------
+# NOTE: gitleaks deprecated the singular [allowlist] table; the plural
+# [[allowlists]] form is required and the two cannot be mixed.
+
+[[allowlists]]
+description = "Documented placeholders and test fixtures, not real credentials"
+
+# Match these patterns against the whole source line, not just the captured
+# secret, so placeholder context like PASTE_..._HERE is visible to the rule.
+regexTarget = "line"
+
+paths = [
+  # The example env file exists to be copied; it holds no live values.
+  '''^\.env\.example$''',
+  # Lock files contain hashes that look high-entropy but are not secrets.
+  '''^uv\.lock$''',
+  '''^\.pip-audit-cache/''',
+  # This file is a deliberate corpus of FAKE credentials whose only purpose is
+  # to prove kb/security_scan.py detects them. Every value is synthetic:
+  # AKIAIOSFODNN7EXAMPLE is AWS's own published documentation example, the
+  # fine-grained token is built as "a1B2" * 12, and the password is "hunter2".
+  # Scanning it will always "find" secrets, by construction.
+  '''^tests/test_security_scan\.py$''',
+]
+
+regexes = [
+  # ---- Documentation placeholders -------------------------------------
+  # docs/mcp/README.md, docs/mcp/codex-hosted.config.toml and the MCP
+  # connector SKILL.md all show the config shape with a literal instruction
+  # in place of the value.
+  '''PASTE_[A-Z_]+''',
+  '''<paste your ctdl_ token>''',
+  '''ctdl_<''',
+  # Prose naming the token PREFIX while explaining the format, e.g. tasks.md
+  # and docs/progress.md ("token prefix: `ctdl_`").
+  '''token[ _-]prefix''',
+  # Onboarding/docs output that shows the shape rather than a value.
+  '''ctdl_(…|\.\.\.|xxx|XXX|your|YOUR|paste|example|EXAMPLE|token)''',
+
+  # ---- Test doubles ----------------------------------------------------
+  '''ctdl_(test|fake|dummy|sample|placeholder)[A-Za-z0-9_-]*''',
+  '''gh[pousr]_abcd''',
+  '''(?i)\b(fake|dummy|sample|placeholder|not-a-real)[-_]?(token|key|secret)\b''',
+  # Redaction assertions: tests feed a fake credential in to prove it is
+  # scrubbed on the way out.
+  '''clip_excerpt\(''',
+]
+
+[[allowlists]]
+description = "generic-api-key heuristic is too noisy against test fixtures"
+# `generic-api-key` is gitleaks' low-precision heuristic: it fires on anything
+# shaped like `token = "..."`. Test fixtures are full of such strings by
+# design, because several suites exist specifically to prove Citadel redacts
+# credentials (tests/test_llm_enrichment.py feeds in
+# "api_key=supersecretvalue1234 ... token: ctdl_abcdef123456" to assert it is
+# scrubbed on the way out).
+#
+# We relax ONLY this one heuristic, and ONLY under tests/. Every high-precision
+# rule — citadel-access-token, citadel-admin-key, github-pat, aws-access-token,
+# stripe-access-token, private-key — stays fully armed there, so a real
+# credential committed into a test file is still a hard failure.
+targetRules = ["generic-api-key"]
+paths = ['''^tests/''']

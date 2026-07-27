@@ -1,0 +1,103 @@
+# Path-based auto-labelling, consumed by .github/workflows/labeler.yml
+# (actions/labeler v5 schema).
+#
+# This applies `area/*` labels only. `type/*`, `priority/*` and `status/*` stay
+# a human triage decision — a path cannot tell you whether a change is a bug
+# fix or a feature, or how urgent it is.
+
+"area/cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/cli.py"
+          - "kb/onboard.py"
+          - "kb/prompt.py"
+          - "kb/status.py"
+          - "kb/capture.py"
+          - "kb/capture_config.py"
+          - "kb/capture_policy.py"
+          - "kb/tool_detect.py"
+          - "kb/hooks/**"
+          - "install.sh"
+
+"area/mcp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/mcp_server.py"
+          - "plugins/**"
+          - "docs/mcp/**"
+
+"area/server":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/server.py"
+          - "kb/service.py"
+          - "kb/access.py"
+          - "kb/access_client.py"
+          - "kb/config.py"
+          - "scripts/run_railway.py"
+          - "railway.toml"
+
+"area/search":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/search_format.py"
+          - "kb/source_search.py"
+          - "kb/cognee_client.py"
+          - "kb/retry.py"
+
+"area/ingest":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/learning.py"
+          - "kb/learning_agent.py"
+          - "kb/llm_enrichment.py"
+          - "kb/security_scan.py"
+          - "kb/promotion.py"
+          - "kb/promotion_queue.py"
+          - "kb/promotion_client.py"
+          - "kb/conflicts.py"
+          - "kb/tags.py"
+
+"area/sync":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/github_sync.py"
+          - "kb/linear_sync.py"
+          - "kb/obsidian_sync.py"
+          - "kb/repo_content_sync.py"
+          - "kb/repository_update.py"
+          - "kb/backup_mirror.py"
+          - "kb/google_chat.py"
+          - "kb/notification_gateways.py"
+
+"area/graph":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/knowledge_mesh.py"
+          - "kb/mesh.py"
+
+"area/web":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kb/static/**"
+
+"area/ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".gitleaks.toml"
+          - "pyproject.toml"
+          - "uv.lock"
+          - "requirements.txt"
+
+"area/docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
+          - "!CHANGELOG.md"
+
+"area/tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"

@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Static analysis for the Python source. Code scanning is free for public
+# repositories, and results land in the repository Security tab rather than in
+# a public issue — which matters here, because an unpatched finding must never
+# be disclosed publicly before it is fixed (see SECURITY.md).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Rules improve over time; a weekly run re-checks unchanged code against
+    # the current rule set rather than only what a PR happened to touch.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (python)
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload results to the code-scanning API.
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-and-quality adds maintainability rules on top of the
+          # default security queries.
+          queries: security-and-quality
+
+      # No build step: CodeQL analyses Python from source directly. We
+      # deliberately do NOT install dependencies here — nothing in this
+      # workflow needs to execute project code.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
