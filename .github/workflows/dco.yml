@@ -38,25 +38,29 @@ jobs:
           # games, and it stays correct after force-pushes and rebases.
           # `select((.parents|length) < 2)` drops merge commits, which
           # introduce no authored change of their own.
+          #
+          # The message is base64-encoded so a multi-line commit body survives
+          # as ONE tab-separated record. Do not "simplify" this to
+          # gsub("\n"; "\\n"): @tsv escapes the backslash that produces, so the
+          # consumer gets a literal \n two-character sequence, the trailer
+          # never lands on its own line, and the ^-anchored match below silently
+          # fails for every commit.
           gh api --paginate "repos/${REPO}/pulls/${PR}/commits" \
             --jq '.[]
                   | select((.parents | length) < 2)
                   | [ .sha,
                       (.commit.author.email // ""),
-                      (.commit.message | gsub("\n"; "\\n")) ]
+                      (.commit.message | @base64) ]
                   | @tsv' > commits.tsv
 
           missing=0
           checked=0
 
-          while IFS=$'\t' read -r sha email message; do
+          while IFS=$'\t' read -r sha email message_b64; do
             [ -z "${sha:-}" ] && continue
             checked=$(( checked + 1 ))
 
-            # jq flattened newlines to the two-character sequence \n so each
-            # commit stayed on one TSV record. Restore them so trailers sit on
-            # their own lines and can be anchored with ^.
-            body="$(printf '%b' "${message}")"
+            body="$(printf '%s' "${message_b64}" | base64 -d)"
             email_lc="$(printf '%s' "${email}" | tr '[:upper:]' '[:lower:]')"
 
             # Two-stage match avoids escaping the author's address into a
