@@ -2,7 +2,9 @@
    Aligned to the AGENTIC / Masumi design system (masumi-network/sokosumi-landing
    apps/sokosumi/DESIGN.md): Inter-only, weight lightens as size grows, sentence
    case, neutral ramp + one accent (masumi Iris magenta #FF51FF), flat elevation
-   (borders + tint, no drop shadows), radius xl=14, segmented-line section heads.
+   (borders + tint, no drop shadows), segmented-line section heads. One local
+   deviation from DESIGN.md: radius is 0, not xl=14 — Citadel's chrome is
+   square everywhere (dashboard included), so the public pages match it.
    Served under strict CSP: no inline <style>/<script>/style="". Mono is used
    only for genuine code/data; chart bar heights set via CSSOM in info.js. */
 
@@ -41,25 +43,15 @@
 
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --radius: 14px;
+  /* Square chrome: panels, fields, and buttons are hard rectangles. Kept as a
+     token so the corner treatment stays one decision. Circles (status dots)
+     and capsules (.pill) keep their own radii. */
+  --radius: 0;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ground: #0a0a0a;
-    --surface: #171717;
-    --surface-2: #1f1f1f;
-    --ink: #fafafa;
-    --ink-2: rgba(250, 250, 250, 0.60);
-    --ink-3: rgba(250, 250, 250, 0.42);
-    --border: rgba(255, 255, 255, 0.10);
-    --border-2: rgba(255, 255, 255, 0.16);
-    --accent: #ff51ff;
-    --accent-ink: #ff86f2;
-    --accent-soft: rgba(255, 81, 255, 0.15);
-    --good: #4ade80; --good-bg: rgba(74, 222, 128, 0.12);
-    --warn: #f59e0b; --warn-bg: rgba(245, 158, 11, 0.12);
-  }
-}
+/* Light is the default, deliberately. The page does NOT follow
+   prefers-color-scheme: dark is an explicit choice made with the toggle and
+   remembered in localStorage. This also removes the dark flash that an
+   OS-dark visitor used to get before the deferred script ran. */
 :root[data-theme="light"] {
   --ground: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5;
   --ink: #0a0a0a; --ink-2: rgba(10,10,10,0.56); --ink-3: rgba(10,10,10,0.42);
@@ -93,7 +85,7 @@ a { color: var(--accent-ink); text-underline-offset: 2px; }
 .themebtn {
   position: fixed; top: 16px; right: 16px; z-index: 10;
   font-family: var(--sans); font-size: 12.5px; font-weight: 500; color: var(--ink-2);
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 0;
   padding: 7px 12px; cursor: pointer; transition: border-color .15s, color .15s;
 }
 .themebtn:hover { color: var(--accent-ink); border-color: var(--border-2); }
@@ -105,7 +97,7 @@ a { color: var(--accent-ink); text-underline-offset: 2px; }
 header { padding: 40px 0 0; }
 .brandrow { display: flex; align-items: center; gap: 15px; margin-bottom: 36px; }
 .mark { display: grid; grid-template-columns: repeat(7,1fr); grid-template-rows: repeat(7,1fr); width: 40px; height: 40px; gap: 1.5px; flex: 0 0 auto; }
-.mark i { border-radius: 1px; }
+.mark i { border-radius: 0; }
 .mark i.on { background: linear-gradient(135deg, var(--accent), var(--accent-ink)); }
 .wordmark { font-family: var(--sans); font-weight: 600; font-size: 18px; letter-spacing: .14em; text-transform: uppercase; line-height: 1.1; }
 .subword { font-family: var(--sans); font-size: 12px; color: var(--ink-3); }
@@ -124,7 +116,7 @@ h1 .grad {
 .pill.live.down .hdot { background: var(--warn); }
 
 /* TL;DR */
-.tldr { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px 32px; margin: 36px 0 0; position: relative; overflow: hidden; }
+.tldr { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 28px 32px; margin: 36px 0 0; position: relative; overflow: hidden; }
 .tldr::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(var(--accent), var(--accent-ink)); }
 .tldr .lbl { margin: 0 0 14px; font-size: 12px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--accent-ink); }
 .tldr p { margin: 0 0 14px; font-size: 17.5px; line-height: 1.6; }
@@ -132,7 +124,7 @@ h1 .grad {
 
 /* jump nav */
 nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 0; }
-nav.toc a { font-size: 12.5px; font-weight: 500; text-decoration: none; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 7px 12px; transition: border-color .15s, color .15s; }
+nav.toc a { font-size: 12.5px; font-weight: 500; text-decoration: none; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 7px 12px; transition: border-color .15s, color .15s; }
 nav.toc a:hover { color: var(--accent-ink); border-color: var(--border-2); }
 
 /* section scaffolding — segmented-line header */
@@ -144,7 +136,7 @@ section { padding-top: 66px; }
 
 /* metrics */
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px; }
+.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 18px 18px; }
 .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 500; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.1; color: var(--ink); }
 .metric .n small { font-size: 14px; color: var(--ink-3); font-weight: 400; }
 .metric .k { font-size: 12.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.4; }
@@ -155,19 +147,19 @@ section { padding-top: 66px; }
 
 /* pillars */
 .pillars { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; transition: border-color .15s; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 22px 24px; transition: border-color .15s; }
 .card:hover { border-color: var(--border-2); }
 .card h3 { margin: 0 0 10px; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-.card h3 .dot { width: 8px; height: 8px; border-radius: 2px; background: var(--accent); flex: 0 0 auto; }
+.card h3 .dot { width: 8px; height: 8px; border-radius: 0; background: var(--accent); flex: 0 0 auto; }
 .card p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
-.card .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 6px; }
+.card .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 0; }
 
 /* details / go-deeper */
-details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-top: 14px; overflow: hidden; }
+details { background: var(--surface); border: 1px solid var(--border); border-radius: 0; margin-top: 14px; overflow: hidden; }
 details[open] { border-color: var(--border-2); }
 summary { list-style: none; cursor: pointer; padding: 17px 22px; display: flex; align-items: center; gap: 12px; font-weight: 500; font-size: 15px; color: var(--ink); }
 summary::-webkit-details-marker { display: none; }
-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: var(--radius); }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 0; }
 summary .chev { color: var(--accent-ink); transition: transform .2s ease; flex: 0 0 auto; font-size: 13px; }
 details[open] summary .chev { transform: rotate(90deg); }
 summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); margin-left: auto; }
@@ -181,26 +173,26 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 .dbody li b { color: var(--ink); font-weight: 600; }
 
 /* architecture diagram */
-.arch { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px 28px 24px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "phead . ohead" "psrc . osrc" "pnode bridge central" "access access access"; column-gap: 18px; row-gap: 12px; align-items: stretch; }
+.arch { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 28px 28px 24px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "phead . ohead" "psrc . osrc" "pnode bridge central" "access access access"; column-gap: 18px; row-gap: 12px; align-items: stretch; }
 .lanehead { font-size: 11px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
 .lanehead.p { grid-area: phead; color: var(--accent-ink); }
 .lanehead.o { grid-area: ohead; color: var(--ink-2); }
 .srccol { display: flex; flex-direction: column; gap: 6px; }
 .srccol.p { grid-area: psrc; } .srccol.o { grid-area: osrc; }
-.node-chip { font-size: 12.5px; font-weight: 500; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 7px 11px; }
+.node-chip { font-size: 12.5px; font-weight: 500; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 0; padding: 7px 11px; }
 .flowcap { font-size: 11px; color: var(--ink-3); margin-top: 3px; }
-.store { border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); }
+.store { border-radius: 0; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); }
 .store b { font-size: 15px; font-weight: 600; } .store span { font-size: 11.5px; color: var(--ink-3); }
 .store.node { grid-area: pnode; background: var(--accent-soft); border-color: var(--accent-soft); }
 .store.node b { color: var(--accent-ink); }
 .store.central { grid-area: central; background: var(--surface-2); }
 .bridge { grid-area: bridge; align-self: center; text-align: center; font-size: 10.5px; color: var(--ink-3); line-height: 1.6; max-width: 120px; }
 .bridge .arw { display: block; font-size: 15px; color: var(--accent); letter-spacing: -1px; }
-.access { grid-area: access; margin-top: 8px; text-align: center; font-size: 13.5px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 13px 16px; }
+.access { grid-area: access; margin-top: 8px; text-align: center; font-size: 13.5px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 0; padding: 13px 16px; }
 .access b { color: var(--ink); font-weight: 600; }
 
 /* activity chart */
-.chartwrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px 26px 20px; margin-bottom: 30px; }
+.chartwrap { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 24px 26px 20px; margin-bottom: 30px; }
 .charthead { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
 .charthead .t { font-size: 14px; font-weight: 600; }
 .charthead .note { font-size: 11.5px; color: var(--ink-3); }
@@ -208,7 +200,7 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 6px; height: 100%; min-width: 0; }
 .bar-val { font-family: var(--mono); font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .bar-col.ship .bar-val { color: var(--accent-ink); font-weight: 500; }
-.bar { width: 74%; max-width: 30px; min-height: 3px; border-radius: 4px 4px 0 0; background: var(--surface-2); border: 1px solid var(--border-2); transition: filter .15s; }
+.bar { width: 74%; max-width: 30px; min-height: 3px; border-radius: 0; background: var(--surface-2); border: 1px solid var(--border-2); transition: filter .15s; }
 .bar-col.ship .bar { background: linear-gradient(var(--accent), var(--accent-ink)); border: none; }
 .bar-col:hover .bar { filter: brightness(1.05); }
 .bar-lbl { font-size: 9.5px; color: var(--ink-3); text-align: center; line-height: 1.3; }
@@ -229,12 +221,12 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 
 /* next */
 .status-legend { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 22px; }
-.chip { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 5px 11px; border-radius: 8px; text-transform: uppercase; white-space: nowrap; }
+.chip { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 5px 11px; border-radius: 0; text-transform: uppercase; white-space: nowrap; }
 .chip.ship { color: var(--good); background: var(--good-bg); }
 .chip.prog { color: var(--warn); background: var(--warn-bg); }
 .chip.plan { color: var(--ink-2); background: var(--surface-2); }
 .next { display: flex; flex-direction: column; gap: 12px; }
-.nrow { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; display: grid; grid-template-columns: 118px 1fr; gap: 20px; align-items: start; }
+.nrow { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 22px 24px; display: grid; grid-template-columns: 118px 1fr; gap: 20px; align-items: start; }
 .nrow .left { display: flex; padding-top: 3px; }
 .nrow h3 { margin: 0 0 7px; font-size: 16px; font-weight: 600; }
 .nrow p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
@@ -242,10 +234,10 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 
 /* footer */
 footer { margin-top: 34px; color: var(--ink-2); font-size: 15px; }
-.cmd { font-family: var(--mono); font-size: 13.5px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; color: var(--ink); margin: 16px 0; overflow-x: auto; white-space: nowrap; }
+.cmd { font-family: var(--mono); font-size: 13.5px; background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 14px 16px; color: var(--ink); margin: 16px 0; overflow-x: auto; white-space: nowrap; }
 .cmd .p { color: var(--accent-ink); user-select: none; }
 .foot-note { color: var(--ink-3); font-size: 13.5px; margin-top: 18px; }
-code { font-family: var(--mono); font-size: .84em; background: var(--surface-2); padding: 1.5px 6px; border-radius: 5px; color: var(--ink); }
+code { font-family: var(--mono); font-size: .84em; background: var(--surface-2); padding: 1.5px 6px; border-radius: 0; color: var(--ink); }
 
 /* wide screens: report/dashboard frame, text kept at a comfortable measure */
 @media (min-width: 1120px) {
@@ -284,10 +276,50 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
 /* Unfilled placeholder. Deliberately loud — this must not reach production. */
 .todo { font-family: var(--mono); font-size: .92em; font-weight: 600; color: var(--accent-ink); background: var(--accent-soft); border: 1px dashed var(--accent); border-radius: 0; padding: 1px 6px; }
 
-/* --- shared top navigation (public pages: /info, /partners) ---------------
-   Carries the brand lockup, so neither page repeats it in its own header.
-   /login is deliberately excluded: it is styled by styles.css (the dashboard
-   theme), and an auth form does not want a marketing nav. */
+/* --- /login — seat access ------------------------------------------------
+   The sign-in screen is a public page, so it is styled here rather than in
+   styles.css (the authed dashboard theme): same neutral ramp, same single
+   accent, same light/dark toggle, same top nav. A visitor arriving from
+   /info should not feel handed to a different product at the door. */
+
+.auth { min-height: calc(100vh - 46px); display: flex; align-items: center; justify-content: center; padding: 40px 26px 80px; }
+.auth-in { width: 100%; max-width: 380px; }
+.auth h1 { font-size: clamp(28px, 4.4vw, 38px); font-weight: 300; letter-spacing: -.03em; line-height: 1.08; margin: 0 0 12px; }
+.auth-lede { color: var(--ink-2); font-size: 15px; line-height: 1.6; margin: 0 0 28px; }
+
+.auth-form { display: flex; flex-direction: column; gap: 8px; }
+.auth-label { font-size: 13px; font-weight: 500; color: var(--ink); }
+.auth-input {
+  width: 100%; font-family: var(--mono); font-size: 14px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border-2); border-radius: 0;
+  padding: 12px 14px; transition: border-color .15s;
+}
+.auth-input::placeholder { color: var(--ink-3); }
+.auth-input:hover { border-color: var(--ink-3); }
+.auth-input:focus { outline: none; border-color: var(--accent); }
+.auth-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.auth-hint { margin: 4px 0 0; font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+.auth-error { margin: 0; font-size: 13px; line-height: 1.6; color: var(--warn); }
+.auth-error:empty { display: none; }
+
+.auth-submit {
+  margin-top: 12px; font-family: var(--sans); font-size: 14px; font-weight: 500;
+  color: #0a0a0a; background: var(--accent); border: 1px solid var(--accent); border-radius: 0;
+  padding: 12px 16px; cursor: pointer; transition: filter .15s, opacity .15s;
+}
+.auth-submit:hover { filter: brightness(1.06); }
+.auth-submit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.auth-submit[aria-busy="true"], .auth-submit:disabled { opacity: .6; cursor: default; }
+
+.auth-alt { margin: 22px 0 0; font-size: 13px; color: var(--ink-3); }
+.auth-alt a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--border-2); }
+.auth-alt a:hover { color: var(--accent-ink); border-bottom-color: var(--accent); }
+
+@media (max-width: 620px) { .auth { padding: 28px 16px 60px; min-height: calc(100vh - 42px); } }
+
+/* --- shared top navigation (public pages: /info, /partners, /login) -------
+   Carries the brand lockup, so no page repeats it in its own header. */
 
 .topnav { position: sticky; top: 0; z-index: 20; background: var(--ground); border-bottom: 1px solid var(--border); }
 .topnav-in { max-width: 860px; margin: 0 auto; padding: 11px 26px; display: flex; align-items: center; gap: 14px; }

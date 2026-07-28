@@ -10,14 +10,19 @@ Source of truth for the bitmask and column colors: [`kb/banner.py`](kb/banner.py
 ## The mark — Pixel Bastion
 
 ```
-■ · ■ · ■ · ■     columns: magenta → cyan
+■ · ■ · ■ · ■     columns: Iris #FF51FF → #B00A90
 ■■■■■■■
-■■·■·■■           windows (blink on idle)
+■■■■■■■           interior cells blink on idle
+■■■■■■■
 ■■·■·■■
-■■■■■■■
-■■···■■           gate
-■■···■■
+■■·■·■■           gate shaft
+■■·■·■■
 ```
+
+One fortress everywhere. The bitmask in `kb/banner.py` is what the CLI, the
+favicon, the brand SVGs, the README banner, the dashboard sidebar, and the web
+nav all draw; `tests/test_banner.py` pins it so the web copy cannot drift again.
+Cells are square and there is no chrome box around the mark.
 
 - **Wordmark:** `CITADEL` (bold).
 - **Product chip:** `ARCHIVE` (mono, web / README).
@@ -39,7 +44,7 @@ external SVG mark/favicon (`@keyframes` inside the SVG — safe under page CSP).
 
 | Element | Style |
 |---|---|
-| Lit pixels | column gradient `#FA008C` → `#22D3EE` (truecolor / 256); cyan fallback |
+| Lit pixels | column gradient `#FF51FF` → `#B00A90` (truecolor / 256); cyan fallback |
 | Wordmark | bold + cyan |
 | Tagline | dim |
 | Status OK `✓` | green |
@@ -69,16 +74,23 @@ promotion. See [`CONTEXT.md`](CONTEXT.md) for the full domain glossary.
 
 ## Web UI palette — _set 2026-06-29_ (shell restyle 2026-07-21)
 
-The web dashboard is themed to **Masumi Network's brand** — magenta `#FA008C`
-on a dark, faint-emerald-neutral base. Tokens live in `kb/static/styles.css`
-`:root`; everything derives from them. Chrome follows
+_Accent + shape revised 2026-07-28: one accent, square corners._
+
+The web dashboard follows the **AGENTIC / Masumi design system** (Iris Flower
+magenta `#FF51FF`) on a dark, faint-emerald-neutral base, the same accent the
+public pages use, so the app, the mark, and the favicon read as one product.
+Tokens live in `kb/static/styles.css` `:root`; everything derives from them.
+Chrome follows
 [`docs/Citadel Archive branding/Citadel Interface.dc.html`](docs/Citadel%20Archive%20branding/Citadel%20Interface.dc.html):
-sidebar-first lockup, Pixel Bastion mark, Inter + JetBrains Mono, 14px cards.
+sidebar-first lockup, Pixel Bastion mark, Inter + JetBrains Mono. Corners are
+square everywhere: the `--radius*` tokens are all `0`, and only circles
+(avatars, status dots) and capsule pills keep a radius. This is a deliberate
+local deviation from DESIGN.md's radius xl=14.
 
 | Role | Token | Value | Rationale |
 |---|---|---|---|
-| Brand accent | `--primary` | `#FA008C` | Masumi's declared `theme-color` (masumi.network) |
-| Accent hover/glow | `--primary-strong` | `#FF5CB0` | lighter magenta |
+| Brand accent | `--primary` | `#FF51FF` | AGENTIC DESIGN.md's one accent (Iris Flower) |
+| Accent hover/glow | `--primary-strong` | `#FF86F2` | lighter Iris |
 | Success / indexed | `--success` | `#34D399` | emerald — day-to-day "healthy/indexed" status |
 | Info / search | `--info` | `#22D3EE` | cyan — nod to Citadel's CLI brand |
 | Danger | `--danger` | `#FA140A` | Masumi's own red |

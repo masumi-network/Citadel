@@ -38,14 +38,16 @@
   --muted: #a3b3ab;
   --quiet: #7d8b82;
 
-  /* Accent — Masumi brand magenta (#FA008C) */
-  --primary: #fa008c;
-  --primary-strong: #ff5cb0;
-  --primary-deep: #cc0073;
-  --primary-soft: rgba(250, 0, 140, 0.16);
-  --primary-border: rgba(250, 0, 140, 0.45);
-  --primary-text: #ffffff;
-  --focus: #ff5cb0;
+  /* Accent — AGENTIC / Masumi Iris Flower magenta (#FF51FF), the one accent.
+     The dashboard follows the same design system as the public pages, so the
+     app, the mark, and the favicon all read as one product. */
+  --primary: #ff51ff;
+  --primary-strong: #ff86f2;
+  --primary-deep: #c010a0;
+  --primary-soft: rgba(255, 81, 255, 0.16);
+  --primary-border: rgba(255, 81, 255, 0.45);
+  --primary-text: #0a0a0a;
+  --focus: #ff86f2;
 
   /* Semantic status — emerald success, cyan info (Citadel CLI heritage), Masumi red */
   --danger: #fa140a;
@@ -53,12 +55,15 @@
   --success: #34d399;
   --info: #22d3ee;
 
-  /* Shape, motion, type — Interface radii (nav 8 / card 14 / search 12) */
-  --radius: 6px;
-  --radius-lg: 8px;
-  --radius-nav: 8px;
-  --radius-card: 14px;
-  --radius-search: 12px;
+  /* Shape, motion, type — square chrome: every panel, field, and button is a
+     hard rectangle. The radius tokens are kept (rather than deleted at each
+     call site) so the corner treatment stays one decision in one place.
+     Circles (avatars, status dots) and capsules (pills) are unaffected. */
+  --radius: 0;
+  --radius-lg: 0;
+  --radius-nav: 0;
+  --radius-card: 0;
+  --radius-search: 0;
   --speed: 140ms;
   --font: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -141,72 +146,9 @@ pre {
   font-family: var(--mono);
 }
 
-/* ---------- Login ---------- */
-
-.login-shell {
-  display: grid;
-  min-height: 100vh;
-  place-items: center;
-  padding: 20px;
-  background: var(--bg);
-}
-
-.login-panel {
-  width: min(100%, 400px);
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  padding: 28px 26px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  background: var(--surface);
-  box-shadow: none;
-}
-
-.login-brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-/* Login hero: SVG mark (1:1 with 72 viewBox) — blink/glow live inside the SVG */
-.brand-pixel-img {
-  display: block;
-  flex: 0 0 auto;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-nav);
-  animation: pixel-chrome-glow 2.6s ease-in-out infinite;
-}
-
-.brand-pixel-img--hero {
-  width: 72px;
-  height: 72px;
-  border-radius: 14px;
-  animation:
-    pixel-cascade-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both,
-    pixel-chrome-glow 2.6s ease-in-out 0.45s infinite;
-}
-
-.login-brand-text {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.login-brand-text .brand-wordmark {
-  font-size: 22px;
-}
-
-.login-tagline {
-  color: var(--quiet);
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
+/* Login is no longer styled here: /login moved onto the public design system
+   (info.css) so it reads as a sibling of /info and /partners rather than a
+   stray dashboard screen. See the `/login — seat access` block in info.css. */
 
 /* ---------- App frame (sidebar-first; no topbar / status-bar) ---------- */
 
@@ -310,7 +252,7 @@ pre {
 .brand-chip {
   flex: 0 0 auto;
   padding: 3px 7px;
-  border-radius: 4px;
+  border-radius: 0;
   background: rgba(255, 255, 255, 0.07);
   color: rgba(255, 255, 255, 0.55);
   font-family: var(--mono);
@@ -332,27 +274,21 @@ pre {
   flex: 0 0 auto;
   padding: 3px;
   overflow: hidden;
-  border: 1px solid rgba(250, 0, 140, 0.22);
-  border-radius: var(--radius-nav);
-  background: var(--bg);
-  animation: pixel-chrome-glow 2.6s ease-in-out infinite;
+  background: transparent;
 }
 
 .brand-pixel {
   width: 4px;
   height: 4px;
-  border-radius: 1px;
+  border-radius: 0;
   background: transparent;
 }
 
-/* Column colors in CSS — CSP blocks inline style="--px:…" */
-.brand-pixel--c0.brand-pixel--lit { background: #fa008c; }
-.brand-pixel--c1.brand-pixel--lit { background: #d6239c; }
-.brand-pixel--c2.brand-pixel--lit { background: #b246ad; }
-.brand-pixel--c3.brand-pixel--lit { background: #8e6abd; }
-.brand-pixel--c4.brand-pixel--lit { background: #6a8dcd; }
-.brand-pixel--c5.brand-pixel--lit { background: #46b0de; }
-.brand-pixel--c6.brand-pixel--lit { background: #22d3ee; }
+/* One Iris gradient per cell — identical to the web nav mark and the SVG,
+   which fills every cell from the same objectBoundingBox gradient. */
+.brand-pixel--lit {
+  background: linear-gradient(135deg, var(--primary), var(--primary-deep));
+}
 
 /* Idle window blink — Bot-style ~3.4s, clearly off then on */
 .brand-pixel--window {
@@ -371,31 +307,7 @@ pre {
   }
 }
 
-/* Soft magenta chrome pulse (idle glow) */
-@keyframes pixel-chrome-glow {
-  0%,
-  100% {
-    box-shadow: 0 0 0 1px rgba(250, 0, 140, 0.12);
-  }
-  50% {
-    box-shadow: 0 0 0 2px rgba(250, 0, 140, 0.32), 0 0 14px rgba(250, 0, 140, 0.18);
-  }
-}
-
-/* Transform-only so window blink can own opacity without fighting */
-@keyframes pixel-cascade-in {
-  from {
-    transform: scale(0.45);
-  }
-  to {
-    transform: scale(1);
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .brand-pixel-grid,
-  .brand-pixel-img,
-  .brand-pixel-img--hero,
   .brand-pixel--window {
     animation: none !important;
   }
@@ -2236,7 +2148,7 @@ textarea[aria-invalid="true"] {
   min-width: 64px;
   min-height: 28px;
   border: 0;
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: 0;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -2941,7 +2853,7 @@ textarea[aria-invalid="true"] {
   height: 10px;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: 0;
   background: var(--field);
 }
 

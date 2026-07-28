@@ -441,51 +441,56 @@ LOGIN_HTML = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Citadel</title>
+    <title>Sign in to Citadel</title>
+    <meta name="description" content="Sign in to your Citadel seat." />
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=pixel-bastion-4" />
+    <link rel="stylesheet" href="/static/info.css">
   </head>
   <body>
-    <main class="login-shell">
-      <section class="login-panel">
-        <div class="login-brand">
-          <img
-            class="brand-pixel-img brand-pixel-img--hero"
-            src="/static/pixel-bastion.svg?v=pixel-bastion-4"
-            width="72"
-            height="72"
-            alt=""
-            aria-hidden="true"
-          />
-          <div class="login-brand-text">
-            <div class="sidebar-brand-text">
-              <div class="brand-wordmark">CITADEL</div>
-              <div class="brand-chip">ARCHIVE</div>
-            </div>
-            <p class="login-tagline">the organization vault</p>
-          </div>
+    <nav class="topnav" aria-label="Main">
+      <div class="topnav-in">
+        <a class="topnav-brand" href="/">
+          <span class="mark" id="mark" aria-hidden="true"></span>
+          <span class="wordmark">Citadel</span>
+        </a>
+        <div class="topnav-links">
+          <a href="/">Home</a>
+          <a href="/info">Status</a>
+          <a href="/partners">Partnering</a>
+          <a href="/login" aria-current="page">Sign in</a>
         </div>
-        <form id="loginForm" class="form">
-          <div class="field">
-            <label for="adminKey">Seat token</label>
-            <input
-              id="adminKey"
-              name="accessKey"
-              type="password"
-              autocomplete="current-password"
-              required
-              autofocus
-              placeholder="ctdl_…"
-            />
-          </div>
-          <p class="form-hint">
-            Paste the seat token from your admin (or
+        <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+      </div>
+    </nav>
+    <main class="auth">
+      <div class="auth-in">
+        <p class="eyebrow">Seat access</p>
+        <h1>Open your vault.</h1>
+        <p class="auth-lede">
+          Your Node stays private. Signing in opens your own seat. Central is
+          shared, and nobody reads another seat's notes.
+        </p>
+        <form id="loginForm" class="auth-form">
+          <label class="auth-label" for="adminKey">Seat token</label>
+          <input
+            id="adminKey"
+            class="auth-input"
+            name="accessKey"
+            type="password"
+            autocomplete="current-password"
+            required
+            autofocus
+            placeholder="ctdl_…"
+          />
+          <p class="auth-hint">
+            Paste the seat token from your admin (or run
             <code>citadel seat token</code>). Operators can still use the env admin key.
           </p>
-          <p id="loginError" class="form-error" role="alert"></p>
-          <button id="loginSubmit" class="primary-button" type="submit">Open workspace</button>
+          <p id="loginError" class="auth-error" role="alert"></p>
+          <button id="loginSubmit" class="auth-submit" type="submit">Open workspace</button>
         </form>
-      </section>
+        <p class="auth-alt">No token yet? <a href="/info">Read what Citadel is</a>.</p>
+      </div>
     </main>
     <script src="/static/login.js" type="module"></script>
   </body>

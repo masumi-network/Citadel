@@ -11,10 +11,10 @@
     if (saved === "light" || saved === "dark") root.setAttribute("data-theme", saved);
   } catch (e) { /* storage blocked — fall back to prefers-color-scheme */ }
 
+  // Light is the default. Dark is only ever an explicit, remembered choice, so
+  // the OS preference is deliberately not consulted.
   function currentTheme() {
-    var attr = root.getAttribute("data-theme");
-    if (attr) return attr;
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    return root.getAttribute("data-theme") || "light";
   }
   var btn = document.getElementById("themebtn");
   function updateBtn() {
@@ -28,12 +28,6 @@
       try { localStorage.setItem("citadel-info-theme", next); } catch (e) { /* ignore */ }
       updateBtn();
     });
-    if (window.matchMedia) {
-      // follow OS changes only while the user hasn't set an explicit override
-      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
-        if (!root.getAttribute("data-theme")) updateBtn();
-      });
-    }
   }
 
   // ---- Pixel Bastion mark (7x7 crenellated castle) ----
