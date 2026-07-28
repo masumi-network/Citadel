@@ -873,19 +873,43 @@ def test_writer_access_can_ingest_and_feedback_but_not_admin_actions() -> None:
 
 
 def test_ui_requires_admin_key() -> None:
+    """The dashboard stays behind auth; anonymous callers are sent to /login.
+
+    The dashboard moved from / to /app when the root became the landing page.
+    What matters here is unchanged: an anonymous caller never receives
+    index.html.
+    """
     app.state.citadel = FakeCitadel()
     client = TestClient(app)
 
-    response = client.get("/", follow_redirects=False)
+    response = client.get("/app", follow_redirects=False)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+    assert "graphCanvas" not in response.text
+
+
+def test_root_is_the_public_landing_page_for_everyone() -> None:
+    """/ never serves the app, signed in or not.
+
+    One URL, one body: a member must be able to open the landing page and send
+    the link on instead of being bounced into the dashboard.
+    """
+    app.state.citadel = FakeCitadel()
+
+    anon = TestClient(app).get("/")
+    member = authed_client().get("/")
+
+    for response in (anon, member):
+        assert response.status_code == 200
+        assert 'id="graphCanvas"' not in response.text
+        assert '<link rel="stylesheet" href="/static/info.css">' in response.text
 
 
 def test_ui_shell_is_served_after_login() -> None:
     client = authed_client()
 
-    response = client.get("/")
+    response = client.get("/app")
 
     assert response.status_code == 200
     assert "Citadel Archive" in response.text

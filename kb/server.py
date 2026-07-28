@@ -2344,8 +2344,18 @@ async def me_summary(request: Request) -> dict[str, Any]:
 
     document_count = 0
     recent_activity: list[dict[str, Any]] = []
+async def landing_page() -> FileResponse:
+    # The root is the landing page for everyone, signed in or not. The app
+    # lives at /app, so one URL means one body: a member can read the landing
+    # page and send the link on without being bounced into the dashboard.
+    return FileResponse(STATIC_DIR / "landing.html")
+
+
+@app.get("/app", include_in_schema=False)
     last_ingest_at: str | None = None
     if node:
+        # The dashboard stays behind auth. Anonymous callers go to the sign-in
+        # page rather than the landing page: they asked for the app by name.
         try:
             snapshot = await get_mesh().snapshot(config)
             scoped = scope_mesh_snapshot(snapshot, identity)

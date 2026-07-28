@@ -64,7 +64,7 @@ form.addEventListener("submit", async (event) => {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || "Seat token or access key was rejected.");
     }
-    window.location.assign("/");
+    window.location.assign("/app");
   } catch (err) {
     error.textContent = err.message;
   } finally {

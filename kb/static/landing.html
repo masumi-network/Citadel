@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Citadel, the organization vault</title>
+  <meta name="description" content="Citadel is shared, governed memory for your team and its AI agents. Your work flows in automatically, your Node stays private, and Central is the org's curated memory.">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/info.css">
+  <script src="/static/info.js" defer></script>
+</head>
+<body>
+  <nav class="topnav" aria-label="Main">
+    <div class="topnav-in">
+      <a class="topnav-brand" href="/">
+        <span class="mark" id="mark" aria-hidden="true"></span>
+        <span class="wordmark">Citadel</span>
+      </a>
+      <div class="topnav-links">
+        <a href="/" aria-current="page">Home</a>
+        <a href="/info">Status</a>
+        <a href="/partners">Partnering</a>
+        <a href="/login">Sign in</a>
+      </div>
+      <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <header class="hero">
+      <p class="eyebrow">The organization vault</p>
+      <h1>Your team already wrote it down. <span class="grad">Citadel remembers it.</span></h1>
+      <p class="hero-lede">
+        Commits, coding sessions, docs, and Linear issues flow in on their own.
+        You search your private <b>Node</b> and the org's <b>Central</b> from the
+        CLI, or from any agent over MCP. Nothing is copied between seats, and
+        nothing reaches Central without a person promoting it.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="/app">Open workspace</a>
+        <a class="btn" href="/info">See the live status</a>
+      </div>
+      <div class="meta">
+        <span class="pill">Self-hosted</span>
+        <span class="pill">CLI, MCP, HTTP API</span>
+        <span class="pill">Apache-2.0</span>
+      </div>
+
+      <div class="tldr">
+        <p class="lbl">TL;DR</p>
+        <p>Citadel is an <b>organization vault</b>: shared, governed memory for a team and the agents working alongside it. Your commits, coding sessions, docs, and Linear issues flow in without anyone filing anything, and you search them from the CLI or any MCP client.</p>
+        <p>What makes it different is the boundary. Everything lands in your private <b>Node</b> first. <b>Central</b>, the org's shared memory, only ever holds what a person deliberately promoted, so it stays small enough to trust. Live numbers, releases, and what is coming next live on the <a href="/info">status page</a>.</p>
+      </div>
+    </header>
+
+    <section id="what">
+      <div class="sechead"><span class="kicker">01 · What it is</span><h2>Memory with a boundary</h2></div>
+      <p class="lede">Most team knowledge tools ask you to file things. Citadel captures the work you were doing anyway, then keeps the personal and the shared strictly apart.</p>
+      <div class="pillars">
+        <div class="card">
+          <h3><span class="dot"></span>Personal by default</h3>
+          <p>Everything you capture lands in your own <b>Node</b>. No other seat can read it, and no background job moves it out. Sharing is an act, not a setting.</p>
+          <span class="tag">seat scoped</span>
+        </div>
+        <div class="card">
+          <h3><span class="dot"></span>Central is curated</h3>
+          <p>The org's shared memory only holds what a person promoted into it, so it stays worth trusting instead of turning into a dump of everyone's scratch notes.</p>
+          <span class="tag">promotion gated</span>
+        </div>
+        <div class="card">
+          <h3><span class="dot"></span>Agents are first class</h3>
+          <p>Any MCP client, Claude Code, Cursor, or your own agent, searches the same vault under the same seat and the same read isolation as you do.</p>
+          <span class="tag">MCP native</span>
+        </div>
+        <div class="card">
+          <h3><span class="dot"></span>Source linked</h3>
+          <p>Every answer points back at where it came from, a commit, an issue, a session, so you can check the claim instead of taking the vault's word for it.</p>
+          <span class="tag">provenance</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="how">
+      <div class="sechead"><span class="kicker">02 · How it works</span><h2>Three moving parts</h2></div>
+      <p class="lede">You install once. After that the interesting part is what you do not have to do.</p>
+      <div class="nrow">
+        <div class="left"><span class="chip step">Capture</span></div>
+        <p><span class="k">It runs without you.</span> A session hook, a GitHub sync, and a Linear mirror feed your Node while you work. Nothing to file, nothing to remember to save.</p>
+      </div>
+      <div class="nrow">
+        <div class="left"><span class="chip step">Search</span></div>
+        <p><span class="k">One question, both memories.</span> <code>citadel search</code> and the MCP tools read your Node and Central together, and tell you which one answered.</p>
+      </div>
+      <div class="nrow">
+        <div class="left"><span class="chip step">Promote</span></div>
+        <p><span class="k">Sharing stays deliberate.</span> When something is worth the whole org knowing, you promote it. Until then it is yours, including from the agents.</p>
+      </div>
+    </section>
+
+    <section id="start">
+      <div class="sechead"><span class="kicker">03 · Get started</span><h2>Two commands</h2></div>
+      <p class="lede">Install the CLI, then hand it your seat token. The onboarding wires up the MCP client you already use.</p>
+      <div class="cmd"><span class="p">$</span> pipx install citadel-archive</div>
+      <div class="cmd"><span class="p">$</span> citadel onboard</div>
+      <p class="foot-note">Already have a seat? <a href="/login">Sign in</a>. Thinking about a consortium or a joint bid? <a href="/partners">Read the partnering profile</a>.</p>
+    </section>
+  </div>
+</body>
+</html>

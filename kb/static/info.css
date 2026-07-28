@@ -276,6 +276,34 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
 /* Unfilled placeholder. Deliberately loud — this must not reach production. */
 .todo { font-family: var(--mono); font-size: .92em; font-weight: 600; color: var(--accent-ink); background: var(--accent-soft); border: 1px dashed var(--accent); border-radius: 0; padding: 1px 6px; }
 
+/* --- / landing -----------------------------------------------------------
+   The front door. Reuses the report's cards, nrow, chips, and pills; only the
+   hero, the call-to-action pair, and the step chip are new. */
+
+.hero { padding: 64px 0 8px; }
+.hero h1 { max-width: 20ch; }
+.hero-lede { color: var(--ink-2); max-width: 62ch; margin: 0 0 30px; font-size: 17.5px; line-height: 1.6; }
+
+.cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 26px; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--sans); font-size: 14px; font-weight: 500; text-decoration: none;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border-2); border-radius: 0; padding: 11px 20px;
+  transition: border-color .15s, color .15s, filter .15s;
+}
+.btn:hover { border-color: var(--ink-3); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn-primary { color: #0a0a0a; background: var(--accent); border-color: var(--accent); }
+.btn-primary:hover { filter: brightness(1.06); border-color: var(--accent); }
+
+.chip.step { color: var(--accent-ink); background: var(--accent-soft); letter-spacing: .08em; }
+
+@media (max-width: 620px) {
+  .hero { padding-top: 40px; }
+  .cta .btn { flex: 1 1 100%; }
+}
+
 /* --- /login — seat access ------------------------------------------------
    The sign-in screen is a public page, so it is styled here rather than in
    styles.css (the authed dashboard theme): same neutral ramp, same single
