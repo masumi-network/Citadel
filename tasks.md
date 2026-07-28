@@ -158,6 +158,40 @@ synthesized-notes + BM25? (2) synthesis must respect ADR-0009 read scope
 (Central notes only from Central + promoted, never cross-Node); (3) LLM cost of
 synthesis-on-ingest + contradiction checks vs. cheap add-a-chunk.
 
+## Public site: landing, status, partnering, sign-in (2026-07-28) — BUILT, NOT DEPLOYED
+
+Branch `feat/partners-page`. Four public pages under one nav and one design
+system, plus the first unauthenticated write path in the service
+(decision record: [`docs/adr/0013-public-contact-endpoint.md`](docs/adr/0013-public-contact-endpoint.md)).
+
+- [x] `/` landing page: TL;DR, the Node/Central boundary, capture-search-promote,
+      get-started. Metrics and updates deliberately stay on `/info`
+- [x] Dashboard moved `/` → `/app`; anonymous callers redirect to `/login`
+- [x] Shared nav across `/`, `/info`, `/partners`, `/login`: Home, Status,
+      Partnering, Sign in
+- [x] `/login` rebuilt on `info.css` (was the dashboard theme)
+- [x] `/partners` contact form → `POST /contact` → Google Chat, own thread,
+      honeypot, per-IP + global rate limits, formatting scrubbed, fail-closed 503
+- [x] One canonical Pixel Bastion: web mark had drifted from `kb/banner.py`;
+      now generated into favicon, both brand SVGs, README banner, sidebar, CLI,
+      pinned by a test so it cannot drift again
+- [x] Square corners product-wide (radius tokens → 0); documented deviation
+      from DESIGN.md xl=14
+- [x] Dashboard accent `#FA008C` → Iris `#FF51FF`; one accent, one favicon
+- [x] Light by default on public pages; dark is an explicit remembered toggle
+
+**Todos / carry-over:**
+
+- [ ] Fill the `/partners` contact placeholders (NAME, EMAIL, REGISTERED
+      ADDRESS) — `test_partners_page_has_no_unfilled_placeholders` fails until
+      then, by design
+- [ ] Confirm `CITADEL_GOOGLE_CHAT_*` is live on the Railway node, or the form
+      renders and 503s on submit
+- [ ] Nothing visually verified in a browser this session; click through all
+      four pages in light and dark before merging
+- [ ] `/info` and `/partners` prose still uses em dashes (55 + 17); sweep is
+      pending a decision, since it means rewriting existing copy
+
 ## Dashboard graph + mesh read isolation + /mcp fix (2026-07-14) — SHIPPED + DEPLOYED
 
 Merged to `main` (PR #76 dashboard/isolation, PR #77 /mcp) → Railway deploy

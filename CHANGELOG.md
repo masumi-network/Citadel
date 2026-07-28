@@ -8,6 +8,25 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Added
 
+- **Public landing page at `/`, and the dashboard moved to `/app`.** The root is
+  now the front door for everyone, signed in or not: a TL;DR of what Citadel is,
+  the Node/Central boundary, how capture, search, and promotion fit together,
+  and the two commands to get started (`kb/static/landing.html`). Metrics,
+  releases, and roadmap stay on `/info`. The dashboard lives at `/app` and still
+  redirects anonymous callers to `/login`, so one URL means one body and a
+  member can send the landing link on without being bounced into the app. All
+  four public pages now share one nav: Home, Status, Partnering, Sign in.
+- **Partnering contact form on `/partners` (`POST /contact`).** A consortium
+  coordinator can write from the page they are reading. The enquiry relays to
+  the org's Google Chat space in its own thread and never touches the vault.
+  Hardened as the only unauthenticated write path in the service: honeypot
+  answered with 200 so bots learn nothing, per-IP (3 / 15 min) and global
+  (30 / hour) rate limits, length caps at the model boundary, Chat formatting
+  characters stripped so submitted text cannot forge an official looking
+  message, and fail-closed 503 when the gateway is unconfigured so an enquiry is
+  never accepted into a void. See
+  [ADR-0013](docs/adr/0013-public-contact-endpoint.md).
+
 - **Agent-facing search shaping + feedback.** Search hits carry a stable schema
   (`doc_type`, `content_hint`, `trust_tier`, `rank`, provenance) with
   spec/docs/asset-ID ranking and `canonical_only` / `exclude_ambient` /
@@ -33,6 +52,29 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Changed
 
+- **One mark everywhere, and it is square.** The web copy of Pixel Bastion had
+  drifted from `kb/banner.py` (windows dropped, gate narrowed) and nothing
+  caught it, because nothing compared them. The mark shipping in the web nav is
+  now canonical and generated from one source into `kb/static/favicon.svg`,
+  `kb/static/pixel-bastion.svg`, `docs/brand/pixel-bastion.svg`, the README
+  banner, the dashboard sidebar, and `kb/banner.py`, so the CLI draws the same
+  fortress. Square cells, no chrome box, one Iris gradient per cell.
+  `tests/test_banner.py` pins the bitmask against the shipped web mark.
+- **Square corners across the product.** Every radius token in
+  `kb/static/styles.css` and `info.css` is `0`, along with the ad-hoc px radii.
+  Circles (avatars, status dots) and capsule pills keep theirs. A documented
+  local deviation from DESIGN.md's radius xl=14.
+- **The dashboard moved to the Iris accent `#FF51FF`.** The app was themed to
+  Masumi's `theme-color` magenta `#FA008C` while the public pages used the
+  AGENTIC design system's Iris, so the product shipped two magentas and a
+  favicon that did not match the app it labelled. One accent now, tokens only.
+- **Sign-in rebuilt on the public design system.** `/login` moved off the
+  dashboard theme onto `info.css`: same nav, same neutral ramp, same accent,
+  same theme toggle, so arriving from `/info` no longer feels like being handed
+  to a different product at the door.
+- **Light is the default on the public pages.** `prefers-color-scheme` no longer
+  switches them; dark is an explicit, remembered toggle. This also removes the
+  dark flash an OS-dark visitor got before the deferred script ran.
 - **`/info` aligned to the AGENTIC / Masumi design system**
   (`masumi-network/sokosumi-landing` → `apps/sokosumi/DESIGN.md`): Inter-only,
   weight lightens as size grows (Inter Light headings, negative tracking,
