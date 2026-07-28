@@ -304,6 +304,21 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
   .cta .btn { flex: 1 1 100%; }
 }
 
+/* --- /partners contact form ----------------------------------------------
+   Reuses the /login field and button styles below, so the two forms in the
+   product look like the same form. */
+
+.contact-form { display: flex; flex-direction: column; gap: 14px; max-width: 640px; }
+.contact-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.contact-field { display: flex; flex-direction: column; gap: 7px; }
+.contact-textarea { resize: vertical; min-height: 130px; line-height: 1.6; }
+.contact-submit { align-self: flex-start; margin-top: 4px; }
+.contact-ok { color: var(--good); }
+/* Honeypot. Off-screen rather than display:none, which some bots skip. */
+.contact-trap { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+
+@media (max-width: 620px) { .contact-row { grid-template-columns: 1fr; } }
+
 /* --- /login — seat access ------------------------------------------------
    The sign-in screen is a public page, so it is styled here rather than in
    styles.css (the authed dashboard theme): same neutral ramp, same single

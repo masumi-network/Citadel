@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from kb.tags import normalize_tags
 from kb.cognee_client import assert_cognee_dataset_api
 from kb.config import CitadelConfig
 from kb.github_sync import GitHubOrgSyncer
+from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
@@ -496,6 +498,94 @@ LOGIN_HTML = """<!doctype html>
   </body>
 </html>
 """
+
+
+class ContactBody(BaseModel):
+    """A partnering enquiry from the public /partners page.
+
+    Every field is length capped at the model boundary so an oversized body is
+    rejected before it reaches the scrubber or the Chat gateway.
+    """
+
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=200)
+    message: str = Field(min_length=1, max_length=4000)
+    organization: str = Field(default="", max_length=160)
+    # Honeypot. Hidden from humans, so a filled value means a bot.
+    website: str = Field(default="", max_length=200)
+
+
+# Partner contact: best-effort per-IP bucket plus a hard global ceiling. The
+# per-IP part is spoofable behind a proxy, so the global cap is what actually
+# bounds the damage. In-process only, which is enough for a single Railway
+# instance and fails toward refusing rather than accepting.
+CONTACT_PER_IP_LIMIT = 3
+CONTACT_PER_IP_WINDOW_SECONDS = 900
+CONTACT_GLOBAL_LIMIT = 30
+CONTACT_GLOBAL_WINDOW_SECONDS = 3600
+CONTACT_THREAD_KEY = "citadel-partner-contact"
+_contact_hits: dict[str, list[float]] = {}
+_contact_global_hits: list[float] = []
+_contact_lock = threading.Lock()
+
+
+def contact_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()[:64]
+    client = request.client
+    return client.host if client else "unknown"
+
+
+def contact_rate_limit_ok(client_ip: str) -> bool:
+    now = time.monotonic()
+    with _contact_lock:
+        recent_global = [t for t in _contact_global_hits if now - t < CONTACT_GLOBAL_WINDOW_SECONDS]
+        _contact_global_hits[:] = recent_global
+        if len(recent_global) >= CONTACT_GLOBAL_LIMIT:
+            return False
+        recent = [t for t in _contact_hits.get(client_ip, []) if now - t < CONTACT_PER_IP_WINDOW_SECONDS]
+        if len(recent) >= CONTACT_PER_IP_LIMIT:
+            _contact_hits[client_ip] = recent
+            return False
+        recent.append(now)
+        _contact_hits[client_ip] = recent
+        _contact_global_hits.append(now)
+        # Bound the bucket map so a spray of spoofed IPs cannot grow it forever.
+        if len(_contact_hits) > 2000:
+            for stale_ip, hits in list(_contact_hits.items()):
+                if not hits or now - hits[-1] >= CONTACT_PER_IP_WINDOW_SECONDS:
+                    _contact_hits.pop(stale_ip, None)
+        return True
+
+
+def scrub_contact_field(value: str) -> str:
+    """Make submitted text safe to paste into a Google Chat message.
+
+    Chat renders ``<url|label>`` as a link and ``*_~``` as formatting, so a
+    submitter could otherwise forge an official looking message in the org's
+    space. Angle brackets and formatting characters are dropped rather than
+    escaped, since this text is only ever read by a human.
+    """
+    cleaned = "".join(ch for ch in value if ch == "\n" or (ch.isprintable() and ch not in "<>*_~`"))
+    lines = [line.strip() for line in cleaned.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def contact_gateway() -> Any:
+    """The Chat gateway for partner enquiries, or None when unconfigured.
+
+    Enquiries go to their own thread, never into the organization digest
+    thread, so a partner message cannot be mistaken for generated content.
+    """
+    try:
+        gateway = GoogleChatDelivery.from_config(get_citadel().config)
+    except GoogleChatConfigError:
+        logger.warning("Partner contact gateway is misconfigured; the form will report 503")
+        return None
+    if gateway is not None:
+        gateway.thread_key = CONTACT_THREAD_KEY
+    return gateway
 
 
 class IngestBody(BaseModel):
@@ -2254,8 +2344,18 @@ async def audit_forwarded_mcp_call(request: Request, call_next: Any) -> Response
 
 
 @app.get("/", include_in_schema=False)
+async def landing_page() -> FileResponse:
+    # The root is the landing page for everyone, signed in or not. The app
+    # lives at /app, so one URL means one body: a member can read the landing
+    # page and send the link on without being bounced into the dashboard.
+    return FileResponse(STATIC_DIR / "landing.html")
+
+
+@app.get("/app", include_in_schema=False)
 async def ui(request: Request) -> Response:
     if not session_role(request):
+        # The dashboard stays behind auth. Anonymous callers go to the sign-in
+        # page rather than the landing page: they asked for the app by name.
         return RedirectResponse("/login", status_code=303)
     return FileResponse(STATIC_DIR / "index.html")
 
@@ -2277,6 +2377,52 @@ async def partners_page() -> FileResponse:
     # Public partnering profile for EU consortia. Shares info.css/info.js with
     # /info; the live health pill hydrates from the same public /api/state.
     return FileResponse(STATIC_DIR / "partners.html")
+
+
+@app.post("/contact", include_in_schema=False)
+async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]:
+    """Deliver a partnering enquiry to the org's Google Chat space.
+
+    This is the only unauthenticated write path in the service, so it is
+    deliberately narrow: it never touches the vault, never becomes Structured
+    Knowledge, and never echoes submitted text back into a response. A missing
+    gateway is a 503, not a silent drop, so an enquiry is never accepted into
+    a void.
+    """
+    if body.website.strip():
+        # Honeypot. A human never sees this field, so anything in it is a bot.
+        # Answer 200 so the bot does not learn it was filtered.
+        logger.info("Partner contact rejected: honeypot field was filled")
+        return {"delivered": True}
+
+    client_ip = contact_client_ip(request)
+    if not contact_rate_limit_ok(client_ip):
+        raise HTTPException(status_code=429, detail="Too many messages. Try again later.")
+
+    gateway = contact_gateway()
+    if gateway is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The contact channel is not configured on this node. Please email us instead.",
+        )
+
+    text = (
+        f"*Partnering enquiry via /partners*\n"
+        f"*From:* {scrub_contact_field(body.name)}\n"
+        f"*Email:* {scrub_contact_field(body.email)}\n"
+        f"*Organization:* {scrub_contact_field(body.organization) or 'not given'}\n"
+        f"\n{scrub_contact_field(body.message)}"
+    )
+    try:
+        await asyncio.to_thread(gateway.post_digest, text)
+    except Exception:
+        logger.exception("Partner contact delivery failed")
+        raise HTTPException(
+            status_code=502,
+            detail="We could not deliver that right now. Please email us instead.",
+        ) from None
+    logger.info("Partner contact delivered from %s", client_ip)
+    return {"delivered": True}
 
 
 @app.post("/admin/session")
@@ -2344,18 +2490,8 @@ async def me_summary(request: Request) -> dict[str, Any]:
 
     document_count = 0
     recent_activity: list[dict[str, Any]] = []
-async def landing_page() -> FileResponse:
-    # The root is the landing page for everyone, signed in or not. The app
-    # lives at /app, so one URL means one body: a member can read the landing
-    # page and send the link on without being bounced into the dashboard.
-    return FileResponse(STATIC_DIR / "landing.html")
-
-
-@app.get("/app", include_in_schema=False)
     last_ingest_at: str | None = None
     if node:
-        # The dashboard stays behind auth. Anonymous callers go to the sign-in
-        # page rather than the landing page: they asked for the app by name.
         try:
             snapshot = await get_mesh().snapshot(config)
             scoped = scope_mesh_snapshot(snapshot, identity)

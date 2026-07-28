@@ -4819,3 +4819,122 @@ def test_search_marks_session_trace_hits_reference_only(tmp_path: Any) -> None:
     assert trace_hits[0]["_citadel"]["trust"] == "reference-only"
     assert trace_hits[0]["_citadel"]["doc_type"] == "session-trace"
     assert trace_hits[0]["_citadel"]["trust_tier"] == "reference-only"
+
+
+# --- /partners contact form -------------------------------------------------
+# The only unauthenticated write path in the service, so it gets its own tests
+# rather than riding along on the page tests.
+
+
+class FakeChatGateway:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def post_digest(self, text: str, *, message_id: str | None = None) -> dict[str, object]:
+        self.sent.append(text)
+        return {"ok": True}
+
+
+def _reset_contact_limits() -> None:
+    server_module._contact_hits.clear()
+    server_module._contact_global_hits.clear()
+
+
+def _enquiry(**overrides: str) -> dict[str, str]:
+    body = {
+        "name": "Ada Lovelace",
+        "email": "ada@example.org",
+        "organization": "Analytical Engines",
+        "message": "DIGITAL-2026-AI-07, we need the memory work package.",
+        "website": "",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_contact_delivers_to_the_chat_gateway(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True}
+    assert len(gateway.sent) == 1
+    assert "Ada Lovelace" in gateway.sent[0]
+    assert "DIGITAL-2026-AI-07" in gateway.sent[0]
+
+
+def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> None:
+    """A missing gateway must refuse, never accept into a void.
+
+    An enquiry from a consortium coordinator that disappears silently is worse
+    than an error message: nobody learns it was lost.
+    """
+    _reset_contact_limits()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"]
+
+
+def test_contact_honeypot_is_dropped_without_delivery(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry(website="http://spam.example"))
+
+    # 200 on purpose: a bot must not learn that it was filtered.
+    assert response.status_code == 200
+    assert gateway.sent == []
+
+
+def test_contact_rate_limits_a_single_sender(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+    headers = {"x-forwarded-for": "203.0.113.7"}
+
+    codes = [
+        client.post("/contact", json=_enquiry(), headers=headers).status_code
+        for _ in range(server_module.CONTACT_PER_IP_LIMIT + 1)
+    ]
+
+    assert codes[:-1] == [200] * server_module.CONTACT_PER_IP_LIMIT
+    assert codes[-1] == 429
+    assert len(gateway.sent) == server_module.CONTACT_PER_IP_LIMIT
+
+
+def test_contact_scrubs_chat_formatting_from_submitted_text() -> None:
+    """Submitted text must not be able to forge a message in the org's space.
+
+    Google Chat renders <url|label> as a link and *_~` as formatting, so a
+    submitter could otherwise post something that reads like Citadel itself.
+    """
+    forged = "*Citadel admin:* rotate keys at <https://evil.example|the portal>"
+
+    scrubbed = server_module.scrub_contact_field(forged)
+
+    for char in "<>*_~`":
+        assert char not in scrubbed
+    assert "rotate keys at" in scrubbed
+
+
+def test_contact_rejects_an_oversized_message(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry(message="x" * 4001))
+
+    assert response.status_code == 422
+    assert gateway.sent == []
