@@ -357,6 +357,93 @@ def test_login_page_uses_static_script_for_csp() -> None:
     assert "<script>\n" not in response.text
 
 
+def test_partners_page_is_public_and_csp_clean() -> None:
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.get("/partners")
+
+    assert response.status_code == 200
+    # No token, no session — a consortium coordinator must be able to open this.
+    assert "Partnering" in response.text
+    assert "Draft work package" in response.text
+    # Reuses the /info stylesheet + script rather than shipping its own.
+    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
+    assert '<script src="/static/info.js" defer></script>' in response.text
+    # Strict CSP: nothing inline.
+    assert "<script>\n" not in response.text
+    assert "<style>" not in response.text
+    assert 'style="' not in response.text
+
+
+def test_public_pages_share_one_top_nav() -> None:
+    """/info and /partners carry the same nav, each marking its own entry.
+
+    The nav is what stops the two public pages from being orphans reachable
+    only by direct link. /login is deliberately not in this set: it is styled
+    by styles.css, not info.css.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    info = client.get("/info").text
+    partners = client.get("/partners").text
+
+    for page in (info, partners):
+        assert 'class="topnav"' in page
+        assert '<a href="/info"' in page
+        assert '<a href="/partners"' in page
+        assert '<a href="/login">Sign in</a>' in page
+        # The lockup lives in the nav now, so the page header must not repeat it.
+        assert 'class="brandrow"' not in page
+
+    assert '<a href="/info" aria-current="page">' in info
+    assert '<a href="/partners" aria-current="page">' in partners
+
+
+def test_partners_page_avoids_info_report_element_ids() -> None:
+    """/partners shares info.js with /info, so it must not reuse report-only ids.
+
+    info.js unconditionally writes the State-of-the-Vault text into these ids
+    wherever it finds them. /partners reusing id="foot-note" silently replaced
+    its own footer with "State-of-the-vault report ... window v0.2.0 -> v0.4.0"
+    at runtime, which no server-side test would have caught.
+
+    /partners keeps only the ids it genuinely wants hydrated: the health pill
+    and the brand mark.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    partners = client.get("/partners").text
+
+    report_only_ids = ("foot-note", "state-updated", "m-version", "m-docs", "m-docs-sub")
+    for element_id in report_only_ids:
+        assert f'id="{element_id}"' not in partners, (
+            f'kb/static/partners.html declares id="{element_id}", which info.js '
+            "overwrites with /info report copy. Use a different id or no id."
+        )
+
+    # The two it does want, plus the mark info.js paints.
+    assert 'id="pill-health-text"' in partners
+    assert 'id="mark"' in partners
+
+
+def test_partners_page_has_no_unfilled_placeholders() -> None:
+    """Contact details must be filled in before this page is deployed.
+
+    /partners is public and outward-facing: it is sent to consortium
+    coordinators and pasted into EU partner-search forms. Shipping it with a
+    literal NAME/EMAIL/ADDRESS placeholder is worse than not shipping it, so
+    the guard is a test rather than a review comment.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.get("/partners")
+
+    assert 'class="todo"' not in response.text, (
+        "kb/static/partners.html still contains unfilled <span class='todo'> "
+        "placeholders. Fill the contact name, email and registered address."
+    )
+
+
 def test_api_uses_configured_citadel_service() -> None:
     client = authed_client()
 

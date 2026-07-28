@@ -10,16 +10,23 @@
   <script src="/static/info.js" defer></script>
 </head>
 <body>
-  <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+  <nav class="topnav" aria-label="Main">
+    <div class="topnav-in">
+      <a class="topnav-brand" href="/">
+        <span class="mark" id="mark" aria-hidden="true"></span>
+        <span class="wordmark">Citadel</span>
+      </a>
+      <div class="topnav-links">
+        <a href="/">Home</a>
+        <a href="/info" aria-current="page">Status</a>
+        <a href="/partners">Partnering</a>
+        <a href="/login">Sign in</a>
+      </div>
+      <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+    </div>
+  </nav>
   <div class="wrap">
     <header>
-      <div class="brandrow">
-        <div class="mark" id="mark" aria-hidden="true"></div>
-        <div>
-          <div class="wordmark">Citadel</div>
-          <div class="subword">the organization vault</div>
-        </div>
-      </div>
       <p class="eyebrow">State of the vault · internal report</p>
       <h1>Shared, governed memory for the team <span class="grad">and its AI agents</span>.</h1>
       <div class="meta">
@@ -227,6 +234,7 @@
       <div class="cmd"><span class="p">$ </span>pip install citadel-archive &amp;&amp; citadel onboard</div>
       <footer>
         <p>Verify anytime with <code>citadel status</code>. Live node: <code>citadel-archive-production.up.railway.app</code></p>
+        <p>Building an EU-funded project? <a href="/partners">How we partner with consortia</a> — what runs today, what a project would fund, and a draft work package.</p>
         <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.4.0.</p>
       </footer>
     </section>

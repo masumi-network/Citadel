@@ -2267,6 +2267,13 @@ async def info_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "info.html")
 
 
+@app.get("/partners", include_in_schema=False)
+async def partners_page() -> FileResponse:
+    # Public partnering profile for EU consortia. Shares info.css/info.js with
+    # /info; the live health pill hydrates from the same public /api/state.
+    return FileResponse(STATIC_DIR / "partners.html")
+
+
 @app.post("/admin/session")
 async def create_admin_session(body: AdminSessionBody, response: Response) -> dict[str, Any]:
     access_key = body.access_key or body.admin_key
