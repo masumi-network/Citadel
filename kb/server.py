@@ -49,6 +49,7 @@ from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidat
 from kb.tags import normalize_tags
 from kb.cognee_client import assert_cognee_dataset_api
 from kb.config import CitadelConfig
+from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
 from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
@@ -1038,6 +1039,14 @@ def get_access_store() -> AccessStore:
         max_audit_events=config.audit_max_events,
     )
     return app.state.access_store
+
+
+def get_contact_store() -> ContactStore:
+    existing = getattr(app.state, "contact_store", None)
+    if isinstance(existing, ContactStore):
+        return existing
+    app.state.contact_store = ContactStore(get_citadel().config.contact_store_path)
+    return app.state.contact_store
 
 
 def get_obsidian_sync() -> ObsidianSyncStore:
@@ -2672,8 +2681,35 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
     if not contact_rate_limit_ok(client_ip):
         raise HTTPException(status_code=429, detail="Too many messages. Try again later.")
 
+    # Persist BEFORE attempting delivery (ADR-0013, amended). Google Chat is
+    # unconfigured on this node, so the old "no gateway is a 503" rule was
+    # turning every partner enquiry away and keeping no record of it. The ADR's
+    # actual requirement is that an enquiry is never accepted into a void; a
+    # capped file on the state volume is not a void. The vault is still not a
+    # destination — unauthenticated text must not reach the substrate agents
+    # read as authority, which is the part of ADR-0013 that stands unchanged.
+    from datetime import datetime, timezone
+
+    stored = False
+    try:
+        get_contact_store().append(
+            {
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "name": scrub_contact_field(body.name),
+                "email": scrub_contact_field(body.email),
+                "organization": scrub_contact_field(body.organization),
+                "message": scrub_contact_field(body.message),
+            }
+        )
+        stored = True
+    except Exception:
+        logger.exception("Partner contact could not be stored")
+
     gateway = contact_gateway()
     if gateway is None:
+        if stored:
+            logger.info("Partner contact stored from %s (no Chat gateway configured)", client_ip)
+            return {"delivered": True, "stored": True}
         raise HTTPException(
             status_code=503,
             detail="The contact channel is not configured on this node. Please email us instead.",
@@ -2690,12 +2726,32 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
         await asyncio.to_thread(gateway.post_digest, text)
     except Exception:
         logger.exception("Partner contact delivery failed")
+        if stored:
+            # Chat is down but the enquiry is on disk, so it is not lost and the
+            # sender should not be told to try again and send it twice.
+            return {"delivered": True, "stored": True}
         raise HTTPException(
             status_code=502,
             detail="We could not deliver that right now. Please email us instead.",
         ) from None
     logger.info("Partner contact delivered from %s", client_ip)
-    return {"delivered": True}
+    return {"delivered": True, "stored": stored}
+
+
+@app.get("/api/contact/enquiries")
+async def list_contact_enquiries(request: Request, limit: int = 50) -> dict[str, Any]:
+    """Read the stored partner enquiries. Admin only.
+
+    The queue exists because Google Chat is unconfigured (ADR-0013, amended).
+    Once the gateway is set up this stays useful as the durable record behind a
+    Chat message that someone scrolls past.
+    """
+    require_access(request, "admin", "access:read")
+    store = get_contact_store()
+    return {
+        "enquiries": store.recent(min(max(1, limit), 200)),
+        "total": store.count(),
+    }
 
 
 @app.post("/admin/session")
