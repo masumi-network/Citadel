@@ -2,6 +2,107 @@
 
 Last updated: 2026-07-29.
 
+## 2026-07-29 (evening) — The Kuzu lock is dead, and six things that reported success while doing nothing
+
+The hourly evolve cycle had been failing for weeks and saying it was fine. Fixing
+that turned into finding the reason it went unnoticed, which was a pattern rather
+than a bug.
+
+### #88 — the Kuzu lock — FIXED and verified live
+
+Every hour, `github_sync` and `linear_sync` died with `Could not set lock on file:
+cognee_graph_kuzu (Lock is held by PID 44)`.
+
+The root cause is not what the issue title said. cognee 1.2.2 opens Kuzu read-write
+with an exclusive OS file lock and holds it for the lifetime of whichever process
+opens it, and in this deployment that is always the web. The evolve subprocess could
+therefore never acquire it. The subprocess existed to "free the Kuzu lock on exit"
+(`kb/server.py:253`), which was backwards: it was the one that could not get in.
+
+The add-only guard never helped either, because `cognee.add` is itself a Kuzu opener.
+`cognee/modules/pipelines/operations/run_tasks.py:166` calls `get_graph_engine()` at
+the end of every pipeline run purely to evaluate `hasattr(graph_engine,
+"push_to_s3")`. The comment at `kb/cognee_client.py:335` saying add does not touch
+the graph is false for 1.2.2, and the guard sat fourteen lines after the call that
+threw.
+
+Phase 1 now runs in the web's own event loop (#140). One process, one Kuzu owner,
+which also retires the loop-binding hazard of #69 rather than working around it.
+First cycle after deploy:
+
+```
+22:55:57  Evolve stage github_sync: starting
+22:57:34  Evolve stage github_sync: ok
+22:58:00  Evolve stage repo_content_sync: ok
+22:58:09  Evolve stage self_improve: ok
+```
+
+`/healthz` answered in ~150 ms during that pass, three probes, so moving the work
+onto the request loop did not starve it. That was the main risk in the change and it
+is measured, not assumed.
+
+`linear_sync` has still not been observed green, so #46 stays open. See #153 for why
+that is hard to verify right now.
+
+### The pattern: success reported for work that did not happen
+
+Six independent places, all fixed today. Each was a "nothing configured" or
+"everything failed" path falling through to the success branch, while the ordinary
+failure paths around them were handled carefully.
+
+| What lied | Fix |
+| --- | --- |
+| evolve exited 0 with two dead stages | #137 (#89) |
+| promotion printed `failures=0` while all 22 searches died | #138 |
+| the cognify canary passed because the graph grew, not because anything was retrievable | #139 (#114) |
+| a dying scheduler task was swallowed by a bare `set.discard` done-callback | #141 |
+| an unconfigured Chat gateway made both `/contact` and the org digest do nothing, silently | #142, and #151 |
+| a timed-out search was audited as `success=True` | #152 |
+
+The promotion one is the clearest: the `except` was fine, and the bug lived at the
+boundary where a caller counted the emptied result as a clean zero.
+
+A spec for a bounded sweep of the same shape is at
+`docs/superpowers/specs/2026-07-30-exception-flattened-to-empty-audit-design.md`.
+It found four more instances, filed as #148.
+
+### Security
+
+Two audit findings closed, neither filed publicly since the repo is public.
+
+- **M3** (#143): six server modules sent bearer tokens through the bare `urlopen`,
+  which follows redirects and replays every header at the target. `LLM_ENDPOINT` is
+  the operator-configurable one, so pointing it at `http://` sent
+  `OPENROUTER_API_KEY` in cleartext. One transport now refuses an untrusted scheme
+  and strips credentials cross-origin. Redirects are still followed, because GitHub
+  301s renamed repositories.
+- **M4** (#144): nothing limited authentication attempts. Severity was lower than the
+  audit implied for this deployment, since every credential here is already
+  high-entropy, so the substance is a boot-time refusal of weak env keys plus a
+  throttle counted only on failure. A valid credential never reaches the limiter, so
+  an attacker cannot lock the team out.
+
+### Filed, with root causes rather than symptoms
+
+#147 six seats have no cognee Dataset row and have never had a working vault.
+#148 corrupt state files read as "first run" and can post a false digest to Chat.
+#149 the organization digest LLM call fails 400 every cycle.
+#150 cognee pin drift, and the migration warning it caused is a false alarm.
+#151 Google Chat was never configured, so the digest has never run.
+#153 the evolve scheduler resets its interval on every deploy, so on an active day it
+never fires at all. Exactly one cycle ran in fourteen hours.
+
+#50 and #105 now carry measured root causes. Search costs one LLM call per
+`cognee.search` from cognee's `AUTO_FEEDBACK` default, and a seat query fans out to
+three datasets, so three calls per query. `/healthz` does no work of its own; the
+measured blocker is `AccessStore.authenticate_token` rewriting the whole access store
+on every authenticated request, 35 ms.
+
+### Contributions
+
+First outside contributions merged: #130 and #131 from @WAHIB-EL-KHADIRI, closing
+#113 and #112.
+
 ## 2026-07-29 — Public site rebuilt and deployed, Next port reaches the dashboard
 
 PR #132 merged and deployed. The public site is live on the new build, the
