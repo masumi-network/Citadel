@@ -48,7 +48,7 @@ def install_fake_urlopen(
             raise outcome
         return outcome
 
-    monkeypatch.setattr("kb.google_chat.urlopen", fake_urlopen)
+    monkeypatch.setattr("kb.google_chat.open_secure", fake_urlopen)
     return calls
 
 
