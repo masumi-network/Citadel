@@ -483,3 +483,33 @@ def test_evolve_runs_cognee_stage_bodies_on_one_loop(monkeypatch: Any) -> None:
     assert run_railway.run("evolve") == 0
     assert len(seen) == 2
     assert seen[0] == seen[1]  # repo_content_sync and linear_sync shared one loop
+
+
+def test_evolve_stage_lists_stay_in_sync() -> None:
+    """The sync and in-loop evolve stage lists must not drift (#88).
+
+    evolve_stages() drives the CLI/cron entrypoint and evolve_stages_async()
+    drives the web scheduler. They are separate literals, so this pins that they
+    name the same stages, in the same order, with the same enabled flags.
+    cognify is the one deliberate exception: the scheduler runs it itself as
+    Phase 2, which the old subprocess expressed via an env toggle.
+    """
+    sync_stages = [(name, enabled) for name, enabled, _ in run_railway.evolve_stages()]
+    async_stages = [
+        (name, enabled) for name, enabled, _ in run_railway.evolve_stages_async()
+    ]
+
+    assert [name for name, _ in sync_stages if name != "cognify"] == [
+        name for name, _ in async_stages
+    ]
+    assert "cognify" in dict(sync_stages), "the sync list still owns the cognify stage"
+    for name, enabled in async_stages:
+        assert dict(sync_stages)[name] == enabled, f"{name} toggle drifted"
+
+
+def test_evolve_async_stages_are_all_coroutine_functions() -> None:
+    """A sync callable here would silently never run inside the web loop."""
+    import inspect
+
+    for name, _, runner in run_railway.evolve_stages_async():
+        assert inspect.iscoroutinefunction(runner), f"{name} is not awaitable"

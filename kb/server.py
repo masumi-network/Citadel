@@ -246,56 +246,47 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
     first pass waits one full interval so a redeploy never triggers a heavy cycle
     on boot.
     """
-    import sys
+    from kb.cognee_client import suppress_inline_cognify
+    from scripts.run_railway import run_evolve_in_loop
 
     while True:
         await asyncio.sleep(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
-        # Phase 1 — heavy stages in a subprocess that frees the Kuzu lock on exit.
-        # Hold the in-process writer lock across the subprocess so no web-loop
-        # cognify (an interactive ingest's, /api/cognify/run) writes Kuzu while the
-        # subprocess owns the on-disk lock — that cross-process overlap is the
-        # hourly "Lock is held by PID N" crash (#47). Phase 2 re-acquires it itself.
-        proc = None
+        # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
+        # across them so no interactive cognify (an ingest's, /api/cognify/run)
+        # writes Kuzu underneath the pass. Phase 2 re-acquires it itself.
         writer_lock = getattr(getattr(get_citadel(), "cognee", None), "writer_lock", None)
         acquired = False
         try:
             if writer_lock is not None:
                 await writer_lock.acquire()
                 acquired = True
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "scripts.run_railway",
-                env={
-                    **os.environ,
-                    "CITADEL_RUN_MODE": "evolve",
-                    "CITADEL_EVOLVE_COGNIFY_ENABLED": "false",
-                    # Add-only in Phase 1: the per-ingest background cognify is a
-                    # Kuzu write, so suppress it here and let the web cognify in
-                    # Phase 2 as the sole writer — no cross-process collision (#47).
-                    "CITADEL_SUPPRESS_INLINE_COGNIFY": "true",
-                },
-            )
-            code = await proc.wait()
+            # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
+            # A second process can never open the graph: cognee holds an exclusive
+            # OS file lock on cognee_graph_kuzu for the lifetime of whichever
+            # process opens it, and that is always this one. github_sync and
+            # linear_sync died on "Could not set lock on file" every hour because
+            # of it. Add-only for the duration so the per-ingest background
+            # cognify does not storm the writer lock; Phase 2 below cognifies once
+            # as the sole writer (#47).
+            with suppress_inline_cognify():
+                code = await run_evolve_in_loop()
             if code == 0:
                 logger.info("Evolve scheduler: stages finished (exit=0)")
             else:
                 # A partial failure is the normal broken case, not an edge one:
-                # the stage names are already in the subprocess's "Evolve
-                # finished: ... failed=..." line, so log at ERROR here to make
-                # the cycle visibly bad rather than an INFO nobody reads (#89).
+                # the stage names are already on the "Evolve finished: ...
+                # failed=..." line, so log at ERROR here to make the cycle
+                # visibly bad rather than an INFO nobody reads (#89).
                 logger.error(
                     "Evolve scheduler: stages finished with failures (exit=%s) — "
                     "see the 'Evolve finished' line above for which stages failed",
                     code,
                 )
         except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
-                proc.terminate()
             raise
         except Exception:
-            logger.exception("Evolve scheduler: stages subprocess failed")
+            logger.exception("Evolve scheduler: stages failed")
         finally:
             if acquired:
                 writer_lock.release()
