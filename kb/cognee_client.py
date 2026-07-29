@@ -644,6 +644,43 @@ class CogneePublicClient:
                 mapping.setdefault(str(data_id), []).append(dataset_name)
         return mapping
 
+    async def document_counts_by_dataset(self) -> dict[str, int]:
+        """Durable per-dataset document counts, straight from the relational store.
+
+        The mesh snapshot also knows document counts, but it is rebuilt in
+        memory and empties on every process restart, so a count taken from it
+        drops after each redeploy. This reads the tables that own the answer, so
+        the number survives a restart.
+
+        Counted in the database with a GROUP BY rather than by materialising
+        ``_read_node_dataset_map`` and summing in Python: the caller is a page
+        load, and that map holds one entry per document in the whole vault.
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import func, select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        counts: dict[str, int] = {}
+        async with engine.get_async_session() as session:
+            query = (
+                select(Dataset.name, func.count(DatasetData.data_id))
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .filter(Dataset.owner_id == user.id)
+                .group_by(Dataset.name)
+            )
+            rows = await session.execute(query)
+            for dataset_name, total in rows.all():
+                counts[str(dataset_name)] = int(total or 0)
+        return counts
+
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
         """Delete nodes by id from BOTH the graph and the chunk vector store (#15).
 
