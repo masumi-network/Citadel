@@ -19,14 +19,6 @@ import {
 
 const SECTIONS: Section[] = [{ id: "form", label: "Send a message" }];
 
-/* An unfilled placeholder. Deliberately loud: this must not reach production.
-   Ported as-is from kb/static/contact.html, which still carries three of them.
-   test_contact_page_has_no_unfilled_placeholders is the check that fails until
-   somebody fills them in, and this page is a preview of that page, not a fix
-   for it. */
-const TODO =
-  "border border-dashed border-accent bg-accent-soft px-1.5 py-px font-mono text-[.92em] font-semibold text-accent-ink";
-
 export default function Contact() {
   return (
     <>
@@ -81,11 +73,12 @@ export default function Contact() {
           <ContactForm />
 
           <footer className="mt-[34px] text-[15px] text-ink-2">
+            {/* The website and the city, and nothing else. A personal name, an
+                email and a registered address were placeholders here for a
+                while; the enquiry form above is the route in, and none of the
+                three needed publishing to make it work. */}
             <p>
-              <b>Or write directly</b> · <span className={TODO}>NAME</span> ·{" "}
-              <span className={TODO}>EMAIL</span> · utxo AG,{" "}
-              <span className={TODO}>REGISTERED ADDRESS</span>, Zug, Switzerland ·{" "}
-              <a href="https://utxo.ag/">utxo.ag</a>
+              <b>utxo AG</b> · Zug, Switzerland · <a href="https://utxo.ag/">utxo.ag</a>
             </p>
             <p className={FOOT_NOTE}>
               Bugs and feature requests belong in the{" "}
