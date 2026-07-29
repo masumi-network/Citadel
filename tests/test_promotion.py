@@ -357,3 +357,66 @@ async def test_rejected_candidate_is_not_requeued(
     assert second["queued"] == 0
     assert second["proposals"][0]["reason"] == "previously_rejected"
     assert learning.central_writes == []
+
+
+class _ExplodingCitadel:
+    """Fails a chosen number of leading seed searches, succeeds on the rest."""
+
+    def __init__(self, config: CitadelConfig, *, fail_first: int, exc: Exception) -> None:
+        self.config = config
+        self._fail_first = fail_first
+        self._exc = exc
+        self.calls = 0
+
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls += 1
+        if self.calls <= self._fail_first:
+            raise self._exc
+        return [{"text": _org_note()}]
+
+
+def _exploding_engine(tmp_path: Path, *, fail_first: int, exc: Exception) -> PromotionEngine:
+    config = _config()
+    return PromotionEngine(
+        _ExplodingCitadel(config, fail_first=fail_first, exc=exc),
+        FakeLearning(),
+        AccessStore(str(tmp_path / "access.json")),
+        config,
+    )
+
+
+async def test_enumerate_raises_when_every_seed_query_fails(tmp_path: Path) -> None:
+    """A seat whose searches all die is a failure, not an empty seat.
+
+    Production logged "seats=11 promoted=0 failures=0" for days while all 22
+    searches were failing on the Kuzu lock and DatasetNotFoundError, because
+    enumerate swallowed each one and returned [].
+    """
+    total = len(promotion.DEFAULT_SEED_QUERIES)
+    engine = _exploding_engine(tmp_path, fail_first=total, exc=RuntimeError("kuzu locked"))
+
+    with pytest.raises(promotion.PromotionEnumerationError) as caught:
+        await engine.enumerate(SEAT, 20)
+
+    assert "RuntimeError" in str(caught.value)
+    assert SEAT in str(caught.value)
+
+
+async def test_enumerate_stays_best_effort_when_one_query_fails(tmp_path: Path) -> None:
+    """One flaky query must not fail the seat — only a total wipeout does."""
+    if len(promotion.DEFAULT_SEED_QUERIES) < 2:  # pragma: no cover - guards the fixture
+        pytest.skip("needs at least two seed queries")
+    engine = _exploding_engine(tmp_path, fail_first=1, exc=RuntimeError("kuzu locked"))
+
+    candidates = await engine.enumerate(SEAT, 20)
+
+    assert candidates, "a surviving query's results must still be returned"
+
+
+async def test_enumerate_returns_empty_without_raising_when_searches_succeed(
+    tmp_path: Path,
+) -> None:
+    """A genuinely empty seat stays an empty list, not an error."""
+    engine, _, _ = _engine(tmp_path, [])
+
+    assert await engine.enumerate(SEAT, 20) == []

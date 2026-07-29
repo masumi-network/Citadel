@@ -1,0 +1,415 @@
+"""Server-side gaps the dashboard port needs closed.
+
+Each test names the gap from docs/dashboard-api-contract.md that it pins. The
+theme running through all of them is that the redesigned views were specified
+against data no endpoint returned, and the worst case, gap 7, had the UI about
+to assert a security property nothing checked.
+
+Every one of these fields is additive. The tests assert that too: a field the
+ported pages already read must not move.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+from kb.access import AccessStore, now_iso
+from kb.promotion_queue import build_pending_item, scan_candidate
+from kb.promotion_refs import ReferenceAssessment
+from kb.server import app
+
+from test_server import authed_client
+
+# Split so this file cannot be flagged by its own secret scanner in CI.
+FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+# --------------------------------------------------------------------------
+# Gap 7: per-promotion secret scan
+# --------------------------------------------------------------------------
+
+
+def test_promotion_candidate_with_a_secret_is_scanned_and_blocked() -> None:
+    """The Review view says "secret scan passed". Something must actually scan.
+
+    Before this, nothing scanned a promotion candidate at all. The queue carried
+    `sensitive` from LLM enrichment, which is a model's opinion about tone, not
+    a check for credentials, so the UI would have asserted a property the system
+    never tested.
+    """
+    result = scan_candidate(f"Deploy notes. The token is {FAKE_TOKEN} and it works.")
+
+    assert result["blocked"] is True
+    assert result["ok"] is False
+    assert result["highest_severity"] == "critical"
+    assert result["finding_count"] >= 1
+    assert any(f["category"] == "github_token" for f in result["findings"])
+
+
+def test_a_clean_candidate_passes_the_scan() -> None:
+    """A pass has to be a real pass, or the blocked case means nothing."""
+    result = scan_candidate("We chose smoothstep edges because the diagram reads better.")
+
+    assert result["ok"] is True
+    assert result["blocked"] is False
+    assert result["finding_count"] == 0
+    assert result["findings"] == []
+
+
+def test_the_scan_result_never_carries_the_secret_it_found() -> None:
+    """The verdict is served to a reviewer, so it must not republish the secret.
+
+    This is the failure that would turn a security feature into a leak: the
+    scanner finds a credential in a candidate and the API hands it back in the
+    finding. Asserted on the serialised payload, not the field names.
+    """
+    import json
+
+    serialised = json.dumps(scan_candidate(f"key={FAKE_TOKEN}"))
+
+    assert FAKE_TOKEN not in serialised
+    assert "A1b2C3d4" not in serialised
+    # What may appear is metadata about the match, never the match.
+    assert "pattern=github_token" in serialised
+
+
+def test_a_queued_candidate_carries_its_scan_and_the_reviewer_sees_a_failure(
+    tmp_path: Any,
+) -> None:
+    """A failing scan reaches the reviewer rather than being swallowed."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+
+    item = build_pending_item(
+        seat_slug="alice",
+        seat_dataset="seat:alice",
+        candidate_text=f"Rotate this: {FAKE_TOKEN}",
+        assessment=ReferenceAssessment(status="new_org_project", reason="no_match"),
+        created_at=now_iso(),
+    )
+    app.state.access_store.add_promotion_pending(item)
+
+    payload = admin.get("/api/promotion/pending").json()
+
+    assert payload["count"] == 1
+    served = payload["items"][0]
+    assert served["secret_scan"]["blocked"] is True
+    assert served["secret_scan"]["highest_severity"] == "critical"
+    assert served["secret_scan"]["scanned_at"]
+    # The body is still stripped: the scan does not reopen it.
+    assert "candidate_text" not in served
+    assert FAKE_TOKEN not in str(served)
+
+
+def test_an_item_queued_before_the_scan_existed_is_scanned_on_read(
+    tmp_path: Any,
+) -> None:
+    """Legacy rows must not render as "passed" merely because they are old.
+
+    Items enqueued before this feature carry secret_scan: None. Serving that
+    would either show a claim nobody checked or force the UI to invent one, so
+    the read path scans them, and marks the verdict as deferred.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+
+    item = build_pending_item(
+        seat_slug="alice",
+        seat_dataset="seat:alice",
+        candidate_text=f"legacy row holding {FAKE_TOKEN}",
+        assessment=ReferenceAssessment(status="new_org_project", reason="no_match"),
+        created_at=now_iso(),
+    )
+    # Simulate a row written before the field existed.
+    legacy = type(item)(**{**item.to_dict(), "repo_hints": (), "secret_scan": None})
+    app.state.access_store.add_promotion_pending(legacy)
+
+    served = admin.get("/api/promotion/pending").json()["items"][0]
+
+    assert served["secret_scan"] is not None, "an unscanned item must not reach the UI"
+    assert served["secret_scan"]["blocked"] is True
+    assert served["secret_scan"]["deferred"] is True
+
+
+# --------------------------------------------------------------------------
+# Gaps 1 and 2: /api/me/summary counts
+# --------------------------------------------------------------------------
+
+
+def test_me_summary_gains_readable_count_and_weekly_capture_without_losing_fields(
+    tmp_path: Any,
+) -> None:
+    """Additive: every field the ported Home already reads stays put."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    payload = client.get("/api/me/summary").json()
+
+    for existing in (
+        "ok",
+        "seat_slug",
+        "node_label",
+        "node_dataset",
+        "search_datasets",
+        "document_count",
+        "pending_promotions",
+        "last_ingest_at",
+        "recent_activity",
+        "empty",
+        "checklist",
+    ):
+        assert existing in payload, f"/api/me/summary lost {existing}"
+
+    assert "readable_document_count" in payload
+    assert "captured_last_7d" in payload
+    # Null, never a fabricated zero: zero is a claim the caller can read nothing.
+    assert payload["readable_document_count"] is None or isinstance(
+        payload["readable_document_count"], int
+    )
+
+
+def test_readable_document_count_is_scoped_to_the_caller(tmp_path: Any) -> None:
+    """Gap 1, and the constraint that matters more than the number.
+
+    The count is summed over resolve_search_datasets() for the calling identity,
+    so a dataset the caller cannot search can never be added in. Here Bob's Node
+    holds documents and Alice must not see them counted.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()[
+        "token"
+    ]
+    admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"})
+
+    # A generous per-dataset census, including a seat Alice has no access to.
+    counts = {"masumi-network": 10, "seat:alice": 3, "seat:bob": 99}
+
+    class _Cognee:
+        async def document_counts_by_dataset(self) -> dict[str, int]:
+            return counts
+
+    class _Citadel:
+        config = app.state.citadel.config
+        cognee = _Cognee()
+
+    original = app.state.citadel
+    app.state.citadel = _Citadel()
+    try:
+        alice = TestClient(app, base_url="https://testserver")
+        payload = alice.get(
+            "/api/me/summary", headers={"Authorization": f"Bearer {alice_token}"}
+        ).json()
+    finally:
+        app.state.citadel = original
+
+    total = payload["readable_document_count"]
+    assert total is not None
+    # Whatever Alice can search, Bob's 99 are not part of it.
+    assert total < 99, "another seat's documents were counted"
+    assert "seat:bob" not in (payload["search_datasets"] or [])
+
+
+def test_captured_last_7d_counts_only_recent_successful_node_ingests(
+    tmp_path: Any,
+) -> None:
+    """Gap 2, from the durable audit trail rather than the transient mesh.
+
+    The dashboard derives this today by filtering the mesh event page, so it
+    drops after every redeploy. Counting audit rows fixes that, but only if the
+    window, the success flag and the dataset are all honoured.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from kb.server import _captured_last_7d
+
+    now = datetime.now(UTC)
+    rows = [
+        # (dataset, success, accepted, age_days) -> counted?
+        ("seat:alice", True, True, 1),  # yes
+        ("seat:alice", True, True, 6),  # yes
+        ("seat:alice", True, True, 30),  # no: outside the window
+        ("seat:alice", False, True, 1),  # no: failed
+        ("seat:alice", True, False, 1),  # no: rejected by the server
+        ("seat:bob", True, True, 1),  # no: another seat's Node
+    ]
+    events = []
+    for index, (dataset, success, accepted, age) in enumerate(rows):
+        events.append(
+            {
+                "id": f"audit_{index}",
+                "action": "ingest",
+                "actor_id": None,
+                "actor_kind": None,
+                "actor_name": None,
+                "role": None,
+                "dataset": dataset,
+                "success": success,
+                "detail": {"accepted": accepted},
+                "created_at": (now - timedelta(days=age)).isoformat(),
+            }
+        )
+    # Seeded on disk rather than through record_event, which stamps its own
+    # created_at and so cannot express the out-of-window row.
+    path = tmp_path / "access.json"
+    path.write_text(
+        json.dumps({"principals": [], "tokens": [], "audit_events": events}),
+        encoding="utf-8",
+    )
+    app.state.access_store = AccessStore(path)
+
+    assert _captured_last_7d("seat:alice") == 2
+    assert _captured_last_7d("seat:bob") == 1
+    # No seat means no Node, so None rather than zero.
+    assert _captured_last_7d(None) is None
+
+
+# --------------------------------------------------------------------------
+# Gap 8: per-source failure state
+# --------------------------------------------------------------------------
+
+
+def test_sources_report_last_error_and_a_success_clears_it(tmp_path: Any) -> None:
+    """Gap 8. A source that failed for any reason must be visible as failing.
+
+    "Failing" was inferred from open_conflicts and a GitHub-only scan flag, so
+    an expired token or an upstream 500 looked healthy.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    payload = client.get("/api/sources").json()
+    for source in payload["sources"]:
+        assert "last_error" in source, source.get("source_type")
+        assert "last_error_at" in source, source.get("source_type")
+    repo_content = [s for s in payload["sources"] if s["source_type"] == "github_repo_content"][0]
+    assert repo_content["last_error"] is None
+
+    app.state.access_store.record_event(
+        action="repo_content_sync.run",
+        actor=None,
+        success=False,
+        detail={"error_type": "GitHubAPIError", "error": "GitHub API returned 502"},
+    )
+    failed = client.get("/api/sources").json()
+    repo_content = [s for s in failed["sources"] if s["source_type"] == "github_repo_content"][0]
+    assert repo_content["last_error"] == "GitHub API returned 502"
+    assert repo_content["last_error_at"]
+
+    # A later success clears it, or a source that failed once looks broken forever.
+    app.state.access_store.record_event(
+        action="repo_content_sync.run", actor=None, success=True, detail={}
+    )
+    recovered = client.get("/api/sources").json()
+    repo_content = [s for s in recovered["sources"] if s["source_type"] == "github_repo_content"][0]
+    assert repo_content["last_error"] is None
+
+
+def test_a_source_error_is_redacted_before_it_is_published(tmp_path: Any) -> None:
+    """/api/sources is reader-gated, and upstream errors quote URLs with tokens."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    app.state.access_store.record_event(
+        action="repo_content_sync.run",
+        actor=None,
+        success=False,
+        detail={"error": f"401 fetching https://x?access_token={FAKE_TOKEN}"},
+    )
+
+    body = client.get("/api/sources").text
+
+    assert FAKE_TOKEN not in body
+    assert "A1b2C3d4" not in body
+
+
+# --------------------------------------------------------------------------
+# Gap 9: a seat-less token is a status, not an absence
+# --------------------------------------------------------------------------
+
+
+def test_seatless_tokens_are_explicit_on_both_endpoints(tmp_path: Any) -> None:
+    """Gap 9. A token with no seat authenticates and then cannot search.
+
+    That state has cost debugging time because it reads as "invalid token". It
+    existed only as the absence of a seat_slug, discoverable by joining two
+    endpoints client-side.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    client.post("/api/access/seats", json={"name": "Alice", "slug": "alice"})
+    client.post(
+        "/api/access/tokens",
+        json={"name": "research-agent", "role": "reader", "kind": "service_account"},
+    )
+
+    seats = client.get("/api/access/seats").json()
+    assert seats["seats"], "the seated principal is still listed"
+    assert seats["seatless_token_count"] >= 1
+    orphan = [t for t in seats["seatless_tokens"] if t["name"] == "research-agent"]
+    assert orphan, "a token with no seat must appear as its own row"
+    assert orphan[0]["seat_slug"] is None
+    assert orphan[0]["can_search"] is False, "no seat and no dataset means no search"
+
+    # And the same fact is stated on the token itself.
+    access = client.get("/api/access").json()
+    by_name = {token["name"]: token for token in access["tokens"]}
+    assert by_name["research-agent"]["seatless"] is True
+    assert by_name["research-agent"]["seat_slug"] is None
+    seated = [t for t in access["tokens"] if t["seat_slug"] == "alice"]
+    assert seated and seated[0]["seatless"] is False
+
+
+# --------------------------------------------------------------------------
+# Gap 10: audit paging
+# --------------------------------------------------------------------------
+
+
+def test_access_audit_is_paged_and_walkable(tmp_path: Any) -> None:
+    """Gap 10. The array grew forever; the UI rendered twelve rows of it."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    for index in range(30):
+        app.state.access_store.record_event(
+            action=f"test.event.{index}", actor=None, success=True, detail={}
+        )
+
+    first = client.get("/api/access?limit=10").json()
+    assert len(first["audit_events"]) == 10
+    assert first["audit_events_returned"] == 10
+    assert first["audit_events_total"] >= 30
+    assert first["next_cursor"]
+
+    second = client.get(f"/api/access?limit=10&cursor={first['next_cursor']}").json()
+    assert len(second["audit_events"]) == 10
+    first_ids = {event["id"] for event in first["audit_events"]}
+    second_ids = {event["id"] for event in second["audit_events"]}
+    assert not (first_ids & second_ids), "pages must not overlap"
+
+    # Ordering within a page is unchanged (oldest first), so an untouched
+    # consumer reading audit_events still sees what it expects.
+    created = [event["created_at"] for event in first["audit_events"]]
+    assert created == sorted(created)
+
+    # A stale cursor degrades to the newest page rather than erroring, so the
+    # Admin view cannot be wedged by a cursor from a trimmed store.
+    stale = client.get("/api/access?limit=5&cursor=audit_does_not_exist")
+    assert stale.status_code == 200
+    assert len(stale.json()["audit_events"]) == 5
+
+
+def test_access_snapshot_keeps_its_existing_shape(tmp_path: Any) -> None:
+    """Paging must not disturb the keys the Admin view already reads."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    payload = client.get("/api/access").json()
+
+    for existing in ("ok", "bootstrap_keys", "principals", "tokens", "audit_events"):
+        assert existing in payload, f"/api/access lost {existing}"
+    assert isinstance(payload["audit_events"], list)

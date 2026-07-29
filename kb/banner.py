@@ -16,28 +16,32 @@ import sys
 import time
 from typing import IO, Iterator
 
-# Pixel Bastion — 7×7 bitmask (1 = lit). Rows: battlements, wall, windows×2,
-# wall, gate×2. Column colors step magenta→cyan (see brand.md / Branding canvas).
+# Pixel Bastion — 7×7 bitmask (1 = lit). Rows: battlements, solid keep ×3,
+# gate shaft ×3. This is the mark as it ships on the web nav, the favicon, and
+# the brand SVGs; the CLI draws the same one so there is a single fortress.
 PIXEL_SIZE = 7
 PIXEL_FLAGS: tuple[int, ...] = (
     1, 0, 1, 0, 1, 0, 1,
     1, 1, 1, 1, 1, 1, 1,
-    1, 1, 0, 1, 0, 1, 1,
-    1, 1, 0, 1, 0, 1, 1,
     1, 1, 1, 1, 1, 1, 1,
-    1, 1, 0, 0, 0, 1, 1,
-    1, 1, 0, 0, 0, 1, 1,
+    1, 1, 1, 1, 1, 1, 1,
+    1, 1, 0, 1, 0, 1, 1,
+    1, 1, 0, 1, 0, 1, 1,
+    1, 1, 0, 1, 0, 1, 1,
 )
+# Iris Flower magenta stepped to its deep stop. The web mark runs the same two
+# stops as a per-cell gradient, which a terminal cannot do, so the ramp is laid
+# across the columns instead.
 PIXEL_COLS_HEX: tuple[str, ...] = (
-    "#FA008C",
-    "#D6239C",
-    "#B246AD",
-    "#8E6ABD",
-    "#6A8DCD",
-    "#46B0DE",
-    "#22D3EE",
+    "#FF51FF",
+    "#F142F0",
+    "#E434E0",
+    "#D726D0",
+    "#CA18C0",
+    "#C010A0",
+    "#B00A90",
 )
-# Window cells (row 2–3, cols 2 and 4) — blink for idle ceremony.
+# Interior cells on rows 2–3 — blink for idle ceremony.
 WINDOW_INDICES: tuple[int, ...] = (16, 18, 23, 25)
 
 # Right-side labels keyed by pixel-mark row.

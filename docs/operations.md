@@ -96,6 +96,20 @@ railway variables --service Citadel-Archive \
   pipeline runs GitHub sync → repo-content → self-improve → **promotion** → cognify.
   Toggle the promotion stage alone with `CITADEL_EVOLVE_PROMOTION_ENABLED=true|false`.
 
+> **Two warnings before you add that cron service.**
+>
+> A second process sharing the web service's `/data` is how [#88](https://github.com/masumi-network/Citadel/issues/88)
+> happens: cognee opens the Kuzu graph read-write with an exclusive OS file lock
+> and holds it for the process lifetime, so whichever process touches the graph
+> first locks the other one out. The web service already runs the evolve cycle on
+> `CITADEL_EVOLVE_SCHEDULER_ENABLED`; prefer that over a separate service until
+> #88 is resolved.
+>
+> Set `restartPolicyType = "NEVER"` on any cron-style service. The repo default in
+> `railway.toml` is `ON_FAILURE` with 3 retries, and an evolve pass now exits
+> nonzero when *any* stage failed (#89), so a single failing stage under the
+> default policy would re-run the whole pass up to three more times.
+
 Cron services should also mount `/data` so `github_sync_state.json` and
 `backup_mirror/` persist between runs. Keep app and database in the same
 project/environment so the database stays private to Citadel. The graph store
@@ -135,13 +149,27 @@ and tenant-aware config without changing Cognee internals.
 
 Bootstrap environment keys plus a persistent access store for teammate/agent tokens:
 
+An env access key authenticates as a bearer token on **every** endpoint, so it
+is a password with no username and no rotation story. Generate them; never type
+them. The server refuses to start on an env key shorter than 32 characters
+(override with `CITADEL_ALLOW_WEAK_ACCESS_KEYS=true`, which you should only need
+in local development).
+
 ```bash
-CITADEL_READER_KEYS=alice-reader-key,bob-reader-key
-CITADEL_WRITER_KEYS=teammate-writer-key
-CITADEL_ADMIN_KEY=owner-admin-key
+# Generate each one:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+CITADEL_READER_KEYS=<32+ char random>,<32+ char random>
+CITADEL_WRITER_KEYS=<32+ char random>
+CITADEL_ADMIN_KEY=<32+ char random>
 CITADEL_ACCESS_STORE_PATH=/data/.citadel/access.json
 CITADEL_AUDIT_MAX_EVENTS=1000
 ```
+
+Prefer minted tokens (Access page, or `POST /api/access/tokens`) over env keys
+for anything but bootstrap: they carry a role, scopes, an expiry and a last-used
+timestamp, they are stored only as a hash, and they can be revoked individually.
+An env key can only be rotated by redeploying every consumer at once, which is
+how the GitHub-Sync cron ended up 401ing against a rotated admin key.
 
 | Role | Permissions |
 |---|---|

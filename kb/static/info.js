@@ -11,10 +11,10 @@
     if (saved === "light" || saved === "dark") root.setAttribute("data-theme", saved);
   } catch (e) { /* storage blocked — fall back to prefers-color-scheme */ }
 
+  // Light is the default. Dark is only ever an explicit, remembered choice, so
+  // the OS preference is deliberately not consulted.
   function currentTheme() {
-    var attr = root.getAttribute("data-theme");
-    if (attr) return attr;
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    return root.getAttribute("data-theme") || "light";
   }
   var btn = document.getElementById("themebtn");
   function updateBtn() {
@@ -28,12 +28,6 @@
       try { localStorage.setItem("citadel-info-theme", next); } catch (e) { /* ignore */ }
       updateBtn();
     });
-    if (window.matchMedia) {
-      // follow OS changes only while the user hasn't set an explicit override
-      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
-        if (!root.getAttribute("data-theme")) updateBtn();
-      });
-    }
   }
 
   // ---- Pixel Bastion mark (7x7 crenellated castle) ----
@@ -47,7 +41,12 @@
     });
   }
 
-  // ---- commits per week (baked from git log at report time) ----
+  // ---- commits per week ----
+  // The baked series is the fallback, drawn immediately so the chart is never
+  // an empty box. It came from git log at report time, which is also why it
+  // cannot refresh itself: the deployed node has no git and no repository, only
+  // the built image. /api/state carries the live weekly counts from GitHub, and
+  // drawChart re-runs with those once the fetch lands.
   var weeks = [
     { l: "May 18", v: 9 },
     { l: "May 25", v: 24 },
@@ -61,9 +60,48 @@
     { l: "Jul 20", v: 53, tag: "v0.4.0" }
   ];
   var chart = document.getElementById("chart");
-  if (chart) {
-    var max = weeks.reduce(function (m, w) { return Math.max(m, w.v); }, 1);
-    weeks.forEach(function (w) {
+
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function weekLabel(iso) {
+    var parts = String(iso).split("-");
+    if (parts.length !== 3) return String(iso);
+    var month = MONTHS[parseInt(parts[1], 10) - 1];
+    if (!month) return String(iso);
+    return month + " " + parseInt(parts[2], 10);
+  }
+
+  // Release markers are a local fact, not something GitHub returns, so carry
+  // them across onto whichever live week they contain.
+  //
+  // Matching by label string does not work and silently loses every marker:
+  // the baked series is keyed to Mondays ("Jun 22") while GitHub's
+  // commit_activity weeks start on Sunday ("Jun 21"), so the lookup misses by
+  // one day on every row, no bar ever gets the `ship` class, and the chart
+  // renders entirely grey. Match by date range instead, which is immune to
+  // whichever weekday either side considers the start of a week.
+  var RELEASES = [
+    { on: "2026-06-22", tag: "v0.1.x" },
+    { on: "2026-06-29", tag: "v0.2.0–2.2" },
+    { on: "2026-07-06", tag: "v0.2.3" },
+    { on: "2026-07-13", tag: "v0.3.0" },
+    { on: "2026-07-20", tag: "v0.4.0" }
+  ];
+  var WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+  function tagForWeek(startIso) {
+    var start = Date.parse(startIso);
+    if (isNaN(start)) return "";
+    for (var i = 0; i < RELEASES.length; i++) {
+      var on = Date.parse(RELEASES[i].on);
+      if (!isNaN(on) && on >= start && on < start + WEEK_MS) return RELEASES[i].tag;
+    }
+    return "";
+  }
+
+  function drawChart(series) {
+    if (!chart || !series.length) return;
+    chart.textContent = "";
+    var max = series.reduce(function (m, w) { return Math.max(m, w.v); }, 1);
+    series.forEach(function (w) {
       var col = document.createElement("div");
       col.className = "bar-col" + (w.tag ? " ship" : "");
       col.title = w.v + " commits · week of " + w.l + (w.tag ? " · " + w.tag : "");
@@ -75,7 +113,16 @@
       col.appendChild(val); col.appendChild(bar); col.appendChild(tag); col.appendChild(lbl);
       chart.appendChild(col);
     });
+    var peak = series.reduce(function (m, w) { return w.v > m.v ? w : m; }, series[0]);
+    chart.setAttribute(
+      "aria-label",
+      "Commits per week on the main branch, " + series[0].l + " to " +
+        series[series.length - 1].l + ", peaking at " + peak.v +
+        " in the week of " + peak.l + "."
+    );
   }
+
+  drawChart(weeks);
 
   // ---- live tiles from /api/state ----
   function rel(iso) {
@@ -118,15 +165,44 @@
       var when = gh && gh.last_synced_at ? rel(gh.last_synced_at) : "";
       set("m-docs-sub", "GitHub org synced" + (when ? " · " + when : ""));
 
+      // ---- repo figures, refreshed daily from GitHub ----
+      var repo = d.repo || {};
+      if (typeof repo.adrs === "number") set("m-adrs", repo.adrs);
+      if (typeof repo.mcp_tools === "number") set("m-tools", repo.mcp_tools);
+      if (typeof repo.commits_total === "number") {
+        set("m-commits", repo.commits_total);
+        // Say which commits. This counts the default branch over the window
+        // GitHub reports, which is not the same number as all-time commits,
+        // and a bare "commits" would read as if it were.
+        set("m-commits-sub", "commits on main · last " +
+          (repo.commits_window_weeks || 52) + " weeks");
+      }
+      if (repo.weeks && repo.weeks.length) {
+        drawChart(repo.weeks.map(function (w) {
+          return { l: weekLabel(w.start), v: w.commits, tag: tagForWeek(w.start) };
+        }));
+      }
+
+      var repoAge = repo.refreshed_at ? rel(repo.refreshed_at) : "";
+      var repoNote;
+      if (repo.source !== "github") {
+        // No successful fetch yet: the tiles are showing the stamped markup.
+        repoNote = " Commit figures are the last published values.";
+      } else if (repo.stale) {
+        repoNote = " Commit figures last refreshed " + repoAge + ".";
+      } else {
+        repoNote = " Commits, decision records and MCP tools refreshed " + repoAge + ".";
+      }
+
       var upd = rel(d.updated_at);
-      set("state-updated", "Live tiles updated" + (upd ? " " + upd : "") +
-        " · repo facts (commits, tests, LOC) as of v0.4.0, 2026-07-22.");
+      set("state-updated", "Live tiles updated" + (upd ? " " + upd : "") + "." +
+        repoNote + " Tests, releases and LOC are as of v0.4.0, 2026-07-22.");
       set("foot-note", "State-of-the-vault report · live tiles from /api/state" +
         (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.4.0.");
     })
     .catch(function () {
       set("m-docs", "—");
       set("m-docs-sub", "GitHub org sync (live data unavailable)");
-      set("state-updated", "Live data unavailable right now — showing repo facts as of v0.4.0, 2026-07-22.");
+      set("state-updated", "Live data unavailable right now. Showing the last published repo figures, as of v0.4.0, 2026-07-22.");
     });
 })();

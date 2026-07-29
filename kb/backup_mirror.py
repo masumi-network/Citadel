@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.config import CitadelConfig
 from kb.retry import run_with_retries
@@ -153,7 +155,7 @@ class GitHubMirrorPublisher:
         )
 
         def send() -> Any:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_secure(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
 
         try:
