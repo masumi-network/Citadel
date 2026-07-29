@@ -4,62 +4,107 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Citadel, the organization vault</title>
-  <meta name="description" content="Citadel is shared, governed memory for your team and its AI agents. Your work flows in automatically, your Node stays private, and Central is the org's curated memory.">
+  <meta name="description" content="Citadel is shared, governed memory for your team and its AI agents. Your work flows in automatically, no other seat can read your Node, and Central is the org's curated memory.">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/info.css">
   <script src="/static/info.js" defer></script>
+  <script src="/static/landing.js" defer></script>
 </head>
 <body>
-  <nav class="topnav" aria-label="Main">
-    <div class="topnav-in">
-      <a class="topnav-brand" href="/">
-        <span class="mark" id="mark" aria-hidden="true"></span>
-        <span class="wordmark">Citadel</span>
-      </a>
-      <div class="topnav-links">
-        <a href="/" aria-current="page">Home</a>
-        <a href="/info">Status</a>
-        <a href="/partners">Partnering</a>
-        <a href="/login">Sign in</a>
+  <div class="band band-hero">
+    <div class="hero-glow" aria-hidden="true"></div>
+    <nav class="topnav" aria-label="Main">
+      <div class="topnav-in">
+        <a class="topnav-brand" href="/">
+          <span class="mark" id="mark" aria-hidden="true"></span>
+          <span class="wordmark">Citadel</span>
+        </a>
+        <div class="topnav-links">
+          <a href="/" aria-current="page">Home</a>
+          <a href="/info">Status</a>
+          <a href="/use-cases">Use cases</a>
+          <a href="/contact">Contact</a>
+          <a href="/login">Sign in</a>
+        </div>
+        <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
       </div>
-      <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+    </nav>
+    <div class="band-in">
+      <header class="hero">
+        <p class="eyebrow">The organization vault</p>
+        <h1>Citadel remembers your <span class="roll"><span class="roll-track"><span class="grad">decisions.</span><span class="grad">dead ends.</span><span class="grad">reasons.</span><span class="grad">sessions.</span><span class="grad">context.</span><span class="grad" aria-hidden="true">decisions.</span></span></span></h1>
+        <p class="hero-lede">
+          Your team already wrote it down, in commits, sessions, docs, and
+          issues. Citadel captures it as it happens and gives you, and the
+          agents beside you, one place to ask.
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="#start">Get started</a>
+          <a class="btn" href="/use-cases">See what teams use it for</a>
+        </div>
+      </header>
+    </div>
+  </div>
+
+  <nav class="index" aria-label="Sections">
+    <div class="index-in">
+      <a href="#what">What it is</a>
+      <a href="#how">How it works</a>
+      <a href="#next">Two ways in</a>
+      <a href="#start">Get started</a>
+      <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.4.0</span></span>
     </div>
   </nav>
 
-  <div class="wrap">
-    <header class="hero">
-      <p class="eyebrow">The organization vault</p>
-      <h1>Your team already wrote it down. <span class="grad">Citadel remembers it.</span></h1>
-      <p class="hero-lede">
-        Commits, coding sessions, docs, and Linear issues flow in on their own.
-        You search your private <b>Node</b> and the org's <b>Central</b> from the
-        CLI, or from any agent over MCP. Nothing is copied between seats, and
-        nothing reaches Central without a person promoting it.
-      </p>
-      <div class="cta">
-        <a class="btn btn-primary" href="/app">Open workspace</a>
-        <a class="btn" href="/info">See the live status</a>
+  <section class="band band-proof">
+    <div class="band-in">
+      <div class="tiles">
+        <div class="tile accent">
+          <div class="n sm">Apache-2.0</div>
+          <div class="k">Open source, self-hosted</div>
+        </div>
+        <div class="tile">
+          <div class="n">900</div>
+          <div class="k">Tests, CI on every push</div>
+        </div>
+        <div class="tile">
+          <div class="n">22</div>
+          <div class="k">MCP tools for agents</div>
+        </div>
+        <div class="tile">
+          <div class="n">12</div>
+          <div class="k">Architecture decision records</div>
+        </div>
       </div>
-      <div class="meta">
-        <span class="pill">Self-hosted</span>
-        <span class="pill">CLI, MCP, HTTP API</span>
-        <span class="pill">Apache-2.0</span>
-      </div>
+      <p class="proof-note">This page is served by the system it describes. Live numbers, releases, and the roadmap are on the <a href="/info">status page</a>.</p>
+    </div>
+  </section>
 
-      <div class="tldr">
-        <p class="lbl">TL;DR</p>
-        <p>Citadel is an <b>organization vault</b>: shared, governed memory for a team and the agents working alongside it. Your commits, coding sessions, docs, and Linear issues flow in without anyone filing anything, and you search them from the CLI or any MCP client.</p>
-        <p>What makes it different is the boundary. Everything lands in your private <b>Node</b> first. <b>Central</b>, the org's shared memory, only ever holds what a person deliberately promoted, so it stays small enough to trust. Live numbers, releases, and what is coming next live on the <a href="/info">status page</a>.</p>
-      </div>
-    </header>
-
-    <section id="what">
+  <section class="band band-what" id="what">
+    <div class="band-in">
       <div class="sechead"><span class="kicker">01 · What it is</span><h2>Memory with a boundary</h2></div>
       <p class="lede">Most team knowledge tools ask you to file things. Citadel captures the work you were doing anyway, then keeps the personal and the shared strictly apart.</p>
+      <!-- Two forms of one diagram. The spine is four steps of plain markup and
+           is what ships in the HTML: no JavaScript, no download. landing.js
+           swaps in the interactive React Flow version once this scrolls into
+           view. Someone who never scrolls that far, or who has JavaScript off,
+           still gets a correct picture and never pays for the bundle. -->
+      <div class="spine" id="spine-static" aria-label="How work reaches the vault">
+        <div class="step"><span class="t">Capture</span><span class="s">hooks, no filing</span></div>
+        <span class="arw" aria-hidden="true">→</span>
+        <div class="step hl"><span class="t">Your Node</span><span class="s">seat scoped</span></div>
+        <span class="arw" aria-hidden="true">→</span>
+        <div class="step"><span class="t">Promotion</span><span class="s">scan · approve</span></div>
+        <span class="arw" aria-hidden="true">→</span>
+        <div class="step"><span class="t">Central</span><span class="s">shared</span></div>
+      </div>
+      <p class="spine-read" id="spine-read">You and your agents read via <b>MCP, CLI or web</b>: your Node plus Central, never another seat's.</p>
+      <div class="flowmount" id="flow-root" hidden></div>
+      <p class="flowcap-note" id="flow-note" hidden>Capture to promotion to read, end to end. Hover a step to follow its path, and select one to read what it does.</p>
       <div class="pillars">
         <div class="card">
           <h3><span class="dot"></span>Personal by default</h3>
-          <p>Everything you capture lands in your own <b>Node</b>. No other seat can read it, and no background job moves it out. Sharing is an act, not a setting.</p>
+          <p>Everything you capture lands in your own <b>Node</b>. No other seat can read it, and no background job promotes it into the shared memory. Sharing is an act, not a setting.</p>
           <span class="tag">seat scoped</span>
         </div>
         <div class="card">
@@ -78,32 +123,96 @@
           <span class="tag">provenance</span>
         </div>
       </div>
-    </section>
+      <details>
+        <summary><span class="chev">▸</span> The access and data model in one pass <span class="go">Go deeper</span></summary>
+        <div class="dbody">
+          <p>Citadel is a FastAPI service over a retrieval layer, but the moat is the governance around it.</p>
+          <h4>Read scope</h4>
+          <ul>
+            <li>A caller sees their own <b>Node</b>, <b>Central</b>, and non-seat datasets, resolved by a four-pass cross-dataset visibility algorithm.</li>
+            <li><b>Seat presence is universal</b> (every seat is a hub with a slug and counts), but content is caller-scoped. Foreign-seat drill-down returns <b>404, not 403</b>, so there is no existence oracle.</li>
+            <li>Admin and env tokens bypass for operations; every call is audited.</li>
+          </ul>
+          <h4>Write scope</h4>
+          <ul>
+            <li>All seat-scoped writes land on the owning Node. Untagged writes to Central are rejected (403).</li>
+            <li>Every write path, HTTP, MCP, hooks, feedback, runs the seat write-policy guard and a secret scan.</li>
+          </ul>
+          <h4>Promotion to Central</h4>
+          <ul>
+            <li>The <b>Promotion Agent</b> cross-references GitHub org repos and Central, auto-promotes known work after secret-scan and LLM review, and queues new-project candidates for human approval (dashboard, MCP, or <code>citadel promotion</code>).</li>
+          </ul>
+        </div>
+      </details>
+    </div>
+  </section>
 
-    <section id="how">
+  <section class="band band-how" id="how">
+    <div class="band-in">
       <div class="sechead"><span class="kicker">02 · How it works</span><h2>Three moving parts</h2></div>
       <p class="lede">You install once. After that the interesting part is what you do not have to do.</p>
-      <div class="nrow">
-        <div class="left"><span class="chip step">Capture</span></div>
-        <p><span class="k">It runs without you.</span> A session hook, a GitHub sync, and a Linear mirror feed your Node while you work. Nothing to file, nothing to remember to save.</p>
+      <div class="rows">
+        <div class="nrow">
+          <div class="left"><span class="chip step">Capture</span></div>
+          <div>
+            <h3>It runs without you.</h3>
+            <p>A session hook, a GitHub sync, and a Linear mirror feed your Node while you work. Nothing to file, nothing to remember to save.</p>
+          </div>
+        </div>
+        <div class="nrow">
+          <div class="left"><span class="chip step">Search</span></div>
+          <div>
+            <h3>One question, both memories.</h3>
+            <p><code>citadel search</code> and the MCP tools read your Node and Central together, and tell you which one answered.</p>
+          </div>
+        </div>
+        <div class="nrow">
+          <div class="left"><span class="chip step">Promote</span></div>
+          <div>
+            <h3>Sharing stays deliberate.</h3>
+            <p>When something is worth the whole org knowing, you promote it. Until then it stays on your seat, out of reach of the rest of the org and of their agents.</p>
+          </div>
+        </div>
       </div>
-      <div class="nrow">
-        <div class="left"><span class="chip step">Search</span></div>
-        <p><span class="k">One question, both memories.</span> <code>citadel search</code> and the MCP tools read your Node and Central together, and tell you which one answered.</p>
-      </div>
-      <div class="nrow">
-        <div class="left"><span class="chip step">Promote</span></div>
-        <p><span class="k">Sharing stays deliberate.</span> When something is worth the whole org knowing, you promote it. Until then it is yours, including from the agents.</p>
-      </div>
-    </section>
+    </div>
+  </section>
 
-    <section id="start">
-      <div class="sechead"><span class="kicker">03 · Get started</span><h2>Two commands</h2></div>
+  <section class="band band-next" id="next">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">03 · Where to go next</span><h2>Two ways in</h2></div>
+      <div class="doors">
+        <div class="door lead">
+          <h3>Use it</h3>
+          <p>Run it on your own work. Install the CLI, hand it a seat token, and your agents search the same memory you do. Self-hosted and Apache-2.0, so you can read every line of what it does.</p>
+          <div class="cta">
+            <a class="btn btn-primary" href="#start">Get started</a>
+            <a class="btn" href="/use-cases">Use cases</a>
+          </div>
+        </div>
+        <div class="door">
+          <h3>Work with us</h3>
+          <p>Build it into your project. utxo AG joins consortia as a work-package partner, bringing the vault and the team that wrote it.</p>
+          <div class="cta">
+            <a class="btn" href="/use-cases#fit">Partnering profile</a>
+            <a class="btn" href="/contact">Contact us</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band band-start" id="start">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">04 · Get started</span><h2>Two commands</h2></div>
       <p class="lede">Install the CLI, then hand it your seat token. The onboarding wires up the MCP client you already use.</p>
       <div class="cmd"><span class="p">$</span> pipx install citadel-archive</div>
       <div class="cmd"><span class="p">$</span> citadel onboard</div>
-      <p class="foot-note">Already have a seat? <a href="/login">Sign in</a>. Thinking about a consortium or a joint bid? <a href="/partners">Read the partnering profile</a>.</p>
-    </section>
-  </div>
+      <div class="endrow">
+        <span>Already have a seat? <a href="/login">Sign in</a>.</span>
+        <span>Watch the node on the <a href="/info">live status page</a>.</span>
+        <span>Read the <a href="https://github.com/masumi-network/Citadel">source on GitHub</a>.</span>
+      </div>
+    </div>
+  </section>
 </body>
 </html>
