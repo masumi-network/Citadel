@@ -68,17 +68,6 @@ async def test_stop_evolve_scheduler_handles_none() -> None:
     await server._stop_evolve_scheduler(None)
 
 
-class _FakeProc:
-    def __init__(self, returncode: int = 0) -> None:
-        self.returncode = returncode
-
-    async def wait(self) -> int:
-        return self.returncode
-
-    def terminate(self) -> None:  # pragma: no cover - only on cancel
-        pass
-
-
 class _FakeCitadel:
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
@@ -95,17 +84,49 @@ class _FakeCitadel:
         }
 
 
-async def test_evolve_scheduler_loop_runs_subprocess_then_cognifies(monkeypatch: Any) -> None:
+def _patch_phase1(monkeypatch: Any, *, code: int = 0, raises: bool = False) -> list[bool]:
+    """Replace Phase 1 with a stub and report whether it saw add-only mode.
+
+    Patches scripts.run_railway.run_evolve_in_loop, which kb.server imports by
+    name when the scheduler coroutine starts, so this must be set before the
+    task is created.
+    """
+    from kb.cognee_client import _suppress_inline_cognify
+    import scripts.run_railway as run_railway
+
+    suppressed: list[bool] = []
+
+    async def fake_phase1() -> int:
+        suppressed.append(_suppress_inline_cognify())
+        if raises:
+            raise RuntimeError("phase 1 exploded")
+        return code
+
+    monkeypatch.setattr(run_railway, "run_evolve_in_loop", fake_phase1)
+    return suppressed
+
+
+async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
+    monkeypatch: Any,
+) -> None:
+    """Phase 1 runs in THIS process now, not a subprocess (#88).
+
+    A second process can never open the Kuzu graph: cognee holds an exclusive
+    file lock for the lifetime of whichever process opens it, and that is always
+    the web. github_sync and linear_sync failed on that lock every hour.
+    """
     import kb.server as server
 
-    sub_envs: list[dict[str, Any]] = []
     cognify_calls: list[bool] = []
+    suppressed = _patch_phase1(monkeypatch)
 
-    async def fake_exec(*args: Any, **kwargs: Any) -> _FakeProc:
-        sub_envs.append(kwargs.get("env", {}))
-        return _FakeProc(0)
+    spawned: list[Any] = []
 
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    async def forbidden_exec(*args: Any, **kwargs: Any) -> Any:
+        spawned.append(args)
+        raise AssertionError("the evolve scheduler must not spawn a subprocess")
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", forbidden_exec)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
     task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
@@ -119,27 +140,44 @@ async def test_evolve_scheduler_loop_runs_subprocess_then_cognifies(monkeypatch:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert len(sub_envs) >= 2
-    # Phase 1: heavy stages in a subprocess with cognify disabled (frees the lock).
-    assert sub_envs[0]["CITADEL_RUN_MODE"] == "evolve"
-    assert sub_envs[0]["CITADEL_EVOLVE_COGNIFY_ENABLED"] == "false"
-    # ...and add-only so its per-ingest background cognify never writes Kuzu (#47).
-    assert sub_envs[0]["CITADEL_SUPPRESS_INLINE_COGNIFY"] == "true"
-    # Phase 2: cognify ran in-loop after the subprocess.
+    assert spawned == [], "no subprocess may be spawned"
+    # Phase 1 ran, and saw add-only mode so its per-ingest background cognify
+    # cannot storm the writer lock — what the subprocess env used to express.
+    assert suppressed and all(suppressed)
+    # Phase 2: cognify ran in-loop afterwards.
     assert len(cognify_calls) >= 2
     # The verify canary verdict is recorded for /readyz (#27).
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
 
 
-async def test_evolve_scheduler_loop_cognifies_even_if_subprocess_fails(monkeypatch: Any) -> None:
+async def test_add_only_mode_does_not_leak_outside_the_pass() -> None:
+    """The suppression is scoped to the task tree, never process-wide (#88).
+
+    It used to be an env var on a subprocess. In the web process an env var
+    would make a teammate's ingest arriving mid-pass go add-only too.
+    """
+    from kb.cognee_client import _suppress_inline_cognify, suppress_inline_cognify
+
+    assert _suppress_inline_cognify() is False
+
+    async def observer() -> bool:
+        return _suppress_inline_cognify()
+
+    with suppress_inline_cognify():
+        assert _suppress_inline_cognify() is True
+        # Child tasks created inside the context inherit it...
+        assert await asyncio.create_task(observer()) is True
+
+    assert _suppress_inline_cognify() is False
+    # ...and a task created outside it never sees it.
+    assert await asyncio.create_task(observer()) is False
+
+
+async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(monkeypatch: Any) -> None:
     import kb.server as server
 
     cognify_calls: list[bool] = []
-
-    async def boom_exec(*args: Any, **kwargs: Any) -> _FakeProc:
-        raise RuntimeError("spawn boom")
-
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", boom_exec)
+    _patch_phase1(monkeypatch, raises=True)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
     task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
@@ -153,7 +191,7 @@ async def test_evolve_scheduler_loop_cognifies_even_if_subprocess_fails(monkeypa
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    # A failed stages-subprocess (caught) must not skip the in-loop cognify.
+    # A raising Phase 1 (caught) must not skip the in-loop cognify.
     assert len(cognify_calls) >= 2
 
 
@@ -164,18 +202,14 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
 
     Production ran for days with github_sync and linear_sync failing on the
     Kuzu lock every hour while this logged "stages finished (exit=0)" at INFO.
-    Now the subprocess returns nonzero and the scheduler says so at ERROR.
+    Now a partial failure returns nonzero and the scheduler says so at ERROR.
     """
     import logging
 
     import kb.server as server
 
     cognify_calls: list[bool] = []
-
-    async def fake_exec(*args: Any, **kwargs: Any) -> _FakeProc:
-        return _FakeProc(1)
-
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    _patch_phase1(monkeypatch, code=1)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
     with caplog.at_level(logging.ERROR, logger=server.logger.name):

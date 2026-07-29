@@ -8,6 +8,7 @@ falls back to an in-process pass otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -123,7 +124,14 @@ def _log_result(result: dict[str, Any]) -> None:
     )
 
 
-def run() -> int:
+async def arun() -> int:
+    """The body of :func:`run`, awaitable on the caller's own event loop.
+
+    The evolve scheduler runs this inside the web process's loop (#88), where
+    ``run_async`` is unusable: it falls back to ``asyncio.run``, which raises
+    inside a running loop. Blocking HTTP moves to a thread so the web's request
+    loop is not stalled.
+    """
     dry_run = _bool(os.getenv("CITADEL_SELF_IMPROVE_DRY_RUN"), default=False)
     payload = {"dry_run": dry_run}
     endpoint = _target_endpoint()
@@ -137,7 +145,8 @@ def run() -> int:
             )
             return 1
         logger.info("Starting scheduled self-improvement through %s", endpoint)
-        status_code, result = _post_json(
+        status_code, result = await asyncio.to_thread(
+            _post_json,
             endpoint,
             payload=payload,
             access_key=access_key,
@@ -148,9 +157,7 @@ def run() -> int:
             return 1
     else:
         logger.info("Starting scheduled self-improvement in-process")
-        # run_async shares the evolve chain's single loop so cognee's cached engine
-        # is not bound to a throwaway loop (#69); standalone it is asyncio.run.
-        result = run_async(_run_local(dry_run=dry_run))
+        result = await _run_local(dry_run=dry_run)
 
     if result.get("ok") is False:
         logger.error("Self-improvement pass failed: %s", result)
@@ -158,6 +165,15 @@ def run() -> int:
 
     _log_result(result)
     return 0
+
+
+def run() -> int:
+    """Synchronous entrypoint for the CLI and the standalone cron service.
+
+    run_async shares the evolve chain's single loop so cognee's cached engine
+    is not bound to a throwaway loop (#69); standalone it is asyncio.run.
+    """
+    return run_async(arun())
 
 
 def main() -> None:

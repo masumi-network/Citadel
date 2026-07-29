@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Awaitable
 from typing import Callable
 
 from scripts.stage_loop import run_async, stage_loop
@@ -60,6 +61,12 @@ def _github_sync_stage() -> int:
     return run_github_sync()
 
 
+async def _github_sync_stage_async() -> int:
+    from scripts.run_github_sync import arun
+
+    return await arun()
+
+
 def _skills_refresh_stage() -> int:
     from kb.skills import refresh_skill_catalog
 
@@ -80,17 +87,23 @@ def _self_improve_stage() -> int:
     return run_self_improve()
 
 
+async def _self_improve_stage_async() -> int:
+    from scripts.run_self_improve import arun
+
+    return await arun()
+
+
 def _backup_mirror_stage() -> int:
     from scripts.run_backup_mirror import run as run_backup_mirror
 
     return run_backup_mirror()
 
 
-def _repo_content_sync_stage() -> int:
+async def _repo_content_sync_stage_async() -> int:
     from kb.repo_content_sync import RepoContentSyncer
     from kb.service import Citadel
 
-    result = run_async(RepoContentSyncer(Citadel.from_env()).run())
+    result = await RepoContentSyncer(Citadel.from_env()).run()
     if not result.get("ok"):
         return 1
     if result.get("enabled") is False:
@@ -104,6 +117,10 @@ def _repo_content_sync_stage() -> int:
         result.get("improved"),
     )
     return 0
+
+
+def _repo_content_sync_stage() -> int:
+    return run_async(_repo_content_sync_stage_async())
 
 
 def _cognify_mode(*, verify: bool) -> int:
@@ -212,7 +229,7 @@ def _cognify_stage() -> int:
     return _cognify_mode(verify=False)
 
 
-def _promotion_stage() -> int:
+async def _promotion_stage_async() -> int:
     """Selective seat-node -> Central promotion across every seat (ADR-0005 step 3).
 
     Reuses :class:`kb.promotion.PromotionEngine`, honoring its opt-in
@@ -263,7 +280,7 @@ def _promotion_stage() -> int:
             promoted += result.get("promoted") or 0
         return promoted, failures
 
-    promoted, failures = run_async(_run())
+    promoted, failures = await _run()
     logger.info(
         "Promotion stage finished: seats=%s promoted=%s failures=%s dry_run=%s",
         len(seats),
@@ -275,6 +292,10 @@ def _promotion_stage() -> int:
     if failures and failures == len(seats):
         return 1
     return 0
+
+
+def _promotion_stage() -> int:
+    return run_async(_promotion_stage_async())
 
 
 def pipeline_stages() -> list[tuple[str, bool, Callable[[], int]]]:
@@ -308,7 +329,7 @@ def pipeline_stages() -> list[tuple[str, bool, Callable[[], int]]]:
     ]
 
 
-def _linear_sync_stage() -> int:
+async def _linear_sync_stage_async() -> int:
     """Sync the Linear workspace into Central (+ seat mirrors) for the evolve cron.
 
     No-op (exit 0) when ``CITADEL_LINEAR_API_KEY`` is unset, so the stage is safe
@@ -343,7 +364,11 @@ def _linear_sync_stage() -> int:
         )
         return 0
 
-    return run_async(_run())
+    return await _run()
+
+
+def _linear_sync_stage() -> int:
+    return run_async(_linear_sync_stage_async())
 
 
 def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
@@ -388,6 +413,60 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
             _cognify_stage,
         ),
     ]
+
+
+def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]]:
+    """The evolve stages as awaitables, for running inside the web loop (#88).
+
+    Mirrors :func:`evolve_stages` name-for-name and toggle-for-toggle;
+    ``test_evolve_stage_lists_stay_in_sync`` pins that. ``cognify`` is absent on
+    purpose: the scheduler runs it itself afterwards as Phase 2, which is what
+    the old subprocess expressed by setting CITADEL_EVOLVE_COGNIFY_ENABLED=false.
+    """
+    return [
+        (
+            "github_sync",
+            _bool(os.getenv("CITADEL_EVOLVE_GITHUB_SYNC_ENABLED"), default=True),
+            _github_sync_stage_async,
+        ),
+        (
+            "repo_content_sync",
+            _bool(os.getenv("CITADEL_EVOLVE_REPO_CONTENT_SYNC_ENABLED"), default=True),
+            _repo_content_sync_stage_async,
+        ),
+        (
+            "self_improve",
+            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=True),
+            _self_improve_stage_async,
+        ),
+        (
+            "promotion",
+            _bool(os.getenv("CITADEL_EVOLVE_PROMOTION_ENABLED"), default=True),
+            _promotion_stage_async,
+        ),
+        (
+            "linear_sync",
+            _bool(os.getenv("CITADEL_EVOLVE_LINEAR_SYNC_ENABLED"), default=True),
+            _linear_sync_stage_async,
+        ),
+    ]
+
+
+async def run_evolve_in_loop() -> int:
+    """Run the evolve stages on the caller's loop. The web scheduler's Phase 1.
+
+    Replaces spawning ``python -m scripts.run_railway`` as a subprocess. That
+    subprocess could never succeed for any cognee-touching stage: the web
+    process's cognee Kuzu worker holds an exclusive file lock on
+    ``cognee_graph_kuzu`` for the container's lifetime, so github_sync and
+    linear_sync died on "Could not set lock on file" every single hour (#88,
+    #46). The subprocess existed to free that lock on exit, which was backwards.
+
+    Running here also retires the loop-binding hazard (#69) rather than working
+    around it: one process and one loop means cognee binds its cached engine
+    exactly once.
+    """
+    return await _run_stages_async(evolve_stages_async(), label="Evolve")
 
 
 def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str) -> int:
@@ -440,6 +519,17 @@ def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str
             failed.append(name)
             logger.error("%s stage %s: FAILED with exit code %s", label, name, code)
 
+    return _stage_verdict(label, succeeded, failed, skipped)
+
+
+def _stage_verdict(
+    label: str, succeeded: list[str], failed: list[str], skipped: list[str]
+) -> int:
+    """Log the pass summary and return its exit code.
+
+    Shared by the sync and in-loop stage runners so the #89 rule (any failed
+    stage means a failed pass) cannot drift between the two.
+    """
     logger.info(
         "%s finished: succeeded=%s failed=%s skipped=%s",
         label,
@@ -448,6 +538,50 @@ def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str
         ",".join(skipped) or "none",
     )
     return 1 if failed else 0
+
+
+async def _run_stages_async(
+    stages: list[tuple[str, bool, Callable[[], Awaitable[int]]]], *, label: str
+) -> int:
+    """Run every enabled stage on the CALLER's event loop; continue past failures.
+
+    The in-loop twin of :func:`_run_stages`, used by the web process's evolve
+    scheduler (#88). It cannot reuse the sync version: those runners funnel
+    through ``run_async``, which falls back to ``asyncio.run`` and raises inside
+    a running loop. Running here instead of in a subprocess is the fix for the
+    Kuzu lock, because cognee holds an exclusive OS file lock on the graph for
+    the lifetime of whichever process opens it, and in this deployment that is
+    always the web.
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+    for name, enabled, runner in stages:
+        if not enabled:
+            skipped.append(name)
+            logger.info("%s stage %s: skipped (disabled via env)", label, name)
+            continue
+        logger.info("%s stage %s: starting", label, name)
+        try:
+            code = await runner()
+        except Exception as exc:
+            logger.error(
+                "%s stage %s: FAILED with %s: %s",
+                label,
+                name,
+                exc.__class__.__name__,
+                exc,
+            )
+            failed.append(name)
+            continue
+        if code == 0:
+            succeeded.append(name)
+            logger.info("%s stage %s: ok", label, name)
+        else:
+            failed.append(name)
+            logger.error("%s stage %s: FAILED with exit code %s", label, name, code)
+
+    return _stage_verdict(label, succeeded, failed, skipped)
 
 
 def run_pipeline() -> int:
