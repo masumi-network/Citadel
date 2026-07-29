@@ -179,7 +179,7 @@ def test_google_chat_delivery_posts_sanitized_threaded_message(monkeypatch: Any)
         )
         return FakeResponse()
 
-    monkeypatch.setattr("kb.google_chat.urlopen", fake_urlopen)
+    monkeypatch.setattr("kb.google_chat.open_secure", fake_urlopen)
     delivery = GoogleChatDelivery(
         space_name="spaces/AAA",
         thread_key="citadel-org-digest",

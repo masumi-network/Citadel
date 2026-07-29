@@ -3,6 +3,62 @@
 // Three.js 3D scene was removed in favour of a flat, readable layout with the
 // shared Central dataset pinned at the centre as the largest hub.
 
+// ---- theme, shared with the public pages ----
+// The same storage key and the same rule as info.js: light is the default and
+// prefers-color-scheme is never consulted, so a theme chosen on the landing
+// page carries into the dashboard and back out again. Applied at the top of the
+// file so the attribute lands before anything renders.
+const THEME_KEY = "citadel-info-theme";
+const themeRoot = document.documentElement;
+try {
+  const savedTheme = localStorage.getItem(THEME_KEY);
+  if (savedTheme === "light" || savedTheme === "dark") {
+    themeRoot.setAttribute("data-theme", savedTheme);
+  }
+} catch {
+  // storage blocked — stay on the light default
+}
+
+function currentTheme() {
+  return themeRoot.getAttribute("data-theme") || "light";
+}
+
+// Every .themebtn on the page, so the sidebar toggle and the one in Home's
+// title row stay in step instead of disagreeing about the current theme.
+function initializeThemeToggle() {
+  const buttons = Array.from(document.querySelectorAll(".themebtn"));
+  if (!buttons.length) return;
+
+  function paint() {
+    const dark = currentTheme() === "dark";
+    buttons.forEach((button) => {
+      const icon = button.querySelector(".themebtn-icon");
+      const label = button.querySelector(".themebtn-label");
+      if (icon) icon.textContent = dark ? "☾" : "☀";
+      if (label) label.textContent = dark ? "Dark" : "Light";
+      button.setAttribute("aria-pressed", dark ? "true" : "false");
+      button.title = dark ? "Switch to the light theme" : "Switch to the dark theme";
+    });
+  }
+
+  paint();
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const next = currentTheme() === "dark" ? "light" : "dark";
+      themeRoot.setAttribute("data-theme", next);
+      try {
+        localStorage.setItem(THEME_KEY, next);
+      } catch {
+        // storage blocked — the choice holds for this page only
+      }
+      paint();
+      // Node colours are resolved from the CSS tokens once and memoised; drop
+      // the cache or the canvas keeps painting the theme it booted in.
+      colorCache = null;
+    });
+  });
+}
+
 const state = {
   snapshot: null,
   nodes: new Map(),
@@ -21,6 +77,11 @@ const state = {
   obsidianSources: null,
   accessSnapshot: null,
   settingsSnapshot: null,
+  // Home and Review read these; whichever fetch lands first paints, the rest
+  // fill in. Neither view blocks on the slowest request.
+  meSummary: null,
+  promotions: [],
+  sources: [],
   auditFilter: "all",
   // Knowledge Mesh is the durable view; Vault Activity is restart-transient and
   // therefore empty on every fresh boot/redeploy — a bad first impression.
@@ -132,10 +193,13 @@ const pageButtons = Array.from(document.querySelectorAll("[data-page-target]"));
 const pages = Array.from(document.querySelectorAll("[data-page]"));
 const roleOrder = { reader: 1, writer: 2, admin: 3 };
 
-// Grouped navigation: the sidebar shows 6 top-level items; merged groups expose
-// their sub-pages as a content sub-tab bar that drives the same setPage()
-// switching. Each group's `nav` is the sidebar button (data-page-target) that
-// represents it, so that button stays lit on any of the group's sub-pages.
+// Grouped navigation: the sidebar shows 4 top-level items (Home, Search,
+// Review, Admin); merged groups expose their sub-pages as a content sub-tab bar
+// that drives the same setPage() switching. Each group's `nav` is the sidebar
+// button (data-page-target) that represents it, so that button stays lit on any
+// of the group's sub-pages. The knowledge, events and ingest groups no longer
+// have a sidebar button — they are reached by route or by an in-page button, and
+// their sub-tabs still work; nothing lights up in the sidebar, which is correct.
 const NAV_GROUPS = [
   { nav: "knowledge", tabs: [
     { page: "knowledge", label: "Graph" },
@@ -663,8 +727,10 @@ async function loadSession() {
 function initialPage() {
   const hash = window.location.hash.replace("#", "");
   if (pages.some((page) => page.dataset.page === hash)) return hash;
-  if (state.seatSlug) return "home";
-  return state.role === "admin" ? "overview" : "search";
+  // Home for everyone, including admins and seat-less tokens: Overview is no
+  // longer a nav entry and is no longer routed to. Home already has a seat-less
+  // state, so nobody lands on a page they cannot use.
+  return "home";
 }
 
 function setPage(name) {
@@ -701,6 +767,9 @@ function setPage(name) {
   }
   if (resolvedName === "home") {
     loadSeatHome();
+  }
+  if (resolvedName === "review") {
+    loadReview();
   }
   if (resolvedName === "agents" || resolvedName === "audit") {
     loadAccess();
@@ -785,6 +854,7 @@ function renderSnapshot(snapshot) {
   renderTimeline(snapshot);
   renderOverviewAnalytics(snapshot);
   renderActivityAnalytics(snapshot);
+  renderHome();
 
   indexList.innerHTML = "";
   if (!snapshot.indexes.length) {
@@ -2263,7 +2333,7 @@ function updateRealGraphEmpty() {
         reason.startsWith("graph_engine_error");
       text.textContent = degraded
         ? `Knowledge Mesh unavailable — showing seat presence only. (${reason})`
-        : "Cognee has not produced graph data yet. Ingest notes or run source sync, then check back.";
+        : "The graph has no data yet. Ingest notes or run source sync, then check back.";
     }
   }
 }
@@ -2603,24 +2673,33 @@ async function loadConflicts() {
 }
 
 async function loadPromotionQueue() {
-  if (!dashboardPromotionList) return;
+  // No early return on the legacy dashboard list: Review reads state.promotions,
+  // so this has to run whether or not the old Overview markup is still around.
   if (dashboardPromotionStatus) {
     dashboardPromotionStatus.textContent = "Loading";
     dashboardPromotionStatus.className = "status-chip status-standby";
   }
   try {
     const response = await api("/api/promotion/pending?status=pending");
-    renderPromotionQueue(response.items || []);
+    state.promotions = response.items || [];
+    if (dashboardPromotionList) renderPromotionQueue(state.promotions);
+    renderHome();
+    renderReview();
     const count = response.count || 0;
     if (dashboardPromotionStatus) {
       dashboardPromotionStatus.textContent = `${count} pending`;
       dashboardPromotionStatus.className = `status-chip ${count ? "status-enabled" : "status-standby"}`;
     }
   } catch (error) {
-    dashboardPromotionList.innerHTML = "";
-    dashboardPromotionList.append(
-      emptyState("Could not load promotion queue", error.message),
-    );
+    state.promotions = [];
+    renderHome();
+    renderReview();
+    if (dashboardPromotionList) {
+      dashboardPromotionList.innerHTML = "";
+      dashboardPromotionList.append(
+        emptyState("Could not load promotion queue", error.message),
+      );
+    }
     if (dashboardPromotionStatus) {
       dashboardPromotionStatus.textContent = "Error";
       dashboardPromotionStatus.className = "status-chip status-error";
@@ -2647,7 +2726,7 @@ function renderPromotionQueue(items = []) {
       <p>${escapeHtml(item.reference_reason || item.reference_status || "review")}</p>
     `;
     row.append(meta);
-    if (canUse("writer")) {
+    if (canUse("admin")) {
       const approve = document.createElement("button");
       approve.className = "secondary-button compact-button";
       approve.type = "button";
@@ -2722,6 +2801,7 @@ async function loadGithubSync() {
     }
     renderKnowledgeDailyUpdate(status);
     renderKnowledgeSources();
+    renderHome();
   } catch (error) {
     state.githubSync = null;
     githubSyncStatus.textContent = "Error";
@@ -2896,95 +2976,353 @@ function renderKnowledgeSources(error = null) {
   });
 }
 
-async function loadSeatHome() {
-  const status = document.getElementById("homeStatus");
-  const seatEl = document.getElementById("homeSeatSlug");
-  const nodeLabelEl = document.getElementById("homeNodeLabel");
-  const docEl = document.getElementById("homeDocCount");
-  const pendingEl = document.getElementById("homePendingPromotions");
-  const lastEl = document.getElementById("homeLastIngest");
-  const emptyHint = document.getElementById("homeEmptyHint");
-  const checklist = document.getElementById("homeChecklist");
-  const activityList = document.getElementById("homeActivityList");
-  const title = document.getElementById("homeTitle");
-  if (!status || !checklist || !activityList) return;
+// ---------- Home and Review: shared "needs you" material ----------
+//
+// Both views answer the same question from the same two lists, so the shaping
+// lives here once. Home shows a capped version; Review shows all of it and is
+// the only place that renders Approve and Reject.
 
-  if (!state.seatSlug) {
-    status.textContent = "No seat";
-    status.className = "status-chip status-standby";
-    if (title) title.textContent = "Workspace home";
-    if (seatEl) seatEl.textContent = "—";
-    if (nodeLabelEl) nodeLabelEl.textContent = "service account / no private Node";
-    if (docEl) docEl.textContent = "—";
-    if (pendingEl) pendingEl.textContent = "—";
-    if (lastEl) lastEl.textContent = "—";
-    if (emptyHint) emptyHint.hidden = true;
-    checklist.innerHTML = "";
-    activityList.innerHTML = "";
-    activityList.append(
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+function pendingPromotions() {
+  return Array.isArray(state.promotions) ? state.promotions : [];
+}
+
+// "Failing" is inferred, not reported: /api/sources carries no per-source error
+// field. What it does carry is open conflicts, and, for the GitHub org source, a
+// security scan that blocked the last run. Those are the two real signals.
+function failingSources() {
+  const rows = [];
+  (state.sources || []).forEach((source) => {
+    const conflicts = Number(source.open_conflicts || 0);
+    const metadata = source.metadata || {};
+    const scan = metadata.last_security_scan || {};
+    const name = source.name || source.id || "source";
+    if (conflicts > 0) {
+      rows.push({
+        id: `conflict:${source.id}`,
+        title: name,
+        body: `${conflicts} open conflict${conflicts === 1 ? "" : "s"} to resolve`,
+        target: "conflicts",
+      });
+    }
+    if (scan.blocked === true) {
+      rows.push({
+        id: `scan:${source.id}`,
+        title: name,
+        body: `Sync blocked by the security scan (${scan.finding_count || 0} finding${
+          scan.finding_count === 1 ? "" : "s"
+        }, highest ${scan.highest_severity || "unknown"})`,
+        target: "sources",
+      });
+    }
+  });
+  return rows;
+}
+
+function waitingOnYouCount() {
+  return pendingPromotions().length + failingSources().length;
+}
+
+function promotionMetaRows(item) {
+  const rows = [["Seat", item.seat_slug || "unknown"]];
+  // No secret-scan runs over a promotion candidate. What the queue does carry is
+  // the enrichment sensitivity flag, and it is labelled as exactly that rather
+  // than dressed up as a scan result.
+  rows.push([
+    "Sensitivity",
+    item.sensitive === true ? "flagged" : item.sensitive === false ? "clear" : "not assessed",
+  ]);
+  rows.push(["Reference", item.reference_status || "unreviewed"]);
+  const hints = Array.isArray(item.repo_hints) ? item.repo_hints.length : 0;
+  rows.push(["Notes", `1 candidate${hints ? ` · ${hints} repo hint${hints === 1 ? "" : "s"}` : ""}`]);
+  return rows;
+}
+
+function needsRow({ title, body, meta = [], chip = null }) {
+  const row = document.createElement("div");
+  row.className = "needs-item";
+  const main = document.createElement("div");
+  main.className = "needs-main";
+  main.innerHTML = `
+    <strong>${escapeHtml(title)}</strong>
+    <p>${escapeHtml(body)}</p>
+    ${
+      meta.length
+        ? `<dl class="needs-meta">${meta
+            .map(
+              ([label, value]) =>
+                `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`,
+            )
+            .join("")}</dl>`
+        : ""
+    }
+  `;
+  row.append(main);
+  const actions = document.createElement("div");
+  actions.className = "needs-actions";
+  if (chip) {
+    const span = document.createElement("span");
+    span.className = `status-chip ${chip.tone || "status-standby"}`;
+    span.textContent = chip.label;
+    actions.append(span);
+  }
+  row.append(actions);
+  return { row, actions };
+}
+
+// Approve and Reject only for admins: the endpoints behind them require admin +
+// sources:sync, so rendering them for a writer would offer a button that always
+// 403s. Writers still see the queue, which is the point of showing it.
+function promotionNeedsRow(item) {
+  const { row, actions } = needsRow({
+    title: `Promotion from ${item.seat_slug || "a seat"}`,
+    body: item.preview || item.reference_reason || "Pending candidate",
+    meta: promotionMetaRows(item),
+    chip: canUse("admin") ? null : { label: "waiting on an admin" },
+  });
+  if (canUse("admin")) {
+    const approve = document.createElement("button");
+    approve.className = "primary-button compact-button needs-approve";
+    approve.type = "button";
+    approve.textContent = "Approve";
+    approve.addEventListener("click", () => decidePromotionItem(item.id, "approve"));
+    const reject = document.createElement("button");
+    reject.className = "secondary-button compact-button";
+    reject.type = "button";
+    reject.textContent = "Reject";
+    reject.addEventListener("click", () => decidePromotionItem(item.id, "reject"));
+    actions.append(approve, reject);
+  }
+  return row;
+}
+
+function sourceNeedsRow(source) {
+  const { row, actions } = needsRow({
+    title: source.title,
+    body: source.body,
+    chip: { label: "failing", tone: "status-error" },
+  });
+  const open = document.createElement("button");
+  open.className = "secondary-button compact-button";
+  open.type = "button";
+  open.textContent = "Open";
+  open.addEventListener("click", () => setPage(source.target));
+  actions.append(open);
+  return row;
+}
+
+function renderNeedsList(container, { limit = null, emptyTitle, emptyBody } = {}) {
+  if (!container) return;
+  container.innerHTML = "";
+  const promotions = pendingPromotions();
+  const sources = failingSources();
+  const rows = [
+    ...promotions.map((item) => promotionNeedsRow(item)),
+    ...sources.map((source) => sourceNeedsRow(source)),
+  ];
+  if (!rows.length) {
+    // A real empty state: nothing is waiting, said plainly, with no card
+    // pretending there is something to read.
+    const empty = document.createElement("p");
+    empty.className = "needs-clear";
+    empty.textContent = emptyBody || "Nothing is waiting on you.";
+    if (emptyTitle) empty.textContent = `${emptyTitle} ${empty.textContent}`;
+    container.append(empty);
+    return;
+  }
+  const shown = limit ? rows.slice(0, limit) : rows;
+  shown.forEach((row) => container.append(row));
+  if (limit && rows.length > shown.length) {
+    const more = document.createElement("button");
+    more.className = "secondary-button compact-button needs-more";
+    more.type = "button";
+    more.textContent = `See all ${rows.length} in Review`;
+    more.addEventListener("click", () => setPage("review"));
+    container.append(more);
+  }
+}
+
+// ---------- Home ----------
+
+function homeCapturedThisWeek() {
+  const events = (state.snapshot && state.snapshot.events) || [];
+  const cutoff = Date.now() - WEEK_MS;
+  return events.filter((event) => {
+    if (event.type !== "ingest") return false;
+    const at = Date.parse(event.created_at || "");
+    return !Number.isNaN(at) && at >= cutoff;
+  }).length;
+}
+
+function homeReadableCount() {
+  const stats = (state.snapshot && state.snapshot.stats) || {};
+  if (stats.documents !== undefined && stats.documents !== null) return Number(stats.documents);
+  return Number((state.meSummary && state.meSummary.document_count) || 0);
+}
+
+function renderHomeRecent() {
+  const list = document.getElementById("homeActivityList");
+  if (!list) return;
+  list.innerHTML = "";
+  const meshEvents = (state.snapshot && state.snapshot.events) || [];
+  const events = meshEvents.length
+    ? meshEvents
+    : (state.meSummary && state.meSummary.recent_activity) || [];
+  if (!events.length) {
+    list.append(
       emptyState(
-        "No seat on this token",
-        "Ask an admin for a seat-bound token to get a private Node home.",
+        "Nothing yet",
+        "Captures, searches, and syncs land here as they happen.",
       ),
     );
     return;
   }
+  events.slice(0, 10).forEach((event) => {
+    const row = document.createElement("div");
+    row.className = "entity-item";
+    row.innerHTML = `
+      <div>
+        <strong>${escapeHtml(humanizeToken(event.type || "event"))}</strong>
+        <p>${escapeHtml(event.message || event.dataset || "")}</p>
+      </div>
+      <span class="status-chip status-standby">${escapeHtml(formatDate(event.created_at))}</span>
+    `;
+    list.append(row);
+  });
+}
 
+// Pure render from whatever state has arrived so far. Home is the first page
+// most seats open, so it paints immediately and fills in as each fetch lands
+// rather than waiting on the slowest one.
+function renderHome() {
+  const status = document.getElementById("homeStatus");
+  if (!status) return;
+  const summary = state.meSummary;
+  const copy = document.getElementById("homeCopy");
+  const title = document.getElementById("homeTitle");
+
+  if (title) {
+    title.textContent = state.seatSlug
+      ? state.nodeLabel || "Your Node"
+      : "Workspace home";
+  }
+  if (copy) {
+    copy.textContent = state.seatSlug
+      ? `seat ${state.seatSlug} · private by default, Central still searchable`
+      : "No seat on this token. Central is searchable; there is no private Node.";
+  }
+
+  const syncedAt = document.getElementById("homeSyncedAt");
+  if (syncedAt) {
+    const last = state.githubSync && state.githubSync.last_checked_at;
+    syncedAt.textContent = last ? `Last sync ${formatDate(last)}` : "Never synced";
+  }
+
+  const errors = Number(((state.snapshot || {}).stats || {}).errors || 0);
+  if (!state.snapshot) {
+    status.textContent = "Loading";
+    status.className = "status-chip status-standby";
+  } else if (errors > 0) {
+    status.textContent = `${errors} error${errors === 1 ? "" : "s"}`;
+    status.className = "status-chip status-error";
+  } else {
+    status.textContent = "Healthy";
+    status.className = "status-chip status-enabled";
+  }
+
+  const readable = document.getElementById("homeReadable");
+  if (readable) readable.textContent = String(homeReadableCount());
+  const captured = document.getElementById("homeCapturedWeek");
+  if (captured) captured.textContent = String(homeCapturedThisWeek());
+  const waiting = document.getElementById("homeWaiting");
+  const waitingCard = document.getElementById("homeWaitingCard");
+  const waitingCount = waitingOnYouCount();
+  if (waiting) waiting.textContent = String(waitingCount);
+  // The third number is the only one that is ever coloured.
+  if (waitingCard) waitingCard.classList.toggle("is-waiting", waitingCount > 0);
+
+  renderNeedsList(document.getElementById("homeNeedsList"), {
+    limit: 5,
+    emptyBody: summary && summary.empty
+      ? "Nothing is waiting on you. Your Node is still empty, so capture something or search Central."
+      : "Nothing is waiting on you.",
+  });
+  renderHomeRecent();
+}
+
+async function loadSeatHome() {
+  if (!document.getElementById("homeStatus")) return;
+  renderHome();
+  try {
+    state.meSummary = await api("/api/me/summary");
+  } catch (error) {
+    state.meSummary = null;
+    showToast(error.message || "Could not load your Node summary", true);
+  }
+  renderHome();
+}
+
+// ---------- Review ----------
+
+async function loadReview() {
+  const status = document.getElementById("reviewStatus");
+  if (!status) return;
   status.textContent = "Loading";
   status.className = "status-chip status-standby";
-  try {
-    const summary = await api("/api/me/summary");
-    if (title) title.textContent = summary.node_label || `Seat ${summary.seat_slug}`;
-    if (seatEl) seatEl.textContent = summary.seat_slug || state.seatSlug;
-    if (nodeLabelEl) {
-      nodeLabelEl.textContent = summary.node_dataset || `seat:${summary.seat_slug}`;
-    }
-    if (docEl) docEl.textContent = String(summary.document_count ?? 0);
-    if (pendingEl) pendingEl.textContent = String(summary.pending_promotions ?? 0);
-    if (lastEl) {
-      lastEl.textContent = summary.last_ingest_at
-        ? formatDate(summary.last_ingest_at)
-        : "Never";
-    }
-    if (emptyHint) emptyHint.hidden = !summary.empty;
-    checklist.innerHTML = "";
-    (summary.checklist || []).forEach((item) => {
-      const li = document.createElement("li");
-      li.className = item.done ? "seat-check done" : "seat-check";
-      li.innerHTML = `<span class="seat-check-mark" aria-hidden="true">${item.done ? "✓" : "○"}</span><span>${escapeHtml(item.label)}</span>`;
-      checklist.append(li);
-    });
-    activityList.innerHTML = "";
-    const events = summary.recent_activity || [];
-    if (!events.length) {
-      activityList.append(
-        emptyState(
-          "No Node activity yet",
-          "Capture from your IDE hooks or paste a note — writes land on your Node only.",
-        ),
-      );
+  await Promise.all([loadPromotionQueue(), loadSources()]);
+  renderReview();
+}
+
+function renderReview() {
+  const status = document.getElementById("reviewStatus");
+  if (!status) return;
+  const pending = pendingPromotions().length;
+  const failing = failingSources().length;
+  const total = pending + failing;
+  status.textContent = total ? `${total} to review` : "All clear";
+  status.className = `status-chip ${total ? "status-standby" : "status-enabled"}`;
+
+  const queue = document.getElementById("reviewQueueList");
+  if (queue) {
+    queue.innerHTML = "";
+    const items = pendingPromotions();
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "needs-clear";
+      empty.textContent = "No promotions are waiting for a decision.";
+      queue.append(empty);
     } else {
-      events.forEach((event) => {
-        const row = document.createElement("div");
-        row.className = "entity-item";
-        row.innerHTML = `
-          <div>
-            <strong>${escapeHtml(event.type || "event")}</strong>
-            <p>${escapeHtml(event.message || event.dataset || "")}</p>
-          </div>
-          <span class="status-chip status-standby">${escapeHtml(formatDate(event.created_at))}</span>
-        `;
-        activityList.append(row);
-      });
+      items.forEach((item) => queue.append(promotionNeedsRow(item)));
     }
-    status.textContent = summary.empty ? "Empty Node" : "Ready";
-    status.className = `status-chip ${summary.empty ? "status-standby" : "status-enabled"}`;
-  } catch (error) {
-    status.textContent = "Error";
-    status.className = "status-chip status-error";
-    activityList.innerHTML = "";
-    activityList.append(emptyState("Could not load seat home", error.message || "Try refresh."));
   }
+
+  const sources = document.getElementById("reviewSourceList");
+  if (sources) {
+    sources.innerHTML = "";
+    const rows = failingSources();
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "needs-clear";
+      empty.textContent = "Every connected source synced without an error.";
+      sources.append(empty);
+    } else {
+      rows.forEach((source) => sources.append(sourceNeedsRow(source)));
+    }
+  }
+}
+
+// Every source, for the failing-source lists on Home and Review. The Sources
+// page keeps its own narrower obsidian_vault fetch.
+async function loadSources() {
+  try {
+    const payload = await api("/api/sources");
+    state.sources = payload.sources || [];
+  } catch {
+    state.sources = [];
+  }
+  renderHome();
+  renderReview();
 }
 
 async function loadAccess() {
@@ -3998,6 +4336,71 @@ document.getElementById("ingestForm").addEventListener("submit", async (event) =
   }
 });
 
+// ---------- Search ----------
+//
+// Scope chips map to the dataset the server queries; type chips map to
+// doc_type filters. Both go on the same /search request the app already made,
+// so nothing about the API contract changes.
+const searchFilters = { scope: "all", types: new Set() };
+
+function searchScopeDataset() {
+  if (searchFilters.scope === "central") {
+    // Prefer what the session says this caller can search over the hardcoded
+    // name, so a deployment whose Central dataset is not "masumi-network" still
+    // scopes correctly instead of 403ing on the allowlist.
+    const fromSession = (state.searchDatasets || []).find(
+      (name) =>
+        typeof name === "string" &&
+        !name.startsWith(SEAT_DATASET_PREFIX) &&
+        name !== "session-traces",
+    );
+    return fromSession || CENTRAL_DATASET;
+  }
+  if (searchFilters.scope === "node") {
+    return state.seatSlug ? `${SEAT_DATASET_PREFIX}${state.seatSlug}` : null;
+  }
+  return null;
+}
+
+function initializeSearchFilters() {
+  const scopeChips = Array.from(document.querySelectorAll("[data-search-scope]"));
+  scopeChips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      // "My Node only" is meaningless without a seat, so it says so instead of
+      // quietly searching everything.
+      if (chip.dataset.searchScope === "node" && !state.seatSlug) {
+        showToast("This token has no seat, so there is no private Node to search.", true);
+        return;
+      }
+      searchFilters.scope = chip.dataset.searchScope;
+      scopeChips.forEach((other) => {
+        const on = other === chip;
+        other.classList.toggle("is-on", on);
+        other.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      rerunSearchIfAnswered();
+    });
+  });
+
+  Array.from(document.querySelectorAll("[data-search-type]")).forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const value = chip.dataset.searchType;
+      const on = !searchFilters.types.has(value);
+      if (on) searchFilters.types.add(value);
+      else searchFilters.types.delete(value);
+      chip.classList.toggle("is-on", on);
+      chip.setAttribute("aria-pressed", on ? "true" : "false");
+      rerunSearchIfAnswered();
+    });
+  });
+}
+
+function rerunSearchIfAnswered() {
+  const input = document.getElementById("searchQuery");
+  const form = document.getElementById("searchForm");
+  if (form && input && input.value.trim()) form.requestSubmit();
+}
+
 document.getElementById("searchForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -4006,13 +4409,10 @@ document.getElementById("searchForm").addEventListener("submit", async (event) =
   const error = document.getElementById("searchError");
   const results = document.getElementById("searchResults");
   const queryInput = form.querySelector("[name='query']");
-  const topKInput = form.querySelector("[name='topK']");
   const query = String(formData.get("query") || "").trim();
-  const topK = Number.parseInt(String(formData.get("topK") || "10"), 10) || 10;
   error.textContent = "";
   results.innerHTML = "";
   queryInput.setAttribute("aria-invalid", "false");
-  topKInput.setAttribute("aria-invalid", "false");
   if (!query) {
     error.textContent = "Enter a search query.";
     queryInput.setAttribute("aria-invalid", "true");
@@ -4020,37 +4420,31 @@ document.getElementById("searchForm").addEventListener("submit", async (event) =
     setSearchStatus("Idle");
     return;
   }
-  if (topK < 1 || topK > 100) {
-    error.textContent = "Top K must be between 1 and 100.";
-    topKInput.setAttribute("aria-invalid", "true");
-    topKInput.focus();
-    setSearchStatus("Check limit", "status-error");
-    return;
-  }
-  setBusy(button, true, { idle: "Search vault", loading: "Searching" });
+  setBusy(button, true, { idle: "Search", loading: "Searching" });
   setSearchStatus("Searching", "status-standby");
   results.append(searchLoadingState());
   try {
+    const body = { query, top_k: 10 };
+    const dataset = searchScopeDataset();
+    if (dataset) body.dataset = dataset;
+    if (searchFilters.types.size) body.types = Array.from(searchFilters.types);
     const response = await api("/search", {
       method: "POST",
-      body: JSON.stringify({
-        query,
-        dataset: String(formData.get("dataset") || "").trim() || null,
-        top_k: topK,
-      }),
+      body: JSON.stringify(body),
     });
     const returned = response.results || [];
     setSearchStatus(returned.length ? `${returned.length} result${returned.length === 1 ? "" : "s"}` : "No results", returned.length ? "status-enabled" : "status-standby");
     renderSearchResults(returned, response);
     await loadMesh(false);
   } catch (err) {
+
     results.innerHTML = "";
     results.append(searchErrorState(err.message));
     const retry = results.querySelector("[data-search-retry]");
     if (retry) retry.addEventListener("click", () => form.requestSubmit());
     setSearchStatus("Failed", "status-error");
   } finally {
-    setBusy(button, false, { idle: "Search vault", loading: "Searching" });
+    setBusy(button, false, { idle: "Search", loading: "Searching" });
   }
 });
 
@@ -4128,6 +4522,110 @@ document.getElementById("upgradeButton").addEventListener("click", async (event)
   }
 });
 
+// Central first, then shared traces, then Node — the same order and the same
+// labels as `_render_search` in kb/cli.py, so the web and the CLI teach one
+// mental model. The server does the splitting (`sections` on the /search
+// payload); this only renders it.
+const SEARCH_SECTION_ORDER = ["central", "session_traces", "node"];
+const SEARCH_SECTION_LABELS = {
+  central: "Central",
+  session_traces: "Session traces (reference-only, verify before acting)",
+  node: "Node",
+};
+
+function searchResultCard(result, index) {
+  const item = document.createElement("article");
+  item.className = "result-item citation-card";
+  const feedbackId = findFeedbackId(result);
+  const envelope = resultEnvelope(result);
+  const provenance = resultProvenance(result);
+  const metaRows = resultMetaRows(result);
+  const documentEndpoint = safeDocumentEndpoint(result);
+  const sourceUrl = safeExternalUrl(provenance.source_url);
+  const drilldown = envelope.retrieval?.document_drilldown_available === true;
+  const rank = envelope.rank || index + 1;
+  const datasetName = envelope.dataset || result?.dataset || "";
+  const sourceBadge = datasetSourceBadge(datasetName);
+  // Score is whatever the retrieval layer attached; it is frequently absent, so
+  // the rank is shown either way rather than printing a hollow "score: null".
+  const score =
+    typeof result?.score === "number" && Number.isFinite(result.score)
+      ? result.score.toFixed(3)
+      : null;
+  const trust = envelope.trust || envelope.trust_tier || "unattested";
+  const sourceLabel =
+    provenance.source || provenance.path || datasetName || "unknown source";
+  item.innerHTML = `
+    <div class="result-header">
+      <div>
+        <div class="result-meta">#${escapeHtml(rank)} · ${escapeHtml(sourceLabel)}</div>
+        <strong>${escapeHtml(resultTitle(result, index))}</strong>
+      </div>
+      <div class="result-trust-chips" aria-label="Retrieval status">
+        <span class="status-chip source-badge source-badge-${escapeHtml(sourceBadge.kind)}">${escapeHtml(sourceBadge.label)}</span>
+        <span class="status-chip">${escapeHtml(score ? `score ${score}` : `rank ${rank}`)}</span>
+        <span class="status-chip">${escapeHtml(`trust: ${trust}`)}</span>
+        <span class="status-chip ${drilldown ? "status-enabled" : ""}">${drilldown ? "Document" : "Chunk"}</span>
+      </div>
+    </div>
+    <p class="result-summary">${escapeHtml(resultBodyText(result))}</p>
+    ${
+      metaRows.length
+        ? `<dl class="result-provenance">${metaRows
+            .map(
+              ([label, value]) => `
+                <div>
+                  <dt>${escapeHtml(label)}</dt>
+                  <dd>${escapeHtml(value)}</dd>
+                </div>
+              `
+            )
+            .join("")}</dl>`
+        : ""
+    }
+    <div class="result-retrieval">
+      <span class="citation-required">Citation required before acting</span>
+      ${
+        sourceUrl
+          ? `<a class="result-source-url" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(sourceUrl)}</a>`
+          : provenance.source_url
+            ? `<span class="result-source-url">${escapeHtml(provenance.source_url)}</span>`
+            : ""
+      }
+    </div>
+    <details class="result-raw">
+      <summary>Show raw result</summary>
+      <pre class="result-body">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+    </details>
+  `;
+  const actions = document.createElement("div");
+  actions.className = "result-actions";
+  const previewPanel = document.createElement("div");
+  previewPanel.className = "result-document-preview";
+  previewPanel.hidden = true;
+  if (documentEndpoint) {
+    const action = document.createElement("button");
+    action.className = "secondary-button result-document-link";
+    action.type = "button";
+    action.textContent = "Preview source";
+    action.addEventListener("click", () => loadDocumentPreview(action, documentEndpoint, previewPanel));
+    actions.append(action);
+  }
+  if (feedbackId) {
+    const action = document.createElement("button");
+    action.className = "secondary-button result-feedback-button";
+    action.type = "button";
+    action.textContent = "Use for feedback";
+    action.addEventListener("click", () => fillFeedbackForm(feedbackId));
+    actions.append(action);
+  }
+  if (actions.children.length) {
+    item.append(actions);
+  }
+  item.append(previewPanel);
+  return item;
+}
+
 function renderSearchResults(results, response = {}) {
   const container = document.getElementById("searchResults");
   container.innerHTML = "";
@@ -4135,88 +4633,55 @@ function renderSearchResults(results, response = {}) {
     container.append(searchEmptyState(response));
     return;
   }
-  results.slice(0, 8).forEach((result, index) => {
-    const item = document.createElement("article");
-    item.className = "result-item citation-card";
-    const feedbackId = findFeedbackId(result);
-    const envelope = resultEnvelope(result);
-    const provenance = resultProvenance(result);
-    const metaRows = resultMetaRows(result);
-    const documentEndpoint = safeDocumentEndpoint(result);
-    const sourceUrl = safeExternalUrl(provenance.source_url);
-    const drilldown = envelope.retrieval?.document_drilldown_available === true;
-    const rank = envelope.rank || index + 1;
-    const datasetName = envelope.dataset || result?.dataset || "";
-    const sourceBadge = datasetSourceBadge(datasetName);
-    item.innerHTML = `
-      <div class="result-header">
-        <div>
-          <div class="result-meta">Citation ${escapeHtml(rank)} · ${escapeHtml(datasetName || "default dataset")}</div>
-          <strong>${escapeHtml(resultTitle(result, index))}</strong>
-        </div>
-        <div class="result-trust-chips" aria-label="Retrieval status">
-          <span class="status-chip source-badge source-badge-${escapeHtml(sourceBadge.kind)}">${escapeHtml(sourceBadge.label)}</span>
-          <span class="status-chip status-standby">Untrusted context</span>
-          <span class="status-chip ${drilldown ? "status-enabled" : ""}">${drilldown ? "Document" : "Chunk"}</span>
-        </div>
-      </div>
-      <p class="result-summary">${escapeHtml(resultBodyText(result))}</p>
-      ${
-        metaRows.length
-          ? `<dl class="result-provenance">${metaRows
-              .map(
-                ([label, value]) => `
-                  <div>
-                    <dt>${escapeHtml(label)}</dt>
-                    <dd>${escapeHtml(value)}</dd>
-                  </div>
-                `
-              )
-              .join("")}</dl>`
-          : ""
-      }
-      <div class="result-retrieval">
-        <span class="citation-required">Citation required before acting</span>
-        ${
-          sourceUrl
-            ? `<a class="result-source-url" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(sourceUrl)}</a>`
-            : provenance.source_url
-              ? `<span class="result-source-url">${escapeHtml(provenance.source_url)}</span>`
-              : ""
-        }
-      </div>
-      <details class="result-raw">
-        <summary>Show raw result</summary>
-        <pre class="result-body">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
-      </details>
-    `;
-    const actions = document.createElement("div");
-    actions.className = "result-actions";
-    const previewPanel = document.createElement("div");
-    previewPanel.className = "result-document-preview";
-    previewPanel.hidden = true;
-    if (documentEndpoint) {
-      const action = document.createElement("button");
-      action.className = "secondary-button result-document-link";
-      action.type = "button";
-      action.textContent = "Preview source";
-      action.addEventListener("click", () => loadDocumentPreview(action, documentEndpoint, previewPanel));
-      actions.append(action);
-    }
-    if (feedbackId) {
-      const action = document.createElement("button");
-      action.className = "secondary-button result-feedback-button";
-      action.type = "button";
-      action.textContent = "Use for feedback";
-      action.addEventListener("click", () => fillFeedbackForm(feedbackId));
-      actions.append(action);
-    }
-    if (actions.children.length) {
-      item.append(actions);
-    }
-    item.append(previewPanel);
-    container.append(item);
+
+  const sections = response.sections;
+  const grouped =
+    sections && typeof sections === "object"
+      ? SEARCH_SECTION_ORDER.filter((key) => (sections[key] || []).length)
+      : [];
+
+  if (!grouped.length) {
+    // No sections on the payload (older server, or every hit sat outside the
+    // three known datasets): fall back to one flat list rather than hiding hits.
+    results.slice(0, 10).forEach((result, index) => {
+      container.append(searchResultCard(result, index));
+    });
+    return;
+  }
+
+  let index = 0;
+  grouped.forEach((key) => {
+    const group = document.createElement("section");
+    group.className = "result-group";
+    const heading = document.createElement("h3");
+    heading.className = "result-group-title";
+    heading.textContent = `${SEARCH_SECTION_LABELS[key]} · ${sections[key].length}`;
+    group.append(heading);
+    sections[key].forEach((result) => {
+      group.append(searchResultCard(result, index));
+      index += 1;
+    });
+    container.append(group);
   });
+
+  // Anything the server could not place in a section still has to be shown; a
+  // silently dropped hit is worse than an extra group.
+  const placed = new Set();
+  grouped.forEach((key) => sections[key].forEach((hit) => placed.add(hit)));
+  const rest = results.filter((hit) => !placed.has(hit));
+  if (rest.length) {
+    const group = document.createElement("section");
+    group.className = "result-group";
+    const heading = document.createElement("h3");
+    heading.className = "result-group-title";
+    heading.textContent = `Other · ${rest.length}`;
+    group.append(heading);
+    rest.forEach((result) => {
+      group.append(searchResultCard(result, index));
+      index += 1;
+    });
+    container.append(group);
+  }
 }
 
 window.addEventListener("resize", () => {
@@ -4224,8 +4689,63 @@ window.addEventListener("resize", () => {
   resizeCanvas();
 });
 
+// Home's search bar hands the query to the Search page rather than owning a
+// second results list: one search implementation, two entry points.
+function initializeHomeSearch() {
+  const form = document.getElementById("homeSearchForm");
+  const input = document.getElementById("homeSearchQuery");
+  if (!form || !input) return;
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = input.value.trim();
+    if (!query) {
+      input.focus();
+      return;
+    }
+    const target = document.getElementById("searchQuery");
+    const searchForm = document.getElementById("searchForm");
+    setPage("search");
+    if (target) target.value = query;
+    if (searchForm) searchForm.requestSubmit();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    const active = document.activeElement;
+    const typing =
+      active &&
+      (active.tagName === "INPUT" ||
+        active.tagName === "TEXTAREA" ||
+        active.isContentEditable);
+    const shortcut =
+      (event.key === "k" && (event.metaKey || event.ctrlKey)) ||
+      (event.key === "/" && !typing && !event.metaKey && !event.ctrlKey && !event.altKey);
+    if (!shortcut) return;
+    event.preventDefault();
+    // On Search, focus its own box; anywhere else, go to Home's.
+    const onSearch = document.querySelector('[data-page="search"]:not([hidden])');
+    if (onSearch) {
+      const box = document.getElementById("searchQuery");
+      if (box) box.focus();
+      return;
+    }
+    setPage("home");
+    input.focus();
+    input.select();
+  });
+}
+
+function initializeReviewControls() {
+  const refresh = document.getElementById("reviewRefresh");
+  if (refresh) refresh.addEventListener("click", () => loadReview());
+}
+
 initializeGraph();
 resizeCanvas();
+initializeThemeToggle();
+initializeSearchFilters();
+initializeHomeSearch();
+initializeReviewControls();
 initializeNavigation();
 loadSession().then(() => {
   setPage(initialPage());
@@ -4237,6 +4757,7 @@ loadSession().then(() => {
   }
   loadGithubSync();
   loadPromotionQueue();
+  loadSources();
   loadObsidianSources();
   loadConflicts();
   if (canUse("admin")) {

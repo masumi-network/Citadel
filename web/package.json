@@ -1,0 +1,25 @@
+{
+  "name": "@citadel/web",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The Citadel web frontend: Next.js, TypeScript, Tailwind, statically exported into kb/webui/ so FastAPI can serve it without a Node runtime. See docs/adr/0014-nextjs-frontend-static-export.md.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build && node scripts/copy-export.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.3.5",
+    "next": "^16.2.12",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.7.2"
+  }
+}

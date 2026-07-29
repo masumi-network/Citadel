@@ -202,6 +202,15 @@ def _coerce_classification(parsed: Any) -> Classification | None:
     )
 
 
+class PromotionEnumerationError(RuntimeError):
+    """Every seed query for a seat failed, so its content could not be read.
+
+    Distinct from "this seat has nothing to promote": that is an empty list and
+    a legitimate result. This means the search path itself is broken, and the
+    caller must not record the seat as successfully processed.
+    """
+
+
 class PromotionEngine:
     """Selective seat-to-Central promotion (ADR-0005 step 2)."""
 
@@ -222,9 +231,12 @@ class PromotionEngine:
         cap = max(1, max_items)
         seen: set[str] = set()
         candidates: list[PromotionCandidate] = []
+        attempted = 0
+        errors: list[str] = []
         for query in DEFAULT_SEED_QUERIES:
             if len(candidates) >= cap:
                 break
+            attempted += 1
             try:
                 results = await self.citadel.search(
                     query, dataset=seat_dataset, top_k=cap
@@ -235,6 +247,7 @@ class PromotionEngine:
                     seat_dataset,
                     exc.__class__.__name__,
                 )
+                errors.append(exc.__class__.__name__)
                 continue
             for result in results:
                 parsed = _candidate_from_result(result)
@@ -247,6 +260,16 @@ class PromotionEngine:
                 candidates.append(parsed)
                 if len(candidates) >= cap:
                     break
+        if attempted and len(errors) == attempted:
+            # Every search we actually ran failed, so an empty candidate list
+            # here means "could not look", not "nothing to promote". Returning []
+            # made the caller count the seat as a clean zero: production logged
+            # "seats=11 promoted=0 failures=0" while all 22 searches were dying
+            # on the Kuzu lock and on DatasetNotFoundError.
+            raise PromotionEnumerationError(
+                f"all {attempted} seed queries failed for {seat_dataset}: "
+                f"{', '.join(sorted(set(errors)))}"
+            )
         return candidates[:cap]
 
     def classify(self, text: str) -> Classification | None:
@@ -622,6 +645,9 @@ class PromotionEngine:
             score=proposal.score,
             relevant=proposal.relevant,
             sensitive=proposal.sensitive,
+            # Same threshold the decide() gate used, so the verdict stored on
+            # the item cannot disagree with the gate that let it through.
+            block_severity=self.config.content_scan_block_severity,
         )
         self.access_store.add_promotion_pending(item)
         self.access_store.record_event(

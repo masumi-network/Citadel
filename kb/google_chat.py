@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.config import CitadelConfig
 from kb.retry import retry_after_seconds, run_with_retries
@@ -120,7 +122,7 @@ class GoogleChatDelivery:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with open_secure(request, timeout=self.timeout_seconds) as response:
                 response_body = json.loads(response.read().decode("utf-8") or "{}")
                 return {
                     "ok": 200 <= response.status < 300,
