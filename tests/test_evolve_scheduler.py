@@ -227,3 +227,35 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     failures = [r for r in caplog.records if "stages finished with failures" in r.message]
     assert failures, "a nonzero stages exit must be logged at ERROR"
     assert failures[0].levelno == logging.ERROR
+
+
+async def test_a_dying_scheduler_task_is_logged(monkeypatch: Any, caplog: Any) -> None:
+    """A scheduler that dies on its first line must not vanish silently.
+
+    The done-callback used to be a bare set.discard, which swallows the
+    exception: the task would simply stop existing. That is the same
+    silent-failure shape as #89, and it matters more now that the scheduler
+    imports and runs the stage code itself instead of shelling out (#88).
+    """
+    import logging
+
+    import kb.server as server
+
+    async def boom(_interval: float) -> None:
+        raise RuntimeError("scheduler could not start")
+
+    monkeypatch.setattr(server, "_evolve_scheduler_loop", boom)
+    monkeypatch.setattr(
+        server, "get_citadel", lambda: _fake_citadel(enabled=True, interval=999_999)
+    )
+
+    with caplog.at_level(logging.ERROR, logger=server.logger.name):
+        task = server._start_evolve_scheduler()
+        assert task is not None
+        with contextlib.suppress(RuntimeError):
+            await task
+        await asyncio.sleep(0)  # let the done-callback run
+
+    died = [r for r in caplog.records if "died" in r.message]
+    assert died, "a scheduler task that raised must be logged at ERROR"
+    assert "evolve-scheduler" in died[0].getMessage()
