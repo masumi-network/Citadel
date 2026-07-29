@@ -1,0 +1,331 @@
+/* Citadel — the design system, as a Tailwind theme.
+ *
+ * This is a port of kb/static/info.css, not a redesign. The token sets are the
+ * same values, the square-corner deviation is the same deviation, and the type
+ * ramp is the same ramp; what changes is that the tokens are now Tailwind
+ * theme variables, so `bg-surface` and `text-ink-2` exist and a component does
+ * not have to hand-write `background: var(--surface)`.
+ *
+ * Aligned to the AGENTIC / Masumi design system: Inter only, weight lightens as
+ * size grows, sentence case, a neutral ramp plus exactly one accent (Iris
+ * magenta #FF51FF), flat elevation (borders and tint, never a drop shadow).
+ * The one local deviation is radius: Citadel's chrome is square everywhere, so
+ * the radius scale below is zeroed and only `rounded-full` can curve anything.
+ *
+ * Served under a strict CSP: no inline <style>, no inline <script>, no
+ * style="" written into the HTML.
+ */
+
+@import "tailwindcss";
+
+/* Dark is an explicit choice, remembered in localStorage under
+   `citadel-info-theme` and applied as data-theme on <html> by public/theme.js.
+   It is deliberately NOT prefers-color-scheme: light is the default for
+   everyone, which is also what removes the dark flash an OS-dark visitor used
+   to get before the deferred script ran. */
+@custom-variant dark (&:where(:root[data-theme="dark"], :root[data-theme="dark"] *));
+
+@font-face {
+  font-family: "Inter";
+  src: url("/static/fonts/Inter.var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/static/fonts/JetBrainsMono.var.woff2") format("woff2");
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+:root {
+  /* light-first: white / off-white, neutral ramp */
+  --ground: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f5f5f5;
+  --ink: #0a0a0a;
+  --ink-2: rgba(10, 10, 10, 0.56);
+  --ink-3: rgba(10, 10, 10, 0.42);
+  --border: #e5e5e5;
+  --border-2: #d4d4d4;
+
+  /* masumi Iris Flower magenta — one accent */
+  --accent: #ff51ff;          /* fills, marks, hover, dark-mode text */
+  --accent-ink: #c010a0;      /* links / eyebrows / accent text on light */
+  --accent-soft: rgba(255, 81, 255, 0.10);
+
+  /* Ink for text sitting on the accent fill. Its own token because it is the
+     one colour that must NOT invert: --accent is the same magenta in both
+     themes, so the text on top of it stays near-black in both. Writing --ink
+     there would flip it to near-white in dark mode and destroy the contrast,
+     and writing the hex inline hides the pairing from anyone changing the
+     accent. */
+  --on-accent: #0a0a0a;
+
+  /* semantic status (functional only) */
+  --good: #16a34a;
+  --good-bg: rgba(22, 163, 74, 0.10);
+  --warn: #b45309;
+  --warn-bg: rgba(180, 83, 9, 0.10);
+}
+:root[data-theme="light"] {
+  --ground: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5;
+  --ink: #0a0a0a; --ink-2: rgba(10,10,10,0.56); --ink-3: rgba(10,10,10,0.42);
+  --border: #e5e5e5; --border-2: #d4d4d4;
+  --accent: #ff51ff; --accent-ink: #c010a0; --accent-soft: rgba(255,81,255,0.10);
+  --on-accent: #0a0a0a;
+  --good: #16a34a; --good-bg: rgba(22,163,74,0.10);
+  --warn: #b45309; --warn-bg: rgba(180,83,9,0.10);
+}
+:root[data-theme="dark"] {
+  --ground: #0a0a0a; --surface: #171717; --surface-2: #1f1f1f;
+  --ink: #fafafa; --ink-2: rgba(250,250,250,0.60); --ink-3: rgba(250,250,250,0.42);
+  --border: rgba(255,255,255,0.10); --border-2: rgba(255,255,255,0.16);
+  --accent: #ff51ff; --accent-ink: #ff86f2; --accent-soft: rgba(255,81,255,0.15);
+  --on-accent: #0a0a0a;
+  --good: #4ade80; --good-bg: rgba(74,222,128,0.12);
+  --warn: #f59e0b; --warn-bg: rgba(245,158,11,0.12);
+}
+
+/* `inline` so a utility compiles to var(--surface) rather than to a second
+   variable holding a snapshot of it. That indirection is what would break the
+   theme toggle: the tokens above are re-declared per data-theme, and a copied
+   value would keep the light one. */
+@theme inline {
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-border: var(--border);
+  --color-border-2: var(--border-2);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+  --color-good: var(--good);
+  --color-good-bg: var(--good-bg);
+  --color-warn: var(--warn);
+  --color-warn-bg: var(--warn-bg);
+
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* Square chrome, enforced rather than remembered: every step of the radius
+   scale is 0, so `rounded`, `rounded-md` and `rounded-xl` all mean the same
+   nothing. `rounded-full` is not a scale step (it is calc(infinity * 1px)), so
+   status dots and pills keep their curve and nothing else can acquire one. */
+@theme {
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  --radius-3xl: 0;
+  --radius-4xl: 0;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 16.5px;
+    font-weight: 400;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a {
+    color: var(--accent-ink);
+    text-underline-offset: 2px;
+  }
+  ::selection {
+    background: var(--accent-soft);
+  }
+  /* Tailwind's preflight sets border-color to currentColor. Everything here is
+     hairline-on-neutral, so the token is the better default. */
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
+  }
+  @media (max-width: 620px) {
+    body { font-size: 16px; }
+  }
+}
+
+/* --- cross-document view transitions -------------------------------------
+   Every nav click on this site is a full document load, including the ones
+   that leave the Next app for a hand-written page. Same-origin MPA view
+   transitions let the browser snapshot both documents and tween anything
+   carrying the same view-transition-name, which is what keeps the nav still
+   while the rest of the page cross-fades. Browsers without support ignore
+   every rule here and get exactly today's behaviour. */
+@view-transition { navigation: auto; }
+
+.topnav { view-transition-name: topnav; }
+
+::view-transition-old(root),
+::view-transition-new(root) { animation-duration: .28s; }
+::view-transition-group(topnav) { animation-duration: .2s; }
+
+/* --- motion ---------------------------------------------------------------
+   Two ambient animations live on this page and both are opinions, not
+   information: the drifting hero glow and the rotating headline. Asking for
+   less motion stops them dead rather than speeding them up. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { transition: none !important; }
+  @view-transition { navigation: none; }
+  .hero-glow { animation: none !important; }
+  .roll-track { animation: none !important; transform: none !important; }
+  .flowcanvas .react-flow__edge-path { animation: none !important; }
+}
+
+/* --- the hero glow --------------------------------------------------------
+   A soft accent blob behind the headline, anchored off-canvas so only its
+   falloff is on screen. CSS rather than a utility because it is a keyframed
+   radial gradient, and because dark mode needs a weaker one: the same alpha
+   over #0a0a0a reads as a magenta wash rather than a glow. */
+.hero-glow {
+  position: absolute; top: -300px; right: -190px; z-index: 0;
+  width: 840px; height: 840px; border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, rgba(255,81,255,.30) 0%, rgba(255,81,255,.10) 42%, rgba(255,81,255,0) 70%);
+  animation: drift 20s ease-in-out infinite alternate;
+  will-change: transform;
+}
+:root[data-theme="dark"] .hero-glow {
+  background: radial-gradient(circle, rgba(255,81,255,.14) 0%, rgba(255,81,255,.05) 42%, rgba(255,81,255,0) 70%);
+}
+@keyframes drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-90px, 60px, 0) scale(1.16); }
+}
+@media (max-width: 620px) {
+  .hero-glow { top: -220px; right: -240px; width: 560px; height: 560px; }
+}
+
+/* One glow, one anchor, one drift, on every page. There were per-page variants
+   for a while, on the theory that a set of pages that each placed it
+   differently would not read as one template stamped five times. In practice
+   the blob appearing to jump corner to corner across a navigation was
+   distracting rather than interesting, so it holds still. The variants are not
+   ported. */
+
+/* --- the rotating headline ------------------------------------------------
+   A fixed-height, overflow-hidden column of words that slides one line per
+   beat. Pure CSS: under `script-src 'self'` a JS timer would have nowhere to
+   write to, and this is decoration, so it should not cost a frame of main
+   thread anyway. The list carries a sixth span repeating the first, so the
+   wrap from the last word back to the first rolls instead of cutting.
+
+   The window and the track must be two different elements. If the element that
+   clips is also the element that moves, the translate walks the clipping box
+   down the page instead of scrolling the words through it, and every word ends
+   up visible in a stack. Offsets are in em, matching the item height: with
+   percentages they resolve against the track's own height, so adding or
+   removing a word would silently drift every step.
+
+   align-items: flex-start is load-bearing. `.roll` is a row flex container, so
+   the default `stretch` would force the track down to the window's 1.03em and
+   leave its six children relying on the automatic-minimum-size rule to stay a
+   line tall. Not stretching it removes that reliance.
+
+   1.03em is exactly h1's line-height, which is what lands the word on the
+   surrounding baseline rather than near it. The clip is therefore tight: none
+   of the five words carries a descender, and one that did (a g, j, p, q or y)
+   would be cut off. Grow the box and the span together if the list gains one. */
+.roll { display: inline-flex; align-items: flex-start; overflow: hidden; height: 1.03em; vertical-align: bottom; }
+.roll-track { display: flex; flex-direction: column; animation: rollup 17s cubic-bezier(.62,0,.28,1) infinite; }
+.roll-track span { display: block; height: 1.03em; line-height: 1.03; white-space: nowrap; }
+@keyframes rollup {
+  0%, 17% { transform: translateY(0); }
+  20%, 37% { transform: translateY(-1.03em); }
+  40%, 57% { transform: translateY(-2.06em); }
+  60%, 77% { transform: translateY(-3.09em); }
+  80%, 97% { transform: translateY(-4.12em); }
+  100% { transform: translateY(-5.15em); }
+}
+
+/* Gradient text. background-clip: text clips to the inline box, which is tight
+   to the glyphs, so any letter whose ink overhangs its advance width gets
+   shaved on the right. Pad the painted box and pull the same amount back out of
+   the layout, so nothing moves. */
+.grad {
+  background: linear-gradient(100deg, var(--accent), var(--accent-ink));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  padding: 0 .08em;
+  margin: 0 -.08em;
+}
+
+/* The disclosure marker is replaced by a rotating chevron, so the native one
+   has to go on both engines. */
+.godeeper summary { list-style: none; }
+.godeeper summary::-webkit-details-marker { display: none; }
+.godeeper[open] .chev { transform: rotate(90deg); }
+
+/* --- the React Flow pipeline diagram --------------------------------------
+   Presentation lives here rather than in the component, so the diagram reads
+   from the page's tokens and inverts with the theme toggle for free. The
+   component ships React Flow's own stylesheet and nothing else.
+
+   None of these selectors match until the diagram has been lazily loaded and
+   mounted, which happens on scroll. */
+
+.flowcanvas { position: relative; width: 100%; height: 100%; }
+
+/* React Flow theming hooks, so the canvas, the dot grid and the zoom controls
+   follow the page instead of shipping their default grey. */
+.flowcanvas .react-flow {
+  --xy-background-color: var(--surface);
+  --xy-background-pattern-color: var(--border);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--ink-2);
+  --xy-controls-button-color-hover: var(--accent-ink);
+  --xy-controls-button-border-color: var(--border);
+  --xy-attribution-background-color: transparent;
+}
+/* Nothing here is connectable, so the ports are anchors, not affordances. */
+.flowcanvas .react-flow__handle { width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; background: none; opacity: 0; }
+.flowcanvas .react-flow__attribution { font-size: 9px; }
+.flowcanvas .react-flow__attribution a { color: var(--ink-3); }
+
+.fnode {
+  width: 178px; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 9px 12px; border-radius: 0;
+  font-family: var(--font-sans); font-size: 12.5px; font-weight: 500; line-height: 1.32;
+  color: var(--ink); background: var(--surface); border: 1px solid var(--border-2);
+  transition: opacity .18s ease, border-color .15s ease;
+}
+.fnode-s { font-family: var(--font-mono); font-size: 9.5px; font-weight: 400; letter-spacing: .02em; color: var(--ink-3); }
+.fnode.is-dim { opacity: .2; }
+
+.fnode-source { background: var(--surface-2); border-color: var(--border); }
+/* The two stores are the point of the diagram, so they are the two nodes that
+   do not look like the others. */
+.fnode-store-node { background: var(--accent-soft); border-color: var(--accent); padding: 13px 14px; }
+.fnode-store-node .fnode-l { font-size: 14px; font-weight: 600; color: var(--accent-ink); }
+.fnode-store-central { background: var(--surface-2); border: 2px solid var(--ink-3); padding: 12px 13px; }
+.fnode-store-central .fnode-l { font-size: 14px; font-weight: 600; }
+.fnode-gate { border-style: dashed; }
+.fnode-read { border-color: var(--accent); }
+.fnode-audit { background: var(--surface-2); border-style: dotted; }
+
+.fhead { font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+
+.flowcanvas .react-flow__edge-path { stroke: var(--border-2); stroke-width: 1.5; }
+.flowcanvas .fedge.is-on .react-flow__edge-path { stroke: var(--accent); stroke-width: 2; }
+.flowcanvas .fedge.is-dim .react-flow__edge-path { stroke: var(--border); opacity: .3; }
+.flowcanvas .react-flow__edge-text { font-family: var(--font-sans); font-size: 9px; font-weight: 500; fill: var(--ink-3); }
+.flowcanvas .fedge.is-on .react-flow__edge-text { fill: var(--accent-ink); }
+.flowcanvas .react-flow__edge-textbg { fill: var(--surface); }
