@@ -67,3 +67,41 @@ Constraints that make the endpoint safe enough to expose:
 - If the Chat gateway is unconfigured in an environment, the form is visibly
   broken (503 on submit) rather than quietly useless. That is deliberate, but it
   means the gateway is now part of what `/contact` depends on to work.
+
+## Amendment, 2026-07-30: enquiries are stored before they are relayed
+
+The last consequence above is exactly what happened, and it was worse in
+practice than on paper. The Chat gateway was never configured in production, so
+from the day the public site shipped every enquiry answered 503 and was lost.
+Nothing in the logs said so either: `contact_gateway()` only warns when
+`from_config` *raises*, and the disabled-by-default path returns `None` in
+silence.
+
+"Visibly broken" turned out to mean visible to the sender, who sees an error and
+leaves, and invisible to us.
+
+**What changes.** `POST /contact` now writes the enquiry to a capped JSON file on
+the state volume (`kb/contact_store.py`, `CITADEL_CONTACT_STORE_PATH`) *before*
+attempting the Chat relay, and returns 200 when the write succeeded even if no
+gateway is configured or delivery fails. `GET /api/contact/enquiries` reads the
+queue, admin only. 503 survives for the case where the enquiry can be neither
+stored nor delivered.
+
+**Why this is consistent with the decision above, not a reversal.** The rule was
+never "do not persist"; it was that *an enquiry is never accepted into a void*.
+A file on disk is not a void. A 503 that loses the message is closer to one.
+
+**What does not change.** Destination 1 in the Context section, landing enquiries
+in the vault, stays rejected for exactly the reasons given: unauthenticated text
+must not reach the substrate agents read as authority. The store is a fourth
+destination, deliberately outside the knowledge path, with no search over it and
+no promotion path out of it. A test (`test_contact_is_never_written_to_the_vault`)
+holds that line.
+
+**Cost accepted.** The service now has one unauthenticated write path that
+persists, which the original decision explicitly prized not having. The
+mitigations that made the relay safe all still apply (rate limits, length caps,
+honeypot, scrubbing), and the store is capped at 500 entries so the endpoint
+cannot grow the volume without bound. Note that the stored rows are personal
+data (name, email), so they carry retention obligations that a Chat message
+also carried but that are now ours to honor directly.
