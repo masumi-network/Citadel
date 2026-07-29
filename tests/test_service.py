@@ -9,6 +9,7 @@ from kb.config import CitadelConfig
 from kb.models import FeedbackRequest
 from kb.security_scan import SecretContentError
 from kb.service import MAX_SEARCH_TOP_K, Citadel
+import kb.service as service
 
 
 class FakeCognee:
@@ -232,8 +233,11 @@ async def test_cognify_dataset_verify_ingests_marker_and_confirms_hit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cognify_dataset_verify_failure_propagates_top_level_ok() -> None:
+async def test_cognify_dataset_verify_failure_propagates_top_level_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed verify canary must set top-level ok=False (CLI exit code)."""
+    monkeypatch.setattr(service, "CANARY_SEARCH_BACKOFF_SECONDS", 0)
 
     class StuckCognee(FakeCognee):
         async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
@@ -249,7 +253,62 @@ async def test_cognify_dataset_verify_failure_propagates_top_level_ok() -> None:
     result = await kb.cognify_dataset(verify=True)
 
     assert result["verification"]["ok"] is False
+    assert result["verification"]["search_attempts"] == service.CANARY_SEARCH_ATTEMPTS
     assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_cognify_canary_is_not_ok_on_graph_growth_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#114: a growing graph is not evidence the marker became retrievable.
+
+    Production ran "grew=True canary_ok=True" every hour while github_sync and
+    linear_sync were dead on the Kuzu lock. Any concurrent ingest grows the
+    graph, so growth must stay diagnostic detail and never a pass condition.
+    """
+    monkeypatch.setattr(service, "CANARY_SEARCH_BACKOFF_SECONDS", 0)
+
+    class GrowsButUnsearchable(FakeCognee):
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            return []  # never retrievable...
+
+    fake = GrowsButUnsearchable()  # ...but FakeCognee's graph still grows
+    kb = Citadel(CitadelConfig(default_dataset="masumi-network"), cognee=fake)
+
+    result = await kb.cognify_dataset(verify=True)
+
+    assert result["verification"]["graph_grew"] is True
+    assert result["verification"]["search_hit"] is False
+    assert result["verification"]["ok"] is False
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_cognify_canary_accepts_a_late_search_hit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cognify settles in the background, so a bounded retry must be allowed."""
+    monkeypatch.setattr(service, "CANARY_SEARCH_BACKOFF_SECONDS", 0)
+
+    class SlowCognee(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recall_calls = 0
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_calls += 1
+            # Miss once, then settle — a healthy node that is merely slow.
+            return [] if self.recall_calls < 2 else [{"content": query}]
+
+    fake = SlowCognee()
+    kb = Citadel(CitadelConfig(default_dataset="masumi-network"), cognee=fake)
+
+    result = await kb.cognify_dataset(verify=True)
+
+    assert result["verification"]["search_hit"] is True
+    assert result["verification"]["search_attempts"] == 2
+    assert result["ok"] is True
 
 
 @pytest.mark.asyncio
