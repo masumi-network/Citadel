@@ -111,6 +111,26 @@ MCP_ENDPOINT_PATH = "/mcp/"
 # the event loop does not garbage-collect them mid-flight.
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
+
+def _forget_background_task(task: "asyncio.Task[Any]") -> None:
+    """Drop a finished task, and say so out loud if it died.
+
+    A bare ``set.discard`` done-callback loses the exception: a scheduler that
+    raises on its first line just stops existing, and the only trace is
+    asyncio's "Task exception was never retrieved" whenever the object happens
+    to be collected. That is the same silent-failure shape as #89, and it got
+    more likely once the evolve scheduler started importing and running the
+    stage code itself rather than shelling out (#88).
+    """
+    _BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task %s died: %s", task.get_name(), exc, exc_info=exc
+        )
+
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
 # search stops working — not only when node/auth are down (#27). None until the
@@ -325,10 +345,10 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
     """Launch the 6h evolve cron when enabled.
 
     A separate Railway service cannot host this: the stages work against the Kuzu
-    graph + JSON access store on the local ``/data`` volume, and Railway volumes
-    attach to a single service. The scheduler runs the heavy stages as a
-    subprocess on the web container and then cognifies in-loop (see
-    :func:`_evolve_scheduler_loop` for why the split is required). Off by default
+    graph + JSON access store on the local ``/data`` volume, Railway volumes
+    attach to a single service, and a second process cannot open the graph at all
+    while this one holds cognee's exclusive Kuzu lock (#88). The scheduler runs
+    the stages in this loop and then cognifies, both here. Off by default
     (``CITADEL_EVOLVE_SCHEDULER_ENABLED``).
     """
     config = get_citadel().config
@@ -336,9 +356,9 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
         return None
     interval = max(60, config.evolve_interval_seconds)
     logger.info("Evolve scheduler enabled: interval=%ss", interval)
-    task = asyncio.create_task(_evolve_scheduler_loop(interval))
+    task = asyncio.create_task(_evolve_scheduler_loop(interval), name="evolve-scheduler")
     _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    task.add_done_callback(_forget_background_task)
     return task
 
 
