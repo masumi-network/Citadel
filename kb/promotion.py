@@ -622,6 +622,9 @@ class PromotionEngine:
             score=proposal.score,
             relevant=proposal.relevant,
             sensitive=proposal.sensitive,
+            # Same threshold the decide() gate used, so the verdict stored on
+            # the item cannot disagree with the gate that let it through.
+            block_severity=self.config.content_scan_block_severity,
         )
         self.access_store.add_promotion_pending(item)
         self.access_store.record_event(

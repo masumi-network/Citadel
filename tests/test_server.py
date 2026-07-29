@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+import re
 import secrets
 import tempfile
 from typing import Any
@@ -301,6 +302,109 @@ def test_security_headers_are_applied_to_http_responses() -> None:
     )
 
 
+def test_only_the_landing_page_relaxes_style_src() -> None:
+    """/ is the single route allowed inline styles. Everything else is strict.
+
+    The landing page renders a React Flow diagram, which positions nodes by
+    writing inline transform styles and cannot be configured out of it. That
+    buys exactly one directive on exactly one path, and / holds no token and no
+    user data. If this ever fails on a path other than /, a page has inherited
+    the relaxation, which is how a per-route exception becomes a site-wide one.
+    """
+    client = authed_client()
+
+    relaxed = "style-src 'self' 'unsafe-inline';"
+    strict = "style-src 'self';"
+
+    landing = client.get("/").headers["content-security-policy"]
+    assert relaxed in landing
+    assert strict not in landing
+    # Nothing else moved. Script execution in particular is untouched, so the
+    # exemption cannot be parlayed into running code.
+    assert "script-src 'self';" in landing
+    assert "default-src 'self';" in landing
+    assert "object-src 'none'" in landing
+
+    for path in ("/login", "/app", "/info", "/use-cases", "/contact", "/healthz", "/api/state"):
+        policy = client.get(path).headers["content-security-policy"]
+        assert strict in policy, f"{path} lost the strict style-src"
+        assert "'unsafe-inline'" not in policy, f"{path} inherited the / relaxation"
+
+    assert server_module.CSP_INLINE_STYLE_PATHS == frozenset({"/"}), (
+        "Adding a path here is a security decision. Update this test "
+        "deliberately, and check the page really renders something that needs it."
+    )
+
+
+def test_csp_relaxation_is_opt_in_and_cannot_widen_by_accident() -> None:
+    """The mechanism is exact-path, not prefix, and strict is the default.
+
+    Kept even though the opt-in set is empty, because this is the property that
+    matters when someone re-enables it: a prefix match would hand the relaxation
+    to every child route, and defaulting to relaxed would invert the failure
+    mode from "the flow looks broken" to "every page is exposed".
+    """
+    assert server_module.content_security_policy_for("/anything") == (
+        server_module.CONTENT_SECURITY_POLICY
+    )
+    assert "'unsafe-inline'" not in server_module.CONTENT_SECURITY_POLICY
+    assert "'unsafe-inline'" in server_module.CONTENT_SECURITY_POLICY_INLINE_STYLE
+    # Script execution is never part of the bargain, in either policy.
+    assert "script-src 'self';" in server_module.CONTENT_SECURITY_POLICY_INLINE_STYLE
+
+
+def test_landing_diagram_ships_as_markup_and_upgrades_to_the_bundle() -> None:
+    """Two forms of one diagram, and the served HTML must carry the simple one.
+
+    The React Flow bundle is ~330 KB and is fetched only when the diagram
+    scrolls into view. Someone who never scrolls that far, or who has
+    JavaScript off, has to get a correct picture from the HTML alone, so the
+    four-step spine ships visible and the React container ships empty.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    home = client.get("/").text
+
+    # The plain diagram ships visible, and it is four steps, not the fourteen
+    # element two-lane version it replaced.
+    assert '<div class="spine" id="spine-static"' in home
+    for step in ("Capture", "Your Node", "Promotion", "Central"):
+        assert f'<span class="t">{step}</span>' in home, step
+    # The guarantee sentence survives every simplification of this diagram, and
+    # stays on screen in both forms.
+    assert "never another seat's" in home
+
+    # The React container ships hidden and empty.
+    assert '<div class="flowmount" id="flow-root" hidden></div>' in home
+    # The bundle is never referenced from the HTML: landing.js injects it only
+    # after the IntersectionObserver fires, so it costs nothing until reached.
+    assert "flow.js" not in home
+    assert "flow.css" not in home
+    landing_js = (server_module.STATIC_DIR / "landing.js").read_text(encoding="utf-8")
+    assert "/static/vendor/flow.js" in landing_js
+    assert "IntersectionObserver" in landing_js
+
+
+def test_landing_flow_bundle_is_committed_and_served() -> None:
+    """The React Flow bundle is a build artefact that ships in the repo.
+
+    There is no Node in CI or on the deploy host, so `npm run build:flow` runs
+    on a developer machine and the output is committed. A source change landing
+    without its rebuilt bundle is the failure this catches.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    script = client.get("/static/vendor/flow.js")
+    styles = client.get("/static/vendor/flow.css")
+
+    assert script.status_code == 200
+    assert styles.status_code == 200
+    # esbuild is configured with globalName CitadelFlow; landing.js calls
+    # window.CitadelFlow.mount() once the script has loaded.
+    assert script.text.startswith("var CitadelFlow=")
+    assert ".react-flow" in styles.text
+
+
 def test_security_headers_do_not_force_hsts_on_plain_http() -> None:
     client = TestClient(app, base_url="http://testserver")
 
@@ -355,6 +459,432 @@ def test_login_page_uses_static_script_for_csp() -> None:
     assert response.status_code == 200
     assert '<script src="/static/login.js" type="module"></script>' in response.text
     assert "<script>\n" not in response.text
+    assert "<style>" not in response.text
+    assert 'style="' not in response.text
+
+
+def test_login_page_uses_the_public_design_system() -> None:
+    """/login is a public page, so it wears info.css — not the dashboard theme.
+
+    A visitor arriving from /info must not be handed to a visibly different
+    product at the door: same stylesheet, same nav, same theme toggle.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    page = client.get("/login").text
+
+    assert '<link rel="stylesheet" href="/static/info.css">' in page
+    assert "/static/styles.css" not in page
+    assert 'class="topnav"' in page
+    assert 'id="themebtn"' in page
+
+def test_use_cases_page_is_public_and_csp_clean() -> None:
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.get("/use-cases")
+
+    assert response.status_code == 200
+    # No token, no session — a coordinator or a curious engineer must be able
+    # to open this. Team use cases lead; the partnering profile follows.
+    assert "Four things teams run it for" in response.text
+    assert "Draft work package" in response.text
+    # Reuses the /info stylesheet + script rather than shipping its own.
+    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
+    assert '<script src="/static/info.js" defer></script>' in response.text
+    # Strict CSP: nothing inline.
+    assert "<script>\n" not in response.text
+    assert "<style>" not in response.text
+    assert 'style="' not in response.text
+
+
+def test_partners_url_still_resolves() -> None:
+    """/partners was the first home of this page and is quoted outside the repo.
+
+    It has been sent to coordinators and referenced in docs and commits, so the
+    rename to /use-cases keeps the old URL alive rather than 404ing it.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.get("/partners", follow_redirects=False)
+
+    assert response.status_code == 301
+    assert response.headers["location"] == "/use-cases"
+
+
+def test_contact_page_is_public_and_csp_clean() -> None:
+    """The contact form is its own page, not a section at the bottom of another."""
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.get("/contact")
+
+    assert response.status_code == 200
+    assert 'id="contactForm"' in response.text
+    assert '<script src="/static/contact.js" defer></script>' in response.text
+    # The form only lives here now — /use-cases points at it instead.
+    assert 'id="contactForm"' not in client.get("/use-cases").text
+    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
+    assert "<script>\n" not in response.text
+    assert "<style>" not in response.text
+    assert 'style="' not in response.text
+
+
+def test_public_pages_share_one_top_nav() -> None:
+    """Every public page carries the same nav, each marking its own entry.
+
+    The nav is what stops the public pages from being orphans reachable only by
+    direct link.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    pages = {
+        "/": client.get("/").text,
+        "/info": client.get("/info").text,
+        "/use-cases": client.get("/use-cases").text,
+        "/contact": client.get("/contact").text,
+        "/login": client.get("/login").text,
+    }
+
+    for path, page in pages.items():
+        assert 'class="topnav"' in page, path
+        for link in ("/", "/info", "/use-cases", "/contact", "/login"):
+            assert f'<a href="{link}"' in page, f"{path} is missing the {link} nav link"
+        assert "Sign in</a>" in page, path
+        # The lockup lives in the nav now, so the page header must not repeat it.
+        assert 'class="brandrow"' not in page, path
+        assert f'<a href="{path}" aria-current="page">' in page, path
+
+
+def test_public_pages_share_the_band_layout() -> None:
+    """/info, /use-cases and /contact are built from the same bands as /.
+
+    All three were a single 860px .wrap column left over from before the home
+    page was rebuilt into alternating full-bleed bands. Side by side they read
+    as two different websites, which one shared nav does not fix. The band
+    rhythm and the sticky section index are what make the five pages one site,
+    so they are pinned here rather than left to the next redesign to notice.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    for path in ("/info", "/use-cases", "/contact"):
+        page = client.get(path).text
+
+        # The hero band carries the nav and the glow, exactly as / does.
+        assert '<div class="band band-hero">' in page, path
+        assert 'class="hero-glow' in page, path
+        # Content sits in bands, never in the old single column.
+        assert page.count('<div class="band-in">') >= 2, path
+        assert 'class="wrap"' not in page, path
+        # One sticky index per page, and the jump-chip nav it replaced is gone.
+        assert '<nav class="index" aria-label="Sections">' in page, path
+        assert 'class="toc"' not in page, path
+        # The index is only a bar of dead links without the observer that
+        # tracks the section in view.
+        assert '<script src="/static/landing.js" defer></script>' in page, path
+        # The live pill rides in the index bar, where / carries it.
+        index = page[page.index('<nav class="index"'):page.index("</nav>", page.index('<nav class="index"'))]
+        assert 'id="pill-health"' in index, path
+
+
+def test_every_internal_link_on_the_public_pages_resolves() -> None:
+    """Every internal href and every anchor on the public pages hits something.
+
+    Two things make this rot quietly. Anchors are the first: the sticky index
+    bars are hand-written lists of ids, so renaming a section silently turns
+    its index entry into a no-op that scrolls nowhere and fails no test. The
+    second is /partners, which is now a 301 to /use-cases. That redirect exists
+    for links we have already sent to coordinators, not for our own pages, and
+    a self-inflicted redirect costs a round trip and loses the fragment.
+
+    Checked here rather than by eye because the fragments are the part nobody
+    re-reads after a rename.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    pages = ("/", "/info", "/use-cases", "/contact", "/login")
+    bodies = {path: client.get(path).text for path in pages}
+    ids = {
+        path: set(re.findall(r'id="([^"]+)"', body)) for path, body in bodies.items()
+    }
+
+    checked = 0
+    for page, body in bodies.items():
+        for href in re.findall(r'href="([^"]+)"', body):
+            if href.startswith(("http://", "https://", "mailto:")):
+                continue
+            checked += 1
+            path, _, fragment = href.partition("#")
+
+            if path.startswith("/static/"):
+                assert client.get(path).status_code == 200, f"{page} -> {href}"
+                continue
+
+            assert path != "/partners", (
+                f"{page} links to /partners. That route is a 301 kept alive for "
+                "links already quoted outside the repo; inside our own pages, "
+                "link to /use-cases directly."
+            )
+            if path:
+                response = client.get(path, follow_redirects=False)
+                assert response.status_code == 200, (
+                    f"{page} -> {href} returned {response.status_code}"
+                )
+
+            if fragment:
+                target = path or page
+                assert target in ids, f"{page} -> {href} targets an unaudited page"
+                assert fragment in ids[target], (
+                    f"{page} -> {href} points at #{fragment}, which does not "
+                    f"exist on {target}"
+                )
+
+    # A regex that stopped matching would pass every assertion above.
+    assert checked > 30, f"only {checked} internal links found; the scan broke"
+
+
+def test_public_pages_avoid_info_report_element_ids() -> None:
+    """Pages sharing info.js with /info must not reuse report-only ids.
+
+    info.js unconditionally writes the State-of-the-Vault text into these ids
+    wherever it finds them. The partnering page reusing id="foot-note" silently
+    replaced its own footer with "State-of-the-vault report ... window v0.2.0 ->
+    v0.4.0" at runtime, which no server-side test would have caught.
+
+    Each page keeps only the ids it genuinely wants hydrated: the health pill
+    and the brand mark.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    report_only_ids = ("foot-note", "state-updated", "m-version", "m-docs", "m-docs-sub")
+    for path in ("/use-cases", "/contact"):
+        page = client.get(path).text
+        for element_id in report_only_ids:
+            assert f'id="{element_id}"' not in page, (
+                f'{path} declares id="{element_id}", which info.js overwrites '
+                "with /info report copy. Use a different id or no id."
+            )
+        assert 'id="pill-health-text"' in page, path
+        assert 'id="mark"' in page, path
+
+
+def test_contact_page_has_no_unfilled_placeholders() -> None:
+    """Contact details must be filled in before this page is deployed.
+
+    /contact is public and outward-facing: it is sent to consortium
+    coordinators and pasted into EU partner-search forms. Shipping it with a
+    literal NAME/EMAIL/ADDRESS placeholder is worse than not shipping it, so
+    the guard is a test rather than a review comment.
+
+    This asserts on the placeholder **text**, not on the `todo` class it used to
+    carry. The Next.js port reproduced the placeholders faithfully but styled
+    them with Tailwind utilities, so a class-based check passed on a page that
+    still said REGISTERED ADDRESS. A guard that the content can outlive is not a
+    guard; keying on the words is what makes it survive a restyle or a rewrite.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    surfaces = {"/contact (hand-written)": client.get("/contact").text}
+    ported = server_module.WEBUI_DIR / "contact.html"
+    if ported.exists():
+        surfaces["kb/webui/contact.html (Next.js port)"] = ported.read_text(encoding="utf-8")
+
+    for where, markup in surfaces.items():
+        for placeholder in (">NAME<", ">EMAIL<", "REGISTERED ADDRESS"):
+            assert placeholder not in markup, (
+                f"{where} still contains the unfilled placeholder {placeholder!r}. "
+                "Fill the contact name, email and registered address, in every "
+                "surface that renders them."
+            )
+
+
+def test_each_public_page_owns_its_subject() -> None:
+    """One subject, one page. The public pages used to repeat each other.
+
+    /info explained the Seat/Node/Central model and how to install, both of
+    which / already covered in full, so the same paragraphs were maintained in
+    two places and drifted. Home owns what-it-is and how-to-start; /info owns
+    the live numbers and the roadmap.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    home = client.get("/").text
+    info = client.get("/info").text
+
+    # The pipeline diagram and the install commands live on / only.
+    assert 'class="spine"' in home
+    assert 'class="spine"' not in info
+    assert "pipx install citadel-archive" in home
+    assert "citadel onboard" not in info
+    # The live tiles and the roadmap live on /info only.
+    assert 'id="m-version"' in info
+    assert 'id="m-version"' not in home
+
+
+def test_home_owns_install_and_the_diagram() -> None:
+    """The diagram and the install commands live on / and nowhere else.
+
+    Both used to be repeated on /info, and the copies drifted. This widens
+    test_each_public_page_owns_its_subject from the /info pair to every public
+    page, so a future page cannot quietly grow a second copy of either.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    home = client.get("/").text
+    others = {
+        path: client.get(path).text
+        for path in ("/info", "/use-cases", "/contact", "/login")
+    }
+
+    assert 'class="spine"' in home
+    assert "pipx install citadel-archive" in home
+    assert 'id="m-version"' not in home
+    for path, page in others.items():
+        assert 'class="spine"' not in page, path
+        assert "pipx install citadel-archive" not in page, path
+    # The live version tile is /info's, and only /info's.
+    assert 'id="m-version"' in others["/info"]
+
+
+def test_home_hero_has_no_terminal_block() -> None:
+    """The hero is type only. The terminal block was removed on purpose.
+
+    Four hero variants were built and looked at; the one with a terminal made
+    the page read as documentation rather than as an argument, and pushed the
+    lede below the fold. The commands still ship, at the bottom of the page.
+    This pins the decision so it cannot drift back in.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    home = client.get("/").text
+    hero = home[home.index('<header class="hero">'):home.index("</header>")]
+
+    assert "<pre" not in hero
+    assert 'class="term' not in hero
+    # ...and the commands are still on the page, just not in the hero.
+    assert "pipx install citadel-archive" in home
+
+
+def test_home_rotator_has_a_fixed_word_list() -> None:
+    """The rotating headline word carries exactly this list, in this order.
+
+    A half-edited list is the likely failure: five words tuned together, one
+    of them swapped later without the others. The sixth entry repeats the
+    first and is not a word in the list — it is the seam that lets the CSS
+    keyframe wrap from the last word back to the first without a jump cut.
+    """
+    client = TestClient(app, base_url="https://testserver")
+
+    home = client.get("/").text
+    rotator = re.search(r'<span class="roll">(.*?)</span></h1>', home, re.S)
+
+    assert rotator is not None, "/ no longer carries a .roll rotator in its h1"
+    words = re.findall(r">([^<>]+)</span>", rotator.group(1))
+    assert words == [
+        "decisions.",
+        "dead ends.",
+        "reasons.",
+        "sessions.",
+        "context.",
+        "decisions.",
+    ]
+
+
+def test_home_motion_respects_reduced_motion() -> None:
+    """Both ambient animations stop under prefers-reduced-motion: reduce.
+
+    The glow and the word roll are the only two loops on the page, and both
+    are CSS keyframes, so the only place this can be honoured is inside
+    info.css's global reduced-motion block. A content assertion is weak, but a
+    server-side test cannot evaluate a media query.
+    """
+    css = (server_module.STATIC_DIR / "info.css").read_text(encoding="utf-8")
+
+    start = css.index("@media (prefers-reduced-motion: reduce)")
+    block = css[start:css.index("\n}", start)]
+
+    # Both animations exist...
+    assert "@keyframes drift" in css
+    assert "@keyframes rollup" in css
+    assert "animation: drift" in css
+    assert "animation: rollup" in css
+    # ...and both are neutralised inside the reduced-motion block. !important
+    # matters: each animation is declared later in the file at the same
+    # specificity, so a plain override would lose the cascade.
+    assert ".hero-glow { animation: none !important; }" in block
+    # The track carries the animation, not the window. `.roll` clips and never
+    # moves; neutralising it here would be a no-op and the words would keep
+    # rolling with reduced motion on.
+    assert ".roll-track { animation: none !important;" in block
+
+
+def test_home_rotator_window_and_track_are_separate_elements() -> None:
+    """The clipping element and the animated element must not be the same one.
+
+    They were, once. `.roll` both clipped (`overflow: hidden` plus a fixed
+    height) and carried the `rollup` animation, so the translate walked the
+    clipping box down the page instead of scrolling the words through it, and
+    every word rendered at once as a stack. Correct markup did not catch it,
+    because the markup was already correct. This pins the structure instead.
+    """
+    css = (server_module.STATIC_DIR / "info.css").read_text(encoding="utf-8")
+
+    # rindex, not index: `.roll-track` also appears inside the reduced-motion
+    # block earlier in the file, where it is deliberately set to `animation: none`.
+    # The real declaration is the later one.
+    window = css[css.index(".roll {"):css.index("\n", css.index(".roll {"))]
+    track = css[css.rindex(".roll-track {"):css.index("\n", css.rindex(".roll-track {"))]
+
+    assert "overflow: hidden" in window, ".roll must be the clipping window"
+    assert "animation:" not in window, (
+        ".roll must not animate. If the element that clips is also the element "
+        "that moves, the whole word list renders as a visible stack."
+    )
+    assert "animation: rollup" in track, ".roll-track must carry the animation"
+
+    # The window must not lay its own children out in a column, and must not
+    # stretch the track to its own height. Either one squashes six 1.03em items
+    # into a 1.03em box, where they are shrinkable flex items saved only by the
+    # automatic minimum size rule.
+    assert "flex-direction: column" not in window, (
+        ".roll must not be a column: it would stack the words rather than clip them"
+    )
+    assert "align-items: flex-start" in window, (
+        ".roll must not stretch .roll-track, or the track is forced to the "
+        "window's height and its six items become shrinkable inside it"
+    )
+    assert "flex-direction: column" in track, ".roll-track stacks the words"
+
+    # Offsets in em, not percentages: percentages resolve against the track's
+    # own height, so adding or removing a word silently drifts every step.
+    frames = css[css.index("@keyframes rollup"):]
+    frames = frames[:frames.index("\n}")]
+    assert "%)" not in frames.replace("0%,", "").replace("%,", ""), (
+        "rollup offsets must be in em, matching the item height"
+    )
+
+    client = TestClient(app, base_url="https://testserver")
+    page = client.get("/").text
+    assert 'class="roll"><span class="roll-track">' in page.replace("\n", "")
+
+
+def test_no_vendor_name_on_user_facing_surfaces() -> None:
+    """No page a reader can open names the retrieval dependency.
+
+    Source, comments and imports still name it; this is about what a visitor
+    sees. /openapi.json is included because its description string is served
+    publicly at /docs, which is the surface everyone forgets.
+    """
+    vendor = "cognee"
+    client = authed_client()
+
+    pages = {
+        path: client.get(path).text
+        for path in ("/", "/info", "/use-cases", "/contact", "/login", "/app")
+    }
+    description = client.get("/openapi.json").json()["info"]["description"]
+
+    for path, page in pages.items():
+        assert vendor not in page.lower(), f"{path} names the retrieval vendor"
+    assert vendor not in description.lower()
 
 
 def test_api_uses_configured_citadel_service() -> None:
@@ -679,19 +1209,43 @@ def test_writer_access_can_ingest_and_feedback_but_not_admin_actions() -> None:
 
 
 def test_ui_requires_admin_key() -> None:
+    """The dashboard stays behind auth; anonymous callers are sent to /login.
+
+    The dashboard moved from / to /app when the root became the landing page.
+    What matters here is unchanged: an anonymous caller never receives
+    index.html.
+    """
     app.state.citadel = FakeCitadel()
     client = TestClient(app)
 
-    response = client.get("/", follow_redirects=False)
+    response = client.get("/app", follow_redirects=False)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+    assert "graphCanvas" not in response.text
+
+
+def test_root_is_the_public_landing_page_for_everyone() -> None:
+    """/ never serves the app, signed in or not.
+
+    One URL, one body: a member must be able to open the landing page and send
+    the link on instead of being bounced into the dashboard.
+    """
+    app.state.citadel = FakeCitadel()
+
+    anon = TestClient(app).get("/")
+    member = authed_client().get("/")
+
+    for response in (anon, member):
+        assert response.status_code == 200
+        assert 'id="graphCanvas"' not in response.text
+        assert '<link rel="stylesheet" href="/static/info.css">' in response.text
 
 
 def test_ui_shell_is_served_after_login() -> None:
     client = authed_client()
 
-    response = client.get("/")
+    response = client.get("/app")
 
     assert response.status_code == 200
     assert "Citadel Archive" in response.text
@@ -704,6 +1258,222 @@ def test_ui_shell_is_served_after_login() -> None:
     assert "Obsidian Vaults" in response.text
     assert "mcp-remote" in response.text
     assert "Audit event filter" in response.text
+
+
+STATIC_DIR = Path(server_module.__file__).resolve().parent / "static"
+
+
+def test_app_nav_has_four_primary_entries() -> None:
+    """Home, Search, Review, Admin. Nothing else is a primary nav entry.
+
+    Seven entries were the problem the redesign exists to fix: two of them
+    nobody could tell apart, and the promotion queue that people actually needed
+    was buried inside an admin-only Overview. Explore and Activity are still
+    reachable by route; they are just not resident in the sidebar.
+    """
+    client = authed_client()
+
+    page = client.get("/app").text
+
+    nav = re.search(r'<nav class="side-nav".*?</nav>', page, re.S)
+    assert nav, "the /app shell no longer renders a <nav class=\"side-nav\">"
+    labels = re.findall(r'<span class="nav-label">([^<]+)</span>', nav.group(0))
+
+    assert labels == ["Home", "Search", "Review", "Admin"], labels
+    assert 'class="nav-link" data-page-target="overview"' not in page
+    assert 'class="nav-link" data-page-target="ingest"' not in page
+    # Review is writer-gated; Admin stays admin-gated.
+    assert 'data-page-target="review" aria-label="Review" data-min-role="writer"' in nav.group(0)
+    assert 'data-page-target="agents" aria-label="Admin" data-min-role="admin"' in nav.group(0)
+
+
+def test_app_defaults_to_light() -> None:
+    """Light on :root, dark under [data-theme="dark"] — not the reverse.
+
+    The app and the public site are one product. If the dashboard kept its dark
+    base and merely offered a light override, an OS-dark visitor would still get
+    two different-looking products, which is the thing this replaced.
+    """
+    css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    root = re.search(r"^:root \{(.*?)^\}", css, re.S | re.M)
+    dark = re.search(r'^:root\[data-theme="dark"\] \{(.*?)^\}', css, re.S | re.M)
+    assert root and dark, "styles.css no longer declares both theme blocks"
+
+    assert "color-scheme: light;" in root.group(1)
+    assert "--surface: #ffffff;" in root.group(1)
+    assert "--bg: #fafafa;" in root.group(1)
+    assert "--text: #0a0a0a;" in root.group(1)
+
+    assert "color-scheme: dark;" in dark.group(1)
+    assert "--surface: #171717;" in dark.group(1)
+    assert "--bg: #0a0a0a;" in dark.group(1)
+
+    # prefers-color-scheme is deliberately not consulted: dark is an explicit,
+    # remembered choice, exactly as on the public pages.
+    assert "@media (prefers-color-scheme" not in css
+
+
+def test_app_and_site_share_a_theme_key() -> None:
+    """One storage key, so a theme chosen on the landing page survives the door.
+
+    Two keys would mean picking dark on / and being handed a white dashboard a
+    click later.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    info_js = (STATIC_DIR / "info.js").read_text(encoding="utf-8")
+
+    assert "citadel-info-theme" in app_js
+    assert "citadel-info-theme" in info_js
+    # Same default on both sides: light when the key is absent.
+    assert 'getAttribute("data-theme") || "light"' in app_js
+    assert 'getAttribute("data-theme") || "light"' in info_js
+
+
+def test_app_home_leads_with_search_and_three_numbers() -> None:
+    """Home is search bar, three numbers, Needs you, Recent. No charts, no graph.
+
+    The front page used to be an admin-only Overview dominated by a graph nobody
+    could read, and human search was a nav item you had to go and find.
+    """
+    client = authed_client()
+
+    page = client.get("/app").text
+    home = re.search(r'<section class="page page-active" data-page="home".*?\n          </section>', page, re.S)
+    assert home, "the shell no longer renders a home page section"
+    home_markup = home.group(0)
+
+    assert 'id="homeSearchForm"' in home_markup
+    assert 'id="homeSearchQuery"' in home_markup
+    for number in ("homeReadable", "homeCapturedWeek", "homeWaiting"):
+        assert f'id="{number}"' in home_markup, number
+    assert "Notes you can read" in home_markup
+    assert "Captured this week" in home_markup
+    assert "Waiting on you" in home_markup
+    assert 'id="homeNeedsList"' in home_markup
+    assert 'id="homeActivityList"' in home_markup
+    # The title row carries the theme toggle, and Recent links on to Activity.
+    assert 'id="homeThemeToggle"' in home_markup
+    assert 'data-page-target="events"' in home_markup
+    # The old seat checklist and the overview charts are not on the front page.
+    assert 'id="homeChecklist"' not in home_markup
+    assert "overviewChart" not in home_markup
+    assert 'id="graphCanvas"' not in home_markup
+
+
+def test_search_view_groups_central_before_node() -> None:
+    """The web groups hits exactly as `_render_search` does in the CLI.
+
+    Two surfaces over one vault have to teach one mental model: Central first,
+    then shared traces, then your Node. If the CLI order changes, this fails.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    cli_py = Path(server_module.__file__).resolve().parent / "cli.py"
+    cli = cli_py.read_text(encoding="utf-8")
+
+    web_order = re.search(r"const SEARCH_SECTION_ORDER = \[(.*?)\];", app_js, re.S)
+    cli_order = re.search(r"_SEARCH_SECTION_ORDER = \((.*?)\)", cli, re.S)
+    assert web_order and cli_order, "the section order constant moved"
+
+    web = re.findall(r'"([a-z_]+)"', web_order.group(1))
+    cli_sections = re.findall(r'"([a-z_]+)"', cli_order.group(1))
+
+    assert web == cli_sections, (web, cli_sections)
+    assert web.index("central") < web.index("node")
+    # And the results panel says so on the page itself.
+    assert "Central first, then your Node" in authed_client().get("/app").text
+
+
+def test_review_is_the_only_place_with_approve_and_reject() -> None:
+    """Approve and Reject live on Review, and only admins get the buttons.
+
+    /api/promotion/pending/{id}/approve requires admin + sources:sync, so
+    rendering the button for a writer would offer an action that always 403s.
+    """
+    client = authed_client()
+
+    page = client.get("/app").text
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'data-page="review" data-min-role="writer"' in page
+    assert 'id="reviewQueueList"' in page
+    assert 'id="reviewSourceList"' in page
+
+    row = re.search(
+        r"function promotionNeedsRow\(item\) \{(.*?)\n\}", app_js, re.S
+    )
+    assert row, "promotionNeedsRow moved"
+    body = row.group(1)
+    assert 'canUse("admin")' in body
+    assert 'canUse("writer")' not in body
+    assert '"Approve"' in body and '"Reject"' in body
+
+
+def test_knowledge_mesh_canvas_is_reachable_from_the_knowledge_page() -> None:
+    """The mesh canvas must live on a page the nav actually links to.
+
+    It was markup inside the `overview` section. When the nav collapsed to four
+    entries, `overview` was unlinked and `initialPage()` stopped returning it, so
+    the production Knowledge Mesh became reachable only by typing #overview and
+    only as an admin. Nothing caught it because the URL still resolved and the
+    ids still existed, which is exactly why this asserts the owning page rather
+    than the presence of the ids.
+    """
+    from html.parser import HTMLParser
+
+    void = {"meta", "link", "br", "hr", "img", "input", "source", "path", "circle", "use"}
+
+    class _Ancestry(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stack: list[tuple[str, str | None]] = []
+            self.owning_page: str | None = None
+            self.seen = False
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            data = dict(attrs)
+            if data.get("id") == "graphCanvas":
+                self.seen = True
+                pages = [page for _, page in self.stack if page]
+                self.owning_page = pages[-1] if pages else None
+            if tag not in void:
+                self.stack.append((tag, data.get("data-page")))
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in void:
+                return
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.stack[index][0] == tag:
+                    del self.stack[index:]
+                    break
+
+    client = authed_client()
+    page = client.get("/app").text
+
+    parser = _Ancestry()
+    parser.feed(page)
+
+    assert parser.seen, "/app no longer ships the mesh canvas at all"
+    assert parser.owning_page == "knowledge", (
+        f"the mesh canvas sits on the '{parser.owning_page}' page. It must be on "
+        "'knowledge', which the nav links to; 'overview' is unlinked, so putting "
+        "it there makes the graph reachable only by typing the hash."
+    )
+    # The rest of the canvas furniture has to travel with it, or the toolbar and
+    # the inspector end up on a page the canvas is no longer on.
+    for element_id in (
+        "mesh",
+        "meshAlert",
+        "graphLegend",
+        "selectedNode",
+        "fitButton",
+        "pauseButton",
+        "graphDepthInput",
+        "canvasEmpty",
+        "realGraphEmpty",
+        "graphMeta",
+    ):
+        assert page.count(f'id="{element_id}"') == 1, element_id
 
 
 def test_admin_can_create_and_use_role_based_access_token(tmp_path: Any) -> None:
@@ -4601,3 +5371,122 @@ def test_search_marks_session_trace_hits_reference_only(tmp_path: Any) -> None:
     assert trace_hits[0]["_citadel"]["trust"] == "reference-only"
     assert trace_hits[0]["_citadel"]["doc_type"] == "session-trace"
     assert trace_hits[0]["_citadel"]["trust_tier"] == "reference-only"
+
+
+# --- /partners contact form -------------------------------------------------
+# The only unauthenticated write path in the service, so it gets its own tests
+# rather than riding along on the page tests.
+
+
+class FakeChatGateway:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def post_digest(self, text: str, *, message_id: str | None = None) -> dict[str, object]:
+        self.sent.append(text)
+        return {"ok": True}
+
+
+def _reset_contact_limits() -> None:
+    server_module._contact_hits.clear()
+    server_module._contact_global_hits.clear()
+
+
+def _enquiry(**overrides: str) -> dict[str, str]:
+    body = {
+        "name": "Ada Lovelace",
+        "email": "ada@example.org",
+        "organization": "Analytical Engines",
+        "message": "DIGITAL-2026-AI-07, we need the memory work package.",
+        "website": "",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_contact_delivers_to_the_chat_gateway(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True}
+    assert len(gateway.sent) == 1
+    assert "Ada Lovelace" in gateway.sent[0]
+    assert "DIGITAL-2026-AI-07" in gateway.sent[0]
+
+
+def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> None:
+    """A missing gateway must refuse, never accept into a void.
+
+    An enquiry from a consortium coordinator that disappears silently is worse
+    than an error message: nobody learns it was lost.
+    """
+    _reset_contact_limits()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"]
+
+
+def test_contact_honeypot_is_dropped_without_delivery(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry(website="http://spam.example"))
+
+    # 200 on purpose: a bot must not learn that it was filtered.
+    assert response.status_code == 200
+    assert gateway.sent == []
+
+
+def test_contact_rate_limits_a_single_sender(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+    headers = {"x-forwarded-for": "203.0.113.7"}
+
+    codes = [
+        client.post("/contact", json=_enquiry(), headers=headers).status_code
+        for _ in range(server_module.CONTACT_PER_IP_LIMIT + 1)
+    ]
+
+    assert codes[:-1] == [200] * server_module.CONTACT_PER_IP_LIMIT
+    assert codes[-1] == 429
+    assert len(gateway.sent) == server_module.CONTACT_PER_IP_LIMIT
+
+
+def test_contact_scrubs_chat_formatting_from_submitted_text() -> None:
+    """Submitted text must not be able to forge a message in the org's space.
+
+    Google Chat renders <url|label> as a link and *_~` as formatting, so a
+    submitter could otherwise post something that reads like Citadel itself.
+    """
+    forged = "*Citadel admin:* rotate keys at <https://evil.example|the portal>"
+
+    scrubbed = server_module.scrub_contact_field(forged)
+
+    for char in "<>*_~`":
+        assert char not in scrubbed
+    assert "rotate keys at" in scrubbed
+
+
+def test_contact_rejects_an_oversized_message(monkeypatch) -> None:
+    _reset_contact_limits()
+    gateway = FakeChatGateway()
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: gateway)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry(message="x" * 4001))
+
+    assert response.status_code == 422
+    assert gateway.sent == []

@@ -158,6 +158,102 @@ synthesized-notes + BM25? (2) synthesis must respect ADR-0009 read scope
 (Central notes only from Central + promoted, never cross-Node); (3) LLM cost of
 synthesis-on-ingest + contradiction checks vs. cheap add-a-chunk.
 
+## Public site: landing, status, use cases, contact, sign-in (2026-07-28) — BUILT, NOT DEPLOYED
+
+Branch `feat/partners-page`. Five public pages under one nav and one design
+system, one subject each, plus the first unauthenticated write path in the
+service (decision record: [`docs/adr/0013-public-contact-endpoint.md`](docs/adr/0013-public-contact-endpoint.md)).
+
+- [x] `/` landing page: TL;DR, the Node/Central boundary, capture-search-promote,
+      get-started. Metrics and updates deliberately stay on `/info`
+- [x] Dashboard moved `/` → `/app`; anonymous callers redirect to `/login`
+- [x] `/login` rebuilt on `info.css` (was the dashboard theme)
+- [x] Contact form → `POST /contact` → Google Chat, own thread, honeypot,
+      per-IP + global rate limits, formatting scrubbed, fail-closed 503
+- [x] One canonical Pixel Bastion: web mark had drifted from `kb/banner.py`;
+      now generated into favicon, both brand SVGs, README banner, sidebar, CLI,
+      pinned by a test so it cannot drift again
+- [x] Square corners product-wide (radius tokens → 0); documented deviation
+      from DESIGN.md xl=14
+- [x] Dashboard accent `#FA008C` → Iris `#FF51FF`; one accent, one favicon
+- [x] Light by default on public pages; dark is an explicit remembered toggle
+
+**Second pass — one subject per page (same day):**
+
+- [x] `/info` lost "The model" and "Join in": both were fuller on `/`. The
+      architecture lane diagram and the access/data-model deep dive moved to `/`;
+      `/info` is now current state, what's live, releases, roadmap
+- [x] `/` hero lede rewritten so it stops restating its own TL;DR
+- [x] `/partners` → `/use-cases`, leading with four team use cases, then the
+      partnering profile unchanged. Old URL 301s rather than 404s
+- [x] Contact form moved off the bottom of that page onto its own `/contact`
+- [x] Nav is now Home, Status, Use cases, Contact, Sign in across all five pages,
+      pinned by a test that walks every page and checks every link + aria-current
+- [x] `test_each_public_page_owns_its_subject` guards the dedup: the arch diagram
+      and install commands on `/` only, the live tiles on `/info` only
+- [x] Four duplicated test functions in `tests/test_server.py` removed (a stash
+      merge had left two copies; pytest only ever ran the stale second one)
+
+**Third pass — home page redesign, app shell, and the stack decision (2026-07-29):**
+
+Design sessions produced two specs, both stack-independent and still valid:
+[`docs/superpowers/specs/2026-07-29-home-page-design.md`](docs/superpowers/specs/2026-07-29-home-page-design.md)
+and [`2026-07-29-app-ui-design.md`](docs/superpowers/specs/2026-07-29-app-ui-design.md).
+
+- [x] `/` rebuilt: dark-free light hero with a drifting Iris glow, rotating
+      headline word, sticky section index, proof tiles, hairline "how it works"
+      rows, two doors, get-started. No terminal in the hero, by decision
+- [x] Rotating headline bug: `.roll` both clipped and animated, so the whole
+      word list rendered as a stack. Window and track are now separate elements
+      and the keyframe offsets are in `em`, not percentages, which silently
+      drifted whenever a word was added. Pinned by a structural test
+- [x] Pipeline diagram simplified from fourteen elements to four steps
+      (`.spine`: capture → Node → promotion → Central), stacking on narrow
+      screens. The guarantee sentence stays in every form of it
+- [x] Interactive React Flow version of the same diagram, lazily fetched only
+      when it scrolls into view; the four-step markup is the served default and
+      the no-JS fallback. Bundle is committed (~330 KB raw, ~109 KB gzipped),
+      built by esbuild on a developer machine, since there is no Node in CI
+- [x] Per-route CSP: `style-src 'self' 'unsafe-inline'` on `/` only, because
+      React Flow writes inline transforms. Exact-path opt-in, strict everywhere
+      else, two tests pinning that `/app` and `/login` cannot inherit it
+- [x] Removed a false claim before it shipped: "no data leaves your node" is not
+      true, `kb/llm_enrichment.py` POSTs content to OpenRouter. Seat-isolation
+      claims are fine; data-residency claims are not
+- [x] Vendor name out of every user-facing surface, including the public
+      OpenAPI `description` served at `/openapi.json`
+- [x] App shell: `styles.css` restructured light-default with a dark override,
+      converged onto the public token set, sharing the `citadel-info-theme` key
+      so a theme picked on the landing page follows you into the dashboard
+- [x] App nav collapsed seven entries to four (Home, Search, Review, Admin).
+      Knowledge, Activity and Write left routable but out of the nav
+- [x] **Stack decided: Next.js + TypeScript + Tailwind, statically exported**
+      into `kb/static/` and served by FastAPI, matching the org stack in
+      `masumi-network/sokosumi-landing` while keeping `pip install` self-hosting
+      working with no Node at runtime. See
+      [`docs/adr/0014-nextjs-frontend-static-export.md`](docs/adr/0014-nextjs-frontend-static-export.md)
+
+**Next up (not started):**
+
+- [ ] Scaffold the Next.js app in `web/`, port `info.css`'s light and dark token
+      sets into the Tailwind theme
+- [ ] Port the public pages, with React Flow as a native component rather than a
+      bolt-on bundle
+- [ ] Port the dashboard views (Home, Search, Review, Admin, Explore) and delete
+      `kb/static/app.js`, 4,247 lines. Explore keeps `force-graph` on canvas
+- [ ] Decide whether the app depends on `@summation/shared` for chrome
+
+**Todos / carry-over:**
+
+- [ ] Fill the `/contact` placeholders (NAME, EMAIL, REGISTERED ADDRESS) —
+      `test_contact_page_has_no_unfilled_placeholders` fails until then, by design
+- [ ] Confirm `CITADEL_GOOGLE_CHAT_*` is live on the Railway node, or the form
+      renders and 503s on submit
+- [ ] Nothing visually verified in a browser this session; click through all
+      five pages in light and dark before merging
+- [ ] `/info` and `/use-cases` prose still uses em dashes; sweep is pending a
+      decision, since it means rewriting existing copy
+
 ## Dashboard graph + mesh read isolation + /mcp fix (2026-07-14) — SHIPPED + DEPLOYED
 
 Merged to `main` (PR #76 dashboard/isolation, PR #77 /mcp) → Railway deploy

@@ -8,6 +8,77 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Added
 
+- **The home page rebuilt, and an interactive pipeline diagram.** `/` is now a
+  light hero with a drifting accent glow and a rotating headline word, a sticky
+  section index, proof tiles, hairline how-it-works rows, and two routes onward
+  for the two audiences. The Node-to-Central pipeline is four steps of plain
+  markup by default, and upgrades in place to an interactive React Flow diagram
+  once it scrolls into view. The bundle is committed and built by esbuild on a
+  developer machine, because there is no Node in CI or on the deploy host, and
+  it is never fetched by someone who does not reach the diagram.
+- **The app gains a light theme, and light is the default.** `styles.css` is
+  restructured the way `info.css` already was: light on `:root`, dark under
+  `[data-theme="dark"]`, no `prefers-color-scheme` following. The dashboard also
+  moves onto the public token set, so the app and the site stop being two
+  different-looking products, and both share the `citadel-info-theme` key, so a
+  theme chosen on the landing page follows you into the dashboard.
+- **The dashboard navigation drops from seven entries to four**: Home, Search,
+  Review, Admin. Knowledge, Activity and Write remain routable but leave the
+  nav, and Review is new: promotion approvals used to be buried inside an
+  admin-only Overview.
+
+### Changed
+
+- **The frontend stack is decided: Next.js, statically exported**
+  ([ADR-0014](docs/adr/0014-nextjs-frontend-static-export.md)). This matches the
+  org's stack while keeping `pip install citadel-archive` working on a host with
+  no Node, since the export is served by FastAPI from the same origin. Nothing
+  is migrated yet; the hand-written pages ship first so the port starts from a
+  working, tested baseline.
+
+### Fixed
+
+- **The rotating headline rendered as a static stack of every word.** `.roll`
+  was both the clipping window and the animated element, so the translate moved
+  the window down the page instead of scrolling words through it. Window and
+  track are now separate elements, and the keyframe offsets are in `em` rather
+  than percentages, which resolved against the track's own height and drifted
+  silently whenever a word was added or removed.
+- **A false data-residency claim was caught before it shipped.** The home page
+  said "no data leaves your node". It does: `kb/llm_enrichment.py` posts vault
+  content to a third-party model API on the normal path. Seat-isolation claims
+  are enforced in code and stay; unqualified residency claims are gone.
+- **The retrieval vendor's name no longer appears on any user-facing surface**,
+  including the public OpenAPI `description` served at `/openapi.json`.
+
+- **Public landing page at `/`, and the dashboard moved to `/app`.** The root is
+  now the front door for everyone, signed in or not: a TL;DR of what Citadel is,
+  the Node/Central boundary, how capture, search, and promotion fit together,
+  and the two commands to get started (`kb/static/landing.html`). Metrics,
+  releases, and roadmap stay on `/info`. The dashboard lives at `/app` and still
+  redirects anonymous callers to `/login`, so one URL means one body and a
+  member can send the landing link on without being bounced into the app.
+- **Contact form at `/contact` (`POST /contact`).** A consortium coordinator or
+  a team evaluating Citadel can write from the site. The enquiry relays to
+  the org's Google Chat space in its own thread and never touches the vault.
+  Hardened as the only unauthenticated write path in the service: honeypot
+  answered with 200 so bots learn nothing, per-IP (3 / 15 min) and global
+  (30 / hour) rate limits, length caps at the model boundary, Chat formatting
+  characters stripped so submitted text cannot forge an official looking
+  message, and fail-closed 503 when the gateway is unconfigured so an enquiry is
+  never accepted into a void. See
+  [ADR-0013](docs/adr/0013-public-contact-endpoint.md).
+- **One subject per public page.** `/info` explained the Seat/Node/Central
+  model and how to install, both of which `/` already covered in full, so the
+  same paragraphs were maintained twice and drifted. Home now owns
+  what-it-is and how-to-start (including the architecture diagram and the
+  access/data-model deep dive); `/info` is only the live numbers, releases,
+  and roadmap. `/partners` became `/use-cases`, which leads with the four
+  things teams actually run Citadel for and then keeps the full partnering
+  profile; the old URL 301s. The contact form moved off the bottom of that
+  page onto `/contact`. Nav across all five public pages: Home, Status,
+  Use cases, Contact, Sign in, pinned by a test that walks every page.
+
 - **Agent-facing search shaping + feedback.** Search hits carry a stable schema
   (`doc_type`, `content_hint`, `trust_tier`, `rank`, provenance) with
   spec/docs/asset-ID ranking and `canonical_only` / `exclude_ambient` /
@@ -33,6 +104,29 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Changed
 
+- **One mark everywhere, and it is square.** The web copy of Pixel Bastion had
+  drifted from `kb/banner.py` (windows dropped, gate narrowed) and nothing
+  caught it, because nothing compared them. The mark shipping in the web nav is
+  now canonical and generated from one source into `kb/static/favicon.svg`,
+  `kb/static/pixel-bastion.svg`, `docs/brand/pixel-bastion.svg`, the README
+  banner, the dashboard sidebar, and `kb/banner.py`, so the CLI draws the same
+  fortress. Square cells, no chrome box, one Iris gradient per cell.
+  `tests/test_banner.py` pins the bitmask against the shipped web mark.
+- **Square corners across the product.** Every radius token in
+  `kb/static/styles.css` and `info.css` is `0`, along with the ad-hoc px radii.
+  Circles (avatars, status dots) and capsule pills keep theirs. A documented
+  local deviation from DESIGN.md's radius xl=14.
+- **The dashboard moved to the Iris accent `#FF51FF`.** The app was themed to
+  Masumi's `theme-color` magenta `#FA008C` while the public pages used the
+  AGENTIC design system's Iris, so the product shipped two magentas and a
+  favicon that did not match the app it labelled. One accent now, tokens only.
+- **Sign-in rebuilt on the public design system.** `/login` moved off the
+  dashboard theme onto `info.css`: same nav, same neutral ramp, same accent,
+  same theme toggle, so arriving from `/info` no longer feels like being handed
+  to a different product at the door.
+- **Light is the default on the public pages.** `prefers-color-scheme` no longer
+  switches them; dark is an explicit, remembered toggle. This also removes the
+  dark flash an OS-dark visitor got before the deferred script ran.
 - **`/info` aligned to the AGENTIC / Masumi design system**
   (`masumi-network/sokosumi-landing` → `apps/sokosumi/DESIGN.md`): Inter-only,
   weight lightens as size grows (Inter Light headings, negative tracking,
