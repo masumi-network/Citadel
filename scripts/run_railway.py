@@ -393,8 +393,17 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
 def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str) -> int:
     """Run every enabled stage; continue past failures.
 
-    Exit code is nonzero only when all enabled stages fail, so one flaky
-    source never blocks the rest of the scheduled work.
+    Every enabled stage runs regardless of what failed before it — that is
+    delivered by the ``continue`` in the loop below, not by the return value.
+    The exit code is a separate question: it reports whether the pass was
+    clean, so any failed stage makes it nonzero (#89).
+
+    It used to return 0 unless *every* stage failed, which meant the hourly
+    evolve cycle reported success while github_sync and linear_sync failed on
+    the Kuzu lock every single time (#88, #46) and nothing ever surfaced it.
+
+    Callers that must not retry a partial failure need
+    ``restartPolicyType = "NEVER"``; see docs/operations.md.
     """
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -438,9 +447,7 @@ def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str
         ",".join(failed) or "none",
         ",".join(skipped) or "none",
     )
-    if failed and not succeeded:
-        return 1
-    return 0
+    return 1 if failed else 0
 
 
 def run_pipeline() -> int:

@@ -278,7 +278,18 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
                 },
             )
             code = await proc.wait()
-            logger.info("Evolve scheduler: stages finished (exit=%s)", code)
+            if code == 0:
+                logger.info("Evolve scheduler: stages finished (exit=0)")
+            else:
+                # A partial failure is the normal broken case, not an edge one:
+                # the stage names are already in the subprocess's "Evolve
+                # finished: ... failed=..." line, so log at ERROR here to make
+                # the cycle visibly bad rather than an INFO nobody reads (#89).
+                logger.error(
+                    "Evolve scheduler: stages finished with failures (exit=%s) — "
+                    "see the 'Evolve finished' line above for which stages failed",
+                    code,
+                )
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
                 proc.terminate()

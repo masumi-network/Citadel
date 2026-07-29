@@ -155,3 +155,41 @@ async def test_evolve_scheduler_loop_cognifies_even_if_subprocess_fails(monkeypa
 
     # A failed stages-subprocess (caught) must not skip the in-loop cognify.
     assert len(cognify_calls) >= 2
+
+
+async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """A partially failed cycle must be loud (#89).
+
+    Production ran for days with github_sync and linear_sync failing on the
+    Kuzu lock every hour while this logged "stages finished (exit=0)" at INFO.
+    Now the subprocess returns nonzero and the scheduler says so at ERROR.
+    """
+    import logging
+
+    import kb.server as server
+
+    cognify_calls: list[bool] = []
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> _FakeProc:
+        return _FakeProc(1)
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
+
+    with caplog.at_level(logging.ERROR, logger=server.logger.name):
+        task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
+        try:
+            for _ in range(300):
+                if cognify_calls:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    failures = [r for r in caplog.records if "stages finished with failures" in r.message]
+    assert failures, "a nonzero stages exit must be logged at ERROR"
+    assert failures[0].levelno == logging.ERROR
