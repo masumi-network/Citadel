@@ -1,4 +1,4 @@
-/* Citadel — /partners contact form. Posts to /contact, which relays to the
+/* Citadel — /contact form. Posts to /contact, which relays to the
    org's Google Chat space. Loaded as an external script under a strict CSP:
    no inline handlers, no inline styles. */
 (function () {
