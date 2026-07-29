@@ -425,6 +425,10 @@ async def _stop_evolve_scheduler(task: "asyncio.Task[Any] | None") -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
+    # Refuse to serve with a guessable env access key (M4). Deliberately at
+    # startup and not at kb.config import: the CLI imports that module too and
+    # must not die because the server's environment is misconfigured.
+    enforce_access_key_strength()
     async with mcp_server.session_manager.run():
         # Eagerly build the mesh and seed its in-memory activity counters from
         # persistent source state so a redeploy does not look like the graph reset.
@@ -1099,6 +1103,60 @@ def configured_access_keys() -> list[tuple[str, str]]:
     return entries
 
 
+# An env access key is a bearer credential on every endpoint (see
+# bearer_identity below), and unlike a minted ctdl_ token it is whatever string
+# an operator typed. docs/operations.md used to suggest "owner-admin-key".
+# 32 chars is well under a token_urlsafe(32) and well over anything hand-written.
+WEAK_ACCESS_KEY_MIN_LENGTH = 32
+
+
+def weak_access_keys() -> list[tuple[str, int]]:
+    """(env var name, length) for every configured env key that is too short."""
+    config = get_citadel().config
+    candidates: list[tuple[str, str]] = []
+    if config.admin_key:
+        candidates.append(("CITADEL_ADMIN_KEY", config.admin_key))
+    candidates.extend(("CITADEL_WRITER_KEYS", key) for key in config.writer_keys)
+    candidates.extend(("CITADEL_READER_KEYS", key) for key in config.reader_keys)
+    return [
+        (name, len(key))
+        for name, key in candidates
+        if len(key) < WEAK_ACCESS_KEY_MIN_LENGTH
+    ]
+
+
+def allow_weak_access_keys() -> bool:
+    return os.getenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def enforce_access_key_strength() -> None:
+    """Refuse to serve with a brute-forceable env access key (M4).
+
+    A hard stop rather than a warning, on purpose. A warning is the shape of
+    signal that let the Kuzu lock run for weeks: present in the logs, read by
+    nobody. The escape hatch is explicit and greppable, so an operator who needs
+    a short key in development makes a deliberate, auditable choice.
+    """
+    if allow_weak_access_keys():
+        return
+    weak = weak_access_keys()
+    if not weak:
+        return
+    listed = ", ".join(f"{name} ({length} chars)" for name, length in weak)
+    raise SystemExit(
+        f"Refusing to start: access key too short — {listed}. "
+        f"Minimum is {WEAK_ACCESS_KEY_MIN_LENGTH} characters, because an env key "
+        "authenticates as a bearer token on every endpoint.\n"
+        '  Mint one:  python -c "import secrets; print(secrets.token_urlsafe(32))"\n'
+        "  Override:  CITADEL_ALLOW_WEAK_ACCESS_KEYS=true"
+    )
+
+
 def env_identity(role: str) -> AccessIdentity:
     return AccessIdentity(
         role=role,
@@ -1199,13 +1257,92 @@ def session_role(request: Request) -> str | None:
     return identity.role if identity else None
 
 
+# Failed-auth throttle (M4). Counted ONLY on failure, so a caller holding a
+# valid credential never touches it and cannot be locked out no matter how much
+# noise an attacker generates. Per-IP is spoofable behind the Railway proxy, so
+# as with the contact form the global ceiling is what actually bounds it.
+AUTH_FAIL_PER_IP_LIMIT = 10
+AUTH_FAIL_PER_IP_WINDOW_SECONDS = 300
+AUTH_FAIL_GLOBAL_LIMIT = 200
+AUTH_FAIL_GLOBAL_WINDOW_SECONDS = 3600
+_auth_fail_hits: dict[str, list[float]] = {}
+_auth_fail_global_hits: list[float] = []
+_auth_fail_lock = threading.Lock()
+
+
+def reset_auth_throttle() -> None:
+    """Clear the buckets. For tests, and for an operator digging out of a flood."""
+    with _auth_fail_lock:
+        _auth_fail_hits.clear()
+        _auth_fail_global_hits.clear()
+
+
+def record_auth_failure(client_ip: str) -> bool:
+    """Record one failed auth. False when the caller is now over a limit.
+
+    A blocked attempt is deliberately NOT counted. Our own clients retry 429
+    (kb/retry.py TRANSIENT_HTTP_STATUSES) but never 401, so counting the blocked
+    retries would let a client with a stale token extend its own ban forever and
+    hide a plain wrong-credential behind "rate limited" — which is exactly how
+    the GitHub-Sync key drift got misdiagnosed before.
+    """
+    now = time.monotonic()
+    try:
+        with _auth_fail_lock:
+            recent_global = [
+                hit
+                for hit in _auth_fail_global_hits
+                if now - hit < AUTH_FAIL_GLOBAL_WINDOW_SECONDS
+            ]
+            _auth_fail_global_hits[:] = recent_global
+            recent = [
+                hit
+                for hit in _auth_fail_hits.get(client_ip, [])
+                if now - hit < AUTH_FAIL_PER_IP_WINDOW_SECONDS
+            ]
+            if len(recent) >= AUTH_FAIL_PER_IP_LIMIT or len(recent_global) >= AUTH_FAIL_GLOBAL_LIMIT:
+                _auth_fail_hits[client_ip] = recent
+                return False
+            recent.append(now)
+            _auth_fail_hits[client_ip] = recent
+            _auth_fail_global_hits.append(now)
+            if len(_auth_fail_hits) > 2000:
+                for stale_ip, hits in list(_auth_fail_hits.items()):
+                    if not hits or now - hits[-1] >= AUTH_FAIL_PER_IP_WINDOW_SECONDS:
+                        _auth_fail_hits.pop(stale_ip, None)
+            return True
+    except Exception:
+        # Fail OPEN. This is an in-process dict, so it should not raise, but a
+        # throttle that breaks must not become an outage for the whole team.
+        logger.exception("Auth throttle failed; allowing the request")
+        return True
+
+
+def _reject_unauthenticated(request: Request) -> None:
+    """401, or 429 once this source has failed too many times."""
+    client_ip = contact_client_ip(request)
+    if not record_auth_failure(client_ip):
+        logger.warning(
+            "Throttled repeated auth failures from %s: %s %s",
+            client_ip,
+            request.method,
+            request.url.path,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication attempts. Try again later.",
+            headers={"Retry-After": str(AUTH_FAIL_PER_IP_WINDOW_SECONDS)},
+        )
+    logger.warning(
+        "Rejected unauthenticated request: %s %s", request.method, request.url.path
+    )
+    raise HTTPException(status_code=401, detail="Access key required.")
+
+
 def require_role(request: Request, minimum_role: str) -> AccessIdentity:
     identity = request_identity(request)
     if not identity:
-        logger.warning(
-            "Rejected unauthenticated request: %s %s", request.method, request.url.path
-        )
-        raise HTTPException(status_code=401, detail="Access key required.")
+        _reject_unauthenticated(request)
     if ROLE_ORDER[identity.role] < ROLE_ORDER[minimum_role]:
         logger.warning(
             "Denied %s %s for actor %s: role %s below required %s",
@@ -2755,7 +2892,9 @@ async def list_contact_enquiries(request: Request, limit: int = 50) -> dict[str,
 
 
 @app.post("/admin/session")
-async def create_admin_session(body: AdminSessionBody, response: Response) -> dict[str, Any]:
+async def create_admin_session(
+    body: AdminSessionBody, response: Response, request: Request
+) -> dict[str, Any]:
     access_key = body.access_key or body.admin_key
     if not configured_access_keys() and not get_access_store().has_tokens():
         raise HTTPException(status_code=503, detail="Access keys are not configured.")
@@ -2763,6 +2902,16 @@ async def create_admin_session(body: AdminSessionBody, response: Response) -> di
         raise HTTPException(status_code=422, detail="Access key is required.")
     identity_with_cookie = access_key_identity(access_key)
     if not identity_with_cookie:
+        # Same throttle as the bearer path (M4): this endpoint accepts the same
+        # env keys, so limiting only one of the two would leave the door open.
+        client_ip = contact_client_ip(request)
+        if not record_auth_failure(client_ip):
+            logger.warning("Throttled repeated login failures from %s", client_ip)
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed authentication attempts. Try again later.",
+                headers={"Retry-After": str(AUTH_FAIL_PER_IP_WINDOW_SECONDS)},
+            )
         logger.warning("Admin session login rejected: access key did not match any credential")
         raise HTTPException(status_code=401, detail="Access key was rejected.")
     identity, session_cookie = identity_with_cookie
