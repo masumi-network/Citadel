@@ -149,13 +149,27 @@ and tenant-aware config without changing Cognee internals.
 
 Bootstrap environment keys plus a persistent access store for teammate/agent tokens:
 
+An env access key authenticates as a bearer token on **every** endpoint, so it
+is a password with no username and no rotation story. Generate them; never type
+them. The server refuses to start on an env key shorter than 32 characters
+(override with `CITADEL_ALLOW_WEAK_ACCESS_KEYS=true`, which you should only need
+in local development).
+
 ```bash
-CITADEL_READER_KEYS=alice-reader-key,bob-reader-key
-CITADEL_WRITER_KEYS=teammate-writer-key
-CITADEL_ADMIN_KEY=owner-admin-key
+# Generate each one:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+CITADEL_READER_KEYS=<32+ char random>,<32+ char random>
+CITADEL_WRITER_KEYS=<32+ char random>
+CITADEL_ADMIN_KEY=<32+ char random>
 CITADEL_ACCESS_STORE_PATH=/data/.citadel/access.json
 CITADEL_AUDIT_MAX_EVENTS=1000
 ```
+
+Prefer minted tokens (Access page, or `POST /api/access/tokens`) over env keys
+for anything but bootstrap: they carry a role, scopes, an expiry and a last-used
+timestamp, they are stored only as a hash, and they can be revoked individually.
+An env key can only be rotated by redeploying every consumer at once, which is
+how the GitHub-Sync cron ended up 401ing against a rotated admin key.
 
 | Role | Permissions |
 |---|---|

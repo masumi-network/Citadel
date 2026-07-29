@@ -8,8 +8,10 @@ from pathlib import Path
 import re
 import secrets
 import tempfile
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 import kb.server as server_module
@@ -5490,3 +5492,120 @@ def test_contact_rejects_an_oversized_message(monkeypatch) -> None:
 
     assert response.status_code == 422
     assert gateway.sent == []
+
+
+# --- M4: failed-auth throttle and weak-key guard -----------------------------
+
+
+def test_repeated_failed_auth_is_throttled_with_retry_after() -> None:
+    """Brute force gets a 429, not an unlimited stream of 401s."""
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+
+    codes = [
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"}).status_code
+        for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT + 3)
+    ]
+
+    assert codes[0] == 401
+    assert codes[-1] == 429
+    assert codes.count(401) == server_module.AUTH_FAIL_PER_IP_LIMIT
+    blocked = client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+    assert blocked.headers["Retry-After"] == str(server_module.AUTH_FAIL_PER_IP_WINDOW_SECONDS)
+
+
+def test_a_valid_credential_is_never_throttled(monkeypatch) -> None:
+    """The whole point: an attacker's noise must not lock out the team.
+
+    The credential is resolved before the limiter is consulted, so a caller who
+    holds a real one keeps working no matter how deep the failure bucket is.
+    """
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+    for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT + 5):
+        assert client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    # Now the bucket is well over the limit. A recognised identity must sail past.
+    monkeypatch.setattr(
+        server_module,
+        "request_identity",
+        lambda _request: AccessIdentity(
+            role="admin",
+            actor_id="env:admin",
+            actor_kind="env",
+            actor_name="admin",
+            source="env",
+            seat_slug=None,
+        ),
+    )
+    identity = server_module.require_role(
+        SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/mesh")), "admin"
+    )
+
+    assert identity.role == "admin"
+
+
+def test_a_blocked_attempt_does_not_extend_the_ban() -> None:
+    """Our own clients retry 429 but never 401 (kb/retry.py).
+
+    Counting blocked retries would let a stale-token client extend its own ban
+    forever and hide a wrong credential behind "rate limited".
+    """
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+    for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT):
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    before = len(server_module._auth_fail_global_hits)
+    for _ in range(5):
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    assert len(server_module._auth_fail_global_hits) == before
+
+
+def test_weak_env_access_key_refuses_to_start(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(
+                admin_key="owner-admin-key", writer_keys=(), reader_keys=()
+            )
+        ),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        server_module.enforce_access_key_strength()
+
+    assert "CITADEL_ADMIN_KEY" in str(caught.value)
+    assert "token_urlsafe" in str(caught.value)
+
+
+def test_a_strong_env_access_key_starts_normally(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(
+                admin_key="x" * 64, writer_keys=(), reader_keys=()
+            )
+        ),
+    )
+
+    server_module.enforce_access_key_strength()
+
+
+def test_the_weak_key_guard_can_be_overridden_explicitly(monkeypatch) -> None:
+    """Deliberate and greppable, unlike a warning nobody reads."""
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(admin_key="short", writer_keys=(), reader_keys=())
+        ),
+    )
+
+    server_module.enforce_access_key_strength()
