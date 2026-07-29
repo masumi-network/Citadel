@@ -7,8 +7,8 @@
 
 ## Context
 
-`/partners` is a public page aimed at EU consortium coordinators, who need a way
-to reach us from the page they are reading. That means an unauthenticated write
+`/contact` is a public page aimed at EU consortium coordinators and at teams
+evaluating Citadel, who need a way to reach us from the site they are reading. That means an unauthenticated write
 path on a service whose entire design premise is that writes are seat scoped and
 promotion gated.
 
@@ -66,4 +66,4 @@ Constraints that make the endpoint safe enough to expose:
   relaxing this endpoint.
 - If the Chat gateway is unconfigured in an environment, the form is visibly
   broken (503 on submit) rather than quietly useless. That is deliberate, but it
-  means the gateway is now part of what `/partners` depends on to work.
+  means the gateway is now part of what `/contact` depends on to work.

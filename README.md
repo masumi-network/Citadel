@@ -22,9 +22,11 @@ The result is organizational memory that behaves like a company vault: private w
 
 **📊 [State of the Vault](https://citadel-archive-production.up.railway.app/info)** — a live report of current metrics, shipped releases, and the roadmap, served from the running node.
 
-The node serves four public pages: `/` (what Citadel is), `/info` (live status),
-`/partners` (partnering profile and contact form), and `/login`. The dashboard
-itself lives at `/app`, behind a seat token.
+The node serves five public pages, each owning one subject: `/` (what Citadel
+is, and how to start), `/info` (live numbers, releases, roadmap), `/use-cases`
+(what teams run it for, then the partnering profile for EU consortia),
+`/contact` (the enquiry form), and `/login`. The dashboard itself lives at
+`/app`, behind a seat token.
 
 ## What Citadel does
 
