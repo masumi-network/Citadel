@@ -126,6 +126,42 @@ class RepoContentGitHubClient(GitHubOrgClient):
             raise GitHubAPIError(f"Could not resolve commit SHA for {full_name}@{ref}.")
         return commit_sha
 
+    def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
+        """Every file path in the repo, in ONE request. (paths, truncated) or None.
+
+        Replaces probing. The old discovery asked GitHub one question per root
+        path and one per directory in a depth-4 walk, so a repo with none of the
+        wanted files still cost ~7 requests that all 404'd — several hundred
+        failed calls an hour across the org, and the bulk of the error log.
+
+        Returns None when the tree cannot be read, so the caller can fall back to
+        probing rather than silently syncing nothing.
+        """
+        try:
+            data = self._get_json(
+                f"/repos/{quote(full_name, safe='/')}/git/trees/{quote(ref, safe='')}",
+                {"recursive": "1"},
+            )
+        except GitHubAPIError as exc:
+            logger.warning(
+                "Tree read failed for %s@%s (%s); falling back to path probing",
+                full_name,
+                ref[:12],
+                exc.status or exc.__class__.__name__,
+            )
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+            logger.warning("Unexpected tree payload for %s; falling back to probing", full_name)
+            return None
+        paths = [
+            str(entry["path"])
+            for entry in data["tree"]
+            if isinstance(entry, dict) and entry.get("type") == "blob" and entry.get("path")
+        ]
+        # GitHub truncates very large trees. A truncated tree is missing files,
+        # so say so and let the caller decide rather than treating it as whole.
+        return paths, bool(data.get("truncated"))
+
     def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
         try:
             data = self._get_json(
@@ -176,6 +212,54 @@ class RepoContentGitHubClient(GitHubOrgClient):
         return []
 
 
+def _select_from_tree(
+    paths: list[str],
+    *,
+    root_paths: tuple[str, ...],
+    tree_prefixes: tuple[str, ...],
+    tree_extensions: tuple[str, ...],
+    max_files: int,
+    max_depth: int,
+) -> list[str]:
+    """Pick the wanted files out of a full repo tree, with zero further requests.
+
+    Mirrors the probing order exactly so the selection is unchanged: every root
+    path that exists, in configured order, then each tree prefix in order.
+    """
+    present = set(paths)
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    for path in root_paths:
+        normalized = path.strip().lstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        if normalized in present:
+            selected.append(normalized)
+            seen.add(normalized)
+        if len(selected) >= max_files:
+            return selected
+
+    for prefix in tree_prefixes:
+        if len(selected) >= max_files:
+            break
+        root = prefix.strip().strip("/")
+        if not root:
+            continue
+        for entry_path in paths:
+            if len(selected) >= max_files:
+                return selected
+            if entry_path in seen or not entry_path.startswith(f"{root}/"):
+                continue
+            # The probing walk stopped at max_depth levels below the prefix.
+            if entry_path[len(root) + 1 :].count("/") + 1 > max_depth:
+                continue
+            if _matches_extension(entry_path, tree_extensions):
+                selected.append(entry_path)
+                seen.add(entry_path)
+    return selected
+
+
 def discover_repo_paths(
     client: RepoContentGitHubClient,
     full_name: str,
@@ -187,6 +271,26 @@ def discover_repo_paths(
     max_files: int,
     max_depth: int = 4,
 ) -> list[str]:
+    tree = client.fetch_tree(full_name, ref=ref)
+    if tree is not None:
+        paths, truncated = tree
+        if truncated:
+            # Missing entries would look like missing files, which is exactly the
+            # silent-empty shape. Probe instead of quietly syncing a partial repo.
+            logger.warning(
+                "Tree for %s is truncated by GitHub; falling back to path probing",
+                full_name,
+            )
+        else:
+            return _select_from_tree(
+                paths,
+                root_paths=root_paths,
+                tree_prefixes=tree_prefixes,
+                tree_extensions=tree_extensions,
+                max_files=max_files,
+                max_depth=max_depth,
+            )
+
     selected: list[str] = []
     seen: set[str] = set()
 

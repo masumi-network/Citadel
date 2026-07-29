@@ -71,6 +71,20 @@ class FakeRepoContentClient(RepoContentGitHubClient):
                 {"path": "skills/sokosumi/SKILL.md", "type": "file"},
             ],
         }
+        # The single-tree read (one request per repo). Without this override the
+        # fake inherits the REAL fetch_tree and the test hits api.github.com.
+        self.tree_truncated = False
+        self.tree_fails = False
+        self.tree_calls = 0
+        self.probe_calls = 0
+
+    def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
+        self.tree_calls += 1
+        if self.tree_fails:
+            return None
+        prefix = f"{full_name}/"
+        paths = [key[len(prefix) :] for key in self.files if key.startswith(prefix)]
+        return sorted(paths), self.tree_truncated
 
     def fetch_default_branch(self, full_name: str) -> str:
         return "main"
@@ -79,6 +93,7 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         return "commit123"
 
     def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
+        self.probe_calls += 1
         return f"{full_name}/{path}" in self.files
 
     def fetch_file_text(self, full_name: str, path: str, *, ref: str) -> RepoContentFile | None:
@@ -95,6 +110,7 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         )
 
     def list_directory(self, full_name: str, path: str, *, ref: str) -> list[dict[str, Any]]:
+        self.probe_calls += 1
         return self.directories.get(f"{full_name}/{path}", [])
 
 
@@ -303,3 +319,127 @@ def test_resolved_repos_autojoin_disabled_skips_discovery() -> None:
     syncer = RepoContentSyncer(FakeCitadel(config), client=TrackingClient(), state_path="unused")
     assert syncer._resolved_repos() == ["masumi-network/sokosumi-cli"]
     assert fetch_calls == []
+
+
+# --- single-tree discovery: the refactor must be behaviour-preserving --------
+
+
+def _rich_client() -> FakeRepoContentClient:
+    """A repo shape with every edge the two code paths could disagree on."""
+    client = FakeRepoContentClient()
+    client.files = {
+        "o/r/README.md": {"sha": "1", "content": "x"},
+        "o/r/AGENTS.md": {"sha": "2", "content": "x"},
+        "o/r/skills/a/SKILL.md": {"sha": "3", "content": "x"},
+        "o/r/skills/a/b/deep.md": {"sha": "4", "content": "x"},
+        "o/r/skills/a/b/c/d/too-deep.md": {"sha": "5", "content": "x"},
+        "o/r/skills/notes.txt": {"sha": "6", "content": "x"},  # wrong extension
+        "o/r/docs/guide.md": {"sha": "7", "content": "x"},
+        "o/r/skillsets/decoy.md": {"sha": "8", "content": "x"},  # prefix lookalike
+    }
+    client.directories = {
+        "o/r/skills": [
+            {"path": "skills/a", "type": "dir"},
+            {"path": "skills/notes.txt", "type": "file"},
+        ],
+        "o/r/skills/a": [
+            {"path": "skills/a/SKILL.md", "type": "file"},
+            {"path": "skills/a/b", "type": "dir"},
+        ],
+        "o/r/skills/a/b": [
+            {"path": "skills/a/b/deep.md", "type": "file"},
+            {"path": "skills/a/b/c", "type": "dir"},
+        ],
+        "o/r/skills/a/b/c": [{"path": "skills/a/b/c/d", "type": "dir"}],
+        "o/r/skills/a/b/c/d": [{"path": "skills/a/b/c/d/too-deep.md", "type": "file"}],
+        "o/r/docs": [{"path": "docs/guide.md", "type": "file"}],
+        "o/r/skillsets": [{"path": "skillsets/decoy.md", "type": "file"}],
+    }
+    return client
+
+
+_DISCOVERY_KW = dict(
+    root_paths=("README.md", "AGENTS.md", "MISSING.md"),
+    tree_prefixes=("skills/", "docs/"),
+    tree_extensions=(".md",),
+    max_files=10,
+    max_depth=3,
+)
+
+
+def test_tree_and_probe_discovery_select_the_same_files() -> None:
+    """The refactor must not change WHICH files get synced, only how we find them.
+
+    A silent change in selection would be invisible in production: the vault
+    would just quietly hold different content.
+    """
+    via_tree = _rich_client()
+    via_probe = _rich_client()
+    via_probe.tree_fails = True  # force the old path
+
+    tree_paths = discover_repo_paths(via_tree, "o/r", ref="sha", **_DISCOVERY_KW)
+    probe_paths = discover_repo_paths(via_probe, "o/r", ref="sha", **_DISCOVERY_KW)
+
+    assert tree_paths == probe_paths, f"selection drifted: {tree_paths} != {probe_paths}"
+    assert tree_paths == [
+        "README.md",
+        "AGENTS.md",
+        "skills/a/SKILL.md",
+        "skills/a/b/deep.md",
+        "docs/guide.md",
+    ]
+    # The edges: wrong extension, too deep, and a prefix lookalike are all excluded.
+    assert "skills/notes.txt" not in tree_paths
+    assert "skills/a/b/c/d/too-deep.md" not in tree_paths
+    assert "skillsets/decoy.md" not in tree_paths
+
+
+def test_the_tree_path_makes_one_request_instead_of_many() -> None:
+    """The point of the change: stop firing requests that 404."""
+    via_tree = _rich_client()
+    via_probe = _rich_client()
+    via_probe.tree_fails = True
+
+    discover_repo_paths(via_tree, "o/r", ref="sha", **_DISCOVERY_KW)
+    discover_repo_paths(via_probe, "o/r", ref="sha", **_DISCOVERY_KW)
+
+    assert via_tree.tree_calls == 1
+    assert via_tree.probe_calls == 0, "the tree path must not probe at all"
+    assert via_probe.probe_calls >= 7, "the old path really did fire this many"
+
+
+def test_a_truncated_tree_falls_back_instead_of_syncing_a_partial_repo() -> None:
+    """A truncated tree is missing files, which looks identical to 'no files'.
+
+    That is the silent-empty shape, so it must fall back rather than quietly
+    sync less than the repo actually has.
+    """
+    client = _rich_client()
+    client.tree_truncated = True
+
+    paths = discover_repo_paths(client, "o/r", ref="sha", **_DISCOVERY_KW)
+
+    assert client.probe_calls > 0, "truncation must fall back to probing"
+    assert paths == ["README.md", "AGENTS.md", "skills/a/SKILL.md", "skills/a/b/deep.md", "docs/guide.md"]
+
+
+def test_an_unreadable_tree_falls_back_and_still_finds_everything() -> None:
+    client = _rich_client()
+    client.tree_fails = True
+
+    paths = discover_repo_paths(client, "o/r", ref="sha", **_DISCOVERY_KW)
+
+    assert client.probe_calls > 0
+    assert "README.md" in paths and "skills/a/SKILL.md" in paths
+
+
+def test_max_files_cap_is_respected_identically_on_both_paths() -> None:
+    via_tree = _rich_client()
+    via_probe = _rich_client()
+    via_probe.tree_fails = True
+    kw = {**_DISCOVERY_KW, "max_files": 3}
+
+    assert (
+        discover_repo_paths(via_tree, "o/r", ref="sha", **kw)
+        == discover_repo_paths(via_probe, "o/r", ref="sha", **kw)
+    )
