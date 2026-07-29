@@ -96,6 +96,20 @@ railway variables --service Citadel-Archive \
   pipeline runs GitHub sync → repo-content → self-improve → **promotion** → cognify.
   Toggle the promotion stage alone with `CITADEL_EVOLVE_PROMOTION_ENABLED=true|false`.
 
+> **Two warnings before you add that cron service.**
+>
+> A second process sharing the web service's `/data` is how [#88](https://github.com/masumi-network/Citadel/issues/88)
+> happens: cognee opens the Kuzu graph read-write with an exclusive OS file lock
+> and holds it for the process lifetime, so whichever process touches the graph
+> first locks the other one out. The web service already runs the evolve cycle on
+> `CITADEL_EVOLVE_SCHEDULER_ENABLED`; prefer that over a separate service until
+> #88 is resolved.
+>
+> Set `restartPolicyType = "NEVER"` on any cron-style service. The repo default in
+> `railway.toml` is `ON_FAILURE` with 3 retries, and an evolve pass now exits
+> nonzero when *any* stage failed (#89), so a single failing stage under the
+> default policy would re-run the whole pass up to three more times.
+
 Cron services should also mount `/data` so `github_sync_state.json` and
 `backup_mirror/` persist between runs. Keep app and database in the same
 project/environment so the database stays private to Citadel. The graph store
