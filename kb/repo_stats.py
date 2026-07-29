@@ -38,7 +38,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.security_scan import redact_secrets
 
@@ -200,7 +202,7 @@ def fetch_commit_activity(
         },
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_secure(request, timeout=timeout) as response:
             if response.status == 202:
                 raise RepoStatsUnavailable(
                     "GitHub is still computing commit statistics for this repository."

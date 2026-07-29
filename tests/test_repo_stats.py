@@ -145,7 +145,7 @@ def test_a_202_is_treated_as_try_again_not_as_data(monkeypatch: Any) -> None:
         def __exit__(self, *exc: Any) -> None:
             return None
 
-    monkeypatch.setattr(repo_stats, "urlopen", lambda *a, **k: _Response())
+    monkeypatch.setattr(repo_stats, "open_secure", lambda *a, **k: _Response())
 
     try:
         repo_stats.fetch_commit_activity("masumi-network/Citadel")
