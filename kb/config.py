@@ -65,6 +65,15 @@ def _repo_content_sync_state_path(value: str | None) -> str:
     return str(Path(_state_root()) / "repo_content_sync_state.json")
 
 
+def _repo_stats_state_path(value: str | None) -> str:
+    if value:
+        return value
+    # Lives with the other sync state, which on Railway is the mounted volume.
+    # That matters: the cache is what a redeploy reads before the first refresh
+    # lands, so on the volume the public numbers survive a restart.
+    return str(Path(_state_root()) / "repo_stats.json")
+
+
 def _access_store_path(value: str | None) -> str:
     if value:
         return value
@@ -198,6 +207,13 @@ class CitadelConfig:
     evolve_scheduler_enabled: bool = False
     evolve_interval_seconds: int = 21600
     github_token: str | None = None
+    # Live repo figures for the public pages. On by default: it is one GitHub
+    # request a day, it degrades to the cached value, and the alternative is
+    # numbers that are wrong and say nothing about it.
+    repo_stats_enabled: bool = True
+    repo_stats_repo: str = "masumi-network/Citadel"
+    repo_stats_state_path: str = ".citadel/repo_stats.json"
+    repo_stats_interval_seconds: int = 86400
     repo_content_sync_enabled: bool = True
     repo_content_sync_dataset: str = "masumi-network"
     repo_content_sync_session: str = "masumi-repo-content"
@@ -369,6 +385,18 @@ class CitadelConfig:
                 default=21600,
             ),
             github_token=os.getenv("CITADEL_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or None,
+            repo_stats_enabled=_bool(
+                os.getenv("CITADEL_REPO_STATS_ENABLED"),
+                default=True,
+            ),
+            repo_stats_repo=os.getenv("CITADEL_REPO_STATS_REPO", "masumi-network/Citadel"),
+            repo_stats_state_path=_repo_stats_state_path(
+                os.getenv("CITADEL_REPO_STATS_STATE_PATH")
+            ),
+            repo_stats_interval_seconds=_int(
+                os.getenv("CITADEL_REPO_STATS_INTERVAL_SECONDS"),
+                default=86400,
+            ),
             repo_content_sync_enabled=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_ENABLED"),
                 default=True,
