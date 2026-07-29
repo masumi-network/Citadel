@@ -177,8 +177,6 @@ def test_readable_document_count_is_scoped_to_the_caller(tmp_path: Any) -> None:
     so a dataset the caller cannot search can never be added in. Here Bob's Node
     holds documents and Alice must not see them counted.
     """
-    from kb.server import resolve_search_datasets
-
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
     alice_token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()[
