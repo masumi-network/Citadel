@@ -5413,19 +5413,56 @@ def test_contact_delivers_to_the_chat_gateway(monkeypatch) -> None:
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True}
+    assert response.json() == {"delivered": True, "stored": True}
     assert len(gateway.sent) == 1
     assert "Ada Lovelace" in gateway.sent[0]
     assert "DIGITAL-2026-AI-07" in gateway.sent[0]
 
 
-def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> None:
-    """A missing gateway must refuse, never accept into a void.
+def _contact_store_at(monkeypatch, tmp_path) -> Any:
+    """Point the endpoint at a throwaway enquiry store."""
+    from kb.contact_store import ContactStore
 
-    An enquiry from a consortium coordinator that disappears silently is worse
-    than an error message: nobody learns it was lost.
+    store = ContactStore(str(tmp_path / "contacts.json"))
+    monkeypatch.setattr(server_module, "get_contact_store", lambda: store)
+    return store
+
+
+def test_contact_is_stored_when_the_gateway_is_unconfigured(monkeypatch, tmp_path) -> None:
+    """No gateway must not mean the enquiry is lost (ADR-0013, amended).
+
+    Google Chat is unconfigured in production, so the old fail-closed 503 turned
+    away every partner enquiry and kept no record. ADR-0013's rule is that an
+    enquiry is never accepted into a void; a file on the state volume is not a
+    void, and the sender should not be told to go away.
     """
     _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True, "stored": True}
+    saved = store.recent()
+    assert len(saved) == 1
+    assert saved[0]["name"] == "Ada Lovelace"
+    assert "DIGITAL-2026-AI-07" in saved[0]["message"]
+    assert saved[0]["received_at"]
+
+
+def test_contact_still_fails_closed_when_it_can_neither_store_nor_deliver(
+    monkeypatch, tmp_path
+) -> None:
+    """The fail-closed rule survives; it just has a second chance first."""
+    _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+
+    def explode(_entry: Any) -> None:
+        raise OSError("disk is gone")
+
+    monkeypatch.setattr(store, "append", explode)
     monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
     client = TestClient(app, base_url="https://testserver")
 
@@ -5433,6 +5470,60 @@ def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> N
 
     assert response.status_code == 503
     assert "not configured" in response.json()["detail"]
+
+
+def test_contact_is_kept_when_chat_delivery_fails(monkeypatch, tmp_path) -> None:
+    """A stored enquiry must not ask the sender to send it a second time."""
+    _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+
+    class BrokenGateway:
+        thread_key = "citadel-partner-contact"
+
+        def post_digest(self, text: str, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("chat is down")
+
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: BrokenGateway())
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True, "stored": True}
+    assert len(store.recent()) == 1
+
+
+def test_contact_enquiries_endpoint_is_admin_only(monkeypatch, tmp_path) -> None:
+    _contact_store_at(monkeypatch, tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+
+    assert client.get("/api/contact/enquiries").status_code in {401, 403}
+
+
+def test_contact_is_never_written_to_the_vault(monkeypatch, tmp_path) -> None:
+    """The part of ADR-0013 that did NOT change.
+
+    Unauthenticated public text must never reach the substrate agents read as
+    authority. Storing enquiries on disk is a fourth destination, not a reversal
+    of the vault rejection.
+    """
+    _reset_contact_limits()
+    _contact_store_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+
+    ingested: list[Any] = []
+
+    class Tripwire:
+        async def ingest(self, *args: Any, **kwargs: Any) -> Any:
+            ingested.append((args, kwargs))
+            raise AssertionError("a contact enquiry must never reach the vault")
+
+    monkeypatch.setattr(server_module, "get_citadel", lambda: Tripwire())
+    client = TestClient(app, base_url="https://testserver")
+
+    client.post("/contact", json=_enquiry())
+
+    assert ingested == []
 
 
 def test_contact_honeypot_is_dropped_without_delivery(monkeypatch) -> None:
