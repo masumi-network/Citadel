@@ -14,7 +14,9 @@ import logging
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.access import CENTRAL_DATASET, SEAT_DATASET_PREFIX, AccessStore, seat_dataset
 from kb.cognee_client import _suppress_inline_cognify
@@ -134,7 +136,7 @@ class LinearClient:
             },
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_secure(request, timeout=self.timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
