@@ -189,6 +189,24 @@ All notable changes to `citadel-archive` are documented here. Format follows
   could attribute a trace to a colleague); and the dataset name no longer
   satisfies `repo=` / `path=` scoping (Central is named after the org).
 
+### Removed
+
+- **`kb.session_trace` no longer re-exports the distill helpers, and
+  `share_session_tags` is gone**
+  ([#130](https://github.com/masumi-network/Citadel/pull/130), thanks
+  @WAHIB-EL-KHADIRI). `DeadEnd`, `SessionTraceRecord`, `ToolErrorPair`,
+  `distill_node_note`, `distill_trace`, `format_compact_context`,
+  `iter_transcript_entries` and `redact_commands` were forwarded through
+  `kb.session_trace` and imported through it by nothing. Import them from
+  `kb.session_trace_distill`, which is where every in-tree caller already got
+  them. `share_session_tags` had no callers at all and is deleted outright
+  rather than moved. `enrich_shared_trace` and `force_shared_trace_author_seat`
+  are unaffected.
+
+  Called out because these names shipped in `v0.4.0` on PyPI, so this is a
+  breaking change for anything importing them out of tree, even though nothing
+  in this repository did.
+
 ## [0.4.0] — 2026-07-22
 
 ### Added
