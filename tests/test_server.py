@@ -5700,3 +5700,57 @@ def test_the_weak_key_guard_can_be_overridden_explicitly(monkeypatch) -> None:
     )
 
     server_module.enforce_access_key_strength()
+
+
+def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
+    """A search that returned nothing must not be recorded as a success (#50).
+
+    The audit detail already carried timed_out, but success was hardcoded True,
+    so /api/audit?view=failures never listed a timed-out search and any
+    success-rate metric read 100% while callers got zero hits. That is why the
+    "~20% silent failure rate" in #50 could never be quantified from the data
+    the node itself records.
+    """
+    import asyncio as aio
+    import dataclasses
+
+    class SlowCitadel(FakeCitadel):
+        config = dataclasses.replace(FakeCitadel.config, search_timeout_seconds=0.01)
+
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            await aio.sleep(0.3)
+            return [{"id": "x"}]
+
+    audited: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        server_module,
+        "record_mcp_audit",
+        lambda request, **kw: audited.append(kw),
+    )
+
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+
+    body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+
+    assert body.get("timed_out") is True
+    assert audited, "the search must be audited at all"
+    entry = audited[-1]
+    assert entry["detail"]["timed_out"] is True
+    assert entry["success"] is False, "a timed-out search is not a success"
+
+
+def test_a_normal_search_is_still_audited_as_a_success() -> None:
+    """The guard against over-correcting: only the timeout path flips."""
+    audited: list[dict[str, Any]] = []
+    original = server_module.record_mcp_audit
+    server_module.record_mcp_audit = lambda request, **kw: audited.append(kw)
+    try:
+        client = authed_client("test-reader")
+        app.state.citadel = FakeCitadel()
+        body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+    finally:
+        server_module.record_mcp_audit = original
+
+    assert body.get("timed_out") in (None, False)
+    assert audited and audited[-1]["success"] is True
