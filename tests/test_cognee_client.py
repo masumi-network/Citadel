@@ -461,6 +461,293 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     }
 
 
+def test_auto_feedback_is_off_by_default_in_cognees_own_config(monkeypatch: Any) -> None:
+    """cognee must actually agree the gate is off, not just see our env var (#50, #105).
+
+    This asserts through cognee's own is_auto_feedback_enabled(), which is what
+    session_turn.py:379 calls, so a cognee release that renames the variable or
+    changes the default fails here instead of quietly restoring an LLM call to
+    every search.
+
+    That call is awaited on the FastAPI event loop, so it blocks every other
+    request while it runs. It is the leading suspect for the 25-40s /healthz
+    hangs in #105, not only the per-search latency in #50.
+    """
+    from cognee.infrastructure.session.get_session_manager import get_session_manager
+
+    monkeypatch.delenv("AUTO_FEEDBACK", raising=False)
+    CogneePublicClient()._prepare_cognee_environment()
+
+    assert os.environ["AUTO_FEEDBACK"] == "false"
+    assert get_session_manager().is_auto_feedback_enabled() is False
+
+
+def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
+    """The default must be overridable without a deploy, so it stays reversible."""
+    monkeypatch.setenv("AUTO_FEEDBACK", "true")
+    CogneePublicClient()._prepare_cognee_environment()
+
+    assert os.environ["AUTO_FEEDBACK"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
+    monkeypatch: Any,
+) -> None:
+    """ensure_dataset provisions a seat's Dataset row exactly once (#147).
+
+    Against the REAL cognee Dataset model on a throwaway sqlite, so a version
+    bump that moves or renames the columns the existence check reads (name,
+    owner_id, tenant_id) fails here rather than silently re-provisioning every
+    seat on every call.
+
+    create_authorized_dataset itself is stubbed. It is cognee's function and
+    cognee guards it; what is being pinned is our decision of WHEN to call it.
+    """
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee.modules.data.methods as methods_pkg
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Dataset
+
+    user_id, tenant_id = uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Dataset.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add(
+            Dataset(id=uuid4(), name="seat:alice", owner_id=user_id, tenant_id=tenant_id)
+        )
+        # Same NAME, different tenant. Must not read as already provisioned,
+        # because the read path matches on tenant too.
+        session.add(
+            Dataset(id=uuid4(), name="seat:carol", owner_id=user_id, tenant_id=uuid4())
+        )
+        await session.commit()
+
+    class _FakeRelEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    created: list[str] = []
+
+    async def fake_create_authorized_dataset(name: str, user: Any) -> Any:
+        created.append(name)
+        async with maker() as session:
+            session.add(
+                Dataset(id=uuid4(), name=name, owner_id=user.id, tenant_id=user.tenant_id)
+            )
+            await session.commit()
+
+    # get_datasets binds get_relational_engine at ITS module import, so patching
+    # the relational package would not reach it.
+    monkeypatch.setattr(
+        import_module("cognee.modules.data.methods.get_datasets"),
+        "get_relational_engine",
+        lambda: _FakeRelEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(
+        methods_pkg, "create_authorized_dataset", fake_create_authorized_dataset
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    # Already provisioned for this tenant.
+    assert await client.ensure_dataset("seat:alice") is False
+    # Missing entirely.
+    assert await client.ensure_dataset("seat:dave") is True
+    # Now present, so reported as not-new, which is what a backfill counts.
+    assert await client.ensure_dataset("seat:dave") is False
+    # Present under a DIFFERENT tenant, so still missing for this one. This is
+    # the assertion the real-cognee tests below do not cover.
+    assert await client.ensure_dataset("seat:carol") is True
+
+    await engine.dispose()
+    # Provisioning runs on EVERY call, including the two that reported False.
+    # The return value describes what was found, not whether we called through:
+    # an early return would strand a seat whose row exists but whose ACL rows
+    # are missing, which test_ensure_dataset_repairs_a_row_that_has_no_acl pins.
+    assert created == ["seat:alice", "seat:dave", "seat:dave", "seat:carol"]
+
+
+@pytest.fixture
+def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
+    """Point cognee's REAL relational engine at a throwaway sqlite.
+
+    The caches are lru_cached module-wide, so they are cleared on the way in AND
+    on the way out; skipping the second clear poisons every later test in the
+    session with this tmp_path.
+    """
+    from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.relational.config import get_relational_config
+    from cognee.infrastructure.databases.relational.create_relational_engine import (
+        create_relational_engine,
+    )
+
+    for key, value in {
+        "DB_PROVIDER": "sqlite",
+        "DB_NAME": "citadel_test.db",
+        "SYSTEM_ROOT_DIRECTORY": str(tmp_path / "system"),
+        "DATA_ROOT_DIRECTORY": str(tmp_path / "data"),
+        "CACHE_ROOT_DIRECTORY": str(tmp_path / "cache"),
+        "COGNEE_LOGS_DIR": str(tmp_path / "logs"),
+        "DEFAULT_USER_EMAIL": "citadel_test@example.com",
+        "DEFAULT_USER_PASSWORD": "citadel-test-password",
+        "LLM_API_KEY": "unused-by-this-test",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    def _clear() -> None:
+        get_base_config.cache_clear()
+        get_relational_config.cache_clear()
+        create_relational_engine.cache_clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+def _real_cognee_client(monkeypatch: Any) -> CogneePublicClient:
+    client = CogneePublicClient()
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_makes_a_seat_resolvable_to_cognee(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """The claim that matters: cognee's own read-path resolver finds the seat (#147).
+
+    The stubbed test above pins when we call through. This one pins that the
+    call works, against the real relational stack, by asserting the exact
+    resolver the search path uses flips from None to the dataset.
+    """
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.data.methods import get_authorized_dataset_by_name
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+    client = _real_cognee_client(monkeypatch)
+
+    assert await get_authorized_dataset_by_name("seat:alice", user, "read") is None
+
+    assert await client.ensure_dataset("seat:alice") is True
+    resolved = await get_authorized_dataset_by_name("seat:alice", user, "read")
+    assert resolved is not None and resolved.name == "seat:alice"
+
+    assert await client.ensure_dataset("seat:alice") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_survives_losing_a_creation_race(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """A concurrent provisioner must not blow up this one (#147).
+
+    create_dataset is SELECT-then-INSERT on a deterministic uuid5 id and
+    handles no IntegrityError, so two writers for the same name collide on the
+    primary key. Reachable rather than theoretical: Railway runs evolve and
+    linear-sync as separate OS processes against one Postgres, and linear_sync
+    writes into seat:<slug>, so a boot backfill can meet an in-flight
+    cognee.add. Unhandled, the first collision aborts the whole sweep and every
+    later seat is silently skipped.
+    """
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.data.methods import get_authorized_dataset_by_name
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    # Warm the default user first. get_default_user CREATES it lazily, and
+    # racing that collides on users.email long before dataset creation is
+    # reached. That is a separate cognee-wide race on every entry point, not
+    # one this change introduces, and guarding it here would only hide which
+    # race the test is actually about. In the boot backfill the user is warm
+    # anyway: ensure_session_traces_dataset runs first, and the loop is
+    # sequential within a process.
+    user = await get_default_user()
+    client = _real_cognee_client(monkeypatch)
+
+    results = await asyncio.gather(
+        *(client.ensure_dataset("seat:racer") for _ in range(3)),
+        return_exceptions=True,
+    )
+
+    raised = [r for r in results if isinstance(r, BaseException)]
+    assert not raised, f"a lost race must not propagate: {raised}"
+    assert sum(1 for r in results if r is True) <= 1, "at most one creator"
+
+    # The row is there regardless of who won, which is the point of the call.
+    assert await get_authorized_dataset_by_name("seat:racer", user, "read") is not None
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """The half-provisioned seat: row present, ACL rows absent (#147).
+
+    create_authorized_dataset commits the Dataset row and THEN writes four
+    permission rows in separate sessions, and give_permission_on_dataset gives
+    up after three attempts, so a partial write is reachable. The read path
+    filters by ACL, so such a seat is exactly as broken as one with no row, and
+    an ensure_dataset that returned early on a present row could never repair
+    it.
+    """
+    from cognee.infrastructure.databases.relational import (
+        create_db_and_tables,
+        get_relational_engine,
+    )
+    from cognee.modules.data.methods import (
+        get_authorized_dataset_by_name,
+        get_unique_dataset_id,
+    )
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+
+    name = "seat:halfway"
+    dataset_id = await get_unique_dataset_id(dataset_name=name, user=user)
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(
+            Dataset(id=dataset_id, name=name, owner_id=user.id, tenant_id=user.tenant_id)
+        )
+        await session.commit()
+
+    assert await get_authorized_dataset_by_name(name, user, "read") is None
+
+    await _real_cognee_client(monkeypatch).ensure_dataset(name)
+
+    assert (
+        await get_authorized_dataset_by_name(name, user, "read")
+    ) is not None, "seat still unsearchable after ensure_dataset"
+
+
 def test_assert_cognee_dataset_api_imports_real_symbols() -> None:
     # A cognee bump that moves the private dataset-attribution internals must
     # fail HERE (loud, in CI), not silently fail-closed in prod. This imports

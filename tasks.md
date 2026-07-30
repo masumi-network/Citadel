@@ -1,5 +1,74 @@
 # Citadel Tasks
 
+## Next up (as of 2026-07-29 end of day)
+
+Ordered by what actually costs the org something today. Every root cause below was
+measured, not inferred; the issue carries the evidence.
+
+### Do first
+
+1. **`AUTO_FEEDBACK=false`** (#50) — environment only, no code, reversible by
+   unsetting. cognee defaults `auto_feedback = True`, adding one structured-output
+   LLM call per `cognee.search`, and a seat query fans out to three datasets, so
+   **three LLM calls per user query**, each shipping ~2,263 fixed tokens. This is
+   the 6-9s. Proven by running the real cognee code, not by reading it.
+2. **#153 evolve scheduler resets its interval on every deploy.** The loop sleeps a
+   full hour *before* its first pass, so any deploy inside that hour restarts the
+   clock. Exactly one cycle ran in the fourteen hours of 2026-07-29. Everything else
+   we fix gets deployed and then does not run. Nothing reports the staleness, so a
+   node that has not evolved in a week looks identical to one that just did.
+3. **#148 corrupt state read as "first run".** Four `_load_state` sites flatten a
+   `JSONDecodeError` to an empty state, and every `_save_state` is a non-atomic
+   `write_text`. A restart mid-write makes the next `github_sync` mark every repo
+   changed, compose a full "everything changed" digest, **ingest it into the vault
+   and post it to Chat**, then overwrite the evidence. All four already guard
+   first-run with `state_path.exists()`, so raising is safe. Copy the atomic
+   temp-file-and-rename from `kb/access.py:904-910`.
+
+### Then
+
+4. **#147 six of eleven seats have no cognee Dataset row.** `create_seat` writes the
+   `seat:<slug>` string to JSON and nothing ever creates the dataset; cognee only
+   creates it on the write path. Those six have never had a working vault. Fix is
+   provision-on-create, backfill the six, and make promotion distinguish "no dataset"
+   from "search failed".
+5. **#105 loop starvation.** `/healthz` does no work of its own. The measured
+   blocker is `AccessStore.authenticate_token` doing a full load plus pretty-printed
+   dump plus rename of the ~1 MB access store on **every authenticated request**,
+   35 ms, purely to stamp `last_used_at`. Roughly 15 lines. Note `--workers 2` is not
+   an option (ADR-0015).
+6. **#149** the organization digest LLM call fails 400 every cycle. A 400 is a
+   request problem, so retries cannot help.
+7. **#151** configure Google Chat, and make "no gateway configured" an explicit skip
+   reason rather than an empty success.
+8. **#150** align the cognee pin in `pyproject.toml` with `requirements.txt`. Do
+   **not** run `cognee-cli stamp base`: the migration warning is a false alarm from a
+   28-hour accidental 1.3.0 upgrade, and the database is healthy.
+
+### Open decisions, not code
+
+- **#129** governance PR: two required CI gates pass vacuously (the DCO check exits 0
+  when zero commits are enumerated; the linked-issue check matches the PR template's
+  own example text), and the branch would revert the `datamodel-code-generator` CVE
+  pin. When it lands, re-add the `CI gate` and `DCO sign-off` required contexts only
+  after fixing both. A required gate that always passes is worse than no gate.
+- **#99** dashboard accent: close it. Main already shipped the same tokens and a
+  better theme toggle; merging would add a duplicate `#themeToggle` id and a second
+  localStorage key.
+- **#46** cannot be verified until #153 is fixed, because the cycle rarely completes.
+- Rotate the Postgres password. It appears in plaintext in the alembic boot log and
+  in `VECTOR_DB_URL`.
+
+### Deferred deliberately
+
+The silent-empty audit spec
+(`docs/superpowers/specs/2026-07-30-exception-flattened-to-empty-audit-design.md`)
+scopes one of the four shapes that defect class takes. The other three, empty
+aggregates reported as success, verdicts asserted from a proxy signal, and discarded
+return values, are real and unswept. That was a deliberate finite-over-systemic
+choice, recorded so nobody assumes the sweep was exhaustive.
+
+
 ## "Not just a cognee wrapper" — differentiation roadmap (2026-07-15) — GRILLED → ADR-0010
 
 Source: 6-stream research synthesis (Karpathy "LLM Wiki" gist + 4 repos —

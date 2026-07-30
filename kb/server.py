@@ -20,6 +20,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -40,10 +42,11 @@ from kb.access import (
     default_scopes,
     hash_api_token,
     is_seat_dataset,
+    seat_dataset,
     validate_seat_slug,
 )
 from kb.capture_policy import SeatCapturePolicy, capture_policy_payload
-from kb.capture_config import matched_capture_root
+from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, matched_capture_root
 from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPublishError
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
@@ -461,6 +464,13 @@ async def lifespan(app: FastAPI) -> Any:
                 "Failed to bootstrap %s dataset; seat search/share may fail until provisioned",
                 SESSION_TRACES_DATASET,
             )
+        try:
+            await backfill_seat_datasets(get_citadel(), get_access_store())
+        except Exception:
+            logger.exception(
+                "Seat dataset backfill failed; seats created before provisioning "
+                "may still fail every search (#147)"
+            )
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
@@ -488,6 +498,36 @@ app = FastAPI(
 )
 STATIC_DIR = Path(__file__).with_name("static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(RequestValidationError)
+async def log_request_validation_error(
+    request: Request, exc: RequestValidationError
+) -> Any:
+    """Say WHY a 422 happened, in the log, without echoing the payload.
+
+    FastAPI answers the caller with the field-level detail but the server side
+    records nothing, so a rejected write appears in the deploy log as a bare
+    "422 Unprocessable Entity". A real client looping on a malformed request is
+    then undiagnosable from the node: seen in production as ten consecutive
+    PUT /api/access/seats/{slug}/capture-roots 422s with no way to tell whether
+    the payload was wrong, too large, or the wrong shape.
+
+    Field locations and error types only. The values are the caller's data,
+    which on these routes means filesystem paths and note content, and a log
+    line is exactly the wrong place for it.
+    """
+    problems = [
+        f"{'.'.join(str(part) for part in error.get('loc', ()))}: {error.get('type', 'invalid')}"
+        for error in exc.errors()
+    ]
+    logger.warning(
+        "Rejected %s %s as invalid: %s",
+        request.method,
+        request.url.path,
+        "; ".join(problems) or "no detail",
+    )
+    return await request_validation_exception_handler(request, exc)
 
 # The Next.js static export (see docs/adr/0014-nextjs-frontend-static-export.md).
 # Its own directory rather than a corner of static/, which holds the fonts, the
@@ -930,7 +970,9 @@ class CapturePolicyBody(BaseModel):
 
 
 class CaptureRootsBody(BaseModel):
-    roots: list[str] = Field(default_factory=list, max_length=50)
+    roots: list[str] = Field(
+        default_factory=list, max_length=MAX_APPROVED_CAPTURE_ROOTS
+    )
 
 
 class ObsidianVaultBody(BaseModel):
@@ -2369,6 +2411,52 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
         )
 
 
+async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[str, int]:
+    """Give every existing seat the cognee Dataset row its searches need (#147).
+
+    Seats created before provisioning existed have a dataset NAME and no row,
+    so every search for them raises DatasetNotFoundError. Six of eleven live
+    seats were in that state and had never had a working vault.
+
+    A boot pass rather than a script, for the same reason
+    ``ensure_session_traces_dataset`` above is one: it needs cognee's event
+    loop, and running it here makes the repair self-healing instead of
+    something an operator has to remember. ``ensure_dataset`` is idempotent and
+    also repairs a row whose ACLs are missing, so re-running every boot is both
+    safe and the point.
+
+    Relational store only, so this never opens the graph and cannot contend
+    with the single Kuzu writer during startup.
+
+    Per-seat failures are swallowed deliberately: one seat that cannot be
+    provisioned must not stop the other ten, and must not stop the node
+    booting. They are counted and logged.
+    """
+    counts = {"seats": 0, "created": 0, "failed": 0}
+    cognee_client = getattr(citadel, "cognee", None)
+    ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+    if not callable(ensure_dataset):
+        return counts
+
+    for slug in store.seat_slugs():
+        counts["seats"] += 1
+        try:
+            if await ensure_dataset(seat_dataset(slug)):
+                counts["created"] += 1
+        except Exception:
+            counts["failed"] += 1
+            logger.exception("Seat dataset backfill failed for seat:%s", slug)
+
+    if counts["created"] or counts["failed"]:
+        logger.info(
+            "Seat dataset backfill: seats=%d created=%d failed=%d",
+            counts["seats"],
+            counts["created"],
+            counts["failed"],
+        )
+    return counts
+
+
 def known_datasets(config: Any) -> list[str]:
     """Datasets a caller can target, in preference order, deduplicated."""
     ordered: list[str] = []
@@ -2767,6 +2855,36 @@ async def ui(request: Request) -> Response:
 @app.get("/login", include_in_schema=False)
 async def login() -> HTMLResponse:
     return HTMLResponse(LOGIN_HTML)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt() -> Response:
+    """Keep crawlers on the marketing pages and off everything else.
+
+    This node serves a public site (/, /info, /use-cases) from the same origin
+    as the app and the whole API, so without this a crawler is free to walk
+    /app, /next and /api. Those all require auth and answer 401, but a 401 is
+    still a request that reaches the event loop, and #105 is about how little
+    it takes to saturate that.
+
+    Was showing up as 404s in the production log, which is how it was noticed.
+    """
+    body = "\n".join(
+        [
+            "User-agent: *",
+            "Allow: /$",
+            "Allow: /info",
+            "Allow: /use-cases",
+            "Disallow: /api/",
+            "Disallow: /app",
+            "Disallow: /next/",
+            "Disallow: /mcp",
+            "Disallow: /search",
+            "Disallow: /ingest",
+            "",
+        ]
+    )
+    return Response(content=body, media_type="text/plain")
 
 
 @app.get("/info", include_in_schema=False)
@@ -3372,6 +3490,30 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # create_seat only computes the seat's dataset NAME; cognee creates the row
+    # itself lazily, and only on the write path. Until something is ingested the
+    # row does not exist, and every search for this seat dies on
+    # DatasetNotFoundError (#147). Provision it here so a seat works from the
+    # moment it is handed over.
+    #
+    # Deliberately not fatal. The seat and its token are already persisted by
+    # this point, so raising would leave a half-created seat behind and the
+    # admin no way to tell which half. Report the outcome instead: the audit
+    # event and the response both carry it, and the backfill can pick up any
+    # seat that landed unprovisioned.
+    provisioned: bool | None = None
+    try:
+        cognee_client = getattr(get_citadel(), "cognee", None)
+        ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+        if callable(ensure_dataset):
+            await ensure_dataset(created.principal.default_dataset)
+            provisioned = True
+    except Exception:
+        provisioned = False
+        logger.exception(
+            "seat dataset provisioning failed for %s", created.principal.default_dataset
+        )
+
     get_access_store().record_event(
         action="access.seat.create",
         actor=actor,
@@ -3382,11 +3524,13 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
             "seat_slug": created.principal.seat_slug,
             "token_id": created.api_token.id if created.api_token else None,
             "role": created.principal.role,
+            "node_dataset_provisioned": provisioned,
         },
     )
     payload: dict[str, Any] = {
         "ok": True,
         "principal": jsonable_encoder(created.principal),
+        "node_dataset_provisioned": provisioned,
     }
     if created.token and created.api_token:
         payload["token"] = created.token

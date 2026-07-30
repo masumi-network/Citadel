@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from kb.capture import capture_token
-from kb.capture_config import CaptureConfig, normalize_capture_root_paths
+from kb.capture_config import (
+    MAX_APPROVED_CAPTURE_ROOTS,
+    CaptureConfig,
+    normalize_capture_root_paths,
+)
 from kb.promotion_client import (
     PromotionClientError,
     get_seat_capture_roots,
@@ -22,6 +26,8 @@ class CaptureRootsSyncResult:
     detail: str
     seat_slug: str | None = None
     merged_count: int = 0
+    # True when retrying cannot possibly help: a rejected payload stays rejected.
+    permanent: bool = False
 
 
 def merge_capture_root_paths(
@@ -83,6 +89,25 @@ def _sync_local_capture_roots_once(
                 seat_slug=seat_slug,
                 merged_count=len(merged),
             )
+        if len(merged) > MAX_APPROVED_CAPTURE_ROOTS:
+            # Refuse locally instead of sending a payload the Node will reject.
+            # The merge is a union of server and local roots, so it only grows,
+            # and the write never lands: merged stays different from the server
+            # list, so the "unchanged" short-circuit above never fires and every
+            # subsequent sync re-sends the same rejected request. That is the
+            # 422 loop, and it cannot end on its own.
+            return CaptureRootsSyncResult(
+                ok=False,
+                status="failed",
+                detail=(
+                    f"{len(merged)} capture roots exceeds the Node limit of "
+                    f"{MAX_APPROVED_CAPTURE_ROOTS}. Remove some roots from "
+                    "capture config, or from the seat on the Node, and re-run."
+                ),
+                seat_slug=seat_slug,
+                merged_count=len(merged),
+                permanent=True,
+            )
         update_seat_capture_roots(
             seat_slug,
             list(merged),
@@ -90,11 +115,15 @@ def _sync_local_capture_roots_once(
             token=token,
         )
     except PromotionClientError as exc:
+        # A 4xx means the Node understood and refused. Sending it again changes
+        # nothing except the error rate.
+        status = getattr(exc, "status", None)
         return CaptureRootsSyncResult(
             ok=False,
             status="failed",
             detail=str(exc),
             seat_slug=seat_slug,
+            permanent=bool(status is not None and 400 <= status < 500),
         )
 
     return CaptureRootsSyncResult(
@@ -115,15 +144,19 @@ def sync_local_capture_roots_to_server(
     """Merge local roots into the seat's server-approved list (best-effort).
 
     Non-seat tokens and offline Nodes are skipped with a warning — local setup
-    must still succeed when sync cannot run. Transient Node errors are retried
-    once before returning a failed result.
+    must still succeed when sync cannot run. TRANSIENT Node errors are retried
+    once; a rejection is not retried, because the Node refusing a payload it
+    understood will refuse the identical payload again. Production showed the
+    cost of not making that distinction: ten consecutive
+    PUT .../capture-roots 422s, two per invocation, none of which could ever
+    have succeeded.
     """
     result = _sync_local_capture_roots_once(
         config,
         base_url=base_url,
         token=token,
     )
-    if result.status == "failed":
+    if result.status == "failed" and not result.permanent:
         result = _sync_local_capture_roots_once(
             config,
             base_url=base_url,

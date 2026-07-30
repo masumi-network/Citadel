@@ -151,6 +151,14 @@ def save_capture_config(
     return config_path
 
 
+# The most approved capture roots a seat may hold. One number, imported by the
+# API model, the access store and the sync client, because the three disagreeing
+# is the actual bug: the model capped the list at 50, the store enforced nothing,
+# and the client merged without a bound, so a seat could end up holding more
+# roots than the endpoint that wrote them would accept.
+MAX_APPROVED_CAPTURE_ROOTS = 50
+
+
 def normalize_capture_root_paths(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Normalize and dedupe approved capture root paths (order-preserving)."""
     seen: dict[str, None] = {}
