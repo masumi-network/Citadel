@@ -40,6 +40,7 @@ from kb.access import (
     default_scopes,
     hash_api_token,
     is_seat_dataset,
+    seat_dataset,
     validate_seat_slug,
 )
 from kb.capture_policy import SeatCapturePolicy, capture_policy_payload
@@ -460,6 +461,13 @@ async def lifespan(app: FastAPI) -> Any:
             logger.exception(
                 "Failed to bootstrap %s dataset; seat search/share may fail until provisioned",
                 SESSION_TRACES_DATASET,
+            )
+        try:
+            await backfill_seat_datasets(get_citadel(), get_access_store())
+        except Exception:
+            logger.exception(
+                "Seat dataset backfill failed; seats created before provisioning "
+                "may still fail every search (#147)"
             )
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
@@ -2367,6 +2375,52 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
             SESSION_TRACES_DATASET,
             result.reason,
         )
+
+
+async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[str, int]:
+    """Give every existing seat the cognee Dataset row its searches need (#147).
+
+    Seats created before provisioning existed have a dataset NAME and no row,
+    so every search for them raises DatasetNotFoundError. Six of eleven live
+    seats were in that state and had never had a working vault.
+
+    A boot pass rather than a script, for the same reason
+    ``ensure_session_traces_dataset`` above is one: it needs cognee's event
+    loop, and running it here makes the repair self-healing instead of
+    something an operator has to remember. ``ensure_dataset`` is idempotent and
+    also repairs a row whose ACLs are missing, so re-running every boot is both
+    safe and the point.
+
+    Relational store only, so this never opens the graph and cannot contend
+    with the single Kuzu writer during startup.
+
+    Per-seat failures are swallowed deliberately: one seat that cannot be
+    provisioned must not stop the other ten, and must not stop the node
+    booting. They are counted and logged.
+    """
+    counts = {"seats": 0, "created": 0, "failed": 0}
+    cognee_client = getattr(citadel, "cognee", None)
+    ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+    if not callable(ensure_dataset):
+        return counts
+
+    for slug in store.seat_slugs():
+        counts["seats"] += 1
+        try:
+            if await ensure_dataset(seat_dataset(slug)):
+                counts["created"] += 1
+        except Exception:
+            counts["failed"] += 1
+            logger.exception("Seat dataset backfill failed for seat:%s", slug)
+
+    if counts["created"] or counts["failed"]:
+        logger.info(
+            "Seat dataset backfill: seats=%d created=%d failed=%d",
+            counts["seats"],
+            counts["created"],
+            counts["failed"],
+        )
+    return counts
 
 
 def known_datasets(config: Any) -> list[str]:
