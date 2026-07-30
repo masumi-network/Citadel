@@ -26,15 +26,40 @@ All notable changes to `citadel-archive` are documented here. Format follows
   Review, Admin. Knowledge, Activity and Write remain routable but leave the
   nav, and Review is new: promotion approvals used to be buried inside an
   admin-only Overview.
+- **Promotion candidates are actually scanned for secrets.** `build_pending_item`
+  now runs `scan_text_entries` over the candidate body before it can be
+  approved, so a key pasted into a note cannot be promoted into Central by
+  someone clicking approve. Note that `kb/linear_sync.py` still runs neither the
+  scan nor change detection ([#117](https://github.com/masumi-network/Citadel/issues/117));
+  this closes the promotion path only.
+- **Live repository statistics on `/info`, refreshed daily** (`kb/repo_stats.py`).
+  The commit-velocity chart reads real GitHub `commit_activity` through a disk
+  cache rather than numbers baked into the page. Refresh is gated on
+  `repo_stats_interval_seconds` (default 86400) and fails soft to the cached
+  copy, because unauthenticated GitHub allows 60 requests an hour and a public
+  page must not spend them.
+- **The Next port adds the app shell and Review** behind `/next/app/*`, alongside
+  the public pages. Review is the one app view actually ported: the promotion
+  queue plus the sources that are failing, and the only place in the app with
+  Approve and Reject. Search and Admin are routable but render a placeholder
+  naming what each will become, and there is no Explore page or route yet, so
+  `/next/app/explore` is a 404. Seat and token minting, the capture-policy
+  editor, and Activity are absent too. Every placeholder says so rather than
+  shipping a stub that looks finished.
 
 ### Changed
 
 - **The frontend stack is decided: Next.js, statically exported**
   ([ADR-0014](docs/adr/0014-nextjs-frontend-static-export.md)). This matches the
   org's stack while keeping `pip install citadel-archive` working on a host with
-  no Node, since the export is served by FastAPI from the same origin. Nothing
-  is migrated yet; the hand-written pages ship first so the port starts from a
-  working, tested baseline.
+  no Node, since the export is served by FastAPI from the same origin. The port
+  lives behind `/next/*` preview routes and nothing user-facing is switched over
+  yet: `/` and `/app` still serve the hand-written pages, so the port starts
+  from a working, tested baseline and can be compared against it. The Pages
+  Router was chosen over the App Router because the App Router serialises its
+  render payload into executable inline `<script>` blocks that a static export
+  cannot nonce, while the Pages Router emits `<script type="application/json">`,
+  which the `script-src` policy does not apply to.
 
 ### Fixed
 
