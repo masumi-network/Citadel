@@ -633,6 +633,48 @@ async def test_ensure_dataset_makes_a_seat_resolvable_to_cognee(
 
 
 @pytest.mark.asyncio
+async def test_ensure_dataset_survives_losing_a_creation_race(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """A concurrent provisioner must not blow up this one (#147).
+
+    create_dataset is SELECT-then-INSERT on a deterministic uuid5 id and
+    handles no IntegrityError, so two writers for the same name collide on the
+    primary key. Reachable rather than theoretical: Railway runs evolve and
+    linear-sync as separate OS processes against one Postgres, and linear_sync
+    writes into seat:<slug>, so a boot backfill can meet an in-flight
+    cognee.add. Unhandled, the first collision aborts the whole sweep and every
+    later seat is silently skipped.
+    """
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.data.methods import get_authorized_dataset_by_name
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    # Warm the default user first. get_default_user CREATES it lazily, and
+    # racing that collides on users.email long before dataset creation is
+    # reached. That is a separate cognee-wide race on every entry point, not
+    # one this change introduces, and guarding it here would only hide which
+    # race the test is actually about. In the boot backfill the user is warm
+    # anyway: ensure_session_traces_dataset runs first, and the loop is
+    # sequential within a process.
+    user = await get_default_user()
+    client = _real_cognee_client(monkeypatch)
+
+    results = await asyncio.gather(
+        *(client.ensure_dataset("seat:racer") for _ in range(3)),
+        return_exceptions=True,
+    )
+
+    raised = [r for r in results if isinstance(r, BaseException)]
+    assert not raised, f"a lost race must not propagate: {raised}"
+    assert sum(1 for r in results if r is True) <= 1, "at most one creator"
+
+    # The row is there regardless of who won, which is the point of the call.
+    assert await get_authorized_dataset_by_name("seat:racer", user, "read") is not None
+
+
+@pytest.mark.asyncio
 async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
     cognee_sqlite: Any, monkeypatch: Any
 ) -> None:

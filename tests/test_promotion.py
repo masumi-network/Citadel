@@ -439,6 +439,25 @@ async def test_enumerate_names_an_unprovisioned_seat_distinctly(tmp_path: Path) 
     assert isinstance(caught.value, promotion.PromotionEnumerationError)
 
 
+def test_promotion_matches_cognees_real_exception_name() -> None:
+    """Pin the literal kb/promotion.py matches to cognee's actual class (#147).
+
+    The discriminator compares exc.__class__.__name__ to the string
+    "DatasetNotFoundError" because no kb module imports cognee at module scope.
+    Nothing else in the suite touches the real class, so a cognee rename would
+    turn the discrimination off silently: every unprovisioned seat would go
+    back to reading as a generic failure and no test would notice.
+
+    Imported from cognee.modules.data.exceptions specifically. That is the one
+    both search-reachable raise sites use (search.py:294, recall.py:595).
+    cognee 1.2.2 also defines a same-named class in api/v1/exceptions that no
+    search path raises.
+    """
+    from cognee.modules.data.exceptions import DatasetNotFoundError
+
+    assert DatasetNotFoundError.__name__ == "DatasetNotFoundError"
+
+
 async def test_enumerate_keeps_the_generic_error_for_mixed_failures(tmp_path: Path) -> None:
     """A seat that is BOTH unprovisioned and erroring is not a provisioning story.
 

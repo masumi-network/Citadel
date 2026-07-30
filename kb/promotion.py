@@ -280,14 +280,20 @@ class PromotionEngine:
             # on the Kuzu lock and on DatasetNotFoundError.
             distinct = sorted(set(errors))
             if distinct == ["DatasetNotFoundError"]:
-                # Matched on the class NAME, and it has to stay that way. cognee
-                # 1.2.2 defines DatasetNotFoundError TWICE, in
-                # api/v1/exceptions/exceptions.py and in
-                # modules/data/exceptions/exceptions.py, and raises both on
-                # paths a search can reach (search.py:294, recall.py:595). An
-                # isinstance check against either import silently misses the
-                # other. Name-matching also keeps this module importable without
-                # cognee, which no kb module requires at import time.
+                # Matched on the class NAME because no kb module imports cognee
+                # at module scope, and an except/isinstance check needs the
+                # symbol there. enumerate already records names, not exceptions.
+                #
+                # The cost is that a cognee rename would silently stop the
+                # discrimination without failing anything, so
+                # test_promotion_matches_cognees_real_exception_name pins the
+                # real class name to this literal.
+                #
+                # Both search-reachable raise sites, search.py:294 and
+                # recall.py:595, import DatasetNotFoundError from
+                # cognee.modules.data.exceptions. cognee 1.2.2 does define a
+                # second class of the same name in api/v1/exceptions, but no
+                # path a search reaches raises it.
                 raise SeatDatasetMissingError(
                     f"{seat_dataset} has no cognee dataset row: all {attempted} "
                     "seed queries raised DatasetNotFoundError. The seat predates "

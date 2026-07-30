@@ -742,6 +742,7 @@ class CogneePublicClient:
         await self._ensure_cognee_ready(cognee)
         from cognee.modules.data.methods import create_authorized_dataset, get_datasets
         from cognee.modules.users.methods import get_default_user
+        from sqlalchemy.exc import IntegrityError
 
         user = await get_default_user()
         # Read FIRST, purely to decide what to report. Mirror create_dataset's
@@ -760,7 +761,21 @@ class CogneePublicClient:
         # while its searches keep failing on PermissionDeniedError rather than
         # DatasetNotFoundError. Calling through costs four guarded no-op queries
         # on a healthy seat and repairs the broken one.
-        await create_authorized_dataset(name, user)
+        try:
+            await create_authorized_dataset(name, user)
+        except IntegrityError:
+            # Lost a creation race. create_dataset is SELECT-then-INSERT on a
+            # deterministic uuid5 id (get_unique_dataset_id) and handles no
+            # IntegrityError, so two writers for the same name collide on the
+            # primary key. That is reachable here rather than theoretical:
+            # Railway runs evolve and linear-sync as separate OS processes
+            # against the same Postgres, and linear_sync writes into
+            # seat:<slug>, so a boot backfill can meet an in-flight cognee.add.
+            #
+            # The row exists either way, which is the whole point of the call,
+            # and the loser reports False because it did not create it.
+            logger.info("ensure_dataset lost a creation race for %s", name)
+            return False
         return was_missing
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
