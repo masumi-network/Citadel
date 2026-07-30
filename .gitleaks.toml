@@ -7,8 +7,13 @@
 # This repository is PUBLIC and the live vault is not. A leaked `ctdl_` token
 # authenticates against the production node, so it is treated as a hard stop.
 #
-# Verified against gitleaks 8.30.1: a full-history scan of this repository
-# (351 commits) reports zero findings with this configuration.
+# Verified against gitleaks 8.30.1, in both directions. A full-history scan
+# (404 commits) and a scan of the tracked tree each report zero findings. And
+# planting a real-shaped credential fails the scan in every place an allowlist
+# touches: a `ctdl_` token in .env.example, a `ghp_` token sharing a line with
+# `clip_excerpt(` in docs/, a live token on a "token prefix:" line, and one
+# pasted into a test file. Re-run both halves when editing an allowlist below;
+# a green scan alone does not tell you the scan still works.
 
 title = "Citadel gitleaks config"
 
@@ -32,7 +37,13 @@ keywords = ["ctdl_"]
 [[rules]]
 id = "citadel-admin-key"
 description = "Citadel admin access key assigned in config or env"
-regex = '''(?i)\b(CITADEL_ADMIN_KEY|CITADEL_ACCESS_KEY|CITADEL_MCP_ACCESS_TOKEN)\b\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?'''
+# `[ \t]` rather than `\s` around the separator. gitleaks matches against whole
+# file content, not line by line, so `\s` crosses the newline: an EMPTY
+# assignment then swallows the next line's variable name. `.env.example` ships
+# `CITADEL_MCP_ACCESS_TOKEN=` directly above `CITADEL_MCP_DEFAULT_DATASET=…`,
+# and that pair matched as a live key. Allowlisting the file was the wrong
+# answer to a rule that should not have fired.
+regex = '''(?i)\b(CITADEL_ADMIN_KEY|CITADEL_ACCESS_KEY|CITADEL_MCP_ACCESS_TOKEN)\b[ \t]*[:=][ \t]*['"]?[A-Za-z0-9_\-]{16,}['"]?'''
 keywords = ["citadel_admin_key", "citadel_access_key", "citadel_mcp_access_token"]
 
 # ---------------------------------------------------------------------------
@@ -41,49 +52,85 @@ keywords = ["citadel_admin_key", "citadel_access_key", "citadel_mcp_access_token
 # NOTE: gitleaks deprecated the singular [allowlist] table; the plural
 # [[allowlists]] form is required and the two cannot be mixed.
 
+# EVERY block below names the rules it relaxes with `targetRules`. A block
+# without it applies to all of them, the upstream high-precision rules
+# included, and because gitleaks defaults to `condition = "OR"` a single
+# `paths` or `regexes` entry is then enough on its own to disarm the scan
+# repository-wide. That is how an earlier version of this file worked, and a
+# live `ctdl_` token committed to .env.example scanned clean under it.
+
 [[allowlists]]
-description = "Documented placeholders and test fixtures, not real credentials"
-
-# Match these patterns against the whole source line, not just the captured
-# secret, so placeholder context like PASTE_..._HERE is visible to the rule.
-regexTarget = "line"
-
+description = "Files whose every credential-shaped string is fake by construction"
+# The one place `targetRules` is deliberately absent, because these files are
+# exempt from everything:
+#   - test_security_scan.py is a corpus of synthetic credentials whose only
+#     purpose is to prove kb/security_scan.py detects them.
+#     AKIAIOSFODNN7EXAMPLE is AWS's own published documentation example, the
+#     fine-grained token is "a1B2" * 12, and the password is "hunter2".
+#     Scanning it will always "find" secrets.
+#   - lock files and the audit cache hold hashes: high-entropy, not credentials.
 paths = [
-  # The example env file exists to be copied; it holds no live values.
-  '''^\.env\.example$''',
-  # Lock files contain hashes that look high-entropy but are not secrets.
+  '''^tests/test_security_scan\.py$''',
   '''^uv\.lock$''',
   '''^\.pip-audit-cache/''',
-  # This file is a deliberate corpus of FAKE credentials whose only purpose is
-  # to prove kb/security_scan.py detects them. Every value is synthetic:
-  # AKIAIOSFODNN7EXAMPLE is AWS's own published documentation example, the
-  # fine-grained token is built as "a1B2" * 12, and the password is "hunter2".
-  # Scanning it will always "find" secrets, by construction.
-  '''^tests/test_security_scan\.py$''',
 ]
 
+[[allowlists]]
+description = "Synthetic credentials in test fixtures, matched on their fake shape"
+# `condition = "AND"` so the path AND the shape both have to match. A real
+# credential pasted into a test file carries none of these markers, so the
+# high-precision rules still fail the scan there.
+condition = "AND"
+targetRules = [
+  "citadel-access-token",
+  "citadel-admin-key",
+  "curl-auth-header",
+  "github-pat",
+]
+paths = ['''^tests/''']
+# Match against the whole source line, not just the captured secret, so the
+# surrounding fixture context is visible.
+regexTarget = "line"
 regexes = [
-  # ---- Documentation placeholders -------------------------------------
-  # docs/mcp/README.md, docs/mcp/codex-hosted.config.toml and the MCP
-  # connector SKILL.md all show the config shape with a literal instruction
-  # in place of the value.
+  '''ctdl_(test|fake|dummy|sample|placeholder|stale|fresh|rotated|headless|abcdef)''',
+  '''gh[pousr]_(abcd|example)''',
+  # Redaction assertions feed a fake credential in to prove it is scrubbed.
+  '''clip_excerpt\(''',
+]
+
+[[allowlists]]
+description = "Documented config placeholders in docs and skills"
+# Same AND pairing: only under docs/, skills/ and plugins/, and only where the
+# line carries a literal placeholder instead of a value.
+condition = "AND"
+targetRules = ["citadel-access-token", "citadel-admin-key"]
+paths = [
+  '''^docs/''',
+  '''^skills/''',
+  '''^plugins/''',
+]
+regexTarget = "line"
+regexes = [
   '''PASTE_[A-Z_]+''',
   '''<paste your ctdl_ token>''',
   '''ctdl_<''',
-  # Prose naming the token PREFIX while explaining the format, e.g. tasks.md
-  # and docs/progress.md ("token prefix: `ctdl_`").
-  '''token[ _-]prefix''',
-  # Onboarding/docs output that shows the shape rather than a value.
   '''ctdl_(…|\.\.\.|xxx|XXX|your|YOUR|paste|example|EXAMPLE|token)''',
-
-  # ---- Test doubles ----------------------------------------------------
-  '''ctdl_(test|fake|dummy|sample|placeholder)[A-Za-z0-9_-]*''',
-  '''gh[pousr]_abcd''',
-  '''(?i)\b(fake|dummy|sample|placeholder|not-a-real)[-_]?(token|key|secret)\b''',
-  # Redaction assertions: tests feed a fake credential in to prove it is
-  # scrubbed on the way out.
-  '''clip_excerpt\(''',
 ]
+
+[[allowlists]]
+description = "Notes recording a token PREFIX while explaining the format"
+# tasks.md and docs/progress.md record which service-account token was minted
+# by its first few characters ("token prefix: `ctdl_…`"). A prefix is not a
+# credential, and it is far too short for citadel-access-token to fire; only
+# the generic heuristic sees it. The line has to say so, hence AND.
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = [
+  '''^docs/''',
+  '''^tasks\.md$''',
+]
+regexTarget = "line"
+regexes = ['''token[ _-]prefix''']
 
 [[allowlists]]
 description = "generic-api-key heuristic is too noisy against test fixtures"
