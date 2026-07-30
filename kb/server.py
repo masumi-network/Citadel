@@ -5929,7 +5929,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        # A search that blew its budget returned empty-fast; the caller got no
+        # hits. Recording it as a success meant /api/audit?view=failures never
+        # showed it and any success-rate metric read 100% while users saw
+        # nothing — which is how the "~20% silent failure" in #50 stayed
+        # unquantified. The detail dict already carried timed_out; nothing read it.
+        success=not timed_out,
         dataset=search_datasets[0],
         detail={
             "operation": "search",
