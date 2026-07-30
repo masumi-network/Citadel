@@ -7,13 +7,20 @@
 # This repository is PUBLIC and the live vault is not. A leaked `ctdl_` token
 # authenticates against the production node, so it is treated as a hard stop.
 #
-# Verified against gitleaks 8.30.1, in both directions. A full-history scan
-# (404 commits) and a scan of the tracked tree each report zero findings. And
-# planting a real-shaped credential fails the scan in every place an allowlist
-# touches: a `ctdl_` token in .env.example, a `ghp_` token sharing a line with
-# `clip_excerpt(` in docs/, a live token on a "token prefix:" line, and one
-# pasted into a test file. Re-run both halves when editing an allowlist below;
-# a green scan alone does not tell you the scan still works.
+# Verified against gitleaks 8.30.1, in both directions: the history sweep and a
+# scan of the tracked tree each report zero findings, and a planted real-shaped
+# credential fails the scan in .env.example, in a test file with no fake marker,
+# and in docs prose. Re-run both halves when editing an allowlist below. A green
+# scan on its own does not tell you the scan still works.
+#
+# Two gaps stay open, so the paragraph above is not read as more than it says.
+# `regexTarget = "line"` suppresses a real credential that shares a line with an
+# allowlisted marker, which also lets a fake token pardon a real one beside it;
+# it holds on config-shaped lines, where generic-api-key still fires, and leaks
+# on prose and `export X=` lines. And the first block below carries no
+# targetRules, so its three paths are exempt from every rule. Neither is a
+# regression (the previous config ran the same patterns repo-wide under OR and
+# missed strictly more), and neither is closed.
 
 title = "Citadel gitleaks config"
 
@@ -43,7 +50,15 @@ description = "Citadel admin access key assigned in config or env"
 # `CITADEL_MCP_ACCESS_TOKEN=` directly above `CITADEL_MCP_DEFAULT_DATASET=…`,
 # and that pair matched as a live key. Allowlisting the file was the wrong
 # answer to a rule that should not have fired.
-regex = '''(?i)\b(CITADEL_ADMIN_KEY|CITADEL_ACCESS_KEY|CITADEL_MCP_ACCESS_TOKEN)\b[ \t]*[:=][ \t]*['"]?[A-Za-z0-9_\-]{16,}['"]?'''
+#
+# The optional `\r?\n[ \t]+` puts back the one real shape that bounding to
+# [ \t] alone lost: a value on the next line, INDENTED, as YAML and a wrapped
+# Python assignment both write it. The indent is what makes it safe. The false
+# positive above cannot satisfy it, because the next variable in a .env file
+# starts at column 0. Losing this shape mattered most under tests/, where
+# generic-api-key is relaxed and the admin key carries no `ctdl_` prefix for
+# citadel-access-token to catch, so nothing else was covering it.
+regex = '''(?i)\b(CITADEL_ADMIN_KEY|CITADEL_ACCESS_KEY|CITADEL_MCP_ACCESS_TOKEN)\b[ \t]*[:=][ \t]*(?:\r?\n[ \t]+)?['"]?[A-Za-z0-9_\-]{16,}['"]?'''
 keywords = ["citadel_admin_key", "citadel_access_key", "citadel_mcp_access_token"]
 
 # ---------------------------------------------------------------------------
