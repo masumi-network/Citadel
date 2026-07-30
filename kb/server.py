@@ -20,6 +20,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -44,7 +46,7 @@ from kb.access import (
     validate_seat_slug,
 )
 from kb.capture_policy import SeatCapturePolicy, capture_policy_payload
-from kb.capture_config import matched_capture_root
+from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, matched_capture_root
 from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPublishError
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
@@ -497,6 +499,36 @@ app = FastAPI(
 STATIC_DIR = Path(__file__).with_name("static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+@app.exception_handler(RequestValidationError)
+async def log_request_validation_error(
+    request: Request, exc: RequestValidationError
+) -> Any:
+    """Say WHY a 422 happened, in the log, without echoing the payload.
+
+    FastAPI answers the caller with the field-level detail but the server side
+    records nothing, so a rejected write appears in the deploy log as a bare
+    "422 Unprocessable Entity". A real client looping on a malformed request is
+    then undiagnosable from the node: seen in production as ten consecutive
+    PUT /api/access/seats/{slug}/capture-roots 422s with no way to tell whether
+    the payload was wrong, too large, or the wrong shape.
+
+    Field locations and error types only. The values are the caller's data,
+    which on these routes means filesystem paths and note content, and a log
+    line is exactly the wrong place for it.
+    """
+    problems = [
+        f"{'.'.join(str(part) for part in error.get('loc', ()))}: {error.get('type', 'invalid')}"
+        for error in exc.errors()
+    ]
+    logger.warning(
+        "Rejected %s %s as invalid: %s",
+        request.method,
+        request.url.path,
+        "; ".join(problems) or "no detail",
+    )
+    return await request_validation_exception_handler(request, exc)
+
 # The Next.js static export (see docs/adr/0014-nextjs-frontend-static-export.md).
 # Its own directory rather than a corner of static/, which holds the fonts, the
 # favicon and the hand-written pages: one is generated and replaced wholesale on
@@ -938,7 +970,9 @@ class CapturePolicyBody(BaseModel):
 
 
 class CaptureRootsBody(BaseModel):
-    roots: list[str] = Field(default_factory=list, max_length=50)
+    roots: list[str] = Field(
+        default_factory=list, max_length=MAX_APPROVED_CAPTURE_ROOTS
+    )
 
 
 class ObsidianVaultBody(BaseModel):
@@ -2821,6 +2855,36 @@ async def ui(request: Request) -> Response:
 @app.get("/login", include_in_schema=False)
 async def login() -> HTMLResponse:
     return HTMLResponse(LOGIN_HTML)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt() -> Response:
+    """Keep crawlers on the marketing pages and off everything else.
+
+    This node serves a public site (/, /info, /use-cases) from the same origin
+    as the app and the whole API, so without this a crawler is free to walk
+    /app, /next and /api. Those all require auth and answer 401, but a 401 is
+    still a request that reaches the event loop, and #105 is about how little
+    it takes to saturate that.
+
+    Was showing up as 404s in the production log, which is how it was noticed.
+    """
+    body = "\n".join(
+        [
+            "User-agent: *",
+            "Allow: /$",
+            "Allow: /info",
+            "Allow: /use-cases",
+            "Disallow: /api/",
+            "Disallow: /app",
+            "Disallow: /next/",
+            "Disallow: /mcp",
+            "Disallow: /search",
+            "Disallow: /ingest",
+            "",
+        ]
+    )
+    return Response(content=body, media_type="text/plain")
 
 
 @app.get("/info", include_in_schema=False)

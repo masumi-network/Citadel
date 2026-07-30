@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import logging
 import tempfile
 from types import SimpleNamespace
 from typing import Any
@@ -3622,6 +3623,53 @@ def test_create_seat_api_provisions_node_and_writer_token(tmp_path: Any) -> None
         json={"name": "Bad", "slug": "Bad Slug"},
     )
     assert invalid.status_code == 422
+
+
+def test_a_422_says_why_in_the_log_without_echoing_the_payload(
+    tmp_path: Any, caplog: Any
+) -> None:
+    """A rejected write must be diagnosable from the node, not just from the caller.
+
+    Production showed ten consecutive PUT .../capture-roots 422s with nothing in
+    the deploy log but the status code, so there was no way to tell whether the
+    payload was the wrong shape, too large, or missing a field.
+
+    The values stay out. On these routes they are filesystem paths and note
+    content, and a log line is the wrong place for them.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+    client.post("/api/access/seats", json={"name": "Sarthi", "slug": "sarthi"})
+
+    with caplog.at_level(logging.WARNING, logger="kb.server"):
+        response = client.put(
+            "/api/access/seats/sarthi/capture-roots",
+            json={"roots": "/Users/secret/path-not-a-list"},
+        )
+
+    assert response.status_code == 422
+    assert "detail" in response.json(), "the caller still gets FastAPI's normal body"
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "capture-roots" in logged and "roots" in logged, logged
+    assert "/Users/secret/path-not-a-list" not in logged, "the payload value leaked"
+
+
+def test_robots_txt_keeps_crawlers_off_the_api(tmp_path: Any) -> None:
+    """The public pages share an origin with the app and the API (#105 adjacent).
+
+    Every crawled /api path is a request that reaches the event loop even though
+    it answers 401.
+    """
+    client = authed_client()
+
+    response = client.get("/robots.txt")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    body = response.text
+    assert "Disallow: /api/" in body
+    assert "Allow: /info" in body
 
 
 def test_create_seat_provisions_the_cognee_dataset_row(tmp_path: Any) -> None:
