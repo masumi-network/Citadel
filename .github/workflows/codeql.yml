@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: python
           # security-and-quality adds maintainability rules on top of the
@@ -47,6 +47,6 @@ jobs:
       # deliberately do NOT install dependencies here — nothing in this
       # workflow needs to execute project code.
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:python"
