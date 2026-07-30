@@ -19,6 +19,23 @@ def _isolate_claude_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_auth_throttle():
+    """Empty the failed-auth buckets around every test (M4).
+
+    They are module globals, and TestClient presents a single client host, so
+    the suite's 401 assertions all land in one per-IP bucket whose limit is 10.
+    Without this the suite passes or fails on test ordering.
+    """
+    server = sys.modules.get("kb.server")
+    if server is not None:
+        server.reset_auth_throttle()
+    yield
+    server = sys.modules.get("kb.server")
+    if server is not None:
+        server.reset_auth_throttle()
+
+
+@pytest.fixture(autouse=True)
 def _reset_app_state():
     """Restore kb.server.app.state after every test that assigns to it (#120).
 

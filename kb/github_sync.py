@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.learning import LearningProcess
 from kb.repository_update import (
@@ -185,7 +187,7 @@ class GitHubOrgClient:
         )
 
         def fetch() -> Any:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_secure(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
 
         try:

@@ -22,7 +22,9 @@ import logging
 import os
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from kb.secure_http import open_secure
 
 from kb.retry import run_with_retries
 from kb.security_scan import SecurityScanEntry, redact_secrets, scan_text_entries
@@ -132,7 +134,7 @@ def openrouter_chat(
     )
 
     def fetch() -> dict[str, Any]:
-        with urlopen(request, timeout=timeout) as response:
+        with open_secure(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
     try:
