@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import re
 import secrets
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +27,12 @@ CENTRAL_DATASET = "masumi-network"
 SESSION_TRACES_DATASET = "session-traces"
 SEAT_DATASET_PREFIX = "seat:"
 SEAT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+# How often the SAME token's rejection earns an audit event. A client holding a
+# revoked token retries indefinitely, so auditing every attempt turns the audit
+# ring into a log of that one client. Five minutes keeps "this token is still
+# being presented" visible without crowding out anything else.
+REJECTION_AUDIT_INTERVAL_SECONDS = 300.0
 
 ROLE_ORDER = {"reader": 1, "writer": 2, "admin": 3}
 VALID_ROLES = frozenset(ROLE_ORDER)
@@ -260,9 +267,21 @@ def _resolve_token_memory_scope(
 
 
 class AccessStore:
-    def __init__(self, path: Path | str, *, max_audit_events: int = 1000) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        max_audit_events: int = 1000,
+        rejection_audit_interval_seconds: float = REJECTION_AUDIT_INTERVAL_SECONDS,
+    ) -> None:
         self.path = Path(path)
         self.max_audit_events = max_audit_events
+        self.rejection_audit_interval_seconds = rejection_audit_interval_seconds
+        # token_id -> monotonic time of the last AUDITED rejection. In memory on
+        # purpose: this is a rate limiter, not a ledger, and losing it on
+        # redeploy just means the next rejection is audited again, which is the
+        # safe direction.
+        self._audited_rejections: dict[str, float] = {}
 
     def has_tokens(self) -> bool:
         return any(token.revoked_at is None for token in self._tokens(self._load()))
@@ -573,12 +592,33 @@ class AccessStore:
 
     def _record_token_rejection(self, data: dict[str, Any], api_token: ApiToken) -> None:
         reason = self._rejection_reason(data, api_token) or "rejected"
+        # Always log. It is cheap, it goes to the deploy log, and ops wants
+        # every occurrence when chasing a specific client.
         logger.warning(
             "Rejected token %s for principal %s: %s",
             api_token.id,
             api_token.principal_id,
             reason,
         )
+
+        # Audit at most once per token per interval. A client that keeps
+        # presenting a revoked token retries forever, and every rejection used
+        # to append an audit event: observed in production at roughly one every
+        # two minutes from a single stale capture hook, which fills the whole
+        # max_audit_events ring in well under a day and evicts every real event
+        # with it. The audit log is then a log of one broken client rather than
+        # a record of what happened on the node.
+        #
+        # Suppressing repeats loses nothing a reader needs. The first rejection
+        # is always audited, so the signal that a revoked token is in use is
+        # never lost; only the identical repeats are dropped, and the deploy log
+        # above still has every one.
+        now = monotonic()
+        last = self._audited_rejections.get(api_token.id)
+        if last is not None and now - last < self.rejection_audit_interval_seconds:
+            return
+        self._audited_rejections[api_token.id] = now
+
         self.record_event(
             action="access.token.rejected",
             actor=None,
