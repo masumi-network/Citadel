@@ -11,31 +11,11 @@ from kb.llm_enrichment import (
     enrichment_enabled,
     openrouter_chat,
 )
-from kb.session_trace_distill import (
-    DeadEnd,
-    SessionTraceRecord,
-    ToolErrorPair,
-    distill_node_note,
-    distill_trace,
-    format_compact_context,
-    iter_transcript_entries,
-    redact_commands,
-)
-
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DeadEnd",
-    "SessionTraceRecord",
-    "ToolErrorPair",
-    "distill_node_note",
-    "distill_trace",
-    "format_compact_context",
-    "iter_transcript_entries",
-    "redact_commands",
     "enrich_shared_trace",
     "force_shared_trace_author_seat",
-    "share_session_tags",
 ]
 
 _AUTHOR_SEAT_LINE = re.compile(r"^Author-Seat:\s*.+$", re.MULTILINE)
@@ -79,12 +59,3 @@ def enrich_shared_trace(data: str, *, has_tool_errors: bool) -> str:
         logger.warning("shared trace LLM output blocked by security scan; using deterministic text")
         return data
     return content.strip()
-
-
-def share_session_tags(record: SessionTraceRecord) -> list[str]:
-    tags = ["shared-session-trace", f"author:{record.author_seat}"]
-    if record.repo:
-        tags.append(record.repo)
-    if record.branch:
-        tags.append(record.branch)
-    return tags

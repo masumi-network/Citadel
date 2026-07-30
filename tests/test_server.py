@@ -8,8 +8,10 @@ from pathlib import Path
 import re
 import secrets
 import tempfile
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 import kb.server as server_module
@@ -5413,19 +5415,56 @@ def test_contact_delivers_to_the_chat_gateway(monkeypatch) -> None:
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True}
+    assert response.json() == {"delivered": True, "stored": True}
     assert len(gateway.sent) == 1
     assert "Ada Lovelace" in gateway.sent[0]
     assert "DIGITAL-2026-AI-07" in gateway.sent[0]
 
 
-def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> None:
-    """A missing gateway must refuse, never accept into a void.
+def _contact_store_at(monkeypatch, tmp_path) -> Any:
+    """Point the endpoint at a throwaway enquiry store."""
+    from kb.contact_store import ContactStore
 
-    An enquiry from a consortium coordinator that disappears silently is worse
-    than an error message: nobody learns it was lost.
+    store = ContactStore(str(tmp_path / "contacts.json"))
+    monkeypatch.setattr(server_module, "get_contact_store", lambda: store)
+    return store
+
+
+def test_contact_is_stored_when_the_gateway_is_unconfigured(monkeypatch, tmp_path) -> None:
+    """No gateway must not mean the enquiry is lost (ADR-0013, amended).
+
+    Google Chat is unconfigured in production, so the old fail-closed 503 turned
+    away every partner enquiry and kept no record. ADR-0013's rule is that an
+    enquiry is never accepted into a void; a file on the state volume is not a
+    void, and the sender should not be told to go away.
     """
     _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True, "stored": True}
+    saved = store.recent()
+    assert len(saved) == 1
+    assert saved[0]["name"] == "Ada Lovelace"
+    assert "DIGITAL-2026-AI-07" in saved[0]["message"]
+    assert saved[0]["received_at"]
+
+
+def test_contact_still_fails_closed_when_it_can_neither_store_nor_deliver(
+    monkeypatch, tmp_path
+) -> None:
+    """The fail-closed rule survives; it just has a second chance first."""
+    _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+
+    def explode(_entry: Any) -> None:
+        raise OSError("disk is gone")
+
+    monkeypatch.setattr(store, "append", explode)
     monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
     client = TestClient(app, base_url="https://testserver")
 
@@ -5433,6 +5472,60 @@ def test_contact_fails_closed_when_the_gateway_is_unconfigured(monkeypatch) -> N
 
     assert response.status_code == 503
     assert "not configured" in response.json()["detail"]
+
+
+def test_contact_is_kept_when_chat_delivery_fails(monkeypatch, tmp_path) -> None:
+    """A stored enquiry must not ask the sender to send it a second time."""
+    _reset_contact_limits()
+    store = _contact_store_at(monkeypatch, tmp_path)
+
+    class BrokenGateway:
+        thread_key = "citadel-partner-contact"
+
+        def post_digest(self, text: str, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("chat is down")
+
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: BrokenGateway())
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post("/contact", json=_enquiry())
+
+    assert response.status_code == 200
+    assert response.json() == {"delivered": True, "stored": True}
+    assert len(store.recent()) == 1
+
+
+def test_contact_enquiries_endpoint_is_admin_only(monkeypatch, tmp_path) -> None:
+    _contact_store_at(monkeypatch, tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+
+    assert client.get("/api/contact/enquiries").status_code in {401, 403}
+
+
+def test_contact_is_never_written_to_the_vault(monkeypatch, tmp_path) -> None:
+    """The part of ADR-0013 that did NOT change.
+
+    Unauthenticated public text must never reach the substrate agents read as
+    authority. Storing enquiries on disk is a fourth destination, not a reversal
+    of the vault rejection.
+    """
+    _reset_contact_limits()
+    _contact_store_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(server_module, "contact_gateway", lambda: None)
+
+    ingested: list[Any] = []
+
+    class Tripwire:
+        async def ingest(self, *args: Any, **kwargs: Any) -> Any:
+            ingested.append((args, kwargs))
+            raise AssertionError("a contact enquiry must never reach the vault")
+
+    monkeypatch.setattr(server_module, "get_citadel", lambda: Tripwire())
+    client = TestClient(app, base_url="https://testserver")
+
+    client.post("/contact", json=_enquiry())
+
+    assert ingested == []
 
 
 def test_contact_honeypot_is_dropped_without_delivery(monkeypatch) -> None:
@@ -5490,3 +5583,174 @@ def test_contact_rejects_an_oversized_message(monkeypatch) -> None:
 
     assert response.status_code == 422
     assert gateway.sent == []
+
+
+# --- M4: failed-auth throttle and weak-key guard -----------------------------
+
+
+def test_repeated_failed_auth_is_throttled_with_retry_after() -> None:
+    """Brute force gets a 429, not an unlimited stream of 401s."""
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+
+    codes = [
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"}).status_code
+        for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT + 3)
+    ]
+
+    assert codes[0] == 401
+    assert codes[-1] == 429
+    assert codes.count(401) == server_module.AUTH_FAIL_PER_IP_LIMIT
+    blocked = client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+    assert blocked.headers["Retry-After"] == str(server_module.AUTH_FAIL_PER_IP_WINDOW_SECONDS)
+
+
+def test_a_valid_credential_is_never_throttled(monkeypatch) -> None:
+    """The whole point: an attacker's noise must not lock out the team.
+
+    The credential is resolved before the limiter is consulted, so a caller who
+    holds a real one keeps working no matter how deep the failure bucket is.
+    """
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+    for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT + 5):
+        assert client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    # Now the bucket is well over the limit. A recognised identity must sail past.
+    monkeypatch.setattr(
+        server_module,
+        "request_identity",
+        lambda _request: AccessIdentity(
+            role="admin",
+            actor_id="env:admin",
+            actor_kind="env",
+            actor_name="admin",
+            source="env",
+            seat_slug=None,
+        ),
+    )
+    identity = server_module.require_role(
+        SimpleNamespace(method="GET", url=SimpleNamespace(path="/api/mesh")), "admin"
+    )
+
+    assert identity.role == "admin"
+
+
+def test_a_blocked_attempt_does_not_extend_the_ban() -> None:
+    """Our own clients retry 429 but never 401 (kb/retry.py).
+
+    Counting blocked retries would let a stale-token client extend its own ban
+    forever and hide a wrong credential behind "rate limited".
+    """
+    server_module.reset_auth_throttle()
+    client = TestClient(app, base_url="https://testserver")
+    for _ in range(server_module.AUTH_FAIL_PER_IP_LIMIT):
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    before = len(server_module._auth_fail_global_hits)
+    for _ in range(5):
+        client.get("/api/mesh", headers={"Authorization": "Bearer wrong"})
+
+    assert len(server_module._auth_fail_global_hits) == before
+
+
+def test_weak_env_access_key_refuses_to_start(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(
+                admin_key="owner-admin-key", writer_keys=(), reader_keys=()
+            )
+        ),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        server_module.enforce_access_key_strength()
+
+    assert "CITADEL_ADMIN_KEY" in str(caught.value)
+    assert "token_urlsafe" in str(caught.value)
+
+
+def test_a_strong_env_access_key_starts_normally(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(
+                admin_key="x" * 64, writer_keys=(), reader_keys=()
+            )
+        ),
+    )
+
+    server_module.enforce_access_key_strength()
+
+
+def test_the_weak_key_guard_can_be_overridden_explicitly(monkeypatch) -> None:
+    """Deliberate and greppable, unlike a warning nobody reads."""
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+    monkeypatch.setattr(
+        server_module,
+        "get_citadel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(admin_key="short", writer_keys=(), reader_keys=())
+        ),
+    )
+
+    server_module.enforce_access_key_strength()
+
+
+def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
+    """A search that returned nothing must not be recorded as a success (#50).
+
+    The audit detail already carried timed_out, but success was hardcoded True,
+    so /api/audit?view=failures never listed a timed-out search and any
+    success-rate metric read 100% while callers got zero hits. That is why the
+    "~20% silent failure rate" in #50 could never be quantified from the data
+    the node itself records.
+    """
+    import asyncio as aio
+    import dataclasses
+
+    class SlowCitadel(FakeCitadel):
+        config = dataclasses.replace(FakeCitadel.config, search_timeout_seconds=0.01)
+
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            await aio.sleep(0.3)
+            return [{"id": "x"}]
+
+    audited: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        server_module,
+        "record_mcp_audit",
+        lambda request, **kw: audited.append(kw),
+    )
+
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+
+    body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+
+    assert body.get("timed_out") is True
+    assert audited, "the search must be audited at all"
+    entry = audited[-1]
+    assert entry["detail"]["timed_out"] is True
+    assert entry["success"] is False, "a timed-out search is not a success"
+
+
+def test_a_normal_search_is_still_audited_as_a_success() -> None:
+    """The guard against over-correcting: only the timeout path flips."""
+    audited: list[dict[str, Any]] = []
+    original = server_module.record_mcp_audit
+    server_module.record_mcp_audit = lambda request, **kw: audited.append(kw)
+    try:
+        client = authed_client("test-reader")
+        app.state.citadel = FakeCitadel()
+        body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+    finally:
+        server_module.record_mcp_audit = original
+
+    assert body.get("timed_out") in (None, False)
+    assert audited and audited[-1]["success"] is True

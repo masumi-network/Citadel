@@ -1,6 +1,192 @@
 # Citadel Progress
 
-Last updated: 2026-07-22.
+Last updated: 2026-07-29.
+
+## 2026-07-29 (evening) — The Kuzu lock is dead, and six things that reported success while doing nothing
+
+The hourly evolve cycle had been failing for weeks and saying it was fine. Fixing
+that turned into finding the reason it went unnoticed, which was a pattern rather
+than a bug.
+
+### #88 — the Kuzu lock — FIXED and verified live
+
+Every hour, `github_sync` and `linear_sync` died with `Could not set lock on file:
+cognee_graph_kuzu (Lock is held by PID 44)`.
+
+The root cause is not what the issue title said. cognee 1.2.2 opens Kuzu read-write
+with an exclusive OS file lock and holds it for the lifetime of whichever process
+opens it, and in this deployment that is always the web. The evolve subprocess could
+therefore never acquire it. The subprocess existed to "free the Kuzu lock on exit"
+(`kb/server.py:253`), which was backwards: it was the one that could not get in.
+
+The add-only guard never helped either, because `cognee.add` is itself a Kuzu opener.
+`cognee/modules/pipelines/operations/run_tasks.py:166` calls `get_graph_engine()` at
+the end of every pipeline run purely to evaluate `hasattr(graph_engine,
+"push_to_s3")`. The comment at `kb/cognee_client.py:335` saying add does not touch
+the graph is false for 1.2.2, and the guard sat fourteen lines after the call that
+threw.
+
+Phase 1 now runs in the web's own event loop (#140). One process, one Kuzu owner,
+which also retires the loop-binding hazard of #69 rather than working around it.
+First cycle after deploy:
+
+```
+22:55:57  Evolve stage github_sync: starting
+22:57:34  Evolve stage github_sync: ok
+22:58:00  Evolve stage repo_content_sync: ok
+22:58:09  Evolve stage self_improve: ok
+```
+
+`/healthz` answered in ~150 ms during that pass, three probes, so moving the work
+onto the request loop did not starve it. That was the main risk in the change and it
+is measured, not assumed.
+
+`linear_sync` has still not been observed green, so #46 stays open. See #153 for why
+that is hard to verify right now.
+
+### The pattern: success reported for work that did not happen
+
+Six independent places, all fixed today. Each was a "nothing configured" or
+"everything failed" path falling through to the success branch, while the ordinary
+failure paths around them were handled carefully.
+
+| What lied | Fix |
+| --- | --- |
+| evolve exited 0 with two dead stages | #137 (#89) |
+| promotion printed `failures=0` while all 22 searches died | #138 |
+| the cognify canary passed because the graph grew, not because anything was retrievable | #139 (#114) |
+| a dying scheduler task was swallowed by a bare `set.discard` done-callback | #141 |
+| an unconfigured Chat gateway made both `/contact` and the org digest do nothing, silently | #142, and #151 |
+| a timed-out search was audited as `success=True` | #152 |
+
+The promotion one is the clearest: the `except` was fine, and the bug lived at the
+boundary where a caller counted the emptied result as a clean zero.
+
+A spec for a bounded sweep of the same shape is at
+`docs/superpowers/specs/2026-07-30-exception-flattened-to-empty-audit-design.md`.
+It found four more instances, filed as #148.
+
+### Security
+
+Two audit findings closed, neither filed publicly since the repo is public.
+
+- **M3** (#143): six server modules sent bearer tokens through the bare `urlopen`,
+  which follows redirects and replays every header at the target. `LLM_ENDPOINT` is
+  the operator-configurable one, so pointing it at `http://` sent
+  `OPENROUTER_API_KEY` in cleartext. One transport now refuses an untrusted scheme
+  and strips credentials cross-origin. Redirects are still followed, because GitHub
+  301s renamed repositories.
+- **M4** (#144): nothing limited authentication attempts. Severity was lower than the
+  audit implied for this deployment, since every credential here is already
+  high-entropy, so the substance is a boot-time refusal of weak env keys plus a
+  throttle counted only on failure. A valid credential never reaches the limiter, so
+  an attacker cannot lock the team out.
+
+### Filed, with root causes rather than symptoms
+
+#147 six seats have no cognee Dataset row and have never had a working vault.
+#148 corrupt state files read as "first run" and can post a false digest to Chat.
+#149 the organization digest LLM call fails 400 every cycle.
+#150 cognee pin drift, and the migration warning it caused is a false alarm.
+#151 Google Chat was never configured, so the digest has never run.
+#153 the evolve scheduler resets its interval on every deploy, so on an active day it
+never fires at all. Exactly one cycle ran in fourteen hours.
+
+#50 and #105 now carry measured root causes. Search costs one LLM call per
+`cognee.search` from cognee's `AUTO_FEEDBACK` default, and a seat query fans out to
+three datasets, so three calls per query. `/healthz` does no work of its own; the
+measured blocker is `AccessStore.authenticate_token` rewriting the whole access store
+on every authenticated request, 35 ms.
+
+### Contributions
+
+First outside contributions merged: #130 and #131 from @WAHIB-EL-KHADIRI, closing
+#113 and #112.
+
+## 2026-07-29 — Public site rebuilt and deployed, Next port reaches the dashboard
+
+PR #132 merged and deployed. The public site is live on the new build, the
+Next.js port now covers three dashboard views behind preview routes, and two
+gaps found while building them are filed rather than papered over.
+
+### Public site — SHIPPED (deploy `92707d02`, verified live)
+
+Production route probe after the deploy reached SUCCESS:
+
+| Route | Before | After |
+| --- | --- | --- |
+| `/` | 303 → `/login` | 200, landing page |
+| `/use-cases` | 404 | 200 |
+| `/contact` | 404 | 200 |
+| `/partners` | 200 | 301 → `/use-cases` |
+| `/app` | 200 | 303 → `/login` when anonymous |
+
+CSP is scoped per path rather than loosened globally: `/` carries
+`style-src 'self' 'unsafe-inline'` for the inline hero glow, `/info` and every
+other page do not. That exception is temporary and disappears when `/` switches
+to the Next build.
+
+Also shipped in the same PR: the contact form relaying to Google Chat and never
+into the vault ([ADR-0013](adr/0013-public-contact-endpoint.md)), the promotion
+secret scan, live repo statistics on a daily refresh, and one stylesheet across
+all five public pages.
+
+### Next port — Search, Admin, Explore (committed, not pushed)
+
+On `feat/partners-page` as `6485b87`. Verified locally: **955 passed, 1 skipped,
+0 failed**, `ruff` clean, `tsc --noEmit` exit 0. The export grows 87.6 KB for
+the three views, and `force-graph` is not in that number because Explore loads
+it from `kb/static/vendor/` at runtime instead of bundling a second copy.
+
+Only one line of the slice touches the running server, and it is additive:
+`explore` joins `WEBUI_APP_VIEWS` at reader role. `/app` still serves the
+hand-written dashboard.
+
+Not built, and stated on the pages rather than stubbed: seat and token minting
+(minting returns a secret exactly once and deserves a deliberate reveal-once
+design), the capture-policy editor (a `window.prompt` today, and porting it
+faithfully would be porting a bad UI), and Activity, which is blocked on a
+product decision about what one seat may learn about another's work.
+
+### Two gaps filed
+
+- **[#134](https://github.com/masumi-network/Citadel/issues/134)**: mesh
+  counters reset to zero on restart. Observed on production directly after the
+  deploy: `stats.documents` 0 while the source nodes in the same payload sum to
+  268 documents, all marked `rehydrated: true`. The node topology rehydrates on
+  boot; the counters, derived from an in-memory event log, do not. No content is
+  affected, but the dashboard renders those counters where a total belongs, so a
+  redeploy is visually indistinguishable from an emptied vault. This was
+  mistaken for data loss in practice, not in theory.
+- **[#135](https://github.com/masumi-network/Citadel/issues/135)**: graph nodes
+  carry no trust tier, and `promoted_by` / `promoted_at` do not exist anywhere
+  in the tree. Distinct from #104: that one is ingest storing no provenance,
+  this one is that the tier has no representation outside the search path, and
+  that "who promoted this?" is unanswerable for every document in the vault
+  today. Filed P1 on one ground: the promoter half cannot be backfilled, so
+  every document promoted before it lands loses that record permanently.
+
+### Open, and explicitly not claimed as fixed
+
+- **#117**: `kb/linear_sync.py` still runs neither the secret scan nor change
+  detection. The scan added in this PR covers `kb/promotion.py` only, which is
+  easy to misread from the commit subject alone.
+- **#126**: `kb/static/app.js` was rewritten by 1150 lines and `loadMesh` now
+  has a failure path that flips the connection state to "Offline" and raises an
+  alert, so a failed fetch is no longer indistinguishable from a slow load. But
+  `updateGraphMeta` still prints "Loading Knowledge Mesh" whenever the payload
+  is null, which is exactly the failed state, and the projection-inspector half
+  is unchecked. There is no browser harness, so this stays open.
+
+### Still queued
+
+- Switch `/` and `/app` to the Next build. That is the commit where the
+  `'unsafe-inline'` exception on `/` gets deleted.
+- Verify the promotion secret scan against the real production queue. It has
+  never run on live candidates; if any contain secrets, that is a finding.
+- Give `repo_stats` a GitHub token on prod, or it serves cached fallbacks once
+  the 60-request unauthenticated ceiling is hit.
+- Gap 11, the Activity view, blocked on the cross-seat visibility decision.
 
 ## 2026-07-22 — Public `/info` state page, `/api/state`, Masumi design alignment
 
