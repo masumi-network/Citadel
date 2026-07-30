@@ -3,7 +3,7 @@
 # move, which would silently fail-closed and blank every scoped caller's vault.
 # assert_cognee_dataset_api() (boot self-check + test) catches a bump; this pin
 # stops Railway pulling one unattended on the next build.
-cognee[fastembed,postgres-binary]>=1.2.2,<1.3.0
+cognee[fastembed,postgres-binary]>=1.2.2,<1.5.0
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
 aiohttp>=3.14.1,<4.0.0
