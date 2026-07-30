@@ -85,7 +85,7 @@ surfaced failures), #47 (Kuzu writer lock + cross-process cognify guard), #15
   cache, Kuzu graph, pgvector chunks). Graph deletion ≠ vector deletion ≠
   session-cache; **live prod testing was essential — unit tests passed at every
   wrong layer.**
-- **Action:** rotate `CITADEL_ADMIN_KEY` (surfaced in-session during ops).
+- **Action:** credential rotation — tracked privately in the ops runbook.
 
 ## Fix specs (shipped in batch 2 above — kept for reference)
 

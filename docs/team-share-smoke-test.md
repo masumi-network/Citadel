@@ -9,7 +9,7 @@ Use this checklist before sharing Citadel setup with teammates or agents.
 For Codex-compatible agents:
 
 ```bash
-npx skills add masumi-network/citadel-archive --skill citadel-archive
+npx skills add masumi-network/citadel --skill citadel
 ```
 
 For agents that cannot install skills:
@@ -28,8 +28,8 @@ files.
 Verified on 2026-06-03, production commit
 `3c70e92171b5a82e7aa99609b3d0596c3379127e`.
 
-- `npx skills add masumi-network/citadel-archive --skill citadel-archive` installs
-  the `citadel-archive` skill from `skills/citadel-archive/`.
+- `npx skills add masumi-network/citadel --skill citadel` installs
+  the `citadel-archive` skill from `skills/citadel/`.
 - Public endpoints return `200` for `/healthz`, `/.well-known/citadel.json`,
   `/skills`, `/skills/connect`, and `/static/login.js`.
 - Hosted MCP initializes at `/mcp/`, lists 13 tools, and exposes

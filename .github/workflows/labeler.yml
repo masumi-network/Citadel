@@ -1,0 +1,31 @@
+name: Labeler
+
+# Applies `area/*` labels to a pull request based on which paths it touches,
+# so triage starts from something rather than from nothing. Mapping lives in
+# .github/labeler.yml.
+
+on:
+  # `pull_request_target` is required to label pull requests opened from forks:
+  # the default GITHUB_TOKEN on a fork-triggered `pull_request` event is
+  # read-only and cannot write labels.
+  #
+  # This is safe here because the job never checks out or executes pull-request
+  # code — actions/labeler reads the changed-file list through the API. Do not
+  # add a checkout step to this workflow.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: apply area labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          configuration-path: .github/labeler.yml
+          # Never remove a label a maintainer applied deliberately.
+          sync-labels: false

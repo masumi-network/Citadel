@@ -1,0 +1,117 @@
+name: Bug report
+description: Something in Citadel behaves incorrectly
+title: "<short description of what is broken>"
+labels: ["type/bug", "status/needs-triage"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        **Security issues do not belong here.** This repository is public and
+        the vault it talks to is not. If this is a vulnerability, report it
+        privately instead:
+        [open a security advisory](https://github.com/masumi-network/Citadel/security/advisories/new).
+
+        **Never paste a `ctdl_` token, `.env` contents, database credentials or
+        exported vault content into this form.** Redact them first.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe? Paste the actual output or error, redacted.
+      placeholder: |
+        Running `citadel search "payment flow"` returned no results and exited 0.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      placeholder: |
+        1. uv sync --all-extras --dev
+        2. citadel status --json
+        3. citadel search "..."
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Citadel
+      description: Best guess is fine — a maintainer will confirm during triage.
+      options:
+        - CLI (citadel command)
+        - Hosted MCP (/mcp, agent tools)
+        - Server / HTTP API
+        - Search and retrieval
+        - Ingestion and promotion
+        - Source sync (GitHub, Linear, Obsidian)
+        - Knowledge Mesh / graph
+        - Web UI and dashboard
+        - Packaging, CI or docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Citadel version
+      description: "Output of `citadel --version`, or the commit SHA you are on."
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: "Output of `python --version`. Citadel requires 3.11 or newer."
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - pip install citadel-archive
+        - From source (editable install)
+        - Hosted MCP endpoint only
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >
+        Logs, related issues, or what you already tried. Remember to redact
+        tokens and vault content.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: This is not a security vulnerability (those go to a private advisory)
+          required: true
+        - label: I removed all tokens, credentials and vault content from this report
+          required: true

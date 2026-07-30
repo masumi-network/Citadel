@@ -53,6 +53,7 @@
       <a href="#live">What's live</a>
       <a href="#releases">Releases</a>
       <a href="#next">What's next</a>
+      <a href="#opensource">Open source</a>
       <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.4.0</span></span>
     </div>
   </nav>
@@ -190,6 +191,21 @@
         <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Structured Knowledge: own the representation</h3><p>Make durable, first-class <span class="k">Structured Knowledge</span> the source of truth Citadel owns, with the retrieval layer demoted to a rebuildable index. Plus a retrieval eval harness (<code>citadel bench</code>) and vault lint (<code>citadel lint</code>). This is how the vault stops depending on any one engine to hold the truth.</p></div></div>
         <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>Session Traces v1.1 + more surfaces</h3><p>Retraction controls (<code>citadel unshare</code>, ~90-day TTL, admin hard-delete), overlap-ranked <span class="k">prior-work retrieval</span>, and more delivery gateways (Agent Messenger, Slack, email, webhook) off the same update-agent contract.</p></div></div>
       </div>
+    </div>
+  </section>
+
+  <section class="band band-white" id="opensource">
+    <div class="band-in">
+        <div class="sechead"><span class="kicker">05 · Open source</span><h2>Citadel is open to contributions</h2></div>
+        <p class="lede">The application is <b>Apache-2.0</b> and public. The vault it serves is not — and that separation is the point. You can read every line, run the full test suite offline, and send a pull request without ever touching org memory.</p>
+        <div class="pillars">
+          <div class="card"><h3><span class="dot"></span>Apache-2.0</h3><p>Licensed under Apache-2.0, including the patent grant. Contributions come in under the same terms via <b>DCO sign-off</b> (<code>git commit -s</code>) — there is no CLA to sign.</p><span class="tag">inbound = outbound · no CLA</span></div>
+          <div class="card"><h3><span class="dot"></span>Public app, private vault</h3><p>Contributors work on the application only. No <code>ctdl_</code> token is issued and none is needed: the suite runs with no token, no network and no database, so every change is reviewable without vault access.</p><span class="tag">shielded by design</span></div>
+          <div class="card"><h3><span class="dot"></span>Checked on every PR</h3><p>Tests on Python 3.11 and 3.12, ruff, a dependency audit, CodeQL, licence review, DCO, and a gitleaks secret scan carrying a rule for <code>ctdl_</code> tokens. One <code>CI gate</code> check guards <code>main</code>.</p><span class="tag">automated · fail-closed</span></div>
+          <div class="card"><h3><span class="dot"></span>Tracked in the open</h3><p>Work is labelled by <code>type</code>, <code>area</code>, <code>priority</code> and <code>status</code>. New issues land in <code>status/needs-triage</code>; newcomers start at <code>good first issue</code>. Vulnerabilities go to a private advisory, never a public issue.</p><span class="tag">triaged · never silent</span></div>
+        </div>
+        <p class="verified"><span class="vdot"></span>Start with <a href="https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — setup, the label taxonomy, commit conventions, and exactly what you can and cannot run locally.</p>
+    
     </div>
   </section>
 

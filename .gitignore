@@ -27,6 +27,44 @@ scripts/ingest_masumi_workspace.py
 .superstack/
 .local-review/
 
+# ---------------------------------------------------------------------------
+# Vault data must never enter this public repository
+# ---------------------------------------------------------------------------
+# The application is public; the Organization Vault is not. Everything below is
+# a shape that carries vault CONTENT rather than application source. See
+# docs/public-and-private.md and SECURITY.md.
+#
+# Note that gitleaks cannot inspect binary formats, so these path rules are the
+# only thing standing between a local database or export and a public commit.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+kuzu_data/
+pgdata/
+postgres-data/
+*-export.json
+*-export.md
+*-export.csv
+vault-export.*
+backup.tar.gz
+
+# ---------------------------------------------------------------------------
+# Editor and agent tool configs that commonly hold inline tokens
+# ---------------------------------------------------------------------------
+# `.claude/` is already ignored above. `.cursor/` and `.windsurf/` were not,
+# even though Cursor writes MCP server configs — frequently containing a live
+# `Authorization: Bearer` value — to `.cursor/mcp.json`.
+#
+# The `rules/` subdirectories ARE legitimate tracked project source (the shared
+# Citadel agent policy), so they are re-included rather than ignored.
+.cursor/*
+!.cursor/rules/
+.windsurf/*
+!.windsurf/rules/
+
 # superpowers brainstorm mockups (local only)
 .superpowers/
 

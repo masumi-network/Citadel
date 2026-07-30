@@ -1,0 +1,78 @@
+name: Feature request
+description: Propose new behaviour or an improvement to existing behaviour
+title: "<what you want Citadel to do>"
+labels: ["type/feature", "status/needs-triage"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are welcome. The most useful ones start from a concrete
+        problem rather than a proposed solution.
+
+        For open-ended ideas that are not yet a defined piece of work, prefer
+        [Discussions](https://github.com/masumi-network/Citadel/discussions).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do that Citadel makes hard or impossible today?
+        Describe the situation, not the feature.
+      placeholder: >
+        When an agent searches the vault it cannot tell which hits came from
+        Central versus its own Node, so it cites private notes as org-authoritative.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including any workaround you are using now.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Citadel
+      options:
+        - CLI (citadel command)
+        - Hosted MCP (agent tools)
+        - Server / HTTP API
+        - Search and retrieval
+        - Ingestion and promotion
+        - Source sync (GitHub, Linear, Obsidian)
+        - Knowledge Mesh / graph
+        - Web UI and dashboard
+        - Packaging, CI or docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: participation
+    attributes:
+      label: Participation
+      options:
+        - label: I am willing to work on this myself
+          required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: >
+            I checked CONTEXT.md and the ADRs in docs/adr/ to see whether this
+            was already decided
+          required: false

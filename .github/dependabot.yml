@@ -1,0 +1,58 @@
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------
+  # GitHub Actions
+  # ---------------------------------------------------------------------
+  # Third-party actions in this repository are pinned to a commit SHA with a
+  # version comment. Dependabot understands that convention and will bump both
+  # the SHA and the comment together, so pinning costs nothing in maintenance
+  # while removing the "mutable tag gets repointed" supply-chain risk.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "type/chore"
+      - "area/ci"
+    groups:
+      # One PR for routine bumps instead of five. Majors stay separate so a
+      # breaking change is reviewed on its own.
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------
+  # Python
+  # ---------------------------------------------------------------------
+  # pip-audit in test.yml reports vulnerabilities that already exist; this
+  # opens the pull request that actually fixes them.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "build"
+      include: scope
+    labels:
+      - "type/chore"
+      - "area/ci"
+    groups:
+      dev-dependencies:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "pip-audit"
+      server-minor-patch:
+        update-types:
+          - minor
+          - patch

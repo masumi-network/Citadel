@@ -1,0 +1,86 @@
+name: Stale
+
+# Keeps the public backlog honest. An issue nobody has touched in three months
+# is usually either done, obsolete, or was never really going to happen — and
+# a backlog full of those makes it impossible for a newcomer to find real work.
+#
+# Deliberately conservative: long windows, and generous exemptions so roadmap
+# and security items are never auto-closed.
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    name: mark and close stale items
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-issue-stale: 90
+          days-before-issue-close: 21
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+
+          stale-issue-label: "status/stale"
+          stale-pr-label: "status/stale"
+
+          stale-issue-message: >
+            This issue has had no activity for 90 days, so it is being marked
+            stale. If it is still relevant, leave a comment and it will be
+            reopened for triage — a comment is enough, no action required.
+            Without activity it will close in 21 days.
+
+            Roadmap, security and pinned items are exempt from this and will
+            never be auto-closed.
+
+          stale-pr-message: >
+            This pull request has had no activity for 30 days and is being
+            marked stale. If you are still working on it, leave a comment or
+            push a commit. It will close in 14 days otherwise, and you can
+            always reopen it.
+
+          close-issue-message: >
+            Closing after 21 days with no further activity. This is backlog
+            hygiene, not a judgement on the idea — comment to reopen at any
+            time.
+
+          close-pr-message: >
+            Closing after 14 days with no further activity. Reopen whenever
+            you would like to pick it back up.
+
+          # Never auto-close long-lived roadmap work, security items, anything
+          # a maintainer pinned, or work reserved for newcomers.
+          exempt-issue-labels: >
+            priority/P0,
+            type/security,
+            status/blocked,
+            status/in-progress,
+            roadmap,
+            pinned,
+            good first issue,
+            help wanted
+          exempt-pr-labels: >
+            type/security,
+            status/blocked,
+            status/in-progress,
+            pinned
+
+          # Draft PRs are work in progress by definition.
+          exempt-draft-pr: true
+
+          # Assigned work is somebody's responsibility, not backlog rot.
+          exempt-all-assignees: true
+
+          # Default is 30/run; the backlog is small enough to sweep fully.
+          operations-per-run: 200
+
+          ascending: true

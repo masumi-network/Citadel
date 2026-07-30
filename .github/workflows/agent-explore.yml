@@ -1,0 +1,151 @@
+name: Agent Explore
+
+# Label-driven investigation, modelled on the agent-workflow pattern in
+# mattpocock/sandcastle.
+#
+# Add the `agent:explore` label to an issue and an agent reads the codebase,
+# then posts an investigation comment: where the relevant code lives, likely
+# root cause, and what a fix would touch. It does NOT write code, push a
+# branch, or open a pull request — exploration only.
+#
+# Label state machine
+# -------------------
+#   agent:explore      you add this to start a run (removed immediately, so
+#                      re-adding it is how you retry)
+#   agent:in-progress  a run is active; always removed when the job ends
+#   agent:blocked      the run failed; the comment says why
+#
+# Security notes for this PUBLIC repository
+# -----------------------------------------
+#   * The trigger is a LABEL. Applying a label requires triage or write access,
+#     so a drive-by contributor cannot start an agent run or reach the secret.
+#   * The job checks out `main`, never pull-request code.
+#   * Permissions are the minimum: read the repo, write issue comments.
+#   * Requires the CLAUDE_CODE_OAUTH_TOKEN repository secret. Without it the
+#     workflow reports that clearly instead of failing with a cryptic error.
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: agent-explore-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  explore:
+    name: explore issue
+    if: github.event.label.name == 'agent:explore'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+
+    steps:
+      - name: Transition labels
+        run: |
+          set -euo pipefail
+          # Remove the trigger first: re-adding the label is the retry gesture.
+          gh issue edit "${ISSUE_NUMBER}" --remove-label "agent:explore"     || true
+          gh issue edit "${ISSUE_NUMBER}" --remove-label "agent:blocked"     || true
+          gh issue edit "${ISSUE_NUMBER}" --add-label    "agent:in-progress" || true
+
+      - name: Check the agent credential is configured
+        id: preflight
+        env:
+          # The `secrets` context is not available in job-level `if:`, so the
+          # presence check has to happen in a step.
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "The \`CLAUDE_CODE_OAUTH_TOKEN\` repository secret is not set,"
+              echo "so \`agent:explore\` cannot run."
+              echo
+              echo "A maintainer can add it under **Settings → Secrets and variables"
+              echo "→ Actions → New repository secret**, then re-add the"
+              echo "\`agent:explore\` label to retry."
+            } > "${RUNNER_TEMP}/failure_reason.md"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report missing credential
+        if: steps.preflight.outputs.configured == 'false'
+        run: |
+          set -euo pipefail
+          gh issue comment "${ISSUE_NUMBER}" --body-file "${RUNNER_TEMP}/failure_reason.md"
+          gh issue edit "${ISSUE_NUMBER}" --add-label "agent:blocked" || true
+
+      - name: Checkout main
+        if: steps.preflight.outputs.configured == 'true'
+        uses: actions/checkout@v4
+        with:
+          # Explicitly the trunk, never contributor-supplied code.
+          ref: main
+          fetch-depth: 0
+
+      - name: Run the explore agent
+        if: steps.preflight.outputs.configured == 'true'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Do not let external Apps invoke this on a public repository.
+          allowed_bots: ""
+          prompt: |
+            You are investigating GitHub issue #${{ github.event.issue.number }}
+            in the Citadel repository, and posting your findings as a comment.
+
+            Issue title: ${{ github.event.issue.title }}
+
+            Read `CONTEXT.md` first and use its domain vocabulary — Organization
+            Vault, Seat, Node, Central, Learning Process, Structured Knowledge,
+            Knowledge Index, Knowledge Mesh, Promotion, Capture Root, Session
+            Trace, Tiered Ingestion. Check `docs/adr/` for a decision that
+            already settles the question.
+
+            Produce:
+            1. Which files and functions are involved, with `path:line` refs.
+            2. The most likely root cause, and the evidence for it.
+            3. What a fix would touch, and which existing tests cover it.
+            4. Anything that makes this harder than it looks.
+
+            Rules:
+            - Investigate and report ONLY. Do not modify files, commit, push, or
+              open a pull request.
+            - Ground every claim in code you actually read. Cite `path:line`.
+            - If the issue is unclear or you cannot determine the cause, say so
+              plainly and list what additional information would settle it.
+              Do not speculate and present it as findings.
+
+      - name: Mark blocked on failure
+        if: failure()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          # The backticks below are literal markdown code formatting for the
+          # issue comment, not command substitution — single quotes are correct.
+          {
+            printf '`agent:explore` failed on this issue.\n\n'
+            printf 'Workflow run: %s\n\n' "${RUN_URL}"
+            printf 'Re-add the `agent:explore` label to retry.\n'
+          } > "${RUNNER_TEMP}/failed.md"
+          gh issue comment "${ISSUE_NUMBER}" --body-file "${RUNNER_TEMP}/failed.md" || true
+          gh issue edit "${ISSUE_NUMBER}" --add-label "agent:blocked" || true
+
+      - name: Always clear in-progress
+        if: always()
+        run: gh issue edit "${ISSUE_NUMBER}" --remove-label "agent:in-progress" || true

@@ -1,0 +1,40 @@
+name: Dependency review
+
+# Two gates on every pull request that changes dependencies:
+#
+#   1. Security — block newly introduced packages with known vulnerabilities,
+#      before they reach the lockfile. `pip-audit` in test.yml catches what is
+#      already installed; this catches what a PR is trying to add.
+#
+#   2. Licence compatibility — Citadel ships under Apache-2.0. Pulling in a
+#      strong-copyleft dependency would make the published PyPI distribution
+#      undistributable under that licence. This is a licensing control, not
+#      just a security one.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: dependency review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+        with:
+          # Vulnerabilities below "high" are reported in the job summary but do
+          # not block; the dependency is often transitive and unfixable in the
+          # same PR. pip-audit still tracks them repo-wide.
+          fail-on-severity: high
+
+          # Strong copyleft is incompatible with redistributing this project
+          # under Apache-2.0. Weak copyleft (LGPL, MPL-2.0) is intentionally
+          # NOT denied — it is compatible when linked, not vendored.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, AGPL-1.0, SSPL-1.0
+
+          comment-summary-in-pr: on-failure

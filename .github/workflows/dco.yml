@@ -1,0 +1,105 @@
+name: DCO
+
+# Citadel takes contributions under Apache-2.0 with a Developer Certificate of
+# Origin sign-off (https://developercertificate.org/). There is NO CLA to sign.
+#
+# Every commit in a pull request must carry a trailer matching its own author:
+#
+#     Signed-off-by: Your Name <you@example.com>
+#
+# `git commit -s` adds it for you. To fix a branch that is missing sign-offs:
+#
+#     git rebase --signoff origin/main
+#     git push --force-with-lease
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every commit is signed off
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Read the commits from the API rather than from git: it returns
+          # exactly the commits under review, with no base/head ref fetching
+          # games, and it stays correct after force-pushes and rebases.
+          # `select((.parents|length) < 2)` drops merge commits, which
+          # introduce no authored change of their own.
+          #
+          # The message is base64-encoded so a multi-line commit body survives
+          # as ONE tab-separated record. Do not "simplify" this to
+          # gsub("\n"; "\\n"): @tsv escapes the backslash that produces, so the
+          # consumer gets a literal \n two-character sequence, the trailer
+          # never lands on its own line, and the ^-anchored match below silently
+          # fails for every commit.
+          gh api --paginate "repos/${REPO}/pulls/${PR}/commits" \
+            --jq '.[]
+                  | select((.parents | length) < 2)
+                  | [ .sha,
+                      (.commit.author.email // ""),
+                      (.commit.message | @base64) ]
+                  | @tsv' > commits.tsv
+
+          missing=0
+          checked=0
+
+          while IFS=$'\t' read -r sha email message_b64; do
+            [ -z "${sha:-}" ] && continue
+            checked=$(( checked + 1 ))
+
+            body="$(printf '%s' "${message_b64}" | base64 -d)"
+            email_lc="$(printf '%s' "${email}" | tr '[:upper:]' '[:lower:]')"
+
+            # Two-stage match avoids escaping the author's address into a
+            # regex: stage one finds well-formed trailers, stage two does a
+            # fixed-string comparison against this commit's author.
+            if printf '%s\n' "${body}" \
+                 | tr '[:upper:]' '[:lower:]' \
+                 | grep -E '^[[:space:]]*signed-off-by:[[:space:]]+.+<.+@.+>' \
+                 | grep -qF "<${email_lc}>"; then
+              echo "  ok    ${sha:0:8}  ${email}"
+            else
+              echo "  MISS  ${sha:0:8}  ${email}"
+              missing=$(( missing + 1 ))
+            fi
+          done < commits.tsv
+
+          echo
+          echo "Checked ${checked} commit(s); ${missing} missing a matching sign-off."
+
+          if [ "${missing}" -gt 0 ]; then
+            echo
+            echo "::error::${missing} commit(s) are missing a Signed-off-by trailer matching the commit author."
+            cat <<'EOF'
+
+          How to fix
+          ----------
+          Sign off all commits on this branch and force-push:
+
+              git rebase --signoff origin/main
+              git push --force-with-lease
+
+          For future commits, use the -s flag:
+
+              git commit -s -m "fix(cli): correct the thing"
+
+          The sign-off email must match the commit author email. By adding it
+          you certify the Developer Certificate of Origin: that you wrote the
+          patch, or otherwise have the right to submit it under Apache-2.0.
+          See CONTRIBUTING.md.
+          EOF
+            exit 1
+          fi

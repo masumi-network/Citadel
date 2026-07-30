@@ -30,11 +30,11 @@ The agent will ask for a `ctdl_...` access token, configure MCP locally, verify 
 
 The agent skills now live in the repo's top-level [`skills/`](../../skills/)
 directory (so they install via
-`npx skills add masumi-network/citadel-archive --skill '*'`):
+`npx skills add masumi-network/citadel --skill '*'`):
 
 | Directory | Purpose |
 |---|---|
-| `skills/citadel-archive/` | Primary skill (search, connect, safety overview) |
+| `skills/citadel/` | Primary skill (search, connect, safety overview) |
 | `skills/citadel-mcp-connector/` | Setup: token, MCP config, verify |
 | `skills/citadel-vault/` | Daily use: search, ingest, safety |
 | `skills/citadel-data-boundary/` | What must stay private |

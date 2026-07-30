@@ -1,0 +1,53 @@
+# Code owners for masumi-network/Citadel.
+#
+# `main` requires one approving review. This file routes that review request
+# automatically, and — more importantly — makes sure the paths that can reach
+# production or handle credentials cannot be changed without a maintainer
+# looking at them.
+#
+# Syntax: https://docs.github.com/articles/about-code-owners
+# Last matching pattern wins, so the sensitive paths are listed last.
+
+# Default owner for everything in the repository.
+*                           @Sarthib7
+
+# ---------------------------------------------------------------------------
+# High blast radius — an outside contributor changing any of these could reach
+# CI, secrets, or the production deployment. Never auto-merge these.
+# ---------------------------------------------------------------------------
+
+# Workflows execute in CI. A change here is a change to what runs with the
+# repository token.
+/.github/                   @Sarthib7
+/.github/workflows/         @Sarthib7
+
+# Secret-scanning rules. Weakening an allowlist here silently disarms the
+# gate that keeps `ctdl_` tokens out of a public repository.
+/.gitleaks.toml             @Sarthib7
+
+# Deployment surface: a merge to main auto-deploys to the Railway node.
+/railway.toml               @Sarthib7
+/scripts/run_railway.py     @Sarthib7
+/scripts/                   @Sarthib7
+
+# Runs on a contributor's machine during install/onboarding.
+/install.sh                 @Sarthib7
+
+# Packaging and dependency surface — what gets published to PyPI, and what
+# code is pulled in at install time.
+/pyproject.toml             @Sarthib7
+/uv.lock                    @Sarthib7
+/requirements.txt           @Sarthib7
+
+# Access control, authentication and the secret-scan gate.
+/kb/access.py               @Sarthib7
+/kb/access_client.py        @Sarthib7
+/kb/security_scan.py        @Sarthib7
+/kb/promotion.py            @Sarthib7
+/kb/promotion_queue.py      @Sarthib7
+
+# Licensing and security policy.
+/LICENSE                    @Sarthib7
+/NOTICE                     @Sarthib7
+/SECURITY.md                @Sarthib7
+/CODE_OF_CONDUCT.md         @Sarthib7

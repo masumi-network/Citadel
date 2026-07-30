@@ -7,8 +7,10 @@
 > A self-hosted **Organization Vault** — shared, access-controlled memory for your team and its AI agents.
 
 [![State of the Vault](https://img.shields.io/badge/live-state%20of%20the%20vault-FF51FF?style=flat&labelColor=0a0a0a)](https://citadel-archive-production.up.railway.app/info)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+[![Test](https://github.com/masumi-network/Citadel/actions/workflows/test.yml/badge.svg)](https://github.com/masumi-network/Citadel/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-FF51FF)](CONTRIBUTING.md)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Client](https://img.shields.io/badge/cli-zero--dependency-green)
 ![MCP](https://img.shields.io/badge/MCP-hosted-7c3aed)
 
@@ -95,9 +97,9 @@ citadel doctor                        # diagnose setup; --fix repairs hooks + .m
 citadel activity                      # what your Node is doing — captures, syncs, promotions
 ```
 
-> **No Python yet?** The bootstrap installer checks for Python 3.10+, **asks before installing it** if missing, then sets up pipx + the CLI:
+> **No Python yet?** The bootstrap installer checks for Python 3.11+, **asks before installing it** if missing, then sets up pipx + the CLI:
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel-Archive/main/install.sh | sh
+> curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel/main/install.sh | sh
 > ```
 > Add `-s -- -y` to skip prompts, `--dry-run` to preview.
 
@@ -170,11 +172,12 @@ Per-client setup: [`docs/mcp/README.md`](docs/mcp/README.md).
 Install agent skills from this repo:
 
 ```bash
-npx skills add masumi-network/citadel-archive --skill citadel-archive
-# all bundled skills: npx skills add masumi-network/citadel-archive --skill '*'
+npx skills add masumi-network/citadel --skill citadel
+# all bundled skills: npx skills add masumi-network/citadel --skill '*'
 ```
 
-(`masumi-network/Citadel-Archive` works the same — GitHub is case-insensitive.)
+(`masumi-network/Citadel` works the same — GitHub is case-insensitive. The repo was
+renamed from `Citadel-Archive`; the old path still redirects, but prefer the new one.)
 
 The hosted [`/skills`](https://citadel-archive-production.up.railway.app/skills) index and [discovery manifest](https://citadel-archive-production.up.railway.app/.well-known/citadel.json) publish skill hashes, MCP endpoint, token requirements, and public/private boundaries.
 
@@ -194,7 +197,7 @@ MCP is the live tool surface — see
 6. **Share dead ends explicitly** — use `citadel_share_session` only after user approval.
 7. **Admin tools need approval** — do not trigger sync, backup, or improve cycles proactively.
 
-Skill reference: [`skills/citadel-archive/SKILL.md`](skills/citadel-archive/SKILL.md).
+Skill reference: [`skills/citadel/SKILL.md`](skills/citadel/SKILL.md).
 
 ### CLI for agents
 
@@ -250,14 +253,32 @@ Full endpoint reference: [`docs/operations.md`](docs/operations.md#http-api-refe
 
 | Repo | Visibility | Role |
 |---|---|---|
-| [Citadel Archive](https://github.com/masumi-network/Citadel-Archive) (this) | **Public** | app, hosted MCP, docs, agent skills (no vault content) |
+| [Citadel](https://github.com/masumi-network/Citadel) (this) | **Public** | app, hosted MCP, docs, agent skills (no vault content) |
 | Vault Backup Mirror | Private | manifest-only backup of vault evidence |
 | [Railway deployment](https://citadel-archive-production.up.railway.app) | Private | live Organization Vault |
 
 ## Contributing
 
-Issues and pull requests welcome. Tests: `uv run pytest`; lint: `uv run ruff check .`. Keep the lightweight client free of server dependencies — the base package is stdlib-only (a test guards the import boundary).
+Contributions are welcome. **[`CONTRIBUTING.md`](CONTRIBUTING.md)** is the full guide — start there.
+
+The important thing to know up front: **the application is public, the vault is not.** Outside contributors work on the app only. You are never issued a `ctdl_` token and you do not need one — the entire test suite runs offline with no token, no network and no database, so every pull request is reviewable without vault access.
+
+```bash
+git clone https://github.com/masumi-network/Citadel.git
+cd Citadel
+uv sync --all-extras --dev
+uv run ruff check .          # lint
+uv run pytest tests/ -q      # tests
+```
+
+New here? Start with [`good first issue`](https://github.com/masumi-network/Citadel/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) or [`help wanted`](https://github.com/masumi-network/Citadel/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22). Work is tracked with `type/`, `area/`, `priority/` and `status/` labels; new issues land in `status/needs-triage`.
+
+A few things CI enforces on every pull request: commits need a **DCO sign-off** (`git commit -s` — there is no CLA), the PR title follows **Conventional Commits**, and the `CI gate` check must pass. Python **3.11+**. Keep the lightweight client free of server dependencies — the base package is stdlib-only, and a test guards that boundary.
+
+**Found a security issue?** Do not open a public issue — use [private vulnerability reporting](https://github.com/masumi-network/Citadel/security/advisories/new). See [`SECURITY.md`](SECURITY.md).
 
 ## License & attribution
 
-Apache-2.0. Citadel uses [Cognee](https://github.com/topoteretes/cognee) (Topoteretes UG, Apache-2.0) as its knowledge engine — imported as a dependency, not vendored, so upstream can be upgraded independently. Storage, access control, sync pipelines, MCP, CLI, and UI are Citadel's own work.
+Licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Contributions are accepted under the same licence via DCO sign-off, per section 5 of the License; there is no CLA.
+
+Citadel uses [Cognee](https://github.com/topoteretes/cognee) (Topoteretes UG, Apache-2.0) as its knowledge engine — imported as a dependency, not vendored, so upstream can be upgraded independently. Storage, access control, sync pipelines, MCP, CLI, and UI are Citadel's own work.

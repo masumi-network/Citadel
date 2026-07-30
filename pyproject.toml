@@ -3,8 +3,16 @@ name = "citadel-archive"
 dynamic = ["version"]
 description = "Citadel — a self-hosted Organization Vault and seat-capture CLI built on Cognee."
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.11 is the true floor, not a preference: kb/ imports `datetime.UTC` (added
+# in 3.11) in seven modules, and the test suite imports `tomllib` (3.11 stdlib).
+# The previous ">=3.10" let pip install a package that then raised ImportError
+# on the first sync command.
+requires-python = ">=3.11"
 license = "Apache-2.0"
+# Apache-2.0 §4(a) requires the License text to travel with every distribution.
+# Without this the sdist/wheel published by .github/workflows/publish.yml would
+# carry the license *declaration* but not the license *file*.
+license-files = ["LICENSE", "NOTICE"]
 keywords = ["knowledge-base", "vault", "cli", "cognee", "rag", "mcp"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,9 +43,9 @@ server = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/masumi-network/Citadel-Archive"
-Repository = "https://github.com/masumi-network/Citadel-Archive"
-Issues = "https://github.com/masumi-network/Citadel-Archive/issues"
+Homepage = "https://github.com/masumi-network/Citadel"
+Repository = "https://github.com/masumi-network/Citadel"
+Issues = "https://github.com/masumi-network/Citadel/issues"
 
 [project.scripts]
 citadel = "kb.cli:main"

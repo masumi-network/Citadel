@@ -1,0 +1,104 @@
+name: Triage
+
+# The first half of the issue lifecycle described in CONTRIBUTING.md.
+#
+# Every new issue lands in `status/needs-triage` so nothing sits unclassified,
+# and first-time contributors get pointed at the guide rather than left
+# guessing. Needs no secrets and calls no external service.
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    # Metadata only — this workflow never checks out or runs contributor code.
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    name: label and welcome
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Ensure new issues are marked for triage
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          # The issue forms already apply status/needs-triage. This catches
+          # issues opened through any other path so none escape the queue.
+          case ",${LABELS}," in
+            *,status/needs-triage,*)
+              echo "Already marked for triage."
+              ;;
+            *)
+              gh issue edit "${NUMBER}" --add-label "status/needs-triage" || true
+              ;;
+          esac
+
+      - name: Welcome a first-time contributor
+        # author_association is FIRST_TIME_CONTRIBUTOR for someone whose first
+        # contribution this is, and NONE for someone with no association to the
+        # repository at all. Both are newcomers worth orienting.
+        if: >
+          github.event.action == 'opened' &&
+          (
+            github.event.issue.author_association == 'FIRST_TIME_CONTRIBUTOR' ||
+            github.event.issue.author_association == 'FIRST_TIMER' ||
+            github.event.issue.author_association == 'NONE' ||
+            github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR' ||
+            github.event.pull_request.author_association == 'FIRST_TIMER' ||
+            github.event.pull_request.author_association == 'NONE'
+          )
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          KIND: ${{ github.event_name == 'issues' && 'issue' || 'pr' }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ "${KIND}" = "issue" ]; then
+            cat > body.md <<'EOF'
+          Thanks for opening your first issue here.
+
+          A maintainer will triage this and add `type/`, `area/` and `priority/`
+          labels. You do not need to do anything else.
+
+          If you would like to work on it yourself, say so in a comment and it
+          can be assigned to you. [CONTRIBUTING.md][c] covers local setup, and
+          issues labelled [`good first issue`][g] are scoped to be approachable
+          without deep knowledge of the vault internals.
+
+          [c]: https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md
+          [g]: https://github.com/masumi-network/Citadel/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          EOF
+            gh issue comment "${NUMBER}" --body-file body.md
+          else
+            cat > body.md <<'EOF'
+          Thanks for your first pull request to Citadel.
+
+          Two automated checks commonly surprise newcomers, so here they are up
+          front:
+
+          - **DCO** — every commit needs a `Signed-off-by:` trailer matching its
+            author. If the check fails: `git rebase --signoff origin/main` then
+            `git push --force-with-lease`.
+          - **PR title** — must follow Conventional Commits, e.g.
+            `fix(cli): correct the thing`.
+
+          `CI gate` must be green and one maintainer approval is required before
+          merge. Full details in [CONTRIBUTING.md][c].
+
+          [c]: https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md
+          EOF
+            gh pr comment "${NUMBER}" --body-file body.md
+          fi
