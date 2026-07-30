@@ -133,7 +133,7 @@ class RepoContentGitHubClient(GitHubOrgClient):
                 {"ref": ref},
             )
         except GitHubAPIError as exc:
-            if "404" in str(exc):
+            if exc.status == 404:
                 return False
             raise
         return isinstance(data, dict) and data.get("type") == "file"
@@ -212,7 +212,7 @@ def discover_repo_paths(
             try:
                 entries = client.list_directory(full_name, current, ref=ref)
             except GitHubAPIError as exc:
-                if "404" in str(exc):
+                if exc.status == 404:
                     break
                 raise
             for entry in entries:

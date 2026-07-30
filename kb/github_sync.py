@@ -70,7 +70,17 @@ def _matches_any(name: str, patterns: tuple[str, ...]) -> bool:
 
 
 class GitHubAPIError(RuntimeError):
-    pass
+    """A GitHub API call failed. ``status`` is the HTTP code, or None if it never got one.
+
+    Callers need the code, not the message: repo_content_sync probes optional
+    paths and a 404 is its expected "not present" answer. It used to test
+    ``"404" in str(exc)``, which also matches a 404 appearing anywhere in a repo
+    name or an error body.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class GitHubOrgClient:
@@ -184,8 +194,16 @@ class GitHubOrgClient:
             return run_with_retries(fetch, operation=f"github_sync.get {path}")
         except HTTPError as exc:
             detail = redact_secrets(exc.read().decode("utf-8", errors="replace")[:300], self.token)
-            logger.error("GitHub API request %s failed: HTTPError %s", path, exc.code)
-            raise GitHubAPIError(f"GitHub API returned {exc.code}: {detail}") from exc
+            # A 404 is the expected answer when probing for an optional path:
+            # repo_content_sync asks every repo for AGENTS.md, SKILL.md,
+            # CONTEXT.md, skills/, docs/, content/docs/ and plugins/, and most
+            # repos have none of them. Logging those at ERROR produced several
+            # hundred lines an hour and buried every real failure.
+            log = logger.debug if exc.code == 404 else logger.error
+            log("GitHub API request %s failed: HTTPError %s", path, exc.code)
+            raise GitHubAPIError(
+                f"GitHub API returned {exc.code}: {detail}", status=exc.code
+            ) from exc
         except URLError as exc:
             logger.error(
                 "GitHub API request %s failed: %s: %s",

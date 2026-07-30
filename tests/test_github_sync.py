@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -428,3 +429,55 @@ async def test_github_sync_reports_authenticated_flag(tmp_path: Any) -> None:
 
     client.token = "ghp_example"  # type: ignore[attr-defined]
     assert (await syncer.status())["authenticated"] is True
+
+
+def test_a_404_probe_is_not_logged_as_an_error(monkeypatch, caplog) -> None:
+    """repo_content_sync asks every repo for optional paths; most 404.
+
+    Those probes produced several hundred ERROR lines an hour in production and
+    buried every real failure. A 404 is the expected answer here, so it belongs
+    at DEBUG; anything else stays ERROR.
+    """
+    import logging
+    from urllib.error import HTTPError
+
+    import kb.github_sync as gh
+
+    def boom(*_args, **_kwargs):
+        raise HTTPError("https://api.github.com/x", 404, "Not Found", {}, io.BytesIO(b"{}"))
+
+    client = gh.GitHubOrgClient(token=None)
+    monkeypatch.setattr(gh, "run_with_retries", lambda fetch, operation="": fetch())
+    monkeypatch.setattr(gh, "open_secure", boom, raising=False)
+    monkeypatch.setattr(gh, "urlopen", boom, raising=False)
+
+    with caplog.at_level(logging.DEBUG, logger=gh.logger.name):
+        with pytest.raises(gh.GitHubAPIError) as caught:
+            client._get_json("/repos/o/r/contents/SKILL.md", {})
+
+    assert caught.value.status == 404
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == [], f"a 404 probe must not log at ERROR, got: {[r.message for r in errors]}"
+    assert any(r.levelno == logging.DEBUG for r in caplog.records)
+
+
+def test_a_real_failure_is_still_logged_as_an_error(monkeypatch, caplog) -> None:
+    import logging
+    from urllib.error import HTTPError
+
+    import kb.github_sync as gh
+
+    def boom(*_args, **_kwargs):
+        raise HTTPError("https://api.github.com/x", 500, "Server Error", {}, io.BytesIO(b"{}"))
+
+    client = gh.GitHubOrgClient(token=None)
+    monkeypatch.setattr(gh, "run_with_retries", lambda fetch, operation="": fetch())
+    monkeypatch.setattr(gh, "open_secure", boom, raising=False)
+    monkeypatch.setattr(gh, "urlopen", boom, raising=False)
+
+    with caplog.at_level(logging.DEBUG, logger=gh.logger.name):
+        with pytest.raises(gh.GitHubAPIError) as caught:
+            client._get_json("/repos/o/r/contents/SKILL.md", {})
+
+    assert caught.value.status == 500
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR]
