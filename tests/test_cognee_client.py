@@ -540,17 +540,141 @@ async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
 
     monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
 
-    # Already provisioned: no second row, no call.
+    # Already provisioned for this tenant.
     assert await client.ensure_dataset("seat:alice") is False
-    # Missing entirely: provisioned.
+    # Missing entirely.
     assert await client.ensure_dataset("seat:dave") is True
-    # And now idempotent, which is what makes a backfill safe to re-run.
+    # Now present, so reported as not-new, which is what a backfill counts.
     assert await client.ensure_dataset("seat:dave") is False
-    # Present under a DIFFERENT tenant, so still missing for this one.
+    # Present under a DIFFERENT tenant, so still missing for this one. This is
+    # the assertion the real-cognee tests below do not cover.
     assert await client.ensure_dataset("seat:carol") is True
 
     await engine.dispose()
-    assert created == ["seat:dave", "seat:carol"]
+    # Provisioning runs on EVERY call, including the two that reported False.
+    # The return value describes what was found, not whether we called through:
+    # an early return would strand a seat whose row exists but whose ACL rows
+    # are missing, which test_ensure_dataset_repairs_a_row_that_has_no_acl pins.
+    assert created == ["seat:alice", "seat:dave", "seat:dave", "seat:carol"]
+
+
+@pytest.fixture
+def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
+    """Point cognee's REAL relational engine at a throwaway sqlite.
+
+    The caches are lru_cached module-wide, so they are cleared on the way in AND
+    on the way out; skipping the second clear poisons every later test in the
+    session with this tmp_path.
+    """
+    from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.relational.config import get_relational_config
+    from cognee.infrastructure.databases.relational.create_relational_engine import (
+        create_relational_engine,
+    )
+
+    for key, value in {
+        "DB_PROVIDER": "sqlite",
+        "DB_NAME": "citadel_test.db",
+        "SYSTEM_ROOT_DIRECTORY": str(tmp_path / "system"),
+        "DATA_ROOT_DIRECTORY": str(tmp_path / "data"),
+        "CACHE_ROOT_DIRECTORY": str(tmp_path / "cache"),
+        "COGNEE_LOGS_DIR": str(tmp_path / "logs"),
+        "DEFAULT_USER_EMAIL": "citadel_test@example.com",
+        "DEFAULT_USER_PASSWORD": "citadel-test-password",
+        "LLM_API_KEY": "unused-by-this-test",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    def _clear() -> None:
+        get_base_config.cache_clear()
+        get_relational_config.cache_clear()
+        create_relational_engine.cache_clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+def _real_cognee_client(monkeypatch: Any) -> CogneePublicClient:
+    client = CogneePublicClient()
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_makes_a_seat_resolvable_to_cognee(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """The claim that matters: cognee's own read-path resolver finds the seat (#147).
+
+    The stubbed test above pins when we call through. This one pins that the
+    call works, against the real relational stack, by asserting the exact
+    resolver the search path uses flips from None to the dataset.
+    """
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.data.methods import get_authorized_dataset_by_name
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+    client = _real_cognee_client(monkeypatch)
+
+    assert await get_authorized_dataset_by_name("seat:alice", user, "read") is None
+
+    assert await client.ensure_dataset("seat:alice") is True
+    resolved = await get_authorized_dataset_by_name("seat:alice", user, "read")
+    assert resolved is not None and resolved.name == "seat:alice"
+
+    assert await client.ensure_dataset("seat:alice") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """The half-provisioned seat: row present, ACL rows absent (#147).
+
+    create_authorized_dataset commits the Dataset row and THEN writes four
+    permission rows in separate sessions, and give_permission_on_dataset gives
+    up after three attempts, so a partial write is reachable. The read path
+    filters by ACL, so such a seat is exactly as broken as one with no row, and
+    an ensure_dataset that returned early on a present row could never repair
+    it.
+    """
+    from cognee.infrastructure.databases.relational import (
+        create_db_and_tables,
+        get_relational_engine,
+    )
+    from cognee.modules.data.methods import (
+        get_authorized_dataset_by_name,
+        get_unique_dataset_id,
+    )
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+
+    name = "seat:halfway"
+    dataset_id = await get_unique_dataset_id(dataset_name=name, user=user)
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(
+            Dataset(id=dataset_id, name=name, owner_id=user.id, tenant_id=user.tenant_id)
+        )
+        await session.commit()
+
+    assert await get_authorized_dataset_by_name(name, user, "read") is None
+
+    await _real_cognee_client(monkeypatch).ensure_dataset(name)
+
+    assert (
+        await get_authorized_dataset_by_name(name, user, "read")
+    ) is not None, "seat still unsearchable after ensure_dataset"
 
 
 def test_assert_cognee_dataset_api_imports_real_symbols() -> None:

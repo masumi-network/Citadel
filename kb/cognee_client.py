@@ -744,16 +744,24 @@ class CogneePublicClient:
         from cognee.modules.users.methods import get_default_user
 
         user = await get_default_user()
-        # Mirror create_dataset's own uniqueness filter. get_datasets only
-        # narrows by owner, so the tenant check has to happen here or a seat in
-        # another tenant would read as already provisioned.
+        # Read FIRST, purely to decide what to report. Mirror create_dataset's
+        # own uniqueness filter: get_datasets narrows by owner only, so the
+        # tenant check has to happen here or a seat in another tenant reads as
+        # already provisioned.
         existing = await get_datasets(user.id)
-        if any(
+        was_missing = not any(
             dataset.name == name and dataset.tenant_id == user.tenant_id for dataset in existing
-        ):
-            return False
+        )
+        # Then provision UNCONDITIONALLY. Returning early on a present row would
+        # leave a half-provisioned seat broken forever: the row and its four ACL
+        # rows are written by different statements, and give_permission_on_dataset
+        # gives up after three attempts, so a partial failure is reachable. That
+        # seat has a row, fails the existence check, and never gets repaired,
+        # while its searches keep failing on PermissionDeniedError rather than
+        # DatasetNotFoundError. Calling through costs four guarded no-op queries
+        # on a healthy seat and repairs the broken one.
         await create_authorized_dataset(name, user)
-        return True
+        return was_missing
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
         """Delete nodes by id from BOTH the graph and the chunk vector store (#15).
