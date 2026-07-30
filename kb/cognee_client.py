@@ -711,6 +711,50 @@ class CogneePublicClient:
                 counts[str(dataset_name)] = int(total or 0)
         return counts
 
+    async def ensure_dataset(self, name: str) -> bool:
+        """Provision the cognee Dataset row for ``name``, returning whether it was new.
+
+        cognee only creates a Dataset row on the WRITE path: ``cognee.add``
+        resolves the name and calls ``create_authorized_dataset``. The read path
+        does not, so it raises ``DatasetNotFoundError`` instead. A seat whose
+        holder has never successfully ingested therefore has no row, and every
+        search against their node fails (#147). Provision at seat creation
+        rather than waiting for a write that may never come.
+
+        The permission rows are not optional. The read path resolves a name in
+        two steps, and only the first one is about the row existing:
+        ``get_dataset_ids`` matches on name, owner and tenant, then
+        ``get_specific_user_permission_datasets`` filters by ACL. With the row
+        but no ACL a search fails just as hard, only with ``PermissionDeniedError``
+        instead. ``create_authorized_dataset`` writes both.
+
+        Idempotent on both halves, so backfilling an already-healthy seat is a
+        no-op: ``create_dataset`` selects on (name, owner, tenant) before it
+        inserts, and ``give_permission_on_dataset`` looks for the ACL row before
+        adding it.
+
+        Relational store only. This never opens the graph, so it cannot collide
+        with the single Kuzu writer or with an in-flight cognify.
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.modules.data.methods import create_authorized_dataset, get_datasets
+        from cognee.modules.users.methods import get_default_user
+
+        user = await get_default_user()
+        # Mirror create_dataset's own uniqueness filter. get_datasets only
+        # narrows by owner, so the tenant check has to happen here or a seat in
+        # another tenant would read as already provisioned.
+        existing = await get_datasets(user.id)
+        if any(
+            dataset.name == name and dataset.tenant_id == user.tenant_id for dataset in existing
+        ):
+            return False
+        await create_authorized_dataset(name, user)
+        return True
+
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
         """Delete nodes by id from BOTH the graph and the chunk vector store (#15).
 

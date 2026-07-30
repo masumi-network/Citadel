@@ -3624,6 +3624,73 @@ def test_create_seat_api_provisions_node_and_writer_token(tmp_path: Any) -> None
     assert invalid.status_code == 422
 
 
+def test_create_seat_provisions_the_cognee_dataset_row(tmp_path: Any) -> None:
+    """A new seat gets its cognee Dataset row, not just a dataset name (#147).
+
+    cognee only creates the row on the write path, so before this a seat whose
+    holder had never ingested anything had no row at all and every search for
+    them raised DatasetNotFoundError. Six of eleven live seats were in that
+    state.
+
+    What this pins is the wiring: the handler reaches the client and passes the
+    seat's own dataset. It cannot pin that a row appears, because cognee is
+    faked throughout this suite. The row creation itself is cognee's
+    create_authorized_dataset, covered by its select-then-insert.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+    provisioned: list[str] = []
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return True
+
+    class _Citadel(FakeCitadel):
+        cognee = _Cognee()
+
+    app.state.citadel = _Citadel()
+    response = client.post(
+        "/api/access/seats",
+        json={"name": "Alice Smith", "slug": "alice"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["node_dataset_provisioned"] is True
+    assert provisioned == ["seat:alice"], "the seat's dataset row was never provisioned"
+
+
+def test_create_seat_survives_a_failed_dataset_provision(tmp_path: Any) -> None:
+    """Provisioning is best-effort on purpose, and says so when it fails.
+
+    The seat and its token are already persisted by the time provisioning runs,
+    so raising here would leave a half-created seat and no way to tell which
+    half. The seat is returned, and the failure is reported rather than
+    swallowed, so a backfill can find it.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            raise RuntimeError("relational store unavailable")
+
+    class _Citadel(FakeCitadel):
+        cognee = _Cognee()
+
+    app.state.citadel = _Citadel()
+    response = client.post(
+        "/api/access/seats",
+        json={"name": "Bob", "slug": "bob"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["token"].startswith("ctdl_"), "the seat must still be usable"
+    assert payload["node_dataset_provisioned"] is False, "a failure must be visible"
+
+
 def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()

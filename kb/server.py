@@ -3372,6 +3372,30 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # create_seat only computes the seat's dataset NAME; cognee creates the row
+    # itself lazily, and only on the write path. Until something is ingested the
+    # row does not exist, and every search for this seat dies on
+    # DatasetNotFoundError (#147). Provision it here so a seat works from the
+    # moment it is handed over.
+    #
+    # Deliberately not fatal. The seat and its token are already persisted by
+    # this point, so raising would leave a half-created seat behind and the
+    # admin no way to tell which half. Report the outcome instead: the audit
+    # event and the response both carry it, and the backfill can pick up any
+    # seat that landed unprovisioned.
+    provisioned: bool | None = None
+    try:
+        cognee_client = getattr(get_citadel(), "cognee", None)
+        ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+        if callable(ensure_dataset):
+            await ensure_dataset(created.principal.default_dataset)
+            provisioned = True
+    except Exception:
+        provisioned = False
+        logger.exception(
+            "seat dataset provisioning failed for %s", created.principal.default_dataset
+        )
+
     get_access_store().record_event(
         action="access.seat.create",
         actor=actor,
@@ -3382,11 +3406,13 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
             "seat_slug": created.principal.seat_slug,
             "token_id": created.api_token.id if created.api_token else None,
             "role": created.principal.role,
+            "node_dataset_provisioned": provisioned,
         },
     )
     payload: dict[str, Any] = {
         "ok": True,
         "principal": jsonable_encoder(created.principal),
+        "node_dataset_provisioned": provisioned,
     }
     if created.token and created.api_token:
         payload["token"] = created.token

@@ -461,6 +461,98 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     }
 
 
+@pytest.mark.asyncio
+async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
+    monkeypatch: Any,
+) -> None:
+    """ensure_dataset provisions a seat's Dataset row exactly once (#147).
+
+    Against the REAL cognee Dataset model on a throwaway sqlite, so a version
+    bump that moves or renames the columns the existence check reads (name,
+    owner_id, tenant_id) fails here rather than silently re-provisioning every
+    seat on every call.
+
+    create_authorized_dataset itself is stubbed. It is cognee's function and
+    cognee guards it; what is being pinned is our decision of WHEN to call it.
+    """
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee.modules.data.methods as methods_pkg
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Dataset
+
+    user_id, tenant_id = uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Dataset.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add(
+            Dataset(id=uuid4(), name="seat:alice", owner_id=user_id, tenant_id=tenant_id)
+        )
+        # Same NAME, different tenant. Must not read as already provisioned,
+        # because the read path matches on tenant too.
+        session.add(
+            Dataset(id=uuid4(), name="seat:carol", owner_id=user_id, tenant_id=uuid4())
+        )
+        await session.commit()
+
+    class _FakeRelEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    created: list[str] = []
+
+    async def fake_create_authorized_dataset(name: str, user: Any) -> Any:
+        created.append(name)
+        async with maker() as session:
+            session.add(
+                Dataset(id=uuid4(), name=name, owner_id=user.id, tenant_id=user.tenant_id)
+            )
+            await session.commit()
+
+    # get_datasets binds get_relational_engine at ITS module import, so patching
+    # the relational package would not reach it.
+    monkeypatch.setattr(
+        import_module("cognee.modules.data.methods.get_datasets"),
+        "get_relational_engine",
+        lambda: _FakeRelEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(
+        methods_pkg, "create_authorized_dataset", fake_create_authorized_dataset
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    # Already provisioned: no second row, no call.
+    assert await client.ensure_dataset("seat:alice") is False
+    # Missing entirely: provisioned.
+    assert await client.ensure_dataset("seat:dave") is True
+    # And now idempotent, which is what makes a backfill safe to re-run.
+    assert await client.ensure_dataset("seat:dave") is False
+    # Present under a DIFFERENT tenant, so still missing for this one.
+    assert await client.ensure_dataset("seat:carol") is True
+
+    await engine.dispose()
+    assert created == ["seat:dave", "seat:carol"]
+
+
 def test_assert_cognee_dataset_api_imports_real_symbols() -> None:
     # A cognee bump that moves the private dataset-attribution internals must
     # fail HERE (loud, in CI), not silently fail-closed in prod. This imports
