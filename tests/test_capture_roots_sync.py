@@ -130,6 +130,73 @@ def test_sync_failed_on_node_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert attempts == 2
 
 
+def test_sync_does_not_retry_a_rejected_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 4xx means the Node understood and refused, so sending it again is noise.
+
+    Production ran ten consecutive PUT .../capture-roots 422s, two per
+    invocation, none of which could ever have succeeded.
+    """
+    from kb.promotion_client import PromotionClientError
+
+    config = CaptureConfig(node_url="https://node.example").with_root("/tmp/a", ["personal"])
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_tok")
+    monkeypatch.setattr("kb.capture_roots_sync.resolve_seat_slug", lambda *a, **k: "alice")
+    monkeypatch.setattr(
+        "kb.capture_roots_sync.get_seat_capture_roots", lambda *a, **k: {"roots": []}
+    )
+    attempts = 0
+
+    def rejected(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        raise PromotionClientError("unprocessable", status=422)
+
+    monkeypatch.setattr("kb.capture_roots_sync.update_seat_capture_roots", rejected)
+
+    result = sync_local_capture_roots_to_server(config)
+
+    assert result.status == "failed"
+    assert result.permanent is True
+    assert attempts == 1, "a rejected payload must not be retried"
+
+
+def test_sync_refuses_to_send_more_roots_than_the_node_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The merge is a union, so it only grows, and an over-limit write never lands.
+
+    Because it never lands, merged stays different from the server list, the
+    "unchanged" short-circuit never fires, and every later sync re-sends the
+    same rejected request. The loop cannot end on its own, so refuse locally
+    and say what to do about it.
+    """
+    from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS
+
+    config = CaptureConfig(node_url="https://node.example")
+    for index in range(MAX_APPROVED_CAPTURE_ROOTS + 1):
+        config = config.with_root(f"/tmp/root-{index}", ["personal"])
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_tok")
+    monkeypatch.setattr("kb.capture_roots_sync.resolve_seat_slug", lambda *a, **k: "alice")
+    monkeypatch.setattr(
+        "kb.capture_roots_sync.get_seat_capture_roots", lambda *a, **k: {"roots": []}
+    )
+    put_called = False
+
+    def put(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal put_called
+        put_called = True
+        return {}
+
+    monkeypatch.setattr("kb.capture_roots_sync.update_seat_capture_roots", put)
+
+    result = sync_local_capture_roots_to_server(config)
+
+    assert put_called is False, "a request known to be invalid must not be sent"
+    assert result.permanent is True
+    assert str(MAX_APPROVED_CAPTURE_ROOTS) in result.detail
+    assert "Remove some roots" in result.detail
+
+
 def test_sync_retries_once_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     from kb.promotion_client import PromotionClientError
 

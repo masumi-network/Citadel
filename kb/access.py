@@ -11,7 +11,7 @@ import secrets
 from typing import Any
 from uuid import uuid4
 
-from kb.capture_config import normalize_capture_root_paths
+from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, normalize_capture_root_paths
 from kb.capture_policy import SeatCapturePolicy, normalize_deny_globs
 from kb.promotion_queue import (
     APPROVED_STATUS,
@@ -677,8 +677,19 @@ class AccessStore:
         normalized = validate_seat_slug(slug)
         if not self.find_seat_by_slug(normalized):
             raise ValueError(f"Seat not found: {normalized}")
+        normalized_paths = normalize_capture_root_paths(paths)
+        # Enforce the same ceiling the API model does. Without this the store
+        # would accept a list its own PUT endpoint refuses, so GET could hand a
+        # client roots it could never write back, and the client would retry
+        # that rejected write forever.
+        if len(normalized_paths) > MAX_APPROVED_CAPTURE_ROOTS:
+            raise ValueError(
+                f"Too many capture roots for {normalized}: "
+                f"{len(normalized_paths)} exceeds the limit of "
+                f"{MAX_APPROVED_CAPTURE_ROOTS}."
+            )
         roots = SeatApprovedCaptureRoots(
-            paths=normalize_capture_root_paths(paths),
+            paths=normalized_paths,
             updated_at=now_iso(),
             updated_by=actor_id,
         )

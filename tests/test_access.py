@@ -92,6 +92,29 @@ def test_revoked_token_is_rejected_with_audit_event(tmp_path: Path) -> None:
     assert events[0]["detail"]["reason"] == "revoked"
 
 
+def test_capture_roots_store_refuses_more_than_the_api_accepts(tmp_path: Path) -> None:
+    """The store must not hold a list its own PUT endpoint would reject.
+
+    It did: CaptureRootsBody capped roots at 50 and the store enforced nothing,
+    so GET could hand a client roots that PUT refused, and the client retried
+    that rejected write on every sync. One shared constant now, so the two
+    cannot drift again.
+    """
+    from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS
+
+    access_store = store(tmp_path)
+    access_store.create_seat(name="Sarthi", slug="sarthi", issue_token=False)
+
+    at_limit = [f"/Users/sarthi/p{index}" for index in range(MAX_APPROVED_CAPTURE_ROOTS)]
+    saved = access_store.set_approved_capture_roots("sarthi", paths=at_limit, actor_id="a")
+    assert len(saved.paths) == MAX_APPROVED_CAPTURE_ROOTS
+
+    with pytest.raises(ValueError, match="Too many capture roots"):
+        access_store.set_approved_capture_roots(
+            "sarthi", paths=[*at_limit, "/Users/sarthi/one-too-many"], actor_id="a"
+        )
+
+
 def test_token_session_lookup_enforces_expiry(tmp_path: Path) -> None:
     access_store = store(tmp_path)
     created = access_store.create_principal_token(

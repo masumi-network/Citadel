@@ -45,7 +45,7 @@ from kb.access import (
     validate_seat_slug,
 )
 from kb.capture_policy import SeatCapturePolicy, capture_policy_payload
-from kb.capture_config import matched_capture_root
+from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, matched_capture_root
 from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPublishError
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
@@ -962,7 +962,9 @@ class CapturePolicyBody(BaseModel):
 
 
 class CaptureRootsBody(BaseModel):
-    roots: list[str] = Field(default_factory=list, max_length=50)
+    roots: list[str] = Field(
+        default_factory=list, max_length=MAX_APPROVED_CAPTURE_ROOTS
+    )
 
 
 class ObsidianVaultBody(BaseModel):
