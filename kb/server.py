@@ -40,6 +40,7 @@ from kb.access import (
     default_scopes,
     hash_api_token,
     is_seat_dataset,
+    seat_dataset,
     validate_seat_slug,
 )
 from kb.capture_policy import SeatCapturePolicy, capture_policy_payload
@@ -460,6 +461,13 @@ async def lifespan(app: FastAPI) -> Any:
             logger.exception(
                 "Failed to bootstrap %s dataset; seat search/share may fail until provisioned",
                 SESSION_TRACES_DATASET,
+            )
+        try:
+            await backfill_seat_datasets(get_citadel(), get_access_store())
+        except Exception:
+            logger.exception(
+                "Seat dataset backfill failed; seats created before provisioning "
+                "may still fail every search (#147)"
             )
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
@@ -2369,6 +2377,52 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
         )
 
 
+async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[str, int]:
+    """Give every existing seat the cognee Dataset row its searches need (#147).
+
+    Seats created before provisioning existed have a dataset NAME and no row,
+    so every search for them raises DatasetNotFoundError. Six of eleven live
+    seats were in that state and had never had a working vault.
+
+    A boot pass rather than a script, for the same reason
+    ``ensure_session_traces_dataset`` above is one: it needs cognee's event
+    loop, and running it here makes the repair self-healing instead of
+    something an operator has to remember. ``ensure_dataset`` is idempotent and
+    also repairs a row whose ACLs are missing, so re-running every boot is both
+    safe and the point.
+
+    Relational store only, so this never opens the graph and cannot contend
+    with the single Kuzu writer during startup.
+
+    Per-seat failures are swallowed deliberately: one seat that cannot be
+    provisioned must not stop the other ten, and must not stop the node
+    booting. They are counted and logged.
+    """
+    counts = {"seats": 0, "created": 0, "failed": 0}
+    cognee_client = getattr(citadel, "cognee", None)
+    ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+    if not callable(ensure_dataset):
+        return counts
+
+    for slug in store.seat_slugs():
+        counts["seats"] += 1
+        try:
+            if await ensure_dataset(seat_dataset(slug)):
+                counts["created"] += 1
+        except Exception:
+            counts["failed"] += 1
+            logger.exception("Seat dataset backfill failed for seat:%s", slug)
+
+    if counts["created"] or counts["failed"]:
+        logger.info(
+            "Seat dataset backfill: seats=%d created=%d failed=%d",
+            counts["seats"],
+            counts["created"],
+            counts["failed"],
+        )
+    return counts
+
+
 def known_datasets(config: Any) -> list[str]:
     """Datasets a caller can target, in preference order, deduplicated."""
     ordered: list[str] = []
@@ -3372,6 +3426,30 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # create_seat only computes the seat's dataset NAME; cognee creates the row
+    # itself lazily, and only on the write path. Until something is ingested the
+    # row does not exist, and every search for this seat dies on
+    # DatasetNotFoundError (#147). Provision it here so a seat works from the
+    # moment it is handed over.
+    #
+    # Deliberately not fatal. The seat and its token are already persisted by
+    # this point, so raising would leave a half-created seat behind and the
+    # admin no way to tell which half. Report the outcome instead: the audit
+    # event and the response both carry it, and the backfill can pick up any
+    # seat that landed unprovisioned.
+    provisioned: bool | None = None
+    try:
+        cognee_client = getattr(get_citadel(), "cognee", None)
+        ensure_dataset = getattr(cognee_client, "ensure_dataset", None)
+        if callable(ensure_dataset):
+            await ensure_dataset(created.principal.default_dataset)
+            provisioned = True
+    except Exception:
+        provisioned = False
+        logger.exception(
+            "seat dataset provisioning failed for %s", created.principal.default_dataset
+        )
+
     get_access_store().record_event(
         action="access.seat.create",
         actor=actor,
@@ -3382,11 +3460,13 @@ async def create_access_seat(body: CreateSeatBody, request: Request) -> dict[str
             "seat_slug": created.principal.seat_slug,
             "token_id": created.api_token.id if created.api_token else None,
             "role": created.principal.role,
+            "node_dataset_provisioned": provisioned,
         },
     )
     payload: dict[str, Any] = {
         "ok": True,
         "principal": jsonable_encoder(created.principal),
+        "node_dataset_provisioned": provisioned,
     }
     if created.token and created.api_token:
         payload["token"] = created.token

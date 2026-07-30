@@ -3624,6 +3624,136 @@ def test_create_seat_api_provisions_node_and_writer_token(tmp_path: Any) -> None
     assert invalid.status_code == 422
 
 
+def test_create_seat_provisions_the_cognee_dataset_row(tmp_path: Any) -> None:
+    """A new seat gets its cognee Dataset row, not just a dataset name (#147).
+
+    cognee only creates the row on the write path, so before this a seat whose
+    holder had never ingested anything had no row at all and every search for
+    them raised DatasetNotFoundError. Six of eleven live seats were in that
+    state.
+
+    What this pins is the wiring: the handler reaches the client and passes the
+    seat's own dataset. It cannot pin that a row appears, because cognee is
+    faked throughout this suite. The row creation itself is cognee's
+    create_authorized_dataset, covered by its select-then-insert.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+    provisioned: list[str] = []
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return True
+
+    class _Citadel(FakeCitadel):
+        cognee = _Cognee()
+
+    app.state.citadel = _Citadel()
+    response = client.post(
+        "/api/access/seats",
+        json={"name": "Alice Smith", "slug": "alice"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["node_dataset_provisioned"] is True
+    assert provisioned == ["seat:alice"], "the seat's dataset row was never provisioned"
+
+
+def test_create_seat_survives_a_failed_dataset_provision(tmp_path: Any) -> None:
+    """Provisioning is best-effort on purpose, and says so when it fails.
+
+    The seat and its token are already persisted by the time provisioning runs,
+    so raising here would leave a half-created seat and no way to tell which
+    half. The seat is returned, and the failure is reported rather than
+    swallowed, so a backfill can find it.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            raise RuntimeError("relational store unavailable")
+
+    class _Citadel(FakeCitadel):
+        cognee = _Cognee()
+
+    app.state.citadel = _Citadel()
+    response = client.post(
+        "/api/access/seats",
+        json={"name": "Bob", "slug": "bob"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["token"].startswith("ctdl_"), "the seat must still be usable"
+    assert payload["node_dataset_provisioned"] is False, "a failure must be visible"
+
+
+async def test_backfill_seat_datasets_provisions_every_existing_seat(tmp_path: Any) -> None:
+    """Seats that predate provisioning get their row on the next boot (#147).
+
+    A boot pass rather than a script, so the repair is self-healing. One seat
+    that cannot be provisioned must not stop the rest, and must not stop the
+    node booting, so failures are counted rather than raised.
+    """
+    from kb.server import backfill_seat_datasets
+
+    store = AccessStore(tmp_path / "access.json")
+    for slug in ("alice", "bob", "carol"):
+        store.create_seat(name=slug.title(), slug=slug, issue_token=False)
+
+    seen: list[str] = []
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            seen.append(name)
+            if name == "seat:bob":
+                raise RuntimeError("relational store unavailable")
+            # carol was already provisioned by an earlier boot.
+            return name != "seat:carol"
+
+    counts = await backfill_seat_datasets(SimpleNamespace(cognee=_Cognee()), store)
+
+    assert seen == ["seat:alice", "seat:bob", "seat:carol"], "every seat must be attempted"
+    assert counts == {"seats": 3, "created": 1, "failed": 1}
+
+
+def test_backfill_seat_datasets_is_wired_into_boot() -> None:
+    """The backfill is only useful if boot actually calls it (#147).
+
+    The two tests around this one exercise the function directly, so deleting
+    the call from the lifespan leaves them green and the six broken seats
+    unrepaired. Nothing else covers it: ensure_session_traces_dataset, which
+    this copies, has no test referencing it at all.
+
+    Reading the lifespan source is a blunt instrument and only proves the call
+    is present, not that it runs. Running the real lifespan would drag in mesh
+    rehydrate, both schedulers and cognee startup, which is a different and much
+    slower test. This catches the failure that actually happens, someone tidying
+    the call away, which is otherwise silent.
+    """
+    import inspect
+
+    from kb import server
+
+    source = inspect.getsource(server.lifespan)
+    assert "backfill_seat_datasets" in source, "boot no longer backfills seat datasets"
+
+
+async def test_backfill_seat_datasets_is_a_noop_without_a_cognee_client(tmp_path: Any) -> None:
+    """Boot must not break where the client has no ensure_dataset to call."""
+    from kb.server import backfill_seat_datasets
+
+    store = AccessStore(tmp_path / "access.json")
+    store.create_seat(name="Alice", slug="alice", issue_token=False)
+
+    counts = await backfill_seat_datasets(SimpleNamespace(cognee=object()), store)
+
+    assert counts == {"seats": 0, "created": 0, "failed": 0}
+
+
 def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()

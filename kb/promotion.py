@@ -211,6 +211,18 @@ class PromotionEnumerationError(RuntimeError):
     """
 
 
+class SeatDatasetMissingError(PromotionEnumerationError):
+    """The seat has no cognee Dataset row at all, so nothing can read it (#147).
+
+    A subclass, not a sibling, so anything already catching
+    PromotionEnumerationError keeps working. The point is the name: callers log
+    ``exc.__class__.__name__``, and "every search failed" and "this seat was
+    never provisioned" want different responses. The first is an outage to
+    investigate. The second is one backfill run, and the seat has never worked
+    for its holder even once.
+    """
+
+
 class PromotionEngine:
     """Selective seat-to-Central promotion (ADR-0005 step 2)."""
 
@@ -266,9 +278,30 @@ class PromotionEngine:
             # made the caller count the seat as a clean zero: production logged
             # "seats=11 promoted=0 failures=0" while all 22 searches were dying
             # on the Kuzu lock and on DatasetNotFoundError.
+            distinct = sorted(set(errors))
+            if distinct == ["DatasetNotFoundError"]:
+                # Matched on the class NAME because no kb module imports cognee
+                # at module scope, and an except/isinstance check needs the
+                # symbol there. enumerate already records names, not exceptions.
+                #
+                # The cost is that a cognee rename would silently stop the
+                # discrimination without failing anything, so
+                # test_promotion_matches_cognees_real_exception_name pins the
+                # real class name to this literal.
+                #
+                # Both search-reachable raise sites, search.py:294 and
+                # recall.py:595, import DatasetNotFoundError from
+                # cognee.modules.data.exceptions. cognee 1.2.2 does define a
+                # second class of the same name in api/v1/exceptions, but no
+                # path a search reaches raises it.
+                raise SeatDatasetMissingError(
+                    f"{seat_dataset} has no cognee dataset row: all {attempted} "
+                    "seed queries raised DatasetNotFoundError. The seat predates "
+                    "dataset provisioning at creation; backfill it (#147)."
+                )
             raise PromotionEnumerationError(
                 f"all {attempted} seed queries failed for {seat_dataset}: "
-                f"{', '.join(sorted(set(errors)))}"
+                f"{', '.join(distinct)}"
             )
         return candidates[:cap]
 
