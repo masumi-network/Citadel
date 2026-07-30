@@ -413,6 +413,74 @@ async def test_enumerate_stays_best_effort_when_one_query_fails(tmp_path: Path) 
     assert candidates, "a surviving query's results must still be returned"
 
 
+async def test_enumerate_names_an_unprovisioned_seat_distinctly(tmp_path: Path) -> None:
+    """"This seat has no dataset" is a different problem from "search is broken" (#147).
+
+    The driver in scripts/run_railway.py logs exc.__class__.__name__, so the two
+    cases were indistinguishable in production even though one is an outage to
+    investigate and the other is one backfill run. Six of eleven seats were the
+    second kind and read as the first for weeks.
+    """
+
+    class DatasetNotFoundError(Exception):
+        """Stands in for cognee's, which is matched by name, not by class."""
+
+    total = len(promotion.DEFAULT_SEED_QUERIES)
+    engine = _exploding_engine(
+        tmp_path, fail_first=total, exc=DatasetNotFoundError("No datasets found.")
+    )
+
+    with pytest.raises(promotion.SeatDatasetMissingError) as caught:
+        await engine.enumerate(SEAT, 20)
+
+    assert SEAT in str(caught.value)
+    assert "backfill" in str(caught.value)
+    # Still a PromotionEnumerationError, so existing handlers keep catching it.
+    assert isinstance(caught.value, promotion.PromotionEnumerationError)
+
+
+async def test_enumerate_keeps_the_generic_error_for_mixed_failures(tmp_path: Path) -> None:
+    """A seat that is BOTH unprovisioned and erroring is not a provisioning story.
+
+    Only an unmixed run of DatasetNotFoundError means "just backfill it". If
+    anything else is in the mix the seat needs looking at, so it must not be
+    filed under the cheap remedy.
+    """
+    if len(promotion.DEFAULT_SEED_QUERIES) < 2:  # pragma: no cover - guards the fixture
+        pytest.skip("needs at least two seed queries")
+
+    class DatasetNotFoundError(Exception):
+        pass
+
+    class _MixedCitadel:
+        """First query dies on the lock, every later one on a missing dataset."""
+
+        def __init__(self, config: CitadelConfig) -> None:
+            self.config = config
+            self.calls = 0
+
+        async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("kuzu locked")
+            raise DatasetNotFoundError("No datasets found.")
+
+    config = _config()
+    engine = PromotionEngine(
+        _MixedCitadel(config),
+        FakeLearning(),
+        AccessStore(str(tmp_path / "access.json")),
+        config,
+    )
+
+    with pytest.raises(promotion.PromotionEnumerationError) as caught:
+        await engine.enumerate(SEAT, 20)
+
+    assert not isinstance(caught.value, promotion.SeatDatasetMissingError)
+    assert "RuntimeError" in str(caught.value)
+    assert "DatasetNotFoundError" in str(caught.value)
+
+
 async def test_enumerate_returns_empty_without_raising_when_searches_succeed(
     tmp_path: Path,
 ) -> None:
