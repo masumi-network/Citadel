@@ -63,6 +63,25 @@ jobs:
             body="$(printf '%s' "${message_b64}" | base64 -d)"
             email_lc="$(printf '%s' "${email}" | tr '[:upper:]' '[:lower:]')"
 
+            # Bot commits are exempt, and they have to be. A bot cannot agree to
+            # the DCO: there is no person to certify origin, which is the only
+            # thing the sign-off asserts. Dependabot does emit a trailer, but it
+            # signs as <support@github.com> while authoring as
+            # <49699333+dependabot[bot]@users.noreply.github.com>, so the
+            # fixed-string match below can never succeed and every dependency PR
+            # fails a gate it has no way to pass. Nine were stuck this way the
+            # hour after Dependabot was switched on.
+            #
+            # Matched on the noreply.github.com bot-author form rather than a
+            # name allowlist, so a human cannot dodge the check by putting
+            # "[bot]" in their own address.
+            case "${email_lc}" in
+              *"[bot]@users.noreply.github.com")
+                echo "  bot   ${sha:0:8}  ${email}"
+                continue
+                ;;
+            esac
+
             # Two-stage match avoids escaping the author's address into a
             # regex: stage one finds well-formed trailers, stage two does a
             # fixed-string comparison against this commit's author.

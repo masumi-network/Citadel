@@ -46,6 +46,23 @@ updates:
     labels:
       - "type/chore"
       - "area/ci"
+    ignore:
+      # cognee is pinned to 1.2.x ON PURPOSE. ADR-0009 dataset attribution and
+      # the seat provisioning added for #147 read cognee PRIVATE internals
+      # (cognee.modules.data.models, get_default_user, create_authorized_dataset)
+      # that a minor bump can move, and DatasetNotFoundError is matched by class
+      # NAME. The comment above the pin in requirements.txt says the pin exists
+      # to stop Railway pulling one unattended; Dependabot does not read
+      # comments, and proposed >=1.2.2,<1.5.0 in PR #167.
+      #
+      # Worse, CI could not have caught it: CI installs with
+      # `uv sync --all-extras --dev` (pyproject + uv.lock) while Railway
+      # installs from requirements.txt, so that PR was green against a cognee
+      # version it would not have deployed.
+      #
+      # Upgrading cognee is a deliberate exercise: bump it, run the real-store
+      # tests in tests/test_cognee_client.py, and check assert_cognee_dataset_api().
+      - dependency-name: "cognee"
     groups:
       dev-dependencies:
         patterns:
