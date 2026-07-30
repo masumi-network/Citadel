@@ -443,3 +443,46 @@ def test_max_files_cap_is_respected_identically_on_both_paths() -> None:
         discover_repo_paths(via_tree, "o/r", ref="sha", **kw)
         == discover_repo_paths(via_probe, "o/r", ref="sha", **kw)
     )
+
+
+def _depth_ordered_client() -> FakeRepoContentClient:
+    """A prefix whose nested file arrives BEFORE its top-level one.
+
+    This is the shape the rich fixture cannot express: its only file directly
+    under ``skills/`` has the wrong extension, so it is filtered out before the
+    cap can ever choose between the two depths. Here ``skills/a`` sorts before
+    ``skills/zzz.md``, so the recursive tree lists ``skills/a/SKILL.md`` first
+    while the directory walk saw ``skills/zzz.md`` first.
+    """
+    client = FakeRepoContentClient()
+    client.files = {
+        "o/r/skills/a/SKILL.md": {"sha": "1", "content": "x"},
+        "o/r/skills/zzz.md": {"sha": "2", "content": "x"},
+    }
+    client.directories = {
+        "o/r/skills": [
+            {"path": "skills/a", "type": "dir"},
+            {"path": "skills/zzz.md", "type": "file"},
+        ],
+        "o/r/skills/a": [{"path": "skills/a/SKILL.md", "type": "file"}],
+    }
+    return client
+
+
+def test_a_binding_cap_keeps_the_shallower_file_on_both_paths() -> None:
+    """The cap must truncate the same list probing would have truncated.
+
+    Selection drift is silent in production: paths_discovered still reports the
+    cap, nothing is logged, and the files that fall off the end simply stop
+    being refreshed while different ones start being ingested.
+    """
+    via_tree = _depth_ordered_client()
+    via_probe = _depth_ordered_client()
+    via_probe.tree_fails = True
+    kw = {**_DISCOVERY_KW, "tree_prefixes": ("skills/",), "max_files": 1}
+
+    tree_paths = discover_repo_paths(via_tree, "o/r", ref="sha", **kw)
+    probe_paths = discover_repo_paths(via_probe, "o/r", ref="sha", **kw)
+
+    assert probe_paths == ["skills/zzz.md"], "the walk takes the prefix's own files first"
+    assert tree_paths == probe_paths, f"selection drifted under the cap: {tree_paths} != {probe_paths}"

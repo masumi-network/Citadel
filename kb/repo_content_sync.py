@@ -212,6 +212,25 @@ class RepoContentGitHubClient(GitHubOrgClient):
         return []
 
 
+def _in_probe_order(paths: list[str], root: str) -> list[str]:
+    """The paths under ``root``, ordered the way the directory walk reached them.
+
+    GitHub returns a recursive tree depth-first, so a file three levels down
+    arrives before a sibling of its top directory. The walk this replaces was
+    breadth-first: every file directly under the prefix, then the next level.
+    Both orders hold the same files, so the difference stays invisible until
+    ``max_files`` binds, at which point each path keeps a different subset and
+    the vault quietly starts holding different content.
+
+    Sorts on components rather than the raw string because '-' sorts before
+    '/': a directory ``a`` and a file ``a-b.md`` come out in the opposite order
+    otherwise, which is not what listing the directory returned.
+    """
+    marker = f"{root}/"
+    under = [path for path in paths if path.startswith(marker)]
+    return sorted(under, key=lambda path: (path[len(marker) :].count("/"), path.split("/")))
+
+
 def _select_from_tree(
     paths: list[str],
     *,
@@ -223,8 +242,10 @@ def _select_from_tree(
 ) -> list[str]:
     """Pick the wanted files out of a full repo tree, with zero further requests.
 
-    Mirrors the probing order exactly so the selection is unchanged: every root
-    path that exists, in configured order, then each tree prefix in order.
+    Selection order matches the probing walk this replaces: every root path that
+    exists, in configured order, then each tree prefix in order, and within a
+    prefix breadth-first by depth. That last part has to be restored explicitly
+    (see ``_in_probe_order``) because the tree arrives depth-first.
     """
     present = set(paths)
     selected: list[str] = []
@@ -246,10 +267,10 @@ def _select_from_tree(
         root = prefix.strip().strip("/")
         if not root:
             continue
-        for entry_path in paths:
+        for entry_path in _in_probe_order(paths, root):
             if len(selected) >= max_files:
                 return selected
-            if entry_path in seen or not entry_path.startswith(f"{root}/"):
+            if entry_path in seen:
                 continue
             # The probing walk stopped at max_depth levels below the prefix.
             if entry_path[len(root) + 1 :].count("/") + 1 > max_depth:
