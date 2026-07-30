@@ -738,6 +738,73 @@ class CogneePublicClient:
                 counts[str(dataset_name)] = int(total or 0)
         return counts
 
+    async def ensure_dataset(self, name: str) -> bool:
+        """Provision the cognee Dataset row for ``name``, returning whether it was new.
+
+        cognee only creates a Dataset row on the WRITE path: ``cognee.add``
+        resolves the name and calls ``create_authorized_dataset``. The read path
+        does not, so it raises ``DatasetNotFoundError`` instead. A seat whose
+        holder has never successfully ingested therefore has no row, and every
+        search against their node fails (#147). Provision at seat creation
+        rather than waiting for a write that may never come.
+
+        The permission rows are not optional. The read path resolves a name in
+        two steps, and only the first one is about the row existing:
+        ``get_dataset_ids`` matches on name, owner and tenant, then
+        ``get_specific_user_permission_datasets`` filters by ACL. With the row
+        but no ACL a search fails just as hard, only with ``PermissionDeniedError``
+        instead. ``create_authorized_dataset`` writes both.
+
+        Idempotent on both halves, so backfilling an already-healthy seat is a
+        no-op: ``create_dataset`` selects on (name, owner, tenant) before it
+        inserts, and ``give_permission_on_dataset`` looks for the ACL row before
+        adding it.
+
+        Relational store only. This never opens the graph, so it cannot collide
+        with the single Kuzu writer or with an in-flight cognify.
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.modules.data.methods import create_authorized_dataset, get_datasets
+        from cognee.modules.users.methods import get_default_user
+        from sqlalchemy.exc import IntegrityError
+
+        user = await get_default_user()
+        # Read FIRST, purely to decide what to report. Mirror create_dataset's
+        # own uniqueness filter: get_datasets narrows by owner only, so the
+        # tenant check has to happen here or a seat in another tenant reads as
+        # already provisioned.
+        existing = await get_datasets(user.id)
+        was_missing = not any(
+            dataset.name == name and dataset.tenant_id == user.tenant_id for dataset in existing
+        )
+        # Then provision UNCONDITIONALLY. Returning early on a present row would
+        # leave a half-provisioned seat broken forever: the row and its four ACL
+        # rows are written by different statements, and give_permission_on_dataset
+        # gives up after three attempts, so a partial failure is reachable. That
+        # seat has a row, fails the existence check, and never gets repaired,
+        # while its searches keep failing on PermissionDeniedError rather than
+        # DatasetNotFoundError. Calling through costs four guarded no-op queries
+        # on a healthy seat and repairs the broken one.
+        try:
+            await create_authorized_dataset(name, user)
+        except IntegrityError:
+            # Lost a creation race. create_dataset is SELECT-then-INSERT on a
+            # deterministic uuid5 id (get_unique_dataset_id) and handles no
+            # IntegrityError, so two writers for the same name collide on the
+            # primary key. That is reachable here rather than theoretical:
+            # Railway runs evolve and linear-sync as separate OS processes
+            # against the same Postgres, and linear_sync writes into
+            # seat:<slug>, so a boot backfill can meet an in-flight cognee.add.
+            #
+            # The row exists either way, which is the whole point of the call,
+            # and the loser reports False because it did not create it.
+            logger.info("ensure_dataset lost a creation race for %s", name)
+            return False
+        return was_missing
+
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
         """Delete nodes by id from BOTH the graph and the chunk vector store (#15).
 
