@@ -461,6 +461,35 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     }
 
 
+def test_auto_feedback_is_off_by_default_in_cognees_own_config(monkeypatch: Any) -> None:
+    """cognee must actually agree the gate is off, not just see our env var (#50, #105).
+
+    This asserts through cognee's own is_auto_feedback_enabled(), which is what
+    session_turn.py:379 calls, so a cognee release that renames the variable or
+    changes the default fails here instead of quietly restoring an LLM call to
+    every search.
+
+    That call is awaited on the FastAPI event loop, so it blocks every other
+    request while it runs. It is the leading suspect for the 25-40s /healthz
+    hangs in #105, not only the per-search latency in #50.
+    """
+    from cognee.infrastructure.session.get_session_manager import get_session_manager
+
+    monkeypatch.delenv("AUTO_FEEDBACK", raising=False)
+    CogneePublicClient()._prepare_cognee_environment()
+
+    assert os.environ["AUTO_FEEDBACK"] == "false"
+    assert get_session_manager().is_auto_feedback_enabled() is False
+
+
+def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
+    """The default must be overridable without a deploy, so it stays reversible."""
+    monkeypatch.setenv("AUTO_FEEDBACK", "true")
+    CogneePublicClient()._prepare_cognee_environment()
+
+    assert os.environ["AUTO_FEEDBACK"] == "true"
+
+
 def test_assert_cognee_dataset_api_imports_real_symbols() -> None:
     # A cognee bump that moves the private dataset-attribution internals must
     # fail HERE (loud, in CI), not silently fail-closed in prod. This imports

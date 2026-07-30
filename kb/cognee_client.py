@@ -278,6 +278,33 @@ class CogneePublicClient:
     def _prepare_cognee_environment(self) -> None:
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
+        self._ensure_auto_feedback_default()
+
+    def _ensure_auto_feedback_default(self) -> None:
+        """Default cognee's AUTO_FEEDBACK off, because it costs an LLM call per search.
+
+        cognee's CacheConfig defaults ``caching`` and ``auto_feedback`` to True,
+        and every retriever inherits ``prepare_session_turn_for_retrieval`` from
+        BaseRetriever, so the CHUNKS path Citadel runs is gated the same as any
+        other. With it on, ``session_turn.prepare_session_turn`` runs a
+        structured-output LLM call before retrieval; with it off it returns at
+        session_turn.py:379 having done nothing. Measured on this node at 6 to 9
+        seconds per search (#50).
+
+        That call is awaited directly on the FastAPI event loop, because nothing
+        in the search path uses run_in_executor or to_thread. So it does not
+        merely make one search slow, it blocks every other request for its
+        duration, which is what makes a trivial /healthz or a 401 take 30
+        seconds under ordinary search traffic (#105).
+
+        Set here rather than in Railway's environment on purpose. This fix has
+        been written down in docs/progress.md, docs/uat-2026-07-23-findings.md
+        and tasks.md since 2026-06-30 and was never applied to a running node,
+        because a variable nobody sets is not a fix. An explicit AUTO_FEEDBACK
+        in the environment still wins, so it can be turned back on without a
+        deploy.
+        """
+        os.environ.setdefault("AUTO_FEEDBACK", "false")
 
     def _configured_search_type(self, cognee: Any) -> Any | None:
         raw_value = os.getenv("CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS").strip().upper()
