@@ -2,7 +2,9 @@
    Aligned to the AGENTIC / Masumi design system (masumi-network/sokosumi-landing
    apps/sokosumi/DESIGN.md): Inter-only, weight lightens as size grows, sentence
    case, neutral ramp + one accent (masumi Iris magenta #FF51FF), flat elevation
-   (borders + tint, no drop shadows), radius xl=14, segmented-line section heads.
+   (borders + tint, no drop shadows), segmented-line section heads. One local
+   deviation from DESIGN.md: radius is 0, not xl=14 — Citadel's chrome is
+   square everywhere (dashboard included), so the public pages match it.
    Served under strict CSP: no inline <style>/<script>/style="". Mono is used
    only for genuine code/data; chart bar heights set via CSSOM in info.js. */
 
@@ -39,32 +41,32 @@
   --good: #16a34a;   --good-bg: rgba(22, 163, 74, 0.10);
   --warn: #b45309;   --warn-bg: rgba(180, 83, 9, 0.10);
 
+
+  /* Ink for text sitting on the accent fill. Its own token because it is the
+     one colour that must NOT invert: --accent is the same magenta in both
+     themes, so the text on top of it stays near-black in both. Writing --ink
+     there would flip it to near-white in dark mode and destroy the contrast,
+     and writing #0a0a0a inline (as this file did in two places) hides the
+     pairing from anyone changing the accent. */
+  --on-accent: #0a0a0a;
+
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --radius: 14px;
+  /* Square chrome: panels, fields, and buttons are hard rectangles. Kept as a
+     token so the corner treatment stays one decision. Circles (status dots)
+     and capsules (.pill) keep their own radii. */
+  --radius: 0;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ground: #0a0a0a;
-    --surface: #171717;
-    --surface-2: #1f1f1f;
-    --ink: #fafafa;
-    --ink-2: rgba(250, 250, 250, 0.60);
-    --ink-3: rgba(250, 250, 250, 0.42);
-    --border: rgba(255, 255, 255, 0.10);
-    --border-2: rgba(255, 255, 255, 0.16);
-    --accent: #ff51ff;
-    --accent-ink: #ff86f2;
-    --accent-soft: rgba(255, 81, 255, 0.15);
-    --good: #4ade80; --good-bg: rgba(74, 222, 128, 0.12);
-    --warn: #f59e0b; --warn-bg: rgba(245, 158, 11, 0.12);
-  }
-}
+/* Light is the default, deliberately. The page does NOT follow
+   prefers-color-scheme: dark is an explicit choice made with the toggle and
+   remembered in localStorage. This also removes the dark flash that an
+   OS-dark visitor used to get before the deferred script ran. */
 :root[data-theme="light"] {
   --ground: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5;
   --ink: #0a0a0a; --ink-2: rgba(10,10,10,0.56); --ink-3: rgba(10,10,10,0.42);
   --border: #e5e5e5; --border-2: #d4d4d4;
   --accent: #ff51ff; --accent-ink: #c010a0; --accent-soft: rgba(255,81,255,0.10);
+  --on-accent: #0a0a0a;
   --good: #16a34a; --good-bg: rgba(22,163,74,0.10);
   --warn: #b45309; --warn-bg: rgba(180,83,9,0.10);
 }
@@ -73,13 +75,80 @@
   --ink: #fafafa; --ink-2: rgba(250,250,250,0.60); --ink-3: rgba(250,250,250,0.42);
   --border: rgba(255,255,255,0.10); --border-2: rgba(255,255,255,0.16);
   --accent: #ff51ff; --accent-ink: #ff86f2; --accent-soft: rgba(255,81,255,0.15);
+  --on-accent: #0a0a0a;
   --good: #4ade80; --good-bg: rgba(74,222,128,0.12);
   --warn: #f59e0b; --warn-bg: rgba(245,158,11,0.12);
 }
 
+/* --- cross-document view transitions -------------------------------------
+   This is a multi-page site: every nav click is a full document load, so by
+   default the browser tears one page down and paints the next, and nothing can
+   move between them. That is why navigation felt abrupt, and why the hero glow
+   appeared to teleport from one corner to another rather than travelling.
+
+   Same-origin MPA view transitions let the browser snapshot both documents and
+   animate between them. Any element carrying the same view-transition-name on
+   both sides is tweened rather than swapped, which is what makes the glow drift
+   to its new anchor instead of jumping. Each name must be unique within a
+   document; .hero-glow and .topnav both appear exactly once per page.
+
+   Browsers without support ignore every rule here and get precisely today's
+   behaviour, so this degrades to nothing rather than breaking. */
+@view-transition { navigation: auto; }
+
+/* The nav is named, so it holds still while the rest of the page cross-fades,
+   instead of blinking out and back on every navigation.
+
+   The glow is deliberately NOT named. Naming an element hands it to the
+   transition machinery, which snapshots it and freezes its own animation for
+   the duration; on a looping ambient animation that reads as the blob simply
+   stopping. The cross-fade already covers the fact that it sits in a different
+   corner on the next page, which was the original complaint, so naming it buys
+   a tween nobody asked for at the cost of the drift everybody liked. */
+.topnav { view-transition-name: topnav; }
+
+::view-transition-old(root),
+::view-transition-new(root) { animation-duration: .28s; }
+::view-transition-group(topnav) { animation-duration: .2s; }
+
 * { box-sizing: border-box; }
+
+/* The `hidden` attribute has to win, always.
+ *
+ * The user agent stylesheet says `[hidden] { display: none }`, but that is a UA
+ * rule at the lowest origin, so *any* author rule giving an element a display
+ * value outranks it. `.spine { display: flex }` did exactly that: landing.js
+ * hid the static diagram by setting `hidden` when React Flow mounted over it,
+ * the flex rule won, and both diagrams rendered at once, live, for hours.
+ *
+ * That was fixed with a `.spine[hidden]` rule, which fixes one element and
+ * leaves the trap set for the next one. This is the rule that closes the class:
+ * every element, no matter what display it is given, is hidden when the
+ * attribute is set. `kb/static/styles.css` has carried the same rule for the
+ * dashboard all along, and Tailwind's preflight ships it for the Next app,
+ * which is why neither of those surfaces ever had this bug.
+ *
+ * `:not([hidden="until-found"])` keeps the attribute's find-in-page variant
+ * working: that value is meant to render collapsed-but-searchable, and a plain
+ * `display: none` would break it. */
+[hidden]:not([hidden="until-found"]) { display: none !important; }
 html { scroll-behavior: smooth; }
-@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { transition: none !important; }
+  /* Cross-document transitions are motion too. Off means the browser paints
+     the next page directly, exactly as it did before view transitions existed. */
+  @view-transition { navigation: none; }
+  /* The two ambient animations on / stop dead: the hero glow sits still and
+     the rotating headline shows its first word. !important because both
+     animations are declared later in this file at the same specificity. */
+  .hero-glow { animation: none !important; }
+  .roll-track { animation: none !important; transform: none !important; }
+  /* React Flow marks a highlighted edge with a marching-dash animation. The
+     bundle already stops requesting it when this query matches; this is the
+     same rule stated where the rest of the page's motion is stated. */
+  .flowcanvas .react-flow__edge-path { animation: none !important; }
+}
 body {
   margin: 0; background: var(--ground); color: var(--ink);
   font-family: var(--sans); font-size: 16.5px; font-weight: 400; line-height: 1.65;
@@ -93,17 +162,19 @@ a { color: var(--accent-ink); text-underline-offset: 2px; }
 .themebtn {
   position: fixed; top: 16px; right: 16px; z-index: 10;
   font-family: var(--sans); font-size: 12.5px; font-weight: 500; color: var(--ink-2);
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 0;
   padding: 7px 12px; cursor: pointer; transition: border-color .15s, color .15s;
 }
 .themebtn:hover { color: var(--accent-ink); border-color: var(--border-2); }
 .themebtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* header / masthead */
-header { padding: 60px 0 0; }
+/* header / masthead — top padding is smaller than it looks: the shared .topnav
+   sits above it and carries the brand lockup, so the page header starts at the
+   eyebrow rather than repeating the mark. */
+header { padding: 40px 0 0; }
 .brandrow { display: flex; align-items: center; gap: 15px; margin-bottom: 36px; }
 .mark { display: grid; grid-template-columns: repeat(7,1fr); grid-template-rows: repeat(7,1fr); width: 40px; height: 40px; gap: 1.5px; flex: 0 0 auto; }
-.mark i { border-radius: 1px; }
+.mark i { border-radius: 0; }
 .mark i.on { background: linear-gradient(135deg, var(--accent), var(--accent-ink)); }
 .wordmark { font-family: var(--sans); font-weight: 600; font-size: 18px; letter-spacing: .14em; text-transform: uppercase; line-height: 1.1; }
 .subword { font-family: var(--sans); font-size: 12px; color: var(--ink-3); }
@@ -113,6 +184,14 @@ h1 { font-size: clamp(30px, 5.4vw, 62px); font-weight: 300; line-height: 1.03; m
 h1 .grad {
   background: linear-gradient(100deg, var(--accent), var(--accent-ink));
   -webkit-background-clip: text; background-clip: text; color: transparent;
+  /* background-clip: text clips to the inline box, which is tight to the
+     glyphs. Any letter whose ink overhangs its advance width gets shaved on
+     the right, which is why the final r in "and where we partner" looked cut
+     off. Pad the painted box and pull the same amount back out of the layout,
+     so nothing moves. The negative italic-style overhang on the left needs the
+     same treatment for letters like f and j. */
+  padding: 0 .08em;
+  margin: 0 -.08em;
 }
 .meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .pill { font-size: 12.5px; font-weight: 500; padding: 6px 13px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); background: var(--surface); }
@@ -122,7 +201,7 @@ h1 .grad {
 .pill.live.down .hdot { background: var(--warn); }
 
 /* TL;DR */
-.tldr { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px 32px; margin: 36px 0 0; position: relative; overflow: hidden; }
+.tldr { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 28px 32px; margin: 36px 0 0; position: relative; overflow: hidden; }
 .tldr::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(var(--accent), var(--accent-ink)); }
 .tldr .lbl { margin: 0 0 14px; font-size: 12px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--accent-ink); }
 .tldr p { margin: 0 0 14px; font-size: 17.5px; line-height: 1.6; }
@@ -130,7 +209,7 @@ h1 .grad {
 
 /* jump nav */
 nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 0; }
-nav.toc a { font-size: 12.5px; font-weight: 500; text-decoration: none; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 7px 12px; transition: border-color .15s, color .15s; }
+nav.toc a { font-size: 12.5px; font-weight: 500; text-decoration: none; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 7px 12px; transition: border-color .15s, color .15s; }
 nav.toc a:hover { color: var(--accent-ink); border-color: var(--border-2); }
 
 /* section scaffolding — segmented-line header */
@@ -142,30 +221,35 @@ section { padding-top: 66px; }
 
 /* metrics */
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px; }
+.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 18px 18px; }
 .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 500; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.1; color: var(--ink); }
 .metric .n small { font-size: 14px; color: var(--ink-3); font-weight: 400; }
 .metric .k { font-size: 12.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.4; }
 .metric.accent .n, .metric.tealn .n { color: var(--accent-ink); }
 .metric .n.pending { color: var(--ink-3); }
-.verified { font-size: 12.5px; color: var(--ink-3); margin-top: 16px; display: flex; align-items: center; gap: 8px; line-height: 1.5; }
-.verified .vdot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex: 0 0 auto; }
+/* Not flex. Flex makes every inline child its own item, so a line containing
+   links gets broken into separate boxes with the gap between them, and the
+   links drop onto their own lines. It looked fine wherever the line was a
+   single text node, which is why it survived. The dot is positioned instead,
+   so the text flows as normal prose however many links it contains. */
+.verified { position: relative; font-size: 12.5px; color: var(--ink-3); margin-top: 16px; padding-left: 14px; line-height: 1.5; }
+.verified .vdot { position: absolute; left: 0; top: .5em; width: 6px; height: 6px; border-radius: 50%; background: var(--good); }
 
 /* pillars */
 .pillars { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; transition: border-color .15s; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 22px 24px; transition: border-color .15s; }
 .card:hover { border-color: var(--border-2); }
 .card h3 { margin: 0 0 10px; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-.card h3 .dot { width: 8px; height: 8px; border-radius: 2px; background: var(--accent); flex: 0 0 auto; }
+.card h3 .dot { width: 8px; height: 8px; border-radius: 0; background: var(--accent); flex: 0 0 auto; }
 .card p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
-.card .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 6px; }
+.card .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 0; }
 
 /* details / go-deeper */
-details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-top: 14px; overflow: hidden; }
+details { background: var(--surface); border: 1px solid var(--border); border-radius: 0; margin-top: 14px; overflow: hidden; }
 details[open] { border-color: var(--border-2); }
 summary { list-style: none; cursor: pointer; padding: 17px 22px; display: flex; align-items: center; gap: 12px; font-weight: 500; font-size: 15px; color: var(--ink); }
 summary::-webkit-details-marker { display: none; }
-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: var(--radius); }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 0; }
 summary .chev { color: var(--accent-ink); transition: transform .2s ease; flex: 0 0 auto; font-size: 13px; }
 details[open] summary .chev { transform: rotate(90deg); }
 summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); margin-left: auto; }
@@ -179,26 +263,45 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 .dbody li b { color: var(--ink); font-weight: 600; }
 
 /* architecture diagram */
-.arch { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px 28px 24px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "phead . ohead" "psrc . osrc" "pnode bridge central" "access access access"; column-gap: 18px; row-gap: 12px; align-items: stretch; }
+/* The pipeline, as one line: capture, Node, promotion, Central. Deliberately
+   four steps and nothing else. The two-lane grid it replaced carried fourteen
+   elements, and the six source chips in it were the first thing every reader
+   skipped. What it showed is still said, in prose, in the cards below. */
+.spine { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 26px 0 0; }
+.spine .step { flex: 1 1 0; min-width: 0; text-align: center; }
+.spine .step .t { display: block; font-size: 15.5px; font-weight: 600; letter-spacing: -.01em; }
+.spine .step .s { display: block; margin-top: 2px; font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+.spine .step.hl .t { color: var(--accent-ink); }
+.spine .arw { flex: 0 0 auto; font-size: 18px; color: var(--border-2); }
+.spine-read { margin: 18px 0 30px; padding-top: 14px; border-top: 1px solid var(--border); text-align: center; font-size: 14.5px; color: var(--ink-2); }
+.spine-read b { color: var(--ink); }
+/* On a narrow screen it stacks and the arrows turn to point down, so it stays a
+   diagram instead of collapsing into four stray labels. */
+@media (max-width: 620px) {
+  .spine { flex-direction: column; gap: 6px; }
+  .spine .arw { transform: rotate(90deg); }
+}
+
+.arch { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 28px 28px 24px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr auto 1fr; grid-template-areas: "phead . ohead" "psrc . osrc" "pnode bridge central" "access access access"; column-gap: 18px; row-gap: 12px; align-items: stretch; }
 .lanehead { font-size: 11px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
 .lanehead.p { grid-area: phead; color: var(--accent-ink); }
 .lanehead.o { grid-area: ohead; color: var(--ink-2); }
 .srccol { display: flex; flex-direction: column; gap: 6px; }
 .srccol.p { grid-area: psrc; } .srccol.o { grid-area: osrc; }
-.node-chip { font-size: 12.5px; font-weight: 500; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 7px 11px; }
+.node-chip { font-size: 12.5px; font-weight: 500; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 0; padding: 7px 11px; }
 .flowcap { font-size: 11px; color: var(--ink-3); margin-top: 3px; }
-.store { border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); }
+.store { border-radius: 0; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); }
 .store b { font-size: 15px; font-weight: 600; } .store span { font-size: 11.5px; color: var(--ink-3); }
 .store.node { grid-area: pnode; background: var(--accent-soft); border-color: var(--accent-soft); }
 .store.node b { color: var(--accent-ink); }
 .store.central { grid-area: central; background: var(--surface-2); }
 .bridge { grid-area: bridge; align-self: center; text-align: center; font-size: 10.5px; color: var(--ink-3); line-height: 1.6; max-width: 120px; }
 .bridge .arw { display: block; font-size: 15px; color: var(--accent); letter-spacing: -1px; }
-.access { grid-area: access; margin-top: 8px; text-align: center; font-size: 13.5px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 13px 16px; }
+.access { grid-area: access; margin-top: 8px; text-align: center; font-size: 13.5px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 0; padding: 13px 16px; }
 .access b { color: var(--ink); font-weight: 600; }
 
 /* activity chart */
-.chartwrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px 26px 20px; margin-bottom: 30px; }
+.chartwrap { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 24px 26px 20px; margin-bottom: 30px; }
 .charthead { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
 .charthead .t { font-size: 14px; font-weight: 600; }
 .charthead .note { font-size: 11.5px; color: var(--ink-3); }
@@ -206,7 +309,7 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 6px; height: 100%; min-width: 0; }
 .bar-val { font-family: var(--mono); font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .bar-col.ship .bar-val { color: var(--accent-ink); font-weight: 500; }
-.bar { width: 74%; max-width: 30px; min-height: 3px; border-radius: 4px 4px 0 0; background: var(--surface-2); border: 1px solid var(--border-2); transition: filter .15s; }
+.bar { width: 74%; max-width: 30px; min-height: 3px; border-radius: 0; background: var(--surface-2); border: 1px solid var(--border-2); transition: filter .15s; }
 .bar-col.ship .bar { background: linear-gradient(var(--accent), var(--accent-ink)); border: none; }
 .bar-col:hover .bar { filter: brightness(1.05); }
 .bar-lbl { font-size: 9.5px; color: var(--ink-3); text-align: center; line-height: 1.3; }
@@ -227,12 +330,12 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 
 /* next */
 .status-legend { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 22px; }
-.chip { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 5px 11px; border-radius: 8px; text-transform: uppercase; white-space: nowrap; }
+.chip { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 5px 11px; border-radius: 0; text-transform: uppercase; white-space: nowrap; }
 .chip.ship { color: var(--good); background: var(--good-bg); }
 .chip.prog { color: var(--warn); background: var(--warn-bg); }
 .chip.plan { color: var(--ink-2); background: var(--surface-2); }
 .next { display: flex; flex-direction: column; gap: 12px; }
-.nrow { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; display: grid; grid-template-columns: 118px 1fr; gap: 20px; align-items: start; }
+.nrow { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 22px 24px; display: grid; grid-template-columns: 118px 1fr; gap: 20px; align-items: start; }
 .nrow .left { display: flex; padding-top: 3px; }
 .nrow h3 { margin: 0 0 7px; font-size: 16px; font-weight: 600; }
 .nrow p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
@@ -240,15 +343,18 @@ summary .go { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-tran
 
 /* footer */
 footer { margin-top: 34px; color: var(--ink-2); font-size: 15px; }
-.cmd { font-family: var(--mono); font-size: 13.5px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; color: var(--ink); margin: 16px 0; overflow-x: auto; white-space: nowrap; }
+.cmd { font-family: var(--mono); font-size: 13.5px; background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 14px 16px; color: var(--ink); margin: 16px 0; overflow-x: auto; white-space: nowrap; }
 .cmd .p { color: var(--accent-ink); user-select: none; }
 .foot-note { color: var(--ink-3); font-size: 13.5px; margin-top: 18px; }
-code { font-family: var(--mono); font-size: .84em; background: var(--surface-2); padding: 1.5px 6px; border-radius: 5px; color: var(--ink); }
+code { font-family: var(--mono); font-size: .84em; background: var(--surface-2); padding: 1.5px 6px; border-radius: 0; color: var(--ink); }
 
 /* wide screens: report/dashboard frame, text kept at a comfortable measure */
 @media (min-width: 1120px) {
   .wrap { max-width: 1200px; padding-left: 40px; padding-right: 40px; }
-  header { padding-top: 76px; }
+  /* .topnav-in must track .wrap here too — that override lives with the rest
+     of the nav rules at the end of this file, because the nav's base rule is
+     declared after this block and would otherwise win. */
+  header { padding-top: 52px; }
   h1 { max-width: 18ch; }
   .tldr p, .dbody p, .dbody li, .nrow p { max-width: 76ch; }
   .metric .n { font-size: 28px; }
@@ -265,4 +371,407 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
   .arch { grid-template-columns: 1fr; grid-template-areas: "phead" "psrc" "pnode" "bridge" "ohead" "osrc" "central" "access"; }
   .bridge { max-width: none; margin: 2px 0; }
   .bar-val, .bar-tag { font-size: 8.5px; }
+}
+
+/* --- /partners page ------------------------------------------------------
+   The partnering profile reuses this stylesheet wholesale (cards, chips,
+   nrow, tldr, metrics, toc). Only these two classes are new. */
+
+.plainlist { margin: 14px 0 0; padding: 0 0 0 18px; display: flex; flex-direction: column; gap: 9px; color: var(--ink-2); font-size: 14.5px; line-height: 1.55; }
+.plainlist li::marker { color: var(--ink-3); }
+.plainlist b { color: var(--ink); font-weight: 600; }
+.tldr .plainlist { font-size: 15.5px; margin-top: 4px; }
+
+/* Unfilled placeholder. Deliberately loud — this must not reach production. */
+.todo { font-family: var(--mono); font-size: .92em; font-weight: 600; color: var(--accent-ink); background: var(--accent-soft); border: 1px dashed var(--accent); border-radius: 0; padding: 1px 6px; }
+
+/* --- / landing -----------------------------------------------------------
+   The front door. Full-bleed bands, each holding a 940px measure, alternating
+   white / grey with one accent-tinted band at the fork. The report's .arch,
+   .card, .nrow, .chip, .cmd and .pill are reused as they are; the bands, the
+   hero glow, the rotating headline, the sticky index, the proof tiles and the
+   doors are what this page adds. Every band colour is a token, so dark mode
+   inverts with the rest of the ramp. */
+
+.band { position: relative; padding: 74px 0; }
+.band-in { max-width: 940px; margin: 0 auto; padding: 0 26px; }
+.band-proof, .band-how { background: var(--surface); }
+.band-what, .band-start { background: var(--surface-2); }
+.band-next { background: var(--accent-soft); }
+/* the sticky index, not the nav, is what an anchor jump has to clear here */
+.band[id] { scroll-margin-top: 46px; }
+
+/* hero — white, no chrome box: the nav rides inside the band, transparent, so
+   the page opens on white rather than on a bordered strip */
+.band-hero { background: var(--surface); overflow: hidden; padding: 0; }
+.band-hero .topnav { position: relative; background: none; border-bottom: 0; }
+.band-hero .topnav-in { max-width: 940px; padding: 11px 26px; }
+
+.hero-glow {
+  position: absolute; top: -300px; right: -190px; z-index: 0;
+  width: 840px; height: 840px; border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, rgba(255,81,255,.30) 0%, rgba(255,81,255,.10) 42%, rgba(255,81,255,0) 70%);
+  animation: drift 20s ease-in-out infinite alternate;
+  will-change: transform;
+}
+:root[data-theme="dark"] .hero-glow {
+  background: radial-gradient(circle, rgba(255,81,255,.14) 0%, rgba(255,81,255,.05) 42%, rgba(255,81,255,0) 70%);
+}
+@keyframes drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-90px, 60px, 0) scale(1.16); }
+}
+
+/* Each page anchors the glow somewhere different and drifts it a different way,
+   so the set does not read as one template stamped five times. The animation is
+   always `drift*`, so the reduced-motion rule at the top of this file catches
+   every variant without naming them. */
+.hero-glow--left {
+  right: auto; left: -240px; top: -340px;
+  animation-name: drift-b;
+}
+.hero-glow--low {
+  top: -160px; right: -300px; width: 720px; height: 720px;
+  animation-name: drift-c;
+}
+.hero-glow--center {
+  top: 50%; right: 50%; width: 760px; height: 760px;
+  margin: -380px -380px 0 0;
+  animation-name: drift-d;
+}
+@keyframes drift-b {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(80px, 70px, 0) scale(1.14); }
+}
+@keyframes drift-c {
+  from { transform: translate3d(0, 0, 0) scale(1.05); }
+  to { transform: translate3d(-60px, -50px, 0) scale(1); }
+}
+@keyframes drift-d {
+  from { transform: translate3d(-30px, 20px, 0) scale(1); }
+  to { transform: translate3d(30px, -20px, 0) scale(1.12); }
+}
+
+/* /login is a single centred card, so the glow sits behind it rather than in a
+   corner. The card's own surface keeps the text legible on top of it. */
+.auth { position: relative; overflow: hidden; }
+.auth-in { position: relative; z-index: 1; }
+
+.hero { position: relative; z-index: 1; padding: 58px 0 92px; }
+.hero h1 { max-width: 15ch; }
+.hero-lede { color: var(--ink-2); max-width: 58ch; margin: 0 0 30px; font-size: 17.5px; line-height: 1.6; }
+
+/* rotating word — a fixed-height, overflow-hidden column of words that slides
+   one line per beat. Pure CSS: a JS timer would need an inline handler or a
+   style write the CSP has no reason to allow. The list carries a sixth span
+   repeating the first, so the wrap from the last word back to the first rolls
+   instead of cutting. Fixed height + inline-flex means a longer word can never
+   reflow the headline.
+
+   The 1.03em box is exactly h1's line-height, which is what makes
+   vertical-align: bottom land the word on the surrounding baseline rather than
+   near it. It also means the clip is tight: none of the five words carries a
+   descender, and one that did (a g, j, p, q or y) would be cut off. Grow the
+   box and the span together if the list ever gains one. */
+/* The window and the track must be two different elements. If the element that
+   clips is also the element that moves, the translate walks the clipping box
+   down the page instead of scrolling the words through it, and every word ends
+   up visible in a stack. Offsets are in em, matching the item height: with
+   percentages they resolve against the track's own height, so adding or
+   removing a word silently drifts every step. */
+/* align-items: flex-start is load-bearing. `.roll` is a row flex container, so
+   the default `stretch` would force the track down to the window's 1.03em, and
+   the track's six 1.03em children would then be shrinkable flex items in a box
+   one sixth their total size. They survive only because a flex item's automatic
+   minimum size floors them at one line box. Not stretching the track removes
+   the reliance on that rule: it sizes to its own 6.18em of content, and the
+   window clips it. */
+.roll { display: inline-flex; align-items: flex-start; overflow: hidden; height: 1.03em; vertical-align: bottom; }
+.roll-track { display: flex; flex-direction: column; animation: rollup 17s cubic-bezier(.62,0,.28,1) infinite; }
+.roll-track span { display: block; height: 1.03em; line-height: 1.03; white-space: nowrap; }
+@keyframes rollup {
+  0%, 17% { transform: translateY(0); }
+  20%, 37% { transform: translateY(-1.03em); }
+  40%, 57% { transform: translateY(-2.06em); }
+  60%, 77% { transform: translateY(-3.09em); }
+  80%, 97% { transform: translateY(-4.12em); }
+  100% { transform: translateY(-5.15em); }
+}
+
+/* section index — sticky, and it takes over from the hero nav on scroll */
+.index { position: sticky; top: 0; z-index: 20; height: 46px; background: var(--ground); border-bottom: 1px solid var(--border); }
+.index-in { max-width: 940px; height: 100%; margin: 0 auto; padding: 0 26px; display: flex; align-items: center; gap: 2px; overflow-x: auto; }
+.index a { display: inline-flex; align-items: center; height: 100%; padding: 0 11px; font-size: 13px; font-weight: 500; white-space: nowrap; text-decoration: none; color: var(--ink-2); border-bottom: 2px solid transparent; transition: color .15s, border-color .15s; }
+.index a:hover { color: var(--ink); }
+.index a.on { color: var(--ink); border-bottom-color: var(--accent); }
+.index a:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.index .pill { margin-left: auto; flex: 0 0 auto; }
+
+/* proof tiles — static repo facts. Live numbers stay on /info. */
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 20px; }
+.tile .n { font-family: var(--mono); font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--ink); }
+.tile .n.sm { font-size: 19px; }
+.tile.accent .n { color: var(--accent-ink); }
+.tile .k { margin-top: 8px; font-size: 12.5px; line-height: 1.4; color: var(--ink-2); }
+.proof-note { margin: 18px 0 0; font-size: 13px; line-height: 1.6; color: var(--ink-3); }
+
+/* 01 — the diagram reads store first, feeds after, so the source chips sit
+   under the store they feed rather than above it */
+.band .arch { grid-template-areas: "phead . ohead" "pnode bridge central" "psrc . osrc" "access access access"; margin-bottom: 14px; }
+
+/* --- / flow (the React Flow pipeline diagram) ----------------------------
+   Presentation for the nodes lives here rather than in the bundle, so the
+   diagram reads from the same tokens as the rest of the page and inverts with
+   the theme toggle for free. The bundle ships React Flow's own stylesheet and
+   nothing else; kb/static/vendor/flow.css is vendor code, not ours.
+
+   The whole block only applies once landing.js has swapped the static .arch
+   out, which happens on scroll. Before that none of these selectors match. */
+
+.flowmount { height: 520px; margin-bottom: 14px; background: var(--surface); border: 1px solid var(--border); }
+.flowcanvas { position: relative; width: 100%; height: 100%; }
+.flowcap-note { margin: 0 0 30px; font-size: 12.5px; line-height: 1.6; color: var(--ink-3); }
+
+/* React Flow theming hooks, so the canvas, the dot grid and the zoom controls
+   follow the page instead of shipping their default grey. */
+.flowcanvas .react-flow {
+  --xy-background-color: var(--surface);
+  --xy-background-pattern-color: var(--border);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--ink-2);
+  --xy-controls-button-color-hover: var(--accent-ink);
+  --xy-controls-button-border-color: var(--border);
+  --xy-attribution-background-color: transparent;
+}
+/* Nothing here is connectable, so the ports are anchors, not affordances. */
+.flowcanvas .react-flow__handle { width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; background: none; opacity: 0; }
+.flowcanvas .react-flow__attribution { font-size: 9px; }
+.flowcanvas .react-flow__attribution a { color: var(--ink-3); }
+
+.fnode {
+  width: 178px; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 9px 12px; border-radius: 0;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 500; line-height: 1.32;
+  color: var(--ink); background: var(--surface); border: 1px solid var(--border-2);
+  transition: opacity .18s ease, border-color .15s ease;
+}
+.fnode-s { font-family: var(--mono); font-size: 9.5px; font-weight: 400; letter-spacing: .02em; color: var(--ink-3); }
+.fnode.is-dim { opacity: .2; }
+
+.fnode-source { background: var(--surface-2); border-color: var(--border); }
+/* The two stores are the point of the diagram, so they are the two nodes that
+   do not look like the others. */
+.fnode-store-node { background: var(--accent-soft); border-color: var(--accent); padding: 13px 14px; }
+.fnode-store-node .fnode-l { font-size: 14px; font-weight: 600; color: var(--accent-ink); }
+.fnode-store-central { background: var(--surface-2); border: 2px solid var(--ink-3); padding: 12px 13px; }
+.fnode-store-central .fnode-l { font-size: 14px; font-weight: 600; }
+.fnode-gate { border-style: dashed; }
+.fnode-read { border-color: var(--accent); }
+.fnode-audit { background: var(--surface-2); border-style: dotted; }
+
+.fhead { font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+
+.flowcanvas .react-flow__edge-path { stroke: var(--border-2); stroke-width: 1.5; }
+.flowcanvas .fedge.is-on .react-flow__edge-path { stroke: var(--accent); stroke-width: 2; }
+.flowcanvas .fedge.is-dim .react-flow__edge-path { stroke: var(--border); opacity: .3; }
+.flowcanvas .react-flow__edge-text { font-family: var(--sans); font-size: 9px; font-weight: 500; fill: var(--ink-3); }
+.flowcanvas .fedge.is-on .react-flow__edge-text { fill: var(--accent-ink); }
+.flowcanvas .react-flow__edge-textbg { fill: var(--surface); }
+
+.flowhint { position: absolute; left: 12px; bottom: 12px; z-index: 5; margin: 0; font-size: 11.5px; color: var(--ink-3); pointer-events: none; }
+.flowpanel { position: absolute; right: 12px; bottom: 12px; z-index: 5; width: 310px; max-width: calc(100% - 24px); padding: 16px 18px; background: var(--surface); border: 1px solid var(--accent); }
+.flowpanel-k { margin: 0 0 6px; font-family: var(--mono); font-size: 9.5px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; color: var(--accent-ink); }
+.flowpanel h4 { margin: 0 0 8px; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.flowpanel p { margin: 0; font-size: 13px; line-height: 1.55; color: var(--ink-2); }
+.flowpanel-x { margin-top: 13px; font-family: var(--sans); font-size: 11.5px; font-weight: 500; color: var(--ink-2); background: none; border: 1px solid var(--border-2); border-radius: 0; padding: 5px 11px; cursor: pointer; transition: color .15s, border-color .15s; }
+.flowpanel-x:hover { color: var(--accent-ink); border-color: var(--accent); }
+.flowpanel-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* 02 — hairline rows, not cards */
+.band-how .nrow { background: none; border: 0; border-top: 1px solid var(--border); padding: 24px 0; }
+.band-how .rows .nrow:last-child { border-bottom: 1px solid var(--border); }
+
+/* 03 — the fork. The left door is the one we want taken. */
+.doors { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+.door { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border-2); border-radius: 0; padding: 26px 28px; }
+.door.lead { border-color: var(--accent); }
+.door h3 { margin: 0 0 8px; font-size: 20px; font-weight: 500; letter-spacing: -.02em; }
+.door p { margin: 0 0 22px; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
+.door .cta { margin: auto 0 0; }
+
+/* 04 — closing links */
+.endrow { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 13.5px; color: var(--ink-3); }
+.endrow a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--border-2); }
+.endrow a:hover { color: var(--accent-ink); border-bottom-color: var(--accent); }
+
+.cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 26px; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--sans); font-size: 14px; font-weight: 500; text-decoration: none;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border-2); border-radius: 0; padding: 11px 20px;
+  transition: border-color .15s, color .15s, filter .15s;
+}
+.btn:hover { border-color: var(--ink-3); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn-primary { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+.btn-primary:hover { filter: brightness(1.06); border-color: var(--accent); }
+
+.chip.step { color: var(--accent-ink); background: var(--accent-soft); letter-spacing: .08em; }
+
+@media (max-width: 900px) {
+  .tiles { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 620px) {
+  .band { padding: 48px 0; }
+  .band-hero { padding: 0; }
+  .band-in { padding: 0 16px; }
+  .band-hero .topnav-in { padding: 9px 16px; }
+  .index-in { padding: 0 16px; }
+  .hero { padding: 34px 0 60px; }
+  .hero-glow { top: -220px; right: -240px; width: 560px; height: 560px; }
+  .cta .btn { flex: 1 1 100%; }
+  .doors { grid-template-columns: 1fr; }
+  .band .arch { grid-template-columns: 1fr; grid-template-areas: "phead" "pnode" "psrc" "bridge" "ohead" "central" "osrc" "access"; }
+  .flowmount { height: 400px; }
+  .flowpanel { width: auto; left: 12px; }
+  .flowhint { display: none; }
+}
+
+/* --- the same bands on /info, /use-cases and /contact ---------------------
+   Those three were single .wrap columns from before / was rebuilt, and read as
+   a different site the moment you crossed the nav. They now use the .band /
+   .band-in structure above, the same hero band with its glow, and the same
+   sticky .index.
+
+   The landing page names each band after its content (.band-proof, .band-what,
+   ...) and several of those names carry layout rules as well as a colour:
+   .band-how restyles .nrow into hairline rows, for one. These three modifiers
+   carry the colour and nothing else, so a report section can sit on the same
+   three surfaces without inheriting the front door's layout. Same tokens, same
+   rhythm: white, grey, white, with the accent tint reserved for a fork. */
+.band-white { background: var(--surface); }
+.band-grey { background: var(--surface-2); }
+.band-tint { background: var(--accent-soft); }
+
+/* / opens on three words, so its headline is set at a 15ch measure. These pages
+   open on a sentence, which at 15ch stacks into a column five lines deep. */
+.hero-wide { padding-bottom: 66px; }
+.hero-wide h1 { max-width: 24ch; }
+
+/* The TL;DR used to be a white card on the page's --ground, and the hero band
+   is --surface, so in the band it would have been white on white behind a
+   hairline. It takes the next surface down instead, and inverts in dark mode
+   with everything else. */
+.band-hero .tldr { background: var(--surface-2); }
+
+/* A closing footer that is itself a band is full-bleed, so the margin that
+   separates an in-column footer from the text above it would show as a stripe
+   of --ground between two bands. */
+footer.band { margin-top: 0; }
+
+/* --- /partners contact form ----------------------------------------------
+   Reuses the /login field and button styles below, so the two forms in the
+   product look like the same form. */
+
+.contact-form { display: flex; flex-direction: column; gap: 14px; max-width: 640px; }
+.contact-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.contact-field { display: flex; flex-direction: column; gap: 7px; }
+.contact-textarea { resize: vertical; min-height: 130px; line-height: 1.6; }
+.contact-submit { align-self: flex-start; margin-top: 4px; }
+.contact-ok { color: var(--good); }
+/* Honeypot. Off-screen rather than display:none, which some bots skip. */
+.contact-trap { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+
+@media (max-width: 620px) { .contact-row { grid-template-columns: 1fr; } }
+
+/* --- /login — seat access ------------------------------------------------
+   The sign-in screen is a public page, so it is styled here rather than in
+   styles.css (the authed dashboard theme): same neutral ramp, same single
+   accent, same light/dark toggle, same top nav. A visitor arriving from
+   /info should not feel handed to a different product at the door. */
+
+.auth { min-height: calc(100vh - 46px); display: flex; align-items: center; justify-content: center; padding: 40px 26px 80px; }
+.auth-in { width: 100%; max-width: 380px; }
+.auth h1 { font-size: clamp(28px, 4.4vw, 38px); font-weight: 300; letter-spacing: -.03em; line-height: 1.08; margin: 0 0 12px; }
+.auth-lede { color: var(--ink-2); font-size: 15px; line-height: 1.6; margin: 0 0 28px; }
+
+.auth-form { display: flex; flex-direction: column; gap: 8px; }
+.auth-label { font-size: 13px; font-weight: 500; color: var(--ink); }
+.auth-input {
+  width: 100%; font-family: var(--mono); font-size: 14px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border-2); border-radius: 0;
+  padding: 12px 14px; transition: border-color .15s;
+}
+.auth-input::placeholder { color: var(--ink-3); }
+.auth-input:hover { border-color: var(--ink-3); }
+.auth-input:focus { outline: none; border-color: var(--accent); }
+.auth-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.auth-hint { margin: 4px 0 0; font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+.auth-error { margin: 0; font-size: 13px; line-height: 1.6; color: var(--warn); }
+.auth-error:empty { display: none; }
+
+.auth-submit {
+  margin-top: 12px; font-family: var(--sans); font-size: 14px; font-weight: 500;
+  color: var(--on-accent); background: var(--accent); border: 1px solid var(--accent); border-radius: 0;
+  padding: 12px 16px; cursor: pointer; transition: filter .15s, opacity .15s;
+}
+.auth-submit:hover { filter: brightness(1.06); }
+.auth-submit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.auth-submit[aria-busy="true"], .auth-submit:disabled { opacity: .6; cursor: default; }
+
+.auth-alt { margin: 22px 0 0; font-size: 13px; color: var(--ink-3); }
+.auth-alt a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--border-2); }
+.auth-alt a:hover { color: var(--accent-ink); border-bottom-color: var(--accent); }
+
+@media (max-width: 620px) { .auth { padding: 28px 16px 60px; min-height: calc(100vh - 42px); } }
+
+/* --- shared top navigation (public pages: /info, /partners, /login) -------
+   Carries the brand lockup, so no page repeats it in its own header. */
+
+.topnav { position: sticky; top: 0; z-index: 20; background: var(--ground); border-bottom: 1px solid var(--border); }
+.topnav-in { max-width: 860px; margin: 0 auto; padding: 11px 26px; display: flex; align-items: center; gap: 14px; }
+
+.topnav-brand { display: flex; align-items: center; gap: 10px; margin-right: auto; text-decoration: none; color: inherit; }
+.topnav-brand .mark { width: 22px; height: 22px; gap: 1px; }
+.topnav-brand .wordmark { font-size: 13px; letter-spacing: .12em; }
+.topnav-brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 0; }
+
+.topnav-links { display: flex; align-items: center; gap: 2px; }
+.topnav-links a { font-size: 13px; font-weight: 500; text-decoration: none; color: var(--ink-2); padding: 6px 11px; border-radius: 0; transition: color .15s, background .15s; }
+.topnav-links a:hover { color: var(--ink); background: var(--surface-2); }
+.topnav-links a[aria-current="page"] { color: var(--accent-ink); background: var(--accent-soft); }
+.topnav-links a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Sign in is the one destination in the nav that is a door rather than a page,
+   so it carries a border. Selected by href rather than by a class, because
+   test_public_pages_share_one_top_nav pins the exact nav anchor markup on all
+   five pages, and because there is only ever one sign-in link. Bordered
+   everywhere at once: a nav that differs between pages is worse. */
+.topnav-links a[href="/login"] { margin-left: 6px; padding: 5px 12px; color: var(--ink); border: 1px solid var(--border-2); }
+.topnav-links a[href="/login"]:hover { color: var(--accent-ink); background: none; border-color: var(--accent); }
+.topnav-links a[href="/login"][aria-current="page"] { color: var(--accent-ink); background: var(--accent-soft); border-color: var(--accent); }
+
+/* the toggle moves into the bar instead of floating over the page */
+.topnav .themebtn { position: static; margin-left: 4px; padding: 6px 10px; font-size: 12px; }
+
+/* the bar is sticky, so anchor jumps must clear it or land under it */
+section[id] { scroll-margin-top: 62px; }
+
+/* Wide screens: track .wrap's widened frame so the brand stays aligned with
+   the page content beneath it. This lives here, not in the min-width:1120px
+   block above, because .topnav-in's base rule is declared after that block
+   and would otherwise win at every viewport. */
+@media (min-width: 1120px) {
+  .topnav-in { max-width: 1200px; padding-left: 40px; padding-right: 40px; }
+}
+
+@media (max-width: 620px) {
+  .topnav-in { padding: 9px 16px; gap: 8px; }
+  .topnav-brand .wordmark { display: none; }
+  .topnav-links a { padding: 6px 8px; font-size: 12.5px; }
 }

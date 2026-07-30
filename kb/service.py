@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from hashlib import sha256
 import logging
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 # negatives/zero to 1 and caps absurd values so no caller — present, future, or one that
 # bypasses pydantic — can drive an unbounded recall into the search-backend timeout.
 MAX_SEARCH_TOP_K = 100
+
+# The cognify verify canary re-searches for its marker, because cognify can be
+# settling when the first search runs. Module-level so a test can shrink them
+# instead of sleeping through the real backoff.
+CANARY_SEARCH_ATTEMPTS = 3
+CANARY_SEARCH_BACKOFF_SECONDS = 2.0
 
 
 class Citadel:
@@ -250,10 +257,23 @@ class Citadel:
             marker = f"COGNIFY_TEST_MARKER_{uuid4().hex}"
             await self.ingest(marker, dataset=target_dataset)
             await self.cognee.cognify(datasets=[target_dataset], force=force)
-            matches = await self.search(marker, dataset=target_dataset, top_k=10)
+            # Cognify can still be settling, so re-search a bounded number of
+            # times before calling it a miss (#114). Without this, requiring a
+            # real search hit would flag a slow-but-healthy node as broken.
+            search_hit = False
+            attempts = 0
+            for attempt in range(CANARY_SEARCH_ATTEMPTS):
+                attempts = attempt + 1
+                matches = await self.search(marker, dataset=target_dataset, top_k=10)
+                if _marker_in_results(marker, matches):
+                    search_hit = True
+                    break
+                if attempts < CANARY_SEARCH_ATTEMPTS:
+                    await asyncio.sleep(CANARY_SEARCH_BACKOFF_SECONDS)
             verification = {
                 "marker": marker,
-                "search_hit": _marker_in_results(marker, matches),
+                "search_hit": search_hit,
+                "search_attempts": attempts,
             }
             # Backprop (#15): the canary marker used to persist forever, surfacing in
             # search/linear_search results. Delete its node now so verify leaves no
@@ -266,7 +286,12 @@ class Citadel:
         )
         if verification is not None:
             verification["graph_grew"] = graph_grew
-            verification["ok"] = bool(verification["search_hit"] or graph_grew)
+            # graph_grew is diagnostic detail, NOT a pass condition (#114). Any
+            # concurrent ingest grows the graph, so growth is no evidence that
+            # THIS marker became retrievable. Production showed the cost:
+            # "grew=True canary_ok=True" every hour while two of five ingest
+            # stages were dead on the Kuzu lock and contributing nothing.
+            verification["ok"] = bool(verification["search_hit"])
 
         return {
             # Surface the verify canary verdict at the top level so the CLI exit

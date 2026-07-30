@@ -4,6 +4,7 @@ import io
 
 from kb.banner import (
     PIXEL_FLAGS,
+    WINDOW_INDICES,
     banner,
     banner_large,
     paint,
@@ -66,20 +67,40 @@ def test_banner_color_has_ansi(monkeypatch) -> None:
 def test_banner_truecolor_uses_column_gradient(monkeypatch) -> None:
     monkeypatch.setenv("COLORTERM", "truecolor")
     out = banner(color=True)
-    assert "\033[38;2;250;0;140m" in out  # first column magenta
-    assert "\033[38;2;34;211;238m" in out  # last column cyan
+    assert "\033[38;2;255;81;255m" in out  # first column Iris
+    assert "\033[38;2;176;10;144m" in out  # last column deep Iris
 
 
 def test_pixel_cells_match_canonical_grid() -> None:
     cells = pixel_cells()
     assert len(cells) == 49
-    # Lit = base flags + 4 window eyes
-    assert sum(1 for c in cells if c["lit"]) == sum(PIXEL_FLAGS) + 4
-    assert cells[0]["color"] == "#FA008C"
-    assert cells[6]["color"] == "#22D3EE"
+    # The window cells sit inside the solid keep, so they are lit in the mask
+    # itself; blanking them is the blink's off frame, not a missing bit.
+    assert sum(1 for c in cells if c["lit"]) == sum(PIXEL_FLAGS)
+    assert cells[0]["color"] == "#FF51FF"
+    assert cells[6]["color"] == "#B00A90"
     blank = pixel_cells(blank_windows=True)
-    assert sum(1 for c in blank if c["lit"]) == sum(PIXEL_FLAGS)
+    assert sum(1 for c in blank if c["lit"]) == sum(PIXEL_FLAGS) - len(WINDOW_INDICES)
     assert all(not c["lit"] for c in blank if c["window"])
+
+
+def test_cli_mark_matches_the_shipped_web_mark() -> None:
+    """The CLI, the favicon, and the web nav must draw one fortress.
+
+    The web copy drifted from banner.py once already (windows dropped, gate
+    narrowed) and nothing caught it, because no test compared the two. This
+    pins the bitmask that kb/static/favicon.svg and info.js render.
+    """
+    shipped = (
+        "1010101"
+        "1111111"
+        "1111111"
+        "1111111"
+        "1101011"
+        "1101011"
+        "1101011"
+    )
+    assert "".join(str(flag) for flag in PIXEL_FLAGS) == shipped
 
 
 def test_paint_passthrough_when_disabled() -> None:

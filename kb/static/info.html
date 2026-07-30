@@ -3,133 +3,97 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Citadel — State of the Vault</title>
+  <title>Citadel: State of the Vault</title>
   <meta name="description" content="Citadel: shared, governed memory for your team and its AI agents. Current state, shipped releases, and roadmap.">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/info.css">
   <script src="/static/info.js" defer></script>
+  <script src="/static/landing.js" defer></script>
 </head>
 <body>
-  <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
-  <div class="wrap">
-    <header>
-      <div class="brandrow">
-        <div class="mark" id="mark" aria-hidden="true"></div>
-        <div>
-          <div class="wordmark">Citadel</div>
-          <div class="subword">the organization vault</div>
+  <div class="band band-hero">
+    <div class="hero-glow" aria-hidden="true"></div>
+    <nav class="topnav" aria-label="Main">
+      <div class="topnav-in">
+        <a class="topnav-brand" href="/">
+          <span class="mark" id="mark" aria-hidden="true"></span>
+          <span class="wordmark">Citadel</span>
+        </a>
+        <div class="topnav-links">
+          <a href="/">Home</a>
+          <a href="/info" aria-current="page">Status</a>
+          <a href="/use-cases">Use cases</a>
+          <a href="/contact">Contact</a>
+          <a href="/login">Sign in</a>
         </div>
+        <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
       </div>
-      <p class="eyebrow">State of the vault · internal report</p>
-      <h1>Shared, governed memory for the team <span class="grad">and its AI agents</span>.</h1>
-      <div class="meta">
-        <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.4.0</span></span>
-        <span class="pill">Railway + PyPI</span>
-        <span class="pill">Window: v0.2.0 → v0.4.0</span>
-      </div>
+    </nav>
+    <div class="band-in">
+      <header class="hero hero-wide">
+        <p class="eyebrow">State of the vault · internal report</p>
+        <h1>Shared, governed memory for the team <span class="grad">and its AI agents</span>.</h1>
+        <div class="meta">
+          <span class="pill">Railway + PyPI</span>
+          <span class="pill">Window: v0.2.0 → v0.4.0</span>
+        </div>
 
-      <div class="tldr">
-        <p class="lbl">TL;DR — read this, skim the rest</p>
-        <p>Citadel is a working <b>organization vault</b>: your commits, coding sessions, docs, and Linear issues flow in automatically, and you search your private <b>Node</b> plus org <b>Central</b> from the CLI or any MCP agent. Everything is personal-by-default and read-isolated — no one reads another seat's Node.</p>
-        <p>Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear sync, read-side isolation, and <b>Shared Session Traces</b> (share a dead end, reference-only, without leaking private memory). Next: a <b>GitHub App</b> for PR context + checks, a <b>Google Chat digest bot</b>, and one <b>central agent hub</b> over all org knowledge. Every section below expands — open the ones you care about.</p>
-      </div>
+        <div class="tldr">
+          <p class="lbl">TL;DR: read this, skim the rest</p>
+          <p>This is the running node reporting on itself: what is deployed right now, what shipped across v0.2.0 → v0.4.0, and what is being built next. If you are new to Citadel, the <a href="/">home page</a> covers what it is and how to start; this page is the numbers.</p>
+          <p>Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear sync, read-side isolation, and <b>Shared Session Traces</b> (share a dead end, reference-only, without leaking private memory). Next: a <b>GitHub App</b> for PR context + checks, a <b>Google Chat digest bot</b>, and one <b>central agent hub</b> over all org knowledge. Every section below expands. Open the ones you care about.</p>
+        </div>
+      </header>
+    </div>
+  </div>
 
-      <nav class="toc" aria-label="Jump to section">
-        <a href="#state">01 · Current state</a>
-        <a href="#works">02 · How it works</a>
-        <a href="#live">03 · What's live</a>
-        <a href="#releases">04 · Releases</a>
-        <a href="#next">05 · What's next</a>
-        <a href="#opensource">06 · Open source</a>
-        <a href="#start">07 · Get started</a>
-      </nav>
-    </header>
+  <nav class="index" aria-label="Sections">
+    <div class="index-in">
+      <a href="#state">Current state</a>
+      <a href="#live">What's live</a>
+      <a href="#releases">Releases</a>
+      <a href="#next">What's next</a>
+      <a href="#opensource">Open source</a>
+      <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.4.0</span></span>
+    </div>
+  </nav>
 
-    <section id="state">
-      <div class="sechead"><span class="kicker">01 — Current state</span><h2>Where things stand today</h2></div>
+  <section class="band band-white" id="state">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">01 · Current state</span><h2>Where things stand today</h2></div>
       <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are repo facts as of the last report.</p>
       <div class="metrics">
         <div class="metric tealn"><div class="n" id="m-version">v0.4.0</div><div class="k">deployed &amp; healthy on Railway</div></div>
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
         <div class="metric accent"><div class="n">10</div><div class="k">releases shipped (v0.1.0 → v0.4.0)</div></div>
-        <div class="metric"><div class="n">377</div><div class="k">commits · 166 since v0.2.0</div></div>
-        <div class="metric"><div class="n">807</div><div class="k">tests across 52 files · CI on every push</div></div>
-        <div class="metric"><div class="n">25</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n">10</div><div class="k">architecture decision records</div></div>
+        <div class="metric"><div class="n" id="m-commits">340</div><div class="k" id="m-commits-sub">commits on main · last 52 weeks</div></div>
+        <div class="metric"><div class="n">906</div><div class="k">tests across 52 files · CI on every push</div></div>
+        <div class="metric"><div class="n" id="m-tools">22</div><div class="k">MCP tools for agents</div></div>
+        <div class="metric"><div class="n" id="m-adrs">13</div><div class="k">architecture decision records</div></div>
         <div class="metric"><div class="n">~25k</div><div class="k">LOC · 53 modules · zero-dep client</div></div>
       </div>
-      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. Repo facts (commits, tests, LOC) are as of the last report — v0.4.0, 2026-07-22.</span></p>
-    </section>
+      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. Commits, decision records and MCP tools refresh daily. Tests, releases and LOC are as of v0.4.0, 2026-07-22.</span></p>
+    </div>
+  </section>
 
-    <section id="works">
-      <div class="sechead"><span class="kicker">02 — The model</span><h2>How Citadel works</h2></div>
-      <p class="lede">Three ideas carry the whole system: a private space per person, a shared org space, and strict rules for what moves between them. Read the summary, or expand for the mechanics.</p>
-      <div class="arch">
-        <div class="lanehead p">Personal</div>
-        <div class="lanehead o">Organization</div>
-        <div class="srccol p">
-          <span class="node-chip">git pre-push</span>
-          <span class="node-chip">SessionEnd hook</span>
-          <span class="node-chip">citadel capture</span>
-          <span class="flowcap">↓ capture, fail-silent</span>
-        </div>
-        <div class="srccol o">
-          <span class="node-chip">GitHub org</span>
-          <span class="node-chip">Linear workspace</span>
-          <span class="node-chip">Repo content</span>
-          <span class="flowcap">↓ evolve, hourly</span>
-        </div>
-        <div class="store node"><b>Your Node</b><span>seat:slug · private</span></div>
-        <div class="bridge"><span class="arw">▸▸</span>Promotion<br>secret-scan · approve</div>
-        <div class="store central"><b>Central</b><span>masumi-network · org</span></div>
-        <div class="access">You &amp; agents read via <b>MCP · CLI · Web</b> — caller-scoped: your Node + Central, never another seat's.</div>
-      </div>
-      <div class="pillars">
-        <div class="card"><h3><span class="dot"></span>Seat · Node · Central</h3><p>Each teammate has a private <b>Node</b> (<code>seat:slug</code>) for working memory. The org shares <b>Central</b> (<code>masumi-network</code>). You read your Node + Central, never another seat's.</p><span class="tag">read-isolation · ADR-0009</span></div>
-        <div class="card"><h3><span class="dot"></span>Tiered ingestion</h3><p>Private Node memory is indexed lightly and fast. Org-bound content goes through the full Learning Process — security review, enrichment, structuring — before it lands in Central.</p><span class="tag">light Node · full Central</span></div>
-        <div class="card"><h3><span class="dot"></span>Governed promotion</h3><p>Seat writes stay on your Node by default. Reaching Central takes org sync, a tagged contribution, or the Promotion Agent — secret-scanned and approved, never a silent mirror of every note.</p><span class="tag">secret-scan · gated · approved</span></div>
-        <div class="card"><h3><span class="dot"></span>Two front doors</h3><p>Agents use a hosted <b>MCP</b> endpoint (URL + token, 25 tools). Humans use a zero-dependency <b>CLI</b> where every command speaks <code>--json</code>, plus a web UI with the live Knowledge Mesh.</p><span class="tag">MCP + CLI + web</span></div>
-      </div>
-      <details>
-        <summary><span class="chev">▸</span> The access &amp; data model in one pass <span class="go">Go deeper</span></summary>
-        <div class="dbody">
-          <p>Citadel is a FastAPI service over a cognee-backed retrieval layer, but the moat is the governance around it — the part cognee will never have.</p>
-          <h4>Read scope</h4>
-          <ul>
-            <li>A caller sees their own <b>Node</b>, <b>Central</b>, and non-seat datasets — resolved by a four-pass cross-dataset visibility algorithm.</li>
-            <li><b>Seat presence is universal</b> (every seat is a hub with a slug + counts), but content is caller-scoped. Foreign-seat drill-down returns <b>404, not 403</b> — no existence oracle.</li>
-            <li>Admin/env tokens bypass for operations; every call is audited.</li>
-          </ul>
-          <h4>Write scope</h4>
-          <ul>
-            <li>All seat-scoped writes land on the owning Node. Untagged writes to Central are rejected (403).</li>
-            <li>Every write path — HTTP, MCP, hooks, feedback — runs the seat write-policy guard and a secret scan.</li>
-          </ul>
-          <h4>Promotion to Central</h4>
-          <ul>
-            <li>The <b>Promotion Agent</b> cross-references GitHub org repos + Central, auto-promotes known work after secret-scan + LLM review, and queues new-project candidates for human approval (dashboard / MCP / <code>citadel promotion</code>).</li>
-          </ul>
-        </div>
-      </details>
-    </section>
-
-    <section id="live">
-      <div class="sechead"><span class="kicker">03 — Shipped &amp; live</span><h2>What you can use right now</h2></div>
+  <section class="band band-grey" id="live">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">02 · Shipped &amp; live</span><h2>What you can use right now</h2></div>
       <p class="lede">The capabilities that are in production today. The three you'll touch most are session sharing, autonomous capture, and Linear sync.</p>
       <div class="pillars">
         <div class="card"><h3><span class="dot"></span>Shared Session Context</h3><p>SessionEnd distills how you approached a problem into a private Session Trace. Hit a dead end worth flagging? <code>citadel_share_session</code> shares a redacted, compacted version to a shared dataset.</p><span class="tag">reference-only · never promotes</span></div>
-        <div class="card"><h3><span class="dot"></span>Autonomous ingestion</h3><p>A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node — fail-silent. An hourly evolve cycle folds GitHub, Linear, and repo content into the graph.</p><span class="tag">hooks + hourly evolve</span></div>
-        <div class="card"><h3><span class="dot"></span>Linear sync</h3><p>The full workspace syncs to Central; issues assigned to you mirror into your Node as a Seat-Scoped Mirror — so an agent answers "what do I need to do?" from your memory.</p><span class="tag">workspace → Central · yours → Node</span></div>
-        <div class="card"><h3><span class="dot"></span>Knowledge Mesh &amp; portal</h3><p>A web UI renders org knowledge as a concept map and a live sync/search/ingest timeline. Portal Phase 1: paste your token, land on <b>My Node</b> — stats, checklist, deep links.</p><span class="tag">Pixel Bastion brand · caller-scoped</span></div>
+        <div class="card"><h3><span class="dot"></span>Autonomous ingestion</h3><p>A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both are fail-silent. An hourly evolve cycle folds GitHub, Linear, and repo content into the graph.</p><span class="tag">hooks + hourly evolve</span></div>
+        <div class="card"><h3><span class="dot"></span>Linear sync</h3><p>The full workspace syncs to Central; issues assigned to you mirror into your Node as a Seat-Scoped Mirror, so an agent answers "what do I need to do?" from your memory.</p><span class="tag">workspace → Central · yours → Node</span></div>
+        <div class="card"><h3><span class="dot"></span>Knowledge Mesh &amp; portal</h3><p>A web UI renders org knowledge as a concept map and a live sync/search/ingest timeline. Portal Phase 1: paste your token, land on <b>My Node</b> (stats, checklist, deep links).</p><span class="tag">Pixel Bastion brand · caller-scoped</span></div>
       </div>
       <details>
         <summary><span class="chev">▸</span> How Shared Session Traces actually work <span class="go">Go deeper</span></summary>
         <div class="dbody">
-          <p>Shipped in v0.4.0 (ADR-0011). The goal: let the team learn from each other's dead ends without exposing anyone's raw private working memory.</p>
+          <p>Shipped in v0.4.0. The goal: let the team learn from each other's dead ends without exposing anyone's raw private working memory.</p>
           <ul>
-            <li><b>Explicit only.</b> SessionEnd always writes a private Node trace (light tier). Sharing is a deliberate call — <code>citadel_share_session</code> or <code>POST /api/share-session</code> — and requires an <b>Approved Capture Root</b> (server-side <code>cwd</code> check).</li>
+            <li><b>Explicit only.</b> SessionEnd always writes a private Node trace (light tier). Sharing is a deliberate call (<code>citadel_share_session</code> or <code>POST /api/share-session</code>) and requires an <b>Approved Capture Root</b> (server-side <code>cwd</code> check).</li>
             <li><b>Compact Session Context.</b> The client distills + redacts the trace; the server runs an LLM dead-end refinement only when real tool-error pairs exist, then <b>dual-writes</b> to your Node and the shared <code>session-traces</code> dataset.</li>
-            <li><b>Deferred cognify</b> (~5–15 min, coalesced) — sharing doesn't block the tool call, and your private Node memory is never enriched.</li>
+            <li><b>Deferred cognify</b> (~5–15 min, coalesced): sharing doesn't block the tool call, and your private Node memory is never enriched.</li>
             <li><b>Trust demotion.</b> Default <code>citadel_search</code> includes traces with a <code>reference-only</code> tag. Traces never promote to Central and never feed the daily improve loop.</li>
           </ul>
         </div>
@@ -140,35 +104,40 @@
           <p>Zero per-session ceremony. Three capture paths feed your Node; one scheduled cycle keeps Central fresh.</p>
           <h4>Capture (→ your Node)</h4>
           <ul>
-            <li><b>git pre-push hook</b> — a commit-metadata snapshot on every push from an Approved Capture Root.</li>
-            <li><b>SessionEnd hook</b> — distills a coding session and posts it to your seat. Reuses the one token you already set. HTTPS-only, refuses redirects, fail-silent.</li>
-            <li><b><code>citadel capture</code></b> — summarizes each approved root (git metadata + README, never raw files).</li>
+            <li><b>git pre-push hook</b>: a commit-metadata snapshot on every push from an Approved Capture Root.</li>
+            <li><b>SessionEnd hook</b>: distills a coding session and posts it to your seat. Reuses the one token you already set. HTTPS-only, refuses redirects, fail-silent.</li>
+            <li><b><code>citadel capture</code></b>: summarizes each approved root (git metadata + README, never raw files).</li>
           </ul>
           <h4>Evolve (→ Central, hourly)</h4>
           <ul>
-            <li>GitHub org digest + repo content sync + Linear sync run as staged subprocesses, then cognify runs in-loop on the web service — the single Kuzu writer. Cadence went 6h → 1h in v0.2.1.</li>
+            <li>GitHub org digest + repo content sync + Linear sync run as staged subprocesses, then cognify runs in-loop on the web service, the single Kuzu writer. Cadence went 6h → 1h in v0.2.1.</li>
           </ul>
         </div>
       </details>
-    </section>
+    </div>
+  </section>
 
-    <section id="releases">
-      <div class="sechead"><span class="kicker">04 — Release history</span><h2>v0.2.0 → v0.4.0</h2></div>
+  <section class="band band-white" id="releases">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">03 · Release history</span><h2>v0.2.0 → v0.4.0</h2></div>
       <p class="lede">Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.</p>
       <div class="chartwrap">
         <div class="charthead"><span class="t">Commits per week</span><span class="note">brand-color bars = a release shipped that week</span></div>
-        <div class="chart" id="chart" role="img" aria-label="Commits per week from mid-May to late July 2026, peaking at 91 in the week of June 22."></div>
+        <!-- Bars are drawn by info.js: live weekly counts from /api/state when
+             the daily GitHub refresh has landed, the baked series otherwise.
+             The aria-label is rewritten to match whichever was used. -->
+        <div class="chart" id="chart" role="img" aria-label="Commits per week."></div>
       </div>
       <div class="rail">
         <div class="rel tip">
           <details open>
             <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.4.0</span><span class="date">2026-07-22 · latest</span><span class="reltitle">Shared team memory, the seat portal, and a real brand.</span></span></summary>
             <div class="dbody"><ul>
-              <li><b>Shared Session Traces v1</b> — explicit in-session share via MCP + <code>/api/share-session</code>; Compact Session Context, reference-only in search, deferred cognify. (ADR-0011)</li>
-              <li><b>Multi-agent policy on onboard</b> — the same agent policy installed to AGENTS.md, Cursor, Windsurf, GEMINI.md, and Claude Code.</li>
-              <li><b>Seat portal Phase 1</b> — members log in and land on "My Node" with doc counts, activity, and a checklist.</li>
-              <li><b>Pixel Bastion brand + analytics panels</b> — CLI mark, README banner, favicon, dashboard chrome; CSP-safe charts.</li>
-              <li><b>Security</b> — Obsidian vaults enforce ownership; <code>/api/knowledge/events</code> and <code>/feedback</code> are now caller-scoped; pip-audit CI gate.</li>
+              <li><b>Shared Session Traces v1</b>: explicit in-session share via MCP + <code>/api/share-session</code>; Compact Session Context, reference-only in search, deferred cognify.</li>
+              <li><b>Multi-agent policy on onboard</b>: the same agent policy installed to AGENTS.md, Cursor, Windsurf, GEMINI.md, and Claude Code.</li>
+              <li><b>Seat portal Phase 1</b>: members log in and land on "My Node" with doc counts, activity, and a checklist.</li>
+              <li><b>Pixel Bastion brand + analytics panels</b>: CLI mark, README banner, favicon, dashboard chrome; CSP-safe charts.</li>
+              <li><b>Security</b>: Obsidian vaults enforce ownership; <code>/api/knowledge/events</code> and <code>/feedback</code> are now caller-scoped; pip-audit CI gate.</li>
             </ul></div>
           </details>
         </div>
@@ -176,10 +145,10 @@
           <details>
             <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.3.0</span><span class="date">2026-07-16</span><span class="reltitle">Read-side privacy release + graph legibility.</span></span></summary>
             <div class="dbody"><ul>
-              <li><b>Mesh read isolation (ADR-0009)</b> — graph, activity, and document drill-down are caller-scoped; seat presence stays universal.</li>
-              <li><b>Knowledge Mesh reads as a concept map</b> — per-hub aggregation, human labels, drill-down, kind-filter legend.</li>
-              <li><b><code>citadel activity</code></b> — dev-side view of your vault; <code>--watch</code> and a <code>--global</code> seat-presence board.</li>
-              <li><b>Agent-onboarding hardening</b> — seat-bound token mandate, headless SKILL runbook, <code>--json</code> error parity.</li>
+              <li><b>Mesh read isolation</b>: graph, activity, and document drill-down are caller-scoped; seat presence stays universal.</li>
+              <li><b>Knowledge Mesh reads as a concept map</b>: per-hub aggregation, human labels, drill-down, kind-filter legend.</li>
+              <li><b><code>citadel activity</code></b>: dev-side view of your vault; <code>--watch</code> and a <code>--global</code> seat-presence board.</li>
+              <li><b>Agent-onboarding hardening</b>: seat-bound token mandate, headless SKILL runbook, <code>--json</code> error parity.</li>
             </ul></div>
           </details>
         </div>
@@ -187,8 +156,8 @@
           <details>
             <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.2.2 – v0.2.3</span><span class="date">2026-07-02 · 07-07</span><span class="reltitle">Onboarding &amp; token friction, removed.</span></span></summary>
             <div class="dbody"><ul>
-              <li><b>Seat-bound token minting</b> — <code>token create --seat</code> inherits the seat's role and private dataset; interactive picker replaces the service-account footgun.</li>
-              <li><b><code>citadel token set</code> + <code>citadel update</code></b> — rotate a token or self-update without re-running onboard; stale-shell auth hints tell you the actual fix.</li>
+              <li><b>Seat-bound token minting</b>: <code>token create --seat</code> inherits the seat's role and private dataset; interactive picker replaces the service-account footgun.</li>
+              <li><b><code>citadel token set</code> + <code>citadel update</code></b>: rotate a token or self-update without re-running onboard; stale-shell auth hints tell you the actual fix.</li>
             </ul></div>
           </details>
         </div>
@@ -196,53 +165,56 @@
           <details>
             <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.2.0 – v0.2.1</span><span class="date">2026-06-29</span><span class="reltitle">Top-to-bottom CLI DX overhaul (PyPI + Railway).</span></span></summary>
             <div class="dbody"><ul>
-              <li><b>Seat-scoped ingest that works</b> — <code>ingest</code>/<code>search</code> HTTP-backed by default and routed to your seat; inline cognify makes notes searchable immediately.</li>
-              <li><b>First-run onboarding + multi-tool MCP</b> — <code>citadel mcp add</code> wires Cursor, Codex, Gemini, Windsurf; guided first run; <code>citadel doctor</code> repairs setup drift.</li>
-              <li><b>Seat / token commands + faster status</b> — concurrent health checks; the old TUI folded into <code>citadel status</code>.</li>
-              <li><b>Evolve cadence 6h → 1h</b> — GitHub / Linear / repo sync + cognify now run hourly.</li>
+              <li><b>Seat-scoped ingest that works</b>: <code>ingest</code>/<code>search</code> HTTP-backed by default and routed to your seat; inline cognify makes notes searchable immediately.</li>
+              <li><b>First-run onboarding + multi-tool MCP</b>: <code>citadel mcp add</code> wires Cursor, Codex, Gemini, Windsurf; guided first run; <code>citadel doctor</code> repairs setup drift.</li>
+              <li><b>Seat / token commands + faster status</b>: concurrent health checks; the old TUI folded into <code>citadel status</code>.</li>
+              <li><b>Evolve cadence 6h → 1h</b>: GitHub / Linear / repo sync + cognify now run hourly.</li>
             </ul></div>
           </details>
         </div>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <section id="next">
-      <div class="sechead"><span class="kicker">05 — The road ahead</span><h2>What's next</h2></div>
+  <section class="band band-grey" id="next">
+    <div class="band-in">
+      <div class="sechead"><span class="kicker">04 · The road ahead</span><h2>What's next</h2></div>
       <p class="lede">Honest status: some of this is in active design, some is still a sketch we're pressure-testing. Nothing here is claimed as shipped.</p>
       <div class="status-legend">
         <span class="chip prog">In design</span>
         <span class="chip plan">Brainstorming</span>
       </div>
       <div class="next">
-        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>GitHub App — PR context injection + verifying checks</h3><p>A GitHub App that injects relevant vault context into pull requests and runs <span class="k">verifying checks</span> as a PR status — kept <span class="k">in sync with Linear</span> and other connected apps, so a review sees the same knowledge an agent would. Direction sketched via the modular update-agent architecture; not built yet.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>One central agent hub</h3><p>A single point of access to <span class="k">all org knowledge and context</span> — an internal update agent plus hosted MCP consolidating GitHub, Citadel search, Linear, and future approved sources behind one contract. Repository boundary and initial contract are drafted.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Google Chat digest bot</h3><p>A daily <span class="k">Organization Update Digest</span> to one Google Chat space — what changed, what's open, what merged, plus a cautious source-linked "Agent read." Outbound-only in Phase 1; app-auth and schedule locked in ADR-0002. Silent on quiet days.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Structured Knowledge — own the representation</h3><p>Make durable, first-class <span class="k">Structured Knowledge</span> the source of truth Citadel owns, with cognee demoted to a rebuildable index. Plus a retrieval eval harness (<code>citadel bench</code>) and vault lint (<code>citadel lint</code>). This is how we stop being "just a cognee wrapper." (ADR-0010)</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>Session Traces v1.1 + more surfaces</h3><p>Retraction controls (<code>citadel unshare</code>, ~90-day TTL, admin hard-delete), overlap-ranked <span class="k">prior-work retrieval</span>, and more delivery gateways — Agent Messenger, Slack, email, webhook — off the same update-agent contract.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>GitHub App: PR context injection + verifying checks</h3><p>A GitHub App that injects relevant vault context into pull requests and runs <span class="k">verifying checks</span> as a PR status, kept <span class="k">in sync with Linear</span> and other connected apps, so a review sees the same knowledge an agent would. Direction sketched via the modular update-agent architecture; not built yet.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>One central agent hub</h3><p>A single point of access to <span class="k">all org knowledge and context</span>: an internal update agent plus hosted MCP consolidating GitHub, Citadel search, Linear, and future approved sources behind one contract. Repository boundary and initial contract are drafted.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Google Chat digest bot</h3><p>A daily <span class="k">Organization Update Digest</span> to one Google Chat space: what changed, what's open, what merged, plus a cautious source-linked "Agent read." Outbound-only in Phase 1; app-auth and schedule are settled. Silent on quiet days.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Structured Knowledge: own the representation</h3><p>Make durable, first-class <span class="k">Structured Knowledge</span> the source of truth Citadel owns, with the retrieval layer demoted to a rebuildable index. Plus a retrieval eval harness (<code>citadel bench</code>) and vault lint (<code>citadel lint</code>). This is how the vault stops depending on any one engine to hold the truth.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>Session Traces v1.1 + more surfaces</h3><p>Retraction controls (<code>citadel unshare</code>, ~90-day TTL, admin hard-delete), overlap-ranked <span class="k">prior-work retrieval</span>, and more delivery gateways (Agent Messenger, Slack, email, webhook) off the same update-agent contract.</p></div></div>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <section id="opensource">
-      <div class="sechead"><span class="kicker">06 — Open source</span><h2>Citadel is open to contributions</h2></div>
-      <p class="lede">The application is <b>Apache-2.0</b> and public. The vault it serves is not — and that separation is the point. You can read every line, run the full test suite offline, and send a pull request without ever touching org memory.</p>
-      <div class="pillars">
-        <div class="card"><h3><span class="dot"></span>Apache-2.0</h3><p>Licensed under Apache-2.0, including the patent grant. Contributions come in under the same terms via <b>DCO sign-off</b> (<code>git commit -s</code>) — there is no CLA to sign.</p><span class="tag">inbound = outbound · no CLA</span></div>
-        <div class="card"><h3><span class="dot"></span>Public app, private vault</h3><p>Contributors work on the application only. No <code>ctdl_</code> token is issued and none is needed: the suite runs with no token, no network and no database, so every change is reviewable without vault access.</p><span class="tag">shielded by design</span></div>
-        <div class="card"><h3><span class="dot"></span>Checked on every PR</h3><p>Tests on Python 3.11 and 3.12, ruff, a dependency audit, CodeQL, licence review, DCO, and a gitleaks secret scan carrying a rule for <code>ctdl_</code> tokens. One <code>CI gate</code> check guards <code>main</code>.</p><span class="tag">automated · fail-closed</span></div>
-        <div class="card"><h3><span class="dot"></span>Tracked in the open</h3><p>Work is labelled by <code>type</code>, <code>area</code>, <code>priority</code> and <code>status</code>. New issues land in <code>status/needs-triage</code>; newcomers start at <code>good first issue</code>. Vulnerabilities go to a private advisory, never a public issue.</p><span class="tag">triaged · never silent</span></div>
-      </div>
-      <p class="verified"><span class="vdot"></span>Start with <a href="https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — setup, the label taxonomy, commit conventions, and exactly what you can and cannot run locally.</p>
-    </section>
+  <section class="band band-white" id="opensource">
+    <div class="band-in">
+        <div class="sechead"><span class="kicker">05 · Open source</span><h2>Citadel is open to contributions</h2></div>
+        <p class="lede">The application is <b>Apache-2.0</b> and public. The vault it serves is not — and that separation is the point. You can read every line, run the full test suite offline, and send a pull request without ever touching org memory.</p>
+        <div class="pillars">
+          <div class="card"><h3><span class="dot"></span>Apache-2.0</h3><p>Licensed under Apache-2.0, including the patent grant. Contributions come in under the same terms via <b>DCO sign-off</b> (<code>git commit -s</code>) — there is no CLA to sign.</p><span class="tag">inbound = outbound · no CLA</span></div>
+          <div class="card"><h3><span class="dot"></span>Public app, private vault</h3><p>Contributors work on the application only. No <code>ctdl_</code> token is issued and none is needed: the suite runs with no token, no network and no database, so every change is reviewable without vault access.</p><span class="tag">shielded by design</span></div>
+          <div class="card"><h3><span class="dot"></span>Checked on every PR</h3><p>Tests on Python 3.11 and 3.12, ruff, a dependency audit, CodeQL, licence review, DCO, and a gitleaks secret scan carrying a rule for <code>ctdl_</code> tokens. One <code>CI gate</code> check guards <code>main</code>.</p><span class="tag">automated · fail-closed</span></div>
+          <div class="card"><h3><span class="dot"></span>Tracked in the open</h3><p>Work is labelled by <code>type</code>, <code>area</code>, <code>priority</code> and <code>status</code>. New issues land in <code>status/needs-triage</code>; newcomers start at <code>good first issue</code>. Vulnerabilities go to a private advisory, never a public issue.</p><span class="tag">triaged · never silent</span></div>
+        </div>
+        <p class="verified"><span class="vdot"></span>Start with <a href="https://github.com/masumi-network/Citadel/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — setup, the label taxonomy, commit conventions, and exactly what you can and cannot run locally.</p>
+    
+    </div>
+  </section>
 
-    <section id="start">
-      <div class="sechead"><span class="kicker">07 — Join in</span><h2>Get started in one command</h2></div>
-      <p class="lede">Onboarding wires your seat token, autosync hooks, MCP, and agent policy in a single pass. Ask an admin for a <b>seat-bound</b> token first — a seat-less one authenticates but can't search.</p>
-      <div class="cmd"><span class="p">$ </span>pip install citadel-archive &amp;&amp; citadel onboard</div>
-      <footer>
-        <p>Verify anytime with <code>citadel status</code>. Live node: <code>citadel-archive-production.up.railway.app</code></p>
-        <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.4.0.</p>
-      </footer>
-    </section>
-  </div>
+  <footer class="band band-white">
+    <div class="band-in">
+      <p>Verify any of this yourself with <code>citadel status</code>, or read the source at <a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a>. Live node: <code>citadel-archive-production.up.railway.app</code></p>
+      <p>New here? <a href="/">Start on the home page</a>. Building an EU-funded project? <a href="/use-cases">See the use cases and how we partner</a>.</p>
+      <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.4.0.</p>
+    </div>
+  </footer>
 </body>
 </html>

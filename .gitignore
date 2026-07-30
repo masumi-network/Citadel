@@ -64,3 +64,13 @@ backup.tar.gz
 !.cursor/rules/
 .windsurf/*
 !.windsurf/rules/
+
+# superpowers brainstorm mockups (local only)
+.superpowers/
+
+# Next.js build scratch. The *export* is committed, at kb/webui/, because a
+# self-hoster installs a wheel and never runs Node; these two are the working
+# directories that produce it.
+web/.next/
+web/out/
+*.tsbuildinfo

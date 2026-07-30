@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -48,7 +49,9 @@ from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidat
 from kb.tags import normalize_tags
 from kb.cognee_client import assert_cognee_dataset_api
 from kb.config import CitadelConfig
+from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
+from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
@@ -65,7 +68,12 @@ from kb.mesh import MeshState
 from kb.models import FeedbackRequest
 from kb.obsidian_sync import ObsidianSyncStore, SyncPushDocument, normalize_path
 from kb.promotion import PromotionEngine
-from kb.promotion_queue import APPROVED_STATUS, PENDING_STATUS, REJECTED_STATUS
+from kb.promotion_queue import (
+    APPROVED_STATUS,
+    PENDING_STATUS,
+    REJECTED_STATUS,
+    scan_candidate,
+)
 from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
@@ -81,7 +89,12 @@ from kb.search_format import (
     is_spec_mode_query,
     token_asset_authority_warning,
 )
-from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
+from kb.security_scan import (
+    SecretContentError,
+    SecurityScanEntry,
+    redact_secrets,
+    scan_text_entries,
+)
 from kb.self_improve import SelfImprovement
 from kb.service import Citadel
 from kb.skills import skill_catalog, skill_integrity, skill_path
@@ -98,6 +111,26 @@ MCP_ENDPOINT_PATH = "/mcp/"
 # Strong refs to detached fire-and-forget tasks (e.g. the webhook re-ingest) so
 # the event loop does not garbage-collect them mid-flight.
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _forget_background_task(task: "asyncio.Task[Any]") -> None:
+    """Drop a finished task, and say so out loud if it died.
+
+    A bare ``set.discard`` done-callback loses the exception: a scheduler that
+    raises on its first line just stops existing, and the only trace is
+    asyncio's "Task exception was never retrieved" whenever the object happens
+    to be collected. That is the same silent-failure shape as #89, and it got
+    more likely once the evolve scheduler started importing and running the
+    stage code itself rather than shelling out (#88).
+    """
+    _BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task %s died: %s", task.get_name(), exc, exc_info=exc
+        )
 
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
@@ -234,45 +267,47 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
     first pass waits one full interval so a redeploy never triggers a heavy cycle
     on boot.
     """
-    import sys
+    from kb.cognee_client import suppress_inline_cognify
+    from scripts.run_railway import run_evolve_in_loop
 
     while True:
         await asyncio.sleep(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
-        # Phase 1 — heavy stages in a subprocess that frees the Kuzu lock on exit.
-        # Hold the in-process writer lock across the subprocess so no web-loop
-        # cognify (an interactive ingest's, /api/cognify/run) writes Kuzu while the
-        # subprocess owns the on-disk lock — that cross-process overlap is the
-        # hourly "Lock is held by PID N" crash (#47). Phase 2 re-acquires it itself.
-        proc = None
+        # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
+        # across them so no interactive cognify (an ingest's, /api/cognify/run)
+        # writes Kuzu underneath the pass. Phase 2 re-acquires it itself.
         writer_lock = getattr(getattr(get_citadel(), "cognee", None), "writer_lock", None)
         acquired = False
         try:
             if writer_lock is not None:
                 await writer_lock.acquire()
                 acquired = True
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "scripts.run_railway",
-                env={
-                    **os.environ,
-                    "CITADEL_RUN_MODE": "evolve",
-                    "CITADEL_EVOLVE_COGNIFY_ENABLED": "false",
-                    # Add-only in Phase 1: the per-ingest background cognify is a
-                    # Kuzu write, so suppress it here and let the web cognify in
-                    # Phase 2 as the sole writer — no cross-process collision (#47).
-                    "CITADEL_SUPPRESS_INLINE_COGNIFY": "true",
-                },
-            )
-            code = await proc.wait()
-            logger.info("Evolve scheduler: stages finished (exit=%s)", code)
+            # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
+            # A second process can never open the graph: cognee holds an exclusive
+            # OS file lock on cognee_graph_kuzu for the lifetime of whichever
+            # process opens it, and that is always this one. github_sync and
+            # linear_sync died on "Could not set lock on file" every hour because
+            # of it. Add-only for the duration so the per-ingest background
+            # cognify does not storm the writer lock; Phase 2 below cognifies once
+            # as the sole writer (#47).
+            with suppress_inline_cognify():
+                code = await run_evolve_in_loop()
+            if code == 0:
+                logger.info("Evolve scheduler: stages finished (exit=0)")
+            else:
+                # A partial failure is the normal broken case, not an edge one:
+                # the stage names are already on the "Evolve finished: ...
+                # failed=..." line, so log at ERROR here to make the cycle
+                # visibly bad rather than an INFO nobody reads (#89).
+                logger.error(
+                    "Evolve scheduler: stages finished with failures (exit=%s) — "
+                    "see the 'Evolve finished' line above for which stages failed",
+                    code,
+                )
         except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
-                proc.terminate()
             raise
         except Exception:
-            logger.exception("Evolve scheduler: stages subprocess failed")
+            logger.exception("Evolve scheduler: stages failed")
         finally:
             if acquired:
                 writer_lock.release()
@@ -311,10 +346,10 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
     """Launch the 6h evolve cron when enabled.
 
     A separate Railway service cannot host this: the stages work against the Kuzu
-    graph + JSON access store on the local ``/data`` volume, and Railway volumes
-    attach to a single service. The scheduler runs the heavy stages as a
-    subprocess on the web container and then cognifies in-loop (see
-    :func:`_evolve_scheduler_loop` for why the split is required). Off by default
+    graph + JSON access store on the local ``/data`` volume, Railway volumes
+    attach to a single service, and a second process cannot open the graph at all
+    while this one holds cognee's exclusive Kuzu lock (#88). The scheduler runs
+    the stages in this loop and then cognifies, both here. Off by default
     (``CITADEL_EVOLVE_SCHEDULER_ENABLED``).
     """
     config = get_citadel().config
@@ -322,7 +357,57 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
         return None
     interval = max(60, config.evolve_interval_seconds)
     logger.info("Evolve scheduler enabled: interval=%ss", interval)
-    task = asyncio.create_task(_evolve_scheduler_loop(interval))
+    task = asyncio.create_task(_evolve_scheduler_loop(interval), name="evolve-scheduler")
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_forget_background_task)
+    return task
+
+
+async def _repo_stats_loop(interval_seconds: int) -> None:
+    """Keep the public pages' repo figures current, once a day.
+
+    Deliberately its own task rather than a stage inside
+    :func:`_evolve_scheduler_loop`, for two reasons. The evolve scheduler is off
+    by default and, on the deployed node, its cadence is an operator Railway
+    cron step rather than this loop, so a stage in there would leave the public
+    numbers frozen on exactly the deployment that shows them. And it shares
+    none of the evolve constraints: this is one outbound GET, no Kuzu writer
+    lock, no subprocess, so serialising it behind a heavy cycle buys nothing.
+
+    The first pass runs shortly after boot rather than a day later. The cache
+    lives on the mounted volume, so a redeploy already has yesterday's answer
+    to serve while this runs; the short delay only keeps startup clear.
+    """
+    from kb import repo_stats
+
+    await asyncio.sleep(30)
+    while True:
+        try:
+            # refresh() enforces the once-a-day floor itself, so an early wake
+            # or a restart loop cannot turn into repeated GitHub requests.
+            await asyncio.to_thread(repo_stats.refresh, get_citadel().config)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let a stats problem end the loop or surface to a request.
+            logger.exception("Repo stats refresh raised")
+        await asyncio.sleep(interval_seconds)
+
+
+def _start_repo_stats_scheduler() -> "asyncio.Task[Any] | None":
+    """Launch the daily repo-stats refresh when enabled."""
+    config = get_citadel().config
+    if not getattr(config, "repo_stats_enabled", False):
+        return None
+    # Wake more often than the refresh floor so a missed window is picked up
+    # within the hour instead of a day later. refresh() decides what actually
+    # goes out to GitHub.
+    interval = max(600, min(3600, int(config.repo_stats_interval_seconds)))
+    logger.info(
+        "Repo stats scheduler enabled: refresh floor=%ss",
+        config.repo_stats_interval_seconds,
+    )
+    task = asyncio.create_task(_repo_stats_loop(interval))
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task
@@ -340,6 +425,10 @@ async def _stop_evolve_scheduler(task: "asyncio.Task[Any] | None") -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
+    # Refuse to serve with a guessable env access key (M4). Deliberately at
+    # startup and not at kb.config import: the CLI imports that module too and
+    # must not die because the server's environment is misconfigured.
+    enforce_access_key_strength()
     async with mcp_server.session_manager.run():
         # Eagerly build the mesh and seed its in-memory activity counters from
         # persistent source state so a redeploy does not look like the graph reset.
@@ -373,10 +462,13 @@ async def lifespan(app: FastAPI) -> Any:
                 SESSION_TRACES_DATASET,
             )
         evolve_task = _start_evolve_scheduler()
+        repo_stats_task = _start_repo_stats_scheduler()
         try:
             yield
         finally:
             await _stop_evolve_scheduler(evolve_task)
+            # Same cancel-and-await shutdown; the helper is not evolve specific.
+            await _stop_evolve_scheduler(repo_stats_task)
 
 
 # Single-source the service version so /.well-known/citadel.json and the CLI
@@ -391,11 +483,38 @@ except PackageNotFoundError:
 app = FastAPI(
     title="Citadel Archive",
     version=_SERVICE_VERSION,
-    description="Self-hosted Organization Vault wrapper around Cognee.",
+    description="Self-hosted Organization Vault.",
     lifespan=lifespan,
 )
 STATIC_DIR = Path(__file__).with_name("static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# The Next.js static export (see docs/adr/0014-nextjs-frontend-static-export.md).
+# Its own directory rather than a corner of static/, which holds the fonts, the
+# favicon and the hand-written pages: one is generated and replaced wholesale on
+# every build, the other is source, and mixing them makes `rm -rf` dangerous.
+#
+# Built with `npm run build:web` and committed, because a self-hoster installs a
+# wheel and has no Node. A checkout that has never run the build simply has no
+# /next, which is why the mount is conditional rather than an import-time crash.
+WEBUI_DIR = Path(__file__).with_name("webui")
+WEBUI_ASSETS_DIR = WEBUI_DIR / "_next"
+if WEBUI_ASSETS_DIR.is_dir():
+    app.mount("/next/_next", StaticFiles(directory=WEBUI_ASSETS_DIR), name="webui")
+
+
+def webui_page(name: str, status_code: int = 200) -> FileResponse:
+    """Serve one exported page, or 404 if the frontend was never built.
+
+    `name` is always a literal from this module, never a path parameter, so it
+    cannot be steered out of the directory.
+    """
+    page = WEBUI_DIR / f"{name}.html"
+    if not page.is_file():
+        # A source checkout that has not run `npm run build:web`. Not an error
+        # worth a stack trace: the built site is simply not present.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(page, status_code=status_code)
 
 
 @app.api_route("/mcp", methods=["GET", "POST", "DELETE", "OPTIONS"], include_in_schema=False)
@@ -412,20 +531,54 @@ AUDIT_LIMIT_MAX = 500
 PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=300"}
 PRIVATE_CACHE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 PUBLIC_CACHE_PATHS = frozenset({"/.well-known/citadel.json", "/skills"})
-PUBLIC_CACHE_PREFIXES = ("/skills/", "/static/")
+PUBLIC_CACHE_PREFIXES = ("/skills/", "/static/", "/next/_next/")
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
-CONTENT_SECURITY_POLICY = (
-    "default-src 'self'; "
-    "script-src 'self'; "
-    "style-src 'self'; "
-    "img-src 'self' data:; "
-    "font-src 'self'; "
-    "connect-src 'self'; "
-    "base-uri 'self'; "
-    "form-action 'self'; "
-    "frame-ancestors 'none'; "
-    "object-src 'none'"
-)
+def _content_security_policy(style_src: str) -> str:
+    """Build the policy from one template so only `style-src` can ever differ."""
+    return (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        f"style-src {style_src}; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    )
+
+
+CONTENT_SECURITY_POLICY = _content_security_policy("'self'")
+
+# The landing page carries an interactive pipeline diagram built on React Flow,
+# which positions every node and the viewport by writing an inline `transform`
+# style attribute. That is not something the library can be configured out of,
+# so the one page that renders it gets 'unsafe-inline' for styles and nothing
+# else. Script execution stays restricted to same-origin files on every page.
+CONTENT_SECURITY_POLICY_INLINE_STYLE = _content_security_policy("'self' 'unsafe-inline'")
+
+# Exact paths, not prefixes, and this set is the only way to reach the relaxed
+# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
+# every API route, every static file) gets the strict policy above.
+# Exact paths, not prefixes, and this set is the only way to reach the relaxed
+# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
+# every API route, every static file) gets the strict policy above.
+#
+# Only / is here, because only / renders the React Flow pipeline diagram, which
+# positions its nodes with inline `transform` styles and cannot be configured
+# out of it. The page holds no token and no user data, which is why this is an
+# acceptable trade there and would not be on /app or /login.
+CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset({"/"})
+
+
+def content_security_policy_for(path: str) -> str:
+    """Strict by default. A path opts in; it can never be opted in by accident."""
+    if path in CSP_INLINE_STYLE_PATHS:
+        return CONTENT_SECURITY_POLICY_INLINE_STYLE
+    return CONTENT_SECURITY_POLICY
+
+
 SECURITY_HEADERS = {
     "Content-Security-Policy": CONTENT_SECURITY_POLICY,
     "X-Content-Type-Options": "nosniff",
@@ -441,56 +594,157 @@ LOGIN_HTML = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Citadel</title>
+    <title>Sign in to Citadel</title>
+    <meta name="description" content="Sign in to your Citadel seat." />
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=pixel-bastion-4" />
+    <link rel="stylesheet" href="/static/info.css">
   </head>
   <body>
-    <main class="login-shell">
-      <section class="login-panel">
-        <div class="login-brand">
-          <img
-            class="brand-pixel-img brand-pixel-img--hero"
-            src="/static/pixel-bastion.svg?v=pixel-bastion-4"
-            width="72"
-            height="72"
-            alt=""
-            aria-hidden="true"
-          />
-          <div class="login-brand-text">
-            <div class="sidebar-brand-text">
-              <div class="brand-wordmark">CITADEL</div>
-              <div class="brand-chip">ARCHIVE</div>
-            </div>
-            <p class="login-tagline">the organization vault</p>
-          </div>
+    <!-- The nav has to sit inside a .band-hero exactly as it does on every
+         other public page. Bare, it falls through to the base .topnav rules:
+         sticky, filled, bottom border, and 860px wide instead of 940px. The
+         result was the nav visibly changing shape when you clicked Sign in. -->
+    <div class="band band-hero">
+      <div class="hero-glow" aria-hidden="true"></div>
+    <nav class="topnav" aria-label="Main">
+      <div class="topnav-in">
+        <a class="topnav-brand" href="/">
+          <span class="mark" id="mark" aria-hidden="true"></span>
+          <span class="wordmark">Citadel</span>
+        </a>
+        <div class="topnav-links">
+          <a href="/">Home</a>
+          <a href="/info">Status</a>
+          <a href="/use-cases">Use cases</a>
+          <a href="/contact">Contact</a>
+          <a href="/login" aria-current="page">Sign in</a>
         </div>
-        <form id="loginForm" class="form">
-          <div class="field">
-            <label for="adminKey">Seat token</label>
-            <input
-              id="adminKey"
-              name="accessKey"
-              type="password"
-              autocomplete="current-password"
-              required
-              autofocus
-              placeholder="ctdl_…"
-            />
-          </div>
-          <p class="form-hint">
-            Paste the seat token from your admin (or
+        <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+      </div>
+    </nav>
+    <main class="auth">
+      <div class="auth-in">
+        <p class="eyebrow">Seat access</p>
+        <h1>Open your vault.</h1>
+        <p class="auth-lede">
+          Your Node stays private. Signing in opens your own seat. Central is
+          shared, and nobody reads another seat's notes.
+        </p>
+        <form id="loginForm" class="auth-form">
+          <label class="auth-label" for="adminKey">Seat token</label>
+          <input
+            id="adminKey"
+            class="auth-input"
+            name="accessKey"
+            type="password"
+            autocomplete="current-password"
+            required
+            autofocus
+            placeholder="ctdl_…"
+          />
+          <p class="auth-hint">
+            Paste the seat token from your admin (or run
             <code>citadel seat token</code>). Operators can still use the env admin key.
           </p>
-          <p id="loginError" class="form-error" role="alert"></p>
-          <button id="loginSubmit" class="primary-button" type="submit">Open workspace</button>
+          <p id="loginError" class="auth-error" role="alert"></p>
+          <button id="loginSubmit" class="auth-submit" type="submit">Open workspace</button>
         </form>
-      </section>
+        <p class="auth-alt">No token yet? <a href="/">Read what Citadel is</a>, or <a href="/contact">ask us for one</a>.</p>
+      </div>
     </main>
+    </div>
     <script src="/static/login.js" type="module"></script>
   </body>
 </html>
 """
+
+
+class ContactBody(BaseModel):
+    """An enquiry from the public /contact page.
+
+    Every field is length capped at the model boundary so an oversized body is
+    rejected before it reaches the scrubber or the Chat gateway.
+    """
+
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=200)
+    message: str = Field(min_length=1, max_length=4000)
+    organization: str = Field(default="", max_length=160)
+    # Honeypot. Hidden from humans, so a filled value means a bot.
+    website: str = Field(default="", max_length=200)
+
+
+# Partner contact: best-effort per-IP bucket plus a hard global ceiling. The
+# per-IP part is spoofable behind a proxy, so the global cap is what actually
+# bounds the damage. In-process only, which is enough for a single Railway
+# instance and fails toward refusing rather than accepting.
+CONTACT_PER_IP_LIMIT = 3
+CONTACT_PER_IP_WINDOW_SECONDS = 900
+CONTACT_GLOBAL_LIMIT = 30
+CONTACT_GLOBAL_WINDOW_SECONDS = 3600
+CONTACT_THREAD_KEY = "citadel-partner-contact"
+_contact_hits: dict[str, list[float]] = {}
+_contact_global_hits: list[float] = []
+_contact_lock = threading.Lock()
+
+
+def contact_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()[:64]
+    client = request.client
+    return client.host if client else "unknown"
+
+
+def contact_rate_limit_ok(client_ip: str) -> bool:
+    now = time.monotonic()
+    with _contact_lock:
+        recent_global = [t for t in _contact_global_hits if now - t < CONTACT_GLOBAL_WINDOW_SECONDS]
+        _contact_global_hits[:] = recent_global
+        if len(recent_global) >= CONTACT_GLOBAL_LIMIT:
+            return False
+        recent = [t for t in _contact_hits.get(client_ip, []) if now - t < CONTACT_PER_IP_WINDOW_SECONDS]
+        if len(recent) >= CONTACT_PER_IP_LIMIT:
+            _contact_hits[client_ip] = recent
+            return False
+        recent.append(now)
+        _contact_hits[client_ip] = recent
+        _contact_global_hits.append(now)
+        # Bound the bucket map so a spray of spoofed IPs cannot grow it forever.
+        if len(_contact_hits) > 2000:
+            for stale_ip, hits in list(_contact_hits.items()):
+                if not hits or now - hits[-1] >= CONTACT_PER_IP_WINDOW_SECONDS:
+                    _contact_hits.pop(stale_ip, None)
+        return True
+
+
+def scrub_contact_field(value: str) -> str:
+    """Make submitted text safe to paste into a Google Chat message.
+
+    Chat renders ``<url|label>`` as a link and ``*_~``` as formatting, so a
+    submitter could otherwise forge an official looking message in the org's
+    space. Angle brackets and formatting characters are dropped rather than
+    escaped, since this text is only ever read by a human.
+    """
+    cleaned = "".join(ch for ch in value if ch == "\n" or (ch.isprintable() and ch not in "<>*_~`"))
+    lines = [line.strip() for line in cleaned.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def contact_gateway() -> Any:
+    """The Chat gateway for partner enquiries, or None when unconfigured.
+
+    Enquiries go to their own thread, never into the organization digest
+    thread, so a partner message cannot be mistaken for generated content.
+    """
+    try:
+        gateway = GoogleChatDelivery.from_config(get_citadel().config)
+    except GoogleChatConfigError:
+        logger.warning("Partner contact gateway is misconfigured; the form will report 503")
+        return None
+    if gateway is not None:
+        gateway.thread_key = CONTACT_THREAD_KEY
+    return gateway
 
 
 class IngestBody(BaseModel):
@@ -791,6 +1045,14 @@ def get_access_store() -> AccessStore:
     return app.state.access_store
 
 
+def get_contact_store() -> ContactStore:
+    existing = getattr(app.state, "contact_store", None)
+    if isinstance(existing, ContactStore):
+        return existing
+    app.state.contact_store = ContactStore(get_citadel().config.contact_store_path)
+    return app.state.contact_store
+
+
 def get_obsidian_sync() -> ObsidianSyncStore:
     existing = getattr(app.state, "obsidian_sync", None)
     if isinstance(existing, ObsidianSyncStore):
@@ -839,6 +1101,60 @@ def configured_access_keys() -> list[tuple[str, str]]:
     entries.extend(("writer", key) for key in config.writer_keys)
     entries.extend(("reader", key) for key in config.reader_keys)
     return entries
+
+
+# An env access key is a bearer credential on every endpoint (see
+# bearer_identity below), and unlike a minted ctdl_ token it is whatever string
+# an operator typed. docs/operations.md used to suggest "owner-admin-key".
+# 32 chars is well under a token_urlsafe(32) and well over anything hand-written.
+WEAK_ACCESS_KEY_MIN_LENGTH = 32
+
+
+def weak_access_keys() -> list[tuple[str, int]]:
+    """(env var name, length) for every configured env key that is too short."""
+    config = get_citadel().config
+    candidates: list[tuple[str, str]] = []
+    if config.admin_key:
+        candidates.append(("CITADEL_ADMIN_KEY", config.admin_key))
+    candidates.extend(("CITADEL_WRITER_KEYS", key) for key in config.writer_keys)
+    candidates.extend(("CITADEL_READER_KEYS", key) for key in config.reader_keys)
+    return [
+        (name, len(key))
+        for name, key in candidates
+        if len(key) < WEAK_ACCESS_KEY_MIN_LENGTH
+    ]
+
+
+def allow_weak_access_keys() -> bool:
+    return os.getenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def enforce_access_key_strength() -> None:
+    """Refuse to serve with a brute-forceable env access key (M4).
+
+    A hard stop rather than a warning, on purpose. A warning is the shape of
+    signal that let the Kuzu lock run for weeks: present in the logs, read by
+    nobody. The escape hatch is explicit and greppable, so an operator who needs
+    a short key in development makes a deliberate, auditable choice.
+    """
+    if allow_weak_access_keys():
+        return
+    weak = weak_access_keys()
+    if not weak:
+        return
+    listed = ", ".join(f"{name} ({length} chars)" for name, length in weak)
+    raise SystemExit(
+        f"Refusing to start: access key too short — {listed}. "
+        f"Minimum is {WEAK_ACCESS_KEY_MIN_LENGTH} characters, because an env key "
+        "authenticates as a bearer token on every endpoint.\n"
+        '  Mint one:  python -c "import secrets; print(secrets.token_urlsafe(32))"\n'
+        "  Override:  CITADEL_ALLOW_WEAK_ACCESS_KEYS=true"
+    )
 
 
 def env_identity(role: str) -> AccessIdentity:
@@ -941,13 +1257,92 @@ def session_role(request: Request) -> str | None:
     return identity.role if identity else None
 
 
+# Failed-auth throttle (M4). Counted ONLY on failure, so a caller holding a
+# valid credential never touches it and cannot be locked out no matter how much
+# noise an attacker generates. Per-IP is spoofable behind the Railway proxy, so
+# as with the contact form the global ceiling is what actually bounds it.
+AUTH_FAIL_PER_IP_LIMIT = 10
+AUTH_FAIL_PER_IP_WINDOW_SECONDS = 300
+AUTH_FAIL_GLOBAL_LIMIT = 200
+AUTH_FAIL_GLOBAL_WINDOW_SECONDS = 3600
+_auth_fail_hits: dict[str, list[float]] = {}
+_auth_fail_global_hits: list[float] = []
+_auth_fail_lock = threading.Lock()
+
+
+def reset_auth_throttle() -> None:
+    """Clear the buckets. For tests, and for an operator digging out of a flood."""
+    with _auth_fail_lock:
+        _auth_fail_hits.clear()
+        _auth_fail_global_hits.clear()
+
+
+def record_auth_failure(client_ip: str) -> bool:
+    """Record one failed auth. False when the caller is now over a limit.
+
+    A blocked attempt is deliberately NOT counted. Our own clients retry 429
+    (kb/retry.py TRANSIENT_HTTP_STATUSES) but never 401, so counting the blocked
+    retries would let a client with a stale token extend its own ban forever and
+    hide a plain wrong-credential behind "rate limited" — which is exactly how
+    the GitHub-Sync key drift got misdiagnosed before.
+    """
+    now = time.monotonic()
+    try:
+        with _auth_fail_lock:
+            recent_global = [
+                hit
+                for hit in _auth_fail_global_hits
+                if now - hit < AUTH_FAIL_GLOBAL_WINDOW_SECONDS
+            ]
+            _auth_fail_global_hits[:] = recent_global
+            recent = [
+                hit
+                for hit in _auth_fail_hits.get(client_ip, [])
+                if now - hit < AUTH_FAIL_PER_IP_WINDOW_SECONDS
+            ]
+            if len(recent) >= AUTH_FAIL_PER_IP_LIMIT or len(recent_global) >= AUTH_FAIL_GLOBAL_LIMIT:
+                _auth_fail_hits[client_ip] = recent
+                return False
+            recent.append(now)
+            _auth_fail_hits[client_ip] = recent
+            _auth_fail_global_hits.append(now)
+            if len(_auth_fail_hits) > 2000:
+                for stale_ip, hits in list(_auth_fail_hits.items()):
+                    if not hits or now - hits[-1] >= AUTH_FAIL_PER_IP_WINDOW_SECONDS:
+                        _auth_fail_hits.pop(stale_ip, None)
+            return True
+    except Exception:
+        # Fail OPEN. This is an in-process dict, so it should not raise, but a
+        # throttle that breaks must not become an outage for the whole team.
+        logger.exception("Auth throttle failed; allowing the request")
+        return True
+
+
+def _reject_unauthenticated(request: Request) -> None:
+    """401, or 429 once this source has failed too many times."""
+    client_ip = contact_client_ip(request)
+    if not record_auth_failure(client_ip):
+        logger.warning(
+            "Throttled repeated auth failures from %s: %s %s",
+            client_ip,
+            request.method,
+            request.url.path,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication attempts. Try again later.",
+            headers={"Retry-After": str(AUTH_FAIL_PER_IP_WINDOW_SECONDS)},
+        )
+    logger.warning(
+        "Rejected unauthenticated request: %s %s", request.method, request.url.path
+    )
+    raise HTTPException(status_code=401, detail="Access key required.")
+
+
 def require_role(request: Request, minimum_role: str) -> AccessIdentity:
     identity = request_identity(request)
     if not identity:
-        logger.warning(
-            "Rejected unauthenticated request: %s %s", request.method, request.url.path
-        )
-        raise HTTPException(status_code=401, detail="Access key required.")
+        _reject_unauthenticated(request)
     if ROLE_ORDER[identity.role] < ROLE_ORDER[minimum_role]:
         logger.warning(
             "Denied %s %s for actor %s: role %s below required %s",
@@ -1112,8 +1507,35 @@ def promotion_pending_filter_seat(identity: AccessIdentity) -> str | None:
 
 
 def redact_pending_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Strip the candidate body, and make sure a secret-scan verdict is present.
+
+    Items queued before the scan existed carry ``secret_scan: None``. The Review
+    view states "secret scan passed" per candidate, so serving None would either
+    render as a claim nobody checked or force the UI to invent one. Scanning
+    here closes that: the candidate body is still on the item at this point,
+    just before it is dropped, so the verdict is real for every item rather than
+    only for newly queued ones.
+
+    Deliberately not persisted. This is a GET, and a read path that writes to
+    the access store to memoise a regex result buys little and costs a lock.
+    """
+    from datetime import datetime, timezone
+
     redacted = dict(item)
-    redacted.pop("candidate_text", None)
+    text = redacted.pop("candidate_text", None)
+    if not redacted.get("secret_scan") and text:
+        try:
+            scan = scan_candidate(
+                text,
+                block_severity=get_citadel().config.content_scan_block_severity,
+            )
+            scan["scanned_at"] = datetime.now(timezone.utc).isoformat()
+            scan["deferred"] = True  # scanned on read, not at enqueue
+            redacted["secret_scan"] = scan
+        except Exception:
+            # Never fail a queue listing over the scanner. None keeps reading as
+            # "not scanned", which the UI must not show as a pass.
+            logger.exception("Deferred secret scan failed for promotion item")
     return redacted
 
 
@@ -2207,6 +2629,12 @@ def public_mcp_tool_rows() -> list[dict[str, str]]:
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next: Any) -> Response:
     response = await call_next(request)
+    # Set first so it wins the setdefault below. content_security_policy_for()
+    # returns the strict policy for every path but the ones that opted in, so
+    # deleting this line would tighten the site, never loosen it.
+    response.headers.setdefault(
+        "Content-Security-Policy", content_security_policy_for(request.url.path)
+    )
     for header, value in SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
     if "cache-control" not in response.headers:
@@ -2249,8 +2677,89 @@ async def audit_forwarded_mcp_call(request: Request, call_next: Any) -> Response
 
 
 @app.get("/", include_in_schema=False)
+async def landing_page() -> FileResponse:
+    # The root is the landing page for everyone, signed in or not. The app
+    # lives at /app, so one URL means one body: a member can read the landing
+    # page and send the link on without being bounced into the dashboard.
+    return FileResponse(STATIC_DIR / "landing.html")
+
+
+@app.get("/next", include_in_schema=False)
+async def next_preview() -> Response:
+    # The Next.js rebuild of the public site, served alongside the hand-written
+    # pages rather than instead of them. /, /info, /use-cases, /contact and
+    # /login are untouched and stay the real site; these five routes are where
+    # the port is checked in a browser until it is good enough to take over.
+    #
+    # It sends the site's strict CSP, unchanged and by default: the export
+    # carries no inline <script> and no inline <style>. That is the whole reason
+    # the Pages Router was chosen over the App Router, whose RSC payload is
+    # emitted as executable inline script a static export cannot nonce. See
+    # web/next.config.ts.
+    return webui_page("index")
+
+
+# The rebuilt dashboard views and the minimum role each needs, mirroring the
+# `data-min-role` attributes the current dashboard carries in its markup.
+#
+# The difference is where the gate runs. The current dashboard ships every
+# page's markup to every seat and hides what the role cannot use, so a writer
+# does receive the Admin markup. A static export cannot vary its HTML by role at
+# all, so the gate has to be the route: a seat that cannot open a view is served
+# the locked page instead, and the view's markup never leaves the server.
+WEBUI_APP_VIEWS: dict[str, str] = {
+    "search": "reader",
+    "review": "writer",
+    "admin": "admin",
+}
+
+
+def next_app_page(request: Request, view: str, minimum_role: str) -> Response:
+    """Serve one dashboard view, behind the same door /app uses."""
+    role = session_role(request)
+    if not role:
+        # Anonymous callers go to the sign-in page rather than the landing page:
+        # they asked for the app by name. Same as /app.
+        return RedirectResponse("/login", status_code=303)
+    if ROLE_ORDER[role] < ROLE_ORDER[minimum_role]:
+        return webui_page("app/locked", status_code=403)
+    return webui_page(view)
+
+
+@app.get("/next/app", include_in_schema=False)
+async def next_app_home(request: Request) -> Response:
+    return next_app_page(request, "app", "reader")
+
+
+@app.get("/next/app/{view}", include_in_schema=False)
+async def next_app_view(view: str, request: Request) -> Response:
+    minimum_role = WEBUI_APP_VIEWS.get(view)
+    if minimum_role is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return next_app_page(request, f"app/{view}", minimum_role)
+
+
+# The rebuilt public pages, one preview route each. Exact names, not a path
+# parameter used as a filename: the export is a directory and "../" is a
+# filename too.
+#
+# Registered last, because `{page}` would otherwise swallow /next/app: FastAPI
+# matches routes in declaration order, and a path parameter matches anything.
+WEBUI_PAGES = frozenset({"info", "use-cases", "contact", "login"})
+
+
+@app.get("/next/{page}", include_in_schema=False)
+async def next_preview_page(page: str) -> Response:
+    if page not in WEBUI_PAGES:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return webui_page(page)
+
+
+@app.get("/app", include_in_schema=False)
 async def ui(request: Request) -> Response:
     if not session_role(request):
+        # The dashboard stays behind auth. Anonymous callers go to the sign-in
+        # page rather than the landing page: they asked for the app by name.
         return RedirectResponse("/login", status_code=303)
     return FileResponse(STATIC_DIR / "index.html")
 
@@ -2267,8 +2776,125 @@ async def info_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "info.html")
 
 
+@app.get("/use-cases", include_in_schema=False)
+async def use_cases_page() -> FileResponse:
+    # What teams run Citadel for, then the partnering profile for EU consortia.
+    # Shares info.css/info.js with /info; the live health pill hydrates from the
+    # same public /api/state.
+    return FileResponse(STATIC_DIR / "use-cases.html")
+
+
+@app.get("/partners", include_in_schema=False)
+async def partners_page() -> RedirectResponse:
+    # /partners was the page's first home and is already quoted in commits,
+    # docs, and anything sent to a coordinator. Keep the URL alive.
+    return RedirectResponse("/use-cases", status_code=301)
+
+
+@app.get("/contact", include_in_schema=False)
+async def contact_page() -> FileResponse:
+    # The form that POSTs to /contact below. Its own page rather than a section
+    # at the bottom of another one, because it is a destination, not a footer.
+    return FileResponse(STATIC_DIR / "contact.html")
+
+
+@app.post("/contact", include_in_schema=False)
+async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]:
+    """Deliver a partnering enquiry to the org's Google Chat space.
+
+    This is the only unauthenticated write path in the service, so it is
+    deliberately narrow: it never touches the vault, never becomes Structured
+    Knowledge, and never echoes submitted text back into a response. A missing
+    gateway is a 503, not a silent drop, so an enquiry is never accepted into
+    a void.
+    """
+    if body.website.strip():
+        # Honeypot. A human never sees this field, so anything in it is a bot.
+        # Answer 200 so the bot does not learn it was filtered.
+        logger.info("Partner contact rejected: honeypot field was filled")
+        return {"delivered": True}
+
+    client_ip = contact_client_ip(request)
+    if not contact_rate_limit_ok(client_ip):
+        raise HTTPException(status_code=429, detail="Too many messages. Try again later.")
+
+    # Persist BEFORE attempting delivery (ADR-0013, amended). Google Chat is
+    # unconfigured on this node, so the old "no gateway is a 503" rule was
+    # turning every partner enquiry away and keeping no record of it. The ADR's
+    # actual requirement is that an enquiry is never accepted into a void; a
+    # capped file on the state volume is not a void. The vault is still not a
+    # destination — unauthenticated text must not reach the substrate agents
+    # read as authority, which is the part of ADR-0013 that stands unchanged.
+    from datetime import datetime, timezone
+
+    stored = False
+    try:
+        get_contact_store().append(
+            {
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "name": scrub_contact_field(body.name),
+                "email": scrub_contact_field(body.email),
+                "organization": scrub_contact_field(body.organization),
+                "message": scrub_contact_field(body.message),
+            }
+        )
+        stored = True
+    except Exception:
+        logger.exception("Partner contact could not be stored")
+
+    gateway = contact_gateway()
+    if gateway is None:
+        if stored:
+            logger.info("Partner contact stored from %s (no Chat gateway configured)", client_ip)
+            return {"delivered": True, "stored": True}
+        raise HTTPException(
+            status_code=503,
+            detail="The contact channel is not configured on this node. Please email us instead.",
+        )
+
+    text = (
+        f"*Enquiry via /contact*\n"
+        f"*From:* {scrub_contact_field(body.name)}\n"
+        f"*Email:* {scrub_contact_field(body.email)}\n"
+        f"*Organization:* {scrub_contact_field(body.organization) or 'not given'}\n"
+        f"\n{scrub_contact_field(body.message)}"
+    )
+    try:
+        await asyncio.to_thread(gateway.post_digest, text)
+    except Exception:
+        logger.exception("Partner contact delivery failed")
+        if stored:
+            # Chat is down but the enquiry is on disk, so it is not lost and the
+            # sender should not be told to try again and send it twice.
+            return {"delivered": True, "stored": True}
+        raise HTTPException(
+            status_code=502,
+            detail="We could not deliver that right now. Please email us instead.",
+        ) from None
+    logger.info("Partner contact delivered from %s", client_ip)
+    return {"delivered": True, "stored": stored}
+
+
+@app.get("/api/contact/enquiries")
+async def list_contact_enquiries(request: Request, limit: int = 50) -> dict[str, Any]:
+    """Read the stored partner enquiries. Admin only.
+
+    The queue exists because Google Chat is unconfigured (ADR-0013, amended).
+    Once the gateway is set up this stays useful as the durable record behind a
+    Chat message that someone scrolls past.
+    """
+    require_access(request, "admin", "access:read")
+    store = get_contact_store()
+    return {
+        "enquiries": store.recent(min(max(1, limit), 200)),
+        "total": store.count(),
+    }
+
+
 @app.post("/admin/session")
-async def create_admin_session(body: AdminSessionBody, response: Response) -> dict[str, Any]:
+async def create_admin_session(
+    body: AdminSessionBody, response: Response, request: Request
+) -> dict[str, Any]:
     access_key = body.access_key or body.admin_key
     if not configured_access_keys() and not get_access_store().has_tokens():
         raise HTTPException(status_code=503, detail="Access keys are not configured.")
@@ -2276,6 +2902,16 @@ async def create_admin_session(body: AdminSessionBody, response: Response) -> di
         raise HTTPException(status_code=422, detail="Access key is required.")
     identity_with_cookie = access_key_identity(access_key)
     if not identity_with_cookie:
+        # Same throttle as the bearer path (M4): this endpoint accepts the same
+        # env keys, so limiting only one of the two would leave the door open.
+        client_ip = contact_client_ip(request)
+        if not record_auth_failure(client_ip):
+            logger.warning("Throttled repeated login failures from %s", client_ip)
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed authentication attempts. Try again later.",
+                headers={"Retry-After": str(AUTH_FAIL_PER_IP_WINDOW_SECONDS)},
+            )
         logger.warning("Admin session login rejected: access key did not match any credential")
         raise HTTPException(status_code=401, detail="Access key was rejected.")
     identity, session_cookie = identity_with_cookie
@@ -2306,6 +2942,54 @@ async def current_session(request: Request) -> dict[str, Any]:
         detail={"role": identity.role},
     )
     return {"ok": True, **role_payload(identity.role, identity)}
+
+
+def _captured_last_7d(node: str | None) -> int | None:
+    """Successful ingests into this seat's Node in the last seven days.
+
+    Counted from the AccessStore audit trail, the same durable rows
+    ``last_ingest_at`` already reads. The dashboard derives this today by
+    filtering the mesh event page, which is capped and rebuilt in memory, so the
+    figure silently drops after every redeploy and is bounded by however many
+    events the mesh happens to be holding.
+
+    Scoped by ``dataset == node``, so it counts only the caller's own Node.
+    Returns None (not 0) for a caller with no seat or on any failure: zero is a
+    claim that nothing was captured.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if not node:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    total = 0
+    try:
+        for audit_event in get_access_store().snapshot().get("audit_events") or []:
+            if not isinstance(audit_event, dict):
+                continue
+            if audit_event.get("dataset") != node or not audit_event.get("success"):
+                continue
+            action = str(audit_event.get("action") or "")
+            if action != "ingest" and not action.endswith("citadel_ingest"):
+                continue
+            detail = audit_event.get("detail") if isinstance(audit_event.get("detail"), dict) else {}
+            if detail.get("accepted") is False:
+                continue
+            created = audit_event.get("created_at")
+            if not isinstance(created, str):
+                continue
+            try:
+                when = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if when >= cutoff:
+                total += 1
+    except Exception:
+        logger.exception("me/summary captured_last_7d failed")
+        return None
+    return total
 
 
 @app.get("/api/me/summary")
@@ -2409,6 +3093,31 @@ async def me_summary(request: Request) -> dict[str, Any]:
                 for audit_event in audit_ingests[:8]
             ]
 
+    # Gap 1: "Notes you can read". document_count above is Node-only and comes
+    # from the mesh, which empties on restart. This counts the datasets this
+    # caller actually searches, from the durable relational store.
+    #
+    # Read isolation: the sum is taken over resolve_search_datasets() for THIS
+    # identity, so a dataset the caller cannot search is never added in. A seat
+    # sees its own Node plus Central, never another seat's Node.
+    readable_datasets = resolve_search_datasets(identity, None, config)
+    readable_document_count: int | None = None
+    try:
+        cognee_client = getattr(get_citadel(), "cognee", None)
+        counts_by_dataset = getattr(cognee_client, "document_counts_by_dataset", None)
+        if callable(counts_by_dataset):
+            counts = await counts_by_dataset()
+            readable_document_count = sum(
+                int(counts.get(name) or 0) for name in readable_datasets
+            )
+    except Exception:
+        # Null, not zero. Zero is a claim that the caller can read nothing.
+        logger.exception("me/summary readable document count failed")
+
+    # Gap 2: "Captured this week", from the durable audit trail rather than the
+    # mesh event page, which is bounded and resets on redeploy.
+    captured_last_7d = _captured_last_7d(node)
+
     # Capture proof is documents or a durable ingest timestamp — not search
     # timeline rows, which can appear on an empty Node.
     capture_done = document_count > 0 or last_ingest_at is not None
@@ -2420,6 +3129,8 @@ async def me_summary(request: Request) -> dict[str, Any]:
         "node_dataset": node,
         "search_datasets": scope.get("search_datasets") or [scope.get("default_dataset")],
         "document_count": document_count,
+        "readable_document_count": readable_document_count,
+        "captured_last_7d": captured_last_7d,
         "pending_promotions": pending_count,
         "last_ingest_at": last_ingest_at,
         "recent_activity": recent_activity[:8],
@@ -2448,16 +3159,84 @@ async def me_summary(request: Request) -> dict[str, Any]:
     }
 
 
+ACCESS_AUDIT_DEFAULT_LIMIT = 200
+ACCESS_AUDIT_MAX_LIMIT = 1000
+
+
 @app.get("/api/access")
-async def access_snapshot(request: Request) -> dict[str, Any]:
+async def access_snapshot(
+    request: Request,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Access snapshot, with the audit trail paged newest first.
+
+    ``audit_events`` used to be the entire array, which the dashboard sliced to
+    twelve. That grows without bound: every ingest, search and MCP call appends
+    a row, so the payload gets heavier every day for a view that shows a dozen.
+
+    Paging is additive. ``audit_events`` keeps its name, its shape and its
+    existing oldest-first ordering, so a consumer that reads it unchanged still
+    works. ``limit`` defaults to the newest 200 rather than to everything, which
+    is far more than any current consumer renders. ``audit_events_total`` and
+    ``next_cursor`` are there so a caller can tell it received a page rather
+    than the lot.
+
+    ``cursor`` is an event id: the page continues from immediately older than
+    that event. An unknown cursor is treated as "start from the newest" rather
+    than as an error, so a stale cursor cannot wedge the Admin view.
+    """
     require_access(request, "admin", "access:manage")
     bootstrap_counts = {"reader": 0, "writer": 0, "admin": 0}
     for role, _ in configured_access_keys():
         bootstrap_counts[role] += 1
+
+    snapshot = get_access_store().snapshot()
+
+    # Gap 9, the other half: state the seat on the token instead of making every
+    # consumer join tokens against principals to discover it is missing.
+    principals_by_id = {principal["id"]: principal for principal in snapshot.get("principals") or []}
+    tokens: list[dict[str, Any]] = []
+    for token in snapshot.get("tokens") or []:
+        principal = principals_by_id.get(token.get("principal_id")) or {}
+        seat_slug = principal.get("seat_slug")
+        tokens.append(
+            {
+                **token,
+                "seat_slug": seat_slug,
+                "seatless": not seat_slug,
+            }
+        )
+    snapshot["tokens"] = tokens
+
+    all_events = list(snapshot.get("audit_events") or [])
+    total = len(all_events)
+
+    if limit is None:
+        page_size = ACCESS_AUDIT_DEFAULT_LIMIT
+    else:
+        page_size = max(1, min(int(limit), ACCESS_AUDIT_MAX_LIMIT))
+
+    end = total
+    if cursor:
+        for index in range(total - 1, -1, -1):
+            event = all_events[index]
+            if isinstance(event, dict) and event.get("id") == cursor:
+                end = index
+                break
+    start = max(0, end - page_size)
+    page = all_events[start:end]
+
+    snapshot["audit_events"] = page
     return {
         "ok": True,
         "bootstrap_keys": bootstrap_counts,
-        **get_access_store().snapshot(),
+        **snapshot,
+        "audit_events_total": total,
+        "audit_events_returned": len(page),
+        # The oldest id on this page. Pass it back as `cursor` for the next,
+        # older page. Null when there is nothing older left.
+        "next_cursor": (page[0].get("id") if start > 0 and page and isinstance(page[0], dict) else None),
     }
 
 
@@ -2529,7 +3308,52 @@ async def list_access_seats(request: Request) -> dict[str, Any]:
             }
         )
     seats.sort(key=lambda seat: seat["seat_slug"])
-    return {"ok": True, "seats": seats}
+
+    # Seat-less tokens, as a first-class list rather than an absence.
+    #
+    # A token whose principal carries no seat_slug authenticates perfectly well
+    # and then cannot search: it has no Node and no default dataset, so a search
+    # raises DatasetNotFoundError, which reads to the operator as "invalid
+    # token". That has cost real debugging time. Today the Admin view can only
+    # infer this state by joining /api/access/seats against /api/access
+    # client-side and noticing a token in neither, which is why it does not.
+    seatless: list[dict[str, Any]] = []
+    principals_by_id = {principal["id"]: principal for principal in snapshot["principals"]}
+    for token in snapshot["tokens"]:
+        principal = principals_by_id.get(token["principal_id"]) or {}
+        if principal.get("seat_slug"):
+            continue
+        seatless.append(
+            {
+                "id": token["id"],
+                "name": token["name"],
+                "prefix": token["prefix"],
+                "role": token["role"],
+                "principal_id": token["principal_id"],
+                "principal_name": principal.get("name"),
+                "principal_kind": principal.get("kind"),
+                "seat_slug": None,
+                "default_dataset": token.get("default_dataset")
+                or principal.get("default_dataset"),
+                "revoked": bool(token.get("revoked_at")),
+                "revoked_at": token.get("revoked_at"),
+                "last_used_at": token.get("last_used_at"),
+                "created_at": token.get("created_at"),
+                # The consequence, stated rather than implied. A token with no
+                # seat and no default dataset cannot run a search at all.
+                "can_search": bool(
+                    token.get("default_dataset") or principal.get("default_dataset")
+                ),
+            }
+        )
+    seatless.sort(key=lambda token: token.get("created_at") or "")
+
+    return {
+        "ok": True,
+        "seats": seats,
+        "seatless_tokens": seatless,
+        "seatless_token_count": len(seatless),
+    }
 
 
 @app.post("/api/access/seats")
@@ -2826,6 +3650,27 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             }
         )
 
+    # Repo figures for the public pages: weekly commits from the daily GitHub
+    # refresh, plus counts derived from the source tree. Cache-only, so this
+    # adds no outbound request to a public endpoint, and it degrades to an
+    # empty block rather than raising.
+    try:
+        from kb import repo_stats
+
+        repo_block = repo_stats.public_payload(get_citadel().config)
+    except Exception:
+        logger.debug("Repo stats unavailable for /api/state", exc_info=True)
+        repo_block = {
+            "adrs": None,
+            "mcp_tools": None,
+            "weeks": [],
+            "commits_total": None,
+            "commits_window_weeks": 0,
+            "refreshed_at": None,
+            "stale": True,
+            "source": "unavailable",
+        }
+
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
     return {
         "ok": True,
@@ -2838,6 +3683,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             "github_repositories": int(gh.get("tracked_repositories", 0) or 0) if gh else 0,
             "linear_issues": int(ln.get("issue_count", 0) or 0) if ln else 0,
         },
+        "repo": repo_block,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3233,6 +4079,55 @@ async def repo_content_sync_status(request: Request) -> Any:
     return jsonable_encoder(await get_repo_content_syncer().status())
 
 
+# Audit actions that mean "this source tried to do its job". The most recent
+# unsuccessful one is what the UI shows as the source's failure state.
+_SOURCE_ERROR_ACTIONS: dict[str, tuple[str, ...]] = {
+    "github": ("learning_agent.run", "github_webhook."),
+    "github_repo_content": ("repo_content_sync.",),
+    "linear": ("linear_sync.",),
+    "obsidian_vault": ("obsidian.sync.", "obsidian_sync"),
+}
+
+
+def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
+    """Most recent failed run for a source, as (message, timestamp).
+
+    Until this existed, "failing" was inferred from ``open_conflicts > 0`` plus
+    a GitHub-only security-scan flag, so a source that failed for any other
+    reason, an expired token, a 500 from an upstream API, a timeout, was
+    indistinguishable in the UI from one that was healthy.
+
+    Read from the AccessStore audit trail, which is durable and already records
+    every sync attempt with its outcome. Messages are truncated and passed
+    through the secret redactor: an upstream error string can carry a URL with a
+    token in it, and /api/sources is read by any reader.
+    """
+    prefixes = _SOURCE_ERROR_ACTIONS.get(source_type)
+    if not prefixes:
+        return None, None
+    try:
+        events = get_access_store().snapshot().get("audit_events") or []
+    except Exception:
+        logger.exception("sources last_error lookup failed")
+        return None, None
+
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        action = str(event.get("action") or "")
+        if not action.startswith(prefixes):
+            continue
+        # The newest matching attempt decides. A success clears the error,
+        # otherwise a source that failed once would look broken forever.
+        if event.get("success"):
+            return None, None
+        detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+        message = detail.get("error") or detail.get("error_type") or detail.get("reason")
+        text = str(message) if message else action
+        return redact_secrets(text[:300]), event.get("created_at")
+    return None, None
+
+
 @app.get("/api/sources")
 async def sources(request: Request, type: str | None = None) -> Any:
     require_access(request, "reader", "sources:read")
@@ -3241,6 +4136,7 @@ async def sources(request: Request, type: str | None = None) -> Any:
 
     if type in {None, "github"}:
         github_status = await get_github_syncer().status()
+        github_error, github_error_at = _last_source_error("github")
         sources_payload.append(
             {
                 "id": "github-org",
@@ -3251,6 +4147,8 @@ async def sources(request: Request, type: str | None = None) -> Any:
                 "last_checked_at": github_status.get("last_checked_at"),
                 "documents": github_status.get("tracked_repositories", 0),
                 "open_conflicts": 0,
+                "last_error": github_error,
+                "last_error_at": github_error_at,
                 "metadata": github_status,
             }
         )
@@ -3258,6 +4156,7 @@ async def sources(request: Request, type: str | None = None) -> Any:
 
     if type in {None, "github_repo_content"}:
         repo_content_status = await get_repo_content_syncer().status()
+        repo_content_error, repo_content_error_at = _last_source_error("github_repo_content")
         sources_payload.append(
             {
                 "id": "github-repo-content",
@@ -3267,6 +4166,8 @@ async def sources(request: Request, type: str | None = None) -> Any:
                 "last_checked_at": repo_content_status.get("last_checked_at"),
                 "documents": repo_content_status.get("tracked_files", 0),
                 "open_conflicts": 0,
+                "last_error": repo_content_error,
+                "last_error_at": repo_content_error_at,
                 "metadata": repo_content_status,
             }
         )
@@ -3274,6 +4175,10 @@ async def sources(request: Request, type: str | None = None) -> Any:
 
     if type in {None, "linear"}:
         linear_status = await get_linear_syncer().status()
+        linear_error, linear_error_at = _last_source_error("linear")
+        if linear_status.get("last_error"):
+            linear_error = redact_secrets(str(linear_status["last_error"])[:300])
+            linear_error_at = linear_status.get("last_synced_at") or linear_error_at
         sources_payload.append(
             {
                 "id": "linear-workspace",
@@ -3283,6 +4188,10 @@ async def sources(request: Request, type: str | None = None) -> Any:
                 "last_checked_at": linear_status.get("last_synced_at"),
                 "documents": linear_status.get("issue_count", 0),
                 "open_conflicts": 0,
+                # Linear is the one syncer that already persists its own failure,
+                # so prefer that over the audit trail: it is more specific.
+                "last_error": linear_error,
+                "last_error_at": linear_error_at,
                 "metadata": linear_status,
             }
         )
@@ -3290,6 +4199,13 @@ async def sources(request: Request, type: str | None = None) -> Any:
 
     if type in {None, "obsidian_vault"}:
         obsidian_status = get_obsidian_sync().source_status(source_type="obsidian_vault")
+        # One vault-wide error: pushes are audited per sync, not per vault, so
+        # the same last-failure applies to every vault entry rather than being
+        # attributed to one of them arbitrarily.
+        obsidian_error, obsidian_error_at = _last_source_error("obsidian_vault")
+        for vault in obsidian_status["sources"]:
+            vault.setdefault("last_error", obsidian_error)
+            vault.setdefault("last_error_at", obsidian_error_at)
         sources_payload.extend(obsidian_status["sources"])
         summary.update(obsidian_status["summary"])
 
@@ -5013,7 +5929,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        # A search that blew its budget returned empty-fast; the caller got no
+        # hits. Recording it as a success meant /api/audit?view=failures never
+        # showed it and any success-rate metric read 100% while users saw
+        # nothing — which is how the "~20% silent failure" in #50 stayed
+        # unquantified. The detail dict already carried timed_out; nothing read it.
+        success=not timed_out,
         dataset=search_datasets[0],
         detail={
             "operation": "search",

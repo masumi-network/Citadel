@@ -65,6 +65,15 @@ def _repo_content_sync_state_path(value: str | None) -> str:
     return str(Path(_state_root()) / "repo_content_sync_state.json")
 
 
+def _repo_stats_state_path(value: str | None) -> str:
+    if value:
+        return value
+    # Lives with the other sync state, which on Railway is the mounted volume.
+    # That matters: the cache is what a redeploy reads before the first refresh
+    # lands, so on the volume the public numbers survive a restart.
+    return str(Path(_state_root()) / "repo_stats.json")
+
+
 def _access_store_path(value: str | None) -> str:
     if value:
         return value
@@ -74,6 +83,17 @@ def _access_store_path(value: str | None) -> str:
         or ("/data/.citadel" if Path("/data").exists() else ".citadel")
     )
     return str(Path(root) / "access.json")
+
+
+def _contact_store_path(value: str | None) -> str:
+    if value:
+        return value
+    root = (
+        os.getenv("CITADEL_STATE_DIRECTORY")
+        or os.getenv("SYSTEM_ROOT_DIRECTORY")
+        or ("/data/.citadel" if Path("/data").exists() else ".citadel")
+    )
+    return str(Path(root) / "contacts.json")
 
 
 def _obsidian_sync_state_path(value: str | None) -> str:
@@ -140,6 +160,7 @@ class CitadelConfig:
     reader_keys: tuple[str, ...] = field(default_factory=tuple)
     writer_keys: tuple[str, ...] = field(default_factory=tuple)
     access_store_path: str = ".citadel/access.json"
+    contact_store_path: str = ".citadel/contacts.json"
     obsidian_sync_state_path: str = ".citadel/obsidian_sync_state.json"
     conflicts_store_path: str = ".citadel/conflicts.json"
     conflicts_max_records: int = 500
@@ -198,6 +219,13 @@ class CitadelConfig:
     evolve_scheduler_enabled: bool = False
     evolve_interval_seconds: int = 21600
     github_token: str | None = None
+    # Live repo figures for the public pages. On by default: it is one GitHub
+    # request a day, it degrades to the cached value, and the alternative is
+    # numbers that are wrong and say nothing about it.
+    repo_stats_enabled: bool = True
+    repo_stats_repo: str = "masumi-network/Citadel"
+    repo_stats_state_path: str = ".citadel/repo_stats.json"
+    repo_stats_interval_seconds: int = 86400
     repo_content_sync_enabled: bool = True
     repo_content_sync_dataset: str = "masumi-network"
     repo_content_sync_session: str = "masumi-repo-content"
@@ -254,6 +282,7 @@ class CitadelConfig:
             reader_keys=tuple(_csv(os.getenv("CITADEL_READER_KEYS"))),
             writer_keys=tuple(_csv(os.getenv("CITADEL_WRITER_KEYS"))),
             access_store_path=_access_store_path(os.getenv("CITADEL_ACCESS_STORE_PATH")),
+            contact_store_path=_contact_store_path(os.getenv("CITADEL_CONTACT_STORE_PATH")),
             obsidian_sync_state_path=_obsidian_sync_state_path(
                 os.getenv("CITADEL_OBSIDIAN_SYNC_STATE_PATH")
             ),
@@ -369,6 +398,18 @@ class CitadelConfig:
                 default=21600,
             ),
             github_token=os.getenv("CITADEL_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or None,
+            repo_stats_enabled=_bool(
+                os.getenv("CITADEL_REPO_STATS_ENABLED"),
+                default=True,
+            ),
+            repo_stats_repo=os.getenv("CITADEL_REPO_STATS_REPO", "masumi-network/Citadel"),
+            repo_stats_state_path=_repo_stats_state_path(
+                os.getenv("CITADEL_REPO_STATS_STATE_PATH")
+            ),
+            repo_stats_interval_seconds=_int(
+                os.getenv("CITADEL_REPO_STATS_INTERVAL_SECONDS"),
+                default=86400,
+            ),
             repo_content_sync_enabled=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_ENABLED"),
                 default=True,

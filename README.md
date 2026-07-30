@@ -24,6 +24,12 @@ The result is organizational memory that behaves like a company vault: private w
 
 **📊 [State of the Vault](https://citadel-archive-production.up.railway.app/info)** — a live report of current metrics, shipped releases, and the roadmap, served from the running node.
 
+The node serves five public pages, each owning one subject: `/` (what Citadel
+is, and how to start), `/info` (live numbers, releases, roadmap), `/use-cases`
+(what teams run it for, then the partnering profile for EU consortia),
+`/contact` (the enquiry form), and `/login`. The dashboard itself lives at
+`/app`, behind a seat token.
+
 ## What Citadel does
 
 - **Organization Vault** — Central (`masumi-network`) holds org-wide structured knowledge; each seat has a private **Node** (`seat:{slug}`) for working memory. You read your Node + Central; you never read another seat's Node.

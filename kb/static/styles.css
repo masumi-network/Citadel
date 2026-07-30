@@ -17,51 +17,172 @@
   font-display: swap;
 }
 
+/* Light is the default, deliberately, and the app follows the same rule the
+   public pages already do: prefers-color-scheme is NOT consulted. Dark is an
+   explicit choice made with the toggle and remembered under the shared
+   `citadel-info-theme` key, so a theme picked on the landing page survives
+   into the dashboard. Every value below is a token; nothing downstream may
+   hard-code a colour, or one theme silently breaks. */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* Surfaces — Masumi-aligned dark with a faint emerald-neutral tint */
-  --bg: #0b0f0e;
-  --chrome: #0e1311;
-  --surface: #131b18;
-  --surface-raised: #16201b;
-  --surface-hover: #18241f;
-  --field: #0e1512;
+  /* Surfaces — the public neutral ramp (info.css): white cards on off-white */
+  --bg: #fafafa;
+  --chrome: #ffffff;
+  --surface: #ffffff;
+  --surface-raised: #f5f5f5;
+  --surface-hover: #f0f0f0;
+  --field: #fafafa;
 
-  /* Borders — Interface soft hairlines (not opaque emerald chrome) */
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
-  --border-quiet: rgba(255, 255, 255, 0.05);
+  /* Borders — solid hairlines on light, alpha hairlines on dark */
+  --border: #e5e5e5;
+  --border-strong: #d4d4d4;
+  --border-quiet: #efefef;
 
-  /* Text — Interface canvas primary */
-  --text: #f2f5f3;
-  --muted: #a3b3ab;
-  --quiet: #7d8b82;
+  /* Text */
+  --text: #0a0a0a;
+  --muted: rgba(10, 10, 10, 0.56);
+  --quiet: rgba(10, 10, 10, 0.42);
 
-  /* Accent — Masumi brand magenta (#FA008C) */
-  --primary: #fa008c;
-  --primary-strong: #ff5cb0;
-  --primary-deep: #cc0073;
-  --primary-soft: rgba(250, 0, 140, 0.16);
-  --primary-border: rgba(250, 0, 140, 0.45);
-  --primary-text: #ffffff;
-  --focus: #ff5cb0;
+  /* Neutral overlays — the tints that used to be baked in as white alphas.
+     --scrim is for panels floating over the graph canvas. */
+  --overlay: rgba(10, 10, 10, 0.05);
+  --overlay-quiet: rgba(10, 10, 10, 0.025);
+  --scrim: rgba(255, 255, 255, 0.94);
 
-  /* Semantic status — emerald success, cyan info (Citadel CLI heritage), Masumi red */
-  --danger: #fa140a;
-  --warning: #fbbf24;
-  --success: #34d399;
-  --info: #22d3ee;
+  /* Accent — AGENTIC / Masumi Iris Flower magenta (#FF51FF), the one accent.
+     The dashboard follows the same design system as the public pages, so the
+     app, the mark, and the favicon all read as one product. --primary is the
+     fill; --primary-strong is accent *text*, which has to darken on white
+     because #FF51FF on white fails contrast. */
+  --primary: #ff51ff;
+  --primary-strong: #c010a0;
+  --primary-deep: #c010a0;
+  --primary-hover: #e63be6;
+  --primary-soft: rgba(255, 81, 255, 0.1);
+  --primary-border: rgba(255, 81, 255, 0.55);
+  --primary-text: #0a0a0a;
+  --focus: #c010a0;
 
-  /* Shape, motion, type — Interface radii (nav 8 / card 14 / search 12) */
-  --radius: 6px;
-  --radius-lg: 8px;
-  --radius-nav: 8px;
-  --radius-card: 14px;
-  --radius-search: 12px;
+  /* Semantic status. Emerald and cyan do not survive a white ground — these
+     are the darker light-mode values info.css already ships. Each colour
+     carries a -soft fill and a -border so tinted rows stay tokenised. */
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.08);
+  --danger-border: rgba(185, 28, 28, 0.32);
+  --warning: #b45309;
+  --warning-soft: rgba(180, 83, 9, 0.1);
+  --warning-border: rgba(180, 83, 9, 0.3);
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.1);
+  --success-border: rgba(22, 163, 74, 0.32);
+  --info: #0891b2;
+  --info-soft: rgba(8, 145, 178, 0.1);
+  --info-border: rgba(8, 145, 178, 0.32);
+
+  /* Loading shimmer endpoints */
+  --skeleton-a: #f0f0f0;
+  --skeleton-b: #e2e2e2;
+
+  /* Shape, motion, type — square chrome: every panel, field, and button is a
+     hard rectangle. The radius tokens are kept (rather than deleted at each
+     call site) so the corner treatment stays one decision in one place.
+     Circles (avatars, status dots) and capsules (pills) are unaffected. */
+  --radius: 0;
+  --radius-lg: 0;
+  --radius-nav: 0;
+  --radius-card: 0;
+  --radius-search: 0;
   --speed: 140ms;
   --font: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* Explicit light, for when the toggle has written "light" rather than left the
+   key unset. Same values as :root; kept as its own block so the two themes read
+   as a pair, exactly as info.css does. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --chrome: #ffffff;
+  --surface: #ffffff;
+  --surface-raised: #f5f5f5;
+  --surface-hover: #f0f0f0;
+  --field: #fafafa;
+  --border: #e5e5e5;
+  --border-strong: #d4d4d4;
+  --border-quiet: #efefef;
+  --text: #0a0a0a;
+  --muted: rgba(10, 10, 10, 0.56);
+  --quiet: rgba(10, 10, 10, 0.42);
+  --overlay: rgba(10, 10, 10, 0.05);
+  --overlay-quiet: rgba(10, 10, 10, 0.025);
+  --scrim: rgba(255, 255, 255, 0.94);
+  --primary: #ff51ff;
+  --primary-strong: #c010a0;
+  --primary-deep: #c010a0;
+  --primary-hover: #e63be6;
+  --primary-soft: rgba(255, 81, 255, 0.1);
+  --primary-border: rgba(255, 81, 255, 0.55);
+  --primary-text: #0a0a0a;
+  --focus: #c010a0;
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.08);
+  --danger-border: rgba(185, 28, 28, 0.32);
+  --warning: #b45309;
+  --warning-soft: rgba(180, 83, 9, 0.1);
+  --warning-border: rgba(180, 83, 9, 0.3);
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.1);
+  --success-border: rgba(22, 163, 74, 0.32);
+  --info: #0891b2;
+  --info-soft: rgba(8, 145, 178, 0.1);
+  --info-border: rgba(8, 145, 178, 0.32);
+  --skeleton-a: #f0f0f0;
+  --skeleton-b: #e2e2e2;
+}
+
+/* Dark, an explicit and remembered choice. The old faint-emerald surfaces are
+   gone: the app and the public pages now share one neutral ramp. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a0a0a;
+  --chrome: #121212;
+  --surface: #171717;
+  --surface-raised: #1f1f1f;
+  --surface-hover: #262626;
+  --field: #101010;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-quiet: rgba(255, 255, 255, 0.06);
+  --text: #fafafa;
+  --muted: rgba(250, 250, 250, 0.6);
+  --quiet: rgba(250, 250, 250, 0.42);
+  --overlay: rgba(255, 255, 255, 0.07);
+  --overlay-quiet: rgba(255, 255, 255, 0.025);
+  --scrim: rgba(23, 23, 23, 0.94);
+  --primary: #ff51ff;
+  --primary-strong: #ff86f2;
+  --primary-deep: #c010a0;
+  --primary-hover: #ff86f2;
+  --primary-soft: rgba(255, 81, 255, 0.16);
+  --primary-border: rgba(255, 81, 255, 0.45);
+  --primary-text: #0a0a0a;
+  --focus: #ff86f2;
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.12);
+  --danger-border: rgba(248, 113, 113, 0.38);
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.12);
+  --warning-border: rgba(245, 158, 11, 0.35);
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.1);
+  --success-border: rgba(74, 222, 128, 0.34);
+  --info: #22d3ee;
+  --info-soft: rgba(34, 211, 238, 0.1);
+  --info-border: rgba(34, 211, 238, 0.34);
+  --skeleton-a: #171717;
+  --skeleton-b: #262626;
 }
 
 * {
@@ -141,72 +262,9 @@ pre {
   font-family: var(--mono);
 }
 
-/* ---------- Login ---------- */
-
-.login-shell {
-  display: grid;
-  min-height: 100vh;
-  place-items: center;
-  padding: 20px;
-  background: var(--bg);
-}
-
-.login-panel {
-  width: min(100%, 400px);
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  padding: 28px 26px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  background: var(--surface);
-  box-shadow: none;
-}
-
-.login-brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-/* Login hero: SVG mark (1:1 with 72 viewBox) — blink/glow live inside the SVG */
-.brand-pixel-img {
-  display: block;
-  flex: 0 0 auto;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-nav);
-  animation: pixel-chrome-glow 2.6s ease-in-out infinite;
-}
-
-.brand-pixel-img--hero {
-  width: 72px;
-  height: 72px;
-  border-radius: 14px;
-  animation:
-    pixel-cascade-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both,
-    pixel-chrome-glow 2.6s ease-in-out 0.45s infinite;
-}
-
-.login-brand-text {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.login-brand-text .brand-wordmark {
-  font-size: 22px;
-}
-
-.login-tagline {
-  color: var(--quiet);
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
+/* Login is no longer styled here: /login moved onto the public design system
+   (info.css) so it reads as a sibling of /info and /partners rather than a
+   stray dashboard screen. See the `/login — seat access` block in info.css. */
 
 /* ---------- App frame (sidebar-first; no topbar / status-bar) ---------- */
 
@@ -310,9 +368,9 @@ pre {
 .brand-chip {
   flex: 0 0 auto;
   padding: 3px 7px;
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.07);
-  color: rgba(255, 255, 255, 0.55);
+  border-radius: 0;
+  background: var(--overlay);
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 600;
@@ -332,27 +390,21 @@ pre {
   flex: 0 0 auto;
   padding: 3px;
   overflow: hidden;
-  border: 1px solid rgba(250, 0, 140, 0.22);
-  border-radius: var(--radius-nav);
-  background: var(--bg);
-  animation: pixel-chrome-glow 2.6s ease-in-out infinite;
+  background: transparent;
 }
 
 .brand-pixel {
   width: 4px;
   height: 4px;
-  border-radius: 1px;
+  border-radius: 0;
   background: transparent;
 }
 
-/* Column colors in CSS — CSP blocks inline style="--px:…" */
-.brand-pixel--c0.brand-pixel--lit { background: #fa008c; }
-.brand-pixel--c1.brand-pixel--lit { background: #d6239c; }
-.brand-pixel--c2.brand-pixel--lit { background: #b246ad; }
-.brand-pixel--c3.brand-pixel--lit { background: #8e6abd; }
-.brand-pixel--c4.brand-pixel--lit { background: #6a8dcd; }
-.brand-pixel--c5.brand-pixel--lit { background: #46b0de; }
-.brand-pixel--c6.brand-pixel--lit { background: #22d3ee; }
+/* One Iris gradient per cell — identical to the web nav mark and the SVG,
+   which fills every cell from the same objectBoundingBox gradient. */
+.brand-pixel--lit {
+  background: linear-gradient(135deg, var(--primary), var(--primary-deep));
+}
 
 /* Idle window blink — Bot-style ~3.4s, clearly off then on */
 .brand-pixel--window {
@@ -371,31 +423,7 @@ pre {
   }
 }
 
-/* Soft magenta chrome pulse (idle glow) */
-@keyframes pixel-chrome-glow {
-  0%,
-  100% {
-    box-shadow: 0 0 0 1px rgba(250, 0, 140, 0.12);
-  }
-  50% {
-    box-shadow: 0 0 0 2px rgba(250, 0, 140, 0.32), 0 0 14px rgba(250, 0, 140, 0.18);
-  }
-}
-
-/* Transform-only so window blink can own opacity without fighting */
-@keyframes pixel-cascade-in {
-  from {
-    transform: scale(0.45);
-  }
-  to {
-    transform: scale(1);
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .brand-pixel-grid,
-  .brand-pixel-img,
-  .brand-pixel-img--hero,
   .brand-pixel--window {
     animation: none !important;
   }
@@ -453,7 +481,7 @@ pre {
   display: flex;
   align-items: center;
   gap: 5px;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--quiet);
   font-family: var(--mono);
   font-size: 9.5px;
   font-weight: 500;
@@ -481,7 +509,39 @@ pre {
 
 .sidebar-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+}
+
+/* Theme toggle — the public .themebtn, minus its fixed positioning: in a shell
+   layout it belongs in the sidebar rather than floating over the workspace. */
+.themebtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 0;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--speed), color var(--speed);
+}
+
+.themebtn:hover {
+  border-color: var(--border-strong);
+  color: var(--primary-strong);
+}
+
+/* Its own row: three buttons across a 220px sidebar would clip their labels. */
+.sidebar-actions .themebtn {
+  flex: 1 0 100%;
+  min-width: 0;
 }
 
 .sidebar-actions .compact-button {
@@ -699,7 +759,7 @@ pre {
 
 .page-subtitle {
   margin-top: 4px;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--quiet);
   font-family: var(--mono);
   font-size: 12.5px;
   font-weight: 500;
@@ -744,7 +804,7 @@ pre {
 .panel-kicker {
   margin-top: 1px;
   margin-bottom: 4px;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--quiet);
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 600;
@@ -757,7 +817,7 @@ pre {
   font-size: 12px;
 }
 
-/* ---------- Cards & windows (Interface: #131B18 on #0B0F0E, soft border) ---------- */
+/* ---------- Cards & windows (--surface on --bg, soft border) ---------- */
 
 .window,
 .metrics-window,
@@ -940,7 +1000,7 @@ pre {
 
 .stats dt,
 .result-grid dt {
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--quiet);
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 600;
@@ -983,7 +1043,7 @@ pre {
 .dashboard-stats span {
   display: block;
   margin-top: 9px;
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--quiet);
   font-size: 11px;
   font-weight: 500;
 }
@@ -1090,7 +1150,7 @@ pre {
   padding: 18px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background: rgba(30, 30, 30, 0.92);
+  background: var(--scrim);
   text-align: center;
 }
 
@@ -1232,7 +1292,7 @@ pre {
   padding: 3px 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(30, 30, 30, 0.92);
+  background: var(--scrim);
   color: var(--muted);
   font-size: 11px;
   cursor: pointer;
@@ -1258,8 +1318,8 @@ pre {
   justify-content: space-between;
   gap: 12px;
   padding: 12px 14px;
-  border-bottom: 1px solid rgba(250, 20, 10, 0.32);
-  background: rgba(250, 20, 10, 0.08);
+  border-bottom: 1px solid var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .inline-alert p {
@@ -1761,8 +1821,8 @@ pre {
 .dashboard-event-card.issue-card,
 .event-item.issue-card,
 .issue-card {
-  border-color: rgba(250, 20, 10, 0.42);
-  background: rgba(250, 20, 10, 0.07);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 /* ---------- Conflicts ---------- */
@@ -1898,9 +1958,9 @@ pre {
   flex-direction: column;
   gap: 4px;
   padding: 10px 12px;
-  border: 1px solid rgba(52, 211, 153, 0.3);
+  border: 1px solid var(--success-border);
   border-radius: var(--radius);
-  background: rgba(52, 211, 153, 0.06);
+  background: var(--success-soft);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1930,7 +1990,7 @@ pre {
 
 label,
 legend {
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--quiet);
   font-size: 11.5px;
   font-weight: 500;
 }
@@ -2085,7 +2145,7 @@ textarea[aria-invalid="true"] {
 }
 
 .primary-button:hover {
-  background: var(--primary-deep);
+  background: var(--primary-hover);
 }
 
 .primary-button:disabled,
@@ -2127,7 +2187,7 @@ textarea[aria-invalid="true"] {
   padding: 2px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-quiet);
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
@@ -2139,8 +2199,8 @@ textarea[aria-invalid="true"] {
 }
 
 .source-badge-central {
-  border-color: color-mix(in srgb, var(--info, #7aa2f7) 45%, var(--border));
-  color: var(--info, #7aa2f7);
+  border-color: color-mix(in srgb, var(--info) 45%, var(--border));
+  color: var(--info);
 }
 
 .seat-home-panel {
@@ -2205,20 +2265,20 @@ textarea[aria-invalid="true"] {
 .status-active,
 .status-enabled,
 .status-synced {
-  border-color: rgba(52, 211, 153, 0.36);
-  background: rgba(52, 211, 153, 0.08);
+  border-color: var(--success-border);
+  background: var(--success-soft);
   color: var(--success);
 }
 
 .status-standby {
-  border-color: rgba(251, 191, 36, 0.35);
-  background: rgba(251, 191, 36, 0.08);
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
   color: var(--warning);
 }
 
 .status-error {
-  border-color: rgba(250, 20, 10, 0.4);
-  background: rgba(250, 20, 10, 0.08);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
@@ -2236,7 +2296,7 @@ textarea[aria-invalid="true"] {
   min-width: 64px;
   min-height: 28px;
   border: 0;
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: 0;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -2440,7 +2500,7 @@ textarea[aria-invalid="true"] {
 }
 
 .document-preview-meta div {
-  background: rgba(28, 28, 28, 0.58);
+  background: var(--surface-raised);
 }
 
 .document-preview-body {
@@ -2573,13 +2633,13 @@ textarea[aria-invalid="true"] {
 }
 
 .toast-error {
-  border-color: rgba(250, 20, 10, 0.5);
-  background: rgba(250, 20, 10, 0.12);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .toast-success {
-  border-color: rgba(52, 211, 153, 0.45);
-  background: rgba(52, 211, 153, 0.1);
+  border-color: var(--success-border);
+  background: var(--success-soft);
 }
 
 .toast-leaving {
@@ -2591,7 +2651,7 @@ textarea[aria-invalid="true"] {
 
 .skeleton {
   border-radius: var(--radius);
-  background: linear-gradient(90deg, #131b18 0%, #1d2a24 50%, #131b18 100%);
+  background: linear-gradient(90deg, var(--skeleton-a) 0%, var(--skeleton-b) 50%, var(--skeleton-a) 100%);
   background-size: 220% 100%;
 }
 
@@ -2664,8 +2724,19 @@ textarea[aria-invalid="true"] {
   .nav-section-label,
   .side-status,
   .seat-footer-meta,
-  .sidebar-actions {
+  .themebtn-label {
     display: none;
+  }
+
+  /* The rail keeps the theme toggle, glyph-only — a theme you cannot switch
+     back from is worse than no toggle. Refresh and Log out do not fit. */
+  .sidebar-actions .compact-button {
+    display: none;
+  }
+
+  .sidebar-actions .themebtn {
+    padding: 7px 0;
+    text-align: center;
   }
 
   .sidebar-brand {
@@ -2750,8 +2821,19 @@ textarea[aria-invalid="true"] {
     flex: 0 0 auto;
   }
 
-  .nav-label {
+  .nav-label,
+  .themebtn-label {
     display: inline;
+  }
+
+  /* The rail's glyph-only toggle and hidden actions are undone here: the
+     sidebar is a full-width bar again, so the labels fit. */
+  .sidebar-actions .compact-button {
+    display: inline-flex;
+  }
+
+  .sidebar-actions .themebtn {
+    padding: 7px 12px;
   }
 
   .seat-footer {
@@ -2941,7 +3023,7 @@ textarea[aria-invalid="true"] {
   height: 10px;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: 0;
   background: var(--field);
 }
 
@@ -2963,5 +3045,310 @@ textarea[aria-invalid="true"] {
 @media (max-width: 1100px) {
   .analytics-strip {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ---------- Home (rebuilt): title row, search, three numbers, needs, recent ---------- */
+
+.home-heading {
+  align-items: flex-start;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.home-synced {
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* The search bar is the widest element on the page, deliberately: human search
+   was the requirement, and it used to be a nav item you had to go and find. */
+.home-search {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.home-search-label {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.home-search-row {
+  display: flex;
+  gap: 8px;
+}
+
+.home-search-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 15px;
+  padding: 12px 14px;
+}
+
+.home-search-button {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 0 20px;
+}
+
+.home-numbers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.number-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.number-value {
+  font-size: 30px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  color: var(--text);
+}
+
+.number-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* Only the third number is ever coloured, and only when it is not zero. */
+.number-card.is-waiting {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+}
+
+.number-card.is-waiting .number-value {
+  color: var(--warning);
+}
+
+/* ---------- Needs you / Review rows ---------- */
+
+.needs-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.needs-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border-quiet);
+}
+
+.needs-item:first-child {
+  border-top: 0;
+}
+
+.needs-main {
+  min-width: 0;
+}
+
+.needs-main strong {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.needs-main p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.needs-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 8px 0 0;
+}
+
+.needs-meta dt {
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.needs-meta dd {
+  margin: 1px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.needs-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.needs-approve {
+  width: auto;
+  padding: 0 12px;
+}
+
+.needs-clear {
+  padding: 10px 0 2px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.needs-more {
+  align-self: flex-start;
+  margin-top: 12px;
+}
+
+/* ---------- Search: one column, chips, grouped results ---------- */
+
+.search-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto;
+}
+
+.search-query-panel {
+  padding: 18px 20px;
+}
+
+.search-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.search-query-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.search-query-row {
+  display: flex;
+  gap: 8px;
+}
+
+.search-query-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 15px;
+  padding: 12px 14px;
+}
+
+.search-submit {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 0 20px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.filter-row-label {
+  min-width: 44px;
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  min-height: 28px;
+  padding: 3px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color var(--speed) ease-out,
+    background-color var(--speed) ease-out,
+    color var(--speed) ease-out;
+}
+
+.chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chip.is-on {
+  border-color: var(--primary-border);
+  background: var(--primary-soft);
+  color: var(--primary-strong);
+  font-weight: 600;
+}
+
+.result-group + .result-group {
+  margin-top: 18px;
+}
+
+/* Central, then shared traces, then Node — matching the CLI's section order. */
+.result-group-title {
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 780px) {
+  .home-numbers {
+    grid-template-columns: 1fr;
+  }
+
+  .home-search-row,
+  .search-query-row {
+    flex-direction: column;
+  }
+
+  .home-search-button,
+  .search-submit {
+    width: 100%;
+  }
+
+  .needs-item {
+    flex-direction: column;
+    gap: 10px;
   }
 }

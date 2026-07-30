@@ -1,66 +1,64 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" role="img" aria-label="Citadel Pixel Bastion">
-  <!-- 7×7 mark: 8px cells, 2px gaps, 2px pad → 72×72 (1:1 at hero size) -->
-  <rect class="chrome" width="72" height="72" rx="14" fill="#0B0F0E" stroke="rgba(250,0,140,0.32)" stroke-width="1.5"/>
-  <!-- Row 0 — battlements -->
-  <rect x="2" y="2" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="22" y="2" width="8" height="8" rx="1" fill="#B246AD"/>
-  <rect x="42" y="2" width="8" height="8" rx="1" fill="#6A8DCD"/>
-  <rect x="62" y="2" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 1 — wall -->
-  <rect x="2" y="12" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="12" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect x="22" y="12" width="8" height="8" rx="1" fill="#B246AD"/>
-  <rect x="32" y="12" width="8" height="8" rx="1" fill="#8E6ABD"/>
-  <rect x="42" y="12" width="8" height="8" rx="1" fill="#6A8DCD"/>
-  <rect x="52" y="12" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="12" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 2 — wall + windows -->
-  <rect x="2" y="22" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="22" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect class="window" x="22" y="22" width="8" height="8" rx="1" fill="#B246AD"/>
-  <rect x="32" y="22" width="8" height="8" rx="1" fill="#8E6ABD"/>
-  <rect class="window" x="42" y="22" width="8" height="8" rx="1" fill="#6A8DCD"/>
-  <rect x="52" y="22" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="22" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 3 — wall + windows -->
-  <rect x="2" y="32" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="32" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect class="window" x="22" y="32" width="8" height="8" rx="1" fill="#B246AD"/>
-  <rect x="32" y="32" width="8" height="8" rx="1" fill="#8E6ABD"/>
-  <rect class="window" x="42" y="32" width="8" height="8" rx="1" fill="#6A8DCD"/>
-  <rect x="52" y="32" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="32" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 4 — wall -->
-  <rect x="2" y="42" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="42" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect x="22" y="42" width="8" height="8" rx="1" fill="#B246AD"/>
-  <rect x="32" y="42" width="8" height="8" rx="1" fill="#8E6ABD"/>
-  <rect x="42" y="42" width="8" height="8" rx="1" fill="#6A8DCD"/>
-  <rect x="52" y="42" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="42" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 5 — gate -->
-  <rect x="2" y="52" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="52" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect x="52" y="52" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="52" width="8" height="8" rx="1" fill="#22D3EE"/>
-  <!-- Row 6 — gate -->
-  <rect x="2" y="62" width="8" height="8" rx="1" fill="#FA008C"/>
-  <rect x="12" y="62" width="8" height="8" rx="1" fill="#D6239C"/>
-  <rect x="52" y="62" width="8" height="8" rx="1" fill="#46B0DE"/>
-  <rect x="62" y="62" width="8" height="8" rx="1" fill="#22D3EE"/>
+  <!-- Canonical Citadel mark. 7x7, 8px cells, 2px gaps, 2px pad -> 72x72.
+       Square cells, no chrome box, one Iris gradient per cell (matches the
+       CSS mark in the web nav: linear-gradient(135deg, #FF51FF, #C010A0)).
+       Generated - do not hand-edit one copy, they must stay identical. -->
+  <defs>
+    <linearGradient id="ctd" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF51FF"/>
+      <stop offset="1" stop-color="#C010A0"/>
+    </linearGradient>
+  </defs>
+  <!-- row 0 -->
+  <rect x="2" y="2" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="22" y="2" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="42" y="2" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="2" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 1 -->
+  <rect x="2" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="22" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="42" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="12" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 2 -->
+  <rect x="2" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect class="w" x="22" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect class="w" x="42" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="22" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 3 -->
+  <rect x="2" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect class="w" x="22" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect class="w" x="42" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="32" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 4 -->
+  <rect x="2" y="42" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="42" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="42" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="42" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="42" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 5 -->
+  <rect x="2" y="52" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="52" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="52" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="52" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="52" width="8" height="8" fill="url(#ctd)"/>
+  <!-- row 6 -->
+  <rect x="2" y="62" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="12" y="62" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="32" y="62" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="52" y="62" width="8" height="8" fill="url(#ctd)"/>
+  <rect x="62" y="62" width="8" height="8" fill="url(#ctd)"/>
   <style>
-    @keyframes ctdBlink {
-      0%, 86%, 100% { opacity: 1; }
-      90%, 96% { opacity: 0; }
-    }
-    @keyframes ctdGlow {
-      0%, 100% { stroke: rgba(250,0,140,0.2); }
-      50% { stroke: rgba(250,0,140,0.6); }
-    }
-    .window { animation: ctdBlink 3.4s ease-in-out infinite; }
-    .chrome { animation: ctdGlow 2.6s ease-in-out infinite; }
-    @media (prefers-reduced-motion: reduce) {
-      .window, .chrome { animation: none; }
-    }
+    @keyframes ctdBlink { 0%, 86%, 100% { opacity: 1; } 90%, 96% { opacity: 0; } }
+    .w { animation: ctdBlink 3.4s ease-in-out infinite; }
+    @media (prefers-reduced-motion: reduce) { .w { animation: none; } }
   </style>
 </svg>
