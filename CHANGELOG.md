@@ -38,17 +38,14 @@ All notable changes to `citadel-archive` are documented here. Format follows
   `repo_stats_interval_seconds` (default 86400) and fails soft to the cached
   copy, because unauthenticated GitHub allows 60 requests an hour and a public
   page must not spend them.
-- **The Next port covers Search, Admin and Explore** behind `/next/app/*`,
-  alongside the public pages. Search groups hits Central, then session traces,
-  then Node, and a test imports the section order and labels from `kb/cli.py` so
-  the web copy cannot drift from what the CLI does. Admin is four tabs in one
-  document; seat-less tokens get their own table stating the consequence per row
-  rather than leaving an operator to read "invalid token" into a
-  `DatasetNotFoundError`, and the audit log pages server-side with a cursor.
-  Explore keeps `force-graph` and loads it from `kb/static/vendor/` at runtime,
-  so the export carries no second copy and only opening Explore pays the 174 KB.
-  Seat and token minting, the capture-policy editor, and Activity are all
-  deliberately absent, and the pages say so rather than shipping a stub.
+- **The Next port adds the app shell and Review** behind `/next/app/*`, alongside
+  the public pages. Review is the one app view actually ported: the promotion
+  queue plus the sources that are failing, and the only place in the app with
+  Approve and Reject. Search and Admin are routable but render a placeholder
+  naming what each will become, and there is no Explore page or route yet, so
+  `/next/app/explore` is a 404. Seat and token minting, the capture-policy
+  editor, and Activity are absent too. Every placeholder says so rather than
+  shipping a stub that looks finished.
 
 ### Changed
 
