@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           # Vulnerabilities below "high" are reported in the job summary but do
           # not block; the dependency is often transitive and unfixable in the
