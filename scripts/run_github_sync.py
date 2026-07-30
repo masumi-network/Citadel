@@ -7,6 +7,7 @@ non-zero when the scheduler should mark the run as failed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -226,7 +227,14 @@ def _print_result(result: dict[str, Any]) -> None:
     print(json.dumps(_public_summary(result), indent=2, default=str))
 
 
-def run() -> int:
+async def arun() -> int:
+    """The body of :func:`run`, awaitable on the caller's own event loop.
+
+    The evolve scheduler runs this inside the web process's loop (#88), where
+    ``run_async`` is unusable: it falls back to ``asyncio.run``, which raises
+    inside a running loop. Blocking HTTP moves to a thread so the web's request
+    loop is not stalled for the duration of the sync.
+    """
     force = _bool(os.getenv("CITADEL_GITHUB_SYNC_FORCE"), default=False)
     dry_run = _bool(os.getenv("CITADEL_GITHUB_SYNC_DRY_RUN"), default=False)
     post_to_chat = _bool(os.getenv("CITADEL_ORG_DIGEST_POST_TO_CHAT"), default=True)
@@ -252,7 +260,8 @@ def run() -> int:
             )
             return 1
         logger.info("Starting scheduled GitHub sync through %s", endpoint)
-        status_code, result = _post_json(
+        status_code, result = await asyncio.to_thread(
+            _post_json,
             endpoint,
             payload=payload,
             access_key=access_key,
@@ -267,16 +276,11 @@ def run() -> int:
             return 1
     else:
         logger.info("Starting scheduled GitHub sync in-process")
-        # run_async, not asyncio.run: in the evolve chain this shares the one stage
-        # loop so cognee's cached engine is not bound to a throwaway loop (#69).
-        # Standalone (no shared loop) it falls back to asyncio.run.
-        result = run_async(
-            _run_local(
-                force=force,
-                dry_run=dry_run,
-                post_to_chat=post_to_chat,
-                include_digest_preview=include_digest_preview,
-            )
+        result = await _run_local(
+            force=force,
+            dry_run=dry_run,
+            post_to_chat=post_to_chat,
+            include_digest_preview=include_digest_preview,
         )
 
     if result.get("ok") is False:
@@ -286,6 +290,16 @@ def run() -> int:
     _log_result(result)
     _print_result(result)
     return 0
+
+
+def run() -> int:
+    """Synchronous entrypoint for the CLI and the standalone cron service.
+
+    run_async, not asyncio.run: in the evolve chain this shares the one stage
+    loop so cognee's cached engine is not bound to a throwaway loop (#69).
+    Standalone (no shared loop) it falls back to asyncio.run.
+    """
+    return run_async(arun())
 
 
 def main() -> None:

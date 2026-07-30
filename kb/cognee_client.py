@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import os
+from collections.abc import Iterator
 from time import monotonic, perf_counter
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
@@ -65,12 +68,39 @@ def assert_cognee_dataset_api() -> None:
     from cognee.modules.users.methods import get_default_user  # noqa: F401
 
 
-def _suppress_inline_cognify() -> bool:
-    """True when this process must ADD only and never cognify (Kuzu write).
+_SUPPRESS_INLINE_COGNIFY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "citadel_suppress_inline_cognify", default=False
+)
 
-    Set on the evolve Phase-1 subprocess so it cannot write Kuzu while the web
-    process owns the single writer (#47); the web cognifies in Phase 2.
+
+@contextlib.contextmanager
+def suppress_inline_cognify() -> Iterator[None]:
+    """Make this task tree ADD only, without touching the rest of the process.
+
+    The evolve Phase 1 used to be a subprocess carrying
+    CITADEL_SUPPRESS_INLINE_COGNIFY=true in its env. Now that it runs inside the
+    web process (#88), an env var would be the wrong tool: it is process-wide, so
+    a teammate's ingest arriving during the ~30s pass would silently go add-only
+    too. A context variable is scoped to this task tree, and asyncio propagates
+    it into child tasks and ``asyncio.to_thread`` calls, which is exactly the
+    reach the stages need and no further.
     """
+    token = _SUPPRESS_INLINE_COGNIFY.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_INLINE_COGNIFY.reset(token)
+
+
+def _suppress_inline_cognify() -> bool:
+    """True when this caller must ADD only and never cognify (Kuzu write).
+
+    Set by :func:`suppress_inline_cognify` around the in-loop evolve Phase 1, or
+    process-wide by CITADEL_SUPPRESS_INLINE_COGNIFY for the standalone evolve
+    entrypoint. Either way the web cognifies in Phase 2 as the sole writer (#47).
+    """
+    if _SUPPRESS_INLINE_COGNIFY.get():
+        return True
     return os.getenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "").strip().lower() in {
         "1",
         "true",
