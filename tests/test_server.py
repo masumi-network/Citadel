@@ -5984,3 +5984,56 @@ def test_a_normal_search_is_still_audited_as_a_success() -> None:
 
     assert body.get("timed_out") in (None, False)
     assert audited and audited[-1]["success"] is True
+
+
+def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/api/mesh must report the real corpus, not what this process happens to
+    have seen since it booted.
+
+    ADR-0018 added a `corpus` parameter to MeshState.snapshot for this, but this
+    endpoint, the one the dashboard actually reads, kept calling snapshot without
+    it. Production served `documents: 1, indexed_chunks: 1` against a real 17991
+    indexed docs, so a healthy vault rendered as empty on login. The parameter
+    existed and was simply never passed, which no test caught because every test
+    asserted on snapshot() directly rather than through the endpoint.
+    """
+    client = authed_client()
+
+    async def fake_corpus_health() -> dict[str, Any]:
+        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+
+    monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
+
+    stats = client.get("/api/mesh").json()["stats"]
+
+    assert stats["documents"] == 317, stats
+    assert stats["indexed_chunks"] == 17991, stats
+    # The uptime figures are still reported, just no longer disguised as totals.
+    assert "since_restart" in stats
+    assert stats["since_restart"]["documents"] != 317
+
+
+def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded corpus read must not blank the dashboard or 500.
+
+    `_corpus_health` is fail-soft and returns None totals on a transient graph
+    error. The endpoint has to survive that, because the alternative is that one
+    slow Kuzu read takes the whole dashboard down.
+    """
+    client = authed_client()
+
+    async def degraded_corpus_health() -> dict[str, Any]:
+        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": "boom"}
+
+    monkeypatch.setattr(server_module, "_corpus_health", degraded_corpus_health)
+
+    response = client.get("/api/mesh")
+
+    assert response.status_code == 200
+    stats = response.json()["stats"]
+    assert stats["documents"] is not None
+    assert stats["indexed_chunks"] is not None
