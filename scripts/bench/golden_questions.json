@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "created_at": "2026-07-31",
   "corpus": "repo_content sync of masumi-network/{sokosumi,Sokosumi-MCP,sokosumi-cli,sokosumi-docs}",
   "notes": [
@@ -9,41 +9,52 @@
     "repos, so more than one document legitimately answers the question.",
     "Questions marked expected_recall 0 target documents the security scanner",
     "blocks at ingest time. They should MISS. If they ever start hitting, either",
-    "the block was lifted or the answer leaked in from another document."
+    "the block was lifted or the answer leaked in from another document.",
+    "v2 (2026-07-31): widened from 24 to cover Linear (previously zero coverage, 200 freshly synced issues) and repo-content files the first set never reached. Linear ground truth is `linear:<IDENTIFIER>`, matched off the `# Linear SOK-123:` header the syncer writes."
   ],
   "questions": [
     {
       "id": "q01",
       "question": "What is the structure of the Sokosumi monorepo?",
-      "expect_any": ["masumi-network/sokosumi/README.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/README.md"
+      ],
       "category": "repo_overview",
       "expected_recall": 1
     },
     {
       "id": "q02",
       "question": "How does a cloud agent connect to the database in Sokosumi?",
-      "expect_any": ["masumi-network/sokosumi/docs/agents/cloud-agent-database.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/cloud-agent-database.md"
+      ],
       "category": "architecture",
       "expected_recall": 1
     },
     {
       "id": "q03",
       "question": "Which issue tracker does the Sokosumi project use?",
-      "expect_any": ["masumi-network/sokosumi/docs/agents/issue-tracker.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/issue-tracker.md"
+      ],
       "category": "process",
       "expected_recall": 1
     },
     {
       "id": "q04",
       "question": "What triage labels are used on Sokosumi issues?",
-      "expect_any": ["masumi-network/sokosumi/docs/agents/triage-labels.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/triage-labels.md"
+      ],
       "category": "process",
       "expected_recall": 1
     },
     {
       "id": "q05",
       "question": "How do vendor workspace grants work in the Coworker API?",
-      "expect_any": ["masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"
+      ],
       "category": "api",
       "expected_recall": 1
     },
@@ -60,7 +71,9 @@
     {
       "id": "q07",
       "question": "What does the coworker chat cold-start benchmark measure?",
-      "expect_any": ["masumi-network/sokosumi/docs/coworker/benchmarks/README.md"],
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/benchmarks/README.md"
+      ],
       "category": "benchmark",
       "expected_recall": 1
     },
@@ -124,14 +137,18 @@
     {
       "id": "q14",
       "question": "How do I install the Sokosumi shortcuts?",
-      "expect_any": ["masumi-network/Sokosumi-MCP/skills/install-shortcuts/SKILL.md"],
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/install-shortcuts/SKILL.md"
+      ],
       "category": "skill",
       "expected_recall": 1
     },
     {
       "id": "q15",
       "question": "What is the Sokosumi CLI and what does it do?",
-      "expect_any": ["masumi-network/sokosumi-cli/README.md"],
+      "expect_any": [
+        "masumi-network/sokosumi-cli/README.md"
+      ],
       "category": "repo_overview",
       "expected_recall": 1
     },
@@ -186,18 +203,22 @@
     {
       "id": "b01",
       "question": "How do I debug a failing Sokosumi MCP connection?",
-      "expect_any": ["masumi-network/Sokosumi-MCP/docs/DEBUG_CONNECTION.md"],
-      "category": "blocked_probe",
-      "expected_recall": 0,
-      "blocked_reason": "secret_assignment x5"
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/docs/DEBUG_CONNECTION.md"
+      ],
+      "category": "was_blocked_probe",
+      "expected_recall": 1,
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
     },
     {
       "id": "b02",
       "question": "What are the agent guidelines for working in the Sokosumi CLI repository?",
-      "expect_any": ["masumi-network/sokosumi-cli/AGENTS.md"],
-      "category": "blocked_probe",
-      "expected_recall": 0,
-      "blocked_reason": "secret_assignment x2"
+      "expect_any": [
+        "masumi-network/sokosumi-cli/AGENTS.md"
+      ],
+      "category": "was_blocked_probe",
+      "expected_recall": 1,
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
     },
     {
       "id": "b03",
@@ -205,9 +226,9 @@
       "expect_any": [
         "masumi-network/sokosumi/docs/superpowers/plans/2026-06-12-admin-user-overview.md"
       ],
-      "category": "blocked_probe",
-      "expected_recall": 0,
-      "blocked_reason": "unsafe_url_scheme (data: in a JS snippet)"
+      "category": "was_blocked_probe",
+      "expected_recall": 1,
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
     },
     {
       "id": "b04",
@@ -215,9 +236,350 @@
       "expect_any": [
         "masumi-network/sokosumi/docs/superpowers/plans/2026-07-27-task-credit-pause-timeline-ux.md"
       ],
-      "category": "blocked_probe",
-      "expected_recall": 0,
-      "blocked_reason": "unsafe_url_scheme (data: in a JS snippet)"
+      "category": "was_blocked_probe",
+      "expected_recall": 1,
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
+    },
+    {
+      "id": "l01",
+      "question": "Why was the coworker pending-response mirror TTL renewed for long room streams?",
+      "expect_any": [
+        "linear:SOK-673"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l02",
+      "question": "What is planned for shared compose file upload of markdown and chat attachments?",
+      "expect_any": [
+        "linear:SOK-672"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l03",
+      "question": "What happens to legacy conversation storage and APIs after the rooms cutover?",
+      "expect_any": [
+        "linear:SOK-671",
+        "linear:SOK-657"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l04",
+      "question": "How should DESIGN.md blobs be scoped by user or organization owner?",
+      "expect_any": [
+        "linear:SOK-670"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l05",
+      "question": "Where should vendor logos be stored?",
+      "expect_any": [
+        "linear:SOK-669"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l06",
+      "question": "How are chat attachments scoped away from the personal user blob prefix?",
+      "expect_any": [
+        "linear:SOK-668"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l07",
+      "question": "What is JobFile and how do job-scoped direct Blob uploads work?",
+      "expect_any": [
+        "linear:SOK-667"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l08",
+      "question": "Where should organization logos be stored?",
+      "expect_any": [
+        "linear:SOK-666"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l09",
+      "question": "What is the plan for domain-scoped blob uploads beyond the user prefix?",
+      "expect_any": [
+        "linear:SOK-665"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l10",
+      "question": "How does archiving a schedule template affect its occurrence children?",
+      "expect_any": [
+        "linear:SOK-664"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l11",
+      "question": "Can scheduled tasks created by other coworkers be archived or cancelled?",
+      "expect_any": [
+        "linear:SOK-663"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l12",
+      "question": "How were personal assistant plan-coverage checks sped up on Core hot paths?",
+      "expect_any": [
+        "linear:SOK-661"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l13",
+      "question": "What should happen when the chat organization member roster fails to load?",
+      "expect_any": [
+        "linear:SOK-660"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l14",
+      "question": "How was room-stream parity restored with the legacy coworker chat?",
+      "expect_any": [
+        "linear:SOK-659"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l15",
+      "question": "How was room stream turn dedup hardened without relying only on Redis?",
+      "expect_any": [
+        "linear:SOK-658"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l16",
+      "question": "How are coworker DM thread replies supported via the room stream?",
+      "expect_any": [
+        "linear:SOK-656"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l17",
+      "question": "How does Pheme make UI links optional on progress comments?",
+      "expect_any": [
+        "linear:DEVREL-130"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l18",
+      "question": "How does Pheme separate useful progress comments from clean final replies?",
+      "expect_any": [
+        "linear:DEVREL-129"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l19",
+      "question": "How does Pheme support X posts longer than 280 characters?",
+      "expect_any": [
+        "linear:DEVREL-127"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l20",
+      "question": "How does Pheme avoid billing skipped immediate-publish duplicates?",
+      "expect_any": [
+        "linear:DEVREL-126"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l21",
+      "question": "How was immediate publishing made idempotent under concurrency?",
+      "expect_any": [
+        "linear:DEVREL-125"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "l22",
+      "question": "How does Pheme resolve task traces from Sokosumi share links?",
+      "expect_any": [
+        "linear:DEVREL-123"
+      ],
+      "category": "linear_issue",
+      "expected_recall": 1
+    },
+    {
+      "id": "r01",
+      "question": "What is coworker metadata and what does it describe?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker-metadata.md"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "r02",
+      "question": "How do Hermes orchestrator approve overrides work?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/hermes-orchestrator-approve-overrides.md",
+        "masumi-network/sokosumi/docs/orchestrator/hermes-orchestrator-actor.md"
+      ],
+      "category": "architecture",
+      "expected_recall": 1
+    },
+    {
+      "id": "r03",
+      "question": "What is in the Sokosumi domain documentation for agents?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/domain.md"
+      ],
+      "category": "architecture",
+      "expected_recall": 1
+    },
+    {
+      "id": "r04",
+      "question": "What does the Hannah skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/hannah/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/hannah/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r05",
+      "question": "What does the Sokosumi Jobs skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/jobs/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/jobs/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r06",
+      "question": "What does the Market skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/market/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/market/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r07",
+      "question": "What does the Research skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/research/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/research/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r08",
+      "question": "What does the Sokosumi Watch skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/watch/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/watch/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r09",
+      "question": "How do I set up Sokosumi?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/setup/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r10",
+      "question": "What does the Sokosumi Tasks skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/tasks/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/tasks/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "r11",
+      "question": "What is in the Sokosumi API reference?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/api-reference/index.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "r12",
+      "question": "What does the Sokosumi CLI documentation cover?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/cli_docs/index.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "r13",
+      "question": "What is Hermes in the Sokosumi documentation?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/documentation/hermes.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "r14",
+      "question": "How does organization management work in Sokosumi?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/documentation/organization.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "r15",
+      "question": "What is the chat rooms cutover deprecating conversations?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
     }
   ]
 }
