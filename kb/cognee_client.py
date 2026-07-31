@@ -443,13 +443,30 @@ class CogneePublicClient:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return  # no running loop (sync caller); nothing to schedule
+            # Silent here meant content was recorded as ingested and never
+            # reached the graph, with nothing in the logs either way. cognee.add
+            # writes the relational and vector stores; ONLY cognify writes Kuzu.
+            # Skipping it makes a document that exists as a row and cannot be
+            # retrieved. Say so.
+            logger.error(
+                "cognify NOT scheduled for %s: no running event loop. The data "
+                "is stored but will not be searchable until a cognify runs.",
+                wanted,
+            )
+            return
 
         async def _run() -> None:
             try:
                 await self.cognify(datasets=wanted)
             except Exception:  # noqa: BLE001 - background task: log, never crash the loop
                 logger.exception("background cognify for datasets %s failed", wanted)
+            else:
+                # Log SUCCESS too. Previously only failures were logged, so a
+                # cognify that never ran — because the process exited before this
+                # detached task was scheduled — was indistinguishable in the logs
+                # from one that completed. That is how a whole repository stayed
+                # missing from the index while every surface reported it synced.
+                logger.info("background cognify finished for datasets %s", wanted)
 
         task = loop.create_task(_run())
         _BACKGROUND_COGNIFY_TASKS.add(task)

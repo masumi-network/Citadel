@@ -11,6 +11,7 @@ from kb.github_sync import GitHubAPIError
 from kb.models import IngestResult
 from kb.repo_content_sync import (
     DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS,
+    STATE_VERSION,
     RepoContentFile,
     RepoContentGitHubClient,
     RepoContentSyncer,
@@ -39,8 +40,19 @@ class FakeLearningProcess:
     async def learn(self, data: str, **kwargs: Any) -> Any:
         self.calls.append({"data": data, **kwargs})
 
+        # A realistic cognee payload. The syncer now requires evidence of what
+        # cognee actually assigned before it will treat a file as done, so a
+        # fake that reports "accepted" with no data id models precisely the
+        # unverifiable claim that left 12 files permanently skipped.
+        self._seq = getattr(self, "_seq", 0) + 1
+        cognee_result = {
+            "added": {"data_ingestion_info": [{"data_id": f"data-{self._seq}"}]}
+        }
+
         class Outcome:
-            ingest = IngestResult(True, "accepted", kwargs.get("dataset", "x"), ())
+            ingest = IngestResult(
+                True, "accepted", kwargs.get("dataset", "x"), (), cognee_result
+            )
             chunk_ingests = ()
             improve = {"ok": True} if kwargs.get("run_improve") else None
 
@@ -644,3 +656,76 @@ async def test_state_is_checkpointed_per_file_so_a_killed_run_resumes(
     assert result["files_ingested"] == 1
     assert result["files_skipped_by_reason"].get("unchanged") == 1
     assert len(resumed_learning.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_state_entry_without_a_cognee_id_is_re_ingested(tmp_path: Path) -> None:
+    """State repair, and the reason 12 files stayed missing from the index.
+
+    Ingest reports `accepted` as soon as cognee.add() returns, but add() writes
+    only the relational and vector stores — the graph write is a DETACHED
+    background cognify that can silently never run (no event loop, or the
+    process exits first). A state entry holding just sha + content_hash
+    therefore records "we told ourselves we ingested this", and `unchanged`
+    made that permanent: the file was never retried, while being absent from
+    the index.
+
+    Requiring evidence of what cognee assigned repairs such entries on the next
+    ordinary sync rather than needing a forced re-sync. Safe to re-ingest now
+    that ADR-0016 made an unchanged file render byte-identically, so cognee's
+    content-addressed ingestion resolves it to the same id instead of a copy.
+    """
+    state_path = tmp_path / "state.json"
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+    # A legacy entry: correct sha and hash, no evidence it ever reached the graph.
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": STATE_VERSION,
+                "files": {
+                    "masumi-network/sokosumi-cli/README.md": {
+                        "sha": "abc",
+                        "content_hash": FakeRepoContentClient()
+                        .fetch_file_text(
+                            "masumi-network/sokosumi-cli", "README.md", ref="commit123"
+                        )
+                        .content_hash,
+                        "last_ingested_at": "2026-06-01T00:00:00Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+
+    assert result["files_ingested"] == 2, result["files_skipped_by_reason"]
+    repaired = json.loads(state_path.read_text(encoding="utf-8"))["files"]
+    entry = repaired["masumi-network/sokosumi-cli/README.md"]
+    assert entry["cognee_data_ids"], "repaired entry must record what cognee assigned"
+
+    # And once repaired, it goes quiet again rather than re-ingesting forever.
+    second = await syncer.run()
+    assert second["files_ingested"] == 0
+    assert second["files_skipped_by_reason"] == {"unchanged": 2}
