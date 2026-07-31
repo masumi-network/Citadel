@@ -90,15 +90,24 @@ class Citadel:
                 "Ingest rejected for dataset %s: duplicate_in_process", target_dataset
             )
             return IngestResult(False, "duplicate_in_process", target_dataset, merged_tags)
+        # Claimed BEFORE the await so two concurrent ingests of identical content
+        # cannot both pass the check, and released again if the write fails. It
+        # used to be added and never removed, so one failed remember() marked that
+        # content "seen" for the life of the process: every retry then returned
+        # duplicate_in_process, and a caller that only records state on success
+        # (repo_content_sync) could never recover the file.
         self._seen_ingest_keys.add(ingest_key)
-
-        result = await self.cognee.remember(
-            data,
-            dataset_name=target_dataset,
-            session_id=session_id,
-            tags=merged_tags,
-            defer_cognify=defer_cognify,
-        )
+        try:
+            result = await self.cognee.remember(
+                data,
+                dataset_name=target_dataset,
+                session_id=session_id,
+                tags=merged_tags,
+                defer_cognify=defer_cognify,
+            )
+        except BaseException:
+            self._seen_ingest_keys.discard(ingest_key)
+            raise
         return IngestResult(True, "accepted", target_dataset, merged_tags, result)
 
     def _guard_content(self, data: str, dataset: str) -> None:

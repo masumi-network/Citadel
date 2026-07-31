@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+
+# The real cognee return type. Imported, never hand-rolled: a fake that invents a
+# third-party's shape can only prove that our parser parses the fake.
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 
 from kb.config import CitadelConfig
 from kb.github_sync import GitHubAPIError
@@ -12,6 +17,7 @@ from kb.models import IngestResult
 from kb.repo_content_sync import (
     DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS,
     STATE_VERSION,
+    _cognee_data_ids,
     RepoContentFile,
     RepoContentGitHubClient,
     RepoContentSyncer,
@@ -40,13 +46,29 @@ class FakeLearningProcess:
     async def learn(self, data: str, **kwargs: Any) -> Any:
         self.calls.append({"data": data, **kwargs})
 
-        # A realistic cognee payload. The syncer now requires evidence of what
-        # cognee actually assigned before it will treat a file as done, so a
-        # fake that reports "accepted" with no data id models precisely the
-        # unverifiable claim that left 12 files permanently skipped.
-        self._seq = getattr(self, "_seq", 0) + 1
+        # The REAL cognee return type, imported from the installed package, not a
+        # dict invented here. The previous fake returned
+        # {"added": {"data_ingestion_info": [...]}}; cognee actually returns a
+        # PipelineRunInfo model wrapped as {"added": <model>}, so _cognee_data_ids
+        # extracted nothing in production while this fake made it look correct.
+        # Every direction of the test passed against a shape that does not exist.
+        # A fake may only specify a contract we own; for a third-party return
+        # value it has to be the third party's own type.
+        #
+        # The id is derived from the content, because cognee is content-addressed
+        # and returns the SAME data_id for a byte-identical document. That is the
+        # premise ADR-0016 relies on, and a per-call counter contradicted it.
         cognee_result = {
-            "added": {"data_ingestion_info": [{"data_id": f"data-{self._seq}"}]}
+            "added": PipelineRunCompleted(
+                pipeline_run_id=uuid5(NAMESPACE_URL, f"run:{data}"),
+                dataset_id=uuid5(NAMESPACE_URL, str(kwargs.get("dataset", "x"))),
+                dataset_name=str(kwargs.get("dataset", "x")),
+                payload=None,
+                data_ingestion_info=[
+                    {"data_id": str(uuid5(NAMESPACE_URL, f"data:{data}"))}
+                ],
+            ),
+            "background_cognify": True,
         }
 
         class Outcome:
@@ -729,3 +751,51 @@ async def test_a_state_entry_without_a_cognee_id_is_re_ingested(tmp_path: Path) 
     second = await syncer.run()
     assert second["files_ingested"] == 0
     assert second["files_skipped_by_reason"] == {"unchanged": 2}
+
+
+def test_cognee_data_ids_reads_the_real_cognee_return_type() -> None:
+    """Pin the extraction against cognee's ACTUAL type, not a fake of our own.
+
+    This is the test that was missing. `_cognee_data_ids` used to gate on
+    `isinstance(added, dict)`, and every fake in the suite returned a dict, so
+    the whole suite agreed with the bug. In production `cognee.add()` returns a
+    `PipelineRunInfo` model and the gate was always taken, so the helper returned
+    `[]` for every file and the sync could never converge.
+
+    Constructing the real type here means a cognee upgrade that changes the shape
+    fails HERE, loudly, instead of degrading into a silent livelock in prod.
+    """
+    data_id = "1b4196ac-5cb8-4e5f-abe2-a5ba8f42c2f2"
+    real = PipelineRunCompleted(
+        pipeline_run_id=uuid5(NAMESPACE_URL, "run"),
+        dataset_id=uuid5(NAMESPACE_URL, "ds"),
+        dataset_name="masumi-network",
+        payload=None,
+        data_ingestion_info=[{"data_id": data_id}],
+    )
+
+    def outcome(cognee_result: Any) -> Any:
+        ingest = IngestResult(True, "accepted", "masumi-network", (), cognee_result)
+
+        class Outcome:
+            all_ingests = (ingest,)
+
+        return Outcome()
+
+    # It must NOT be a dict. If this ever becomes one, the fallback below is what
+    # keeps working, but we want to know the contract changed.
+    assert not isinstance(real, dict)
+
+    # Every branch CogneePublicClient.remember can return (kb/cognee_client.py).
+    for extra in ({"background_cognify": True}, {"cognify": "suppressed"}, {"cognify": "deferred"}):
+        assert _cognee_data_ids(outcome({"added": real, **extra})) == [data_id]
+
+    # Forward compatibility: a future cognee returning a plain mapping still works.
+    assert _cognee_data_ids(
+        outcome({"added": {"data_ingestion_info": [{"data_id": "d-9"}]}})
+    ) == ["d-9"]
+
+    # Genuinely empty stays empty, so the guard still refuses to trust a
+    # claim it cannot check.
+    assert _cognee_data_ids(outcome({"added": {}})) == []
+    assert _cognee_data_ids(outcome(None)) == []
