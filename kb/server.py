@@ -2593,7 +2593,24 @@ def with_result_metadata(
     }
     if drilldown_available:
         metadata["document_endpoint"] = document_endpoint
-    if dataset == SESSION_TRACES_DATASET or shared_trace:
+    # Classify BEFORE deciding trust, because the two questions have different
+    # authorities and conflating them is what broke `mode="docs"`.
+    #
+    # `dataset == SESSION_TRACES_DATASET` is attested: the hit was genuinely read
+    # out of the traces dataset, so `reference-only` is honest (ADR-0012).
+    # `shared_trace` is NOT attested — it is assigned by matching chunk TEXT
+    # against that dataset (search_across_datasets), so any document a trace
+    # quotes verbatim inherits it. Source-linked repository documentation carries
+    # a full Repository/Source/Commit/Blob header the repo-content syncer wrote,
+    # which a text collision cannot fake, so it keeps its own identity.
+    #
+    # ADR-0017 applied that exception to `doc_type` but left `trust` demoted
+    # unconditionally, so Central documentation still came back labelled as a
+    # trace's trust tier. This finishes it: the exception now governs both.
+    preview = {**normalized, "_citadel": metadata}
+    inferred = infer_doc_type(preview)
+    source_linked = inferred == DOC_TYPE_CANONICAL
+    if dataset == SESSION_TRACES_DATASET or (shared_trace and not source_linked):
         metadata["trust"] = "reference-only"
         author_seat = _trace_author_seat(normalized)
         if author_seat:
@@ -2601,25 +2618,11 @@ def with_result_metadata(
         created_at = _trace_created_at(normalized)
         if created_at:
             metadata["created_at"] = created_at
-    # Infer against in-progress metadata so dataset/trust are visible
-    # (raw hits do not yet carry ``_citadel``).
-    preview = {**normalized, "_citadel": metadata}
-    # ``reference-only`` is attested by the dataset, so it outranks anything the
-    # body text would suggest — otherwise a trace whose text mentions /skills/
-    # classifies as a skill doc and reads as verified knowledge.
-    #
-    # The one exception is source-linked repository documentation, which carries
-    # a full Repository/Source/Commit/Blob header written by the repo-content
-    # syncer. A shared-trace marker is assigned by matching chunk TEXT against
-    # the session-traces dataset (search_across_datasets), so any document a
-    # trace happens to quote verbatim inherits ``reference-only`` and was then
-    # relabelled a trace. That is how every hit on this node — READMEs, SKILL.md,
-    # design specs — came back as ``session-trace`` and why ``mode="docs"``
-    # matched nothing. Structural provenance in the body beats a text collision.
-    inferred = infer_doc_type(preview)
+        # Re-derive against the now-populated trust so downstream inference sees it.
+        preview = {**normalized, "_citadel": metadata}
     doc_type = (
         DOC_TYPE_TRACE
-        if metadata.get("trust") == "reference-only" and inferred != DOC_TYPE_CANONICAL
+        if metadata.get("trust") == "reference-only" and not source_linked
         else inferred
     )
     metadata["doc_type"] = doc_type
