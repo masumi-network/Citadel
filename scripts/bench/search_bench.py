@@ -33,6 +33,10 @@ DEFAULT_NODE = "https://citadel-archive-production.up.railway.app"
 HERE = Path(__file__).resolve().parent
 GROUND_TRUTH = HERE / "ground_truth"
 SOURCE_HEADER = re.compile(r"^#\s+([\w.-]+/[\w.-]+/\S+)", re.MULTILINE)
+# Linear notes are written as `# Linear SOK-658: <title>`. Normalising them to
+# `linear:SOK-658` lets one golden set span both sources with one ground-truth
+# field, instead of a second matching path per source type.
+LINEAR_HEADER = re.compile(r"^#\s+Linear\s+([A-Z]+-\d+)", re.MULTILINE)
 SHINGLE_WORDS = 12
 # Near-duplicate documents (two AGENTS.md files from the same template) share
 # boilerplate runs, so a single shared shingle produced a false positive during
@@ -72,6 +76,10 @@ def hit_paths(result: dict[str, Any]) -> list[str]:
     paths: list[str] = []
     for item in result.get("results") or []:
         text = item.get("text") or ""
+        linear = LINEAR_HEADER.search(text)
+        if linear:
+            paths.append(f"linear:{linear.group(1)}")
+            continue
         match = SOURCE_HEADER.search(text)
         paths.append(match.group(1) if match else "")
     return paths

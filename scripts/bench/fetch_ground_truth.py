@@ -46,6 +46,10 @@ def main() -> int:
         wanted.update(question["expect_any"])
 
     for repo_path in sorted(wanted):
+        if "/" not in repo_path or repo_path.startswith("linear:"):
+            # Linear ground truth is an identifier, not a fetchable path; it is
+            # matched off the `# Linear SOK-123:` header instead.
+            continue
         target = CACHE / (repo_path.replace("/", "__"))
         if target.exists():
             continue
