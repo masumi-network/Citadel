@@ -106,16 +106,44 @@ def monthly_cost(
     return lines, per_service
 
 
-def marginal_search_cost(p50_seconds: float, vcpu_fraction: float) -> float:
-    """Cost of serving one additional search.
+# Measured on production 2026-07-31: 12 golden questions, top_k=5, bytes on the
+# wire from POST /search. min 27,655 / median 76,229 / max 206,131.
+MEASURED_SEARCH_RESPONSE_BYTES = 76_229
 
-    Embeddings are local (cognee is installed with the ``fastembed`` extra, model
-    BAAI/bge-small-en-v1.5), and ``AUTO_FEEDBACK`` is forced off in
-    kb/cognee_client.py, which removes the structured-output LLM call cognee
-    otherwise runs before every retrieval. So a search buys CPU time and nothing
-    else. There is no per-query API bill to add.
+
+def marginal_search_cost(
+    p50_seconds: float,
+    vcpu_fraction: float,
+    response_bytes: int = MEASURED_SEARCH_RESPONSE_BYTES,
+) -> tuple[float, float]:
+    """Cost of serving one additional search: (cpu, egress).
+
+    There is no per-query API bill. Embeddings run locally (cognee installed
+    with the ``fastembed`` extra) and ``AUTO_FEEDBACK`` is DEFAULTED off at
+    kb/cognee_client.py:326 via ``os.environ.setdefault``, removing the
+    structured-output LLM call cognee otherwise runs before every retrieval.
+    Defaulted, not forced: an explicit env var still wins, and the docstring
+    there says so. Production latency of ~130ms server-side corroborates that it
+    is off, since the same file records AUTO_FEEDBACK-on at 6 to 9 seconds.
+
+    But a response is paid egress, and the first version of this model omitted
+    it while pricing egress in every other line. That was not a rounding error:
+    at the median 76KB response, egress is 65% of the marginal cost and the
+    figure was understated by ~3x. The bill-doubling threshold moved from 26.4M
+    searches a month to 9.3M.
+
+    That omission is the same failure as measuring one of three services: a
+    component left out of a model that reads as complete. Worth stating plainly
+    because it happened twice in one file.
+
+    Response size varies ~7x across queries (27KB to 206KB), so this is a
+    median, not a constant. The MCP path compacts responses by ~81%
+    (kb/mcp_server.py), which reduces this term by the same proportion for agent
+    callers.
     """
-    return p50_seconds * vcpu_fraction * PRICE_VCPU_SECOND
+    cpu = p50_seconds * vcpu_fraction * PRICE_VCPU_SECOND
+    egress = response_bytes / 1_000_000_000 * PRICE_EGRESS_GB
+    return cpu, egress
 
 
 def main() -> int:
@@ -137,19 +165,29 @@ def main() -> int:
 
     lines, per_service = monthly_cost(services)
     total = round(sum(line.monthly_usd for line in lines), 2)
-    # Pessimistic: assumes a search saturates a full vCPU for its whole p50.
-    # The measured CPU peak over 24h was 0.26 vCPU, so this over-states by ~4x
-    # and is the number to quote.
-    per_search = marginal_search_cost(args.search_p50_seconds, 1.0)
+    # The CPU half assumes a search saturates a full vCPU for its whole p50.
+    # An earlier comment here justified that as "over-states by ~4x, peak was
+    # 0.26 vCPU"; that 0.26 was an HOURLY-AVERAGED max, and at 60s sampling the
+    # trailing-24h max was 2.27 vCPU. So the assumption is reasonable, not
+    # generous, and the old justification for it was wrong.
+    cpu_cost, egress_cost = marginal_search_cost(args.search_p50_seconds, 1.0)
+    per_search = cpu_cost + egress_cost
 
     if args.json:
         print(json.dumps({
             "monthly_total_usd": total,
+            "monthly_total_note": (
+                "24h-average basis. Memory dominates and moves with the window: a "
+                "trailing-7-day basis gives ~$61. Quote as 'about $55', not to the cent."
+            ),
             "services": per_service,
             "lines": [asdict(line) for line in lines],
             "marginal_cost_per_search_usd": round(per_search, 8),
+            "marginal_cost_cpu_usd": round(cpu_cost, 8),
+            "marginal_cost_egress_usd": round(egress_cost, 8),
             "marginal_cost_per_1k_searches_usd": round(per_search * 1000, 4),
             "searches_per_month_to_double_cost": int(total / per_search) if per_search else None,
+            "search_response_bytes_median": MEASURED_SEARCH_RESPONSE_BYTES,
             "price_source": "https://railway.com/pricing, fetched 2026-07-31",
         }, indent=2))
         return 0
@@ -167,8 +205,13 @@ def main() -> int:
 
     dominant = max(lines, key=lambda line: line.monthly_usd)
     print(f"  {dominant.component} is {dominant.share_pct:.0f}% of the bill.")
-    print("  The lever is resident footprint, not query volume.\n")
+    print("  The lever is resident footprint, not query volume.")
+    print("  Quote as 'about $55'. Memory moves with the averaging window:")
+    print("  a trailing-7-day basis gives ~$61. Two decimals would be false precision.\n")
     print(f"  Marginal cost per search : ${per_search:.8f}")
+    print(f"    CPU                    : ${cpu_cost:.8f}  ({100 * cpu_cost / per_search:.0f}%)")
+    print(f"    Response egress        : ${egress_cost:.8f}  ({100 * egress_cost / per_search:.0f}%)"
+          f"  at a {MEASURED_SEARCH_RESPONSE_BYTES:,}-byte median response")
     print(f"  Per 1,000 searches       : ${per_search * 1000:.4f}")
     if per_search:
         print(f"  Searches/month needed to double the bill: {int(total / per_search):,}")
