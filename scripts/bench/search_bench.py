@@ -128,6 +128,47 @@ def rank_of_expected(
     return None, "none"
 
 
+def corpus_fingerprint(node_url: str, token: str, timeout: float) -> dict[str, Any]:
+    """Record what the corpus looked like for this run.
+
+    Two runs of this benchmark are only comparable if the corpus did not move
+    underneath them. On 2026-07-31 recall@5 went 0.40 -> 0.60 between two runs
+    with no code deployed: an evolve cognify pass and a partially-completed sync
+    had both landed in between, and without this the jump was indistinguishable
+    from a real improvement. Always report these alongside the metrics.
+    """
+    fingerprint: dict[str, Any] = {}
+    for name, path in (("state", "/api/state"), ("indexes", "/api/indexes")):
+        request = urllib.request.Request(
+            f"{node_url.rstrip('/')}{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            fingerprint[name] = {"error": exc.__class__.__name__}
+            continue
+        if name == "state":
+            fingerprint["documents_tracked"] = (body.get("totals") or {}).get("documents")
+            fingerprint["sources"] = [
+                {
+                    "name": source.get("name"),
+                    "type": source.get("type"),
+                    "documents": source.get("documents"),
+                    "last_synced_at": source.get("last_synced_at"),
+                }
+                for source in body.get("sources") or []
+            ]
+            fingerprint["version"] = body.get("version")
+        else:
+            stats = body.get("stats") or {}
+            # Reported as-is. These reset on process restart, so they measure
+            # uptime as much as content; they are a change signal, not a total.
+            fingerprint["indexes_stats"] = stats
+    return fingerprint
+
+
 def percentile(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
@@ -152,6 +193,7 @@ def main() -> int:
         return 2
 
     questions = load_questions(Path(args.questions))
+    corpus = corpus_fingerprint(args.node_url, token, args.timeout)
     rows: list[dict[str, Any]] = []
     latencies: list[float] = []
 
@@ -245,9 +287,18 @@ def main() -> int:
     for key, value in summary.items():
         print(f"{key:>26}: {value}")
 
+    print("\n--- corpus at run time (compare before trusting a delta) ---")
+    print(f"{'documents_tracked':>26}: {corpus.get('documents_tracked')}")
+    for source in corpus.get("sources") or []:
+        print(
+            f"{source['type']:>26}: {source['documents']} docs, "
+            f"synced {source['last_synced_at']}"
+        )
+
     if args.out:
         Path(args.out).write_text(
-            json.dumps({"summary": summary, "rows": rows}, indent=2), encoding="utf-8"
+            json.dumps({"summary": summary, "corpus": corpus, "rows": rows}, indent=2),
+            encoding="utf-8",
         )
         print(f"\nwrote {args.out}")
     return 0
