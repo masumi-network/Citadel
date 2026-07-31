@@ -324,6 +324,28 @@ def main() -> int:
         )
         if any(row["hits_returned"] for row in rows)
         else 0.0,
+        # The ratio above divides by ALL hits, so a hit whose source path could
+        # not be resolved counts against diversity exactly like a duplicate does.
+        # Measured 2026-07-31 that was 15 of 304 hits (4.9%), worth 0.61 vs 0.65.
+        # Report both rather than pick: the first is the pessimistic bound, the
+        # second is what the resolvable evidence actually supports, and quoting
+        # one without the other invites the obvious rebuttal.
+        "distinct_source_ratio_resolvable_only": round(
+            statistics.fmean(
+                [
+                    len({path for path in (row["hit_paths"] or []) if path})
+                    / len([path for path in (row["hit_paths"] or []) if path])
+                    for row in rows
+                    if any(row["hit_paths"] or [])
+                ]
+            ),
+            4,
+        )
+        if any(any(row["hit_paths"] or []) for row in rows)
+        else 0.0,
+        "hits_with_unresolvable_source": sum(
+            1 for row in rows for path in (row["hit_paths"] or []) if not path
+        ),
         "queries_with_one_distinct_source": sum(
             1 for row in rows if row["hits_returned"] and row["distinct_sources"] <= 1
         ),
