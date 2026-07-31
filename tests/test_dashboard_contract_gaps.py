@@ -16,6 +16,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from kb.access import AccessStore, now_iso
+from kb.mesh import MeshState
 from kb.promotion_queue import build_pending_item, scan_candidate
 from kb.promotion_refs import ReferenceAssessment
 from kb.server import app
@@ -413,3 +414,46 @@ def test_access_snapshot_keeps_its_existing_shape(tmp_path: Any) -> None:
     for existing in ("ok", "bootstrap_keys", "principals", "tokens", "audit_events"):
         assert existing in payload, f"/api/access lost {existing}"
     assert isinstance(payload["audit_events"], list)
+
+
+def test_seat_home_is_not_empty_after_a_restart_wipes_the_mesh_projection(
+    tmp_path: Any,
+) -> None:
+    """A redeploy must not make a populated seat render as "nothing captured".
+
+    `document_count` used to come only from the in-memory mesh projection, which
+    is rebuilt per process and is empty immediately after a restart. That zero
+    fed `capture_done`, which flipped `empty` true, so a seat holding thousands
+    of notes showed the onboarding empty state on every deploy. This service
+    redeploys on every merge to main, so that was most of any given day.
+
+    The mesh here is deliberately left EMPTY, which is exactly the post-restart
+    state, so this test fails if the count ever goes back to the projection.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()[
+        "token"
+    ]
+
+    class _Cognee:
+        async def document_counts_by_dataset(self) -> dict[str, int]:
+            return {"masumi-network": 10, "seat:alice": 42}
+
+    class _Citadel:
+        config = app.state.citadel.config
+        cognee = _Cognee()
+
+    original = app.state.citadel
+    app.state.citadel = _Citadel()
+    app.state.mesh = MeshState()  # a fresh process: projection holds nothing
+    try:
+        alice = TestClient(app, base_url="https://testserver")
+        payload = alice.get(
+            "/api/me/summary", headers={"Authorization": f"Bearer {alice_token}"}
+        ).json()
+    finally:
+        app.state.citadel = original
+
+    assert payload["document_count"] == 42, payload
+    assert payload["empty"] is False, "a populated seat rendered as empty"

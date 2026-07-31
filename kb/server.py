@@ -3244,6 +3244,19 @@ async def me_summary(request: Request) -> dict[str, Any]:
             readable_document_count = sum(
                 int(counts.get(name) or 0) for name in readable_datasets
             )
+            # Prefer the durable count for the Node total too. `document_count`
+            # above walks the mesh projection, which is rebuilt in memory and
+            # empties on every process restart, so on a service that redeploys
+            # per merge it reads 0 for a seat holding thousands of notes. That
+            # zero then propagated into `capture_done` below and flipped `empty`
+            # true, so the seat home rendered its "nothing captured yet" state
+            # over a full Node.
+            #
+            # Read isolation is unchanged: `node` is THIS caller's own seat Node
+            # from seat_node_dataset(identity), so no other seat's dataset is
+            # ever read here.
+            if node:
+                document_count = int(counts.get(node) or 0) or document_count
     except Exception:
         # Null, not zero. Zero is a claim that the caller can read nothing.
         logger.exception("me/summary readable document count failed")
