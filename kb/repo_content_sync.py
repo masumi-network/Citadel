@@ -86,6 +86,28 @@ def _matches_extension(path: str, extensions: tuple[str, ...]) -> bool:
     return any(lowered.endswith(ext.lower()) for ext in extensions)
 
 
+def _cognee_data_ids(outcome: Any) -> list[str]:
+    """Pull the data ids cognee assigned out of an ingest outcome.
+
+    Best-effort and shape-tolerant: cognee's result is a nested dict whose exact
+    layout is not part of any contract we control. An empty list simply means
+    the next sync re-ingests this file, which is the safe direction — it repairs
+    rather than silently trusting a claim it cannot check.
+    """
+    ids: list[str] = []
+    for result in getattr(outcome, "all_ingests", ()) or ():
+        payload = getattr(result, "cognee_result", None)
+        if not isinstance(payload, dict):
+            continue
+        added = payload.get("added")
+        if not isinstance(added, dict):
+            continue
+        for info in added.get("data_ingestion_info") or ():
+            if isinstance(info, dict) and info.get("data_id"):
+                ids.append(str(info["data_id"]))
+    return list(dict.fromkeys(ids))
+
+
 def format_repo_content_document(file: RepoContentFile) -> str:
     """Render a repo file as a vault document.
 
@@ -602,10 +624,25 @@ class RepoContentSyncer:
                         continue
 
                     previous = tracked.get(key) if isinstance(tracked.get(key), dict) else {}
+                    # An entry must also carry the id cognee assigned. Without
+                    # it, "unchanged" only means "we told ourselves we ingested
+                    # this", which is exactly how 12 files stayed permanently
+                    # skipped while absent from the index: ingest reports
+                    # accepted as soon as cognee.add() returns, but the graph
+                    # write is a detached background cognify that can silently
+                    # never run. Entries written before this field existed are
+                    # therefore treated as needing re-ingestion, which repairs
+                    # the state on the next sync instead of requiring force.
+                    #
+                    # Re-ingesting an unchanged file is now cheap and safe:
+                    # ADR-0016 removed the retrieval timestamp, so the rendered
+                    # document is byte-identical and cognee's content-addressed
+                    # ingestion resolves it to the same id rather than a copy.
                     unchanged = (
                         not force
                         and previous.get("sha") == file.sha
                         and previous.get("content_hash") == file.content_hash
+                        and bool(previous.get("cognee_data_ids"))
                     )
                     if unchanged:
                         _record_skip(repo_result, "unchanged")
@@ -691,6 +728,11 @@ class RepoContentSyncer:
                             "sha": file.sha,
                             "content_hash": file.content_hash,
                             "last_ingested_at": checked_at,
+                            # What cognee actually assigned. Stored so a later
+                            # run can check its own claim against the index; a
+                            # state file holding only sha and content_hash can
+                            # never verify what it asserted.
+                            "cognee_data_ids": _cognee_data_ids(outcome),
                         }
                         # Checkpoint immediately. State used to be written only
                         # after every repo finished, so a run killed part-way
