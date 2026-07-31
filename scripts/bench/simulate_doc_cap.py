@@ -52,7 +52,6 @@ from search_bench import (  # noqa: E402
     load_questions,
     rank_of_expected,
     search,
-    shingles,
 )
 
 
