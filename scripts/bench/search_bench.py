@@ -263,6 +263,15 @@ def main() -> int:
                 "matched_by": matched_by,
                 "hit_paths": observed,
                 "hit_datasets": datasets,
+                # Recall says the right document was on the page. It says nothing
+                # about the other four slots. Measured on 2026-07-31, recall@5 was
+                # 0.93 while the mean distinct-source ratio was 0.62: 22 of 60
+                # queries returned one or two distinct documents, the rest of the
+                # page being more chunks of the same file. "What is the Hermes
+                # orchestrator actor" returned that one file five times. An agent
+                # pays full context for a page that answers once.
+                "distinct_sources": len({path for path in observed if path}),
+                "hits_returned": len(observed),
                 "errors": errors,
             }
         )
@@ -299,6 +308,25 @@ def main() -> int:
         "recall_at_3": round(recall_at(positives, 3), 4),
         "recall_at_5": round(recall_at(positives, 5), 4),
         "mrr": round(mrr, 4),
+        # 1.00 means every slot on the page was a different document. Lower means
+        # one document is occupying slots the agent is paying context for. Track
+        # this NEXT TO recall: a high recall with a low ratio is a page that
+        # answers once and repeats itself four times.
+        "distinct_source_ratio_mean": round(
+            statistics.fmean(
+                [
+                    row["distinct_sources"] / row["hits_returned"]
+                    for row in rows
+                    if row["hits_returned"]
+                ]
+            ),
+            4,
+        )
+        if any(row["hits_returned"] for row in rows)
+        else 0.0,
+        "queries_with_one_distinct_source": sum(
+            1 for row in rows if row["hits_returned"] and row["distinct_sources"] <= 1
+        ),
         "blocked_probe_hit_rate": round(recall_at(probes, args.top_k), 4),
         "latency_ms_p50": round(percentile(latencies, 0.50), 1),
         "latency_ms_p95": round(percentile(latencies, 0.95), 1),

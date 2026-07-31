@@ -492,6 +492,37 @@ def _clamp_top_k(top_k: int) -> int:
     return min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
 
 
+def _compact_search_for_agent(payload: Any) -> Any:
+    """Drop the `sections` hit copies before handing a search back to an agent.
+
+    ``/search`` returns every hit twice: once in ``results``, and again inside
+    ``sections`` grouped by Central / node / session traces. The dashboard needs
+    that grouping (kb/static/app.js renders a heading per section), so the
+    endpoint is right to send it. An agent is not: it reads ``results``, and
+    every hit already carries its own ``_citadel.dataset``.
+
+    Measured on production, one ``top_k=5`` call returned 84,376 characters, of
+    which 41,986 were the ``sections`` copy. That is half the payload, and it
+    was large enough to exceed the MCP tool output limit outright, so the caller
+    got an error and a file path instead of an answer.
+
+    The grouping is preserved as counts under ``section_counts``, so a caller
+    can still see the Central/node split without a second copy of the text.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    sections = payload.get("sections")
+    if not isinstance(sections, dict):
+        return payload
+    compacted = dict(payload)
+    compacted["section_counts"] = {
+        str(name): len(items) if isinstance(items, list) else 0
+        for name, items in sections.items()
+    }
+    compacted.pop("sections", None)
+    return compacted
+
+
 def _audit_query(view: str, limit: int) -> str:
     normalized_view = view.strip().lower() or "mcp"
     if normalized_view not in AUDIT_VIEWS:
@@ -795,7 +826,7 @@ def create_mcp_server(
         if isinstance(mode, str) and mode.strip().lower() == "docs":
             payload["mode"] = "docs"
             payload["exclude_ambient"] = True
-        return await _call_async(
+        result = await _call_async(
             "citadel_search",
             lambda: resolve_client(ctx).post(
                 "/search",
@@ -803,6 +834,7 @@ def create_mcp_server(
                 tool_name="citadel_search",
             ),
         )
+        return _compact_search_for_agent(result)
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_get_mesh"].annotations)
     async def citadel_get_mesh(ctx: Context) -> dict[str, Any]:
