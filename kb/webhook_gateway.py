@@ -22,10 +22,12 @@ probe, not because the admin is untrusted.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import logging
 import socket
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any
@@ -57,55 +59,103 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise WebhookConfigError(f"webhook endpoint attempted a {code} redirect")
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def _is_forbidden_ip(host: str) -> bool:
-    """True when *host* is, or resolves to, an address a webhook must not reach."""
-    candidates: list[str] = []
+def _is_forbidden_address(candidate: str) -> bool:
+    """True when *candidate* is an IP a webhook must never reach."""
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return bool(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
+
+
+def resolve_public_address(host: str) -> str:
+    """Resolve *host* to one public IP, or raise.
+
+    Returns the address so the caller can CONNECT to that exact IP. Checking a
+    hostname and then letting urllib resolve it again is a DNS-rebinding hole:
+    an attacker controlling the name answers with a public address for the check
+    and a private one microseconds later for the connection. The validated
+    address has to be the one dialled, which is why this returns it rather than
+    a bool.
+    """
     try:
         ipaddress.ip_address(host)
-        candidates.append(host)
+        candidates = [host]
     except ValueError:
         try:
-            resolved = socket.getaddrinfo(host, None)
-        except OSError:
-            # Unresolvable: let the request fail normally rather than guessing.
-            return False
-        candidates.extend(str(info[4][0]) for info in resolved)
+            resolved = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except OSError as exc:
+            raise WebhookConfigError(f"webhook host does not resolve: {host}") from exc
+        candidates = [str(info[4][0]) for info in resolved]
+    if not candidates:
+        raise WebhookConfigError(f"webhook host does not resolve: {host}")
+    # EVERY answer must be public. Accepting the first public one would let a
+    # host with mixed records steer the connection to the private one.
     for candidate in candidates:
-        try:
-            address = ipaddress.ip_address(candidate)
-        except ValueError:
-            continue
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_reserved
-            or address.is_multicast
-            or address.is_unspecified
-        ):
-            return True
-    return False
+        if _is_forbidden_address(candidate):
+            raise WebhookConfigError(
+                f"webhook URL resolves to a private or loopback address: {host}"
+            )
+    return candidates[0]
 
 
-def require_webhook_url(url: str) -> None:
-    """Raise unless *url* is an endpoint a webhook may post vault content to."""
+def require_webhook_url(url: str) -> str:
+    """Raise unless *url* is an endpoint a webhook may post vault content to.
+
+    Returns the validated IP to connect to, so the check and the connection
+    cannot disagree.
+    """
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https":
         raise WebhookConfigError(
             f"webhook URL must be https, got {parsed.scheme or 'no scheme'}"
         )
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")  # a trailing dot dodges suffixes
     if not host:
         raise WebhookConfigError("webhook URL has no host")
     if host in _BLOCKED_HOSTNAMES or host.endswith(_BLOCKED_SUFFIXES):
         raise WebhookConfigError(f"webhook URL may not target an internal host: {host}")
-    if _is_forbidden_ip(host):
-        raise WebhookConfigError(
-            f"webhook URL resolves to a private or loopback address: {host}"
-        )
+    return resolve_public_address(host)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Dial a pre-validated IP while keeping the hostname for TLS.
+
+    `server_hostname` stays the original host so SNI and certificate validation
+    are unchanged; only the address dialled is pinned. That closes the window
+    between validating a name and resolving it again to connect.
+    """
+
+    def __init__(self, host: str, *, pinned_ip: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        context = self._context or ssl.create_default_context()
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pinned_ip: str) -> None:
+        super().__init__()
+        self._pinned_ip = pinned_ip
+
+    def https_open(self, req: Any) -> Any:
+        def build(host: str, **kwargs: Any) -> _PinnedHTTPSConnection:
+            kwargs.pop("context", None)
+            return _PinnedHTTPSConnection(host, pinned_ip=self._pinned_ip, **kwargs)
+
+        return self.do_open(build, req)
 
 
 class WebhookDelivery:
@@ -119,7 +169,7 @@ class WebhookDelivery:
         max_message_bytes: int = 30000,
         timeout_seconds: int = 20,
     ) -> None:
-        require_webhook_url(url)
+        self.pinned_ip = require_webhook_url(url)
         self.url = url
         self.token = token
         self.max_message_bytes = max(1000, max_message_bytes)
@@ -156,21 +206,30 @@ class WebhookDelivery:
         }
 
     def post_digest(self, text: str, *, message_id: str | None = None) -> dict[str, Any]:
-        body = text[: self.max_message_bytes]
-        truncated = len(text) > self.max_message_bytes
-        payload = {"text": body}
-        if message_id:
-            payload["message_id"] = message_id
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        if self.token:
-            request.add_header("Authorization", f"Bearer {self.token}")
+        # Everything, including payload construction, lives inside the try. The
+        # contract is that delivery never raises, and building the body can:
+        # a non-str `text` raises on slicing, and a lone UTF-16 surrogate (which
+        # any upstream using errors="surrogateescape" can produce) raises on
+        # .encode("utf-8"). Both would previously have escaped this method.
+        truncated = False
         try:
-            with _OPENER.open(request, timeout=self.timeout_seconds) as response:
+            body = text[: self.max_message_bytes]
+            truncated = len(text) > self.max_message_bytes
+            payload = {"text": body}
+            if message_id:
+                payload["message_id"] = message_id
+            request = urllib.request.Request(
+                self.url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if self.token:
+                request.add_header("Authorization", f"Bearer {self.token}")
+            opener = urllib.request.build_opener(
+                _NoRedirect, _PinnedHTTPSHandler(self.pinned_ip)
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 status_code = response.status
         except WebhookConfigError as exc:
             logger.error("Webhook delivery refused: %s", redact_secrets(str(exc)))
