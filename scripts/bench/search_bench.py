@@ -185,7 +185,21 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1, help="runs per question")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--out", default=None, help="write JSON results here")
+    parser.add_argument(
+        "--mode",
+        default=None,
+        help=(
+            "apply a search mode (e.g. 'docs') the way the MCP layer does. "
+            "POST /search takes no mode; it is applied by shape_search_payload, "
+            "so this calls the server's own function on the raw hits."
+        ),
+    )
     args = parser.parse_args()
+
+    shape = None
+    if args.mode:
+        sys.path.insert(0, str(HERE.parent.parent))
+        from kb.search_format import shape_search_payload as shape  # noqa: PLC0415
 
     token = os.getenv("CITADEL_MCP_ACCESS_TOKEN") or os.getenv("CITADEL_ACCESS_TOKEN")
     if not token:
@@ -214,6 +228,8 @@ def main() -> int:
                 errors.append(error or "empty")
                 ranks.append(None)
                 continue
+            if shape is not None:
+                body = shape(body, query=question["question"], mode=args.mode)
             paths = hit_paths(body)
             texts = [(item.get("text") or "") for item in body.get("results") or []]
             datasets = [
