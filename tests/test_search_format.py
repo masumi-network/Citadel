@@ -294,3 +294,112 @@ def test_compact_search_filters_omits_empty() -> None:
         "mode": "docs",
         "dataset": "notes",
     }
+
+
+# --- docs mode returned zero for everything -------------------------------
+#
+# 2026-07-31: `mode="docs"` matched nothing on prod, for any query, including
+# ones whose answer was an ingested .md file. Three independent causes, each
+# sufficient on its own. All three are pinned below.
+
+REPO_DOC_TEXT = (
+    "# masumi-network/sokosumi/README.md\n"
+    "\n"
+    "Repository: masumi-network/sokosumi\n"
+    "Source: https://github.com/masumi-network/sokosumi/blob/f401d38/README.md\n"
+    "Commit: f401d3896820ff35a82cf707818e308b67f5bce2\n"
+    "Blob: a4b30a4548af239f695ba3cba1935b545e96d675\n"
+    "\n"
+    "---\n"
+    "\n"
+    "# Sokosumi Monorepo\n\nSokosumi is a marketplace platform.\n"
+)
+
+
+def test_repo_content_header_classifies_as_documentation() -> None:
+    """Cause 3: infer_doc_type had no repo-content rule and returned 'other'."""
+    assert infer_doc_type({"text": REPO_DOC_TEXT}) == "canonical-docs"
+
+
+def test_repo_doc_survives_a_shared_trace_text_collision() -> None:
+    """Cause 1: a text collision with session-traces relabelled real docs.
+
+    The marker is assigned by matching chunk TEXT against the session-traces
+    dataset, so any document a trace quoted verbatim inherited reference-only
+    and was reclassified a trace. Structural provenance must win.
+    """
+    hit = {"text": REPO_DOC_TEXT, "_citadel": {"trust": "reference-only"}}
+
+    assert infer_doc_type(hit) == "canonical-docs"
+
+
+def test_exclude_ambient_does_not_consult_the_trust_tier() -> None:
+    """Cause 2: the trust half of the condition was unsatisfiable.
+
+    `reference-only` is the only tier the server can attest, so every hit
+    carries it and requiring `trust_tier != reference-only` removed everything.
+    """
+    hits = [
+        normalize_search_hit({"text": REPO_DOC_TEXT}, index=0),
+        normalize_search_hit({"text": "GitHub org daily digest"}, index=1),
+    ]
+    for hit in hits:
+        hit["trust_tier"] = "reference-only"
+
+    kept = filter_hits(hits, exclude_ambient=True)
+
+    assert len(kept) == 1, kept
+    assert kept[0]["doc_type"] == "canonical-docs"
+
+
+def test_docs_mode_returns_the_documentation_and_drops_the_issue() -> None:
+    """End to end: the shape that returned zero results on prod."""
+    payload = {
+        "results": [
+            # Both Linear shapes exactly as the syncer writes them.
+            {
+                "text": (
+                    "# Linear SOK-623: coworker init UX\n\n"
+                    "- **State:** In Review (started)\n"
+                    "- **Team:** Sokosumi\n"
+                    "- **URL:** https://linear.app/masumi/issue/SOK-623/coworker-init-ux"
+                )
+            },
+            {"text": REPO_DOC_TEXT},
+            {"text": "# Linear workspace sync\n\nSynced 200 issues.\n\n- **SOK-670** [Triage] x"},
+        ]
+    }
+
+    shaped = shape_search_payload(payload, query="Sokosumi monorepo structure", mode="docs")
+
+    assert shaped["docs_mode"] is True
+    assert len(shaped["results"]) == 1, shaped["results"]
+    assert "sokosumi/README.md" in shaped["results"][0]["text"]
+
+
+def test_the_linear_workspace_digest_counts_as_ambient() -> None:
+    """It is titled "Linear workspace sync", not "Linear sync".
+
+    ACTIVITY_RE required the two words adjacent, so the single document holding
+    120 issue titles classified as `other` — which is not ambient — and was
+    never excluded. It is the strongest magnet in the corpus.
+    """
+    digest = {"text": "# Linear workspace sync\n\nSynced 200 issues.\n\n- **SOK-670** [Triage] x"}
+
+    assert infer_doc_type(digest) == "activity"
+    assert filter_hits([normalize_search_hit(digest, index=0)], exclude_ambient=True) == []
+
+
+def test_a_trace_still_cannot_dress_itself_as_documentation() -> None:
+    """The guard this fix relaxes must still hold for actual traces.
+
+    A session trace mentioning /skills/ must not read as a skill doc just
+    because the body says so — it lacks the structural header.
+    """
+    trace = {
+        "text": "ran the agent against /skills/masumi/SKILL.md and it worked",
+        "_citadel": {"dataset": "session-traces"},
+    }
+
+    assert infer_doc_type(trace) == "session-trace"
+    assert infer_trust_tier(trace) == "reference-only"

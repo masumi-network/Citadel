@@ -18,7 +18,25 @@ SPEC_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 ACTIVITY_RE = re.compile(
-    r"(daily\s+digest|organization\s+update|github\s+org|linear\s+sync)",
+    # `linear\s+\w*\s*sync` rather than `linear\s+sync`: the digest this is meant
+    # to catch is titled "Linear workspace sync", and the intervening word made
+    # it classify as `other`, which is not ambient — so the one document holding
+    # 120 issue titles was never excluded from docs-mode results.
+    r"(daily\s+digest|organization\s+update|github\s+org|linear(\s+\w+)?\s+sync)",
+    re.IGNORECASE,
+)
+# The header `format_repo_content_document` writes. It is the one structural
+# provenance marker any hit actually carries: hits expose no tags, an empty
+# `provenance`, and null `source_node_set`/`source_pipeline`, so body text is
+# the only signal available. A document that names its repo, its source URL,
+# its commit and its blob is source-linked repository documentation, whatever
+# else its text may coincidentally match.
+REPO_CONTENT_HEADER_RE = re.compile(
+    r"^#\s+[\w.-]+/[\w.-]+/\S+\s*\n\s*\n"
+    r"Repository:\s*\S+\s*\n"
+    r"Source:\s*https?://\S+\s*\n"
+    r"Commit:\s*\S+\s*\n"
+    r"Blob:\s*\S+",
     re.IGNORECASE,
 )
 # Cardano policy IDs are 56 hex chars; asset names / units are often longer hex.
@@ -120,7 +138,15 @@ def infer_doc_type(item: dict[str, Any]) -> str:
         return DOC_TYPE_TRACE
     text = _hit_text(item)
     lowered = text.lower()
-    # Activity/issue material is checked FIRST. A digest aggregates titles written
+    # Checked before the ambient patterns, and only this one may be, because it
+    # is structural rather than keyword-based: the full Repository/Source/Commit/
+    # Blob header is written by the repo-content syncer and cannot be produced by
+    # a digest quoting an issue title. Without it, a README that merely mentions
+    # "linear sync" classified as ambient activity and was filtered out of
+    # docs-mode results.
+    if REPO_CONTENT_HEADER_RE.search(text):
+        return DOC_TYPE_CANONICAL
+    # Activity/issue material is checked next. A digest aggregates titles written
     # by anyone (a public-repo issue called "MIP-003 endpoint schema" lands in the
     # org digest verbatim), so testing the spec patterns first let ambient
     # material relabel itself as documentation and slip past exclude_ambient.
@@ -485,12 +511,13 @@ def filter_hits(
         # is attested-only now, so this deliberately no longer consults it.
         filtered = [h for h in filtered if _hit_doc_type(h) in DOC_SHAPED_TYPES]
     if exclude_ambient:
-        filtered = [
-            h
-            for h in filtered
-            if _hit_doc_type(h) not in AMBIENT_DOC_TYPES
-            and _hit_trust_tier(h) != TRUST_REFERENCE
-        ]
+        # Content-shaped only, for the same reason canonical_only above stopped
+        # consulting the tier: `reference-only` is the single tier the server can
+        # attest today, so every hit carries it and the trust half of this
+        # condition was unsatisfiable. `mode="docs"` therefore returned zero
+        # results for every query, including ones whose answer was an ingested
+        # .md file sitting in the vault.
+        filtered = [h for h in filtered if _hit_doc_type(h) not in AMBIENT_DOC_TYPES]
     return filtered
 
 
