@@ -23,7 +23,9 @@ python scripts/bench/search_bench.py --repeats 3 --top-k 5 --out results.json
 | `recall_at_k` | fraction of questions where the document that answers it appears in the top k |
 | `mrr` | mean reciprocal rank over the same questions |
 | `blocked_probe_hit_rate` | fraction of *deliberately unanswerable* questions that returned their target anyway |
-| `latency_ms_p50` / `p95` | server-side search latency over all samples |
+| `latency_ms_p50` / `p95` | **client round-trip**, timed around `urlopen`, so it includes DNS, TCP, TLS and the network path from wherever you ran it. It is NOT server-side latency: on 2026-07-31 a run measuring 269ms from a laptop corresponded to 107-141ms in the Railway edge logs. Quote it as "round-trip from our client", and read server-side timing from the platform logs instead. |
+| `distinct_source_ratio_mean` | distinct source documents per result page, divided by ALL hits. 1.00 means every slot is a different document; lower means one document is occupying slots the caller pays context for. A hit whose source path cannot be resolved counts against this exactly like a duplicate does. |
+| `distinct_source_ratio_resolvable_only` | the same ratio over hits whose source path resolved. Report both: the first is the pessimistic bound, this is what the resolvable evidence supports. |
 
 ## How a hit is scored
 
