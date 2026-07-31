@@ -1,0 +1,223 @@
+{
+  "version": 1,
+  "created_at": "2026-07-31",
+  "corpus": "repo_content sync of masumi-network/{sokosumi,Sokosumi-MCP,sokosumi-cli,sokosumi-docs}",
+  "notes": [
+    "Ground truth is the source path a hit must resolve to. Hits carry their path",
+    "in the first line of the chunk body: '# masumi-network/<repo>/<path>'.",
+    "expect_any lists every acceptable path; several skills are published from two",
+    "repos, so more than one document legitimately answers the question.",
+    "Questions marked expected_recall 0 target documents the security scanner",
+    "blocks at ingest time. They should MISS. If they ever start hitting, either",
+    "the block was lifted or the answer leaked in from another document."
+  ],
+  "questions": [
+    {
+      "id": "q01",
+      "question": "What is the structure of the Sokosumi monorepo?",
+      "expect_any": ["masumi-network/sokosumi/README.md"],
+      "category": "repo_overview",
+      "expected_recall": 1
+    },
+    {
+      "id": "q02",
+      "question": "How does a cloud agent connect to the database in Sokosumi?",
+      "expect_any": ["masumi-network/sokosumi/docs/agents/cloud-agent-database.md"],
+      "category": "architecture",
+      "expected_recall": 1
+    },
+    {
+      "id": "q03",
+      "question": "Which issue tracker does the Sokosumi project use?",
+      "expect_any": ["masumi-network/sokosumi/docs/agents/issue-tracker.md"],
+      "category": "process",
+      "expected_recall": 1
+    },
+    {
+      "id": "q04",
+      "question": "What triage labels are used on Sokosumi issues?",
+      "expect_any": ["masumi-network/sokosumi/docs/agents/triage-labels.md"],
+      "category": "process",
+      "expected_recall": 1
+    },
+    {
+      "id": "q05",
+      "question": "How do vendor workspace grants work in the Coworker API?",
+      "expect_any": ["masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"],
+      "category": "api",
+      "expected_recall": 1
+    },
+    {
+      "id": "q06",
+      "question": "What is the Hermes orchestrator actor and what is it responsible for?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/orchestrator/hermes-orchestrator-actor.md",
+        "masumi-network/sokosumi/docs/hermes-orchestrator-approve-overrides.md"
+      ],
+      "category": "architecture",
+      "expected_recall": 1
+    },
+    {
+      "id": "q07",
+      "question": "What does the coworker chat cold-start benchmark measure?",
+      "expect_any": ["masumi-network/sokosumi/docs/coworker/benchmarks/README.md"],
+      "category": "benchmark",
+      "expected_recall": 1
+    },
+    {
+      "id": "q08",
+      "question": "How are Better Auth cookie prefixes derived from the git commit ref?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-03-24-better-auth-cookie-prefix-commit-ref-design.md",
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-03-24-better-auth-cookie-prefix-commit-ref.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
+    },
+    {
+      "id": "q09",
+      "question": "Why was OpenRouter removed from the Sokosumi web app?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-19-remove-openrouter-from-web-design.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
+    },
+    {
+      "id": "q10",
+      "question": "What is the chat_room schema and the chats API namespace design?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-27-chats-api-and-chat-room-schema-design.md",
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
+    },
+    {
+      "id": "q11",
+      "question": "How does the OAuth refresh token opt-in work?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-23-oauth-refresh-token-opt-in-design.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
+    },
+    {
+      "id": "q12",
+      "question": "Why was credit pricing authority moved into Core?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-18-zero-margin-pricing-core-authority-design.md"
+      ],
+      "category": "design_spec",
+      "expected_recall": 1
+    },
+    {
+      "id": "q13",
+      "question": "What does the Elena skill do?",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/elena/SKILL.md",
+        "masumi-network/sokosumi-cli/skills/elena/SKILL.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "q14",
+      "question": "How do I install the Sokosumi shortcuts?",
+      "expect_any": ["masumi-network/Sokosumi-MCP/skills/install-shortcuts/SKILL.md"],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "q15",
+      "question": "What is the Sokosumi CLI and what does it do?",
+      "expect_any": ["masumi-network/sokosumi-cli/README.md"],
+      "category": "repo_overview",
+      "expected_recall": 1
+    },
+    {
+      "id": "q16",
+      "question": "How is the Sokosumi skill distributed to users?",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/skills/sokosumi/references/distribution.md"
+      ],
+      "category": "skill",
+      "expected_recall": 1
+    },
+    {
+      "id": "q17",
+      "question": "What are coworkers in Sokosumi?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/documentation/coworkers.mdx",
+        "masumi-network/sokosumi/docs/coworker-metadata.md"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "q18",
+      "question": "How does image generation work in Sokosumi?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/documentation/image-generation.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "q19",
+      "question": "How do I assign a job to a project in Sokosumi?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/documentation/projects.mdx"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "q20",
+      "question": "How do I connect to the Sokosumi MCP server?",
+      "expect_any": [
+        "masumi-network/sokosumi-docs/content/docs/mcp/index.mdx",
+        "masumi-network/Sokosumi-MCP/README.md",
+        "masumi-network/Sokosumi-MCP/skills/sokosumi/SKILL.md"
+      ],
+      "category": "product_docs",
+      "expected_recall": 1
+    },
+    {
+      "id": "b01",
+      "question": "How do I debug a failing Sokosumi MCP connection?",
+      "expect_any": ["masumi-network/Sokosumi-MCP/docs/DEBUG_CONNECTION.md"],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_reason": "secret_assignment x5"
+    },
+    {
+      "id": "b02",
+      "question": "What are the agent guidelines for working in the Sokosumi CLI repository?",
+      "expect_any": ["masumi-network/sokosumi-cli/AGENTS.md"],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_reason": "secret_assignment x2"
+    },
+    {
+      "id": "b03",
+      "question": "What is the implementation plan for the admin user overview, SOK-565?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-06-12-admin-user-overview.md"
+      ],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_reason": "unsafe_url_scheme (data: in a JS snippet)"
+    },
+    {
+      "id": "b04",
+      "question": "What is the implementation plan for the task credit pause and timeline UX?",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-07-27-task-credit-pause-timeline-ux.md"
+      ],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_reason": "unsafe_url_scheme (data: in a JS snippet)"
+    }
+  ]
+}
