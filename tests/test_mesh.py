@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from kb.config import CitadelConfig
 from kb.mesh import MeshState
 from kb.models import FeedbackResult, IngestResult
@@ -300,3 +302,59 @@ async def test_timeline_tracks_chunks_and_resume_filters() -> None:
     assert [event["id"] for event in chunk_events["events"]] == [2, 1]
     assert chunk_events["stats"]["indexed_chunks"] == 4
     assert chunk_events["stats"]["last_indexed_at"] == chunk_events["events"][0]["created_at"]
+
+
+# --- the dashboard reported the vault as empty -----------------------------
+#
+# 2026-07-31: /api/indexes reported documents=1 and indexed_chunks=1 against a
+# real 15641 indexed / 308 tracked. Every MeshState counter is in-memory and
+# rehydrate deliberately does not reseed them, so on a service that redeploys
+# on every merge to main they measured uptime, not corpus.
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reports_authoritative_corpus_totals() -> None:
+    config = CitadelConfig()
+    mesh = MeshState()
+    mesh.documents = 1
+    mesh.indexed_chunks = 1
+    mesh.searches = 386
+
+    snapshot = await mesh.snapshot(
+        config, corpus={"ok": True, "tracked_sources": 308, "indexed_docs": 15641}
+    )
+    stats = snapshot["stats"]
+
+    assert stats["documents"] == 308
+    assert stats["indexed_chunks"] == 15641
+    assert stats["nodes"] == 15641
+    # The in-memory values are still available, correctly labelled.
+    assert stats["since_restart"]["documents"] == 1
+    assert stats["since_restart"]["indexed_chunks"] == 1
+    # Activity counters are genuinely uptime-scoped and stay where they are.
+    assert stats["searches"] == 386
+
+
+@pytest.mark.asyncio
+async def test_snapshot_falls_back_when_corpus_is_unavailable() -> None:
+    """_corpus_health fails soft and returns None counts; do not report None."""
+    config = CitadelConfig()
+    mesh = MeshState()
+    mesh.documents = 4
+
+    snapshot = await mesh.snapshot(
+        config, corpus={"ok": True, "tracked_sources": None, "indexed_docs": None}
+    )
+
+    assert snapshot["stats"]["documents"] == 4
+
+
+@pytest.mark.asyncio
+async def test_snapshot_without_corpus_keeps_the_old_shape() -> None:
+    config = CitadelConfig()
+    mesh = MeshState()
+    mesh.documents = 7
+
+    snapshot = await mesh.snapshot(config)
+
+    assert snapshot["stats"]["documents"] == 7

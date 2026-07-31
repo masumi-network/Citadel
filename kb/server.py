@@ -4220,7 +4220,9 @@ async def resolve_knowledge_conflict(
 async def indexes(request: Request) -> Any:
     require_access(request, "reader", "kb:read")
     citadel = get_citadel()
-    snapshot = await get_mesh().snapshot(citadel.config)
+    # Pass the authoritative corpus figures so the dashboard reports the vault's
+    # real size rather than whatever has happened since the last deploy.
+    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
     return jsonable_encoder({"indexes": snapshot["indexes"], "stats": snapshot["stats"]})
 
 

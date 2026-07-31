@@ -206,28 +206,68 @@ class MeshState:
             self._edge(source_id, repo_id, "observed")
             self._edge(repo_id, dataset_id, "summarized")
 
-    async def snapshot(self, config: CitadelConfig) -> dict[str, Any]:
+    async def snapshot(
+        self, config: CitadelConfig, *, corpus: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Dashboard projection, plus corpus totals when the caller supplies them.
+
+        Everything on ``MeshState`` is in-memory and resets with the process, and
+        ``rehydrate`` deliberately does not reseed the accumulating counters. That
+        is correct for activity — "searches this uptime" is a live signal — but it
+        was also being reported as ``documents`` and ``indexed_chunks``, which read
+        as corpus totals. On a service that redeploys on every merge to main the
+        dashboard therefore showed 1 document and 1 indexed chunk against a real
+        15641 indexed / 308 tracked: understated by four orders of magnitude, in
+        the direction that makes a working vault look dead.
+
+        ``corpus`` carries the authoritative figures (the same ones ``/readyz``
+        and ``citadel status`` already report). When present they are reported as
+        the totals and the in-memory versions move under ``since_restart``, which
+        is what they have always actually measured.
+        """
         async with self._lock:
             self._ensure_base_graph(config)
             indexes = self._indexes(config)
+            since_restart = {
+                "documents": self.documents,
+                "searches": self.searches,
+                "feedback": self.feedback_items,
+                "upgrades": self.upgrades,
+                "errors": self.errors,
+                "indexed_chunks": self.indexed_chunks,
+                "projection_nodes": len(self.nodes),
+                "projection_edges": len(self.edges),
+            }
+            corpus = corpus or {}
+            authoritative_nodes = corpus.get("indexed_docs")
+            authoritative_docs = corpus.get("tracked_sources")
             return {
                 "revision": self.revision,
                 "generated_at": utc_now(),
                 "tenant_id": config.tenant_id,
                 "default_dataset": config.default_dataset,
                 "stats": {
-                    "nodes": len(self.nodes),
+                    "nodes": (
+                        authoritative_nodes if authoritative_nodes is not None else len(self.nodes)
+                    ),
                     "edges": len(self.edges),
-                    "documents": self.documents,
+                    "documents": (
+                        authoritative_docs if authoritative_docs is not None else self.documents
+                    ),
                     "searches": self.searches,
                     "feedback": self.feedback_items,
                     "upgrades": self.upgrades,
                     "errors": self.errors,
-                    "indexed_chunks": self.indexed_chunks,
+                    "indexed_chunks": (
+                        authoritative_nodes
+                        if authoritative_nodes is not None
+                        else self.indexed_chunks
+                    ),
                     "pending_chunks": self.pending_chunks,
                     "failed_chunks": self.failed_chunks,
                     "last_indexed_at": self.last_indexed_at,
                     "latest_event_id": self.revision,
+                    "since_restart": since_restart,
                 },
                 "indexes": indexes,
                 "nodes": list(self.nodes.values()),
