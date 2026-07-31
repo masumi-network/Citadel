@@ -7,6 +7,15 @@
 
 Citadel separates **private agent memory** from **organization-wide knowledge** using three layers: a **Seat** (one licensed human **Principal**), a **Node** (that seat's private mini knowledge base), and **Central** (the shared organization dataset, `masumi-network`). The **Node** is the storage boundary — not the **Token**. Admins provision a seat before issuing tokens; each token inherits the seat's node scope plus read access to Central. Reads never cross seat nodes; writes default to the seat node, with org-bound paths and tagged contributions landing in Central; **Promotion** copies curated content from a node into Central via dual-write (the original stays in the node).
 
+> **Body corrected 2026-07-31.** The sentence above still describes seat writes
+> reaching **Central** through org-bound paths and tagged contributions. That
+> path was removed by [ADR-0007](0007-seat-capture-promotion-write-policy.md):
+> a seat-scoped caller is now refused a direct Central write on every channel,
+> and **Central** is fed only by governed sync and the **Promotion Agent**. The
+> supersession banner at the top of this ADR has flagged that since 2026-06-27,
+> but the body text was never edited to match, so a reader taking this paragraph
+> at face value would expect a write path that returns 403.
+
 **Considered Options**
 
 - **Lazy provisioning vs admin-first:** Auto-create a node on first token use is simpler to ship, but makes audit, seat inventory, and support overrides harder. Admin-first provisioning keeps a clear principal → seat → node → token chain and matches licensed team membership.

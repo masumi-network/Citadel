@@ -35,8 +35,14 @@ Three forces landed at once:
 
 The web frontend becomes a **Next.js + TypeScript + Tailwind** application living in
 this repository, at `web/`, under npm workspaces so more packages can join later.
-It is built with **static export** into `kb/static/`, and FastAPI serves the output
+It is built with **static export** into `kb/webui/`, and FastAPI serves the output
 exactly as it serves hand-written files today.
+
+> **Corrected 2026-07-31.** This ADR originally said the export lands in
+> `kb/static/`. It does not, and deliberately so: `web/scripts/copy-export.mjs`
+> targets `kb/webui/` because `kb/static/` holds hand-written pages and fonts
+> that a generated tree would clobber. The text was never amended when the
+> implementation chose the safer target.
 
 Consequences of choosing static export specifically:
 
@@ -95,7 +101,7 @@ dashboard, where the Knowledge Mesh keeps `force-graph` on canvas.
   unusable because it inlines a `<style>` block, so fonts are declared with
   plain `@font-face`; and Next's built-in 404 must be replaced, since it ships
   one inline `<style>` and six `style=""` attributes.
-- **Build output is committed.** `kb/static/` gains generated files, which makes
+- **Build output is committed.** `kb/webui/` gains generated files, which makes
   diffs noisier and creates a class of bug where the source and the built output
   disagree. A CI check that rebuilds and fails on a dirty tree is the mitigation.
 - **`app.js` gets deleted, eventually.** 4,247 lines of imperative DOM is the real

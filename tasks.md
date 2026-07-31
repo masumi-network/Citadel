@@ -316,8 +316,13 @@ and [`2026-07-29-app-ui-design.md`](docs/superpowers/specs/2026-07-29-app-ui-des
 
 - [ ] Fill the `/contact` placeholders (NAME, EMAIL, REGISTERED ADDRESS) —
       `test_contact_page_has_no_unfilled_placeholders` fails until then, by design
-- [ ] Confirm `CITADEL_GOOGLE_CHAT_*` is live on the Railway node, or the form
-      renders and 503s on submit
+- [x] ~~Confirm `CITADEL_GOOGLE_CHAT_*` is live on the Railway node, or the form
+      renders and 503s on submit~~ — **resolved 2026-07-31, no longer a risk.**
+      ADR-0013's store-then-relay amendment means `/contact` persists the
+      enquiry BEFORE attempting any Chat relay and returns 200 with
+      `stored:true` even when `CITADEL_GOOGLE_CHAT_*` is unset; it 503s only if
+      the store AND the delivery both fail. Reads stay admin-only. Configuring
+      Chat is now an enhancement (live notification), not a fix.
 - [ ] Nothing visually verified in a browser this session; click through all
       five pages in light and dark before merging
 - [ ] `/info` and `/use-cases` prose still uses em dashes; sweep is pending a
