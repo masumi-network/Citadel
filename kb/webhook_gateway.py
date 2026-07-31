@@ -142,6 +142,12 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def connect(self) -> None:
         sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
         context = self._context or ssl.create_default_context()
+        # Pin the floor explicitly rather than trusting the interpreter's
+        # default. CPython 3.12 already defaults to TLS 1.2, but that is a
+        # property of the Python/OpenSSL build, not of this code, and a
+        # different deployment image could allow TLS 1.0/1.1. Stating it makes
+        # the guarantee travel with the connector.
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.sock = context.wrap_socket(sock, server_hostname=self.host)
 
 

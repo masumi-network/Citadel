@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from kb.config import CitadelConfig
-from kb.notification_gateways import configured_gateways
+from kb import notification_gateways as ng
 from kb import webhook_gateway as wg
 from kb.webhook_gateway import (
     WebhookConfigError,
@@ -191,18 +191,18 @@ def test_status_never_leaks_the_url_or_token() -> None:
 def test_registry_picks_up_a_configured_webhook() -> None:
     config = CitadelConfig(webhook_enabled=True, webhook_url=GOOD)
 
-    assert "webhook" in configured_gateways(config)
+    assert "webhook" in ng.configured_gateways(config)
 
 
 def test_registry_omits_an_unconfigured_webhook() -> None:
-    assert "webhook" not in configured_gateways(CitadelConfig())
+    assert "webhook" not in ng.configured_gateways(CitadelConfig())
 
 
 def test_a_bad_url_disables_the_gateway_instead_of_crashing_boot() -> None:
     """A misconfigured connector must not take the service down at startup."""
     config = CitadelConfig(webhook_enabled=True, webhook_url="http://169.254.169.254/x")
 
-    assert configured_gateways(config) == {}
+    assert ng.configured_gateways(config) == {}
 
 
 # --- findings from an adversarial review, each pinned -----------------------
@@ -300,8 +300,6 @@ def test_one_broken_provider_does_not_unregister_the_others(monkeypatch) -> None
     """GoogleChatDelivery.__init__ raises on a space name missing `spaces/`, so
     without isolation a single mistyped env var would also drop a perfectly good
     webhook and take LearningAgent.__init__ with it."""
-    import kb.notification_gateways as ng
-
     def explode(config: Any) -> Any:
         raise ValueError("CITADEL_GOOGLE_CHAT_SPACE_NAME must look like spaces/...")
 
