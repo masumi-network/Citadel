@@ -86,7 +86,20 @@ def _matches_extension(path: str, extensions: tuple[str, ...]) -> bool:
     return any(lowered.endswith(ext.lower()) for ext in extensions)
 
 
-def format_repo_content_document(file: RepoContentFile, *, checked_at: str) -> str:
+def format_repo_content_document(file: RepoContentFile) -> str:
+    """Render a repo file as a vault document.
+
+    Deliberately carries NO retrieval timestamp. It used to include
+    ``Retrieved: {checked_at}``, which made the body of an unchanged file
+    different on every sync. That defeated content-hash dedup at ingest and the
+    text-keyed dedup at query time, so each re-sync added another copy: one
+    README was occupying 8 of 8 result slots under 8 document ids, and half the
+    average result set was repeats of a single file.
+
+    ``Commit`` and ``Blob`` already pin the exact version this text came from,
+    and they are stable while the file is unchanged, which is the property that
+    makes a document deduplicable. When the file changes they change with it.
+    """
     return "\n".join(
         [
             f"# {file.repo}/{file.path}",
@@ -95,7 +108,6 @@ def format_repo_content_document(file: RepoContentFile, *, checked_at: str) -> s
             f"Source: {file.html_url}",
             f"Commit: {file.ref}",
             f"Blob: {file.sha}",
-            f"Retrieved: {checked_at}",
             "",
             "---",
             "",
@@ -643,7 +655,7 @@ class RepoContentSyncer:
                         )
                         continue
 
-                    document = format_repo_content_document(file, checked_at=checked_at)
+                    document = format_repo_content_document(file)
                     if dry_run:
                         ingested_files += 1
                         repo_result["ingested"] += 1

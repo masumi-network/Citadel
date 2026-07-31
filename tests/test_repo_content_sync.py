@@ -133,10 +133,33 @@ def test_format_repo_content_document() -> None:
         content="# Title",
         html_url="https://example.com",
     )
-    document = format_repo_content_document(file, checked_at="2026-06-16T00:00:00Z")
+    document = format_repo_content_document(file)
     assert "masumi-network/sokosumi-cli/README.md" in document
     assert "Commit: commit123" in document
     assert "# Title" in document
+
+
+def test_repo_content_document_is_stable_for_an_unchanged_file() -> None:
+    """Two syncs of an unchanged file must produce byte-identical documents.
+
+    A `Retrieved: <timestamp>` line used to make every re-sync textually
+    distinct, which defeated dedup at both ingest and query time and let one
+    README occupy 8 of 8 result slots under 8 document ids.
+    """
+    file = RepoContentFile(
+        repo="masumi-network/sokosumi-cli",
+        path="README.md",
+        sha="abc",
+        ref="commit123",
+        content="# Title",
+        html_url="https://example.com",
+    )
+
+    first = format_repo_content_document(file)
+    second = format_repo_content_document(file)
+
+    assert first == second
+    assert "Retrieved:" not in first, "a per-sync timestamp reintroduces duplicates"
 
 
 def test_discover_repo_paths_includes_root_and_tree_files() -> None:

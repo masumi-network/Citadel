@@ -81,6 +81,7 @@ from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
     CODE_TIMEOUT,
+    DOC_TYPE_CANONICAL,
     DOC_TYPE_TRACE,
     apply_query_ranking,
     compact_search_filters,
@@ -2606,8 +2607,20 @@ def with_result_metadata(
     # ``reference-only`` is attested by the dataset, so it outranks anything the
     # body text would suggest — otherwise a trace whose text mentions /skills/
     # classifies as a skill doc and reads as verified knowledge.
+    #
+    # The one exception is source-linked repository documentation, which carries
+    # a full Repository/Source/Commit/Blob header written by the repo-content
+    # syncer. A shared-trace marker is assigned by matching chunk TEXT against
+    # the session-traces dataset (search_across_datasets), so any document a
+    # trace happens to quote verbatim inherits ``reference-only`` and was then
+    # relabelled a trace. That is how every hit on this node — READMEs, SKILL.md,
+    # design specs — came back as ``session-trace`` and why ``mode="docs"``
+    # matched nothing. Structural provenance in the body beats a text collision.
+    inferred = infer_doc_type(preview)
     doc_type = (
-        DOC_TYPE_TRACE if metadata.get("trust") == "reference-only" else infer_doc_type(preview)
+        DOC_TYPE_TRACE
+        if metadata.get("trust") == "reference-only" and inferred != DOC_TYPE_CANONICAL
+        else inferred
     )
     metadata["doc_type"] = doc_type
     metadata["content_hint"] = infer_content_hint(preview, doc_type)
@@ -4207,7 +4220,9 @@ async def resolve_knowledge_conflict(
 async def indexes(request: Request) -> Any:
     require_access(request, "reader", "kb:read")
     citadel = get_citadel()
-    snapshot = await get_mesh().snapshot(citadel.config)
+    # Pass the authoritative corpus figures so the dashboard reports the vault's
+    # real size rather than whatever has happened since the last deploy.
+    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
     return jsonable_encoder({"indexes": snapshot["indexes"], "stats": snapshot["stats"]})
 
 
