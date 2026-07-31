@@ -247,6 +247,15 @@ class CitadelConfig:
     organization_digest_llm_enabled: bool = True
     organization_digest_llm_allow_private: bool = False
     organization_digest_post_on_no_updates: bool = False
+    # Generic outbound webhook. One adapter covers Discord, Mattermost, n8n,
+    # Zapier and bespoke receivers; see kb/webhook_gateway.py for why it applies
+    # a stricter URL policy than kb/secure_http.py.
+    webhook_enabled: bool = False
+    webhook_url: str | None = None
+    webhook_token: str | None = None
+    webhook_max_message_bytes: int = 30000
+    webhook_timeout_seconds: int = 20
+
     google_chat_enabled: bool = False
     google_chat_space_name: str | None = None
     google_chat_service_account_json: str | None = None
@@ -487,6 +496,15 @@ class CitadelConfig:
             organization_digest_post_on_no_updates=_bool(
                 os.getenv("CITADEL_ORG_DIGEST_POST_ON_NO_UPDATES"),
                 default=False,
+            ),
+            webhook_enabled=_bool(os.getenv("CITADEL_WEBHOOK_ENABLED"), default=False),
+            webhook_url=os.getenv("CITADEL_WEBHOOK_URL") or None,
+            webhook_token=os.getenv("CITADEL_WEBHOOK_TOKEN") or None,
+            webhook_max_message_bytes=_int(
+                os.getenv("CITADEL_WEBHOOK_MAX_MESSAGE_BYTES"), default=30000
+            ),
+            webhook_timeout_seconds=_int(
+                os.getenv("CITADEL_WEBHOOK_TIMEOUT_SECONDS"), default=20
             ),
             google_chat_enabled=_bool(os.getenv("CITADEL_GOOGLE_CHAT_ENABLED"), default=False),
             google_chat_space_name=os.getenv("CITADEL_GOOGLE_CHAT_SPACE_NAME") or None,

@@ -12,18 +12,39 @@ class _FakeGateway:
         return {"delivered": True, "message_id": message_id}
 
 
+def _stub_factories(monkeypatch, **returns):
+    """Patch every registered factory so the registry can be exercised with a
+    stand-in config.
+
+    These tests are about the registry mapping names to gateways, not about any
+    provider's configuration. Passing a bare ``object()`` only worked while one
+    factory existed; each additional connector reads its own config fields, so
+    every factory has to be stubbed for the stand-in to hold.
+    """
+    for name, provider in ng._GATEWAY_PROVIDERS:
+        monkeypatch.setattr(
+            provider, "from_config", staticmethod(lambda config, _n=name: returns.get(_n))
+        )
+
+
 def test_configured_gateways_includes_google_chat_when_available(monkeypatch):
     fake = _FakeGateway("google_chat")
-    monkeypatch.setattr(
-        ng.GoogleChatDelivery, "from_config", staticmethod(lambda config: fake)
-    )
+    _stub_factories(monkeypatch, google_chat=fake)
     assert ng.configured_gateways(config=object()) == {"google_chat": fake}
 
 
+def test_configured_gateways_includes_every_configured_connector(monkeypatch):
+    chat = _FakeGateway("google_chat")
+    hook = _FakeGateway("webhook")
+    _stub_factories(monkeypatch, google_chat=chat, webhook=hook)
+    assert ng.configured_gateways(config=object()) == {
+        "google_chat": chat,
+        "webhook": hook,
+    }
+
+
 def test_configured_gateways_empty_when_delivery_unavailable(monkeypatch):
-    monkeypatch.setattr(
-        ng.GoogleChatDelivery, "from_config", staticmethod(lambda config: None)
-    )
+    _stub_factories(monkeypatch)
     assert ng.configured_gateways(config=object()) == {}
 
 

@@ -125,6 +125,15 @@ The **Promotion Agent** queues items — **Vault Members do not add them**.
 - **CLI:** `citadel promotion list|approve|reject|run` with headless `--json`.
 - **Visibility:** each **Vault Member** sees their own queue; admins see all
   seats and may approve on a member’s behalf (delegate flagged in audit).
+- **Deciding is admin-only (amended 2026-07-31).** As written, this section
+  implied a member could approve or reject items in their own queue. Issue #48
+  closed that as a self-promotion path: a seat holder able to approve their own
+  item can move arbitrary **Node** content into **Central**, which is exactly
+  what the curated-Central rule exists to prevent. Both `approve` and `reject`
+  now require `role="admin"` on every surface — HTTP routes and MCP tools alike
+  — and the check runs before the item is even loaded. Members keep the rest of
+  the loop: they still **list** their own pending queue and still **run** their
+  own promotion pass. Only the decision is admin-locked.
 - **Reject sticks** — the same note is not re-queued on later cron passes unless
   its content changes.
 - **Approve is one-shot** — promotes that note only; later notes from the same
@@ -177,7 +186,7 @@ See also `CONTEXT.md` glossary (**Promotion Agent**, **Promotion Approval**,
 | 9 | On demand: member own seat, admin any seat |
 | 10 | Surfaces: dashboard + MCP (human confirm) + **`citadel promotion`** CLI |
 | 11 | **Reject sticks** — no re-queue for unchanged content |
-| 12 | **Member queue** — agent proposes; member approves/rejects (does not add items) |
+| 12 | **Member queue** — agent proposes; member lists and runs their own queue, but **deciding is admin-only** (amended 2026-07-31, issue #48 — see §6) |
 
 ## Open questions
 

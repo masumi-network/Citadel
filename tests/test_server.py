@@ -5553,6 +5553,58 @@ def test_search_marks_session_trace_hits_reference_only(tmp_path: Any) -> None:
     assert trace_hits[0]["_citadel"]["trust_tier"] == "reference-only"
 
 
+def test_repo_documentation_keeps_its_trust_when_a_trace_quotes_it() -> None:
+    """A text collision with session-traces must not demote Central docs.
+
+    The shared-trace marker is assigned by matching chunk TEXT, so any document
+    a trace quotes verbatim inherits it. ADR-0017 stopped that from rewriting
+    `doc_type`, but `trust` stayed demoted unconditionally, so Central
+    documentation still came back carrying a trace's trust tier.
+
+    Genuine traces are unaffected: their dataset attests them (ADR-0012), which
+    the test above pins.
+    """
+    repo_doc = {
+        "id": "chunk-1",
+        "text": (
+            "# masumi-network/sokosumi/README.md\n"
+            "\n"
+            "Repository: masumi-network/sokosumi\n"
+            "Source: https://github.com/masumi-network/sokosumi/blob/f401d38/README.md\n"
+            "Commit: f401d3896820ff35a82cf707818e308b67f5bce2\n"
+            "Blob: a4b30a4548af239f695ba3cba1935b545e96d675\n"
+            "\n"
+            "---\n"
+            "\n"
+            "# Sokosumi Monorepo\n"
+        ),
+        server_module.SHARED_TRACE_MARKER: True,
+    }
+
+    envelope = server_module.with_result_metadata(repo_doc, 0, "masumi-network")["_citadel"]
+
+    assert envelope["doc_type"] == "canonical-docs"
+    assert envelope.get("trust") != "reference-only", envelope
+    assert envelope["trust_tier"] == "unattested", envelope
+    # Trace-only metadata must not ride along on a document that is not a trace.
+    assert "author_seat" not in envelope
+
+
+def test_a_real_trace_quoting_a_repo_path_stays_a_trace() -> None:
+    """The ADR-0012 guard still holds: body prose cannot mint provenance."""
+    trace = {
+        "id": "chunk-2",
+        "text": "I opened masumi-network/sokosumi/README.md and Repository: looked fine",
+        server_module.SHARED_TRACE_MARKER: True,
+    }
+
+    envelope = server_module.with_result_metadata(trace, 0, "seat:bob")["_citadel"]
+
+    assert envelope["doc_type"] == "session-trace"
+    assert envelope["trust"] == "reference-only"
+    assert envelope["trust_tier"] == "reference-only"
+
+
 # --- /partners contact form -------------------------------------------------
 # The only unauthenticated write path in the service, so it gets its own tests
 # rather than riding along on the page tests.

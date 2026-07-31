@@ -105,8 +105,11 @@ citadel-update-agent/
 
 ## Migration Notes
 
-- Keep Citadel's built-in Google Chat path as a compatibility fallback until the
-  external repo is deployed.
+- ~~Keep Citadel's built-in Google Chat path as a compatibility fallback until
+  the external repo is deployed.~~ **Google Chat is dropped (2026-07-31)** —
+  there is no fallback to keep. A connector will be chosen later and implements
+  the existing `NotificationGateway` Protocol; the seam it plugs into is
+  unchanged.
 - In production, enable only one poster. Either Citadel cron posts, or the
   external update-agent repo posts.
 - Prefer one Citadel admin token scoped to the external agent identity. Rotate it

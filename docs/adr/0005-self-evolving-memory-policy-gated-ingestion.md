@@ -25,9 +25,15 @@ What already exists (verified 2026-06-26):
   (`org-ready`/`vault-contribution` tags or `/api/contribute`). cognee `improve()`
   on the daily GitHub cron. Per-tool MCP auth/scope/risk policies.
 
-Gaps:
-- **Secret scanning runs ONLY on the GitHub sync path** (`kb/github_sync.py`); `/ingest`,
-  `/api/contribute`, and autosync have **no scan** — unsafe for auto-promotion.
+Gaps (as of the original writing; see the amendment below for what has since
+closed):
+- ~~**Secret scanning runs ONLY on the GitHub sync path** (`kb/github_sync.py`);
+  `/ingest`, `/api/contribute`, and autosync have **no scan** — unsafe for
+  auto-promotion.~~ **Closed.** Verified 2026-07-31: the scan is now a single
+  gate on every write path. `Citadel._guard_content` runs it before enrichment
+  and before chunking, and `/ingest`, `/api/contribute`, the capture hooks
+  (`sync_push`, `sync_session`, `citadel capture`) and the **Promotion Agent**
+  all route through it.
 - Promotion is **manual/curated**, not smart-selective.
 - No GitHub **webhook** (cron-only). No frequent evolve cron.
 - cognee's deeper self-improvement (`auto_improve`, `build_global_context_index`) and
@@ -60,6 +66,12 @@ Gaps:
    `build_global_context_index` on the evolve cycle and add graph-aware retrieval
    (`GRAPH_COMPLETION`/`AUTO`) + cited references so search uses the graph that cognify
    builds.
+   > **NOT SHIPPED as of 2026-07-31.** Verified live on `/readyz`:
+   > `auto_improve: false`, `build_global_context_index: false`, and the search
+   > type is still plain vector `CHUNKS`. The "Gaps" section above therefore
+   > still describes current behaviour for this item, and the graph that cognify
+   > builds is not yet what search reads. Treat this as an open intention, not a
+   > delivered decision.
 
 ## Consequences
 

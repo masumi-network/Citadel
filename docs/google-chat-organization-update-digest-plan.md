@@ -1,5 +1,16 @@
 # Google Chat Organization Update Digest Plan
 
+> **Withdrawn 2026-07-31 — Google Chat is dropped.** This plan is retained for
+> history and no longer describes intent. Delivery of **Organization Update
+> Digests** will go through a connector chosen later, implementing the existing
+> `NotificationGateway` Protocol in `kb/notification_gateways.py`. See
+> [ADR-0002](adr/0002-google-chat-app-auth-for-update-digests.md).
+>
+> The provider-independent decisions in this plan still stand and any
+> replacement connector inherits them: delivery is outbound-only, best-effort
+> (a delivery failure must never fail the digest run), posts only redacted
+> summaries, and never ingests messages back into the vault.
+
 Citadel will post a daily **Organization Update Digest** to one dedicated Google
 Chat space. The digest is outbound-only in Phase 1 and is generated from
 source-linked Organization Vault context, with GitHub activity as the required
