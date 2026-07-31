@@ -30,6 +30,11 @@ class FakeCitadel:
 class FakeLearningProcess:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.improve_calls: list[dict[str, Any]] = []
+
+    async def improve_once(self, **kwargs: Any) -> Any:
+        self.improve_calls.append(kwargs)
+        return {"ok": True}
 
     async def learn(self, data: str, **kwargs: Any) -> Any:
         self.calls.append({"data": data, **kwargs})
@@ -486,3 +491,133 @@ def test_a_binding_cap_keeps_the_shallower_file_on_both_paths() -> None:
 
     assert probe_paths == ["skills/zzz.md"], "the walk takes the prefix's own files first"
     assert tree_paths == probe_paths, f"selection drifted under the cap: {tree_paths} != {probe_paths}"
+
+
+# --- resumability -----------------------------------------------------------
+#
+# 2026-07-31: a forced sync was killed by Railway's 300 s request ceiling after
+# ingesting files, and state was only written after the whole loop, so nothing
+# recorded them. Root cause of the two hours: run_improve fired a full cognee
+# improve pass per file (~2 min each). Both halves are pinned below.
+
+
+@pytest.mark.asyncio
+async def test_improve_runs_once_for_the_whole_sync_not_once_per_file(
+    tmp_path: Path,
+) -> None:
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=True,
+    )
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+
+    assert result["files_ingested"] == 2
+    # No per-file improve...
+    assert all(call.get("run_improve") is False for call in learning.calls)
+    # ...and exactly one improve for the whole run.
+    assert len(learning.improve_calls) == 1
+    assert learning.improve_calls[0]["dataset"] == "masumi-network"
+    assert learning.improve_calls[0]["session_ids"] == ["masumi-repo-content"]
+    assert result["improved"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_improve_pass_when_nothing_was_ingested(tmp_path: Path) -> None:
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=True,
+    )
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    await syncer.run()
+    learning.improve_calls.clear()
+    second = await syncer.run()  # everything unchanged now
+
+    assert second["files_ingested"] == 0
+    assert learning.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_state_is_checkpointed_per_file_so_a_killed_run_resumes(
+    tmp_path: Path,
+) -> None:
+    """A run that dies mid-loop must not lose the files it already ingested."""
+    state_path = tmp_path / "state.json"
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+    class DiesAfterFirstFile(FakeLearningProcess):
+        async def learn(self, data: str, **kwargs: Any) -> Any:
+            if self.calls:
+                raise RuntimeError("killed mid-sync, like a 300s request timeout")
+            return await super().learn(data, **kwargs)
+
+    learning = DiesAfterFirstFile()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError):
+        await syncer.run()
+
+    # The first file's success survived the crash.
+    assert state_path.exists(), "no checkpoint written before the crash"
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(persisted["files"]) == 1, persisted
+
+    # A fresh run skips what was already done instead of redoing it.
+    resumed_learning = FakeLearningProcess()
+    resumed = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=resumed_learning,  # type: ignore[arg-type]
+    )
+    result = await resumed.run()
+
+    assert result["files_ingested"] == 1
+    assert result["files_skipped_by_reason"].get("unchanged") == 1
+    assert len(resumed_learning.calls) == 1

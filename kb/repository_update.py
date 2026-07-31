@@ -539,39 +539,61 @@ def _active_repositories(
     )
 
 
+def _title_suffix(pull_request: dict[str, Any]) -> str:
+    """`: <title>` when the payload actually carries one, else nothing.
+
+    The org events feed's `pull_request` object holds only base/head/id/number/
+    url, so a title is usually absent. Emitting the literal string "(no title)"
+    put that phrase on every PR line in the daily digest, and the digest is
+    cognified into the vault as durable knowledge. Saying less is better than
+    saying something false.
+    """
+    title = _short(pull_request.get("title"), length=100)
+    return f": {title}" if title else ""
+
+
 def _event_summary(event_type: str, payload: dict[str, Any]) -> str:
     if event_type == "PushEvent":
         commits = payload.get("commits") or []
-        # GitHub's events feed reports the full push size separately from the
-        # (possibly truncated) inline commit array. Prefer the real count so the
-        # digest never claims "Pushed 0 commit(s)" when commits exist.
+        # `/orgs/{org}/events` returns an ABBREVIATED payload: its PushEvent
+        # carries only before/head/push_id/ref/repository_id, with no `size`,
+        # `distinct_size` or `commits`. An earlier fix here preferred `size`
+        # over `len(commits)` to avoid claiming "Pushed 0 commits", but since
+        # none of those keys exist on this endpoint it always fell through to
+        # len([]) == 0 and every push in the digest read "Pushed 0 commits".
+        # When the count is genuinely unknown, do not invent one.
         count = payload.get("size")
         if count is None:
             count = payload.get("distinct_size")
-        if count is None:
+        if count is None and commits:
             count = len(commits)
         messages = [_short(commit.get("message"), length=80) for commit in commits[:2]]
         ref = str(payload.get("ref") or "").removeprefix("refs/heads/")
         detail = "; ".join(message for message in messages if message)
-        plural = "" if count == 1 else "s"
-        return f"Pushed {count} commit{plural} to {ref or 'a branch'}" + (
-            f": {detail}" if detail else ""
-        )
+        target = ref or "a branch"
+        if count is None:
+            head = str(payload.get("head") or "")
+            summary = f"Pushed to {target}"
+            if head:
+                summary += f" (head {head[:12]})"
+        else:
+            plural = "" if count == 1 else "s"
+            summary = f"Pushed {count} commit{plural} to {target}"
+        return summary + (f": {detail}" if detail else "")
     if event_type == "PullRequestEvent":
         pull_request = payload.get("pull_request") or {}
         action = payload.get("action", "updated")
         if action == "closed" and pull_request.get("merged"):
             action = "merged"
-        title = _short(pull_request.get("title"), length=100) or "(no title)"
-        return f"{action} pull request #{pull_request.get('number')}: {title}"
+        number = pull_request.get("number") or payload.get("number")
+        return f"{action} pull request #{number}" + _title_suffix(pull_request)
     if event_type == "PullRequestReviewEvent":
         pull_request = payload.get("pull_request") or {}
         review = payload.get("review") or {}
-        title = _short(pull_request.get("title"), length=100) or "(no title)"
         return (
             f"{payload.get('action', 'reviewed')} review "
             f"{review.get('state', 'submitted')} on pull request "
-            f"#{pull_request.get('number')}: {title}"
+            f"#{pull_request.get('number')}" + _title_suffix(pull_request)
         )
     if event_type == "PullRequestReviewCommentEvent":
         pull_request = payload.get("pull_request") or {}

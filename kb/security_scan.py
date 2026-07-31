@@ -105,7 +105,24 @@ REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 URL_PATTERN = re.compile(r"https?://[^\s<>'\"`]+", re.IGNORECASE)
-RISKY_SCHEME_PATTERN = re.compile(r"(?i)\b(?:javascript|data|vbscript):|file://")
+
+# A dangerous scheme is only dangerous as a URI, so each alternative requires
+# what must actually follow the colon.
+#
+# The previous pattern matched the bare word ``data:`` anywhere, which is a
+# JavaScript/JSON property key far more often than a data URI. That blocked
+# seven documentation files whose only offence was ``mockResolvedValue({ data:
+# [...] })`` inside a fenced code block, and the block was silent, so nobody
+# could see it happening. A data URI is required to carry a MIME type (or the
+# ``data:,`` / ``data:;base64,`` degenerate forms), and javascript:/vbscript:
+# payloads run straight into their code with no space.
+RISKY_SCHEME_PATTERN = re.compile(
+    r"(?i)"
+    r"\b(?:javascript|vbscript):[^\s<>'\"]"
+    r"|\bdata:[a-z0-9.+-]+/[a-z0-9.+-]+"
+    r"|\bdata:[;,]"
+    r"|file://"
+)
 BIDI_CONTROL_CODES = {
     "\u202a",
     "\u202b",
@@ -233,10 +250,97 @@ def _scan_entry(entry: SecurityScanEntry) -> list[SecurityScanFinding]:
     return findings
 
 
+# Right-hand sides of a `token = ...` assignment that are code or placeholders
+# rather than a literal credential. Every one of these was observed blocking a
+# real documentation file: `process.env.SOKOSUMI_API_KEY`, `getApiKeyFromEnv()`,
+# `os.environ.get("RAILWAY_API_KEY")`, `request.query_params.get('api_key')` and
+# `YOUR_KEY`. None of them is a secret; all of them are how you correctly avoid
+# hard-coding one.
+_CODE_OR_PLACEHOLDER_VALUE = re.compile(
+    r"""(?ix)
+    ^(?:
+        process\.env\b
+      | import\.meta\.env\b
+      | os\.environ\b
+      | os\.getenv\b
+      | deno\.env\b
+      | system\.getenv\b
+      | getenv\b
+      | (?:your|my|the|some|a)[_-]
+      | x{3,}
+      | \.{3}
+      | \*{3,}
+      | changeme
+      | example
+      | placeholder
+      | redacted
+      | <
+      | \$
+      | \{
+      | %
+    )
+    """
+)
+# A dotted identifier chain (`process.env.SOKOSUMI_API_KEY;`, `config.api.token`)
+# is a reference to a secret, never the secret itself.
+_IDENTIFIER_CHAIN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[;,]?$")
+# A bare SCREAMING_SNAKE name is an env-var placeholder, not a credential.
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,}[;,]?$")
+# Lowercase words joined by _ or -, with no digits: `hashed_token`, `refresh_token`.
+# These are identifiers and test fixtures, not credentials.
+_WORDY_IDENTIFIER = re.compile(r"^[a-z]+(?:[_-][a-z]+)*$")
+# Below this length a wordy all-lowercase value is treated as an identifier.
+# Above it, it is more plausibly a passphrase and stays flagged, which is what
+# keeps `not-a-real-secret-value` (23 chars) caught.
+_WORDY_IDENTIFIER_MAX = 20
+
+
+def _is_credential_like(value: str) -> bool:
+    """Does this assignment's right-hand side look like a literal secret?
+
+    The `secret_assignment` rule fires on any `token|secret|api_key` assignment
+    with 8+ non-space characters after it, which also matches ordinary code that
+    reads a credential from the environment. Every false positive observed on
+    real files was a code expression or a placeholder, so those are what this
+    excludes.
+
+    It deliberately does NOT judge how random the value looks. An earlier
+    attempt here required a digit, or length plus mixed case, and that let
+    `password=not-a-real-secret-value` through — 23 lowercase characters is a
+    perfectly ordinary passphrase. Entropy is not the difference between a
+    secret and `process.env.API_KEY`; being a literal rather than an expression
+    is. The length floor stays at the rule's original 8 so nothing that used to
+    be caught stops being caught for a new reason.
+    """
+    candidate = value.strip().strip("'\"`").rstrip(";,")
+    if len(candidate) < 8:
+        return False
+    # Function calls, indexing and interpolation are code, not literals.
+    if any(char in candidate for char in "()[]{}<>$`"):
+        return False
+    if _CODE_OR_PLACEHOLDER_VALUE.match(candidate):
+        return False
+    if _IDENTIFIER_CHAIN.match(candidate):
+        return False
+    if _ENV_NAME.match(candidate):
+        return False
+    if len(candidate) < _WORDY_IDENTIFIER_MAX and _WORDY_IDENTIFIER.match(candidate):
+        # `token: "hashed_token"` in a test mock. The trade-off is explicit: a
+        # short all-lowercase passphrase with no digits would now be missed by
+        # THIS generic heuristic. Every high-confidence pattern (github_token,
+        # aws_access_key, stripe_live_secret, slack_token, private_key_marker,
+        # citadel token) is unaffected, and real generated credentials carry
+        # digits or mixed case and so never reach this branch.
+        return False
+    return True
+
+
 def _scan_secrets(entry: SecurityScanEntry, text: str) -> list[SecurityScanFinding]:
     findings: list[SecurityScanFinding] = []
     for category, severity, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(text):
+            if category == "secret_assignment" and not _is_credential_like(match.group(1)):
+                continue
             findings.append(
                 _finding(
                     severity=severity,

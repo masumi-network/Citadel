@@ -1,0 +1,4 @@
+# Cached copies of other repos' files, refetched by fetch_ground_truth.py.
+# Not vendored: they would go stale against their source repos and the script
+# reproduces them in one command.
+ground_truth/
