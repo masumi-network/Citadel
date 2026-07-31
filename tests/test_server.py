@@ -1266,13 +1266,24 @@ def test_ui_shell_is_served_after_login() -> None:
 STATIC_DIR = Path(server_module.__file__).resolve().parent / "static"
 
 
-def test_app_nav_has_four_primary_entries() -> None:
-    """Home, Search, Review, Admin. Nothing else is a primary nav entry.
+def test_app_nav_has_five_primary_entries() -> None:
+    """Home, Search, Graph, Review, Admin. Nothing else is a primary nav entry.
 
     Seven entries were the problem the redesign exists to fix: two of them
     nobody could tell apart, and the promotion queue that people actually needed
-    was buried inside an admin-only Overview. Explore and Activity are still
-    reachable by route; they are just not resident in the sidebar.
+    was buried inside an admin-only Overview.
+
+    This asserted four for exactly that reason, on the stated premise that the
+    non-resident pages were "still reachable by route". For the Knowledge page
+    that premise was false: it had no nav entry, no setPage() call and no hash
+    link anywhere, so the graph was reachable only by typing the URL fragment
+    and to every user it simply did not exist, while /api/mesh/graph was serving
+    932 nodes in ~300ms. Graph is now resident, at the owner's request.
+
+    Five is still a cap, not an invitation. The lesson of the seven-entry
+    version stands: anything added here has to earn residency, and a page that
+    cannot must at least be reachable from somewhere, which
+    test_every_dashboard_page_is_reachable_from_the_ui now enforces.
     """
     client = authed_client()
 
@@ -1282,7 +1293,7 @@ def test_app_nav_has_four_primary_entries() -> None:
     assert nav, "the /app shell no longer renders a <nav class=\"side-nav\">"
     labels = re.findall(r'<span class="nav-label">([^<]+)</span>', nav.group(0))
 
-    assert labels == ["Home", "Search", "Review", "Admin"], labels
+    assert labels == ["Home", "Search", "Graph", "Review", "Admin"], labels
     assert 'class="nav-link" data-page-target="overview"' not in page
     assert 'class="nav-link" data-page-target="ingest"' not in page
     # Review is writer-gated; Admin stays admin-gated.

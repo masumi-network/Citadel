@@ -457,3 +457,41 @@ def test_seat_home_is_not_empty_after_a_restart_wipes_the_mesh_projection(
 
     assert payload["document_count"] == 42, payload
     assert payload["empty"] is False, "a populated seat rendered as empty"
+
+
+def test_every_dashboard_page_is_reachable_from_the_ui() -> None:
+    """A page with no way in is invisible, however healthy its data is.
+
+    The Knowledge/graph page shipped complete: canvas, depth control, legend,
+    metrics strip, node inspector. It had no `data-page-target` anywhere, so the
+    only way to reach it was to type the URL hash by hand, and the graph looked
+    to users like a feature that did not exist. Meanwhile /api/mesh/graph was
+    returning 932 nodes and 5952 edges in ~300ms.
+
+    `locked` and `overview` are deliberately unreachable: `locked` is the
+    fallback setPage() routes to when a caller lacks the role, and a comment at
+    app.js initialPage() records that `overview` was intentionally dropped from
+    the nav.
+    """
+    from pathlib import Path
+    import re
+
+    html = Path("kb/static/index.html").read_text(encoding="utf-8")
+    pages = set(re.findall(r'data-page="([a-z-]+)"', html))
+    targets = set(re.findall(r'data-page-target="([a-z-]+)"', html))
+    intentionally_unreachable = {"locked", "overview"}
+    # Genuinely unreachable, same defect as the graph page: built, complete, and
+    # with no nav entry, no setPage() call and no hash link anywhere. Listed
+    # rather than silently subtracted so this test still fails on a NEW orphan.
+    # Not fixed here because each needs a role decision (settings and audit are
+    # plausibly admin-only) and guessing at that is a security call, not a UI
+    # one. Tracked separately.
+    known_unreachable = {"audit", "feedback", "settings"}
+
+    orphaned = pages - targets - intentionally_unreachable - known_unreachable
+
+    assert not orphaned, (
+        f"pages with no way to reach them from the UI: {sorted(orphaned)}. "
+        "Add a nav entry or a data-page-target button, or list it as "
+        "intentionally unreachable with a reason."
+    )
