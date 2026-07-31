@@ -67,6 +67,25 @@ def assert_cognee_dataset_api() -> None:
     from cognee.modules.data.models import Dataset, DatasetData  # noqa: F401
     from cognee.modules.users.methods import get_default_user  # noqa: F401
 
+    # Symbol imports alone were not enough. `cognee.add()` returns a
+    # PipelineRunInfo model whose `data_ingestion_info` is an ATTRIBUTE;
+    # `_cognee_data_ids` read it as a dict key, always got nothing, and left the
+    # repo-content sync unable to converge. Nothing failed loudly because the
+    # shape is only ever read best-effort. Pin the field's EXISTENCE here so a
+    # cognee bump that renames or moves it fails at boot and in CI rather than
+    # degrading into a silent livelock.
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunInfo,
+    )
+
+    for model in (PipelineRunInfo, PipelineRunCompleted):
+        if "data_ingestion_info" not in getattr(model, "model_fields", {}):
+            raise RuntimeError(
+                f"cognee {model.__name__} no longer declares data_ingestion_info; "
+                "kb.repo_content_sync._cognee_data_ids needs updating"
+            )
+
 
 _SUPPRESS_INLINE_COGNIFY: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "citadel_suppress_inline_cognify", default=False

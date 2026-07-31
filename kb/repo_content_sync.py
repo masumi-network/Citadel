@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -89,22 +90,40 @@ def _matches_extension(path: str, extensions: tuple[str, ...]) -> bool:
 def _cognee_data_ids(outcome: Any) -> list[str]:
     """Pull the data ids cognee assigned out of an ingest outcome.
 
-    Best-effort and shape-tolerant: cognee's result is a nested dict whose exact
-    layout is not part of any contract we control. An empty list simply means
-    the next sync re-ingests this file, which is the safe direction — it repairs
-    rather than silently trusting a claim it cannot check.
+    ``cognee.add()`` returns a ``PipelineRunInfo`` pydantic model (concretely a
+    ``PipelineRunCompleted``), and ``data_ingestion_info`` is an ATTRIBUTE on it.
+    ``CogneePublicClient.remember`` wraps that object unmodified as
+    ``{"added": <PipelineRunInfo>}``, so it is never a dict at this point.
+
+    The previous version gated on ``isinstance(added, dict)`` and reasoned that
+    an empty list was safe because the next sync would re-ingest the file. That
+    was wrong in both halves. The gate was always taken, so this returned ``[]``
+    for every file ever ingested, and an empty list is NOT safe: it leaves the
+    ``unchanged`` guard permanently unsatisfiable, the next run re-ingests, the
+    process-lifetime dedupe in :meth:`Citadel.ingest` rejects it as
+    ``duplicate_in_process``, and that rejection writes no state at all. The
+    result was a livelock in which no sync could ever converge.
+
+    Read the attribute first and fall back to a mapping, so a future cognee that
+    returns a plain dict still works. Never gate on the container type alone.
     """
     ids: list[str] = []
     for result in getattr(outcome, "all_ingests", ()) or ():
         payload = getattr(result, "cognee_result", None)
-        if not isinstance(payload, dict):
+        added = payload.get("added") if isinstance(payload, Mapping) else None
+        if added is None:
             continue
-        added = payload.get("added")
-        if not isinstance(added, dict):
-            continue
-        for info in added.get("data_ingestion_info") or ():
-            if isinstance(info, dict) and info.get("data_id"):
-                ids.append(str(info["data_id"]))
+        info_list = getattr(added, "data_ingestion_info", None)
+        if info_list is None and isinstance(added, Mapping):
+            info_list = added.get("data_ingestion_info")
+        for info in info_list or ():
+            data_id = (
+                info.get("data_id")
+                if isinstance(info, Mapping)
+                else getattr(info, "data_id", None)
+            )
+            if data_id:
+                ids.append(str(data_id))
     return list(dict.fromkeys(ids))
 
 

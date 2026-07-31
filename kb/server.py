@@ -3244,6 +3244,19 @@ async def me_summary(request: Request) -> dict[str, Any]:
             readable_document_count = sum(
                 int(counts.get(name) or 0) for name in readable_datasets
             )
+            # Prefer the durable count for the Node total too. `document_count`
+            # above walks the mesh projection, which is rebuilt in memory and
+            # empties on every process restart, so on a service that redeploys
+            # per merge it reads 0 for a seat holding thousands of notes. That
+            # zero then propagated into `capture_done` below and flipped `empty`
+            # true, so the seat home rendered its "nothing captured yet" state
+            # over a full Node.
+            #
+            # Read isolation is unchanged: `node` is THIS caller's own seat Node
+            # from seat_node_dataset(identity), so no other seat's dataset is
+            # ever read here.
+            if node:
+                document_count = int(counts.get(node) or 0) or document_count
     except Exception:
         # Null, not zero. Zero is a claim that the caller can read nothing.
         logger.exception("me/summary readable document count failed")
@@ -4059,7 +4072,16 @@ def scope_mesh_snapshot(
 async def mesh(request: Request) -> Any:
     identity = require_access(request, "reader", "kb:read")
     citadel = get_citadel()
-    snapshot = await get_mesh().snapshot(citadel.config)
+    # Pass the authoritative corpus figures, or the dashboard reports the
+    # in-memory counters as though they were totals (ADR-0018). `snapshot` grew a
+    # `corpus` parameter for exactly this, but this endpoint, the one the
+    # dashboard actually reads, was never updated to supply it. In production it
+    # still returned `documents: 1, indexed_chunks: 1` against a real 17991
+    # indexed, which is what makes a healthy vault look empty on login.
+    # `_corpus_health` is the same source /readyz and `citadel status` use, and
+    # is fail-soft: on a transient read error it returns None totals and
+    # `snapshot` falls back to the in-memory values rather than raising here.
+    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
     return jsonable_encoder(scope_mesh_snapshot(snapshot, identity))
 
 
