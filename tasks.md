@@ -321,8 +321,11 @@ and [`2026-07-29-app-ui-design.md`](docs/superpowers/specs/2026-07-29-app-ui-des
       ADR-0013's store-then-relay amendment means `/contact` persists the
       enquiry BEFORE attempting any Chat relay and returns 200 with
       `stored:true` even when `CITADEL_GOOGLE_CHAT_*` is unset; it 503s only if
-      the store AND the delivery both fail. Reads stay admin-only. Configuring
-      Chat is now an enhancement (live notification), not a fix.
+      the store AND the delivery both fail. Reads stay admin-only.
+      **Google Chat is dropped (2026-07-31)**, so this never needs configuring:
+      a connector will be chosen later and implements the existing
+      `NotificationGateway` Protocol. `/contact` keeps working without one,
+      because storing the enquiry is the part that matters.
 - [ ] Nothing visually verified in a browser this session; click through all
       five pages in light and dark before merging
 - [ ] `/info` and `/use-cases` prose still uses em dashes; sweep is pending a
