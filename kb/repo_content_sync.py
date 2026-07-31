@@ -524,6 +524,22 @@ class RepoContentSyncer:
         blocked_files = 0
         improved = False
         skip_totals: dict[str, int] = {}
+        blocked_reasons: dict[str, int] = {}
+
+        def _checkpoint(tracked_files: dict[str, Any]) -> None:
+            """Persist progress so a killed run resumes where it stopped."""
+            if dry_run:
+                return
+            state["version"] = STATE_VERSION
+            state["files"] = tracked_files
+            try:
+                self._save_state(state)
+            except OSError as exc:
+                # A checkpoint failure must not abort a sync that is otherwise
+                # working; worst case is the old behaviour of redoing files.
+                logger.warning(
+                    "Repo content sync could not checkpoint state: %s", exc.__class__.__name__
+                )
 
         def _record_skip(repo_result: dict[str, Any], reason: str) -> None:
             nonlocal skipped_files
@@ -541,6 +557,7 @@ class RepoContentSyncer:
                 "skipped": 0,
                 "skipped_reasons": {},
                 "blocked": 0,
+                "blocked_paths": [],
                 "errors": [],
             }
             try:
@@ -595,6 +612,35 @@ class RepoContentSyncer:
                     if scan.get("blocked"):
                         blocked_files += 1
                         repo_result["blocked"] += 1
+                        # A block silently drops a file from the vault. Without
+                        # the path and the rule, a scanner false positive is
+                        # invisible: the ledger says "blocked: 7" and nothing
+                        # else, and reconstructing which seven meant
+                        # re-implementing the scan by hand. Categories and
+                        # severities are already redacted by public_dict().
+                        categories = sorted(
+                            {
+                                str(finding.get("category"))
+                                for finding in scan.get("findings", [])
+                            }
+                        )
+                        for category in categories:
+                            blocked_reasons[category] = blocked_reasons.get(category, 0) + 1
+                        repo_result["blocked_paths"].append(
+                            {
+                                "path": path,
+                                "highest_severity": scan.get("highest_severity"),
+                                "finding_count": scan.get("finding_count"),
+                                "categories": categories,
+                            }
+                        )
+                        logger.warning(
+                            "Repo content sync BLOCKED %s: severity=%s findings=%s rules=%s",
+                            key,
+                            scan.get("highest_severity"),
+                            scan.get("finding_count"),
+                            ",".join(categories) or "unknown",
+                        )
                         continue
 
                     document = format_repo_content_document(file, checked_at=checked_at)
@@ -621,7 +667,9 @@ class RepoContentSyncer:
                             Path(path).suffix.lstrip(".") or "text",
                         ],
                         operation="repo_content_sync",
-                        run_improve=self.config.repo_content_sync_run_improve,
+                        # Improve ONCE after the whole sync, not per file. See
+                        # LearningProcess.improve_once for why.
+                        run_improve=False,
                         detect_conflicts=False,
                     )
                     if any(result.accepted for result in outcome.all_ingests):
@@ -632,13 +680,32 @@ class RepoContentSyncer:
                             "content_hash": file.content_hash,
                             "last_ingested_at": checked_at,
                         }
-                        if outcome.improved:
-                            improved = True
+                        # Checkpoint immediately. State used to be written only
+                        # after every repo finished, so a run killed part-way
+                        # ingested files into cognee and recorded none of them,
+                        # and the next run redid the same work. A killed run
+                        # must be able to resume, not restart.
+                        _checkpoint(tracked)
                     else:
                         _record_skip(repo_result, "ingest_rejected")
             except GitHubAPIError as exc:
                 repo_result["errors"].append({"error": str(exc)[:240]})
             repo_results.append(repo_result)
+
+        # One improve pass for the whole sync. Per-file improve made a full
+        # forced sync cost ~2 min/file, so 60 files needed ~2 h against a 300 s
+        # platform request ceiling and could never finish.
+        if not dry_run and ingested_files and self.config.repo_content_sync_run_improve:
+            outcome = await self.learning.improve_once(
+                dataset=self.config.repo_content_sync_dataset,
+                session_ids=[self.config.repo_content_sync_session],
+            )
+            improved = not (isinstance(outcome, dict) and outcome.get("ok") is False)
+            if not improved:
+                logger.warning(
+                    "Repo content sync ingested %d file(s) but the improve pass failed",
+                    ingested_files,
+                )
 
         if not dry_run:
             state["version"] = STATE_VERSION
@@ -654,11 +721,14 @@ class RepoContentSyncer:
         )
 
         logger.info(
-            "Repo content sync finished: repos=%d ingested=%d skipped=%d blocked=%d dry_run=%s",
+            "Repo content sync finished: repos=%d discovered=%d ingested=%d skipped=%d "
+            "blocked=%d blocked_rules=%s dry_run=%s",
             len(repo_results),
+            sum(int(result.get("paths_discovered") or 0) for result in repo_results),
             ingested_files,
             skipped_files,
             blocked_files,
+            blocked_reasons or "-",
             dry_run,
         )
         return {
@@ -673,6 +743,7 @@ class RepoContentSyncer:
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_blocked": blocked_files,
+            "files_blocked_by_reason": blocked_reasons,
             "improved": improved,
             "dry_run": dry_run,
             "repositories": repo_results,

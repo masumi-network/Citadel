@@ -238,6 +238,26 @@ class LearningProcess:
             return None
         return self.conflicts.record(candidate)
 
+    async def improve_once(
+        self,
+        *,
+        dataset: str | None = None,
+        session_ids: list[str] | None = None,
+    ) -> Any:
+        """Run a single improve pass, decoupled from any one document.
+
+        `learn(run_improve=True)` improves after every document, which is right
+        for a one-off capture and ruinous for a batch importer: a full cognee
+        improve pass costs roughly two minutes, so a 60-file sync spent about
+        two hours improving and was killed by the platform's 300 s request
+        ceiling before it could record any of it. Batch callers pass
+        `run_improve=False` per document and call this once at the end.
+        """
+        return await self._improve(
+            dataset=dataset or self.config.default_dataset,
+            session_ids=session_ids,
+        )
+
     async def _improve(
         self,
         *,
