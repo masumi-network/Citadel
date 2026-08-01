@@ -1315,30 +1315,56 @@ def create_mcp_server(
 
         return await _call_async("citadel_promotion_reject", reject)
 
+    # Resource reads execute on the event loop that also serves the node's HTTP
+    # API, so a handler that performs a sync self-call parks the loop on the very
+    # request it is waiting for — the same hazard documented for tools/list below
+    # (#100). Every handler must therefore be async and offload its HTTP call via
+    # _call_async, exactly like the tools above.
+
     @mcp.resource("citadel://session")
-    def session_resource() -> str:
+    async def session_resource() -> str:
         """Current Citadel role, actor, and capabilities."""
-        return json.dumps(resolve_client(mcp.get_context()).get("/api/session"), indent=2, default=str)
+        ctx = mcp.get_context()
+        payload = await _call_async(
+            "citadel://session",
+            lambda: resolve_client(ctx).get("/api/session"),
+        )
+        return json.dumps(payload, indent=2, default=str)
 
     @mcp.resource("citadel://discovery")
-    def discovery_resource() -> str:
+    async def discovery_resource() -> str:
         """Safe public Citadel agent discovery metadata."""
-        return json.dumps(public_manifest(), indent=2, default=str)
+        payload = await _call_async("citadel://discovery", public_manifest)
+        return json.dumps(payload, indent=2, default=str)
 
     @mcp.resource("citadel://sources")
-    def sources_resource() -> str:
+    async def sources_resource() -> str:
         """Configured source-learning status."""
-        return json.dumps(resolve_client(mcp.get_context()).get("/api/learning-agent"), indent=2, default=str)
+        ctx = mcp.get_context()
+        payload = await _call_async(
+            "citadel://sources",
+            lambda: resolve_client(ctx).get("/api/learning-agent"),
+        )
+        return json.dumps(payload, indent=2, default=str)
 
     @mcp.resource("citadel://indexes")
-    def indexes_resource() -> str:
+    async def indexes_resource() -> str:
         """Current Citadel index status."""
-        return json.dumps(resolve_client(mcp.get_context()).get("/api/indexes"), indent=2, default=str)
+        ctx = mcp.get_context()
+        payload = await _call_async(
+            "citadel://indexes",
+            lambda: resolve_client(ctx).get("/api/indexes"),
+        )
+        return json.dumps(payload, indent=2, default=str)
 
     @mcp.resource("citadel://events/recent")
-    def recent_events_resource() -> str:
+    async def recent_events_resource() -> str:
         """Recent mesh events."""
-        mesh = resolve_client(mcp.get_context()).get("/api/mesh")
+        ctx = mcp.get_context()
+        mesh = await _call_async(
+            "citadel://events/recent",
+            lambda: resolve_client(ctx).get("/api/mesh"),
+        )
         return json.dumps({"events": mesh.get("events", [])}, indent=2, default=str)
 
     @mcp.prompt()

@@ -4,6 +4,7 @@ import asyncio
 from io import BytesIO
 import inspect
 import json
+import threading
 from typing import Any
 from urllib.error import HTTPError
 
@@ -251,7 +252,7 @@ def test_discovery_resource_reads_public_manifest_only() -> None:
     resource = asyncio.run(server._resource_manager.get_resource("citadel://discovery"))
 
     assert resource is not None
-    assert json.loads(resource.fn()) == {
+    assert json.loads(asyncio.run(resource.fn())) == {
         "ok": True,
         "path": "/.well-known/citadel.json",
         "public": True,
@@ -293,11 +294,78 @@ def test_authed_resource_uses_caller_token_on_hosted_transport(
     monkeypatch.setattr(mcp_server, "CitadelHttpClient", StubClient)
 
     resource = asyncio.run(server._resource_manager.get_resource("citadel://indexes"))
-    payload = json.loads(resource.fn())
+    payload = json.loads(asyncio.run(resource.fn()))
 
     assert captured["token"] == "ctdl_resourcetoken"
     assert captured["path"] == "/api/indexes"
     assert payload == {"ok": True, "path": "/api/indexes"}
+
+
+MCP_RESOURCE_URIS = [
+    "citadel://session",
+    "citadel://discovery",
+    "citadel://sources",
+    "citadel://indexes",
+    "citadel://events/recent",
+]
+
+
+@pytest.mark.parametrize("uri", MCP_RESOURCE_URIS)
+def test_resource_handlers_are_coroutine_functions(uri: str) -> None:
+    """Resource reads run on the server's event loop. A sync handler makes its
+    HTTP self-call on the loop that has to serve that very call — the hazard
+    documented for tools/list (#100) — so every handler must be async and
+    offload via _call_async exactly like the tools.
+    """
+    server = create_mcp_server(FakeHttpClient())
+
+    resource = asyncio.run(server._resource_manager.get_resource(uri))
+
+    assert resource is not None
+    assert inspect.iscoroutinefunction(resource.fn), (
+        f"{uri} handler is sync; it must be async and offload its HTTP call "
+        "so the event loop stays free (#100)"
+    )
+
+
+def test_resource_read_leaves_the_event_loop_free() -> None:
+    """Drive a resource read whose HTTP client refuses to return until a
+    loop-side task has run. Only a handler that offloads the call off the loop
+    can pass: a handler that blocks the loop starves the concurrent task, the
+    client times out unsignalled, and the assertion goes red. A payload-only
+    test would pass either way; this one cannot.
+    """
+    loop_progressed = threading.Event()
+
+    class BlockingHttpClient(FakeHttpClient):
+        def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            # Runs in a worker thread when the handler offloads correctly, and
+            # on the event loop when it does not. Waits for proof that the loop
+            # kept moving while this call was in flight.
+            return {"loop_made_progress": loop_progressed.wait(timeout=5.0)}
+
+    server = create_mcp_server(BlockingHttpClient())
+
+    async def scenario() -> dict[str, Any]:
+        resource = await server._resource_manager.get_resource("citadel://indexes")
+        assert resource is not None
+
+        async def make_progress() -> None:
+            # Must get loop time WHILE the resource read is blocked in the
+            # HTTP client, or the client above returns False.
+            await asyncio.sleep(0.05)
+            loop_progressed.set()
+
+        raw, _ = await asyncio.gather(resource.read(), make_progress())
+        return json.loads(raw)
+
+    payload = asyncio.run(scenario())
+
+    assert payload["loop_made_progress"] is True, (
+        "the event loop made no progress while the resource read was in "
+        "flight — the handler ran its HTTP call on the loop instead of "
+        "offloading it (#100)"
+    )
 
 
 def test_search_clamps_top_k_and_tracks_tool_name() -> None:
