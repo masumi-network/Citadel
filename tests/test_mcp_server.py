@@ -817,3 +817,143 @@ def test_contribute_tool_rejects_empty_or_oversized_payloads(
     monkeypatch.setenv("CITADEL_MCP_MAX_INGEST_BYTES", "4")
     with pytest.raises(ToolError, match="payload is 5 bytes"):
         run_tool(server, "citadel_contribute", "Title", "12345", None)
+
+
+def test_search_does_not_hand_an_agent_every_hit_twice() -> None:
+    """`/search` returns each hit in `results` AND again inside `sections`.
+
+    The dashboard needs that grouping and renders a heading per section, so the
+    endpoint is right to send it. An agent is not: it reads `results`, and each
+    hit already carries its own `_citadel.dataset`.
+
+    Measured against production, one top_k=5 call returned 84,376 characters of
+    which 41,986 were the `sections` copy. That was large enough to blow the MCP
+    tool output limit, so the caller received an error and a file path instead
+    of an answer. Halving it is the difference between a usable search and one
+    that fails outright.
+    """
+    from kb.mcp_server import _compact_search_for_agent
+
+    # Deliberately under the truncation cap: this test is about the duplicate
+    # `sections` copy, not about hit-text length, which has its own test.
+    hit = {"id": "a", "text": "x" * 900, "_citadel": {"dataset": "masumi-network"}}
+    other = {"id": "b", "text": "y" * 900, "_citadel": {"dataset": "seat:alice"}}
+    payload = {
+        "results": [hit, other],
+        "sections": {"central": [hit], "node": [other], "session_traces": []},
+        "search_id": "s-1",
+    }
+    before = len(json.dumps(payload))
+
+    compacted = _compact_search_for_agent(payload)
+
+    assert "sections" not in compacted, "hit copies still being sent to the agent"
+    # The grouping survives as counts, so a caller can still see the split.
+    assert compacted["section_counts"] == {"central": 1, "node": 1, "session_traces": 0}
+    # Nothing a caller actually reads was dropped.
+    assert compacted["results"] == [hit, other]
+    assert compacted["search_id"] == "s-1"
+    assert len(json.dumps(compacted)) < before / 1.8, "payload was not meaningfully reduced"
+
+
+def test_search_compaction_leaves_unexpected_shapes_alone() -> None:
+    """Never turn a search failure into a crash inside the compactor.
+
+    An error body, or a future server that stops sending `sections`, must pass
+    through untouched rather than raising and costing the caller the result.
+    """
+    from kb.mcp_server import _compact_search_for_agent
+
+    assert _compact_search_for_agent({"results": []}) == {"results": []}
+    assert _compact_search_for_agent({"sections": None}) == {"sections": None}
+    assert _compact_search_for_agent("not a dict") == "not a dict"
+    assert _compact_search_for_agent(None) is None
+
+
+def test_citadel_search_tool_strips_the_duplicate_sections(monkeypatch: Any) -> None:
+    """Through the TOOL, not the helper.
+
+    The two tests above call `_compact_search_for_agent` directly, so they would
+    both stay green if the call were dropped from `citadel_search`. That is
+    exactly how a guard shipped inert earlier: the unit test asserted the
+    parser, nothing asserted the wiring. This one goes through the tool, so
+    removing the call turns it red.
+    """
+    hit = {"id": "a", "text": "x" * 900, "_citadel": {"dataset": "masumi-network"}}
+    body = {
+        "results": [hit],
+        "sections": {"central": [hit], "node": [], "session_traces": []},
+        "search_id": "s-9",
+    }
+
+    class SearchClient(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            extra_headers: dict[str, str] | None = None,
+        ) -> dict[str, Any]:
+            self.posts.append({"path": path, "payload": payload, "tool_name": tool_name})
+            return dict(body)
+
+    server = create_mcp_server(SearchClient())
+
+    result = run_tool(server, "citadel_search", "hermes", None, top_k=5)
+
+    assert "sections" not in result, "the tool handed the agent every hit twice"
+    assert result["section_counts"] == {"central": 1, "node": 0, "session_traces": 0}
+    assert result["results"] == [hit]
+    assert result["search_id"] == "s-9"
+
+
+def test_search_truncates_oversized_hit_text_and_says_so(monkeypatch: Any) -> None:
+    """Dropping the duplicate `sections` was necessary and not sufficient.
+
+    Production hits carry 6,000 to 7,000 characters each, so the DOCUMENTED
+    default top_k=10 returned 209,109 characters and blew the tool-result budget
+    even with the duplicate removed (~103,000 remained). A cap is needed too.
+
+    Truncation must never be silent. An agent that cannot tell a full document
+    from its first 500 words will summarise the fragment and present it as the
+    whole, which is a worse failure than the bloat it fixes.
+    """
+    monkeypatch.delenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", raising=False)
+    from kb.mcp_server import _compact_search_for_agent
+
+    long_text = "\n".join(f"line {i} of the document body" for i in range(400))
+    payload = {"results": [{"id": "doc-1", "text": long_text}], "sections": {}}
+
+    compacted = _compact_search_for_agent(payload)
+    hit = compacted["results"][0]
+
+    assert len(hit["text"]) <= 2000
+    assert hit["text_truncated"] is True
+    assert hit["text_full_chars"] == len(long_text)
+    # The escape hatch has to be actionable, so the id must survive.
+    assert hit["id"] == "doc-1"
+    assert "citadel_get_document" in hit["text_hint"]
+
+
+def test_search_leaves_short_hits_and_honours_the_override(monkeypatch: Any) -> None:
+    """A short hit must come back untouched and unflagged, and an operator who
+    genuinely wants full text must be able to ask for it without a deploy."""
+    from kb.mcp_server import _compact_search_for_agent
+
+    monkeypatch.delenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", raising=False)
+    short = {"id": "s", "text": "brief answer"}
+    assert _compact_search_for_agent({"results": [short]})["results"][0] == short
+
+    long_text = "x" * 9000
+    monkeypatch.setenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", "0")
+    untouched = _compact_search_for_agent({"results": [{"id": "d", "text": long_text}]})
+    assert untouched["results"][0]["text"] == long_text, "0 must disable truncation"
+
+    monkeypatch.setenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", "500")
+    tight = _compact_search_for_agent({"results": [{"id": "d", "text": long_text}]})
+    assert len(tight["results"][0]["text"]) <= 500
+
+    monkeypatch.setenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", "not-a-number")
+    safe = _compact_search_for_agent({"results": [{"id": "d", "text": long_text}]})
+    assert len(safe["results"][0]["text"]) <= 2000, "a bad env value must not disable the cap"
