@@ -116,6 +116,14 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         self.tree_fails = False
         self.tree_calls = 0
         self.probe_calls = 0
+        # The repo HEAD. Mutable so a test can push an unrelated commit —
+        # HEAD moves, the tracked files do not.
+        self.head = "commit123"
+        # Overrides for the commit that last touched a path. By default it is
+        # derived from the blob sha, mirroring the real coupling: it moves
+        # exactly when the file's content does, and not when HEAD does.
+        self.last_commits: dict[str, str] = {}
+        self.last_commit_calls = 0
 
     def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
         self.tree_calls += 1
@@ -129,7 +137,15 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         return "main"
 
     def fetch_commit_sha(self, full_name: str, *, ref: str) -> str:
-        return "commit123"
+        return self.head
+
+    def fetch_last_commit_sha(self, full_name: str, path: str, *, ref: str) -> str:
+        self.last_commit_calls += 1
+        key = f"{full_name}/{path}"
+        payload = self.files.get(key)
+        if payload is None:
+            raise GitHubAPIError(f"Could not resolve the last commit for {key}.")
+        return self.last_commits.get(key, f"touched-{payload['sha']}")
 
     def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
         self.probe_calls += 1
@@ -251,6 +267,192 @@ async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None
 
     state = json.loads(Path(config.repo_content_sync_state_path).read_text(encoding="utf-8"))
     assert state["files"]["masumi-network/sokosumi-cli/README.md"]["sha"] == "abc"
+
+
+# --- header pinning: the body must not depend on the repo HEAD ---------------
+#
+# 2026-07-31: one README blob (a4b30a45) existed as THREE documents under three
+# commit values. `Commit:` and the sha inside `Source:` carried the repo HEAD,
+# which moves when ANY file in the repo changes, so every re-render of an
+# unchanged file minted a new content hash and cognee's content-addressed
+# ingestion created a copy. The header is now pinned to the commit that last
+# touched the file itself, so the render is a function of the file's own
+# history — byte-stable across syncs even when the state file did not survive
+# a deploy.
+
+
+def _pinning_config(tmp_path: Path) -> CitadelConfig:
+    return CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unchanged_file_renders_byte_identically_when_only_head_moves(
+    tmp_path: Path,
+) -> None:
+    """Two syncs of an unchanged file must produce the SAME BYTES, even when
+    the repo HEAD moved in between and the state file did not survive.
+
+    Lost state is the realistic worst case (deploys are ephemeral): the
+    `unchanged` guard has nothing to compare, so the file IS re-rendered and
+    re-ingested — and dedup then rests entirely on the render being
+    byte-identical. A HEAD-valued header made exactly this path mint a
+    duplicate document per unrelated push.
+    """
+    config = _pinning_config(tmp_path)
+    client = FakeRepoContentClient()
+    first_learning = FakeLearningProcess()
+    first_syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=first_learning,  # type: ignore[arg-type]
+    )
+    first = await first_syncer.run()
+    assert first["files_ingested"] == 2
+
+    # An unrelated push moves HEAD; the tracked files themselves are untouched.
+    client.head = "commit456"
+    # The deploy was ephemeral: the checkpoint is gone.
+    Path(config.repo_content_sync_state_path).unlink()
+
+    second_learning = FakeLearningProcess()
+    second_syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=second_learning,  # type: ignore[arg-type]
+    )
+    second = await second_syncer.run()
+
+    # With no state, both files really were re-rendered and re-ingested...
+    assert second["files_ingested"] == 2
+    first_docs = [call["data"] for call in first_learning.calls]
+    second_docs = [call["data"] for call in second_learning.calls]
+    # ...and every rendered document is byte-identical to the first sync's,
+    # so cognee resolves each to the SAME document instead of a copy.
+    assert second_docs == first_docs
+    for document in second_docs:
+        assert "commit123" not in document, "the repo HEAD leaked into the body"
+        assert "commit456" not in document, "the repo HEAD leaked into the body"
+
+
+@pytest.mark.asyncio
+async def test_a_file_whose_own_content_changed_renders_differently(
+    tmp_path: Path,
+) -> None:
+    """Pinning must not over-deduplicate: a real edit is a new document."""
+    config = _pinning_config(tmp_path)
+    client = FakeRepoContentClient()
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+    await syncer.run()
+    old_readme_doc = learning.calls[0]["data"]
+
+    # The README itself is edited: new blob, new last-touching commit.
+    client.files["masumi-network/sokosumi-cli/README.md"] = {
+        "sha": "abc2",
+        "content": "# Sokosumi CLI\n\nHeadless mode docs, second edition.",
+    }
+    client.head = "commit789"
+    learning.calls.clear()
+    second = await syncer.run()
+
+    assert second["files_ingested"] == 1
+    assert second["files_skipped_by_reason"] == {"unchanged": 1}
+    new_readme_doc = learning.calls[0]["data"]
+    assert new_readme_doc != old_readme_doc
+    assert "second edition" in new_readme_doc
+    assert "Blob: abc2" in new_readme_doc
+
+
+@pytest.mark.asyncio
+async def test_the_pin_lookup_is_paid_only_for_ingested_files(tmp_path: Path) -> None:
+    """Unchanged files skip before the per-file commits call, so a steady-state
+    sync adds zero GitHub requests over the pre-pinning behaviour."""
+    config = _pinning_config(tmp_path)
+    client = FakeRepoContentClient()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+    await syncer.run()
+    assert client.last_commit_calls == 2
+
+    second = await syncer.run()
+    assert second["files_skipped_by_reason"] == {"unchanged": 2}
+    assert client.last_commit_calls == 2, "an unchanged file must not pay the lookup"
+
+
+def test_fetch_last_commit_sha_asks_for_the_path_scoped_history() -> None:
+    """Pin the request shape and the parsing of GitHub's commits payload."""
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    class RecordingClient(RepoContentGitHubClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+            requests.append((path, params))
+            return [{"sha": "feedface" * 5}]
+
+    client = RecordingClient(token=None)
+    sha = client.fetch_last_commit_sha("o/r", "docs/guide.md", ref="headsha")
+
+    assert sha == "feedface" * 5
+    assert requests == [
+        ("/repos/o/r/commits", {"path": "docs/guide.md", "sha": "headsha", "per_page": 1})
+    ]
+
+
+def test_fetch_last_commit_sha_refuses_an_empty_history() -> None:
+    """No commit means no immutable permalink; fail the file, never invent one."""
+
+    class EmptyHistoryClient(RepoContentGitHubClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+            return []
+
+    with pytest.raises(GitHubAPIError):
+        EmptyHistoryClient(token=None).fetch_last_commit_sha("o/r", "README.md", ref="headsha")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pin_lookup_skips_the_file_instead_of_shipping_head(
+    tmp_path: Path,
+) -> None:
+    """A volatile ref must never reach the vault; the file retries next sync."""
+    config = _pinning_config(tmp_path)
+
+    class PinLookupDown(FakeRepoContentClient):
+        def fetch_last_commit_sha(self, full_name: str, path: str, *, ref: str) -> str:
+            raise GitHubAPIError("GitHub API returned 500")
+
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=PinLookupDown(),
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+    result = await syncer.run()
+
+    assert result["files_ingested"] == 0
+    assert learning.calls == []
+    assert len(result["repositories"][0]["errors"]) == 2
 
 
 @pytest.mark.asyncio

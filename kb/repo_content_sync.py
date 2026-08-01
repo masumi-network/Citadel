@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import base64
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 import logging
@@ -137,9 +137,18 @@ def format_repo_content_document(file: RepoContentFile) -> str:
     README was occupying 8 of 8 result slots under 8 document ids, and half the
     average result set was repeats of a single file.
 
-    ``Commit`` and ``Blob`` already pin the exact version this text came from,
-    and they are stable while the file is unchanged, which is the property that
+    ``Commit`` and ``Blob`` pin the exact version this text came from, and they
+    must be stable while the file is unchanged, which is the property that
     makes a document deduplicable. When the file changes they change with it.
+
+    That only holds if ``file.ref`` is the commit that last touched THIS file,
+    never the repo HEAD. HEAD moves when ANY file in the repo changes, so a
+    HEAD-valued ``Commit:`` line (and the same sha inside ``Source:``) re-wrote
+    the body of every unchanged file on every re-render, minted a new content
+    hash, and cognee's content-addressed ingestion dutifully created a new
+    document: one README blob (a4b30a45) ended up as three documents under
+    three commit values. The syncer resolves the per-file commit before
+    rendering; see the pin step in :meth:`RepoContentSyncer.run`.
     """
     return "\n".join(
         [
@@ -177,6 +186,31 @@ class RepoContentGitHubClient(GitHubOrgClient):
         commit_sha = data.get("sha")
         if not isinstance(commit_sha, str) or not commit_sha:
             raise GitHubAPIError(f"Could not resolve commit SHA for {full_name}@{ref}.")
+        return commit_sha
+
+    def fetch_last_commit_sha(self, full_name: str, path: str, *, ref: str) -> str:
+        """The commit that last touched ``path``, as of ``ref``.
+
+        This is what the document header must carry. The repo HEAD is a fact
+        about the whole repository; the last-touching commit is a fact about
+        the file, stable for exactly as long as the file's content is, and it
+        stays a working immutable permalink. Neither the recursive tree nor the
+        contents API carries commit information, so this is its own request —
+        paid only for files that are actually being ingested.
+        """
+        data = self._get_json(
+            f"/repos/{quote(full_name, safe='/')}/commits",
+            {"path": path, "sha": ref, "per_page": 1},
+        )
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise GitHubAPIError(
+                f"Could not resolve the last commit for {full_name}/{path}."
+            )
+        commit_sha = data[0].get("sha")
+        if not isinstance(commit_sha, str) or not commit_sha:
+            raise GitHubAPIError(
+                f"Could not resolve the last commit for {full_name}/{path}."
+            )
         return commit_sha
 
     def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
@@ -653,10 +687,15 @@ class RepoContentSyncer:
                     # therefore treated as needing re-ingestion, which repairs
                     # the state on the next sync instead of requiring force.
                     #
-                    # Re-ingesting an unchanged file is now cheap and safe:
-                    # ADR-0016 removed the retrieval timestamp, so the rendered
-                    # document is byte-identical and cognee's content-addressed
-                    # ingestion resolves it to the same id rather than a copy.
+                    # Re-ingesting an unchanged file is cheap and safe only
+                    # because the rendered document is byte-identical, so
+                    # cognee's content-addressed ingestion resolves it to the
+                    # same id rather than a copy. That takes BOTH halves:
+                    # ADR-0016 removed the retrieval timestamp, and the pin
+                    # step below keeps the Commit/Source header off the moving
+                    # repo HEAD. With either half missing, every path that
+                    # re-renders (force, lost state, entries predating
+                    # cognee_data_ids) mints a duplicate document instead.
                     unchanged = (
                         not force
                         and previous.get("sha") == file.sha
@@ -710,6 +749,33 @@ class RepoContentSyncer:
                             ",".join(categories) or "unknown",
                         )
                         continue
+
+                    # Pin the header to the commit that last touched THIS
+                    # file. `ref` is the repo HEAD, which moves when ANY file
+                    # in the repo changes; rendering it into the body made an
+                    # unchanged file hash differently on every re-render and
+                    # duplicated the corpus (one blob under three commit
+                    # values). The last-touching commit is a function of the
+                    # file's own history, so the render is byte-stable across
+                    # syncs even when the state file did not survive — and it
+                    # stays an immutable permalink for citation. On failure,
+                    # record the error and retry next sync rather than ever
+                    # writing a document with a volatile ref.
+                    try:
+                        file_ref = self.client.fetch_last_commit_sha(
+                            full_name, path, ref=ref
+                        )
+                    except GitHubAPIError as exc:
+                        repo_result["errors"].append({"path": path, "error": str(exc)[:200]})
+                        continue
+                    file = replace(
+                        file,
+                        ref=file_ref,
+                        html_url=(
+                            f"https://github.com/{full_name}/blob/"
+                            f"{file_ref}/{quote(path, safe='/')}"
+                        ),
+                    )
 
                     document = format_repo_content_document(file)
                     if dry_run:
