@@ -334,10 +334,11 @@ class Citadel:
         """Find (and, when dry_run is False, delete) legacy garbage nodes (#15).
 
         Targets only the well-identified leak classes — COGNIFY_TEST_MARKER canaries,
-        the literal ``[DataItem]`` / session-scaffold blobs, and explicit
-        session-cache node types. The classifier is anchored so real content is
-        never matched; the default dry run returns every candidate id + preview so a
-        human verifies before any deletion.
+        the literal ``[DataItem]`` / session-scaffold blobs, explicit session-cache
+        node types, and pre-ADR-0016 repo-content fossils (machine-rendered headers
+        still carrying a ``Retrieved:`` timestamp line). The classifier is anchored
+        so real content is never matched; the default dry run returns every
+        candidate id + preview so a human verifies before any deletion.
         """
         nodes, _ = await self.cognee.graph_data()
         candidates: list[dict[str, Any]] = []
@@ -361,7 +362,12 @@ class Citadel:
         # The same garbage was also cognified into the chunk vector store, which the
         # graph scan can't see once the graph node is gone. Sweep it via search so
         # orphaned [DataItem]/marker chunks are caught and purged too (#15).
-        for probe in ("[DataItem]", "COGNIFY_TEST_MARKER", "Session ID Question Answer"):
+        for probe in (
+            "[DataItem]",
+            "COGNIFY_TEST_MARKER",
+            "Session ID Question Answer",
+            "Repository: Source: Commit: Blob: Retrieved:",
+        ):
             try:
                 hits = await self.search(probe, dataset=self.config.default_dataset, top_k=100)
             except Exception:  # noqa: BLE001 - sweep is best-effort
@@ -425,12 +431,59 @@ def _is_dataitem_garbage(text: str) -> bool:
     return has_answer
 
 
+_REPO_CONTENT_TITLE_RE = re.compile(r"^#\s+[^\s/]+/[^\s/]+/\S")
+_REPO_CONTENT_HEADER_FIELDS = ("Repository:", "Source:", "Commit:", "Blob:")
+
+
+def _is_repo_content_fossil(text: str) -> bool:
+    """True for a pre-ADR-0016 repo-content document only (d5d0fe3).
+
+    Until d5d0fe3 (ADR-0016) every repo-content sync stamped
+    ``Retrieved: {checked_at}`` into the rendered header, so an unchanged file
+    minted a NEW document each pass. Those pre-fix copies are never superseded
+    and keep occupying result slots.
+
+    A fossil is identified only by the FULL machine-rendered header: the text
+    must start with the ``# org/repo/path`` title line, the header block up to
+    the ``---`` separator may contain only blank lines, the ``Repository:`` /
+    ``Source:`` / ``Commit:`` / ``Blob:`` field lines in renderer order, and a
+    ``Retrieved:`` line — and that ``Retrieved:`` line must be present INSIDE
+    the header, before the separator. A bare "Retrieved:" in a body (after the
+    ``---``), a post-fix header without the line, or any line the renderer
+    never produced means the node is kept. No separator seen (e.g. a chunk cut
+    mid-header) also keeps the node — fail closed on deletion.
+    """
+    lines = [line.strip() for line in text.strip().splitlines()]
+    if not lines or not _REPO_CONTENT_TITLE_RE.match(lines[0]):
+        return False
+    fields = iter(_REPO_CONTENT_HEADER_FIELDS)
+    pending: str | None = next(fields)
+    retrieved_in_header = False
+    for line in lines[1:]:
+        if line == "---":
+            # End of header: qualify only with all four fields AND Retrieved.
+            return pending is None and retrieved_in_header
+        if not line:
+            continue
+        if pending is not None and line.startswith(pending):
+            pending = next(fields, None)
+        elif line.startswith("Retrieved:"):
+            retrieved_in_header = True
+        else:
+            # A line the renderer never emitted: this is not a rendered
+            # repo-content header, so never a fossil.
+            return False
+    return False
+
+
 def _legacy_garbage_kind(node_id: Any, properties: Any) -> str | None:
     """Classify a graph node as legacy garbage to purge, or None to keep (#15).
 
     Conservative + anchored: only an exact COGNIFY_TEST_MARKER id, the literal
-    [DataItem]/session-scaffold blob, or an explicit session-cache node type. Real
-    content is never classified — there is no substring-of-prose match.
+    [DataItem]/session-scaffold blob, an explicit session-cache node type, or a
+    pre-ADR-0016 repo-content fossil (full rendered header with a Retrieved:
+    line inside it). Real content is never classified — there is no
+    substring-of-prose match.
     """
     props = properties if isinstance(properties, dict) else {}
     for value in (props.get("text"), props.get("name"), props.get("title"), props.get("id"), node_id):
@@ -439,6 +492,8 @@ def _legacy_garbage_kind(node_id: Any, properties: Any) -> str | None:
     text = props.get("text")
     if isinstance(text, str) and _is_dataitem_garbage(text):
         return "dataitem"
+    if isinstance(text, str) and _is_repo_content_fossil(text):
+        return "repo_content_fossil"
     for key in ("type", "node_type", "category", "source"):
         value = props.get(key)
         if isinstance(value, str) and value.strip().lower() in _SESSION_CACHE_TYPES:

@@ -410,6 +410,122 @@ def test_legacy_garbage_kind_classifies_safely() -> None:
     assert _legacy_garbage_kind("r5", {"type": "TextSummary"}) is None
 
 
+_FOSSIL_DOC = "\n".join(
+    [
+        "# masumi-network/sokosumi/README.md",
+        "",
+        "Repository: masumi-network/sokosumi",
+        "Source: https://github.com/masumi-network/sokosumi/blob/main/README.md",
+        "Commit: 4f2a9c1db8e77a01c3d5f6a2b9e01234567890ab",
+        "Blob: 8c31b0e4f2a9c1db8e77a01c3d5f6a2b9e012345",
+        "Retrieved: 2026-07-28T14:03:11Z",
+        "",
+        "---",
+        "",
+        "# Sokosumi",
+        "",
+        "Sokosumi is a marketplace for AI agents on Masumi Network.",
+        "",
+        "---",
+        "",
+        "## Getting started",
+        "",
+        "Run `npm install` and configure your payment node.",
+    ]
+)
+
+_POST_FIX_DOC = "\n".join(
+    [
+        "# masumi-network/sokosumi/README.md",
+        "",
+        "Repository: masumi-network/sokosumi",
+        "Source: https://github.com/masumi-network/sokosumi/blob/main/README.md",
+        "Commit: 4f2a9c1db8e77a01c3d5f6a2b9e01234567890ab",
+        "Blob: 8c31b0e4f2a9c1db8e77a01c3d5f6a2b9e012345",
+        "",
+        "---",
+        "",
+        "# Sokosumi",
+        "",
+        "Sokosumi is a marketplace for AI agents on Masumi Network.",
+    ]
+)
+
+# Post-fix document whose BODY (after the --- separator) legitimately contains
+# the literal text "Retrieved: ..." — real documentation about retrieval.
+_BODY_RETRIEVED_DOC = "\n".join(
+    [
+        "# masumi-network/citadel/docs/adr/0016-drop-retrieval-timestamp.md",
+        "",
+        "Repository: masumi-network/citadel",
+        "Source: https://github.com/masumi-network/citadel/blob/main/docs/adr/0016.md",
+        "Commit: d5d0fe3b1656807547e77b5ee82eaf4c5a337c1f",
+        "Blob: c03a30b4f2a9c1db8e77a01c3d5f6a2b9e012345",
+        "",
+        "---",
+        "",
+        "Documents used to carry a header line of the form:",
+        "",
+        "Retrieved: 2026-07-28T14:03:11Z",
+        "",
+        "which minted a new copy on every sync pass.",
+    ]
+)
+
+
+def test_repo_content_fossil_is_matched() -> None:
+    # ADR-0016 / d5d0fe3: a pre-fix repo-content document — full rendered header
+    # with Retrieved: inside it — is classified under its OWN kind so a human
+    # can approve the class independently of marker/dataitem/session_cache.
+    from kb.service import _legacy_garbage_kind
+
+    assert _legacy_garbage_kind("f1", {"text": _FOSSIL_DOC}) == "repo_content_fossil"
+
+
+def test_repo_content_fossil_never_matches_real_content() -> None:
+    # SAFETY — this is deletion tooling; each of these is real knowledge that
+    # must survive the classifier.
+    from kb.service import _legacy_garbage_kind
+
+    # (a) Post-fix repo-content document: same header, no Retrieved: line.
+    assert _legacy_garbage_kind("k1", {"text": _POST_FIX_DOC}) is None
+    # (b) "Retrieved: ..." appearing in the BODY, after the --- separator.
+    assert _legacy_garbage_kind("k2", {"text": _BODY_RETRIEVED_DOC}) is None
+    # (c) A Retrieved: line with no repo-content header around it.
+    assert (
+        _legacy_garbage_kind(
+            "k3",
+            {"text": "Meeting notes\n\nRetrieved: 2026-07-28 from the archive\n\n---\n\nBody."},
+        )
+        is None
+    )
+    # (d) An ordinary Linear issue document.
+    assert (
+        _legacy_garbage_kind(
+            "k4",
+            {
+                "text": (
+                    "# MAS-142: Payment webhook retries\n\n"
+                    "Status: In Progress\nAssignee: sarthi\n\n---\n\n"
+                    "Webhook delivery fails on cold starts; add retry with backoff."
+                )
+            },
+        )
+        is None
+    )
+    # (e) A personal seat note.
+    assert (
+        _legacy_garbage_kind(
+            "k5",
+            {"text": "Note to self: the Kuzu writer lock serializes cognify; never fork it."},
+        )
+        is None
+    )
+    # A chunk cut mid-header (no --- separator reached) is kept — fail closed.
+    truncated = _FOSSIL_DOC.split("---")[0]
+    assert _legacy_garbage_kind("k6", {"text": truncated}) is None
+
+
 class _GraphGateway(FakeCognee):
     def __init__(self, graph_nodes: list[Any]) -> None:
         super().__init__()
@@ -444,6 +560,30 @@ async def test_cleanup_legacy_nodes_dry_run_then_delete() -> None:
     res = await kb.cleanup_legacy_nodes(dry_run=False)
     assert res["deleted"] == 2
     assert set(gw.deleted) == {"g1", "g2"}  # real1 is never deleted
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_fossils_under_their_own_kind() -> None:
+    # A repo-content fossil must surface under its OWN counts_by_kind key so a
+    # human reviewing the dry run can approve the class separately from the
+    # legacy marker/dataitem/session_cache classes.
+    nodes = [
+        ("g1", {"text": "COGNIFY_TEST_MARKER_" + "c" * 32}),
+        ("fossil1", {"text": _FOSSIL_DOC}),
+        ("keep1", {"text": _POST_FIX_DOC}),
+    ]
+    gw = _GraphGateway(nodes)
+    kb = Citadel(CitadelConfig(), cognee=gw)
+
+    dry = await kb.cleanup_legacy_nodes(dry_run=True)
+    assert dry["counts_by_kind"] == {"marker": 1, "repo_content_fossil": 1}
+    assert {c["id"] for c in dry["candidates"]} == {"g1", "fossil1"}
+    kinds = {c["id"]: c["kind"] for c in dry["candidates"]}
+    assert kinds["fossil1"] == "repo_content_fossil"
+
+    res = await kb.cleanup_legacy_nodes(dry_run=False)
+    assert res["deleted"] == 2
+    assert "keep1" not in gw.deleted  # the post-fix document survives
 
 
 @pytest.mark.asyncio
