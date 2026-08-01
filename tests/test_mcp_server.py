@@ -5,6 +5,7 @@ from io import BytesIO
 import inspect
 import json
 import threading
+from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError
 
@@ -328,7 +329,30 @@ def test_resource_handlers_are_coroutine_functions(uri: str) -> None:
     )
 
 
-def test_resource_read_leaves_the_event_loop_free() -> None:
+# Every client-backed resource, with how to dig the flag out of its payload —
+# citadel://events/recent reshapes the response into {"events": [...]}.
+#
+# This MUST cover every URI, not a representative one. The coroutine-function
+# check above passes for a handler that is async and STILL blocks the loop, so
+# it cannot stand alone: a later refactor that inlines resolve_client(ctx).get()
+# into one handler's async body and drops _call_async would reintroduce the
+# exact deadlock with the whole suite green. Only this test catches that, and
+# only for the URIs it actually drives.
+RESOURCE_LOOP_CASES = [
+    ("citadel://session", lambda payload: payload["loop_made_progress"]),
+    ("citadel://discovery", lambda payload: payload["loop_made_progress"]),
+    ("citadel://sources", lambda payload: payload["loop_made_progress"]),
+    ("citadel://indexes", lambda payload: payload["loop_made_progress"]),
+    ("citadel://events/recent", lambda payload: payload["events"][0]["loop_made_progress"]),
+]
+
+
+@pytest.mark.parametrize(
+    "uri,extract", RESOURCE_LOOP_CASES, ids=[uri for uri, _ in RESOURCE_LOOP_CASES]
+)
+def test_resource_read_leaves_the_event_loop_free(
+    uri: str, extract: Callable[[dict[str, Any]], bool]
+) -> None:
     """Drive a resource read whose HTTP client refuses to return until a
     loop-side task has run. Only a handler that offloads the call off the loop
     can pass: a handler that blocks the loop starves the concurrent task, the
@@ -337,17 +361,30 @@ def test_resource_read_leaves_the_event_loop_free() -> None:
     """
     loop_progressed = threading.Event()
 
+    def blocked_payload() -> dict[str, Any]:
+        # Runs in a worker thread when the handler offloads correctly, and on
+        # the event loop when it does not. Waits for proof that the loop kept
+        # moving while this call was in flight. One dict serves every handler's
+        # payload shape.
+        progressed = loop_progressed.wait(timeout=5.0)
+        return {
+            "loop_made_progress": progressed,
+            "events": [{"loop_made_progress": progressed}],
+        }
+
     class BlockingHttpClient(FakeHttpClient):
         def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-            # Runs in a worker thread when the handler offloads correctly, and
-            # on the event loop when it does not. Waits for proof that the loop
-            # kept moving while this call was in flight.
-            return {"loop_made_progress": loop_progressed.wait(timeout=5.0)}
+            return blocked_payload()
+
+        # citadel://discovery offloads public_manifest, which reaches the client
+        # through get_public rather than get.
+        def get_public(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            return blocked_payload()
 
     server = create_mcp_server(BlockingHttpClient())
 
     async def scenario() -> dict[str, Any]:
-        resource = await server._resource_manager.get_resource("citadel://indexes")
+        resource = await server._resource_manager.get_resource(uri)
         assert resource is not None
 
         async def make_progress() -> None:
@@ -361,8 +398,8 @@ def test_resource_read_leaves_the_event_loop_free() -> None:
 
     payload = asyncio.run(scenario())
 
-    assert payload["loop_made_progress"] is True, (
-        "the event loop made no progress while the resource read was in "
+    assert extract(payload) is True, (
+        f"the event loop made no progress while the {uri} read was in "
         "flight — the handler ran its HTTP call on the loop instead of "
         "offloading it (#100)"
     )
