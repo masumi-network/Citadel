@@ -526,6 +526,22 @@ def test_repo_content_fossil_never_matches_real_content() -> None:
     assert _legacy_garbage_kind("k6", {"text": truncated}) is None
 
 
+# Body lines the renderer builds by joining several f-string fragments
+# (kb/repository_update.py:415-416 does the same). Assembled with explicit
+# concatenation here rather than adjacent string literals inside the list
+# below, so neither a reader nor a scanner has to decide whether a comma was
+# forgotten. These lines sit AFTER the section heading, so they are realism
+# only — the classifier never reads past the heading.
+_DIGEST_REPO_LINE = (
+    "- masumi-network/sokosumi (TypeScript): pushed 2026-07-19T04:12:00Z, "
+    + "updated 2026-07-19T04:12:00Z, open issues 4, stars 12, forks 3. "
+    + "Marketplace for AI agents. https://github.com/masumi-network/sokosumi"
+)
+_DIGEST_PR_LINE = (
+    "- masumi-network/sokosumi#88 by sarthib7: Ship the composer. "
+    + "Updated 2026-07-19T03:00:00Z. https://github.com/masumi-network/sokosumi/pull/88"
+)
+
 # Pre-fix GitHub org digest, current render vintage: full machine-rendered
 # header with Checked at: and Window started at: before the first section.
 _DIGEST_FOSSIL_DOC = "\n".join(
@@ -543,13 +559,10 @@ _DIGEST_FOSSIL_DOC = "\n".join(
         "Merged pull requests in window: 1",
         "",
         "## Changed repositories",
-        "- masumi-network/sokosumi (TypeScript): pushed 2026-07-19T04:12:00Z, "
-        "updated 2026-07-19T04:12:00Z, open issues 4, stars 12, forks 3. "
-        "Marketplace for AI agents. https://github.com/masumi-network/sokosumi",
+        _DIGEST_REPO_LINE,
         "",
         "## Open pull requests worth attention",
-        "- masumi-network/sokosumi#88 by sarthib7: Ship the composer. "
-        "Updated 2026-07-19T03:00:00Z. https://github.com/masumi-network/sokosumi/pull/88",
+        _DIGEST_PR_LINE,
     ]
 )
 
