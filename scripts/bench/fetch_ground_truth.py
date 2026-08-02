@@ -43,6 +43,13 @@ def main() -> int:
     CACHE.mkdir(exist_ok=True)
     wanted: set[str] = set()
     for question in questions["questions"]:
+        if question.get("expected_recall", 1) == 0:
+            # NEVER cache probe targets. A probe names material that must stay
+            # out of the vault; a blocked-content target could carry exactly
+            # the secret-bearing text the ingest scanner rejects, and this
+            # directory ships in a PUBLIC repo. Probes are scored by identity
+            # and scanner pattern, not by cached-body overlap.
+            continue
         wanted.update(question["expect_any"])
 
     for repo_path in sorted(wanted):
