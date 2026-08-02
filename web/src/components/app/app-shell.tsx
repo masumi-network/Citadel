@@ -36,7 +36,7 @@ const ENTRIES: Array<{ href: string; label: string; minRole?: Role }> = [
 ];
 
 const LINK =
-  "px-[11px] py-1.5 text-[13px] font-medium no-underline text-ink-2 transition-[color,background-color] duration-150 hover:text-ink hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent max-[620px]:px-2 max-[620px]:text-[12.5px]";
+  "whitespace-nowrap px-[11px] py-1.5 text-[13px] font-medium no-underline text-ink-2 transition-[color,background-color] duration-150 hover:text-ink hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent max-[620px]:px-2 max-[620px]:text-[12.5px]";
 const LINK_CURRENT = "text-accent-ink bg-accent-soft hover:text-accent-ink hover:bg-accent-soft";
 
 export function AppShell({
@@ -64,7 +64,11 @@ export function AppShell({
 
       <div className="min-h-screen bg-ground">
         <nav className="topnav sticky top-0 z-20 border-b border-border bg-ground" aria-label="Main">
-          <div className="mx-auto flex max-w-[1200px] items-center gap-3.5 px-10 py-[11px] max-[620px]:gap-2 max-[620px]:px-4 max-[620px]:py-[9px]">
+          {/* A writer/admin session puts four entries plus Sign out in this
+              row, which needs ~392px: below 430px the row wraps instead of
+              pushing Sign out (and the theme toggle) off-screen. Row one is
+              brand + theme + Sign out, row two the nav entries, full width. */}
+          <div className="mx-auto flex max-w-[1200px] items-center gap-3.5 px-10 py-[11px] max-[620px]:gap-2 max-[620px]:px-4 max-[620px]:py-[9px] max-[430px]:flex-wrap max-[430px]:gap-y-1">
             <a
               href="/next/app"
               className="mr-auto flex items-center gap-2.5 text-inherit no-underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
@@ -74,7 +78,7 @@ export function AppShell({
                 Citadel
               </span>
             </a>
-            <div className="flex items-center gap-0.5">
+            <div className="flex items-center gap-0.5 max-[430px]:order-3 max-[430px]:w-full max-[430px]:justify-between max-[430px]:gap-0">
               {ENTRIES.filter((entry) => !entry.minRole || canUse(role, entry.minRole)).map(
                 (entry) => (
                   <a

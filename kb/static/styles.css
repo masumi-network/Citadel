@@ -2070,6 +2070,11 @@ textarea[aria-invalid="true"] {
 }
 
 .score-options label {
+  /* The containing block for the visually-hidden radio below. Without it the
+     absolute input resolves width:100% against the initial containing block,
+     making each invisible radio one viewport wide and handing the page ~200px
+     of phantom horizontal scroll on phones. */
+  position: relative;
   display: grid;
   min-height: 38px;
   cursor: pointer;
@@ -2765,7 +2770,12 @@ textarea[aria-invalid="true"] {
   .analytics-strip,
   .settings-grid,
   .access-grid {
-    grid-template-columns: 1fr;
+    /* minmax(0, 1fr), matching the base rules: a bare 1fr means
+       minmax(auto, 1fr), so a panel holding a white-space:pre code line
+       (the MCP setup snippets) can never shrink below that line's intrinsic
+       width and drags the whole page into sideways scroll. With 0 the panel
+       shrinks and the pre's own overflow-x:auto finally engages. */
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .audit-toolbar {
@@ -2852,7 +2862,9 @@ textarea[aria-invalid="true"] {
   .search-layout,
   .dashboard-stats,
   .conflict-sides {
-    grid-template-columns: 1fr;
+    /* Same reasoning as the 1100px block: never let a single-column grid
+       inherit its content's min-content width. */
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .segmented-control {
@@ -3044,7 +3056,7 @@ textarea[aria-invalid="true"] {
 
 @media (max-width: 1100px) {
   .analytics-strip {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -3350,5 +3362,37 @@ textarea[aria-invalid="true"] {
   .needs-item {
     flex-direction: column;
     gap: 10px;
+  }
+}
+
+/* ---------- Phones below the 780px ladder ---------- */
+
+/* The graph canvas keeps touch-action: none (force-graph needs the gesture to
+   pan), so at phone widths it is a scroll-dead zone; keep it short enough that
+   scrollable chrome stays on screen around it. */
+@media (max-width: 430px) {
+  .canvas-wrap {
+    min-height: 300px;
+  }
+}
+
+/* Five header tabs need ~362px in one row; below that, wrap rather than leave
+   the Admin tab half off-screen with no visible affordance that the bar
+   scrolls. */
+@media (max-width: 400px) {
+  .side-nav {
+    flex-wrap: wrap;
+  }
+}
+
+/* Pointer-tuned targets get a height bump only on touch devices; a desktop
+   pointer never matches this query, so desktop metrics do not move. */
+@media (pointer: coarse) {
+  .chip {
+    min-height: 36px;
+  }
+
+  .compact-button {
+    min-height: 38px;
   }
 }
