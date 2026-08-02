@@ -5064,7 +5064,17 @@ async def promotion_status(request: Request) -> Any:
 
 @app.post("/api/promote/run")
 async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
+    # A seat previewing its own promotable candidates is the intended flow and
+    # stays at writer (can_run_promotion below also refuses another seat's
+    # dataset). But dry_run comes from the request body, and with it false this
+    # same call writes durably into the shared Central dataset under a
+    # synthetic admin identity, with no further approval on the auto-promote
+    # path. A caller may not grant itself that by flipping a flag, so the write
+    # half now requires what GET /api/promote already requires. The scheduled
+    # promotion path is unaffected.
     actor = require_access(request, "writer", "kb:ingest")
+    if not body.dry_run:
+        actor = require_access(request, "admin", "sources:sync")
     if not is_seat_dataset(body.dataset):
         raise HTTPException(
             status_code=400,
