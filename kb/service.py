@@ -335,10 +335,14 @@ class Citadel:
 
         Targets only the well-identified leak classes — COGNIFY_TEST_MARKER canaries,
         the literal ``[DataItem]`` / session-scaffold blobs, explicit session-cache
-        node types, and pre-ADR-0016 repo-content fossils (machine-rendered headers
-        still carrying a ``Retrieved:`` timestamp line). The classifier is anchored
-        so real content is never matched; the default dry run returns every
-        candidate id + preview so a human verifies before any deletion.
+        node types, pre-ADR-0016 repo-content fossils (machine-rendered headers
+        still carrying a ``Retrieved:`` timestamp line), and pre-fix GitHub digest
+        fossils (machine-rendered digest headers still carrying a ``Checked at:``
+        timestamp line). Each class is counted under its own ``counts_by_kind``
+        key so a human can approve one class independently of the others. The
+        classifier is anchored so real content is never matched; the default dry
+        run returns every candidate id + preview so a human verifies before any
+        deletion.
         """
         nodes, _ = await self.cognee.graph_data()
         candidates: list[dict[str, Any]] = []
@@ -367,6 +371,7 @@ class Citadel:
             "COGNIFY_TEST_MARKER",
             "Session ID Question Answer",
             "Repository: Source: Commit: Blob: Retrieved:",
+            "GitHub daily update Checked at: Repositories scanned:",
         ):
             try:
                 hits = await self.search(probe, dataset=self.config.default_dataset, top_k=100)
@@ -476,14 +481,85 @@ def _is_repo_content_fossil(text: str) -> bool:
     return False
 
 
+_DIGEST_TITLE_SUFFIX = " GitHub daily update"
+# Every header field the digest renderer has ever emitted between the title
+# line and the first section heading, in renderer order. Optional entries cover
+# older render vintages: the earliest digests had neither ``Window started
+# at:`` nor the last three counter lines.
+_GITHUB_DIGEST_HEADER_FIELDS: tuple[tuple[str, bool], ...] = (
+    ("Checked at:", True),
+    ("Window started at:", False),
+    ("Source:", True),
+    ("Repositories scanned:", True),
+    ("Changed repositories since last check:", True),
+    ("New public organization events:", True),
+    ("New commits observed:", False),
+    ("Open pull requests active in window:", False),
+    ("Merged pull requests in window:", False),
+)
+_DIGEST_HEADER_TERMINATOR = "## Changed repositories"
+
+
+def _is_github_digest_fossil(text: str) -> bool:
+    """True for a pre-fix GitHub org digest only.
+
+    Until the digest renderer was brought under ADR-0016, every GitHub sync
+    stamped ``Checked at: {utc_now}`` (and later a derived ``Window started
+    at:`` line) into the digest body, so a digest whose reported activity had
+    not changed still minted a NEW document each pass — the same defect class
+    d5d0fe3 fixed for repo content via its ``Retrieved:`` line. Those pre-fix
+    copies are never superseded and keep occupying result slots.
+
+    A fossil is identified only by the FULL machine-rendered header: the text
+    must start with the ``# {org} GitHub daily update`` title line, every
+    non-blank line before the ``## Changed repositories`` section heading must
+    match the renderer's header fields in renderer order, every required field
+    (``Checked at:`` above all) must be present, and the section heading itself
+    must be reached. A ``Checked at:`` in prose, a post-fix header (which has
+    no ``Checked at:``), an unknown or out-of-order line, or a chunk cut before
+    the section heading all keep the node — fail closed on deletion.
+    """
+    lines = [line.strip() for line in text.strip().splitlines()]
+    if not lines:
+        return False
+    title = lines[0]
+    if (
+        not title.startswith("# ")
+        or not title.endswith(_DIGEST_TITLE_SUFFIX)
+        or not title[2 : -len(_DIGEST_TITLE_SUFFIX)].strip()
+    ):
+        return False
+    index = 0
+    for line in lines[1:]:
+        if line == _DIGEST_HEADER_TERMINATOR:
+            # End of header: qualify only when every required field was seen.
+            return all(not required for _, required in _GITHUB_DIGEST_HEADER_FIELDS[index:])
+        if not line:
+            continue
+        while index < len(_GITHUB_DIGEST_HEADER_FIELDS) and not line.startswith(
+            _GITHUB_DIGEST_HEADER_FIELDS[index][0]
+        ):
+            if _GITHUB_DIGEST_HEADER_FIELDS[index][1]:
+                # A required renderer field is missing or out of order: this is
+                # not a pre-fix rendered digest header, so never a fossil.
+                return False
+            index += 1
+        if index >= len(_GITHUB_DIGEST_HEADER_FIELDS):
+            # A line the renderer never emitted in this position: keep the node.
+            return False
+        index += 1
+    return False
+
+
 def _legacy_garbage_kind(node_id: Any, properties: Any) -> str | None:
     """Classify a graph node as legacy garbage to purge, or None to keep (#15).
 
     Conservative + anchored: only an exact COGNIFY_TEST_MARKER id, the literal
-    [DataItem]/session-scaffold blob, an explicit session-cache node type, or a
+    [DataItem]/session-scaffold blob, an explicit session-cache node type, a
     pre-ADR-0016 repo-content fossil (full rendered header with a Retrieved:
-    line inside it). Real content is never classified — there is no
-    substring-of-prose match.
+    line inside it), or a pre-fix GitHub digest fossil (full rendered digest
+    header with a Checked at: line inside it). Real content is never
+    classified — there is no substring-of-prose match.
     """
     props = properties if isinstance(properties, dict) else {}
     for value in (props.get("text"), props.get("name"), props.get("title"), props.get("id"), node_id):
@@ -494,6 +570,8 @@ def _legacy_garbage_kind(node_id: Any, properties: Any) -> str | None:
         return "dataitem"
     if isinstance(text, str) and _is_repo_content_fossil(text):
         return "repo_content_fossil"
+    if isinstance(text, str) and _is_github_digest_fossil(text):
+        return "github_digest_fossil"
     for key in ("type", "node_type", "category", "source"):
         value = props.get(key)
         if isinstance(value, str) and value.strip().lower() in _SESSION_CACHE_TYPES:

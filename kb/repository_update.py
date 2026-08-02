@@ -335,13 +335,8 @@ def compose_repository_update(
         commits=new_commits,
         pull_requests=recent_pull_requests,
     )
-    window_started_at_iso = window_started_at.isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
-    )
     digest = format_digest(
         org=org,
-        checked_at=checked_at,
-        window_started_at=window_started_at_iso,
         repos=repos,
         changed_repos=changed_repos,
         events=new_events,
@@ -369,8 +364,6 @@ def compose_repository_update(
 def format_digest(
     *,
     org: str,
-    checked_at: str,
-    window_started_at: str | None = None,
     repos: list[GitHubRepo],
     changed_repos: list[GitHubRepo],
     events: list[GitHubEvent],
@@ -380,6 +373,20 @@ def format_digest(
     active_repositories: list[dict[str, Any]] | None = None,
     max_commits_per_repo: int | None = None,
 ) -> str:
+    """Render one Repository Daily Update as a vault document body.
+
+    Deliberately carries NO wall-clock fields (ADR-0016: a document rendered
+    from unchanged source content must be byte-identical to the last render).
+    It used to open with ``Checked at: {utc_now}`` and the derived ``Window
+    started at:`` line, so a digest whose reported activity had not changed was
+    still textually distinct on every sync. That defeated content-hash dedup at
+    ingest and the text-keyed dedup at query time, and each pass stored another
+    copy: one measured result page held five byte-identical digests apart from
+    their ``Checked at:`` line. The activity itself already carries its own
+    timestamps (event, commit, and PR lines), which change exactly when the
+    digest's content changes; the run's wall-clock time lives in the sync state
+    (``last_checked_at`` / ``last_digest_at``), not in the indexed body.
+    """
     open_pull_requests = open_pull_requests or []
     merged_pull_requests = merged_pull_requests or []
     active_repositories = active_repositories or []
@@ -387,8 +394,6 @@ def format_digest(
     lines = [
         f"# {org} GitHub daily update",
         "",
-        f"Checked at: {checked_at}",
-        *( [f"Window started at: {window_started_at}"] if window_started_at else [] ),
         f"Source: {source_url}",
         f"Repositories scanned: {len(repos)}",
         f"Changed repositories since last check: {len(changed_repos)}",
