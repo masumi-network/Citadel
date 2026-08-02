@@ -7,6 +7,7 @@ Keeps a stable hit schema agents can filter on without a second fetch.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any
 
 SPEC_QUERY_RE = re.compile(
@@ -39,6 +40,87 @@ REPO_CONTENT_HEADER_RE = re.compile(
     r"Blob:\s*\S+",
     re.IGNORECASE,
 )
+# Same structural header, but as a PARSER: named groups recover the repo, the
+# per-file commit, the blob and the source URL that cognee's chunk payloads
+# never carry as keys. ``\A`` anchors at the very start of the chunk, because a
+# document that merely QUOTES another document's header mid-body must not be
+# credited with that document's identity — a benchmark once scored quoting
+# documents as if they were the quoted ones on exactly this confusion.
+REPO_CONTENT_HEADER_PARSE_RE = re.compile(
+    r"\A\s*#\s+(?P<header_path>\S+)[ \t]*\n\s*\n"
+    r"Repository:[ \t]*(?P<repo>\S+)[ \t]*\n"
+    r"Source:[ \t]*(?P<source_url>https?://\S+)[ \t]*\n"
+    r"Commit:[ \t]*(?P<commit>\S+)[ \t]*\n"
+    r"Blob:[ \t]*(?P<blob>\S+)[ \t]*(?:\n|\Z)",
+    re.IGNORECASE,
+)
+# The title line format_issue_note writes: "# Linear SOK-123: title". The
+# workspace digest ("# Linear workspace sync") deliberately does not match —
+# it aggregates 120 issues and identifies none of them.
+LINEAR_HEADER_PARSE_RE = re.compile(
+    r"\A\s*#\s+Linear[ \t]+(?P<issue>[A-Z][A-Z0-9]*-\d+):[ \t]*(?P<title>[^\n]+?)[ \t]*(?:\n|\Z)"
+)
+# One "- **Key:** value" bullet from the block right under the Linear title.
+LINEAR_HEADER_FIELD_RE = re.compile(r"^-\s+\*\*(?P<key>[A-Za-z ]+):\*\*[ \t]*(?P<value>.+?)[ \t]*$")
+
+
+def parse_content_header(text: Any) -> dict[str, str]:
+    """Provenance from the structural header a syncer wrote at the START of a chunk.
+
+    cognee stores no per-document metadata (hits expose empty ``provenance`` and
+    ``text_<md5>`` document names), but the repo-content and Linear syncers each
+    render a machine-readable header as the first lines of the documents they
+    ingest. Parsing it back is the only provenance available.
+
+    Only a header at position zero is credited (leading whitespace aside). The
+    values are still body text and therefore author-controlled — callers must
+    label them as content-derived, never as attested trust.
+    """
+    if not isinstance(text, str) or not text:
+        return {}
+    match = REPO_CONTENT_HEADER_PARSE_RE.match(text)
+    if match:
+        repo = match.group("repo")
+        header_path = match.group("header_path")
+        parsed: dict[str, str] = {
+            "kind": "repo-content",
+            "repo": repo,
+            "source_url": match.group("source_url"),
+            "commit": match.group("commit"),
+            "blob": match.group("blob"),
+            "title": header_path,
+        }
+        # The title line is "org/repo/path"; strip the repo prefix to get the
+        # in-repo path. If the two lines disagree the path claim is dropped
+        # rather than guessed.
+        if header_path.lower().startswith(repo.lower() + "/"):
+            parsed["path"] = header_path[len(repo) + 1 :]
+        return parsed
+    match = LINEAR_HEADER_PARSE_RE.match(text)
+    if match:
+        parsed = {
+            "kind": "linear-issue",
+            "issue": match.group("issue"),
+            "title": match.group("title"),
+        }
+        # Consume only the contiguous bullet block right under the title. The
+        # issue DESCRIPTION follows a blank line, so a "- **URL:**" line quoted
+        # inside a description is never credited.
+        rest = text[match.end() :].splitlines()
+        index = 0
+        while index < len(rest) and not rest[index].strip():
+            index += 1
+        while index < len(rest):
+            field = LINEAR_HEADER_FIELD_RE.match(rest[index])
+            if not field:
+                break
+            if field.group("key").strip().lower() == "url":
+                parsed["source_url"] = field.group("value")
+            index += 1
+        return parsed
+    return {}
+
+
 # Cardano policy IDs are 56 hex chars; asset names / units are often longer hex.
 HEX_ASSET_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{56,})(?![0-9a-fA-F])")
 TOKEN_ASSET_QUERY_RE = re.compile(
@@ -106,6 +188,132 @@ def is_docs_mode_query(query: str, *, mode: str | None = None) -> bool:
     return is_token_asset_query(query)
 
 
+# --- lexical relevance ------------------------------------------------------
+#
+# The retriever returns chunk payload dicts with NO score: cognee's CHUNKS
+# retriever hands back ``found_chunk.payload`` only, and the vector engine's
+# ScoredResult.score (a raw cosine distance) is dropped inside cognee before
+# the client boundary ever sees it. Surfacing the real distance is a
+# cognee-client change; until then the only relevance signal this layer can
+# offer HONESTLY is observable lexical overlap between the query and the hit.
+# It is labelled as exactly that — never presented as a retriever score.
+
+_QUERY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./-]*")
+_QUERY_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "this", "that", "these", "those", "from",
+        "what", "how", "where", "when", "which", "who", "whose", "why", "are",
+        "was", "were", "does", "did", "doing", "not", "you", "your", "has",
+        "have", "had", "can", "could", "should", "would", "will", "shall",
+        "may", "might", "must", "about", "into", "onto", "over", "under",
+        "between", "our", "their", "they", "them", "its", "his", "her",
+        "also", "but", "nor", "either", "any", "all", "some", "than", "then",
+        "there", "here", "been", "being", "because", "just", "only", "very",
+        "much", "more", "most", "such", "each", "per", "via", "own", "off",
+        "out", "too", "get", "got", "let", "see", "say", "said", "tell", "show",
+        "find", "use", "used", "using", "one", "two", "way", "make", "made",
+        "need", "want", "know", "like", "work", "works", "please",
+    }
+)
+MAX_QUERY_TERMS = 12
+NO_LEXICAL_MATCH_WARNING = (
+    "No result contains any query term. The retriever always returns the "
+    "nearest chunks it stores, even when nothing in the vault is genuinely "
+    "close, so these hits may be unrelated to the query — verify their content "
+    "before relying on them."
+)
+
+
+def query_terms(query: str) -> list[str]:
+    """Distinct informative query tokens, lowercased, order preserved."""
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in _QUERY_TOKEN_RE.findall((query or "").lower()):
+        token = raw.strip("_./-")
+        if len(token) < 3 or token in _QUERY_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= MAX_QUERY_TERMS:
+            break
+    return terms
+
+
+@lru_cache(maxsize=1024)
+def _term_pattern(term: str) -> re.Pattern[str]:
+    # Token boundaries, not substring: "cli" must not match "client".
+    return re.compile(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])")
+
+
+def text_term_matches(text: str, terms: list[str]) -> list[str]:
+    """Which of ``terms`` occur (token-bounded) in ``text``."""
+    if not text or not terms:
+        return []
+    lowered = text.lower()
+    return [term for term in terms if _term_pattern(term).search(lowered)]
+
+
+def best_match_window(
+    text: str, terms: list[str], *, width: int = 400
+) -> tuple[int, str] | None:
+    """(offset, window) around the densest cluster of query terms.
+
+    Returns None when no term occurs. Exists because truncating a long document
+    at its HEAD hides exactly the part that matched the query — the head of a
+    repo file is its provenance header and imports, and the answer usually
+    lives thousands of characters in.
+    """
+    if not text or not terms:
+        return None
+    lowered = text.lower()
+    positions: list[tuple[int, str]] = []
+    for term in terms:
+        for count, match in enumerate(_term_pattern(term).finditer(lowered)):
+            positions.append((match.start(), term))
+            if count >= 7:
+                break
+    if not positions:
+        return None
+    positions.sort()
+    best_start = positions[0][0]
+    best_count = 0
+    for index, (pos, _term) in enumerate(positions):
+        distinct: set[str] = set()
+        for later_pos, later_term in positions[index:]:
+            if later_pos > pos + width:
+                break
+            distinct.add(later_term)
+        if len(distinct) > best_count:
+            best_count = len(distinct)
+            best_start = pos
+    start = max(0, best_start - max(40, width // 8))
+    return start, text[start : start + width]
+
+
+def lexical_relevance_summary(
+    query: str,
+    coverages: list[float],
+    *,
+    scores_available: bool = False,
+) -> dict[str, Any]:
+    """Response-level honesty block about how relevant the page CAN be known to be.
+
+    ``no_lexical_match`` is the explicit no-confident-match marker: true when
+    the page is non-empty yet no hit contains a single query term. It is
+    phrased as low confidence, not as proof of irrelevance — a semantic match
+    through synonyms would also score zero coverage.
+    """
+    terms = query_terms(query)
+    max_coverage = max(coverages, default=0.0)
+    return {
+        "basis": "lexical-term-overlap",
+        "retriever_scores_available": bool(scores_available),
+        "query_terms": terms,
+        "max_term_coverage": round(float(max_coverage), 3),
+        "no_lexical_match": bool(terms) and bool(coverages) and max_coverage <= 0.0,
+    }
+
+
 def _hit_text(item: dict[str, Any]) -> str:
     parts = [
         item.get("title"),
@@ -129,6 +337,14 @@ def _hit_text(item: dict[str, Any]) -> str:
         ]
     )
     return " ".join(str(p) for p in parts if p)
+
+
+def hit_term_coverage(item: dict[str, Any], terms: list[str]) -> tuple[float, list[str]]:
+    """(fraction of query terms present, the matched terms) for one hit."""
+    if not terms:
+        return 0.0, []
+    matched = text_term_matches(_hit_text(item), terms)
+    return len(matched) / len(terms), matched
 
 
 def infer_doc_type(item: dict[str, Any]) -> str:
@@ -305,7 +521,18 @@ def apply_query_ranking(
         return list(results)
     dict_hits = [item for item in results if isinstance(item, dict)]
     other = [item for item in results if not isinstance(item, dict)]
-    dict_hits.sort(key=lambda item: query_rank_score(item, query, mode=mode), reverse=True)
+    # Class boost first, then lexical term coverage as the tie-breaker. Without
+    # the second key a page of same-class hits (ten repo-content chunks, all
+    # `canonical-docs`) sorted into exactly its input order and mode=docs was
+    # indistinguishable from not passing it. Coverage can only reorder WITHIN a
+    # class — it never lifts an issue above documentation.
+    terms = query_terms(query)
+
+    def rank_key(item: dict[str, Any]) -> tuple[float, float]:
+        coverage, _matched = hit_term_coverage(item, terms)
+        return query_rank_score(item, query, mode=mode), coverage
+
+    dict_hits.sort(key=rank_key, reverse=True)
     return dict_hits + other
 
 
@@ -316,8 +543,19 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
-def normalize_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
-    """Stable agent hit schema for CLI --json output."""
+SNIPPET_CHARS = 500
+
+
+def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None) -> dict[str, Any]:
+    """Stable agent hit schema for CLI --json output.
+
+    With ``query`` given, each hit also carries ``term_coverage`` /
+    ``matched_terms`` (observable lexical overlap — see
+    ``lexical_relevance_summary`` for why there is no retriever score), and the
+    snippet of a LONG text is a window around the densest query-term cluster
+    instead of the head: the head of a repo-content chunk is its provenance
+    header, which is exactly where the answer is not.
+    """
     if not isinstance(item, dict):
         text = str(item)
         return {
@@ -329,7 +567,7 @@ def normalize_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
             "doc_type": DOC_TYPE_OTHER,
             "updated_at": None,
             "score": None,
-            "snippet": text[:500],
+            "snippet": text[:SNIPPET_CHARS],
             "content_hint": HINT_UNCLASSIFIED,
             "trust_tier": TRUST_UNATTESTED,
             "rank": index + 1,
@@ -339,25 +577,44 @@ def normalize_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
     provenance = envelope.get("provenance") if isinstance(envelope.get("provenance"), dict) else {}
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
 
-    path = _first_str(item.get("path"), provenance.get("path"), metadata.get("path"))
+    raw_text = _first_str(
+        item.get("text"),
+        item.get("content"),
+        item.get("summary"),
+        item.get("chunk"),
+    )
+    # Parse the structural header BEFORE the snippet collapses whitespace: it
+    # is the only provenance a bare chunk carries, and identity filters below
+    # (repo=/path=) depend on it when the server envelope is absent.
+    header = parse_content_header(raw_text)
+
+    path = _first_str(
+        item.get("path"), provenance.get("path"), metadata.get("path"), header.get("path")
+    )
     url = _first_str(
         item.get("url"),
         item.get("source_url"),
         provenance.get("source_url"),
         item.get("source"),
+        header.get("source_url"),
     )
-    title = _first_str(item.get("title"), provenance.get("title"), metadata.get("title"))
-    text = _first_str(
-        item.get("text"),
-        item.get("content"),
-        item.get("summary"),
-        item.get("chunk"),
-        title,
-    ) or ""
+    title = _first_str(
+        item.get("title"),
+        provenance.get("title"),
+        metadata.get("title"),
+        header.get("title"),
+    )
+    text = raw_text or title or ""
     if not title:
         title = text.split("\n", 1)[0][:120] if text else (path or url or "untitled")
 
-    repo = _first_str(item.get("repo"), metadata.get("repo"), metadata.get("full_name"))
+    repo = _first_str(
+        item.get("repo"),
+        provenance.get("repo"),
+        metadata.get("repo"),
+        metadata.get("full_name"),
+        header.get("repo"),
+    )
     if not repo and isinstance(url, str) and "github.com/" in url:
         match = re.search(r"github\.com/([^/]+/[^/]+)", url)
         if match:
@@ -372,7 +629,15 @@ def normalize_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
     if not isinstance(score, (int, float)) or isinstance(score, bool):
         score = None
 
-    return {
+    terms = query_terms(query) if query else []
+    snippet_source = text
+    if terms and len(text) > SNIPPET_CHARS:
+        window = best_match_window(text, terms, width=SNIPPET_CHARS)
+        if window and window[0] > 0:
+            snippet_source = "…" + window[1]
+    snippet = " ".join(snippet_source.split())[:SNIPPET_CHARS]
+
+    normalized: dict[str, Any] = {
         "id": item.get("id") or envelope.get("result_id"),
         "title": title,
         "url": url,
@@ -385,15 +650,20 @@ def normalize_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
             metadata.get("updated_at"),
         ),
         "score": score,
-        "snippet": " ".join(text.split())[:500],
+        "snippet": snippet,
         # Alias kept for older agent parsers that read ``text``.
-        "text": " ".join(text.split())[:500],
+        "text": snippet,
         "content_hint": infer_content_hint(item, doc_type),
         "trust_tier": trust_tier,
         "rank": envelope.get("rank") or (index + 1),
         "dataset": envelope.get("dataset"),
         "_citadel": envelope or None,
     }
+    if terms:
+        coverage, matched = hit_term_coverage(item, terms)
+        normalized["term_coverage"] = round(coverage, 3)
+        normalized["matched_terms"] = matched
+    return normalized
 
 
 def _hit_envelope(hit: dict[str, Any]) -> dict[str, Any]:
@@ -417,33 +687,72 @@ def _hit_trust_tier(hit: dict[str, Any]) -> str:
     ).lower()
 
 
-def _hit_blob(hit: dict[str, Any], *extra_keys: str) -> str:
-    """Lowercased haystack for substring filters (shaped hits + server envelopes)."""
+_GITHUB_REPO_URL_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)")
+
+
+def _hit_raw_text(hit: dict[str, Any]) -> str | None:
+    return _first_str(hit.get("text"), hit.get("content"), hit.get("chunk"), hit.get("body"))
+
+
+def _hit_repo_identity(hit: dict[str, Any]) -> str | None:
+    """Which repository this hit IS from — never which repositories it mentions.
+
+    Sources, in order: explicit repo keys, the server-parsed provenance, a
+    github.com source URL, and finally the structural header at the start of
+    the chunk. Body prose is deliberately not consulted: repo="sokosumi-cli"
+    used to match a sokosumi-docs file because its install instructions
+    contained that string. Neither is the envelope dataset — Central is
+    literally named after the org, so repo=<org> would match every hit in it.
+    """
     provenance = _hit_provenance(hit)
     metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
-    parts: list[Any] = [
+    identity = _first_str(
         hit.get("repo"),
-        hit.get("path"),
-        hit.get("url"),
-        hit.get("source"),
-        hit.get("snippet"),
-        hit.get("text"),
-        hit.get("content"),
-        hit.get("title"),
-        provenance.get("path"),
-        provenance.get("source_url"),
-        provenance.get("title"),
+        provenance.get("repo"),
         metadata.get("repo"),
-        metadata.get("path"),
         metadata.get("full_name"),
-        # NOT envelope["dataset"]: Central is literally named after the org, so
-        # repo="masumi-network" matched every hit in it, and a seat dataset
-        # matched its own slug. Scoping filters must not be satisfied by the
-        # name of the dataset a hit happens to live in.
-    ]
-    for key in extra_keys:
-        parts.append(hit.get(key))
-    return " ".join(str(part).lower() for part in parts if part)
+    )
+    if identity:
+        return identity
+    url = _first_str(hit.get("url"), hit.get("source_url"), provenance.get("source_url"))
+    if url:
+        match = _GITHUB_REPO_URL_RE.search(url)
+        if match:
+            return match.group(1)
+    header = parse_content_header(_hit_raw_text(hit))
+    return header.get("repo")
+
+
+def repo_filter_matches(identity: str | None, wanted: str) -> bool:
+    """Repo IDENTITY match: exact, name-only, or org-only — never substring.
+
+    Fail-closed: a hit that cannot state which repo it is from does not satisfy
+    a repo filter, whatever its body text happens to contain.
+    """
+    if not identity:
+        return False
+    identity = identity.strip().strip("/").lower()
+    needle = (wanted or "").strip().strip("/").lower()
+    if not needle:
+        return True
+    return (
+        identity == needle
+        or identity.endswith("/" + needle)
+        or identity.startswith(needle + "/")
+    )
+
+
+def _hit_path_identity(hit: dict[str, Any]) -> str | None:
+    """The path this hit IS — from path keys or the parsed start-of-chunk header."""
+    provenance = _hit_provenance(hit)
+    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    path = _first_str(hit.get("path"), provenance.get("path"), metadata.get("path"))
+    if path:
+        return path
+    header = parse_content_header(_hit_raw_text(hit))
+    # The header title line is "org/repo/path", a superset of the path — fine
+    # for substring path filters, still an identity claim rather than body text.
+    return header.get("path") or header.get("title")
 
 
 def compact_search_filters(
@@ -497,14 +806,18 @@ def filter_hits(
         wanted = {t.strip().lower() for t in types if t.strip()}
         filtered = [h for h in filtered if _hit_doc_type(h) in wanted]
     if repo:
-        needle = repo.lower()
-        filtered = [h for h in filtered if needle in _hit_blob(h)]
+        # Identity, not substring: matching the whole hit blob credited any hit
+        # whose BODY mentioned the repo name (install lines, cross-references).
+        filtered = [h for h in filtered if repo_filter_matches(_hit_repo_identity(h), repo)]
     if path:
-        # Treat as substring; callers may pass glob-ish **/MIP-003/** which still
-        # matches as plain text on path/snippet for agent convenience.
+        # Substring over the hit's own path identity only; callers may pass
+        # glob-ish **/MIP-003/** which still matches as plain text. Matching the
+        # whole blob made path= another body-text filter.
         needle = path.replace("**/", "").replace("/**", "").replace("*", "").lower()
         if needle:
-            filtered = [h for h in filtered if needle in _hit_blob(h)]
+            filtered = [
+                h for h in filtered if needle in (_hit_path_identity(h) or "").lower()
+            ]
     if canonical_only:
         # Content-shaped, NOT a trust filter: it keeps hits whose text reads like
         # documentation. It cannot vouch for any of them — the tier that could
@@ -554,7 +867,9 @@ def shape_search_payload(
         ordered = apply_query_ranking(raw_results, query, mode=mode)
     else:
         ordered = list(raw_results)
-    hits = [normalize_search_hit(item, index=i) for i, item in enumerate(ordered)]
+    hits = [normalize_search_hit(item, index=i, query=query) for i, item in enumerate(ordered)]
+    filters_active = bool(types or repo or path or canonical_only or exclude_ambient)
+    before_filters = len(hits)
     hits = filter_hits(
         hits,
         types=types,
@@ -563,6 +878,15 @@ def shape_search_payload(
         canonical_only=canonical_only,
         exclude_ambient=exclude_ambient,
     )
+    relevance = lexical_relevance_summary(
+        query,
+        [
+            float(h["term_coverage"])
+            for h in hits
+            if isinstance(h.get("term_coverage"), (int, float))
+        ],
+        scores_available=any(h.get("score") is not None for h in hits),
+    )
     warnings: list[str] = []
     if payload.get("note"):
         warnings.append(str(payload["note"]))
@@ -570,6 +894,8 @@ def shape_search_payload(
     truncated = timed_out or bool(payload.get("truncated"))
     if timed_out:
         warnings.append("search timed out; results may be incomplete")
+    if relevance["no_lexical_match"]:
+        warnings.append(NO_LEXICAL_MATCH_WARNING)
     authority = token_asset_authority_warning(query)
     if authority:
         warnings.append(authority)
@@ -584,9 +910,15 @@ def shape_search_payload(
         "truncated": truncated,
         "spec_mode": bool(apply_spec_ranking) and not docs_mode,
         "docs_mode": docs_mode,
+        "relevance": relevance,
         "warnings": warnings,
         "ok": True,
     }
+    if filters_active:
+        # Filters run on the returned page, so they can only shrink it. Say how
+        # much they did, so a short page reads as "filters excluded candidates",
+        # not "the vault holds nothing else".
+        out["filter_stats"] = {"before": before_filters, "after": len(hits)}
     if timed_out:
         out["code"] = CODE_TIMEOUT
     elif payload.get("code"):

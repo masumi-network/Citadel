@@ -83,14 +83,20 @@ from kb.search_format import (
     CODE_TIMEOUT,
     DOC_TYPE_CANONICAL,
     DOC_TYPE_TRACE,
+    NO_LEXICAL_MATCH_WARNING,
     apply_query_ranking,
+    best_match_window,
     compact_search_filters,
     filter_hits,
+    hit_term_coverage,
     infer_content_hint,
     infer_doc_type,
     infer_trust_tier,
     is_docs_mode_query,
     is_spec_mode_query,
+    lexical_relevance_summary,
+    parse_content_header,
+    query_terms,
     token_asset_authority_warning,
 )
 from kb.security_scan import (
@@ -2246,6 +2252,18 @@ async def capture_search_feedback(
             session_id=session_id,
             filters=filters,
         )
+        # search_id_for hashes query + result_count + datasets only, so the
+        # same query with and without mode=docs (or any filter) produced the
+        # SAME search_id and telemetry could not tell the two calls apart.
+        # Suffix a digest of the filters: still deterministic (identical calls
+        # still share an id, so explicit follow-up feedback keeps linking), but
+        # differently-filtered calls no longer collide.
+        base_search_id = telemetry.get("search_id")
+        if filters and isinstance(base_search_id, str):
+            filters_digest = hashlib.sha256(
+                json.dumps(filters, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:8]
+            telemetry["search_id"] = f"{base_search_id}.f{filters_digest}"
         # ADR-0009 (presence for all, content per caller): the row lands on the
         # caller's own Node when they have one, so query text and hit ids stay
         # private to them. A row that has to land on a shared dataset — a
@@ -2495,6 +2513,17 @@ def first_string(*values: Any) -> str | None:
 
 
 def result_provenance(result: dict[str, Any]) -> dict[str, str]:
+    """Provenance for one hit: explicit keys first, then the parsed content header.
+
+    cognee's chunk payloads carry none of the explicit keys (117/117 production
+    hits shipped ``provenance == {}``), but the repo-content and Linear syncers
+    write a structural header as the first lines of every document they ingest.
+    ``parse_content_header`` recovers repo/path/source_url/commit/blob (and the
+    Linear issue id) from a header at the START of the chunk only — a header
+    quoted mid-body is never credited. Header-derived values are body text and
+    therefore author-controlled, so they are marked ``basis: content-header``
+    and must never feed ``trust_tier``.
+    """
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     provenance = {
         "source": first_string(
@@ -2520,6 +2549,25 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
         "title": first_string(result.get("title"), metadata.get("title")),
         "session_id": first_string(result.get("session_id"), metadata.get("session_id")),
     }
+    header = parse_content_header(
+        first_string(
+            result.get("text"),
+            result.get("content"),
+            result.get("chunk"),
+            result.get("body"),
+        )
+    )
+    if header:
+        header_used = False
+        for key in ("repo", "path", "source_url", "commit", "blob", "issue", "title"):
+            value = header.get(key)
+            if value and not provenance.get(key):
+                provenance[key] = value
+                header_used = True
+        if header_used:
+            if not provenance.get("source"):
+                provenance["source"] = header.get("kind")
+            provenance["basis"] = "content-header"
     return {key: value for key, value in provenance.items() if value}
 
 
@@ -2552,12 +2600,31 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     return {"id": f"chunk:{derived}", **result}
 
 
+def _result_retriever_score(result: dict[str, Any]) -> float | None:
+    """A numeric relevance value the retriever itself attached, if any.
+
+    cognee 1.2.2's CHUNKS retriever returns chunk payload dicts without one —
+    the vector engine's ScoredResult carries a cosine distance, but the
+    retriever hands back ``found_chunk.payload`` only, so the distance is
+    dropped upstream of this repo's client boundary. Today this is therefore
+    always None. It is checked anyway so that the moment the client boundary
+    starts merging the distance into the payload, hits surface it here without
+    another change. Never invented: absent stays absent.
+    """
+    for key in ("score", "distance", "similarity"):
+        value = result.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
 def with_result_metadata(
     result: Any,
     index: int,
     dataset: str,
     *,
     drilldown_predicate: Callable[[str], bool] | None = None,
+    query: str | None = None,
 ) -> Any:
     """Attach a reserved Citadel provenance envelope to dict search results.
 
@@ -2568,6 +2635,13 @@ def with_result_metadata(
     that follows the hint never lands on an ADR-0009 404. Without a predicate
     the flag falls back to "any id with a backing endpoint" (non-caller-scoped
     callers/tests). Synthetic ``chunk:<hash>`` ids stay non-drillable either way.
+
+    ``query`` (when supplied) adds ``_citadel.relevance``: the retriever's own
+    score when the payload carries one (it does not today — see
+    ``_result_retriever_score``), observable lexical term coverage, and a
+    ``match_context`` window around the densest query-term cluster so that a
+    caller which truncates ``text`` at the head still shows the part of a long
+    document that actually matched.
     """
     if not isinstance(result, dict):
         return result
@@ -2600,6 +2674,27 @@ def with_result_metadata(
     }
     if drilldown_available:
         metadata["document_endpoint"] = document_endpoint
+    if query is not None:
+        terms = query_terms(query)
+        coverage, matched = hit_term_coverage({**normalized, "_citadel": metadata}, terms)
+        relevance: dict[str, Any] = {
+            "term_coverage": round(coverage, 3),
+            "matched_terms": matched,
+        }
+        retriever_score = _result_retriever_score(normalized)
+        if retriever_score is not None:
+            relevance["retriever_score"] = retriever_score
+        full_text = first_string(
+            normalized.get("text"),
+            normalized.get("content"),
+            normalized.get("chunk"),
+            normalized.get("body"),
+        )
+        if full_text and terms:
+            window = best_match_window(full_text, terms)
+            if window and window[0] > 0:
+                relevance["match_context"] = {"offset": window[0], "text": window[1]}
+        metadata["relevance"] = relevance
     # Classify BEFORE deciding trust, because the two questions have different
     # authorities and conflating them is what broke `mode="docs"`.
     #
@@ -6089,6 +6184,14 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     mesh_state = get_mesh()
     search_datasets = resolve_search_datasets(actor, body.dataset, citadel.config)
     search_sessions = resolve_search_sessions(actor, body.session_id, search_datasets)
+    filter_kw = body.filter_kwargs()
+    filters_active = any(filter_kw.values())
+    # Filters run AFTER retrieval, so on a fixed candidate page they can only
+    # shrink it: top_k=10 with a repo filter used to return 4 hits. Over-fetch
+    # candidates when filters are active and trim back to top_k after
+    # filtering; 100 is SearchBody's own top_k ceiling, so a filtered call can
+    # never fetch more than an unfiltered one is allowed to ask for.
+    fetch_k = min(max(body.top_k * 3, body.top_k + 10), 100) if filters_active else body.top_k
     limit = citadel.config.search_max_concurrency
     timed_out = False
     started = time.perf_counter()
@@ -6101,7 +6204,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 query=body.query,
                 datasets=search_datasets,
                 sessions=search_sessions,
-                top_k=body.top_k,
+                top_k=fetch_k,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
             await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
@@ -6124,13 +6227,125 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             citadel.config, operation="search", error="search budget exceeded"
         )
 
+    # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
+    # drill-down hints are resolved LAST, over the final page only, because
+    # each scoped resolution costs a get_document call and over-fetching for
+    # filters would otherwise triple that cost for hits the caller never sees.
+    bypass_drilldown = can_bypass_dataset_allowlist(actor)
+    normalized = [
+        with_result_metadata(
+            result,
+            index,
+            dataset,
+            # Scoped callers: deny drill-down for now and patch the survivors
+            # up after the trim. The safe failure direction — a missed patch
+            # under-promises (a 200 the hint did not advertise), never an
+            # ADR-0009 404 the hint promised was a document.
+            drilldown_predicate=None if bypass_drilldown else (lambda _result_id: False),
+            query=body.query,
+        )
+        for index, (dataset, result) in enumerate(merged)
+    ]
+    cleaned_mode = body.cleaned_mode()
+    docs_mode = is_docs_mode_query(body.query, mode=cleaned_mode)
+    if docs_mode or is_spec_mode_query(body.query):
+        normalized = apply_query_ranking(normalized, body.query, mode=cleaned_mode)
+    candidates_fetched = len(normalized)
+    if filters_active:
+        dict_hits = [item for item in normalized if isinstance(item, dict)]
+        other = [item for item in normalized if not isinstance(item, dict)]
+        normalized = filter_hits(dict_hits, **filter_kw) + other
+    candidates_matched = len(normalized)
+    if len(normalized) > body.top_k:
+        normalized = normalized[: body.top_k]
+    # Refresh rank numbers after re-order / filter / trim so agents see
+    # consistent ordering.
+    for index, item in enumerate(normalized):
+        if isinstance(item, dict) and isinstance(item.get("_citadel"), dict):
+            item["_citadel"]["rank"] = index + 1
+
+    # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
+    # (and the document_endpoint URL) must be TRUE only when /api/documents would
+    # actually return 200 for THIS caller. Bypass callers reach any resolvable id,
+    # so they skip the check. For a scoped caller we resolve each id through the
+    # SAME steps /api/documents takes — get_document to recover its
+    # ``dataset_node_ids`` (a CHUNKS hit's datasets live on its is_part_of parent
+    # document, NOT the chunk node itself, so a raw-id map lookup would always
+    # miss), then the SAME visibility rule over the SAME once-fetched
+    # node_dataset_map — so the hint can never drift from the endpoint it points
+    # at. Resolved once per UNIQUE drillable id on the final page; the shared
+    # map is fetched once and reused across ids.
+    if not bypass_drilldown:
+        drilldown_map = await load_node_dataset_map(warn_unavailable=False)
+
+        async def _resolve_drilldown(result_id: str) -> bool:
+            if result_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
+                # github drill-down has no ADR-0009 scope gate and resolves via a
+                # different endpoint branch (github_section_document, not
+                # get_document); the endpoint returns 200 for any reader with a
+                # resolvable id.
+                return True
+            # Native cognee id: resolve exactly as the /api/documents cognee branch
+            # does. A missing document (None), a cold/empty map, or an id whose owner
+            # nodes are all hidden each deny (fail-closed) so the flag never promises
+            # a 404 — textless entities and foreign-seat docs/chunks fall out here.
+            try:
+                document = await get_citadel().get_document(result_id)
+            except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
+                return False
+            if document is None:
+                return False
+            owner_node_ids = document.get("dataset_node_ids") or [result_id]
+            return node_ids_visible_in_map(actor, owner_node_ids, drilldown_map)
+
+        drilldown_hint: dict[str, bool] = {}
+        for item in normalized:
+            if not isinstance(item, dict) or not isinstance(item.get("_citadel"), dict):
+                continue
+            envelope = item["_citadel"]
+            result_id = str(envelope.get("result_id") or "")
+            document_endpoint = document_endpoint_for_result(result_id)
+            if not document_endpoint:
+                # Synthetic chunk:<hash> id with no backing store — honestly
+                # non-drillable, nothing to resolve.
+                continue
+            if result_id not in drilldown_hint:
+                drilldown_hint[result_id] = await _resolve_drilldown(result_id)
+            if drilldown_hint[result_id]:
+                envelope["document_endpoint"] = document_endpoint
+                retrieval = envelope.get("retrieval")
+                if isinstance(retrieval, dict):
+                    retrieval["document_drilldown_available"] = True
+
     for search_dataset in search_datasets:
         await mesh_state.record_search(
             citadel.config,
             query=body.query,
             dataset=search_dataset,
-            result_count=sum(1 for ds, _ in merged if ds == search_dataset),
+            # Counted from the page the caller actually receives, not from the
+            # over-fetched candidate pool.
+            result_count=sum(
+                1
+                for item in normalized
+                if isinstance(item, dict)
+                and isinstance(item.get("_citadel"), dict)
+                and item["_citadel"].get("dataset") == search_dataset
+            ),
         )
+    audit_detail: dict[str, Any] = {
+        "operation": "search",
+        "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+        "query_length": len(body.query),
+        "result_count": len(normalized),
+        "top_k": body.top_k,
+        "datasets": search_datasets,
+        "scope_override": scope_override_active(actor, search_datasets),
+        "latency_ms": round(latency_ms, 1),
+        "timed_out": timed_out,
+    }
+    if filters_active:
+        audit_detail["candidates_fetched"] = candidates_fetched
+        audit_detail["candidates_matched"] = candidates_matched
     record_mcp_audit(
         request,
         actor=actor,
@@ -6141,88 +6356,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         # unquantified. The detail dict already carried timed_out; nothing read it.
         success=not timed_out,
         dataset=search_datasets[0],
-        detail={
-            "operation": "search",
-            "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
-            "query_length": len(body.query),
-            "result_count": len(merged),
-            "top_k": body.top_k,
-            "datasets": search_datasets,
-            "scope_override": scope_override_active(actor, search_datasets),
-            "latency_ms": round(latency_ms, 1),
-            "timed_out": timed_out,
-        },
+        detail=audit_detail,
     )
-    # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
-    # (and the document_endpoint URL) must be TRUE only when /api/documents would
-    # actually return 200 for THIS caller. Bypass callers reach any resolvable id,
-    # so they skip the check. For a scoped caller we resolve each id through the
-    # SAME steps /api/documents takes — get_document to recover its
-    # ``dataset_node_ids`` (a CHUNKS hit's datasets live on its is_part_of parent
-    # document, NOT the chunk node itself, so a raw-id map lookup would always
-    # miss), then the SAME visibility rule over the SAME once-fetched
-    # node_dataset_map — so the hint can never drift from the endpoint it points
-    # at. Resolved once per UNIQUE drillable id (results are already deduped and
-    # top_k-bounded); the shared map is fetched once and reused across ids.
-    bypass_drilldown = can_bypass_dataset_allowlist(actor)
-    drilldown_map = (
-        None if bypass_drilldown else await load_node_dataset_map(warn_unavailable=False)
-    )
-
-    async def _resolve_drilldown(result_id: str) -> bool:
-        if result_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
-            # github drill-down has no ADR-0009 scope gate and resolves via a
-            # different endpoint branch (github_section_document, not
-            # get_document); the endpoint returns 200 for any reader with a
-            # resolvable id.
-            return True
-        # Native cognee id: resolve exactly as the /api/documents cognee branch
-        # does. A missing document (None), a cold/empty map, or an id whose owner
-        # nodes are all hidden each deny (fail-closed) so the flag never promises
-        # a 404 — textless entities and foreign-seat docs/chunks fall out here.
-        try:
-            document = await get_citadel().get_document(result_id)
-        except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
-            return False
-        if document is None:
-            return False
-        owner_node_ids = document.get("dataset_node_ids") or [result_id]
-        return node_ids_visible_in_map(actor, owner_node_ids, drilldown_map)
-
-    drilldown_hint: dict[str, bool] = {}
-    if not bypass_drilldown:
-        for _dataset, result in merged:
-            if not isinstance(result, dict):
-                continue
-            result_id = str(with_result_id(result)["id"])
-            if result_id in drilldown_hint or not document_endpoint_for_result(result_id):
-                # Already resolved, or a synthetic chunk:<hash> id with no backing
-                # store — with_result_metadata marks those non-drillable anyway.
-                continue
-            drilldown_hint[result_id] = await _resolve_drilldown(result_id)
-
-    def _drilldown_available(result_id: str) -> bool:
-        # Bypass callers reach any resolvable id; scoped callers get the honest
-        # per-endpoint decision precomputed above (default-deny for safety).
-        return True if bypass_drilldown else drilldown_hint.get(result_id, False)
-
-    normalized = [
-        with_result_metadata(
-            result, index, dataset, drilldown_predicate=_drilldown_available
-        )
-        for index, (dataset, result) in enumerate(merged)
-    ]
-    if is_docs_mode_query(body.query, mode=body.cleaned_mode()) or is_spec_mode_query(body.query):
-        normalized = apply_query_ranking(normalized, body.query, mode=body.cleaned_mode())
-    filter_kw = body.filter_kwargs()
-    if any(filter_kw.values()):
-        dict_hits = [item for item in normalized if isinstance(item, dict)]
-        other = [item for item in normalized if not isinstance(item, dict)]
-        normalized = filter_hits(dict_hits, **filter_kw) + other
-    # Refresh rank numbers after re-order / filter so agents see consistent ordering.
-    for index, item in enumerate(normalized):
-        if isinstance(item, dict) and isinstance(item.get("_citadel"), dict):
-            item["_citadel"]["rank"] = index + 1
     primary_dataset = search_datasets[0]
     node_dataset = (
         actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
@@ -6242,6 +6377,26 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         session_id=body.session_id,
         filters=body.telemetry_filters(),
     )
+    # Response-level relevance honesty (see lexical_relevance_summary): the
+    # retriever exposes no score at this boundary, so the page reports the one
+    # signal it CAN attest — lexical term overlap — and flags a page in which
+    # no hit contains a single query term as not confidently matched.
+    coverages: list[float] = []
+    retriever_scores_seen = False
+    for item in normalized:
+        if not isinstance(item, dict) or not isinstance(item.get("_citadel"), dict):
+            continue
+        hit_relevance = item["_citadel"].get("relevance")
+        if not isinstance(hit_relevance, dict):
+            continue
+        coverage = hit_relevance.get("term_coverage")
+        if isinstance(coverage, (int, float)) and not isinstance(coverage, bool):
+            coverages.append(float(coverage))
+        if hit_relevance.get("retriever_score") is not None:
+            retriever_scores_seen = True
+    relevance_summary = lexical_relevance_summary(
+        body.query, coverages, scores_available=retriever_scores_seen
+    )
     payload: dict[str, Any] = {
         "results": normalized,
         "dataset": primary_dataset,
@@ -6250,7 +6405,19 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             central_dataset=central_dataset(citadel.config),
             node_dataset=node_dataset,
         ),
+        "docs_mode": docs_mode,
+        "spec_mode": is_spec_mode_query(body.query) and not docs_mode,
+        "relevance": relevance_summary,
     }
+    if cleaned_mode:
+        payload["mode"] = cleaned_mode
+    if filters_active:
+        payload["filtering"] = {
+            "applied": {key: value for key, value in filter_kw.items() if value},
+            "candidates_fetched": candidates_fetched,
+            "candidates_matched": candidates_matched,
+            "returned": len(normalized),
+        }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
     if timed_out:
@@ -6261,17 +6428,26 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         payload["timed_out"] = True
         payload["truncated"] = True
         payload["code"] = CODE_TIMEOUT
-    elif not normalized and body.dataset is None:
+    elif not normalized and body.dataset is None and not filters_active:
         payload["note"] = (
             "No results in the default dataset. Pass an explicit \"dataset\" to search a "
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)
+    warnings: list[str] = []
+    if filters_active and candidates_matched < body.top_k and not timed_out:
+        warnings.append(
+            f"Filters matched {candidates_matched} of {candidates_fetched} fetched "
+            "candidates; the page is short because post-retrieval filters excluded "
+            "the rest, not because the search found nothing else."
+        )
+    if relevance_summary["no_lexical_match"]:
+        warnings.append(NO_LEXICAL_MATCH_WARNING)
     authority = token_asset_authority_warning(body.query)
     if authority:
-        payload.setdefault("warnings", [])
-        if isinstance(payload["warnings"], list):
-            payload["warnings"].append(authority)
+        warnings.append(authority)
+    if warnings:
+        payload["warnings"] = warnings
     if telemetry:
         payload["search_id"] = telemetry.get("search_id")
         payload["feedback"] = {
