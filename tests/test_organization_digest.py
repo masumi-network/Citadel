@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import io
+import json
+import logging
 import threading
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
 from kb.config import CitadelConfig
 from kb.google_chat import GoogleChatDelivery
 from kb.learning_agent import LearningAgent
-from kb.organization_digest import build_organization_digest, has_meaningful_source_changes
+from kb.llm_enrichment import DEFAULT_LLM_MODEL
+from kb.organization_digest import (
+    build_organization_digest,
+    has_meaningful_source_changes,
+    llm_agent_read,
+    resolve_openrouter_model,
+)
 
 
 class FakeRepoContentSyncer:
@@ -370,3 +380,215 @@ async def test_learning_agent_posts_gateways_concurrently(monkeypatch: Any) -> N
     assert sorted(started) == ["alpha", "bravo"]
     assert result["notifications"]["gateways"]["alpha"]["sent"] is True
     assert result["notifications"]["gateways"]["bravo"]["sent"] is True
+
+
+# --- OpenRouter model resolution + diagnosable failure logging -----------------
+
+
+def _clear_llm_env(monkeypatch: Any) -> None:
+    for name in (
+        "CITADEL_ORG_DIGEST_LLM_MODEL",
+        "LLM_MODEL",
+        "CITADEL_LLM_MODEL",
+        "LLM_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _digest_packet() -> dict[str, Any]:
+    return {
+        "kind": "organization_update_digest_source_packet",
+        "summary": {"org": "masumi-network"},
+    }
+
+
+class _FakeCompletionResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeCompletionResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+
+def test_resolve_model_strips_litellm_prefix_from_llm_model(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+
+    assert resolve_openrouter_model() == (
+        "openrouter/deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash",
+    )
+
+
+def test_resolve_model_keeps_bare_openrouter_id(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
+
+    assert resolve_openrouter_model() == (
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash",
+    )
+
+
+def test_resolve_model_org_digest_override_wins_in_either_form(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/vendor/from-llm-model")
+
+    monkeypatch.setenv("CITADEL_ORG_DIGEST_LLM_MODEL", "openrouter/qwen/qwen3-coder")
+    assert resolve_openrouter_model() == ("openrouter/qwen/qwen3-coder", "qwen/qwen3-coder")
+
+    monkeypatch.setenv("CITADEL_ORG_DIGEST_LLM_MODEL", "qwen/qwen3-coder")
+    assert resolve_openrouter_model() == ("qwen/qwen3-coder", "qwen/qwen3-coder")
+
+
+def test_resolve_model_keeps_native_openrouter_vendor_id(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/auto")
+
+    assert resolve_openrouter_model() == ("openrouter/auto", "openrouter/auto")
+
+
+def test_resolve_model_default_and_citadel_llm_model_fallbacks(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    assert resolve_openrouter_model() == (DEFAULT_LLM_MODEL, DEFAULT_LLM_MODEL)
+
+    monkeypatch.setenv("CITADEL_LLM_MODEL", "openrouter/z-ai/glm-5")
+    assert resolve_openrouter_model() == ("openrouter/z-ai/glm-5", "z-ai/glm-5")
+
+
+def test_llm_agent_read_sends_stripped_model_to_openrouter(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    seen: list[dict[str, Any]] = []
+
+    def fake_open_secure(request: Any, *, timeout: float) -> _FakeCompletionResponse:
+        seen.append(
+            {
+                "url": request.full_url,
+                "payload": json.loads(request.data.decode("utf-8")),
+                "timeout": timeout,
+            }
+        )
+        return _FakeCompletionResponse(
+            {"choices": [{"message": {"content": "- one\n- two\n- three"}}]}
+        )
+
+    monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
+
+    with caplog.at_level(logging.INFO, logger="kb.organization_digest"):
+        lines = llm_agent_read(_digest_packet())
+
+    assert lines == ["one", "two", "three"]
+    assert len(seen) == 1
+    assert seen[0]["payload"]["model"] == "deepseek/deepseek-v4-flash"
+    assert seen[0]["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert "stripped litellm provider prefix" in caplog.text
+
+
+def test_llm_agent_read_sends_bare_model_unchanged(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
+    seen: list[dict[str, Any]] = []
+
+    def fake_open_secure(request: Any, *, timeout: float) -> _FakeCompletionResponse:
+        seen.append(json.loads(request.data.decode("utf-8")))
+        return _FakeCompletionResponse(
+            {"choices": [{"message": {"content": "- one\n- two\n- three"}}]}
+        )
+
+    monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
+
+    assert llm_agent_read(_digest_packet()) == ["one", "two", "three"]
+    assert seen[0]["model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_llm_agent_read_logs_model_and_response_body_on_http_400(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    calls: list[str] = []
+
+    def fake_open_secure(request: Any, *, timeout: float) -> Any:
+        calls.append(request.full_url)
+        raise HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            None,
+            io.BytesIO(
+                b'{"error":{"message":'
+                b'"deepseek/deepseek-v4-flash is not a valid model ID","code":400}}'
+            ),
+        )
+
+    monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
+
+    with caplog.at_level(logging.WARNING, logger="kb.organization_digest"):
+        assert llm_agent_read(_digest_packet()) is None
+
+    # One attempt only: a 400 is not transient, so no retries.
+    assert calls == ["https://openrouter.ai/api/v1/chat/completions"]
+    assert "HTTP 400" in caplog.text
+    # Resolved and configured ids are both recorded, distinguishably.
+    assert (
+        "for model deepseek/deepseek-v4-flash "
+        "(configured openrouter/deepseek/deepseek-v4-flash)"
+    ) in caplog.text
+    # The response body reaches the log, so the next occurrence is diagnosable.
+    assert "is not a valid model ID" in caplog.text
+
+
+def test_llm_agent_read_redacts_credentials_in_logged_error_body(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    # Synthesized fixture: matches the ctdl_ token shape, never a real value.
+    leaked = "ctdl_unit_test_fake_token_1234567890"
+    body = json.dumps(
+        {"error": {"message": f"upstream rejected token {leaked}", "code": 400}}
+    ).encode("utf-8")
+
+    def fake_open_secure(request: Any, *, timeout: float) -> Any:
+        raise HTTPError(request.full_url, 400, "Bad Request", None, io.BytesIO(body))
+
+    monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
+
+    with caplog.at_level(logging.WARNING, logger="kb.organization_digest"):
+        assert llm_agent_read(_digest_packet()) is None
+
+    assert leaked not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+def test_digest_falls_back_deterministically_when_llm_call_400s(monkeypatch: Any) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+
+    def fake_open_secure(request: Any, *, timeout: float) -> Any:
+        raise HTTPError(request.full_url, 400, "Bad Request", None, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
+
+    digest = build_organization_digest(
+        _learning_result(),
+        CitadelConfig(organization_digest_llm_enabled=True),
+        include_preview=True,
+    )
+
+    assert digest["agent_read_source"] == "deterministic_fallback"
+    assert "Agent read" in digest["preview"]

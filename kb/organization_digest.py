@@ -4,11 +4,24 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 from kb.config import CitadelConfig
-from kb.llm_enrichment import default_llm_model, openrouter_api_key, openrouter_chat
+from kb.llm_enrichment import default_llm_model, openrouter_api_key, openrouter_endpoint
+from kb.retry import run_with_retries
+from kb.secure_http import open_secure
+from kb.security_scan import redact_secrets
 
 logger = logging.getLogger(__name__)
+
+# litellm's provider-routing form ("openrouter/<vendor>/<model>") that cognee
+# requires in LLM_MODEL. OpenRouter's own API rejects it as a model id.
+LITELLM_OPENROUTER_PREFIX = "openrouter/"
+
+_OPERATION = "organization_digest.llm_agent_read"
+_MODEL_LOG_CHARS = 160
+_ERROR_BODY_LOG_CHARS = 500
 
 
 def _github_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -146,15 +159,136 @@ def deterministic_agent_read(packet: dict[str, Any]) -> list[str]:
     return lines[:3]
 
 
-def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
-    if not openrouter_api_key():
-        return None
-    model = (
+def resolve_openrouter_model() -> tuple[str, str]:
+    """Resolve the digest model id as ``(configured, sent)``.
+
+    ``configured`` is the raw value of CITADEL_ORG_DIGEST_LLM_MODEL,
+    LLM_MODEL, or the enrichment default, in that order. ``sent`` is the id
+    actually sent to OpenRouter: cognee needs LLM_MODEL in litellm form
+    ("openrouter/<vendor>/<model>"), which OpenRouter's own API rejects, so
+    that prefix is stripped here instead of asking operators to keep two
+    variables in sync. A native id whose vendor happens to be "openrouter"
+    (no second slash, e.g. "openrouter/auto") is left untouched.
+    """
+    configured = (
         os.getenv("CITADEL_ORG_DIGEST_LLM_MODEL")
         or os.getenv("LLM_MODEL")
         or default_llm_model()
+    ).strip()
+    sent = configured
+    if sent.lower().startswith(LITELLM_OPENROUTER_PREFIX):
+        remainder = sent[len(LITELLM_OPENROUTER_PREFIX) :]
+        if "/" in remainder:
+            sent = remainder
+    return configured, sent
+
+
+def _redacted_line(value: Any, *, length: int) -> str:
+    """One log-safe line: whitespace collapsed, secrets redacted, then cut.
+
+    Redaction runs on the full text before truncation so the cut can never
+    split a credential out of the redaction patterns' reach.
+    """
+    collapsed = " ".join(str(value or "").split())
+    return redact_secrets(collapsed)[:length]
+
+
+def _http_error_body(exc: HTTPError) -> str:
+    """Best-effort read of the error response body; never raises."""
+    try:
+        raw = exc.read()
+    except Exception:  # pragma: no cover - a closed/absent fp must not mask the 4xx
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw or "")
+
+
+def _openrouter_chat_diagnosable(
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    configured_model: str,
+    max_tokens: int,
+    timeout: int,
+) -> str | None:
+    """One OpenRouter chat completion whose failures are diagnosable.
+
+    Unlike :func:`kb.llm_enrichment.openrouter_chat`, an HTTP failure here
+    logs the resolved model id and the redacted response body. Production
+    logged only "HTTP Error 400: Bad Request" once per evolve pass, which
+    cannot distinguish a rejected model id from a context-length rejection.
+    """
+    api_key = openrouter_api_key()
+    if not api_key:
+        return None
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    request = Request(
+        f"{openrouter_endpoint()}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "citadel-llm",
+        },
+        method="POST",
     )
-    message = openrouter_chat(
+
+    def fetch() -> dict[str, Any]:
+        with open_secure(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    try:
+        body = run_with_retries(fetch, operation=_OPERATION)
+    except HTTPError as exc:
+        logger.warning(
+            "%s LLM call failed with HTTP %s for model %s (configured %s); response body: %s",
+            _OPERATION,
+            exc.code,
+            _redacted_line(model, length=_MODEL_LOG_CHARS),
+            _redacted_line(configured_model, length=_MODEL_LOG_CHARS),
+            _redacted_line(_http_error_body(exc), length=_ERROR_BODY_LOG_CHARS) or "<empty>",
+        )
+        return None
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "%s LLM call failed with %s for model %s: %s",
+            _OPERATION,
+            exc.__class__.__name__,
+            _redacted_line(model, length=_MODEL_LOG_CHARS),
+            _redacted_line(str(exc), length=_ERROR_BODY_LOG_CHARS),
+        )
+        return None
+
+    if not isinstance(body, dict):
+        return None
+    choices = body.get("choices") or []
+    if not choices:
+        return None
+    content = (choices[0].get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return content
+
+
+def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
+    if not openrouter_api_key():
+        return None
+    configured, model = resolve_openrouter_model()
+    if model != configured:
+        logger.info(
+            "%s using OpenRouter model %s (stripped litellm provider prefix from %s)",
+            _OPERATION,
+            _redacted_line(model, length=_MODEL_LOG_CHARS),
+            _redacted_line(configured, length=_MODEL_LOG_CHARS),
+        )
+    message = _openrouter_chat_diagnosable(
         [
             {
                 "role": "system",
@@ -171,7 +305,7 @@ def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
             },
         ],
         model=model,
-        operation="organization_digest.llm_agent_read",
+        configured_model=configured,
         max_tokens=420,
         timeout=30,
     )

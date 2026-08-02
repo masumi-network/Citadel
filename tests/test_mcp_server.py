@@ -28,7 +28,7 @@ class FakeHttpClient:
     def __init__(self) -> None:
         self.gets: list[dict[str, Any]] = []
         self.posts: list[dict[str, Any]] = []
-        self.public_gets: list[str] = []
+        self.public_gets: list[dict[str, Any]] = []
 
     def get(
         self,
@@ -51,8 +51,15 @@ class FakeHttpClient:
             "extra_headers": extra_headers or {},
         }
 
-    def get_public(self, path: str) -> dict[str, Any]:
-        self.public_gets.append(path)
+    # Mirrors CitadelHttpClient.get_public exactly: keyword-only extra_headers.
+    # The real client owns this shape; keep the fake in lockstep with it.
+    def get_public(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        self.public_gets.append({"path": path, "extra_headers": extra_headers or {}})
         return {"ok": True, "path": path, "public": True}
 
     def post(
@@ -258,8 +265,104 @@ def test_discovery_resource_reads_public_manifest_only() -> None:
         "path": "/.well-known/citadel.json",
         "public": True,
     }
-    assert client.public_gets == ["/.well-known/citadel.json"]
+    assert client.public_gets == [
+        {"path": "/.well-known/citadel.json", "extra_headers": {}}
+    ]
     assert client.gets == []
+
+
+def test_discovery_resource_forwards_validated_caller_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest's base_url is rendered from the request's host, so the
+    resource must forward the caller's validated proto/host on its loopback
+    self-call, exactly like the citadel_discovery tool. Without this the
+    resource advertised http://127.0.0.1:$PORT, an address the discovering
+    agent cannot reach, while the tool returned the public URL.
+
+    The fetch must also stay tokenless: a bearer on the MCP request must not
+    leak into the public manifest call (client.gets stays empty).
+    """
+    from types import SimpleNamespace
+
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    fake_ctx = SimpleNamespace(
+        request_context=SimpleNamespace(
+            request=SimpleNamespace(
+                headers={
+                    "authorization": "Bearer ctdl_resourcetoken",
+                    "x-forwarded-host": "citadel-archive-production.up.railway.app",
+                    "x-forwarded-proto": "https",
+                },
+                url="http://127.0.0.1:8080/mcp",
+            )
+        )
+    )
+    monkeypatch.setattr(server, "get_context", lambda: fake_ctx)
+
+    resource = asyncio.run(server._resource_manager.get_resource("citadel://discovery"))
+    payload = json.loads(asyncio.run(resource.fn()))
+
+    assert payload["ok"] is True
+    assert client.public_gets == [
+        {
+            "path": "/.well-known/citadel.json",
+            "extra_headers": {
+                "X-Forwarded-Host": "citadel-archive-production.up.railway.app",
+                "X-Forwarded-Proto": "https",
+            },
+        }
+    ]
+    assert client.gets == []
+
+
+def test_public_host_pin_drops_unlisted_forwarded_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With CITADEL_MCP_PUBLIC_HOSTS set, a well-formed but unlisted forwarded
+    host must be dropped (manifest falls back to the node's default rendering)
+    while a listed host still passes. Shape validation alone accepts ANY
+    plausible hostname, so the pin is the only app-level origin check."""
+
+    def ctx_for(host: str) -> Any:
+        class FakeRequest:
+            headers = {"x-forwarded-proto": "https", "x-forwarded-host": host}
+            url = "http://127.0.0.1:8000/mcp"
+
+        class FakeRequestContext:
+            request = FakeRequest()
+
+        class FakeContext:
+            request_context = FakeRequestContext()
+
+        return FakeContext()
+
+    monkeypatch.setenv(
+        "CITADEL_MCP_PUBLIC_HOSTS",
+        "citadel-archive-production.up.railway.app, Citadel.Example.COM",
+    )
+
+    assert mcp_server._public_url_headers_from_context(ctx_for("attacker.example")) == {}
+    assert mcp_server._public_url_headers_from_context(
+        ctx_for("citadel-archive-production.up.railway.app")
+    ) == {
+        "X-Forwarded-Host": "citadel-archive-production.up.railway.app",
+        "X-Forwarded-Proto": "https",
+    }
+    # Case-insensitive on both sides of the comparison.
+    assert mcp_server._public_url_headers_from_context(ctx_for("citadel.example.com")) == {
+        "X-Forwarded-Host": "citadel.example.com",
+        "X-Forwarded-Proto": "https",
+    }
+
+    # Unset pin restores the shape-check-only behavior for the same host.
+    monkeypatch.delenv("CITADEL_MCP_PUBLIC_HOSTS")
+    assert mcp_server._public_url_headers_from_context(ctx_for("attacker.example")) == {
+        "X-Forwarded-Host": "attacker.example",
+        "X-Forwarded-Proto": "https",
+    }
 
 
 def test_authed_resource_uses_caller_token_on_hosted_transport(

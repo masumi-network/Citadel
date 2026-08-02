@@ -457,6 +457,23 @@ def _bearer_from_context(ctx: Context | None) -> str | None:
 
 
 def _public_url_headers_from_context(ctx: Context | None) -> dict[str, str]:
+    """Validated X-Forwarded-Host/Proto lifted from the caller's live request.
+
+    The node renders ``/.well-known/citadel.json`` URLs from the request's
+    host, so a loopback self-call must carry the ORIGINAL caller's host or the
+    manifest advertises the self-address instead of a reachable base_url. Two
+    gates decide what gets forwarded:
+
+    - Shape (always): host must be a bare ``host[:port]`` (PUBLIC_HOST_RE) and
+      proto must be http/https. This blocks header injection, not spoofing.
+    - Pin (opt-in): when ``CITADEL_MCP_PUBLIC_HOSTS`` names the hosts this node
+      is served as (comma-separated, case-insensitive, exact match including
+      any port), a host outside the list is dropped and the manifest falls
+      back to the node's default rendering. Set it when the node is directly
+      exposed or behind a proxy that appends rather than replaces forwarded
+      headers; edges that overwrite ``X-Forwarded-Host`` (Railway's does) make
+      the pin redundant.
+    """
     if ctx is None:
         return {}
     try:
@@ -477,6 +494,13 @@ def _public_url_headers_from_context(ctx: Context | None) -> dict[str, str]:
     host = host.split(",", 1)[0].strip()
     proto = proto.split(",", 1)[0].strip().lower()
     if host and PUBLIC_HOST_RE.fullmatch(host) and proto in {"http", "https"}:
+        pinned = {
+            entry.strip().lower()
+            for entry in os.getenv("CITADEL_MCP_PUBLIC_HOSTS", "").split(",")
+            if entry.strip()
+        }
+        if pinned and host.lower() not in pinned:
+            return {}
         return {"X-Forwarded-Host": host, "X-Forwarded-Proto": proto}
     return {}
 
@@ -664,8 +688,15 @@ class CitadelHttpClient:
     ) -> dict[str, Any]:
         return self._request("GET", path, tool_name=tool_name, extra_headers=extra_headers)
 
-    def get_public(self, path: str) -> dict[str, Any]:
-        return self._request("GET", path, require_token=False)
+    def get_public(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET", path, require_token=False, extra_headers=extra_headers
+        )
 
     def post(
         self,
@@ -804,10 +835,14 @@ def create_mcp_server(
         base_url = getattr(fallback, "base_url", None) if fallback is not None else None
         return CitadelHttpClient(base_url=base_url or _self_base_url(), access_token="")
 
-    def public_manifest() -> dict[str, Any]:
+    def public_manifest(extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
         if fallback is not None and hasattr(fallback, "get_public"):
-            return fallback.get_public("/.well-known/citadel.json")
-        return resolve_public_client().get_public("/.well-known/citadel.json")
+            return fallback.get_public(
+                "/.well-known/citadel.json", extra_headers=extra_headers
+            )
+        return resolve_public_client().get_public(
+            "/.well-known/citadel.json", extra_headers=extra_headers
+        )
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_discovery"].annotations)
     async def citadel_discovery(ctx: Context) -> dict[str, Any]:
@@ -1334,7 +1369,18 @@ def create_mcp_server(
     @mcp.resource("citadel://discovery")
     async def discovery_resource() -> str:
         """Safe public Citadel agent discovery metadata."""
-        payload = await _call_async("citadel://discovery", public_manifest)
+        # The node renders the manifest's base_url from the request's host, and
+        # this handler reaches it through a loopback self-call. Without the
+        # caller's forwarded host the manifest advertised the self-address
+        # (http://127.0.0.1:$PORT), which a discovering agent cannot reach.
+        # Forward the caller's validated proto/host exactly like the
+        # citadel_discovery tool does. No credential is attached: the manifest
+        # must stay readable without a token.
+        ctx = mcp.get_context()
+        forwarded = _public_url_headers_from_context(ctx)
+        payload = await _call_async(
+            "citadel://discovery", lambda: public_manifest(extra_headers=forwarded)
+        )
         return json.dumps(payload, indent=2, default=str)
 
     @mcp.resource("citadel://sources")
