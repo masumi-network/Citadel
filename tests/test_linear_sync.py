@@ -7,6 +7,7 @@ import pytest
 from kb.access import AccessStore, seat_dataset
 from kb.config import CitadelConfig
 from kb.linear_sync import (
+    LinearAPIError,
     LinearClient,
     LinearIssue,
     LinearSyncer,
@@ -384,3 +385,82 @@ def test_linear_sync_status_disabled(tmp_path: Any) -> None:
 
     status = asyncio.run(_status())
     assert status["enabled"] is False
+
+
+# --- #148: corrupt state must fail loudly, not report "no issues" ------------
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_goes_red_in_status_and_raises_on_reads(tmp_path: Any) -> None:
+    """#148: flattening corruption to empty told the user they had no assigned
+    issues while /api/sources stayed green. Reads must raise; status must
+    carry the error instead of 500ing."""
+    from kb.state_io import StateFileError
+
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+    )
+    from pathlib import Path
+
+    Path(config.linear_sync_state_path).write_text('{"issues": [', encoding="utf-8")
+    syncer = LinearSyncer(Citadel(config), client=FakeLinearClient([]))
+
+    status = await syncer.status()
+    assert "linear_state.json" in status["state_error"]
+    assert status["issue_count"] == 0
+
+    with pytest.raises(StateFileError):
+        syncer.issues_for_scope(scope="org", seat_dataset_name=None)
+
+
+@pytest.mark.asyncio
+async def test_member_fetch_failure_is_carried_not_a_neutral_zero(
+    tmp_path: Any,
+    sample_issues: list[dict[str, Any]],
+    monkeypatch: Any,
+) -> None:
+    """#148 (adjacent): a failed fetch_users left auto_mapped_assignees at 0,
+    and the docs read that 0 as "the key cannot read member emails" — a wrong
+    diagnosis. The error must ride in the payload and the persisted state."""
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+        access_store_path=str(tmp_path / "access.json"),
+    )
+    citadel = Citadel(config)
+    store = AccessStore(config.access_store_path)
+    store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
+
+    async def fake_learn(self: Any, data: str, **kwargs: Any) -> Any:
+        class FakeResult:
+            accepted = True
+
+        class Outcome:
+            ingest = FakeResult()
+
+        return Outcome()
+
+    monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+
+    class MemberFetchFails(FakeLinearClient):
+        def fetch_users(self, *, max_users: int = 250) -> list[dict[str, Any]]:
+            raise LinearAPIError("Linear API request failed with HTTP 403")
+
+    syncer = LinearSyncer(
+        citadel,
+        client=MemberFetchFails(sample_issues),
+        access_store=store,
+    )
+    result = await syncer.run(force=True)
+
+    assert result["ok"] is True
+    assert result["auto_mapped_assignees"] == 0
+    assert "403" in result["auto_map_error"]
+
+    import json as _json
+    from pathlib import Path
+
+    state = _json.loads(Path(config.linear_sync_state_path).read_text(encoding="utf-8"))
+    assert "403" in state["auto_map_error"]
