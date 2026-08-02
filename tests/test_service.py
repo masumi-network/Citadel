@@ -526,6 +526,160 @@ def test_repo_content_fossil_never_matches_real_content() -> None:
     assert _legacy_garbage_kind("k6", {"text": truncated}) is None
 
 
+# Pre-fix GitHub org digest, current render vintage: full machine-rendered
+# header with Checked at: and Window started at: before the first section.
+_DIGEST_FOSSIL_DOC = "\n".join(
+    [
+        "# masumi-network GitHub daily update",
+        "",
+        "Checked at: 2026-07-19T05:44:02Z",
+        "Window started at: 2026-07-18T05:44:02Z",
+        "Source: https://github.com/orgs/masumi-network/repositories",
+        "Repositories scanned: 42",
+        "Changed repositories since last check: 3",
+        "New public organization events: 7",
+        "New commits observed: 12",
+        "Open pull requests active in window: 2",
+        "Merged pull requests in window: 1",
+        "",
+        "## Changed repositories",
+        "- masumi-network/sokosumi (TypeScript): pushed 2026-07-19T04:12:00Z, "
+        "updated 2026-07-19T04:12:00Z, open issues 4, stars 12, forks 3. "
+        "Marketplace for AI agents. https://github.com/masumi-network/sokosumi",
+        "",
+        "## Open pull requests worth attention",
+        "- masumi-network/sokosumi#88 by sarthib7: Ship the composer. "
+        "Updated 2026-07-19T03:00:00Z. https://github.com/masumi-network/sokosumi/pull/88",
+    ]
+)
+
+# Oldest render vintage: no Window started at:, only the first three counter
+# lines existed. These are the earliest copies in the vault.
+_DIGEST_FOSSIL_OLDEST_DOC = "\n".join(
+    [
+        "# masumi-network GitHub daily update",
+        "",
+        "Checked at: 2026-06-12T05:00:00Z",
+        "Source: https://github.com/orgs/masumi-network/repositories",
+        "Repositories scanned: 30",
+        "Changed repositories since last check: 1",
+        "New public organization events: 2",
+        "",
+        "## Changed repositories",
+        "- masumi-network/agent (Python): pushed 2026-06-12T04:00:00Z.",
+    ]
+)
+
+# Post-fix digest: same renderer, no wall-clock lines. Cleanup must keep it.
+_DIGEST_POST_FIX_DOC = "\n".join(
+    [
+        "# masumi-network GitHub daily update",
+        "",
+        "Source: https://github.com/orgs/masumi-network/repositories",
+        "Repositories scanned: 42",
+        "Changed repositories since last check: 3",
+        "New public organization events: 7",
+        "New commits observed: 12",
+        "Open pull requests active in window: 2",
+        "Merged pull requests in window: 1",
+        "",
+        "## Changed repositories",
+        "- masumi-network/sokosumi (TypeScript): pushed 2026-08-02T04:12:00Z.",
+    ]
+)
+
+
+def test_github_digest_fossil_never_matches_real_content() -> None:
+    # SAFETY FIRST — this is deletion tooling; each of these is real knowledge
+    # that must survive the classifier. Written before the classifier existed.
+    from kb.service import _legacy_garbage_kind
+
+    # (a) An ordinary Linear issue document.
+    assert (
+        _legacy_garbage_kind(
+            "d1",
+            {
+                "text": (
+                    "# MAS-201: Digest cron misses the window\n\n"
+                    "Status: Todo\nAssignee: sarthi\n\n---\n\n"
+                    "The daily update sometimes runs twice; investigate the scheduler."
+                )
+            },
+        )
+        is None
+    )
+    # (b) A personal seat note.
+    assert (
+        _legacy_garbage_kind(
+            "d2",
+            {"text": "Note to self: the GitHub daily update lands around 05:44 UTC."},
+        )
+        is None
+    )
+    # (c) Repo-content documents: the pre-ADR-0016 fossil keeps its OWN kind
+    # (never the digest kind), and the post-fix repo document is kept.
+    assert _legacy_garbage_kind("d3", {"text": _FOSSIL_DOC}) == "repo_content_fossil"
+    assert _legacy_garbage_kind("d4", {"text": _POST_FIX_DOC}) is None
+    # (d) A document whose BODY merely mentions "Checked at:" — prose about the
+    # digest, not a rendered digest header.
+    assert (
+        _legacy_garbage_kind(
+            "d5",
+            {
+                "text": (
+                    "# Ops runbook: reading the sync dashboard\n\n"
+                    "Every sync stamps a Checked at: timestamp into its state file.\n"
+                    "Compare it against last_digest_at before blaming the cron.\n\n"
+                    "## Changed repositories\n\n"
+                    "This section of the dashboard lists fingerprint changes."
+                )
+            },
+        )
+        is None
+    )
+    # (e) A post-fix digest: rendered header WITHOUT the wall-clock lines.
+    assert _legacy_garbage_kind("d6", {"text": _DIGEST_POST_FIX_DOC}) is None
+    # (f) A chunk cut mid-header (## Changed repositories never reached).
+    truncated_digest = _DIGEST_FOSSIL_DOC.split("## Changed repositories")[0]
+    assert _legacy_garbage_kind("d7", {"text": truncated_digest}) is None
+    # (g) A line the renderer never emitted inside the header block.
+    tampered = _DIGEST_FOSSIL_DOC.replace(
+        "Source: https://github.com/orgs/masumi-network/repositories",
+        "Source: https://github.com/orgs/masumi-network/repositories\n"
+        "Reviewed by: sarthi",
+    )
+    assert _legacy_garbage_kind("d8", {"text": tampered}) is None
+    # (h) Header fields out of renderer order.
+    reordered = _DIGEST_FOSSIL_DOC.replace(
+        "Checked at: 2026-07-19T05:44:02Z\nWindow started at: 2026-07-18T05:44:02Z\n"
+        "Source: https://github.com/orgs/masumi-network/repositories",
+        "Source: https://github.com/orgs/masumi-network/repositories\n"
+        "Checked at: 2026-07-19T05:44:02Z\nWindow started at: 2026-07-18T05:44:02Z",
+    )
+    assert _legacy_garbage_kind("d9", {"text": reordered}) is None
+    # (i) A title that is not the digest title.
+    retitled = _DIGEST_FOSSIL_DOC.replace(
+        "# masumi-network GitHub daily update", "# masumi-network GitHub weekly report"
+    )
+    assert _legacy_garbage_kind("d10", {"text": retitled}) is None
+
+
+def test_github_digest_fossil_is_matched() -> None:
+    # A pre-fix GitHub org digest — full rendered header carrying the moving
+    # Checked at: line — is classified under its OWN kind so a human can
+    # approve this class independently of repo_content_fossil and the rest.
+    from kb.service import _legacy_garbage_kind
+
+    assert _legacy_garbage_kind("g1", {"text": _DIGEST_FOSSIL_DOC}) == "github_digest_fossil"
+    assert (
+        _legacy_garbage_kind("g2", {"text": _DIGEST_FOSSIL_OLDEST_DOC})
+        == "github_digest_fossil"
+    )
+    # The middle vintage rendered Checked at: without a Window started at: line.
+    no_window = _DIGEST_FOSSIL_DOC.replace("Window started at: 2026-07-18T05:44:02Z\n", "")
+    assert _legacy_garbage_kind("g3", {"text": no_window}) == "github_digest_fossil"
+
+
 class _GraphGateway(FakeCognee):
     def __init__(self, graph_nodes: list[Any]) -> None:
         super().__init__()
@@ -584,6 +738,37 @@ async def test_cleanup_reports_fossils_under_their_own_kind() -> None:
     res = await kb.cleanup_legacy_nodes(dry_run=False)
     assert res["deleted"] == 2
     assert "keep1" not in gw.deleted  # the post-fix document survives
+
+
+@pytest.mark.asyncio
+async def test_cleanup_counts_digest_fossils_under_their_own_key() -> None:
+    # Pre-fix GitHub digests are a separate accumulation from repo-content
+    # fossils (different render shape, different sync). They must surface under
+    # their OWN counts_by_kind key so a human can approve the digest class
+    # separately from repo_content_fossil.
+    nodes = [
+        ("digest1", {"text": _DIGEST_FOSSIL_DOC}),
+        ("digest2", {"text": _DIGEST_FOSSIL_OLDEST_DOC}),
+        ("repofossil1", {"text": _FOSSIL_DOC}),
+        ("keepdigest", {"text": _DIGEST_POST_FIX_DOC}),
+        ("keepnote", {"text": "A genuine project decision."}),
+    ]
+    gw = _GraphGateway(nodes)
+    kb = Citadel(CitadelConfig(), cognee=gw)
+
+    dry = await kb.cleanup_legacy_nodes(dry_run=True)
+    assert dry["counts_by_kind"] == {"github_digest_fossil": 2, "repo_content_fossil": 1}
+    kinds = {c["id"]: c["kind"] for c in dry["candidates"]}
+    assert kinds == {
+        "digest1": "github_digest_fossil",
+        "digest2": "github_digest_fossil",
+        "repofossil1": "repo_content_fossil",
+    }
+
+    res = await kb.cleanup_legacy_nodes(dry_run=False)
+    assert res["deleted"] == 3
+    assert "keepdigest" not in gw.deleted  # the post-fix digest survives
+    assert "keepnote" not in gw.deleted
 
 
 @pytest.mark.asyncio

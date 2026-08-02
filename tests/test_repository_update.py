@@ -122,8 +122,27 @@ def test_new_activity_is_meaningful_and_formatted_into_the_digest() -> None:
     assert "# masumi-network GitHub daily update" in update.digest
     assert "teach the archive about commits" in update.digest
     assert "masumi-network/agent#42" in update.digest
-    assert f"Checked at: {CHECKED_AT}" in update.digest
-    assert "Window started at: 2026-06-08T09:00:00Z" in update.digest
+
+
+def test_digest_is_stable_when_the_window_content_is_unchanged() -> None:
+    """Two syncs over identical activity must produce byte-identical digests.
+
+    ``Checked at: {utc_now}`` (and the wall-clock-derived ``Window started
+    at:``) used to make every sync's digest textually distinct even when the
+    reported activity had not changed, which defeated content-hash dedup at
+    ingest and text-keyed dedup at query time — the exact defect ADR-0016
+    fixed for repo content, in this second render path. Measured before the
+    fix: one result page held five byte-identical digests apart from their
+    ``Checked at:`` line.
+    """
+    first = compose()
+    second = compose(checked_at="2026-06-09T11:00:00Z")
+
+    assert first.digest == second.digest
+    assert "Checked at:" not in first.digest, "a per-sync timestamp reintroduces duplicates"
+    assert (
+        "Window started at:" not in first.digest
+    ), "a wall-clock-derived window bound reintroduces duplicates"
 
 
 def test_force_treats_all_activity_as_new() -> None:
