@@ -4731,6 +4731,32 @@ def test_seat_writer_can_run_own_promotion(tmp_path: Any) -> None:
     assert response.json()["dataset"] == "seat:alice"
 
 
+def test_seat_writer_cannot_run_a_live_promotion(tmp_path: Any) -> None:
+    """dry_run is caller-supplied, and with it false this endpoint writes
+    durably into shared Central under a synthetic admin identity with no
+    further approval on the auto-promote path. A writer may preview its own
+    candidates; it may not grant itself the write by flipping the flag."""
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    created = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"})
+    token = created.json()["token"]
+    seat_client = TestClient(app, base_url="https://testserver")
+
+    preview = seat_client.post(
+        "/api/promote/run",
+        json={"dataset": "seat:alice", "dry_run": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    live = seat_client.post(
+        "/api/promote/run",
+        json={"dataset": "seat:alice", "dry_run": False},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert preview.status_code == 200
+    assert live.status_code == 403
+
+
 def test_seat_writer_cannot_run_other_seat_promotion(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
