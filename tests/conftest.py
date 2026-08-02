@@ -19,6 +19,39 @@ def _isolate_claude_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_credentials_for_a_real_node(monkeypatch):
+    """Stop the suite authenticating to whatever Node the developer is pointed at.
+
+    `citadel setup --root` does not only write the local config: it calls
+    sync_local_capture_roots_to_server, which resolves the seat from the token in
+    the environment and merges the local roots into that seat on the Node. A test
+    that passes --root without also passing --node-url therefore registers its own
+    tmp_path against a live seat. One did, and 47 of the 50 approved capture roots
+    on the seat were pytest temp directories, one per run of the suite.
+
+    That is worse than clutter. The server merge is a union, so the list only
+    grows, and capture_roots_sync refuses locally once it would exceed
+    MAX_APPROVED_CAPTURE_ROOTS (50) — a state its own comment describes as a loop
+    that cannot end on its own, because the rejected write never lands and so the
+    "unchanged" short-circuit never fires.
+
+    Clearing the token is enough: _sync_local_capture_roots_once returns
+    "skipped" on an empty token before it resolves a base URL, so no request is
+    made at all. A test that wants a token still sets one with monkeypatch, which
+    runs after this fixture and wins.
+    """
+    for name in (
+        "CITADEL_MCP_ACCESS_TOKEN",
+        "CITADEL_WRITER_KEYS",
+        "CITADEL_ADMIN_KEY",
+        "CITADEL_ADMIN_TOKEN",
+        "CITADEL_ACCESS_KEYS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_auth_throttle():
     """Empty the failed-auth buckets around every test (M4).
 
