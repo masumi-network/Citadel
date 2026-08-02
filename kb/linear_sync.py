@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import logging
 from pathlib import Path
@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 LINEAR_API = "https://api.linear.app/graphql"
 STATE_VERSION = 1
+
+# Tolerance for ordinary clock skew between Linear's clock and ours before an
+# updatedAt counts as future-dated and is excluded from cursor advancement.
+_CURSOR_SKEW_TOLERANCE = timedelta(minutes=5)
+# Consecutive incremental passes that wrote nothing before warning that the
+# sync may be stalled rather than the workspace merely quiet.
+_UNCHANGED_STREAK_WARN = 12
 
 
 def utc_now() -> str:
@@ -407,7 +414,21 @@ class LinearSyncer:
         # An issue absent from the prior state is always written (new issue, or
         # the max_issues window shifted onto it). force=True rewrites everything.
         prior_state = self._load_state()
+        # Anything past this horizon is future-dated, not merely skewed. A cursor
+        # ahead of real time makes `updated > prior_cursor` False for EVERY issue
+        # forever — a permanent stall that still reports ok:true with a fresh
+        # last_synced_at — so future-dated values are barred from the cursor on
+        # both the read side (below) and the write side (cursor advancement).
+        horizon = datetime.now(UTC) + _CURSOR_SKEW_TOLERANCE
         prior_cursor = None if force else _parse_iso(prior_state.get("last_seen_updated_at"))
+        if prior_cursor is not None and prior_cursor > horizon:
+            # Self-heal state poisoned before the clamp existed (or edited by
+            # hand): ignore the stored cursor and run this pass as a full sync.
+            logger.warning(
+                "Stored Linear sync cursor %s is future-dated; ignoring it and running a full pass",
+                prior_state.get("last_seen_updated_at"),
+            )
+            prior_cursor = None
         prior_issues = prior_state.get("issues")
         prior_ids = {
             str(item.get("id"))
@@ -547,19 +568,60 @@ class LinearSyncer:
                 self.citadel.cognee.schedule_cognify(cognify_datasets)
 
         # Advance the cursor to the newest updatedAt seen (keep the prior one
-        # when a pass sees nothing newer, e.g. an empty or truncated fetch).
-        new_cursor = prior_state.get("last_seen_updated_at")
-        best = _parse_iso(new_cursor)
+        # when a pass sees nothing newer, e.g. an empty or truncated fetch),
+        # clamped to the present: one future-dated updatedAt (Linear-side clock
+        # trouble, a bad import, a migration stamping the wrong year) must never
+        # pin the cursor ahead of real time and stall every later pass. The
+        # future-dated issue itself keeps being rewritten each pass (`updated >
+        # cursor` stays true — fail open, same rule as malformed timestamps)
+        # and is named in the warning, so the anomaly stays visible.
+        new_cursor = None
+        best: datetime | None = None
+        stored_raw = prior_state.get("last_seen_updated_at")
+        stored = _parse_iso(stored_raw)
+        if stored is not None and stored <= horizon:
+            best = stored
+            new_cursor = stored_raw
         for issue in issues:
             parsed = _parse_iso(issue.updated_at)
-            if parsed is not None and (best is None or parsed > best):
+            if parsed is None:
+                continue
+            if parsed > horizon:
+                logger.warning(
+                    "Linear issue %s has a future-dated updatedAt (%s); "
+                    "not advancing the sync cursor past it",
+                    issue.identifier,
+                    issue.updated_at,
+                )
+                continue
+            if best is None or parsed > best:
                 best = parsed
                 new_cursor = issue.updated_at
+
+        # A long run of write-less passes is either a genuinely quiet workspace
+        # or a stalled cursor — the logs are otherwise identical, so say so and
+        # name the disambiguator. A force=True pass writes (resetting the
+        # streak) and rebuilds the cursor from scratch.
+        streak_raw = prior_state.get("unchanged_pass_streak")
+        streak = (streak_raw if isinstance(streak_raw, int) and streak_raw >= 0 else 0) + 1
+        if touched_datasets:
+            streak = 0
+        elif streak >= _UNCHANGED_STREAK_WARN:
+            logger.warning(
+                "Linear sync has written nothing for %s consecutive passes "
+                "(%s issues fetched each time). Either the workspace is quiet or "
+                "the incremental cursor is stalled — a force=True run "
+                "(POST /api/linear-sync/run or CITADEL_RUN_MODE=linear-sync) "
+                "distinguishes the two.",
+                streak,
+                len(issues),
+            )
 
         payload = {
             "version": STATE_VERSION,
             "last_synced_at": utc_now(),
             "last_seen_updated_at": new_cursor,
+            "unchanged_pass_streak": streak,
             "last_error": None,  # clear any prior failure on a successful sync
             "last_attempt_at": utc_now(),
             "issues": [asdict(issue) for issue in issues],

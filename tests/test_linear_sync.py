@@ -546,3 +546,90 @@ async def test_linear_sync_backfills_mirror_for_seat_created_after_issue_update(
     assert second["mirrored_count"] == 1  # ENG-1 backfilled into seat:john
     assert [item["dataset"] for item in ingests] == [seat_dataset("john")]
     assert scheduled == [[seat_dataset("john")]]  # Central untouched
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_future_dated_updated_at_cannot_stall_cursor(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any, caplog: Any
+) -> None:
+    # Review of #90: one future-dated updatedAt (Linear clock trouble, a bad
+    # import) must not pin last_seen_updated_at ahead of real time — that would
+    # make _changed() False for every issue forever, a permanent silent stall
+    # that still reports ok:true with a fresh last_synced_at.
+    import json
+    import logging
+
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+    sample_issues[1]["updatedAt"] = "2099-01-01T00:00:00Z"  # poisoned
+
+    with caplog.at_level(logging.WARNING, logger="kb.linear_sync"):
+        first = await syncer.run(force=False)
+    assert first["ok"] is True
+    # The cursor stopped at the newest VALID timestamp, not 2099, and the
+    # future-dated issue was named in a warning.
+    state = json.loads((tmp_path / "linear_state.json").read_text(encoding="utf-8"))
+    assert state["last_seen_updated_at"] == "2026-06-25T10:00:00Z"
+    assert any("ENG-2" in record.getMessage() for record in caplog.records)
+    ingests.clear()
+
+    # The assertion that matters: a normal issue updated AFTER the poisoned pass
+    # is still written on the next incremental pass — the stall cannot happen.
+    from kb.linear_sync import utc_now
+
+    sample_issues[0]["updatedAt"] = utc_now()
+    second = await syncer.run(force=False)
+    assert second["ok"] is True
+    id_tags = {
+        tag
+        for item in ingests
+        if "linear-issue" in item["tags"]
+        for tag in item["tags"]
+        if tag.startswith("linear:")
+    }
+    assert "linear:ENG-1" in id_tags  # the real update landed
+    assert "linear:ENG-2" in id_tags  # the poisoned issue fails open into rewrites
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_recovers_from_future_dated_stored_cursor(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    # State persisted before the clamp existed (or edited by hand) can already
+    # hold a future cursor. It must be ignored (full pass) and replaced by the
+    # newest valid updatedAt, not preserved forever.
+    import json
+
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+    assert (await syncer.run(force=False))["ok"] is True
+    ingests.clear()
+
+    state_path = tmp_path / "linear_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["last_seen_updated_at"] = "2099-01-01T00:00:00Z"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    second = await syncer.run(force=False)
+    assert second["ok"] is True
+    assert second["written_count"] == 2  # full pass, nothing silently skipped
+    healed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert healed["last_seen_updated_at"] == "2026-06-25T10:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_warns_after_prolonged_write_less_streak(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any, caplog: Any
+) -> None:
+    # A permanently-stalled incremental sync and a genuinely quiet workspace
+    # produce identical logs; after enough write-less passes, say so and name
+    # force=True as the disambiguator.
+    import logging
+
+    monkeypatch.setattr("kb.linear_sync._UNCHANGED_STREAK_WARN", 2)
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+    assert (await syncer.run(force=False))["ok"] is True  # writes; streak 0
+
+    with caplog.at_level(logging.WARNING, logger="kb.linear_sync"):
+        assert (await syncer.run(force=False))["ok"] is True  # streak 1: quiet
+        assert not any("written nothing" in record.message for record in caplog.records)
+        assert (await syncer.run(force=False))["ok"] is True  # streak 2: warn
+    assert any("written nothing" in record.message for record in caplog.records)
