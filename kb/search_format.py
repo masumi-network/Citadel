@@ -7,6 +7,7 @@ Keeps a stable hit schema agents can filter on without a second fetch.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -557,6 +558,43 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
+# Epoch windows for _first_timestamp. A number is read in whichever unit puts
+# it inside [2001-09-09, 2096-10-02]; the two windows are three orders of
+# magnitude apart, so no value is valid in both and a unit can never be
+# guessed wrong by decades.
+_EPOCH_SECONDS_MIN = 1_000_000_000  # 2001-09-09T01:46:40+00:00
+_EPOCH_SECONDS_MAX = 4_000_000_000  # 2096-10-02T07:06:40+00:00
+_EPOCH_MILLIS_MIN = _EPOCH_SECONDS_MIN * 1000
+_EPOCH_MILLIS_MAX = _EPOCH_SECONDS_MAX * 1000
+
+
+def _first_timestamp(*values: Any) -> str | None:
+    """First usable timestamp as an ISO-8601 UTC string.
+
+    Strings pass through like ``_first_str``. Numbers are epoch seconds or
+    epoch millis (cognee DataPoint ``updated_at``/``created_at`` are millis),
+    disambiguated by the windows above. Anything outside both windows — 0,
+    negatives, small counters, far-future junk — yields None rather than a
+    date: a missing date is recoverable, a wrong one gets trusted. ``bool``
+    is an ``int`` subclass and is never a timestamp.
+    """
+    for value in values:
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if _EPOCH_SECONDS_MIN <= value <= _EPOCH_SECONDS_MAX:
+            seconds = float(value)
+        elif _EPOCH_MILLIS_MIN <= value <= _EPOCH_MILLIS_MAX:
+            seconds = value / 1000.0
+        else:
+            continue
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat(timespec="seconds")
+    return None
+
+
 def _hit_chunk_index(hit: dict[str, Any]) -> Any:
     """The hit's own chunk_index (CHUNKS payloads carry one), else None."""
     if "chunk_index" in hit:
@@ -666,7 +704,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         "repo": repo,
         "path": path,
         "doc_type": doc_type,
-        "updated_at": _first_str(
+        "updated_at": _first_timestamp(
             item.get("updated_at"),
             envelope.get("created_at"),
             metadata.get("updated_at"),

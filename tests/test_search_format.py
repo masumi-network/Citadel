@@ -403,3 +403,86 @@ def test_a_trace_still_cannot_dress_itself_as_documentation() -> None:
 
     assert infer_doc_type(trace) == "session-trace"
     assert infer_trust_tier(trace) == "reference-only"
+
+
+# --- updated_at: cognee epoch timestamps must survive normalization ----------
+#
+# Production hits carry ``updated_at``/``created_at`` as epoch-millis ints
+# (cognee DataPoint), the ``_citadel`` envelope has NO ``created_at``, and
+# ``metadata`` holds only ``index_fields`` — so every source the field reads
+# from was dead and the schema shipped a freshness field that was always null.
+
+
+def test_updated_at_epoch_millis_becomes_iso() -> None:
+    hit = normalize_search_hit({"updated_at": 1785361521790, "text": "note"})
+    assert hit["updated_at"] == "2026-07-29T21:45:21+00:00"
+
+
+def test_updated_at_epoch_seconds_becomes_iso() -> None:
+    hit = normalize_search_hit({"updated_at": 1782742208, "text": "note"})
+    assert hit["updated_at"] == "2026-06-29T14:10:08+00:00"
+
+
+def test_updated_at_iso_string_passes_through() -> None:
+    hit = normalize_search_hit({"updated_at": "2026-07-29T21:45:21+00:00", "text": "note"})
+    assert hit["updated_at"] == "2026-07-29T21:45:21+00:00"
+
+
+def test_updated_at_nonsense_yields_none_not_a_wrong_date() -> None:
+    # 0/negative must not become 1970; a huge value must not become year 56000;
+    # values between the seconds and millis windows have no sane reading in
+    # either unit; True is an int subclass and must not be read as a timestamp.
+    for junk in (0, -5, 1_782_742_208_187_000, 100_000_000_000, 4_999_999_999, True):
+        hit = normalize_search_hit({"updated_at": junk, "text": "note"})
+        assert hit["updated_at"] is None, junk
+
+
+def test_updated_at_survives_the_real_production_hit_shape() -> None:
+    """Exact shape captured from the live node on 2026-08-03 (values synthetic).
+
+    The load-bearing facts: top-level ``updated_at`` is epoch millis, the
+    ``_citadel`` envelope carries NO ``created_at`` key, and ``metadata`` holds
+    only ``index_fields``. A fixture that invents ``created_at`` in the
+    envelope would pass against a shape production does not have.
+    """
+    hit = {
+        "id": "0c9d5df0-0000-4000-8000-000000000001",
+        "created_at": 1782742208187,
+        "updated_at": 1782742208187,
+        "version": 1,
+        "type": "DocumentChunk",
+        "text": "synthetic chunk body",
+        "chunk_index": 0,
+        "document_id": "0c9d5df0-0000-4000-8000-000000000002",
+        "document_name": "text_0123456789abcdef0123456789abcdef",
+        "belongs_to_set": None,
+        "feedback_weight": 0,
+        "importance_weight": None,
+        "ontology_valid": False,
+        "source_chunk_id": None,
+        "source_content_hash": None,
+        "source_node_set": None,
+        "source_pipeline": None,
+        "source_task": None,
+        "source_user": None,
+        "topological_rank": 0,
+        "metadata": {"index_fields": ["text"]},
+        "_citadel": {
+            "content_hint": "unclassified",
+            "content_sha256": "0" * 64,
+            "dataset": "seat:synthetic",
+            "doc_type": "other",
+            "document_endpoint": "/api/documents/0c9d5df0-0000-4000-8000-000000000002",
+            "provenance": {},
+            "rank": 1,
+            "relevance": None,
+            "result_id": "0c9d5df0-0000-4000-8000-000000000001",
+            "retrieval": "chunks",
+            "trust": "unattested",
+            "trust_tier": "unattested",
+        },
+    }
+    assert "created_at" not in hit["_citadel"]
+    normalized = normalize_search_hit(hit)
+    assert normalized["updated_at"] == "2026-06-29T14:10:08+00:00"
+    assert isinstance(normalized["updated_at"], str)
