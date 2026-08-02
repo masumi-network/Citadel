@@ -64,7 +64,7 @@ LINEAR_HEADER_PARSE_RE = re.compile(
 LINEAR_HEADER_FIELD_RE = re.compile(r"^-\s+\*\*(?P<key>[A-Za-z ]+):\*\*[ \t]*(?P<value>.+?)[ \t]*$")
 
 
-def parse_content_header(text: Any) -> dict[str, str]:
+def parse_content_header(text: Any, *, chunk_index: Any = None) -> dict[str, str]:
     """Provenance from the structural header a syncer wrote at the START of a chunk.
 
     cognee stores no per-document metadata (hits expose empty ``provenance`` and
@@ -72,10 +72,24 @@ def parse_content_header(text: Any) -> dict[str, str]:
     render a machine-readable header as the first lines of the documents they
     ingest. Parsing it back is the only provenance available.
 
-    Only a header at position zero is credited (leading whitespace aside). The
-    values are still body text and therefore author-controlled — callers must
-    label them as content-derived, never as attested trust.
+    Only a header at position zero is credited (leading whitespace aside), and
+    only for the document's FIRST chunk: every chunk starts at position zero of
+    its own payload, so "the start" of chunk 1+ is still mid-document,
+    author-controlled text — a contributor to any synced repo could open a
+    later chunk with a forged header and gain another document's identity (and
+    membership in repo=/path= filtered results). Pass the hit's ``chunk_index``
+    when the payload carries one; a numeric index other than 0 refuses to
+    parse, while absent/None keeps crediting (whole-document payloads and
+    pre-chunk sources carry no index). The values are still body text and
+    therefore author-controlled — callers must label them as content-derived,
+    never as attested trust.
     """
+    if (
+        isinstance(chunk_index, (int, float))
+        and not isinstance(chunk_index, bool)
+        and chunk_index != 0
+    ):
+        return {}
     if not isinstance(text, str) or not text:
         return {}
     match = REPO_CONTENT_HEADER_PARSE_RE.match(text)
@@ -543,6 +557,14 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
+def _hit_chunk_index(hit: dict[str, Any]) -> Any:
+    """The hit's own chunk_index (CHUNKS payloads carry one), else None."""
+    if "chunk_index" in hit:
+        return hit.get("chunk_index")
+    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    return metadata.get("chunk_index")
+
+
 SNIPPET_CHARS = 500
 
 
@@ -586,7 +608,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
     # Parse the structural header BEFORE the snippet collapses whitespace: it
     # is the only provenance a bare chunk carries, and identity filters below
     # (repo=/path=) depend on it when the server envelope is absent.
-    header = parse_content_header(raw_text)
+    header = parse_content_header(raw_text, chunk_index=_hit_chunk_index(item))
 
     path = _first_str(
         item.get("path"), provenance.get("path"), metadata.get("path"), header.get("path")
@@ -719,7 +741,7 @@ def _hit_repo_identity(hit: dict[str, Any]) -> str | None:
         match = _GITHUB_REPO_URL_RE.search(url)
         if match:
             return match.group(1)
-    header = parse_content_header(_hit_raw_text(hit))
+    header = parse_content_header(_hit_raw_text(hit), chunk_index=_hit_chunk_index(hit))
     return header.get("repo")
 
 
@@ -749,7 +771,7 @@ def _hit_path_identity(hit: dict[str, Any]) -> str | None:
     path = _first_str(hit.get("path"), provenance.get("path"), metadata.get("path"))
     if path:
         return path
-    header = parse_content_header(_hit_raw_text(hit))
+    header = parse_content_header(_hit_raw_text(hit), chunk_index=_hit_chunk_index(hit))
     # The header title line is "org/repo/path", a superset of the path — fine
     # for substring path filters, still an identity claim rather than body text.
     return header.get("path") or header.get("title")

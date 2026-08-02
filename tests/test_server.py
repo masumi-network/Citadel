@@ -3126,6 +3126,14 @@ class DrilldownIsolationCitadel(FakeCitadel):
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         return self.cognee_documents.get(document_id)
 
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        # Mirrors the real service contract: the owner ids get_document would
+        # carry in dataset_node_ids, None when the id would not resolve.
+        document = self.cognee_documents.get(document_id)
+        if document is None:
+            return None
+        return list(document.get("dataset_node_ids") or [document_id])
+
 
 def test_document_drilldown_enforces_read_scope_without_existence_oracle(
     tmp_path: Any,
@@ -3365,6 +3373,131 @@ def test_search_drilldown_hint_fails_closed_on_cold_map(tmp_path: Any) -> None:
         "entity-x": True,
     }
     assert admin_central == 200
+
+
+class DrilldownCountingCitadel(DrilldownSearchCitadel):
+    """Counts which resolution surface /search actually pays for per hit."""
+
+    def __init__(self) -> None:
+        self.get_document_calls: list[str] = []
+        self.owner_id_calls: list[str] = []
+
+    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+        self.get_document_calls.append(document_id)
+        return await super().get_document(document_id)
+
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        self.owner_id_calls.append(document_id)
+        return await super().resolve_document_owner_ids(document_id)
+
+
+def test_search_hint_never_assembles_document_bodies(tmp_path: Any) -> None:
+    # The hint needs one boolean per unique id, so /search must resolve owner
+    # ids through the seed-only read — never get_document, whose chunk-store
+    # fallback probes 512 sibling ids and assembles up to ~1MB of body per
+    # graph-missing hit, all discarded. This is the regression test whose
+    # absence let that cost ship: it fails the moment /search touches
+    # get_document again.
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    citadel = DrilldownCountingCitadel()
+    app.state.citadel = citadel
+    app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
+    api = TestClient(app, base_url="https://testserver")
+    try:
+        body = api.post(
+            "/search",
+            json={"query": "x"},
+            headers={
+                "Authorization": f"Bearer {bob_token}",
+                "x-citadel-mcp-tool": "citadel_search",
+            },
+        ).json()
+    finally:
+        app.state.knowledge_mesh = None
+
+    # The hint itself stays correct...
+    assert _search_hint(body) == {
+        "doc-c": True,
+        "doc-a": False,
+        "chunk-b": True,
+        "entity-x": False,
+    }
+    # ...but no document body was assembled to compute it: one owner-id
+    # resolution per unique cognee id, zero get_document calls.
+    assert citadel.get_document_calls == []
+    assert sorted(citadel.owner_id_calls) == [
+        "chunk-b",
+        "doc-a",
+        "doc-c",
+        "entity-x",
+    ]
+    # The audit row exposes the pass's cost instead of stopping the clock
+    # before it (the pre-fix latency_ms was measured before the drill-down
+    # pass, under-reporting exactly what it added).
+    events = app.state.access_store.snapshot()["audit_events"]
+    search_events = [
+        event for event in events if event["detail"].get("operation") == "search"
+    ]
+    assert search_events
+    assert isinstance(search_events[-1]["detail"].get("drilldown_ms"), (int, float))
+    assert search_events[-1]["detail"]["latency_ms"] >= (
+        search_events[-1]["detail"]["drilldown_ms"]
+    )
+
+
+def test_search_hint_pass_denies_once_its_deadline_expires(tmp_path: Any) -> None:
+    # The pass runs outside _search_within_budget and the _SearchSlot, so it
+    # carries its own deadline: a hung owner-id read is cancelled at the
+    # budget, the id denies (the safe under-promise), and the remaining ids
+    # deny without being attempted — the request never hangs on the hint.
+    class _HungResolverCitadel(DrilldownCountingCitadel):
+        config = CitadelConfig(
+            tenant_id="test",
+            default_dataset="notes",
+            admin_key="test-admin",
+            reader_keys=("test-reader",),
+            writer_keys=("test-writer",),
+            search_timeout_seconds=0.2,
+        )
+
+        async def resolve_document_owner_ids(
+            self, document_id: str
+        ) -> list[str] | None:
+            self.owner_id_calls.append(document_id)
+            await asyncio.sleep(30)  # cancelled by the pass deadline
+            return None
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    citadel = _HungResolverCitadel()
+    app.state.citadel = citadel
+    app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
+    api = TestClient(app, base_url="https://testserver")
+    try:
+        body = api.post(
+            "/search",
+            json={"query": "x"},
+            headers={"Authorization": f"Bearer {bob_token}"},
+        ).json()
+    finally:
+        app.state.knowledge_mesh = None
+
+    assert _search_hint(body) == {
+        "doc-c": False,
+        "doc-a": False,
+        "chunk-b": False,
+        "entity-x": False,
+    }
+    # At most the first id was ever attempted; the rest were denied at the
+    # already-expired deadline without a call.
+    assert len(citadel.owner_id_calls) <= 1
 
 
 class KnowledgeCitadel(FakeCitadel):

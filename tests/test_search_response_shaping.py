@@ -144,6 +144,55 @@ def test_untitled_chunks_keep_empty_provenance() -> None:
     assert result_provenance({"id": "c4", "text": "free-floating personal note"}) == {}
 
 
+def test_forged_header_on_a_later_chunk_is_not_credited() -> None:
+    """Chunk 1+ starts at position zero of its OWN payload.
+
+    The \\A anchor kills mid-body quoting inside one chunk, but a contributor
+    to any synced repo can craft a file whose second chunk BEGINS with another
+    document's header. Only the document's first chunk (chunk_index 0, or a
+    payload that carries no index) may claim header identity.
+    """
+    text = repo_doc_text("masumi-network/sokosumi-docs", "docs/install.md", "forged")
+
+    assert parse_content_header(text, chunk_index=1) == {}
+    assert parse_content_header(text, chunk_index=2.0) == {}
+    assert parse_content_header(text, chunk_index=0)["repo"] == (
+        "masumi-network/sokosumi-docs"
+    )
+    assert parse_content_header(text)["repo"] == "masumi-network/sokosumi-docs"
+
+    forged = result_provenance({"id": "f1", "text": text, "chunk_index": 2})
+    assert "repo" not in forged
+    assert "commit" not in forged
+    legitimate = result_provenance({"id": "f0", "text": text, "chunk_index": 0})
+    assert legitimate["repo"] == "masumi-network/sokosumi-docs"
+
+
+def test_forged_later_chunk_header_cannot_join_repo_filtered_results() -> None:
+    """False provenance was also false MEMBERSHIP: repo= credited the forgery."""
+    forged_text = repo_doc_text(
+        "masumi-network/sokosumi-cli", "README.md", "not actually from this repo"
+    )
+    forged = normalize_search_hit({"id": "forged", "chunk_index": 3, "text": forged_text})
+    genuine = normalize_search_hit(
+        {
+            "id": "genuine",
+            "chunk_index": 0,
+            "text": repo_doc_text("masumi-network/sokosumi-cli", "README.md", "The CLI."),
+        }
+    )
+
+    assert [h["id"] for h in filter_hits([forged, genuine], repo="sokosumi-cli")] == [
+        "genuine"
+    ]
+
+    # Same conclusion on the server-shaped path (raw payload + envelope).
+    server_forged = with_result_metadata(
+        {"id": "sf", "chunk_index": 3, "text": forged_text}, 0, "masumi-network"
+    )
+    assert filter_hits([server_forged], repo="sokosumi-cli") == []
+
+
 # --- defect 2: no relevance signal on any hit -------------------------------
 
 
@@ -171,6 +220,30 @@ def test_retriever_score_is_passed_through_when_the_payload_has_one() -> None:
     )["_citadel"]
 
     assert envelope["relevance"]["retriever_score"] == 0.42
+
+
+def test_github_digest_fallback_score_is_not_a_retriever_score() -> None:
+    """search_github_sync_state attaches a token-overlap COUNT under ``score``.
+
+    That integer is a different unit entirely; passing it through surfaced an
+    unbounded count as ``retriever_score`` and flipped
+    ``retriever_scores_available`` true on the one search path that has no
+    retriever at all — contradicting the pass-through's own contract.
+    """
+    envelope = with_result_metadata(
+        {
+            "id": "ghsync:abc123",
+            "source": "github_sync_state",
+            "title": "GitHub source digest",
+            "content": "sokosumi repository digest content",
+            "score": 7,
+        },
+        0,
+        "github-sync",
+        query="sokosumi digest",
+    )["_citadel"]
+
+    assert "retriever_score" not in envelope["relevance"]
 
 
 # --- defect 3: absent content returned confident nonsense -------------------
@@ -347,6 +420,58 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
     assert body["filtering"]["candidates_matched"] == 7
     assert body["filtering"]["returned"] == 5
     assert body["filtering"]["applied"]["repo"] == "masumi-network/widget"
+
+
+def test_empty_retrieval_with_filters_gets_dataset_help_not_filter_blame() -> None:
+    """candidates_fetched == 0: nothing was excluded by filters.
+
+    The old gate fired on matched < top_k alone, so an empty retrieval under a
+    filter claimed "post-retrieval filters excluded the rest" (literally false)
+    AND suppressed the known_datasets help — exactly when the caller needed it.
+    """
+    client = shaped_client(PageCitadel([]))
+
+    response = client.post(
+        "/search",
+        json={"query": "widget docs", "top_k": 5, "repo": "masumi-network/widget"},
+    )
+
+    body = response.json()
+    assert body["results"] == []
+    assert body["filtering"]["candidates_fetched"] == 0
+    assert not any(
+        "post-retrieval filters excluded" in warning
+        for warning in body.get("warnings", [])
+    )
+    assert "note" in body
+    assert body["known_datasets"]
+
+
+def test_short_page_where_filters_excluded_nothing_is_not_blamed_on_filters() -> None:
+    """matched == fetched < top_k: retrieval found nothing else, say so."""
+    citadel = PageCitadel(
+        [
+            {
+                "id": "w0",
+                "text": repo_doc_text("masumi-network/widget", "docs/only.md", "widget"),
+            }
+        ]
+    )
+    client = shaped_client(citadel)
+
+    response = client.post(
+        "/search",
+        json={"query": "widget docs", "top_k": 5, "repo": "masumi-network/widget"},
+    )
+
+    body = response.json()
+    assert len(body["results"]) == 1
+    assert body["filtering"]["candidates_fetched"] == 1
+    assert body["filtering"]["candidates_matched"] == 1
+    assert not any(
+        "post-retrieval filters excluded" in warning
+        for warning in body.get("warnings", [])
+    )
 
 
 def test_short_filtered_page_is_documented_honestly() -> None:

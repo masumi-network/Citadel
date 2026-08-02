@@ -213,6 +213,9 @@ class CogneeGateway(Protocol):
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         ...
 
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        ...
+
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
         ...
 
@@ -974,6 +977,121 @@ class CogneePublicClient:
             return document
         return await self._document_from_chunk_store(doc_id)
 
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        """Owner node ids for the ADR-0009 drill-down visibility rule — WITHOUT
+        assembling the document body.
+
+        /search resolves its drill-down hint once per unique hit id per page,
+        and the hint needs only ``dataset_node_ids``. Answering that through
+        ``get_document`` paid for the full body assembly per id — for a
+        graph-missing id that is the ``_CHUNK_SIBLING_PROBE_LIMIT``-id vector
+        retrieve returning up to ~1 MB of chunk payloads, all discarded. This
+        read is bounded instead: ONE targeted graph read, and (only when the
+        graph lacks the id) at most two single-id vector retrieves. The full
+        assembly stays on /api/documents, one document per explicit click.
+
+        Returns the same owner ids ``get_document`` carries in
+        ``dataset_node_ids`` (a chunk id resolves through its ``is_part_of``
+        parent document, whose node id is the relational Data.id the read-scope
+        map keys on), or ``None`` when the id would not resolve. Corner cases
+        this cheap read cannot see (a transient second graph read failing, a
+        chunk row whose text vanished while siblings survived) return ``None``
+        — the hint then under-promises (a 200 it did not advertise), never an
+        ADR-0009 404 it promised was a document.
+        """
+        doc_id = str(document_id)
+        try:
+            nodes, edges = await self._document_graph(doc_id)
+        except Exception as exc:  # noqa: BLE001
+            if not self._is_no_data_error(exc):
+                raise
+            nodes, edges = [], []
+        props, props_by_id, part_neighbor_ids = self._graph_projection(
+            doc_id, nodes, edges
+        )
+        if props is not None:
+            text, _ = self._extract_text(props)
+            if text is not None:
+                # Chunk id: its datasets live on the textless parent document
+                # (the id get_document's parent-follow resolves through).
+                parent_id = self._textless_neighbor_id(props_by_id, part_neighbor_ids)
+                if parent_id is not None:
+                    return [parent_id, doc_id]
+                return [doc_id, *part_neighbor_ids]
+            # Textless document node: drillable only when a text-bearing chunk
+            # neighbor exists (textless entities must stay a 404).
+            for neighbor_id in part_neighbor_ids:
+                neighbor = props_by_id.get(neighbor_id)
+                if neighbor is not None and self._extract_text(neighbor)[0] is not None:
+                    return [doc_id]
+            # No text anywhere in the graph: get_document falls through to the
+            # chunk store, and so does this.
+        return await self._owner_ids_from_chunk_store(doc_id)
+
+    async def _owner_ids_from_chunk_store(self, doc_id: str) -> list[str] | None:
+        """Owner ids from the durable chunk store via SEED lookups only.
+
+        At most two single-id retrieves (string ids — see
+        ``_document_from_chunk_store`` for why UUID objects break LanceDB):
+        the requested id itself, then — when that misses — the deterministic
+        chunk-0 probe ``uuid5(NAMESPACE_OID, f"{doc_id}-0")``, since
+        TextChunker numbers chunks sequentially from zero. Never the sibling
+        probe. Best effort like the full fallback: any failure returns ``None``
+        (the hint denies, fail-closed).
+        """
+        try:
+            requested = str(UUID(doc_id))
+        except (TypeError, ValueError):
+            # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
+            return None
+        try:
+            engine = await self._vector_engine()
+            retrieve = getattr(engine, "retrieve", None)
+            if not callable(retrieve):
+                return None
+            seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
+            seed_payload = (
+                self._retrieved_payload(seed_rows[0]) if seed_rows else None
+            )
+            if seed_payload is not None:
+                # Chunk hit: the parent document id rides in the payload —
+                # exactly the owner attribution the full assembly reports.
+                if self._extract_text(seed_payload)[0] is None:
+                    return None
+                parent_raw = seed_payload.get("document_id")
+                if not parent_raw and isinstance(
+                    seed_payload.get("is_part_of"), dict
+                ):
+                    parent_raw = seed_payload["is_part_of"].get("id")
+                try:
+                    parent_id = str(UUID(str(parent_raw))) if parent_raw else None
+                except (TypeError, ValueError):
+                    parent_id = None
+                owner_ids = [parent_id] if parent_id is not None else []
+                if doc_id not in owner_ids:
+                    owner_ids.append(doc_id)
+                return owner_ids
+            # Not a chunk id — probe it as a document id through its chunk 0.
+            probe_rows = await retrieve(
+                self._CHUNK_VECTOR_COLLECTION,
+                [str(uuid5(NAMESPACE_OID, f"{requested}-0"))],
+            )
+            probe_payload = (
+                self._retrieved_payload(probe_rows[0]) if probe_rows else None
+            )
+            if probe_payload is None or self._extract_text(probe_payload)[0] is None:
+                return None
+            owner_ids = [requested]
+            if doc_id not in owner_ids:
+                owner_ids.append(doc_id)
+            return owner_ids
+        except Exception:  # noqa: BLE001 - best-effort; None == deny, fail-closed
+            logger.warning(
+                "chunk-store owner-id lookup failed; drill-down hint denies",
+                exc_info=True,
+            )
+            return None
+
     @staticmethod
     def _extract_text(props: dict[str, Any]) -> tuple[str | None, str | None]:
         """First non-empty text field under the keys cognee nodes/chunks use."""
@@ -982,6 +1100,59 @@ class CogneePublicClient:
             if isinstance(value, str) and value.strip():
                 return value, key
         return None, None
+
+    @staticmethod
+    def _graph_projection(
+        doc_id: str, nodes: list[Any], edges: list[Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], list[str]]:
+        """(requested props, props by id, ``is_part_of`` neighbor ids) of one read.
+
+        One pass over nodes: props by str id for O(1) neighbor lookup
+        (setdefault keeps first-encounter semantics on duplicate ids).
+        ``is_part_of`` neighbors (either direction) are collected once and used
+        twice: assembling a textless document's body from its chunks, and
+        dataset attribution for read-scope checks — a chunk id has no
+        relational Data row of its own, so its datasets live on the linked
+        document's node id. ``dataset_node_ids`` plumbs those candidate ids
+        to the caller (kb/server.py drill-down isolation, ADR-0009) so the
+        graph is never re-walked. Duplicate edges to one neighbor count once.
+        Shared by ``_document_from_graph`` and ``resolve_document_owner_ids``
+        so the hint's owner attribution can never drift from the endpoint's.
+        """
+        props_by_id: dict[str, dict[str, Any]] = {}
+        for node_id, properties in nodes:
+            props_by_id.setdefault(str(node_id), dict(properties or {}))
+        part_neighbor_ids: list[str] = []
+        seen: set[str] = set()
+        for source_id, target_id, relationship, _edge_props in edges:
+            if str(relationship) != "is_part_of":
+                continue
+            if str(source_id) == doc_id:
+                neighbor_id = str(target_id)
+            elif str(target_id) == doc_id:
+                neighbor_id = str(source_id)
+            else:
+                continue
+            if neighbor_id in seen:
+                continue
+            seen.add(neighbor_id)
+            part_neighbor_ids.append(neighbor_id)
+        return props_by_id.get(doc_id), props_by_id, part_neighbor_ids
+
+    @classmethod
+    def _textless_neighbor_id(
+        cls, props_by_id: dict[str, dict[str, Any]], part_neighbor_ids: list[str]
+    ) -> str | None:
+        """First textless ``is_part_of`` neighbor: a chunk's parent document."""
+        return next(
+            (
+                neighbor_id
+                for neighbor_id in part_neighbor_ids
+                if (neighbor := props_by_id.get(neighbor_id)) is not None
+                and cls._extract_text(neighbor)[0] is None
+            ),
+            None,
+        )
 
     async def _document_from_graph(
         self, doc_id: str, *, follow_parent: bool
@@ -1000,36 +1171,11 @@ class CogneePublicClient:
                 return None
             raise
 
-        # One pass over nodes: props by str id for O(1) neighbor lookup
-        # (setdefault keeps first-encounter semantics on duplicate ids).
-        props_by_id: dict[str, dict[str, Any]] = {}
-        for node_id, properties in nodes:
-            props_by_id.setdefault(str(node_id), dict(properties or {}))
-        props = props_by_id.get(doc_id)
+        props, props_by_id, part_neighbor_ids = self._graph_projection(
+            doc_id, nodes, edges
+        )
         if props is None:
             return None
-        # ``is_part_of`` neighbors (either direction), collected once and used
-        # twice: assembling a textless document's body from its chunks, and
-        # dataset attribution for read-scope checks — a chunk id has no
-        # relational Data row of its own, so its datasets live on the linked
-        # document's node id. ``dataset_node_ids`` plumbs those candidate ids
-        # to the caller (kb/server.py drill-down isolation, ADR-0009) so the
-        # graph is never re-walked. Duplicate edges to one neighbor count once.
-        part_neighbor_ids: list[str] = []
-        seen: set[str] = set()
-        for source_id, target_id, relationship, _edge_props in edges:
-            if str(relationship) != "is_part_of":
-                continue
-            if str(source_id) == doc_id:
-                neighbor_id = str(target_id)
-            elif str(target_id) == doc_id:
-                neighbor_id = str(source_id)
-            else:
-                continue
-            if neighbor_id in seen:
-                continue
-            seen.add(neighbor_id)
-            part_neighbor_ids.append(neighbor_id)
         text, text_key = self._extract_text(props)
         if text is not None:
             if follow_parent:
@@ -1041,15 +1187,7 @@ class CogneePublicClient:
                 # the PARENT instead so drill-down returns the whole document;
                 # the chunk's own text stays the fallback when the parent
                 # cannot be assembled (never worse than before).
-                parent_id = next(
-                    (
-                        neighbor_id
-                        for neighbor_id in part_neighbor_ids
-                        if (neighbor := props_by_id.get(neighbor_id)) is not None
-                        and self._extract_text(neighbor)[0] is None
-                    ),
-                    None,
-                )
+                parent_id = self._textless_neighbor_id(props_by_id, part_neighbor_ids)
                 if parent_id is not None:
                     parent = await self._document_from_graph(
                         parent_id, follow_parent=False
@@ -1149,7 +1287,13 @@ class CogneePublicClient:
         keys on (ADR-0009), so the drill-down isolation gate is unchanged.
         """
         try:
-            requested = UUID(doc_id)
+            # STRING ids, never uuid.UUID objects — cognee's own retrieve()
+            # callers pass strings (hybrid/chunks.py), and LanceDBAdapter
+            # renders the filter with an f-string, so a UUID object becomes
+            # `id IN (UUID('…'),)` and the whole query errors out ("Error
+            # optimizing sql filter"). pgvector tolerated the objects, which is
+            # how the difference stayed invisible on the production node.
+            requested = str(UUID(doc_id))
         except (TypeError, ValueError):
             # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
             return None
@@ -1176,7 +1320,7 @@ class CogneePublicClient:
                 document_id = doc_id
             payloads: dict[str, dict[str, Any]] = {}
             if seed_payload is not None:
-                payloads[str(requested)] = seed_payload
+                payloads[requested] = seed_payload
             if document_id is not None:
                 try:
                     document_id = str(UUID(document_id))
@@ -1184,7 +1328,7 @@ class CogneePublicClient:
                     document_id = None
             if document_id is not None:
                 sibling_ids = [
-                    uuid5(NAMESPACE_OID, f"{document_id}-{index}")
+                    str(uuid5(NAMESPACE_OID, f"{document_id}-{index}"))
                     for index in range(self._CHUNK_SIBLING_PROBE_LIMIT)
                 ]
                 for row in await retrieve(

@@ -231,6 +231,14 @@ class Citadel:
         """Resolve a cognee search-hit id to its document/chunk (#28)."""
         return await self.cognee.get_document(document_id)
 
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        """Owner node ids for the drill-down visibility rule, body not assembled.
+
+        The cheap read /search's per-hit hint uses; /api/documents keeps the
+        full ``get_document`` assembly. ``None`` means the id would not resolve.
+        """
+        return await self.cognee.resolve_document_owner_ids(document_id)
+
     async def _graph_counts(self) -> dict[str, int]:
         nodes, edges = await self.cognee.graph_data()
         return {"nodes": len(nodes), "edges": len(edges)}

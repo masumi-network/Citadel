@@ -182,7 +182,14 @@ class _ChunkStore:
     PGVectorAdapter.retrieve / LanceDBAdapter.retrieve: return only rows whose
     id was requested, [] when the collection is unknown, rows shaped as
     ScoredResult. This fake refuses to invent rows: content must be seeded by
-    id, exactly like the store it mirrors.
+    id, exactly like the store it mirrors. It also REJECTS non-string ids the
+    way LanceDB effectively does: LanceDBAdapter interpolates the ids into a
+    SQL filter (f"id IN {tuple(ids)}"), so a uuid.UUID object renders as
+    UUID('…') and the query errors out — measured against a real lancedb
+    table as RuntimeError "lance error: Invalid user input: Error optimizing
+    sql filter". A fake that str()-normalized its lookups was looser than the
+    real adapter and hid exactly that class of bug (pgvector tolerated the
+    objects, so only lancedb nodes lost the fallback, silently).
     """
 
     def __init__(self, rows: dict[str, dict[str, Any]]) -> None:
@@ -190,14 +197,19 @@ class _ChunkStore:
         self.calls: list[tuple[str, list[str]]] = []
 
     async def retrieve(self, collection_name: str, data_point_ids: list[Any]) -> list[Any]:
-        self.calls.append((collection_name, [str(i) for i in data_point_ids]))
+        for row_id in data_point_ids:
+            if not isinstance(row_id, str):
+                raise RuntimeError(
+                    "lance error: Invalid user input: Error optimizing sql filter"
+                )
+        self.calls.append((collection_name, list(data_point_ids)))
         if collection_name != "DocumentChunk_text":
             return []
         out = []
         for row_id in data_point_ids:
-            payload = self._rows.get(str(row_id))
+            payload = self._rows.get(row_id)
             if payload is not None:
-                out.append(_ScoredResult(UUID(str(row_id)), payload))
+                out.append(_ScoredResult(UUID(row_id), payload))
         return out
 
 
@@ -381,3 +393,109 @@ async def test_healthy_graph_never_consults_chunk_store(real_graph: Any) -> None
 
     assert document is not None
     assert store.calls == []
+
+
+async def test_chunk_store_reads_pass_string_ids(real_graph: Any) -> None:
+    """The fallback must send str ids, never uuid.UUID objects.
+
+    The fake's retrieve raises on non-str exactly like the real LanceDB
+    adapter, so this resolving at all proves the client's convention matches
+    cognee's own retrieve() callers (hybrid/chunks.py passes strings).
+    """
+    client = _client_over(real_graph)
+    store = _orphan_store()
+    _install_chunk_store(client, store)
+
+    document = await client.get_document(ORPHAN_CHUNK_IDS[0])
+
+    assert document is not None
+    assert store.calls
+    assert all(isinstance(i, str) for _, ids in store.calls for i in ids)
+
+
+# --------------------------------------------------------------------------
+# Owner-id resolution for the /search drill-down hint: the SAME owner ids
+# get_document attributes, with NONE of the body assembly.
+# --------------------------------------------------------------------------
+
+
+async def test_owner_ids_for_graph_chunk_need_no_vector_reads(real_graph: Any) -> None:
+    client = _client_over(real_graph)
+    store = _orphan_store()
+    _install_chunk_store(client, store)
+
+    owner_ids = await client.resolve_document_owner_ids(CHUNK_IDS[1])
+
+    assert owner_ids is not None
+    # Parent document id first (the relational Data.id the read-scope map keys
+    # on), requested chunk id kept.
+    assert owner_ids[0] == DOC_ID
+    assert CHUNK_IDS[1] in owner_ids
+    assert store.calls == []
+
+
+async def test_owner_ids_for_graph_missing_chunk_use_the_seed_lookup_only(
+    real_graph: Any,
+) -> None:
+    """/search's per-hit cost bound: never the sibling probe.
+
+    get_document's chunk-store fallback retrieves _CHUNK_SIBLING_PROBE_LIMIT
+    ids and assembles the whole body; the hint needs only the parent id, which
+    the SEED payload already carries. One retrieve, one id.
+    """
+    client = _client_over(real_graph)
+    store = _orphan_store()
+    _install_chunk_store(client, store)
+
+    owner_ids = await client.resolve_document_owner_ids(ORPHAN_CHUNK_IDS[2])
+
+    assert owner_ids is not None
+    assert owner_ids[0] == ORPHAN_DOC_ID
+    assert ORPHAN_CHUNK_IDS[2] in owner_ids
+    assert len(store.calls) == 1
+    assert all(len(ids) == 1 for _, ids in store.calls)
+
+
+async def test_owner_ids_for_graph_missing_document_probe_chunk_zero_only(
+    real_graph: Any,
+) -> None:
+    client = _client_over(real_graph)
+    store = _orphan_store()
+    _install_chunk_store(client, store)
+
+    owner_ids = await client.resolve_document_owner_ids(ORPHAN_DOC_ID)
+
+    assert owner_ids == [ORPHAN_DOC_ID]
+    # Seed miss + the deterministic chunk-0 probe: two single-id retrieves.
+    assert len(store.calls) == 2
+    assert all(len(ids) == 1 for _, ids in store.calls)
+
+
+async def test_owner_ids_match_get_document_attribution(real_graph: Any) -> None:
+    """Visibility parity: the hint gates on the ids the endpoint gates on.
+
+    Any drift re-opens the promised-404 class ADR-0009 forbids.
+    """
+    client = _client_over(real_graph)
+    _install_chunk_store(client, _orphan_store())
+
+    for requested in (CHUNK_IDS[1], DOC_ID, ORPHAN_CHUNK_IDS[2], ORPHAN_DOC_ID):
+        document = await client.get_document(requested)
+        owner_ids = await client.resolve_document_owner_ids(requested)
+        assert document is not None and owner_ids is not None, requested
+        assert set(owner_ids) == set(document["dataset_node_ids"]), requested
+
+
+async def test_owner_ids_unresolvable_ids_return_none(real_graph: Any) -> None:
+    """Textless entity, ghost id, synthetic id: None, exactly like get_document."""
+    client = _client_over(real_graph)
+    store = _empty_store()
+    _install_chunk_store(client, store)
+
+    assert await client.resolve_document_owner_ids(ENTITY_ID) is None
+    ghost = str(uuid5(NAMESPACE_OID, "ghost-node"))
+    assert await client.resolve_document_owner_ids(ghost) is None
+    assert await client.resolve_document_owner_ids("chunk:deadbeef") is None
+    # The synthetic id never touched the vector engine; the UUID ids paid at
+    # most the two seed lookups each.
+    assert all(len(ids) == 1 for _, ids in store.calls)

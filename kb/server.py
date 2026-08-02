@@ -2520,8 +2520,10 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     write a structural header as the first lines of every document they ingest.
     ``parse_content_header`` recovers repo/path/source_url/commit/blob (and the
     Linear issue id) from a header at the START of the chunk only — a header
-    quoted mid-body is never credited. Header-derived values are body text and
-    therefore author-controlled, so they are marked ``basis: content-header``
+    quoted mid-body is never credited — and only on the document's FIRST chunk
+    (``chunk_index`` 0 or absent), because chunk 1+ starts are author-controlled
+    body text. Header-derived values are body text and therefore
+    author-controlled even then, so they are marked ``basis: content-header``
     and must never feed ``trust_tier``.
     """
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
@@ -2555,7 +2557,10 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
             result.get("content"),
             result.get("chunk"),
             result.get("body"),
-        )
+        ),
+        # Chunk 1+ starts are author-controlled mid-document text: a header
+        # there is forgeable, so only the document's first chunk is credited.
+        chunk_index=result.get("chunk_index", metadata.get("chunk_index")),
     )
     if header:
         header_used = False
@@ -2606,11 +2611,20 @@ def _result_retriever_score(result: dict[str, Any]) -> float | None:
     cognee 1.2.2's CHUNKS retriever returns chunk payload dicts without one —
     the vector engine's ScoredResult carries a cosine distance, but the
     retriever hands back ``found_chunk.payload`` only, so the distance is
-    dropped upstream of this repo's client boundary. Today this is therefore
-    always None. It is checked anyway so that the moment the client boundary
-    starts merging the distance into the payload, hits surface it here without
-    another change. Never invented: absent stays absent.
+    dropped upstream of this repo's client boundary. For cognee hits this is
+    therefore always None. It is checked anyway so that the moment the client
+    boundary starts merging the distance into the payload, hits surface it here
+    without another change. Never invented: absent stays absent.
+
+    The one live producer of a ``score`` today is the github digest fallback
+    (``search_github_sync_state``), whose value is a token-overlap COUNT — an
+    unbounded integer in a different unit. Passing it through here would
+    surface it as ``retriever_score`` and flip ``retriever_scores_available``
+    on exactly the pages whose only signal is lexical, so that path is
+    excluded rather than mislabelled.
     """
+    if result.get("source") == "github_sync_state":
+        return None
     for key in ("score", "distance", "similarity"):
         value = result.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -6221,7 +6235,6 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 },
             )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-    latency_ms = (time.perf_counter() - started) * 1000.0
     if timed_out:
         await mesh_state.record_error(
             citadel.config, operation="search", error="search budget exceeded"
@@ -6267,16 +6280,24 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
     # (and the document_endpoint URL) must be TRUE only when /api/documents would
     # actually return 200 for THIS caller. Bypass callers reach any resolvable id,
-    # so they skip the check. For a scoped caller we resolve each id through the
-    # SAME steps /api/documents takes — get_document to recover its
+    # so they skip the check. For a scoped caller we resolve each id to the SAME
+    # owner ids the /api/documents cognee branch would gate on —
+    # resolve_document_owner_ids, the seed-only read that recovers
     # ``dataset_node_ids`` (a CHUNKS hit's datasets live on its is_part_of parent
     # document, NOT the chunk node itself, so a raw-id map lookup would always
-    # miss), then the SAME visibility rule over the SAME once-fetched
-    # node_dataset_map — so the hint can never drift from the endpoint it points
-    # at. Resolved once per UNIQUE drillable id on the final page; the shared
-    # map is fetched once and reused across ids.
+    # miss) WITHOUT assembling the document body get_document would build and
+    # this boolean would discard — then the SAME visibility rule over the SAME
+    # once-fetched node_dataset_map, so the hint can never drift from the
+    # endpoint it points at. Resolved once per UNIQUE drillable id on the final
+    # page; the shared map is fetched once and reused across ids.
+    drilldown_ms: float | None = None
     if not bypass_drilldown:
+        drilldown_started = time.perf_counter()
         drilldown_map = await load_node_dataset_map(warn_unavailable=False)
+        # This pass runs OUTSIDE _search_within_budget and the _SearchSlot, so
+        # nothing else bounds it: give it its own deadline. On expiry the
+        # remaining ids deny — the safe under-promise, never a hung request.
+        drilldown_deadline = drilldown_started + citadel.config.search_timeout_seconds
 
         async def _resolve_drilldown(result_id: str) -> bool:
             if result_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
@@ -6285,17 +6306,18 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 # get_document); the endpoint returns 200 for any reader with a
                 # resolvable id.
                 return True
-            # Native cognee id: resolve exactly as the /api/documents cognee branch
-            # does. A missing document (None), a cold/empty map, or an id whose owner
-            # nodes are all hidden each deny (fail-closed) so the flag never promises
-            # a 404 — textless entities and foreign-seat docs/chunks fall out here.
+            # Native cognee id: an unresolvable id (None), a cold/empty map, or
+            # an id whose owner nodes are all hidden each deny (fail-closed) so
+            # the flag never promises a 404 — textless entities and foreign-seat
+            # docs/chunks fall out here.
             try:
-                document = await get_citadel().get_document(result_id)
+                owner_node_ids = await get_citadel().resolve_document_owner_ids(
+                    result_id
+                )
             except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
                 return False
-            if document is None:
+            if owner_node_ids is None:
                 return False
-            owner_node_ids = document.get("dataset_node_ids") or [result_id]
             return node_ids_visible_in_map(actor, owner_node_ids, drilldown_map)
 
         drilldown_hint: dict[str, bool] = {}
@@ -6310,12 +6332,27 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 # non-drillable, nothing to resolve.
                 continue
             if result_id not in drilldown_hint:
-                drilldown_hint[result_id] = await _resolve_drilldown(result_id)
+                remaining = drilldown_deadline - time.perf_counter()
+                if remaining <= 0:
+                    drilldown_hint[result_id] = False
+                else:
+                    try:
+                        drilldown_hint[result_id] = await asyncio.wait_for(
+                            _resolve_drilldown(result_id), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        drilldown_hint[result_id] = False
             if drilldown_hint[result_id]:
                 envelope["document_endpoint"] = document_endpoint
                 retrieval = envelope.get("retrieval")
                 if isinstance(retrieval, dict):
                     retrieval["document_drilldown_available"] = True
+        drilldown_ms = (time.perf_counter() - drilldown_started) * 1000.0
+
+    # Measured AFTER the drill-down pass: taking it at the _SearchSlot exit made
+    # the audit row and search telemetry under-report exactly the per-hit cost
+    # the pass adds. drilldown_ms below breaks out the pass's own share.
+    latency_ms = (time.perf_counter() - started) * 1000.0
 
     for search_dataset in search_datasets:
         await mesh_state.record_search(
@@ -6343,6 +6380,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         "latency_ms": round(latency_ms, 1),
         "timed_out": timed_out,
     }
+    if drilldown_ms is not None:
+        audit_detail["drilldown_ms"] = round(drilldown_ms, 1)
     if filters_active:
         audit_detail["candidates_fetched"] = candidates_fetched
         audit_detail["candidates_matched"] = candidates_matched
@@ -6428,14 +6467,28 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         payload["timed_out"] = True
         payload["truncated"] = True
         payload["code"] = CODE_TIMEOUT
-    elif not normalized and body.dataset is None and not filters_active:
+    elif not normalized and body.dataset is None and (
+        not filters_active or candidates_fetched == 0
+    ):
+        # With filters active this fires only when retrieval itself came back
+        # empty — an empty page whose candidates the filters excluded gets the
+        # filter warning below instead, not dataset advice.
         payload["note"] = (
             "No results in the default dataset. Pass an explicit \"dataset\" to search a "
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)
     warnings: list[str] = []
-    if filters_active and candidates_matched < body.top_k and not timed_out:
+    if (
+        filters_active
+        and candidates_matched < body.top_k
+        # Only when the filters actually excluded candidates: with
+        # candidates_matched == candidates_fetched (including 0 fetched) the
+        # page is short because retrieval found nothing else, and saying the
+        # opposite would be literally false.
+        and candidates_matched < candidates_fetched
+        and not timed_out
+    ):
         warnings.append(
             f"Filters matched {candidates_matched} of {candidates_fetched} fetched "
             "candidates; the page is short because post-retrieval filters excluded "
