@@ -3135,7 +3135,13 @@ async def list_contact_enquiries(request: Request, limit: int = 50) -> dict[str,
     Once the gateway is set up this stays useful as the durable record behind a
     Chat message that someone scrolls past.
     """
-    require_access(request, "admin", "access:read")
+    # access:manage, not access:read. The latter is defined nowhere: it is in no
+    # role's DEFAULT_SCOPES, and validate_role_scopes raises on any scope outside
+    # the role defaults, so a token carrying it cannot be minted either. The gate
+    # therefore refused every possible caller, including the account owner, and
+    # the enquiry queue that ADR-0013 added so partner messages would survive an
+    # unconfigured Chat gateway was itself unreadable.
+    require_access(request, "admin", "access:manage")
     store = get_contact_store()
     return {
         "enquiries": store.recent(min(max(1, limit), 200)),
