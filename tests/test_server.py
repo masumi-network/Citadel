@@ -4468,6 +4468,99 @@ def test_admin_scope_override_is_audited(tmp_path: Any) -> None:
     assert search_events[-1]["detail"]["scope_override"] is True
 
 
+# --------------------------------------------------------------------------
+# Token minting must hand over the credential that was asked for, or say no.
+# An operator picked role=admin with a seat selected, got a 200, and held a
+# writer token: every admin call 403'd while the UI had claimed admin. Three
+# guards below: the form disables the ignored control, the server rejects an
+# explicit role instead of dropping it, and the success panel describes what
+# was actually minted from the server response.
+# --------------------------------------------------------------------------
+
+
+def test_seat_token_endpoint_rejects_an_explicit_role(tmp_path: Any) -> None:
+    """POST /api/access/seats/{slug}/tokens 422s when 'role' is supplied.
+
+    Pydantic silently drops undeclared fields, so before this the endpoint
+    accepted {"role": "admin"} and returned a writer token: a credential
+    different from the one requested, discovered only when admin calls 403.
+    A matching role is rejected too; the field is never honoured, so accepting
+    it sometimes would teach callers it works.
+    """
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client()
+    created = client.post("/api/access/seats", json={"name": "Sarthi", "slug": "sarthi"})
+    assert created.status_code == 200
+
+    for role in ("admin", "writer"):
+        denied = client.post(
+            "/api/access/seats/sarthi/tokens",
+            json={"token_name": "re-link", "role": role},
+        )
+        assert denied.status_code == 422, role
+        detail = denied.json()["detail"]
+        assert "role" in detail
+        assert "/api/access/tokens" in detail
+
+    # Without the field the endpoint still mints, scoped by the seat.
+    minted = client.post("/api/access/seats/sarthi/tokens", json={"token_name": "re-link"})
+    assert minted.status_code == 200
+    payload = minted.json()
+    assert payload["api_token"]["role"] == "writer"
+    assert payload["principal"]["seat_slug"] == "sarthi"
+    assert "seat:sarthi" in payload["api_token"]["allowed_datasets"]
+
+
+def test_token_form_disables_role_when_a_seat_is_chosen() -> None:
+    """Choosing a seat disables the role select and shows the why.
+
+    The seat branch of the form posts only token_name, so the role selector is
+    decoration there. It used to stay enabled, which is how an operator chose
+    admin and believed it. The toggle must treat role exactly like the dataset
+    fields it already disables, plus a visible hint carrying the reason.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    page = authed_client().get("/app").text
+
+    toggle = re.search(r"function applyTokenSeatScopeToggle\(\) \{(.*?)\n\}", app_js, re.S)
+    assert toggle, "applyTokenSeatScopeToggle moved"
+    body = toggle.group(1)
+    assert 'getElementById("accessRole")' in body
+    assert 'getElementById("accessRoleSeatHint")' in body
+    assert "roleSelect.disabled = hasSeat" in body
+    assert "roleHint.hidden = !hasSeat" in body
+
+    # The hint the toggle reveals exists in the markup and states the rule.
+    assert 'id="accessRoleSeatHint"' in page
+    assert "Seat tokens are always writer" in page
+    assert "private-memory boundary" in page
+
+
+def test_minted_token_summary_reads_the_server_response_not_the_form() -> None:
+    """The success panel describes the minted credential from the response.
+
+    Role and scope come from api_token/principal in the server's reply, never
+    from the submitted form values, so a token minted differently from what
+    the form claimed is visible the moment it is created. The summary is
+    escaped like the token itself before entering innerHTML.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    fn = re.search(r"function mintedTokenSummary\(response\) \{(.*?)\n\}", app_js, re.S)
+    assert fn, "mintedTokenSummary moved"
+    body = fn.group(1)
+    assert "api_token" in body
+    assert "principal" in body
+    assert "seat_slug" in body
+    assert "allowed_datasets" in body
+    # Never the requested values.
+    assert "formData" not in body
+    assert "FormData" not in body
+
+    # The panel renders it, escaped, alongside the one-time token.
+    assert "escapeHtml(mintedTokenSummary(response))" in app_js
+
+
 class GateCognee:
     """Minimal Cognee stub so a real Citadel gate runs through the server stack."""
 

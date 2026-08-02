@@ -964,6 +964,13 @@ class CreateSeatBody(BaseModel):
 
 class IssueSeatTokenBody(BaseModel):
     token_name: str | None = Field(default=None, max_length=120)
+    # Declared only to be rejected. Pydantic silently drops fields the model
+    # does not declare, so without this a caller who POSTs {"role": "admin"}
+    # gets a 200 and a writer token — they believe they hold an admin
+    # credential and every admin call 403s. A seat token always carries the
+    # seat's own role, so any supplied value, matching or not, is an error the
+    # endpoint must say out loud (see issue_access_seat_token).
+    role: str | None = None
 
 
 class CapturePolicyBody(BaseModel):
@@ -3575,6 +3582,20 @@ async def issue_access_seat_token(
 ) -> dict[str, Any]:
     """Mint a fresh token for an EXISTING seat (e.g. to re-link a lost token)."""
     actor = require_access(request, "admin", "access:manage")
+    if body.role is not None:
+        # Reject rather than ignore: a silently dropped role hands the caller a
+        # credential different from the one they asked for. A seat token always
+        # carries the seat's role; admin in particular is forbidden because an
+        # admin token bypasses the seat's dataset allowlist and dissolves its
+        # private-memory boundary (AccessStore.create_seat enforces the same).
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Seat tokens derive their role from the seat; 'role' cannot be "
+                "set here. Mint admin tokens without a seat via POST "
+                "/api/access/tokens."
+            ),
+        )
     try:
         normalized = validate_seat_slug(slug)
     except ValueError as exc:
