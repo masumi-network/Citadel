@@ -178,7 +178,9 @@
           (repo.commits_window_weeks || 52) + " weeks");
       }
       if (repo.weeks && repo.weeks.length) {
-        drawChart(repo.weeks.map(function (w) {
+        // The layout fits ~12 columns; GitHub can report up to 52 weeks.
+        // Newest win, so the chart stays readable whatever the API returns.
+        drawChart(repo.weeks.slice(-12).map(function (w) {
           return { l: weekLabel(w.start), v: w.commits, tag: tagForWeek(w.start) };
         }));
       }

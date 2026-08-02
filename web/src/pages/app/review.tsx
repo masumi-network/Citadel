@@ -144,11 +144,16 @@ export default function Review() {
                     </span>
                   ))}
                 </div>
-                <p className="m-0 whitespace-pre-wrap text-[14.5px] leading-[1.6] text-ink">
+                {/* pre-wrap alone wraps at whitespace only, and previews are
+                    exactly where paths, note ids and URLs live: break-words
+                    lets those tokens wrap instead of setting the page width. */}
+                <p className="m-0 whitespace-pre-wrap break-words text-[14.5px] leading-[1.6] text-ink">
                   {item.preview}
                 </p>
                 {item.reference_reason ? (
-                  <p className={`m-0 mt-2 text-[12.5px] ${MUTED}`}>{item.reference_reason}</p>
+                  <p className={`m-0 mt-2 break-words text-[12.5px] ${MUTED}`}>
+                    {item.reference_reason}
+                  </p>
                 ) : null}
               </div>
 

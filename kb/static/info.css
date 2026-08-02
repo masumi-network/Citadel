@@ -775,3 +775,65 @@ section[id] { scroll-margin-top: 62px; }
   .topnav-brand .wordmark { display: none; }
   .topnav-links a { padding: 6px 8px; font-size: 12.5px; }
 }
+
+/* --- phones (320-470px) ---------------------------------------------------
+   The ladder above bottoms out at 620px, and the single-row nav needs ~395px:
+   below that the theme toggle and Sign in were clipped by .band-hero's
+   overflow:hidden with no scrollbar and no way to reach them. The bar wraps
+   instead: brand + theme toggle on the first row, the five links spread over
+   their own full-width row (~285px at nowrap, so 320px fits). Nothing here
+   applies at 471px and up. */
+@media (max-width: 470px) {
+  .topnav-in { flex-wrap: wrap; row-gap: 2px; }
+  .topnav-links {
+    order: 3;
+    flex: 1 1 100%;
+    min-width: 0;
+    justify-content: space-between;
+    gap: 0;
+  }
+  /* nowrap also cures the 396-465px band where "Use cases" and "Sign in"
+     broke into two-line lumps; the taller padding is for touch targets. */
+  .topnav-links a { white-space: nowrap; padding: 9px 6px; }
+  .topnav-links a[href="/login"] { padding-top: 8px; padding-bottom: 8px; }
+  .topnav .themebtn { padding: 8px 11px; }
+
+  /* Chart: 10-12 flex columns are ~17-24px wide here while a release tag is
+     31-36px of mono text, and three releases land on consecutive weeks, so
+     the tags collided into one unreadable string. The legend already says
+     brand-color bars = a release shipped that week. */
+  .bar-tag { display: none; }
+}
+
+/* At 320-400px even the week labels touch; keep every other one. */
+@media (max-width: 400px) {
+  .bar-col:nth-child(even) .bar-lbl { display: none; }
+}
+
+/* At 320 the five links fill the row to the last pixel; shave the padding so
+   the smallest phones keep a few px of slack instead of relying on overflow
+   into the bar's own padding. */
+@media (max-width: 360px) {
+  .topnav-links a { padding-left: 4px; padding-right: 4px; }
+  .topnav-links a[href="/login"] { margin-left: 0; padding-left: 9px; padding-right: 9px; }
+}
+
+/* The section index scrolls sideways by design, but the live pill sits at the
+   far end of the row: on phones (and on /use-cases even at tablet width) it
+   was entirely off-screen, with nothing hinting the bar scrolls. Sticky pins
+   it inside the scrollport; when the bar does not overflow the constraint is
+   never violated and the pill stays exactly where it is today, so wider
+   viewports are untouched. The pill's tint is translucent, so a --ground
+   layer underneath keeps scrolled links from showing through; over the bar's
+   own --ground background that paints identically to today. */
+@media (max-width: 940px) {
+  .index .pill { position: sticky; right: 0; z-index: 1; background: var(--ground); }
+  .index .pill.live { background: linear-gradient(var(--good-bg), var(--good-bg)), var(--ground); }
+  .index .pill.live.down { background: linear-gradient(var(--warn-bg), var(--warn-bg)), var(--ground); }
+}
+
+/* iOS Safari zooms the whole page when a focused field's text is under 16px.
+   Covers /contact and /login: both build their fields from .auth-input. */
+@media (max-width: 620px) {
+  .auth-input { font-size: 16px; }
+}

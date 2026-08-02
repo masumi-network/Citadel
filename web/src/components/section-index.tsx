@@ -76,9 +76,18 @@ export function SectionIndex({ sections }: { sections: Section[] }) {
             {section.label}
           </a>
         ))}
+        {/* Sticky below 940px: the pill sits at the far end of a row that
+            overflows on phones (and on /use-cases at tablet width), so it was
+            entirely off-screen there. When the bar does not overflow the
+            sticky constraint is never violated and nothing moves. Its tint is
+            translucent, so a --ground layer underneath keeps scrolled links
+            from showing through; over the bar's own ground it paints the
+            same. */}
         <span
-          className={`ml-auto inline-flex flex-none items-center gap-[7px] rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium ${
-            health.down ? "bg-warn-bg text-warn" : "bg-good-bg text-good"
+          className={`ml-auto inline-flex flex-none items-center gap-[7px] rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[940px]:sticky max-[940px]:right-0 max-[940px]:z-[1] ${
+            health.down
+              ? "bg-warn-bg text-warn max-[940px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]"
+              : "bg-good-bg text-good max-[940px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]"
           }`}
         >
           <span className={`size-[7px] rounded-full ${health.down ? "bg-warn" : "bg-good"}`} />

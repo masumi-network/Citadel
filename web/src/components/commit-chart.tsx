@@ -39,7 +39,8 @@ function weekLabel(iso: string): string {
 
 function liveSeries(repo: RepoBlock | undefined): Week[] | null {
   if (!repo?.weeks?.length) return null;
-  return repo.weeks.map((week) => {
+  // The layout fits ~12 columns; GitHub can report up to 52 weeks. Newest win.
+  return repo.weeks.slice(-12).map((week) => {
     const label = weekLabel(week.start);
     return { label, commits: week.commits, tag: TAG_BY_LABEL.get(label) };
   });
@@ -88,7 +89,7 @@ export function CommitChart({ repo }: { repo: RepoBlock | undefined }) {
         aria-label={drawn ? describe(series) : "Commits per week."}
       >
         {drawn
-          ? series.map((week) => (
+          ? series.map((week, i) => (
               <div
                 key={week.label}
                 className="group flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-1.5"
@@ -111,10 +112,19 @@ export function CommitChart({ repo }: { repo: RepoBlock | undefined }) {
                       : "border border-border-2 bg-surface-2"
                   }`}
                 />
-                <div className="min-h-[11px] text-center font-mono text-[9px] font-medium leading-[1.2] text-accent-ink max-[620px]:text-[8.5px]">
+                {/* At phone widths a column is ~17-24px while a tag is
+                    31-36px of mono text, and releases land on consecutive
+                    weeks, so the tags collide into one string; the legend
+                    already marks release weeks by bar color. */}
+                <div className="min-h-[11px] text-center font-mono text-[9px] font-medium leading-[1.2] text-accent-ink max-[620px]:text-[8.5px] max-[470px]:hidden">
                   {week.tag ?? ""}
                 </div>
-                <div className="text-center text-[9.5px] leading-[1.3] text-ink-3">
+                {/* Below 400px even the week labels touch: keep alternates. */}
+                <div
+                  className={`text-center text-[9.5px] leading-[1.3] text-ink-3${
+                    i % 2 ? " max-[400px]:hidden" : ""
+                  }`}
+                >
                   {week.label}
                 </div>
               </div>

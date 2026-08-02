@@ -226,7 +226,10 @@ export default function AppHome() {
               <span className="font-mono text-[11.5px] uppercase tracking-[.06em] text-ink-3">
                 {event.type ?? "event"}
               </span>
-              <span className="text-ink-2">{event.message ?? ""}</span>
+              {/* min-w-0 + break-words: mesh messages carry unbroken tokens
+                  (file paths, text_<md5> ids, URLs) that would otherwise set
+                  the column's min-content width and drag the page sideways. */}
+              <span className="min-w-0 break-words text-ink-2">{event.message ?? ""}</span>
               <span className="font-mono text-[11.5px] text-ink-3">
                 {relativeTime(event.created_at)}
               </span>
@@ -282,9 +285,12 @@ function NeedsRow({
       <span className="whitespace-nowrap bg-surface-2 px-[11px] py-[5px] text-[11px] font-semibold uppercase tracking-[.04em] text-ink-2">
         {kind}
       </span>
-      <div>
-        <p className="m-0 text-[14.5px] leading-[1.5] text-ink">{title}</p>
-        <p className={`m-0 mt-1 text-[12.5px] ${MUTED}`}>{detail}</p>
+      {/* Promotion previews quote vault content: paths and ids are unbroken
+          tokens, so the cell must be shrinkable and the text breakable or the
+          longest token sets the page width. */}
+      <div className="min-w-0">
+        <p className="m-0 break-words text-[14.5px] leading-[1.5] text-ink">{title}</p>
+        <p className={`m-0 mt-1 break-words text-[12.5px] ${MUTED}`}>{detail}</p>
       </div>
       {href && action ? (
         <a
