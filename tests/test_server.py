@@ -5995,6 +5995,25 @@ def test_contact_enquiries_endpoint_is_admin_only(monkeypatch, tmp_path) -> None
     assert client.get("/api/contact/enquiries").status_code in {401, 403}
 
 
+def test_an_admin_can_actually_read_the_enquiries(monkeypatch, tmp_path) -> None:
+    """The half the admin-only test above cannot see.
+
+    Asserting that a stranger is refused says nothing about whether anyone is
+    admitted, so that test passed just as happily while the gate demanded a scope
+    no credential could hold and the queue was readable by nobody. This one fails
+    if the endpoint is walled off from its own owner.
+    """
+    store = _contact_store_at(monkeypatch, tmp_path)
+    client = authed_client()
+    client.post("/contact", json=_enquiry())
+    assert len(store.recent()) == 1
+
+    response = client.get("/api/contact/enquiries")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+
 def test_contact_is_never_written_to_the_vault(monkeypatch, tmp_path) -> None:
     """The part of ADR-0013 that did NOT change.
 
