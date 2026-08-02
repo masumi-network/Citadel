@@ -3600,6 +3600,10 @@ function renderTokenSeatOptions(seats = []) {
 
 // When a seat is chosen the seat defines scope, so hide+disable the free-text
 // dataset inputs (disabled inputs are excluded from FormData) and show a hint.
+// The role select is disabled too, but stays visible with its own hint: the
+// seat endpoint always mints the seat's writer token and discards any chosen
+// role, so an enabled selector would promise a role the server never grants
+// (an operator once picked admin here and walked away holding a writer token).
 function applyTokenSeatScopeToggle() {
   const select = document.getElementById("accessSeat");
   if (!select) return;
@@ -3609,11 +3613,40 @@ function applyTokenSeatScopeToggle() {
   const datasetInput = document.getElementById("accessDefaultDataset");
   const allowedInput = document.getElementById("accessAllowedDatasets");
   const hint = document.getElementById("accessSeatScopeHint");
+  const roleSelect = document.getElementById("accessRole");
+  const roleHint = document.getElementById("accessRoleSeatHint");
   if (datasetField) datasetField.hidden = hasSeat;
   if (allowedField) allowedField.hidden = hasSeat;
   if (datasetInput) datasetInput.disabled = hasSeat;
   if (allowedInput) allowedInput.disabled = hasSeat;
   if (hint) hint.hidden = !hasSeat;
+  if (roleSelect) roleSelect.disabled = hasSeat;
+  if (roleHint) roleHint.hidden = !hasSeat;
+}
+
+// Describe the credential that was actually minted, read from the server
+// response (api_token + principal), never from the form. The seat endpoint
+// derives role and datasets from the seat and discards any requested role, so
+// echoing the form here would repeat the exact mismatch this line exists to
+// expose: a token requested as admin that authenticates as writer.
+function mintedTokenSummary(response) {
+  const apiToken = (response && response.api_token) || {};
+  const principal = (response && response.principal) || {};
+  const role = apiToken.role || principal.role || "unknown";
+  const seatSlug = principal.seat_slug || null;
+  const allowed = Array.isArray(apiToken.allowed_datasets)
+    ? apiToken.allowed_datasets.filter(Boolean)
+    : [];
+  let datasets;
+  if (role === "admin") {
+    datasets = "every dataset (admin bypasses the allowlist)";
+  } else if (allowed.length) {
+    datasets = allowed.join(", ");
+  } else {
+    datasets = "all non-seat datasets (no allowlist on this token)";
+  }
+  const seat = seatSlug ? `seat ${seatSlug}` : "no seat (service account)";
+  return `Role: ${role} · ${seat} · Datasets: ${datasets}`;
 }
 
 function renderAuditAccessEvents(events = []) {
@@ -4281,6 +4314,7 @@ document.getElementById("accessTokenForm").addEventListener("submit", async (eve
     newAccessToken.hidden = false;
     newAccessToken.innerHTML = `
       <strong>Token created</strong>
+      <p>${escapeHtml(mintedTokenSummary(response))}</p>
       <p>Copy this now. Citadel stores only the hash and will not show it again.</p>
       <code>${escapeHtml(response.token)}</code>
     `;
