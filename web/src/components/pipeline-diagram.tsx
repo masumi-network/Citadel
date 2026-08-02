@@ -56,6 +56,14 @@ export function PipelineDiagram() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
+        // Below 620px React Flow cannot fit the ~1680px-wide topology:
+        // fitView clamps at minZoom, both sides are clipped, and with
+        // panning off for coarse pointers the clipped columns are
+        // unreachable. The static spine is the honest rendering there, so
+        // phones keep it. Not disconnecting means a viewport that later
+        // widens past the gate (rotation, window resize) upgrades on the
+        // next intersection instead of being locked out.
+        if (!window.matchMedia("(min-width: 620px)").matches) return;
         observer.disconnect();
         setWanted(true);
       },
