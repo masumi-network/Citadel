@@ -940,7 +940,7 @@ def test_api_uses_configured_citadel_service() -> None:
     assert feedback.json() == {"recorded": True, "improved": True, "ok": True, "reason": None}
     assert updated_mesh.status_code == 200
     # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
-    assert updated_mesh.json()["stats"]["feedback"] >= 2
+    assert updated_mesh.json()["stats"]["since_restart"]["feedback"] >= 2
     assert upgrade.status_code == 200
 
 
@@ -6319,3 +6319,32 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     stats = response.json()["stats"]
     assert stats["documents"] is not None
     assert stats["indexed_chunks"] is not None
+
+
+def test_api_mesh_activity_counters_are_scoped_not_top_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#196/#197 through the endpoint the dashboard reads.
+
+    The activity counters missed ADR-0018's treatment: `searches`, `feedback`,
+    `upgrades` and `errors` kept restart-scoped values at the top level of the
+    stats payload, where they read as lifetime totals (measured 2026-08-02:
+    top-level and since_restart `searches` were both 294). And `failed_chunks`
+    was the `errors` counter surfaced a second time — it never counted chunks,
+    so it is gone rather than renamed.
+    """
+    client = authed_client()
+
+    async def fake_corpus_health() -> dict[str, Any]:
+        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+
+    monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
+
+    stats = client.get("/api/mesh").json()["stats"]
+
+    for counter in ("searches", "feedback", "upgrades", "errors", "failed_chunks"):
+        assert counter not in stats, f"{counter} is restart-scoped but top-level"
+    since = stats["since_restart"]
+    assert {"searches", "feedback", "upgrades", "errors"} <= set(since)
+    # The window the counters cover ships with them.
+    assert since["started_at"]

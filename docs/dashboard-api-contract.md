@@ -139,7 +139,7 @@ budget shows skeletons until the server returns its own truncated payload.
 | --- | --- | --- |
 | `GET /api/github-sync` | `org`, `tracked_repositories`, `last_checked_at`, `last_digest_at` | boot, refresh |
 | `GET /api/sources?type=obsidian_vault` | `sources[].{name,documents,last_push_at,open_conflicts}`, `summary.{obsidian_documents,open_conflicts}` | boot |
-| `GET /api/mesh` | `stats.documents`, `stats.errors`, `indexes[]`, `events[]` | boot, SSE |
+| `GET /api/mesh` | `stats.documents`, `stats.since_restart.errors`, `indexes[]`, `events[]` | boot, SSE |
 
 Nothing fetches on activation. Note the page shows sources and indexes; the mesh canvas
 is not here.
@@ -148,7 +148,7 @@ is not here.
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,pending_chunks,failed_chunks,last_indexed_at,errors}` | boot, SSE, refresh |
+| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,last_indexed_at}`, `stats.since_restart.{pending_chunks,errors}` | boot, SSE, refresh |
 
 `timelineEnvelope(event)` prefers a server-provided `event.timeline` object and
 otherwise synthesises `{kind, status, dataset, source, metrics}` from

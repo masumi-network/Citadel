@@ -3,6 +3,9 @@
 - Status: Accepted
 - Date: 2026-07-31
 - Relates to: [ADR-0015](0015-one-process-owns-the-graph.md).
+- Amended by: [ADR-0019](0019-activity-counters-are-named-by-their-scope.md) —
+  the activity counters no longer "stay where they are"; they publish only
+  under `since_restart`.
 
 Any figure a surface presents as a size of the **Organization Vault** must be
 read from the vault. A counter that resets when the process restarts may be

@@ -77,9 +77,9 @@ async def test_revision_counter_increments_per_event() -> None:
     snapshot = await mesh.snapshot(CONFIG)
 
     assert snapshot["revision"] == 3
-    assert snapshot["stats"]["searches"] == 1
-    assert snapshot["stats"]["feedback"] == 1
-    assert snapshot["stats"]["errors"] == 1
+    assert snapshot["stats"]["since_restart"]["searches"] == 1
+    assert snapshot["stats"]["since_restart"]["feedback"] == 1
+    assert snapshot["stats"]["since_restart"]["errors"] == 1
     assert [event["id"] for event in snapshot["events"]] == [3, 2, 1]
 
 
@@ -92,7 +92,7 @@ async def test_events_deque_is_bounded_at_160() -> None:
 
     assert len(snapshot["events"]) == 160
     assert snapshot["revision"] == 165
-    assert snapshot["stats"]["errors"] == 165
+    assert snapshot["stats"]["since_restart"]["errors"] == 165
     # Newest first; the oldest five events fell off the bounded deque.
     assert snapshot["events"][0]["details"]["error"] == "failure 164"
     assert snapshot["events"][-1]["details"]["error"] == "failure 5"
@@ -331,8 +331,9 @@ async def test_snapshot_reports_authoritative_corpus_totals() -> None:
     # The in-memory values are still available, correctly labelled.
     assert stats["since_restart"]["documents"] == 1
     assert stats["since_restart"]["indexed_chunks"] == 1
-    # Activity counters are genuinely uptime-scoped and stay where they are.
-    assert stats["searches"] == 386
+    # Activity counters are uptime-scoped, so they live under since_restart
+    # too — a top-level "searches" reads as a lifetime total (#196).
+    assert stats["since_restart"]["searches"] == 386
 
 
 @pytest.mark.asyncio
@@ -358,3 +359,59 @@ async def test_snapshot_without_corpus_keeps_the_old_shape() -> None:
     snapshot = await mesh.snapshot(config)
 
     assert snapshot["stats"]["documents"] == 7
+
+
+# --- activity counters are restart-scoped, and must say so (#196, #197) -----
+#
+# Measured live on 2026-08-02, a day with several redeploys: stats.searches
+# and stats.since_restart.searches were both 294 — the top-level number was
+# the since-restart number under a totals-shaped name. Separately, a
+# "12 failed chunks" reading decomposed to 11 search timeouts + 1
+# DatasetNotFoundError with zero ingestion failures: failed_chunks was the
+# errors counter surfaced a second time, one increment per failed operation,
+# none per chunk.
+
+
+@pytest.mark.asyncio
+async def test_activity_counters_publish_only_under_since_restart() -> None:
+    """#196: a counter that resets on deploy must not sit at the top level of
+    the stats payload, where every consumer reads it as a lifetime total."""
+    mesh = MeshState()
+    await mesh.record_search(CONFIG, query="rotate", dataset="notes", result_count=2)
+    await mesh.record_feedback(
+        CONFIG, qa_id="qa-1", dataset="notes", result=FeedbackResult(True, True)
+    )
+    await mesh.record_upgrade(CONFIG, dataset="notes", session_ids=None)
+    await mesh.record_error(CONFIG, operation="search", error="boom")
+
+    stats = (await mesh.snapshot(CONFIG))["stats"]
+
+    for counter in ("searches", "feedback", "upgrades", "errors", "pending_chunks"):
+        assert counter not in stats, f"{counter} is restart-scoped but top-level"
+    since = stats["since_restart"]
+    assert since["searches"] == 1
+    assert since["feedback"] == 1
+    assert since["upgrades"] == 1
+    assert since["errors"] == 1
+    # The window the counters cover is part of the payload, so a consumer can
+    # tell a quiet vault from a recent deploy.
+    assert since["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_errors_is_the_single_failure_counter() -> None:
+    """#197: failed_chunks was the errors counter incremented a second time in
+    the same code path — record_error's event is the only one whose timeline
+    status is "failed", so the two fields could never diverge and failed_chunks
+    never counted a chunk. One counter, one name."""
+    mesh = MeshState()
+    await mesh.record_error(CONFIG, operation="search", error="timeout")
+    await mesh.record_error(CONFIG, operation="evolve", error="DatasetNotFoundError")
+
+    snapshot = await mesh.snapshot(CONFIG)
+    timeline = await mesh.timeline()
+
+    assert "failed_chunks" not in snapshot["stats"]
+    assert "failed_chunks" not in timeline["stats"]
+    assert snapshot["stats"]["since_restart"]["errors"] == 2
+    assert timeline["stats"]["errors"] == 2
