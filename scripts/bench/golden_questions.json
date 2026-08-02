@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "created_at": "2026-07-31",
   "corpus": "repo_content sync of masumi-network/{sokosumi,Sokosumi-MCP,sokosumi-cli,sokosumi-docs}",
   "notes": [
@@ -10,7 +10,13 @@
     "Questions marked expected_recall 0 target documents the security scanner",
     "blocks at ingest time. They should MISS. If they ever start hitting, either",
     "the block was lifted or the answer leaked in from another document.",
-    "v2 (2026-07-31): widened from 24 to cover Linear (previously zero coverage, 200 freshly synced issues) and repo-content files the first set never reached. Linear ground truth is `linear:<IDENTIFIER>`, matched off the `# Linear SOK-123:` header the syncer writes."
+    "v2 (2026-07-31): widened from 24 to cover Linear (previously zero coverage, 200 freshly synced issues) and repo-content files the first set never reached. Linear ground truth is `linear:<IDENTIFIER>`, matched off the `# Linear SOK-123:` header the syncer writes.",
+    "v3 (2026-08-01): answer_spans added. A question passes only when a span (a verbatim body quote) appears in a retrieved chunk's BODY after header stripping, scored over DISTINCT (path, blob) identities. Questions with answer_spans_unconverted_reason are excluded from answer_recall explicitly, never silently counted. Validate spans with `python scripts/bench/search_bench.py lint` after every edit.",
+    "v4 (2026-08-02): probes restored. #172 unblocked every previously blocked file (b01-b04 are positives now); enumeration on 2026-08-02 replicated the syncer's discovery (_select_from_tree, prod config confirmed via sources API: 4 repos, max_files 40) and ran kb.security_scan.scan_text_entries at block_severity=high over all 69 candidates: 0 files are blocked today, so no real path can serve as a blocked-file target.",
+    "Blocked-content probes p01-p05 are therefore PATTERN probes: expected_recall 0 plus blocked_pattern naming a rule in kb.security_scan.SECRET_PATTERNS. The harness imports the LIVE rule at run and lint time (a renamed or deleted rule fails loudly instead of matching nothing) and flags a hit when a served chunk's RAW text matches the rule - text every current ingest gate (kb/service.py _guard_content, kb/repo_content_sync.py sync scan, share/promotion scans) rejects at block_severity=high. A pattern-probe hit therefore means: content ingested before the scanner existed, ingested with scanning disabled, or a rule weakened after ingest. Report any hit as a security finding, not a metric.",
+    "secret_assignment is deliberately NOT probe-eligible: its _is_credential_like carve-outs mean the bare regex over-matches legitimate documentation, so a probe keyed on it would cry leak on clean content.",
+    "Out-of-corpus negative controls n01-n03 name real GitHub files verifiably outside the syncer's selection (wrong extension or prefix, or a repo absent from the tracked four with autojoin disabled in prod). A hit resolving to one of those identities means the corpus quietly widened (convert the control to a positive, exactly the b01-b04 lifecycle) or identity parsing broke. fetch_ground_truth.py never caches expect_any targets of expected_recall=0 questions, so no probe target can enter this public repo.",
+    "v4 verification status: probes carry a `verification` field recording exactly what was checked on 2026-08-02 and what was not. Three probes were confirmed against production with read-only searches (p01, p04 clean; p02 clean on served text with an undetermined truncated remainder); p03 and p05 are sound by construction but their production miss is unconfirmed; n01-n03 were confirmed offline against the syncer's own discovery and the live sources API, not by a search. Nothing here is a benchmark result - the harness has still never completed a run."
   ],
   "questions": [
     {
@@ -20,7 +26,11 @@
         "masumi-network/sokosumi/README.md"
       ],
       "category": "repo_overview",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "This monorepo contains all core services, including the main web application and backend sync functions.",
+        "Main user-facing web application (Next.js 16, React 19.2, Tailwind CSS, Shadcn UI, next-intl, Prisma, etc.)"
+      ]
     },
     {
       "id": "q02",
@@ -29,7 +39,11 @@
         "masumi-network/sokosumi/docs/agents/cloud-agent-database.md"
       ],
       "category": "architecture",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Each Cursor Cloud agent run can get an ephemeral Neon branch forked from production",
+        "Provision always forks a child branch named cloud-agent-<run-id>"
+      ]
     },
     {
       "id": "q03",
@@ -38,7 +52,10 @@
         "masumi-network/sokosumi/docs/agents/issue-tracker.md"
       ],
       "category": "process",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Issues and PRDs for this repo live in Linear, team Sokosumi (issue key SOK)"
+      ]
     },
     {
       "id": "q04",
@@ -47,7 +64,11 @@
         "masumi-network/sokosumi/docs/agents/triage-labels.md"
       ],
       "category": "process",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "The skills speak in terms of five canonical triage roles.",
+        "the label says who should pick it up; the status says it is ready"
+      ]
     },
     {
       "id": "q05",
@@ -56,7 +77,11 @@
         "masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"
       ],
       "category": "api",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "One workspace grant per (vendorId, workspaceId)",
+        "Read, list, comment, and create are all-or-nothing when granted"
+      ]
     },
     {
       "id": "q06",
@@ -66,7 +91,11 @@
         "masumi-network/sokosumi/docs/hermes-orchestrator-approve-overrides.md"
       ],
       "category": "architecture",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Not a marketplace coworker: no vendor, grants, whitelist, or assignee role.",
+        "Each Hermes user has one Orchestrator row"
+      ]
     },
     {
       "id": "q07",
@@ -75,7 +104,11 @@
         "masumi-network/sokosumi/docs/coworker/benchmarks/README.md"
       ],
       "category": "benchmark",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Repeatable benchmark for Elena (coworker chat) cold-start latency.",
+        "Runs short and realistic scenarios against a coworker's Responses API"
+      ]
     },
     {
       "id": "q08",
@@ -85,7 +118,11 @@
         "masumi-network/sokosumi/docs/superpowers/plans/2026-03-24-better-auth-cookie-prefix-commit-ref.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Replace preview cookie-prefix resolution with a branch-first rule",
+        "Existing preview sessions will stop matching once and require reauthentication."
+      ]
     },
     {
       "id": "q09",
@@ -94,7 +131,11 @@
         "masumi-network/sokosumi/docs/superpowers/specs/2026-06-19-remove-openrouter-from-web-design.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Move job and task name generation into apps/core, which already owns the OpenRouter client and job naming.",
+        "This removes the LLM secret and the @openrouter/ai-sdk-provider dependency from the web runtime and eliminates duplicated naming logic."
+      ]
     },
     {
       "id": "q10",
@@ -104,7 +145,10 @@
         "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Durable org chat under /v1/chats with a hardened chat_room* schema. Keep AI SDK stream/resume working."
+      ]
     },
     {
       "id": "q11",
@@ -113,7 +157,11 @@
         "masumi-network/sokosumi/docs/superpowers/specs/2026-07-23-oauth-refresh-token-opt-in-design.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Add refresh-token issuance to Sokosumi OAuth, opt-in per client, default off.",
+        "Changing access-token lifetime (stays 2 hours) or refresh lifetime (stays 90 days once issued)"
+      ]
     },
     {
       "id": "q12",
@@ -122,7 +170,11 @@
         "masumi-network/sokosumi/docs/superpowers/specs/2026-06-18-zero-margin-pricing-core-authority-design.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "The web app is fully margin-agnostic: no margin lookup keys, no allowlist, no eligibility logic, no tier-selection-by-margin.",
+        "turning a server-side decision into a client-controlled one"
+      ]
     },
     {
       "id": "q13",
@@ -132,7 +184,10 @@
         "masumi-network/sokosumi-cli/skills/elena/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Elena is the Sokosumi coworker for getting started, choosing the right agent or coworker, reviewing open tasks, coordinating workflows, and turning broad goals into executable next steps."
+      ]
     },
     {
       "id": "q14",
@@ -141,7 +196,11 @@
         "masumi-network/Sokosumi-MCP/skills/install-shortcuts/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Ask for confirmation before running the helper because it writes files in the current project.",
+        "If a target skill already exists and is not a symlink, the helper will skip it."
+      ]
     },
     {
       "id": "q15",
@@ -150,7 +209,11 @@
         "masumi-network/sokosumi-cli/README.md"
       ],
       "category": "repo_overview",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "It lets you browse agents and coworkers, create and manage tasks, track job progress, and handle authentication without leaving the command line.",
+        "The app is built with React and Ink and is intended to be a lightweight way to work with Sokosumi workflows from a local shell."
+      ]
     },
     {
       "id": "q16",
@@ -159,7 +222,11 @@
         "masumi-network/sokosumi-cli/skills/sokosumi/references/distribution.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "This skill is packaged in the portable format that Claude-style skill installers already use in practice",
+        "They do not require agent-specific YAML files to function."
+      ]
     },
     {
       "id": "q17",
@@ -169,7 +236,11 @@
         "masumi-network/sokosumi/docs/coworker-metadata.md"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Coworkers are AI agents registered in Sokosumi with a persistent identity.",
+        "Each coworker exposes a capabilities array that controls which Sokosumi features it can use."
+      ]
     },
     {
       "id": "q18",
@@ -178,7 +249,11 @@
         "masumi-network/sokosumi-docs/content/docs/documentation/image-generation.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "the flag persists across all messages in that session so image-generation capability is consistently available",
+        "Coworker conversations do not support the image_generation flag."
+      ]
     },
     {
       "id": "q19",
@@ -187,7 +262,11 @@
         "masumi-network/sokosumi-docs/content/docs/documentation/projects.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Add an existing job or task to a project with a single request",
+        "If a job or task is already assigned to a different project, the API returns 409 Conflict"
+      ]
     },
     {
       "id": "q20",
@@ -198,7 +277,11 @@
         "masumi-network/Sokosumi-MCP/skills/sokosumi/SKILL.md"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "The hosted server uses OAuth, so your client opens a browser and asks you to sign in with Sokosumi during setup.",
+        "Copy the MCP server URL: https://mcp.sokosumi.com/mcp"
+      ]
     },
     {
       "id": "b01",
@@ -208,7 +291,11 @@
       ],
       "category": "was_blocked_probe",
       "expected_recall": 1,
-      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question.",
+      "answer_spans": [
+        "Our server tries Streamable HTTP first, then falls back to SSE.",
+        "DO NOT add remote servers via claude_desktop_config.json - that's only for local servers!"
+      ]
     },
     {
       "id": "b02",
@@ -218,7 +305,11 @@
       ],
       "category": "was_blocked_probe",
       "expected_recall": 1,
-      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question.",
+      "answer_spans": [
+        "Do NOT perform any git operations unless explicitly requested by the user.",
+        "Review existing code before adding new features"
+      ]
     },
     {
       "id": "b03",
@@ -228,7 +319,11 @@
       ],
       "category": "was_blocked_probe",
       "expected_recall": 1,
-      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question.",
+      "answer_spans": [
+        "Searchable, paginated admin view listing all users with available credits, current subscription, started-task count, and registration date.",
+        "backed by a new userRepository.listUsersForAdminOverview method"
+      ]
     },
     {
       "id": "b04",
@@ -238,7 +333,11 @@
       ],
       "category": "was_blocked_probe",
       "expected_recall": 1,
-      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question."
+      "note": "Was a blocked probe: the ingest scanner rejected this file until 2026-07-31. #172 narrowed the rule, repo_content went 60 -> 69 docs, and the probe started hitting - which is exactly the signal it existed to give. Now a normal positive question.",
+      "answer_spans": [
+        "Persist attempted charge amounts on mid-run OUT_OF_CREDITS pause events, expose them in 422 extensions",
+        "Failed attempts must not inflate task.credits"
+      ]
     },
     {
       "id": "l01",
@@ -247,7 +346,9 @@
         "linear:SOK-673"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l02",
@@ -256,7 +357,9 @@
         "linear:SOK-672"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l03",
@@ -266,7 +369,9 @@
         "linear:SOK-657"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l04",
@@ -275,7 +380,9 @@
         "linear:SOK-670"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l05",
@@ -284,7 +391,9 @@
         "linear:SOK-669"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l06",
@@ -293,7 +402,9 @@
         "linear:SOK-668"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l07",
@@ -302,7 +413,9 @@
         "linear:SOK-667"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l08",
@@ -311,7 +424,9 @@
         "linear:SOK-666"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l09",
@@ -320,7 +435,9 @@
         "linear:SOK-665"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l10",
@@ -329,7 +446,9 @@
         "linear:SOK-664"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l11",
@@ -338,7 +457,9 @@
         "linear:SOK-663"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l12",
@@ -347,7 +468,9 @@
         "linear:SOK-661"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l13",
@@ -356,7 +479,9 @@
         "linear:SOK-660"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l14",
@@ -365,7 +490,9 @@
         "linear:SOK-659"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l15",
@@ -374,7 +501,9 @@
         "linear:SOK-658"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l16",
@@ -383,7 +512,9 @@
         "linear:SOK-656"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l17",
@@ -392,7 +523,9 @@
         "linear:DEVREL-130"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l18",
@@ -401,7 +534,9 @@
         "linear:DEVREL-129"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l19",
@@ -410,7 +545,9 @@
         "linear:DEVREL-127"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l20",
@@ -419,7 +556,9 @@
         "linear:DEVREL-126"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l21",
@@ -428,7 +567,9 @@
         "linear:DEVREL-125"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "l22",
@@ -437,7 +578,9 @@
         "linear:DEVREL-123"
       ],
       "category": "linear_issue",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [],
+      "answer_spans_unconverted_reason": "Linear ground truth is not cached: fetch_ground_truth.py skips linear: targets, so there is no body to quote spans from. Excluded from answer_recall until Linear API ground truth is fetched."
     },
     {
       "id": "r01",
@@ -446,7 +589,11 @@
         "masumi-network/sokosumi/docs/coworker-metadata.md"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "How to structure the metadata for a coworker so it shows up correctly in the agents marketplace and the New Task picker",
+        "channels is the only required key. Everything else (profile, offers) is optional and only enriches the UI."
+      ]
     },
     {
       "id": "r02",
@@ -456,7 +603,11 @@
         "masumi-network/sokosumi/docs/orchestrator/hermes-orchestrator-actor.md"
       ],
       "category": "architecture",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "can approve a queued Hermes tool call exactly as proposed, or approve it with an organization override",
+        "Omit it, send no JSON body, or send {} to keep Hermes' original queued args."
+      ]
     },
     {
       "id": "r03",
@@ -465,7 +616,11 @@
         "masumi-network/sokosumi/docs/agents/domain.md"
       ],
       "category": "architecture",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "one shared domain language (jobs, agents, credits, seats, organizations) spans the whole monorepo",
+        "Don't drift to synonyms the glossary explicitly avoids."
+      ]
     },
     {
       "id": "r04",
@@ -475,7 +630,10 @@
         "masumi-network/sokosumi-cli/skills/hannah/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Hannah is the Sokosumi coworker for marketing and growth research: competitors, SEO, AI visibility, target audience analysis, media behavior, positioning, content direction, and campaign planning."
+      ]
     },
     {
       "id": "r05",
@@ -485,7 +643,11 @@
         "masumi-network/sokosumi-cli/skills/jobs/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "If no job id is present, call list_jobs and summarize the most relevant open or recent jobs.",
+        "explain the requested fields and ask the user for missing values before calling provide_job_input"
+      ]
     },
     {
       "id": "r06",
@@ -495,7 +657,11 @@
         "masumi-network/sokosumi-cli/skills/market/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "For market and marketing work, prefer Hannah unless the user explicitly requests a direct specialist agent.",
+        "If Hannah is unavailable, search agents with marketing, market research, SEO, audience, or competitor terms and follow the direct agent job workflow."
+      ]
     },
     {
       "id": "r07",
@@ -505,7 +671,10 @@
         "masumi-network/sokosumi-cli/skills/research/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Prefer a coworker task when the brief is broad or needs coordination; prefer a direct agent job when the user asks for one narrow deliverable from one specialist."
+      ]
     },
     {
       "id": "r08",
@@ -515,7 +684,11 @@
         "masumi-network/sokosumi-cli/skills/watch/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "This skill arms a background monitor so a long-running Sokosumi task is not forgotten. Coworker tasks usually take 10-30 minutes.",
+        "a standalone background script polls the Sokosumi API and re-invokes the agent once when the task is done. No model tokens are spent while waiting."
+      ]
     },
     {
       "id": "r09",
@@ -524,7 +697,11 @@
         "masumi-network/Sokosumi-MCP/skills/setup/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Use this when the user wants to install, authenticate, troubleshoot, or create short aliases for the Sokosumi plugin.",
+        "Never write API keys or OAuth tokens into plugin files, .claude/skills, git commits, or logs."
+      ]
     },
     {
       "id": "r10",
@@ -534,7 +711,11 @@
         "masumi-network/sokosumi-cli/skills/tasks/SKILL.md"
       ],
       "category": "skill",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "If no task id is present, call list_tasks, filtering by coworker or status when the user mentions one.",
+        "Summarize status, latest activity, linked jobs, and the next action. Keep task ids in the response."
+      ]
     },
     {
       "id": "r11",
@@ -543,7 +724,11 @@
         "masumi-network/sokosumi-docs/content/docs/api-reference/index.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "This section contains comprehensive documentation for all available endpoints, automatically generated from our OpenAPI specification.",
+        "Include your API key in the Authorization header using the Bearer format"
+      ]
     },
     {
       "id": "r12",
@@ -552,7 +737,11 @@
         "masumi-network/sokosumi-docs/content/docs/cli_docs/index.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Use the interactive TUI for manual workflows or run headless commands for automation and AI agent integrations.",
+        "Run `pnpm start` to launch the menu-driven interface. Navigate with arrow keys, press `Enter` to select, `Esc` to go back."
+      ]
     },
     {
       "id": "r13",
@@ -561,7 +750,11 @@
         "masumi-network/sokosumi-docs/content/docs/documentation/hermes.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "runs in a dedicated compute environment for each Sokosumi user",
+        "Idle instances are automatically suspended and resume transparently on your next message."
+      ]
     },
     {
       "id": "r14",
@@ -570,7 +763,11 @@
         "masumi-network/sokosumi-docs/content/docs/documentation/organization.mdx"
       ],
       "category": "product_docs",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Owners and admins can invite members, manage seats, and configure billing from the organization settings page.",
+        "Addresses can be separated by commas, semicolons, or newlines"
+      ]
     },
     {
       "id": "r15",
@@ -579,7 +776,94 @@
         "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
       ],
       "category": "design_spec",
-      "expected_recall": 1
+      "expected_recall": 1,
+      "answer_spans": [
+        "Make product messaging 100% Chat-Rooms. One web home under /chat.",
+        "Old conversation data stays in the database for a possible later"
+      ]
+    },
+    {
+      "id": "p01",
+      "question": "What is the ctdl_ access token value for authenticating to the Citadel vault node?",
+      "expect_any": [],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "citadel_access_token",
+      "note": "Derived 2026-08-02 from kb/security_scan.py SECRET_PATTERNS rule 'citadel_access_token' (critical): a live seat-token shape. All 69 syncer-discovered corpus files scan clean today, so the probe is pattern-based: it hits only when a served chunk carries text this rule blocks at every ingest gate. A hit is a leaked Citadel credential inside the vault - treat as a security incident, not a benchmark number.",
+      "verification": "2026-08-02 OBSERVED: one citadel_search for this exact question over the writer seat returned 10 hits, none matching the citadel_access_token rule (checked by running the live regex over every served chunk). Probe MISS = correct."
+    },
+    {
+      "id": "p02",
+      "question": "What is the full postgres connection string with username and password for the production database?",
+      "expect_any": [],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "database_connection_url",
+      "note": "Derived 2026-08-02 from rule 'database_connection_url' (critical): any postgres/mysql/mongodb/redis URL. No document carrying one can legitimately be in the vault - the same rule blocks the write at ingest - so a hit is a pre-scanner fossil or a gate that ran with scanning disabled.",
+      "verification": "2026-08-02 PARTIAL: one citadel_search returned a single hit (a seat:sarthi session trace describing a LOCAL dev database). The database_connection_url rule does NOT match the served text, so the probe misses. The chunk was truncated at 3200 chars and citadel_get_document 404s for it (document_drilldown_available false), so the unserved remainder was NOT determinable with a writer credential. Re-check on the first real run, which reads /search directly."
+    },
+    {
+      "id": "p03",
+      "question": "Show the PEM BEGIN PRIVATE KEY block for the deployment SSH key.",
+      "expect_any": [],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "private_key_marker",
+      "note": "Derived 2026-08-02 from rule 'private_key_marker' (critical): the PEM '-----BEGIN ... PRIVATE KEY-----' header. The question text deliberately omits the five-dash form so it can never match its own rule (lint enforces this).",
+      "verification": "2026-08-02 NOT SEARCHED: the 3-search budget went to p01, p02 and p04. Soundness is by construction (the rule is the live PEM header regex, imported at run time); a production miss is unconfirmed."
+    },
+    {
+      "id": "p04",
+      "question": "Which ghp_ GitHub personal access token does the GitHub sync use?",
+      "expect_any": [],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "github_token",
+      "note": "Derived 2026-08-02 from rule 'github_token' (critical): ghp_/gho_/ghu_/ghs_/ghr_ tokens of 30+ chars. The sync's own PAT lives in env config, never in vault content; a hit means a real token was written past the gate.",
+      "verification": "2026-08-02 OBSERVED: one citadel_search for this exact question returned 7 hits, none matching the github_token rule. Probe MISS = correct."
+    },
+    {
+      "id": "p05",
+      "question": "What is the AKIA access key ID and secret access key for the AWS account?",
+      "expect_any": [],
+      "category": "blocked_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "aws_access_key",
+      "note": "Derived 2026-08-02 from rule 'aws_access_key' (critical): AKIA/ASIA plus exactly 16 uppercase alphanumerics. 'AKIA' followed by a space in this question cannot match the rule.",
+      "verification": "2026-08-02 NOT SEARCHED: see p03. Soundness is by construction; a production miss is unconfirmed."
+    },
+    {
+      "id": "n01",
+      "question": "What dependencies and npm scripts does the sokosumi root package.json declare?",
+      "expect_any": [
+        "masumi-network/sokosumi/package.json"
+      ],
+      "category": "negative_control",
+      "expected_recall": 0,
+      "note": "Out-of-corpus control derived 2026-08-02: the file exists on GitHub (blob d1920682) but is verifiably outside repo-content discovery - root files other than README/AGENTS/SKILL/CONTEXT.md are never selected and .json is not a tree extension (.md/.mdx/.txt). Prod config confirmed identical via the sources API the same day. A hit resolving to this identity means selection widened (convert to a positive, like b01-b04) or identity parsing broke.",
+      "verification": "2026-08-02 OBSERVED (offline): masumi-network/sokosumi/package.json is absent from _select_from_tree output for all four corpus repos under the production config, and absent from ground_truth/. NOT confirmed by a live search."
+    },
+    {
+      "id": "n02",
+      "question": "What does the sokosumi-cli bin/sokosumi.mjs entrypoint script do?",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/bin/sokosumi.mjs"
+      ],
+      "category": "negative_control",
+      "expected_recall": 0,
+      "note": "Out-of-corpus control derived 2026-08-02: real file, doubly excluded from discovery - bin/ is not a tree prefix (skills/, content/docs/, docs/, plugins/) and .mjs is not a tree extension.",
+      "verification": "2026-08-02 OBSERVED (offline): masumi-network/sokosumi-cli/bin/sokosumi.mjs is absent from _select_from_tree output and from ground_truth/. NOT confirmed by a live search."
+    },
+    {
+      "id": "n03",
+      "question": "How do I set up and run the Masumi payment service node?",
+      "expect_any": [
+        "masumi-network/masumi-payment-service/README.md"
+      ],
+      "category": "negative_control",
+      "expected_recall": 0,
+      "note": "Out-of-corpus control derived 2026-08-02: README.md is a root path the syncer selects, but masumi-network/masumi-payment-service is not one of the four tracked repo_content repos and autojoin is disabled in prod (confirmed via the sources API). The github digest source does track that repo, but digests never render a '# org/repo/path' first line, so no legitimate hit can resolve to this identity.",
+      "verification": "2026-08-02 OBSERVED (offline): masumi-network/masumi-payment-service is not in the tracked repo_content repo list returned by the live sources API, and autojoin_enabled is false there. NOT confirmed by a live search."
     }
   ]
 }
