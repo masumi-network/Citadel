@@ -30,7 +30,7 @@ Every write passes through the same pipeline before it becomes searchable.
 
 A **security scan** runs first and blocks content matching secret patterns. This is why a query for an access token or a connection string returns nothing: the material was refused at ingest, not filtered at read time.
 
-**Enrichment** is optional and off by default. When enabled, it sends document text to an external model provider to summarise and structure it. Worth knowing before you turn it on.
+**Enrichment** sends document text to an external model provider to summarise and structure it. The code default is off (`CITADEL_LLM_ENRICHMENT_ENABLED`), but the sample environment file ships it enabled, so a deployment that copies `.env.example` gets it on. Check the value before assuming either way.
 
 **Structuring and indexing** chunks the document, embeds it, and writes the graph relationships that the knowledge mesh renders.
 

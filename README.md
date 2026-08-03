@@ -84,7 +84,7 @@ Twenty-two tools cover search, document fetch, ingest, contribution, and the adm
 
 ## Measured performance
 
-Most tools in this space publish nothing. We publish the numbers, including the ones that look bad.
+We publish the numbers, including the ones that look bad.
 
 Search runs at a 311 ms median through the API. A 69-question golden harness scores `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans. Roughly a third of stored documents are not currently reachable by search, and ranking correlates poorly with query relevance. Both are open work.
 
