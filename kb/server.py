@@ -4457,12 +4457,18 @@ async def sources(request: Request, type: str | None = None) -> Any:
     if type in {None, "github"}:
         github_status = await get_github_syncer().status()
         github_error, github_error_at = _last_source_error("github")
+        # A corrupt state file outranks the audit trail: the source is not
+        # "ready", it is refusing to run until an operator intervenes (#148).
+        if github_status.get("state_error"):
+            github_error = redact_secrets(str(github_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "github-org",
                 "source_type": "github",
                 "name": github_status.get("org"),
-                "status": "tracked" if github_status.get("last_checked_at") else "ready",
+                "status": "error"
+                if github_status.get("state_error")
+                else ("tracked" if github_status.get("last_checked_at") else "ready"),
                 "url": github_status.get("source_url"),
                 "last_checked_at": github_status.get("last_checked_at"),
                 "documents": github_status.get("tracked_repositories", 0),
@@ -4477,12 +4483,16 @@ async def sources(request: Request, type: str | None = None) -> Any:
     if type in {None, "github_repo_content"}:
         repo_content_status = await get_repo_content_syncer().status()
         repo_content_error, repo_content_error_at = _last_source_error("github_repo_content")
+        if repo_content_status.get("state_error"):
+            repo_content_error = redact_secrets(str(repo_content_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "github-repo-content",
                 "source_type": "github_repo_content",
                 "name": repo_content_status.get("org"),
-                "status": "tracked" if repo_content_status.get("last_checked_at") else "ready",
+                "status": "error"
+                if repo_content_status.get("state_error")
+                else ("tracked" if repo_content_status.get("last_checked_at") else "ready"),
                 "last_checked_at": repo_content_status.get("last_checked_at"),
                 "documents": repo_content_status.get("tracked_files", 0),
                 "open_conflicts": 0,
@@ -4499,12 +4509,16 @@ async def sources(request: Request, type: str | None = None) -> Any:
         if linear_status.get("last_error"):
             linear_error = redact_secrets(str(linear_status["last_error"])[:300])
             linear_error_at = linear_status.get("last_synced_at") or linear_error_at
+        if linear_status.get("state_error"):
+            linear_error = redact_secrets(str(linear_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "linear-workspace",
                 "source_type": "linear",
                 "name": "Linear workspace",
-                "status": "tracked" if linear_status.get("last_synced_at") else "ready",
+                "status": "error"
+                if linear_status.get("state_error")
+                else ("tracked" if linear_status.get("last_synced_at") else "ready"),
                 "last_checked_at": linear_status.get("last_synced_at"),
                 "documents": linear_status.get("issue_count", 0),
                 "open_conflicts": 0,

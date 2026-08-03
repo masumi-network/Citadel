@@ -481,3 +481,43 @@ def test_a_real_failure_is_still_logged_as_an_error(monkeypatch, caplog) -> None
 
     assert caught.value.status == 500
     assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+# --- #148: corrupt state must fail loudly, not flatten to "first run" --------
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_raises_instead_of_everything_changed(tmp_path: Any) -> None:
+    """#148: a restart mid-write truncates the state file; the next run must
+    refuse it. Flattening to empty made every repo "changed" and every event
+    "new", ingested a false digest, and then saved over the evidence."""
+    from kb.state_io import StateFileError
+
+    config = CitadelConfig(github_sync_state_path=str(tmp_path / "github_state.json"))
+    citadel = FakeCitadel(config)
+    syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
+    await syncer.run()  # seed a real state file
+    corrupt = '{"version": 1, "org": "masumi-network", "repos"'
+    Path(config.github_sync_state_path).write_text(corrupt, encoding="utf-8")
+
+    with pytest.raises(StateFileError):
+        await syncer.run()
+
+    # No digest was fabricated from the corrupt state, and the file was left
+    # untouched as evidence.
+    assert len(citadel.ingest_calls) == 1
+    assert Path(config.github_sync_state_path).read_text(encoding="utf-8") == corrupt
+
+
+@pytest.mark.asyncio
+async def test_status_reports_corrupt_state_instead_of_raising(tmp_path: Any) -> None:
+    """status() must catch the corruption so /api/sources shows red, not 500."""
+    config = CitadelConfig(github_sync_state_path=str(tmp_path / "github_state.json"))
+    syncer = GitHubOrgSyncer(FakeCitadel(config), client=FakeGitHubClient(), org="masumi-network")
+    Path(config.github_sync_state_path).write_text("not json", encoding="utf-8")
+
+    status = await syncer.status()
+
+    assert status["ok"] is False
+    assert "github_state.json" in status["state_error"]
+    assert status["tracked_repositories"] == 0

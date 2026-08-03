@@ -495,3 +495,26 @@ def test_every_dashboard_page_is_reachable_from_the_ui() -> None:
         "Add a nav entry or a data-page-target button, or list it as "
         "intentionally unreachable with a reason."
     )
+
+
+def test_a_corrupt_sync_state_file_shows_red_instead_of_500(tmp_path: Any) -> None:
+    """#148: a state file that fails to parse must surface as an error'd
+    source. Before this, status() flattened corruption to an empty state, so
+    the source showed "ready" with zero documents — indistinguishable from a
+    node that had never synced."""
+    from kb.config import CitadelConfig
+    from kb.github_sync import GitHubOrgSyncer
+    from kb.service import Citadel
+
+    client = authed_client()
+    state_path = tmp_path / "github_state.json"
+    state_path.write_text('{"version": 1, "repos"', encoding="utf-8")
+    config = CitadelConfig(github_sync_state_path=str(state_path))
+    app.state.github_syncer = GitHubOrgSyncer(Citadel(config), org="masumi-network")
+
+    response = client.get("/api/sources?type=github")
+
+    assert response.status_code == 200
+    source = response.json()["sources"][0]
+    assert source["status"] == "error"
+    assert "github_state.json" in source["last_error"]

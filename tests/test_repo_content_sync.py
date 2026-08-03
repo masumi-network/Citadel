@@ -1001,3 +1001,63 @@ def test_cognee_data_ids_reads_the_real_cognee_return_type() -> None:
     # claim it cannot check.
     assert _cognee_data_ids(outcome({"added": {}})) == []
     assert _cognee_data_ids(outcome(None)) == []
+
+
+# --- #148: corrupt state must fail loudly, not re-ingest the whole allowlist -
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_raises_instead_of_full_reingest(tmp_path: Path) -> None:
+    """#148: flattening corruption to empty made nothing "unchanged", so the
+    entire allowlist re-ingested while reporting ok: True. The run must refuse
+    the corrupt file and leave it as evidence."""
+    from kb.state_io import StateFileError
+
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_state_path=str(tmp_path / "repo_content_sync_state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+    )
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+    first = await syncer.run()
+    assert first["files_ingested"] == 2
+    corrupt = '{"version": 1, "files": {"masumi-network/sokosumi-cli/READ'
+    Path(config.repo_content_sync_state_path).write_text(corrupt, encoding="utf-8")
+
+    with pytest.raises(StateFileError):
+        await syncer.run()
+
+    assert len(learning.calls) == 2  # the seeding run only; nothing re-ingested
+    assert Path(config.repo_content_sync_state_path).read_text(encoding="utf-8") == corrupt
+
+
+@pytest.mark.asyncio
+async def test_status_reports_corrupt_state_instead_of_raising(tmp_path: Path) -> None:
+    """status() must catch the corruption so /api/sources shows red, not 500."""
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=config.repo_content_sync_state_path,
+    )
+    Path(config.repo_content_sync_state_path).write_text("[1, 2", encoding="utf-8")
+
+    status = await syncer.status()
+
+    assert status["ok"] is False
+    assert "state.json" in status["state_error"]
+    assert status["tracked_files"] == 0

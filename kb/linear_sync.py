@@ -22,6 +22,7 @@ from kb.access import CENTRAL_DATASET, SEAT_DATASET_PREFIX, AccessStore, seat_da
 from kb.cognee_client import _suppress_inline_cognify
 from kb.learning import LearningProcess
 from kb.service import Citadel
+from kb.state_io import StateFileError, load_state_file, save_state_file
 
 logger = logging.getLogger(__name__)
 
@@ -270,24 +271,32 @@ class LinearSyncer:
         return LinearClient(api_key=api_key)
 
     def _load_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
+        # Absent file = genuine first run. A corrupt file raises instead of
+        # flattening to empty: an empty state reports "you have no assigned
+        # issues" with a green source status (#148).
+        payload = load_state_file(self.state_path)
+        if payload is None:
             return {"version": STATE_VERSION, "issues": [], "mirrors": {}}
-        try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"version": STATE_VERSION, "issues": [], "mirrors": {}}
-        return payload if isinstance(payload, dict) else {"version": STATE_VERSION, "issues": [], "mirrors": {}}
+        return payload
 
     def _save_state(self, payload: dict[str, Any]) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic (temp file + rename) so a restart mid-write cannot leave the
+        # truncated file _load_state would refuse (#148).
+        save_state_file(self.state_path, payload)
 
     async def status(self) -> dict[str, Any]:
-        state = self._load_state()
+        # A corrupt state file must show as a red source, not a 500 (#148).
+        state_error: str | None = None
+        try:
+            state = self._load_state()
+        except StateFileError as exc:
+            state = {}
+            state_error = str(exc)
         issues = state.get("issues") if isinstance(state.get("issues"), list) else []
         mirrors = state.get("mirrors") if isinstance(state.get("mirrors"), dict) else {}
         mirror_count = sum(len(v) for v in mirrors.values() if isinstance(v, list))
         return {
+            "state_error": state_error,
             "enabled": bool(self.config.linear_api_key),
             "dataset": self.config.linear_sync_dataset,
             "last_synced_at": state.get("last_synced_at"),
@@ -354,6 +363,7 @@ class LinearSyncer:
         # the id is matched instead. Explicit config map entries always win.
         user_map = dict(self.config.linear_user_map)
         auto_mapped = 0
+        auto_map_error: str | None = None
         if self.access_store:
             email_to_slug = {
                 email: dataset.removeprefix(SEAT_DATASET_PREFIX)
@@ -363,6 +373,10 @@ class LinearSyncer:
                 members = await asyncio.to_thread(self._client().fetch_users)
             except LinearAPIError as exc:
                 members = []
+                # Carry the failure into the payload and persisted state so a
+                # 0 auto-map count is not misread as "the key cannot read
+                # member emails" when the fetch itself failed (#148).
+                auto_map_error = str(exc)
                 logger.warning(
                     "Linear member fetch failed; mirrors fall back to assignee email/config map: %s",
                     exc,
@@ -470,6 +484,7 @@ class LinearSyncer:
             "last_synced_at": utc_now(),
             "last_error": None,  # clear any prior failure on a successful sync
             "last_attempt_at": utc_now(),
+            "auto_map_error": auto_map_error,
             "issues": [asdict(issue) for issue in issues],
             "mirrors": mirrors,
         }
@@ -481,9 +496,11 @@ class LinearSyncer:
             "issue_count": len(issues),
             "mirrored_count": mirrored,
             # Diagnostics for #46: how many assignees were auto-mapped to seats by
-            # email. 0 with issues present usually means the Linear key cannot read
-            # member emails — set CITADEL_LINEAR_USER_MAP explicitly in that case.
+            # email. Only read 0 as "the Linear key cannot read member emails —
+            # set CITADEL_LINEAR_USER_MAP" when auto_map_error is None; a failed
+            # member fetch also leaves this at 0 (#148).
             "auto_mapped_assignees": auto_mapped,
+            "auto_map_error": auto_map_error,
             "central_ingested": central_outcome.ingest.accepted,
             "mirrors": mirrors,
             "last_synced_at": payload["last_synced_at"],

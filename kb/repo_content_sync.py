@@ -24,6 +24,7 @@ from kb.github_sync import GitHubAPIError, GitHubOrgClient, utc_now
 from kb.learning import LearningProcess
 from kb.security_scan import SecurityScanEntry, scan_text_entries
 from kb.service import Citadel
+from kb.state_io import StateFileError, load_state_file, save_state_file
 
 __all__ = [
     "DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS",
@@ -506,13 +507,11 @@ class RepoContentSyncer:
         self.state_path = Path(state_path or self.config.repo_content_sync_state_path)
 
     def _load_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            return {"version": STATE_VERSION, "files": {}}
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"version": STATE_VERSION, "files": {}}
-        if not isinstance(data, dict):
+        # Absent file = genuine first run. A corrupt file raises instead of
+        # flattening to empty: an empty state makes nothing "unchanged", so the
+        # entire allowlist re-ingests while reporting ok: True (#148).
+        data = load_state_file(self.state_path)
+        if data is None:
             return {"version": STATE_VERSION, "files": {}}
         files = data.get("files")
         if not isinstance(files, dict):
@@ -520,8 +519,9 @@ class RepoContentSyncer:
         return {"version": STATE_VERSION, "files": files, **{k: v for k, v in data.items() if k != "files"}}
 
     def _save_state(self, state: dict[str, Any]) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        # Atomic (temp file + rename) so a restart mid-write cannot leave the
+        # truncated file _load_state would refuse (#148).
+        save_state_file(self.state_path, state)
 
     def _resolved_repos(self) -> list[str]:
         repos = self.config.repo_content_sync_repos or DEFAULT_REPO_CONTENT_REPOS
@@ -546,10 +546,17 @@ class RepoContentSyncer:
         return resolved
 
     async def status(self) -> dict[str, Any]:
-        state = self._load_state()
+        # A corrupt state file must show as a red source, not a 500 (#148).
+        state_error: str | None = None
+        try:
+            state = self._load_state()
+        except StateFileError as exc:
+            state = {}
+            state_error = str(exc)
         files = state.get("files") if isinstance(state.get("files"), dict) else {}
         return {
-            "ok": True,
+            "ok": state_error is None,
+            "state_error": state_error,
             "authenticated": bool(getattr(self.client, "token", None)),
             "source_type": "github_repo_content",
             "org": self.org,
