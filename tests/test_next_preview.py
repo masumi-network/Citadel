@@ -86,6 +86,36 @@ def test_the_preview_route_set_is_closed() -> None:
         assert client.get(path).status_code == 404, path
 
 
+def test_the_theme_bootstrap_is_served_as_executable_javascript() -> None:
+    """Every exported page loads /next/theme.js from <head>, before paint.
+
+    The site sends X-Content-Type-Options: nosniff, so the browser executes
+    this file only if it arrives with a JavaScript media type. Anything else
+    (the JSON body of a 404 included) is refused, the bootstrap never runs,
+    and a visitor whose remembered choice is dark gets light on every /next
+    page while the live pages still honour it.
+    """
+    client = _client()
+
+    response = client.get("/next/theme.js")
+
+    assert response.status_code == 200
+    media_type = response.headers["content-type"].split(";")[0].strip()
+    assert media_type in {"text/javascript", "application/javascript"}
+    assert response.content == (server_module.WEBUI_DIR / "theme.js").read_bytes()
+
+    # The route is one literal filename, not a pattern: the page allow-list
+    # below it stays closed to every other name.
+    assert client.get("/next/theme.css").status_code == 404
+    assert client.get("/next/landing.js").status_code == 404
+
+    # And every exported document really does depend on it.
+    for page in _exported_html():
+        assert 'src="/next/theme.js"' in page.read_text(encoding="utf-8"), (
+            f"{page.name} does not load the theme bootstrap"
+        )
+
+
 def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
     """The React Flow bundle is a few hundred kilobytes and is fetched only when
     the diagram scrolls into view, so the document has to carry a correct

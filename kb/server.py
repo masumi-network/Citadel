@@ -2959,6 +2959,23 @@ async def next_app_view(view: str, request: Request) -> Response:
     return next_app_page(request, f"app/{view}", minimum_role)
 
 
+# The theme bootstrap. Every exported page loads it from <head> before paint,
+# but it is neither a page (the `{page}` allow-list below serves HTML by exact
+# name and stays closed to other filenames) nor a build asset (the static
+# mount covers only /next/_next). So: one literal route, no path parameter.
+#
+# The media type is pinned rather than guessed from the filename, because the
+# site sends X-Content-Type-Options: nosniff and a browser refuses to execute
+# a script that arrives as anything but JavaScript.
+@app.get("/next/theme.js", include_in_schema=False)
+async def next_theme_js() -> FileResponse:
+    script = WEBUI_DIR / "theme.js"
+    if not script.is_file():
+        # A source checkout that has not run `npm run build:web`.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(script, media_type="text/javascript; charset=utf-8")
+
+
 # The rebuilt public pages, one preview route each. Exact names, not a path
 # parameter used as a filename: the export is a directory and "../" is a
 # filename too.
