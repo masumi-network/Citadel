@@ -139,7 +139,7 @@ async def test_learn_records_mesh_error_and_reraises_on_ingest_failure(tmp_path:
         await learning.learn("Anything", operation="obsidian_sync")
     snapshot = await mesh.snapshot(config)
 
-    assert snapshot["stats"]["errors"] == 1
+    assert snapshot["stats"]["since_restart"]["errors"] == 1
     assert snapshot["events"][0]["details"]["operation"] == "obsidian_sync"
 
 

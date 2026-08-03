@@ -72,7 +72,7 @@ adds `access`, `audit`, `settings` (sub-tabs of the Admin group) and `locked`.
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
 | `GET /api/me/summary` | `document_count` (fallback only), `recent_activity[]` (fallback only), `empty` | on view activation |
-| `GET /api/mesh` | `stats.documents`, `stats.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
+| `GET /api/mesh` | `stats.documents`, `stats.since_restart.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
 | `GET /api/promotion/pending?status=pending` | `items[]` (see Review for fields) | boot |
 | `GET /api/sources` | `sources[].open_conflicts`, `.name`, `.id`, `.metadata.last_security_scan.{blocked,finding_count,highest_severity}` | boot |
 | `GET /api/github-sync` | `last_checked_at` | boot, refresh |
@@ -139,7 +139,7 @@ budget shows skeletons until the server returns its own truncated payload.
 | --- | --- | --- |
 | `GET /api/github-sync` | `org`, `tracked_repositories`, `last_checked_at`, `last_digest_at` | boot, refresh |
 | `GET /api/sources?type=obsidian_vault` | `sources[].{name,documents,last_push_at,open_conflicts}`, `summary.{obsidian_documents,open_conflicts}` | boot |
-| `GET /api/mesh` | `stats.documents`, `stats.errors`, `indexes[]`, `events[]` | boot, SSE |
+| `GET /api/mesh` | `stats.documents`, `stats.since_restart.errors`, `indexes[]`, `events[]` | boot, SSE |
 
 Nothing fetches on activation. Note the page shows sources and indexes; the mesh canvas
 is not here.
@@ -148,7 +148,7 @@ is not here.
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,pending_chunks,failed_chunks,last_indexed_at,errors}` | boot, SSE, refresh |
+| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,last_indexed_at}`, `stats.since_restart.{pending_chunks,errors}` | boot, SSE, refresh |
 
 `timelineEnvelope(event)` prefers a server-provided `event.timeline` object and
 otherwise synthesises `{kind, status, dataset, source, metrics}` from
@@ -339,7 +339,7 @@ that no current endpoint returns.
 
 4. **Last sync time and the health pill (Home title row).** `last_checked_at` on
    `/api/github-sync` is GitHub-only; there is no vault-wide "last sync". Health is
-   inferred from `/api/mesh` `stats.errors`.
+   inferred from `/api/mesh` `stats.since_restart.errors`.
    *Would need:* a small `/api/health` or fields on `/api/me/summary`.
 
 5. **Per-hit score (Search).** `score` is whatever the retrieval layer attached and is
@@ -409,8 +409,8 @@ that no current endpoint returns.
   every refresh. Those four writes have never been visible.
 - **The `.hidden-stats` block** (`index.html:257`, `display: none` in CSS) receives
   `statSearches`, `statFeedback`, `statUpgrades` and `statErrors` from every
-  `renderSnapshot`. Only `stats.errors` is read again, from the snapshot object rather
-  than the DOM.
+  `renderSnapshot`. Only the since-restart error count is read again, from the
+  snapshot object rather than the DOM.
 
 **Server endpoints the dashboard never calls.**
 

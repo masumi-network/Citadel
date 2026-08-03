@@ -1748,16 +1748,21 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
     stats = (mesh or {}).get("stats")
     if not isinstance(stats, dict) or not stats:
         return ""
+    # Activity counters reset with the service and live under since_restart
+    # (#196) — label them by their window, not as lifetime totals.
+    since = stats.get("since_restart")
+    if not isinstance(since, dict):
+        since = {}
 
-    def num(key: str) -> int:
-        value = stats.get(key)
+    def num(source: dict[str, Any], key: str) -> int:
+        value = source.get(key)
         return value if isinstance(value, int) else 0
 
     parts = [
-        f"{paint(str(num('documents')), 'bold', enable=color)} documents",
-        f"{num('nodes')} nodes",
-        f"{num('edges')} edges",
-        f"{num('searches')} searches",
+        f"{paint(str(num(stats, 'documents')), 'bold', enable=color)} documents",
+        f"{num(stats, 'nodes')} nodes",
+        f"{num(stats, 'edges')} edges",
+        f"{num(since, 'searches')} searches since restart",
     ]
     last = stats.get("last_indexed_at")
     if last:

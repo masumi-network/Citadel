@@ -831,15 +831,18 @@ function renderSnapshot(snapshot) {
   meshAlert.hidden = true;
   canvasEmpty.hidden = state.graphMode !== "live" || snapshot.nodes.length > 4;
   updateGraphMeta();
+  // Activity counters reset with the process and are published only under
+  // stats.since_restart (#196) — corpus totals stay top-level.
+  const sinceRestart = snapshot.stats.since_restart || {};
   document.getElementById("statNodes").textContent = snapshot.stats.nodes;
   document.getElementById("statEdges").textContent = snapshot.stats.edges;
   document.getElementById("statDocuments").textContent = snapshot.stats.documents;
-  document.getElementById("statSearches").textContent = snapshot.stats.searches;
-  document.getElementById("statFeedback").textContent = snapshot.stats.feedback;
-  document.getElementById("statUpgrades").textContent = snapshot.stats.upgrades;
-  document.getElementById("statErrors").textContent = snapshot.stats.errors;
+  document.getElementById("statSearches").textContent = sinceRestart.searches || 0;
+  document.getElementById("statFeedback").textContent = sinceRestart.feedback || 0;
+  document.getElementById("statUpgrades").textContent = sinceRestart.upgrades || 0;
+  document.getElementById("statErrors").textContent = sinceRestart.errors || 0;
   if (knowledgeStatus) {
-    const errorCount = Number(snapshot.stats.errors || 0);
+    const errorCount = Number(sinceRestart.errors || 0);
     knowledgeStatus.textContent = errorCount ? "Review" : "Current";
     knowledgeStatus.className = `status-chip ${errorCount ? "status-error" : "status-enabled"}`;
   }
@@ -878,16 +881,19 @@ function renderSnapshot(snapshot) {
 
 function renderTimelineStats(snapshot) {
   const stats = snapshot.stats || {};
+  const since = stats.since_restart || {};
   const events = snapshot.events || [];
   if (eventCount) eventCount.textContent = String(events.length);
   if (timelineStatValues.indexed) {
     timelineStatValues.indexed.textContent = String(stats.indexed_chunks || 0);
   }
   if (timelineStatValues.pending) {
-    timelineStatValues.pending.textContent = String(stats.pending_chunks || 0);
+    timelineStatValues.pending.textContent = String(since.pending_chunks || 0);
   }
   if (timelineStatValues.failed) {
-    timelineStatValues.failed.textContent = String(stats.failed_chunks || 0);
+    // failed_chunks was the errors counter surfaced twice (#197); the single
+    // failure figure is the failed-operation count since restart.
+    timelineStatValues.failed.textContent = String(since.errors || 0);
   }
   if (timelineStatValues.lastIndexed) {
     timelineStatValues.lastIndexed.textContent = stats.last_indexed_at
@@ -895,7 +901,7 @@ function renderTimelineStats(snapshot) {
       : "waiting";
   }
   if (timelineFreshness) {
-    const failed = Number(stats.failed_chunks || 0) + Number(stats.errors || 0);
+    const failed = Number(since.errors || 0);
     timelineFreshness.textContent = failed ? "Review" : events.length ? "Live" : "Waiting";
     timelineFreshness.className = `status-chip ${failed ? "status-error" : events.length ? "status-enabled" : "status-standby"}`;
   }
@@ -1140,12 +1146,13 @@ function analyticsStatusSeries(events) {
 }
 
 function analyticsOpsSeries(stats = {}) {
+  const since = stats.since_restart || {};
   return [
     { label: "Notes", value: Number(stats.documents || 0), tone: "primary" },
     { label: "Nodes", value: Number(stats.nodes || 0), tone: "info" },
-    { label: "Searches", value: Number(stats.searches || 0), tone: "ok" },
-    { label: "Feedback", value: Number(stats.feedback || 0), tone: "attention" },
-    { label: "Errors", value: Number(stats.errors || 0), tone: "failed" },
+    { label: "Searches", value: Number(since.searches || 0), tone: "ok" },
+    { label: "Feedback", value: Number(since.feedback || 0), tone: "attention" },
+    { label: "Errors", value: Number(since.errors || 0), tone: "failed" },
   ];
 }
 
@@ -1279,7 +1286,7 @@ function renderOverviewAnalytics(snapshot) {
   const opsTotal = ops.reduce((sum, row) => sum + row.value, 0);
   setAnalyticsMeta(
     document.getElementById("overviewAnalyticsOpsMeta"),
-    opsTotal ? `${opsTotal} total` : "Empty",
+    opsTotal ? `${opsTotal} · activity since restart` : "Empty",
     opsTotal ? "enabled" : "standby",
   );
   const failed = status.find((row) => row.tone === "failed")?.value || 0;
@@ -1439,12 +1446,12 @@ function renderAuditRuntimeEvents(events = []) {
 
 function renderDashboardOpenIssue(snapshot) {
   if (!dashboardOpenIssue) return;
-  const errorCount = Number(snapshot.stats.errors || 0);
+  const errorCount = Number((snapshot.stats.since_restart || {}).errors || 0);
   const hasEvents = Boolean(snapshot.events.length);
   if (errorCount > 0) {
     dashboardOpenIssue.className = "dashboard-event-card issue-card";
     dashboardOpenIssue.innerHTML = `
-      <strong>${escapeHtml(errorCount)} runtime error${errorCount === 1 ? "" : "s"}</strong>
+      <strong>${escapeHtml(errorCount)} runtime error${errorCount === 1 ? "" : "s"} since restart</strong>
       <p>Open the events page to inspect failed operations.</p>
     `;
     return;
@@ -3219,7 +3226,9 @@ function renderHome() {
     syncedAt.textContent = last ? `Last sync ${formatDate(last)}` : "Never synced";
   }
 
-  const errors = Number(((state.snapshot || {}).stats || {}).errors || 0);
+  // Activity counters are published only under stats.since_restart (#196).
+  const homeStats = (state.snapshot || {}).stats || {};
+  const errors = Number((homeStats.since_restart || {}).errors || 0);
   if (!state.snapshot) {
     status.textContent = "Loading";
     status.className = "status-chip status-standby";
