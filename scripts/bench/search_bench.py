@@ -33,6 +33,7 @@ Usage:
     python scripts/bench/search_bench.py run --baseline previous_run.json
     python scripts/bench/search_bench.py lint
     python scripts/bench/search_bench.py compare run_a.json run_b.json
+    python scripts/bench/search_bench.py report run.json --markdown
 """
 from __future__ import annotations
 
@@ -47,8 +48,10 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -595,6 +598,22 @@ def content_fingerprint(state_path: Path) -> dict[str, Any]:
         f"{key}:{(entry or {}).get('sha', '') if isinstance(entry, dict) else ''}"
         for key, entry in files.items()
     )
+    if not lines:
+        # An empty files map hashes to sha256("") on EVERY run, so two runs
+        # pointed at empty state files would compare as the same corpus while
+        # attesting nothing (this happened on 2026-08-03 and made
+        # duplicate_blob_rate formally not comparable). Fail closed instead.
+        return {
+            "sha256": None,
+            "files": 0,
+            "source": str(state_path),
+            "reason": (
+                "the state file's files map is empty; a fingerprint over zero "
+                "files attests nothing about the corpus, so this run is NOT "
+                "comparable on content (point --repo-state at the node's real "
+                "repo_content_sync_state.json)"
+            ),
+        }
     digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
     return {"sha256": digest, "files": len(lines), "source": str(state_path)}
 
@@ -667,6 +686,122 @@ def api_fingerprint(node_url: str, token: str, timeout: float) -> dict[str, Any]
     return fingerprint
 
 
+# --------------------------------------------------------------------------
+# Corpus census (/api/corpus)
+# --------------------------------------------------------------------------
+
+CENSUS_PAGE_LIMIT = 1000  # /api/corpus CORPUS_MAX_LIMIT
+CENSUS_MAX_PAGES = 100    # 100k documents; a ceiling, not an expectation
+
+
+def make_corpus_fetcher(
+    node_url: str, token: str, timeout: float
+) -> Callable[[str | None], dict[str, Any]]:
+    """One page of GET /api/corpus. Raises on HTTP/network failure; the
+    census turns that into an explicit "unavailable", never a silent zero."""
+
+    def fetch(cursor: str | None) -> dict[str, Any]:
+        params = {"limit": str(CENSUS_PAGE_LIMIT)}
+        if cursor:
+            params["cursor"] = cursor
+        request = urllib.request.Request(
+            f"{node_url.rstrip('/')}/api/corpus?{urllib.parse.urlencode(params)}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    return fetch
+
+
+def corpus_census(
+    fetch_page: Callable[[str | None], dict[str, Any]],
+    max_pages: int = CENSUS_MAX_PAGES,
+) -> dict[str, Any]:
+    """Walk the whole corpus and count documents the index cannot reach.
+
+    /api/corpus is the only endpoint that can enumerate the corpus (the mesh
+    graph caps at 1000 nodes; per-source counters are sync bookkeeping). A row
+    with chunk_count 0 was accepted into the durable store but never
+    vector-indexed, so search cannot return it; a recall figure that ignores
+    that share overstates what retrieval covers. chunk_count null means "not
+    measured", never zero, and is counted separately.
+
+    chunk_count_zero_ratio divides by every walked document (matching the
+    published "892 of 2867" definition); unmeasured rows make the zero count a
+    floor, which the report says next to the number.
+
+    Degrades to {"error", "reason"} when the endpoint is unreachable or the
+    token lacks admin/audit:read: the bench must still run, but the report
+    then states the census is unavailable instead of inventing a count.
+    """
+    started = time.perf_counter()
+    walked = zero = unmeasured = 0
+    documents_total: Any = None
+    cursor: str | None = None
+    pages = 0
+    truncated = False
+    notes: list[str] = []
+    while True:
+        if pages >= max_pages:
+            truncated = True
+            notes.append(
+                f"census stopped at the {max_pages}-page ceiling; counts are a floor"
+            )
+            break
+        try:
+            body = fetch_page(cursor)
+        except urllib.error.HTTPError as exc:
+            return {
+                "error": f"HTTP {exc.code}",
+                "reason": (
+                    "corpus census unavailable (GET /api/corpus needs admin or "
+                    "audit:read); the never-indexed share was not measured"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001 - census must not kill the run
+            return {
+                "error": exc.__class__.__name__,
+                "reason": (
+                    "corpus census failed mid-walk; the never-indexed share "
+                    "was not measured"
+                ),
+            }
+        pages += 1
+        for row in body.get("documents") or []:
+            if not isinstance(row, dict):
+                continue
+            walked += 1
+            count = row.get("chunk_count")
+            if count is None:
+                unmeasured += 1
+            elif int(count) == 0:
+                zero += 1
+        if body.get("documents_total") is not None:
+            documents_total = body.get("documents_total")
+        next_cursor = body.get("next_cursor")
+        if not next_cursor:
+            break
+        if next_cursor == cursor:
+            truncated = True
+            notes.append("census stopped: next_cursor did not advance")
+            break
+        cursor = next_cursor
+    result: dict[str, Any] = {
+        "documents_total": documents_total,
+        "documents_walked": walked,
+        "chunk_count_zero": zero,
+        "chunk_count_unmeasured": unmeasured,
+        "chunk_count_zero_ratio": round(zero / walked, 4) if walked else None,
+        "pages": pages,
+        "truncated": truncated,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 1),
+    }
+    if notes:
+        result["notes"] = notes
+    return result
+
+
 def build_fingerprint(
     node_url: str,
     token: str,
@@ -688,11 +823,19 @@ def build_fingerprint(
         content = content_fingerprint(repo_state)
     return {
         "api": api_fingerprint(node_url, token, timeout),
+        "census": corpus_census(make_corpus_fetcher(node_url, token, timeout)),
         "content": content,
         "harness_git_sha": harness_git_sha(),
         "questions_sha256": hashlib.sha256(questions_path.read_bytes()).hexdigest(),
         "python_version": platform.python_version(),
     }
+
+
+# sha256 of the empty string: what content_fingerprint recorded for an empty
+# files map before the fail-closed fix. Old run JSONs (the 2026-08-03 baseline
+# included) carry it, and two of them would otherwise compare as the same
+# corpus while attesting nothing.
+EMPTY_MAP_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 def compare_fingerprints(
@@ -703,6 +846,14 @@ def compare_fingerprints(
     comparable = True
     current_sha = (current.get("content") or {}).get("sha256")
     baseline_sha = (baseline.get("content") or {}).get("sha256")
+    if EMPTY_MAP_SHA256 in (current_sha, baseline_sha):
+        verdicts.append(
+            "note: a recorded content fingerprint is the sha256 of an empty "
+            "file map (written before the fail-closed fix); it attests "
+            "nothing and is treated as unavailable"
+        )
+        current_sha = None if current_sha == EMPTY_MAP_SHA256 else current_sha
+        baseline_sha = None if baseline_sha == EMPTY_MAP_SHA256 else baseline_sha
     if current_sha is None or baseline_sha is None:
         comparable = False
         verdicts.append(
@@ -723,6 +874,23 @@ def compare_fingerprints(
         verdicts.append(
             "note: harness git sha differs "
             f"({baseline.get('harness_git_sha')} -> {current.get('harness_git_sha')})"
+        )
+    # The content fingerprint covers repo-content files only. The census
+    # covers the WHOLE corpus (digests, session notes, everything), so totals
+    # can drift while repo-content stands still; whole-corpus metrics
+    # (duplication, digest staleness) move with it. A note, not a gate: digest
+    # count grows daily by design and gating on it would block every compare.
+    current_total = (current.get("census") or {}).get("documents_total")
+    baseline_total = (baseline.get("census") or {}).get("documents_total")
+    if (
+        current_total is not None
+        and baseline_total is not None
+        and current_total != baseline_total
+    ):
+        verdicts.append(
+            "note: corpus census document totals differ "
+            f"({baseline_total} -> {current_total}); repo-content is unchanged "
+            "but whole-corpus metrics moved with the corpus"
         )
     if comparable:
         verdicts.insert(0, "COMPARABLE: corpus and questions unchanged.")
@@ -957,6 +1125,10 @@ def execute_benchmark(
     # hit at all.
     probe_patterns = resolve_probe_patterns(questions)
 
+    # Stamped when the searches begin, so every saved run carries its date and
+    # a later reader never has to reconstruct it from file mtimes.
+    run_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
     k_request = max(K_ANSWER, K_DUP)
     rows: list[dict[str, Any]] = []
     latencies: list[float] = []
@@ -1018,7 +1190,7 @@ def execute_benchmark(
         "errors": errors_total,
     }
     summary["repeats"] = repeats
-    return {"summary": summary, "rows": rows}
+    return {"run_at": run_at, "summary": summary, "rows": rows}
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -1077,6 +1249,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         args.node_url, token, args.timeout, questions_path, repo_state
     )
     result["fingerprint"] = fingerprint
+    result["node_url"] = args.node_url
     _print_summary(result["summary"])
 
     print("\n--- corpus fingerprint ---")
@@ -1088,6 +1261,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"{'node_version':>28}: {fingerprint['api'].get('node_version')}")
     print(f"{'harness_git_sha':>28}: {fingerprint['harness_git_sha']}")
     print(f"{'questions_sha256':>28}: {fingerprint['questions_sha256'][:16]}...")
+
+    census = fingerprint.get("census") or {}
+    print("\n--- corpus census (/api/corpus) ---")
+    if census.get("error"):
+        print(f"{'census':>28}: unavailable ({census['error']})")
+        print(f"{'reason':>28}: {census.get('reason')}")
+    else:
+        ratio = census.get("chunk_count_zero_ratio")
+        pct = f" ({ratio * 100:.1f}%)" if isinstance(ratio, (int, float)) else ""
+        print(f"{'documents_total':>28}: {census.get('documents_total')}")
+        print(
+            f"{'chunk_count_zero':>28}: {census.get('chunk_count_zero')}{pct} "
+            "accepted but never vector-indexed; search cannot reach these"
+        )
+        if census.get("chunk_count_unmeasured"):
+            print(
+                f"{'chunk_count_unmeasured':>28}: "
+                f"{census.get('chunk_count_unmeasured')} (zero count is a floor)"
+            )
+        for note in census.get("notes") or []:
+            print(f"{'note':>28}: {note}")
 
     if args.baseline:
         baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
@@ -1159,6 +1353,246 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Markdown report
+# --------------------------------------------------------------------------
+
+# Every metric the report prints MUST state what it matches on, in the same
+# table row as the number. The old harness published "recall@5 0.95" that was
+# head-of-document header credit; the figure travelled without its definition
+# and was quoted as content quality. A definition column makes that class of
+# misquote impossible to produce from this tool. Definitions are single-line
+# and contain no "|" (they live in a markdown table cell).
+METRIC_DEFINITIONS: dict[str, str] = {
+    "answer_recall_at_5": (
+        "a verbatim span from the expected document's BODY appears in the top "
+        "5 distinct identities; the sync header is stripped before matching "
+        "and lint rejects spans found in the document's first line, so "
+        "head-of-document credit cannot count"
+    ),
+    "mrr_body": (
+        "mean reciprocal effective rank of the first distinct identity whose "
+        "stripped body contains an answer span; 0 when none does"
+    ),
+    "doc_recall_at_5": (
+        "the expected document reached the top 5 distinct identities, matched "
+        "by identity (source path plus blob sha, or linear id) or by 12-word "
+        "shingle overlap with the cached ground-truth body; no answer span "
+        "required, so this is weaker evidence than answer_recall_at_5"
+    ),
+    "negative_hit_rate": (
+        "share of probes that registered a hit: a served chunk's raw text "
+        "matched a live ingest-scanner rule, or an out-of-corpus control "
+        "identity came back; anything above 0.0 is a finding to investigate, "
+        "not a score"
+    ),
+    "duplicate_blob_rate_at_10": (
+        "mean share of the top 10 slots occupied by a repeat of an "
+        "already-served (source path, blob sha) identity; 0 means every slot "
+        "was a distinct document identity"
+    ),
+    "header_credit_rate": (
+        "share of span questions where the OLD header-anywhere scorer awards "
+        "a pass that the body scorer refuses; phantom credit measured so it "
+        "can never silently re-enter recall"
+    ),
+}
+
+# (summary section, metric key, sample-count source). The report refuses any
+# key missing from METRIC_DEFINITIONS.
+REPORT_METRICS: list[tuple[str, str, str]] = [
+    ("quality", "answer_recall_at_5", "spans"),
+    ("quality", "mrr_body", "spans"),
+    ("quality", "doc_recall_at_5", "positives"),
+    ("quality", "negative_hit_rate", "probes"),
+    ("duplication", "duplicate_blob_rate_at_10", "dup_rows"),
+    ("quality", "header_credit_rate", "spans"),
+]
+
+
+def _metric_sample_count(run: dict[str, Any], n_source: str) -> Any:
+    counts = (run.get("summary") or {}).get("counts") or {}
+    if n_source == "spans":
+        return counts.get("questions_with_spans")
+    if n_source == "positives":
+        return counts.get("questions_positive")
+    if n_source == "probes":
+        return counts.get("questions_blocked_probe")
+    if n_source == "dup_rows":
+        rows = run.get("rows")
+        if not isinstance(rows, list):
+            return None
+        return sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and row.get("duplicate_blob_rate_at_10") is not None
+        )
+    return None
+
+
+def _census_paragraph(census: dict[str, Any] | None) -> str:
+    if not census:
+        return (
+            "Corpus census unavailable for this run (not recorded); the share "
+            "of never-indexed documents was not measured."
+        )
+    if census.get("error"):
+        return (
+            f"Corpus census unavailable for this run ({census['error']}): the "
+            "share of never-indexed documents was not measured. The census "
+            "needs a token with admin or audit:read."
+        )
+    total = census.get("documents_total")
+    if total is None:
+        total = census.get("documents_walked")
+    zero = census.get("chunk_count_zero")
+    ratio = census.get("chunk_count_zero_ratio")
+    pct = f" ({ratio * 100:.1f}%)" if isinstance(ratio, (int, float)) else ""
+    text = (
+        f"Corpus at run time: {total} documents in the durable store; "
+        f"{zero}{pct} have chunk_count 0. Those were accepted but never "
+        "vector-indexed, so search cannot return them; the recall figures "
+        "above are measured over the golden questions and say nothing about "
+        "content stranded outside the index."
+    )
+    unmeasured = census.get("chunk_count_unmeasured") or 0
+    if unmeasured:
+        text += (
+            f" {unmeasured} documents had no chunk_count measurement, so the "
+            "zero count is a floor."
+        )
+    if census.get("truncated"):
+        text += (
+            f" The census walk was truncated after {census.get('pages')} "
+            "pages, so every count here is a floor."
+        )
+    return text
+
+
+def build_markdown_report(run: dict[str, Any]) -> str:
+    """A README-ready markdown block from one saved run.
+
+    Every number travels with its date, the commit it was measured against,
+    its sample count, and a one-line statement of what it matches on, all in
+    the same table row, so a row copied out of the table alone stays honest.
+    """
+    summary = run.get("summary") or {}
+    if not summary:
+        raise BenchError("run JSON has no summary; nothing to report")
+    fingerprint = run.get("fingerprint") or {}
+    counts = summary.get("counts") or {}
+    latency = summary.get("latency") or {}
+
+    run_at = str(run.get("run_at") or "unknown")
+    run_date = run_at.split("T")[0] if "T" in run_at else run_at
+    sha = str(fingerprint.get("harness_git_sha") or "unknown")
+    short_sha = sha[:12] if sha not in ("", "unknown") else "unknown"
+    node_version = (fingerprint.get("api") or {}).get("node_version")
+
+    lines = [
+        "<!-- Generated by `scripts/bench/search_bench.py report`. "
+        "Regenerate from a run JSON instead of hand-editing numbers. -->",
+        "",
+        "### Retrieval benchmark",
+        "",
+        (
+            f"Run {run_at}, harness commit `{short_sha}`"
+            + (f", node version {node_version}" if node_version else "")
+            + f". {counts.get('questions_total')} questions: "
+            f"{counts.get('questions_with_spans')} with validated answer "
+            f"spans, {counts.get('questions_blocked_probe')} blocked probes, "
+            f"repeats {summary.get('repeats')}."
+        ),
+        "",
+        "| metric | value | date | commit | n | what it matches on |",
+        "|---|---|---|---|---|---|",
+    ]
+    for section, key, n_source in REPORT_METRICS:
+        definition = METRIC_DEFINITIONS.get(key)
+        if definition is None:
+            raise BenchError(
+                f"metric '{key}' has no entry in METRIC_DEFINITIONS. A metric "
+                "published without a statement of what it matches on is how "
+                "the head-line-credit incident happened; add the definition "
+                "before reporting it."
+            )
+        section_values = summary.get(section) or {}
+        if key not in section_values:
+            raise BenchError(
+                f"run JSON summary has no {section}.{key}; refusing to print "
+                "a table row without its measured value"
+            )
+        value = section_values.get(key)
+        value_cell = "n/a (not measured)" if value is None else value
+        n = _metric_sample_count(run, n_source)
+        n_cell = "n/a" if n is None else n
+        lines.append(
+            f"| {key} | {value_cell} | {run_date} | `{short_sha}` | {n_cell} "
+            f"| {definition} |"
+        )
+
+    lines += ["", _census_paragraph(fingerprint.get("census"))]
+
+    p50 = latency.get("p50_ms")
+    samples = latency.get("samples")
+    if p50 is not None:
+        lines += [
+            "",
+            (
+                f"Latency: p50 {p50} ms over {samples} searches, client "
+                "round-trip from the machine that ran the bench (network path "
+                "included; this is not server-side timing). Latency never "
+                "gates quality."
+            ),
+        ]
+
+    content_sha = (fingerprint.get("content") or {}).get("sha256")
+    if content_sha is None:
+        lines += [
+            "",
+            (
+                "WARNING: this run has no content fingerprint and is NOT "
+                "comparable on content to any baseline (see "
+                "fingerprint.content.reason in the run JSON)."
+            ),
+        ]
+    if run_at == "unknown":
+        lines += [
+            "",
+            (
+                "WARNING: this run JSON predates run_at stamping; the date "
+                "column is unknown. Re-run with the current harness."
+            ),
+        ]
+
+    lines += [
+        "",
+        (
+            "Regenerate: `python scripts/bench/search_bench.py run --out "
+            "runs/latest.json` then `python scripts/bench/search_bench.py "
+            "report runs/latest.json --markdown`. Compare against a baseline "
+            "with `compare`; quote deltas only when it prints COMPARABLE."
+        ),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    run = json.loads(Path(args.run_json).read_text(encoding="utf-8"))
+    try:
+        markdown = build_markdown_report(run)
+    except BenchError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.out:
+        Path(args.out).write_text(markdown, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(markdown)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1196,6 +1630,20 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser.add_argument("run_a")
     compare_parser.add_argument("run_b")
     compare_parser.set_defaults(func=cmd_compare)
+
+    report_parser = sub.add_parser(
+        "report", help="emit a README-ready markdown block from a saved run"
+    )
+    report_parser.add_argument("run_json", help="a run JSON written by run --out")
+    report_parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="markdown is the only output format; the flag makes intent explicit",
+    )
+    report_parser.add_argument(
+        "--out", default=None, help="write the block here instead of stdout"
+    )
+    report_parser.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)
     return args.func(args)
