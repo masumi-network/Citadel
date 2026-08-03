@@ -1044,30 +1044,33 @@ class TestPublishedPathsAndProse:
         assert "NOT comparable on content" in markdown
         assert "empty file map" in markdown
 
-    def test_root_readme_mrr_wording_matches_the_harness_definition(self):
-        # README.md restates mrr_body in prose; pin it to METRIC_DEFINITIONS
+    def test_published_mrr_wording_matches_the_harness_definition(self):
+        # docs/performance.md restates mrr_body in prose; pin it to METRIC_DEFINITIONS
         # so the two cannot drift apart. The first character is skipped only
         # because the README sentence starts uppercase.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "performance.md").read_text(
             encoding="utf-8"
         )
         assert sb.METRIC_DEFINITIONS["mrr_body"][1:] in readme
 
-    def test_root_readme_quality_rows_state_their_denominators(self):
+    def test_published_quality_rows_state_their_denominators(self):
         # answer_recall@5 and mrr_body are computed over the 39 span-bearing
         # questions, doc_recall@5 over the 61 positives. A row without its n
         # reads as "over all 69 questions", the head-line-0.95 failure again.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "performance.md").read_text(
             encoding="utf-8"
         )
-        rows = {
-            line.split("|")[1].strip(): line
+        # Assert on the VALUE cell, not the whole row: the definition cell also
+        # says "the 39 span-bearing questions", so a row-wide search passes even
+        # when the value loses its n, which is the drift this guards against.
+        values = {
+            line.split("|")[1].strip(): line.split("|")[2].strip()
             for line in readme.splitlines()
-            if line.startswith("| `")
+            if line.startswith("| `") and line.count("|") >= 4
         }
-        assert "39" in rows["`answer_recall@5`"]
-        assert "61" in rows["`doc_recall@5`"]
-        assert "39" in rows["`mrr_body`"]
+        assert "n=39" in values["`answer_recall@5`"]
+        assert "n=61" in values["`doc_recall@5`"]
+        assert "n=39" in values["`mrr_body`"]
 
 
 # --------------------------------------------------------------------------
