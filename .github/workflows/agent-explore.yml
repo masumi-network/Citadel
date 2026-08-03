@@ -90,7 +90,7 @@ jobs:
 
       - name: Checkout main
         if: steps.preflight.outputs.configured == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Explicitly the trunk, never contributor-supplied code.
           ref: main
