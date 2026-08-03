@@ -69,9 +69,8 @@ def test_every_preview_route_is_served_under_the_strict_policy() -> None:
         assert "object-src 'none'" in policy, path
 
     # No preview path is in the one opt-in list that can relax the policy, and
-    # none may join it: the pages they preview include the page that holds the
-    # opt-in today, so this is exactly where it would be copied across by
-    # reflex.
+    # none may join it. The list is empty today; while / held the opt-in, this
+    # is exactly where it would have been copied across by reflex.
     assert not any(
         path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS
     )

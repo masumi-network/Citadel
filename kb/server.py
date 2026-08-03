@@ -598,25 +598,25 @@ def _content_security_policy(style_src: str) -> str:
 
 CONTENT_SECURITY_POLICY = _content_security_policy("'self'")
 
-# The landing page carries an interactive pipeline diagram built on React Flow,
-# which positions every node and the viewport by writing an inline `transform`
-# style attribute. That is not something the library can be configured out of,
-# so the one page that renders it gets 'unsafe-inline' for styles and nothing
-# else. Script execution stays restricted to same-origin files on every page.
+# The relaxed variant is kept so a page can only ever reach it through the
+# explicit opt-in set below, never by accident. No page uses it today.
+#
+# The landing page's React Flow diagram was the one candidate: it positions
+# every node and the viewport by writing inline `transform` styles, and the
+# library cannot be configured out of that. But it writes them through the
+# CSSOM (element.style), which style-src does not govern; the directive
+# covers <style> elements and style attributes arriving in markup. Measured
+# before the exemption was removed: under style-src 'self' the diagram
+# rendered identically, with zero securitypolicyviolation events (Chrome;
+# the CSSOM carve-out is spec behaviour). Script execution stays restricted
+# to same-origin files on every page under both policies.
 CONTENT_SECURITY_POLICY_INLINE_STYLE = _content_security_policy("'self' 'unsafe-inline'")
 
 # Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-# Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-#
-# Only / is here, because only / renders the React Flow pipeline diagram, which
-# positions its nodes with inline `transform` styles and cannot be configured
-# out of it. The page holds no token and no user data, which is why this is an
-# acceptable trade there and would not be on /app or /login.
-CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset({"/"})
+# policy. It is empty: every route, / and its React Flow diagram included,
+# gets the strict policy above. Adding a path here is a security decision;
+# the tests pin this set so it cannot grow in passing.
+CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset()
 
 
 def content_security_policy_for(path: str) -> str:
