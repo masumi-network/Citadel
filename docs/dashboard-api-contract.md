@@ -122,6 +122,15 @@ Per-hit fields rendered: `_citadel.rank`, `_citadel.dataset`, `_citadel.trust` o
 `_citadel.document_endpoint`, top-level `score`, and the body text. The whole raw hit is
 also dumped into a `<details>` block.
 
+Every hit also carries two undocumented, easy-to-confuse ids at the top level: `id` is
+CHUNK-level (the passage that matched the query), and `document_id` is DOCUMENT-level
+(the same id `citadel_ingest` reports for the whole write, and what a fetched document's
+own `.id` is). `_citadel.result_id` and `_citadel.document_endpoint` are both built from
+`id`, not `document_id` — `/api/documents/{id}` still resolves a chunk id by walking
+chunk -> parent, which hides the distinction. Anything that dedups hits from the same
+document, or compares a hit's id against a fetched document's `.id`, must use
+`document_id`; comparing on `id` will never match.
+
 Errors: renders an error card with a Retry button that re-submits the form. 401/403 land
 there too, with no sign-in prompt. Empty: an empty-state card that lists
 `known_datasets` when present and offers "Review sources" and "Add note" buttons. Slow:

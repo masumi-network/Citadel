@@ -2594,6 +2594,11 @@ def document_endpoint_for_result(result_id: str) -> str | None:
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
     # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
     # no backing store, so they stay honestly non-drillable.
+    #
+    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
+    # its `document_id`. This still resolves because /api/documents walks
+    # chunk -> parent document, so a caller passing either id "works" — which
+    # hides that they are different ids for different things.
     if not result_id or result_id.startswith("chunk:"):
         return None
     return f"/api/documents/{result_id}"
@@ -2610,6 +2615,18 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
 
     Results that already supply an id (e.g. the GitHub digest fallback) are left
     untouched. Other dict results get a content-derived id for traceability.
+
+    ``id`` here is CHUNK-level: for cognee's CHUNKS query type a hit is the raw
+    chunk payload (see ``CogneeClient.recall``), and that payload also carries
+    its own ``document_id`` — the parent document's id, the same id
+    ``citadel ingest`` reports as ``data_id`` for the write. The two are
+    different granularities and neither field documents that on the wire
+    (verified live: a hit's ``id`` and ``document_id`` are always distinct
+    UUIDs). ``/api/documents/{id}`` resolves a chunk id by walking chunk ->
+    parent, so passing ``id`` "works" and hides the mismatch — a caller that
+    dedups or cites on ``id`` and later compares against a fetched document's
+    own ``.id`` (which is the document id, not the chunk id) will never match.
+    Use ``document_id`` for anything that needs to key off the document.
     """
     if result.get("id"):
         return result
