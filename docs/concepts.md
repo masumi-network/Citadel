@@ -20,7 +20,7 @@ A **git pre-push hook** snapshots the commits you push: subject, branch, changed
 
 A **Claude Code SessionEnd hook** distills what a coding session was about and what came of it.
 
-**Approved capture roots** are directories you have told Citadel it may summarise. It records the repository state, not your file contents.
+**Approved capture roots** are directories you have told Citadel it may summarise. It records repository state (branch, remote, recent commit subjects) and a few lines of the README, not your working files.
 
 Alongside those, scheduled syncs pull GitHub organisation activity, repository content, and Linear issues.
 
@@ -28,7 +28,7 @@ Alongside those, scheduled syncs pull GitHub organisation activity, repository c
 
 Every write passes through the same pipeline before it becomes searchable.
 
-A **security scan** runs first and blocks content matching secret patterns. This is why a query for an access token or a connection string returns nothing: the material was refused at ingest, not filtered at read time.
+A **security scan** runs first and blocks content matching secret patterns. This is why a query for an access token or a connection string returns nothing: the material was refused at ingest.
 
 **Enrichment** sends document text to an external model provider to summarise and structure it. The code default is off (`CITADEL_LLM_ENRICHMENT_ENABLED`), but the sample environment file ships it enabled, so a deployment that copies `.env.example` gets it on. Check the value before assuming either way.
 

@@ -80,13 +80,15 @@ Agents need a URL and a token. `citadel onboard` writes this for you:
 }
 ```
 
-Twenty-two tools cover search, document fetch, ingest, contribution, and the admin surface. Every CLI command speaks `--json`. Setup per client and the full tool table are in [`docs/mcp/README.md`](docs/mcp/README.md).
+Twenty-two tools cover search, document fetch, ingest, contribution, and the admin surface. Core CLI commands speak `--json`. Setup per client and the tool reference are in [`docs/mcp/README.md`](docs/mcp/README.md).
 
 ## Measured performance
 
 We publish the numbers, including the ones that look bad.
 
-Search runs at a 311 ms median through the API. A 69-question golden harness scores `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans. Roughly a third of stored documents are not currently reachable by search, and ranking correlates poorly with query relevance. Both are open work.
+Search runs at a 311 to 472 ms median depending on token role. A 69-question golden harness scores `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans.
+
+Two limits belong next to that number. Roughly a third of stored documents are not reachable by search at all ([#228](https://github.com/masumi-network/Citadel/issues/228)), and the documents that are indexed were embedded only at the head, so text past roughly the first 1,500 characters is also unreachable ([#227](https://github.com/masumi-network/Citadel/issues/227)). Ranking also correlates poorly with query relevance. All three are open work, and no recall figure currently describes the whole corpus.
 
 Full table, definitions, and how to reproduce: [`docs/performance.md`](docs/performance.md).
 
