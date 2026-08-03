@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,7 @@ import pytest
 
 from kb.access import AccessStore, AccessIdentity, seat_dataset
 from kb.config import CitadelConfig
+from kb.learning import LearningOutcome
 from kb.models import IngestResult
 from kb.promotion import PromotionEngine, _coerce_classification
 import kb.promotion as promotion
@@ -37,14 +40,27 @@ class FakeCitadel:
 
 
 class FakeLearning:
-    """Records every learn() call so tests can assert on the write targets."""
+    """Records every learn() call so tests can assert on the write targets.
 
-    def __init__(self) -> None:
+    Returns the real :class:`LearningOutcome` shape the engine reads, because a
+    fake inventing its own shape is how a guard ships inert. ``central_reject_reason``
+    makes Central writes come back ``accepted=False`` with that reason, the
+    contract ``Citadel.ingest`` uses for rejections like duplicate_in_process.
+    """
+
+    def __init__(self, central_reject_reason: str | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.central_reject_reason = central_reject_reason
 
-    async def learn(self, data: str, **kwargs: Any) -> IngestResult:
+    async def learn(self, data: str, **kwargs: Any) -> LearningOutcome:
+        dataset = kwargs.get("dataset") or CENTRAL
+        tags = tuple(kwargs.get("tags") or ())
         self.calls.append({"data": data, "dataset": kwargs.get("dataset"), "tier": kwargs.get("tier"), "tags": kwargs.get("tags")})
-        return IngestResult(True, "accepted", kwargs.get("dataset") or CENTRAL, tuple(kwargs.get("tags") or ()))
+        if self.central_reject_reason and dataset == CENTRAL:
+            result = IngestResult(False, self.central_reject_reason, dataset, tags)
+        else:
+            result = IngestResult(True, "accepted", dataset, tags)
+        return LearningOutcome(ingest=result, dataset=dataset)
 
     @property
     def central_writes(self) -> list[dict[str, Any]]:
@@ -507,3 +523,125 @@ async def test_enumerate_returns_empty_without_raising_when_searches_succeed(
     engine, _, _ = _engine(tmp_path, [])
 
     assert await engine.enumerate(SEAT, 20) == []
+
+
+async def test_slow_classifier_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Other coroutines must keep running while the classifier is in flight.
+
+    The classifier is a synchronous HTTP call with a 60s timeout per retry
+    attempt. Awaited inline it parks the whole event loop: nine consecutive
+    evolve passes spent 16-27 minutes in promotion and every route on the node
+    queued behind the blocked loop for the duration (search 22.9s, /mcp 41.9s,
+    an ingest abandoned at 120s). This asserts the observable behaviour (the
+    loop schedules this test's coroutine while classify is mid-call), not the
+    presence of any particular dispatch mechanism.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def stalled_chat(*args: Any, **kwargs: Any) -> str | None:
+        started.set()
+        if not release.wait(timeout=2.0):
+            # The loop never freed us: degrade to the llm_unavailable skip so
+            # the red direction fails on the liveness assert, not a hang.
+            return None
+        return json.dumps(
+            {"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"}
+        )
+
+    monkeypatch.setattr(promotion, "openrouter_chat", stalled_chat)
+    engine, _learning, _store = _engine(tmp_path, [_org_note()], _github_state(tmp_path))
+
+    run_task = asyncio.create_task(engine.run(SEAT, dry_run=False))
+    alive_during_classify = False
+    for _ in range(400):
+        await asyncio.sleep(0.005)
+        if started.is_set():
+            # The classifier has started and is still held open (release is
+            # unset), yet this coroutine is running: the loop is alive. When
+            # classify runs ON the loop this line is unreachable until the
+            # call gives up, by which point run_task has already finished.
+            alive_during_classify = not run_task.done()
+            break
+    release.set()
+    result = await run_task
+
+    assert started.is_set(), "the classifier was never invoked"
+    assert alive_during_classify, (
+        "the event loop made no progress while the classifier was in flight"
+    )
+    assert result["promoted"] == 1
+
+
+async def test_central_rejection_is_not_recorded_as_promoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write Central refuses must not be counted or audited as delivered.
+
+    One production pass logged promoted=169 while ~150 of those Central writes
+    came back duplicate_in_process; each was recorded success=True,
+    accepted=True because the outcome of execute_learning_writes was dropped.
+    """
+    config = _github_state(tmp_path)
+    learning = FakeLearning(central_reject_reason="duplicate_in_process")
+    store = AccessStore(str(tmp_path / "access.json"))
+    engine = PromotionEngine(FakeCitadel(config, [_org_note()]), learning, store, config)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+
+    result = await engine.run(SEAT, dry_run=False)
+
+    assert result["promoted"] == 0
+    proposal = result["proposals"][0]
+    assert proposal["decision"] == "skip"
+    assert proposal["reason"] == "duplicate_in_process"
+    assert proposal["promoted"] is False
+    assert proposal["secret_blocked"] is False, "a duplicate is not a secret block"
+    events = store.recent_audit_events(action="promotion.promote")
+    assert len(events) == 1
+    assert events[0]["success"] is False
+    assert events[0]["detail"]["accepted"] is False
+    assert events[0]["detail"]["write_reason"] == "duplicate_in_process"
+
+
+async def test_duplicate_across_seats_skips_the_classifier_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content already landed in Central this pass is not re-classified.
+
+    The evolve stage runs one engine across every seat, so identical content
+    surfacing from a second seat used to cost a full classifier call and a
+    Central write that the ingest dedupe then rejected: ~150 wasted LLM calls
+    in one measured pass. Once this engine has delivered the exact text, the
+    next identical candidate settles as duplicate_in_process before classify.
+    """
+    config = _github_state(tmp_path)
+    learning = FakeLearning()
+    store = AccessStore(str(tmp_path / "access.json"))
+    engine = PromotionEngine(FakeCitadel(config, [_org_note()]), learning, store, config)
+    classifier_calls = {"count": 0}
+
+    def counting_chat(*args: Any, **kwargs: Any) -> str:
+        classifier_calls["count"] += 1
+        return json.dumps(
+            {"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"}
+        )
+
+    monkeypatch.setattr(promotion, "openrouter_chat", counting_chat)
+
+    first = await engine.run(SEAT, dry_run=False)
+    assert first["promoted"] == 1
+    assert classifier_calls["count"] == 1
+    assert len(learning.central_writes) == 1
+
+    second = await engine.run(seat_dataset("bob"), dry_run=False)
+    assert second["promoted"] == 0
+    assert second["proposals"][0]["decision"] == "skip"
+    assert second["proposals"][0]["reason"] == "duplicate_in_process"
+    assert classifier_calls["count"] == 1, (
+        "identical content must not cost a second classifier call"
+    )
+    assert len(learning.central_writes) == 1, (
+        "identical content must not be re-submitted to Central"
+    )
