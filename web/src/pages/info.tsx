@@ -50,10 +50,7 @@ const SECTIONS: Section[] = [
    reads something true and slightly old rather than a row of dashes. */
 const STAMPED = {
   version: "v0.4.0",
-  commits: 340,
-  commitsWindowWeeks: 52,
   mcpTools: 22,
-  adrs: 13,
 };
 
 const AS_OF = "Tests, releases and LOC are as of v0.4.0, 2026-07-22.";
@@ -81,14 +78,19 @@ function useInfoTiles() {
   const updatedAt = relativeTime(state?.updated_at);
   const repoAge = relativeTime(repo?.refreshed_at);
 
+  // mcp_tools is computed fresh on every /api/state call (a policy-table
+  // length, not a cache), so it carries no "refreshed X ago" note here.
+  // Commit and ADR counts used to live here too; they are gone from the page
+  // by design (repo trivia, not evidence the system works), but the weekly
+  // commit chart stays as recent git activity.
   let repoNote: string;
   if (repo?.source !== "github") {
-    // No successful fetch yet: the tiles are showing the stamped markup.
-    repoNote = " Commit figures are the last published values.";
+    // No successful fetch yet: the chart is showing the baked series.
+    repoNote = " The commit-activity chart has not refreshed yet.";
   } else if (repo.stale) {
-    repoNote = ` Commit figures last refreshed ${repoAge}.`;
+    repoNote = ` The commit-activity chart last refreshed ${repoAge}.`;
   } else {
-    repoNote = ` Commits, decision records and MCP tools refreshed ${repoAge}.`;
+    repoNote = ` The commit-activity chart refreshed ${repoAge}.`;
   }
 
   return {
@@ -102,13 +104,7 @@ function useInfoTiles() {
       : failed
         ? "GitHub org sync (live data unavailable)"
         : "GitHub org sync",
-    commits: typeof repo?.commits_total === "number" ? repo.commits_total : STAMPED.commits,
-    commitsSub:
-      typeof repo?.commits_total === "number"
-        ? `commits on main · last ${repo.commits_window_weeks || STAMPED.commitsWindowWeeks} weeks`
-        : `commits on main · last ${STAMPED.commitsWindowWeeks} weeks`,
     mcpTools: typeof repo?.mcp_tools === "number" ? repo.mcp_tools : STAMPED.mcpTools,
-    adrs: typeof repo?.adrs === "number" ? repo.adrs : STAMPED.adrs,
     stateUpdated: state
       ? `Live tiles updated${updatedAt ? ` ${updatedAt}` : ""}.${repoNote} ${AS_OF}`
       : null,
@@ -147,7 +143,8 @@ export default function Info() {
           <p className={TLDR_P}>
             This is the running node reporting on itself: what is deployed right now, what shipped
             across v0.2.0 → v0.4.0, and what is being built next. If you are new to Citadel, the{" "}
-            <a href="/">home page</a> covers what it is and how to start; this page is the numbers.
+            <a href="/">home page</a> covers what it is, how it&apos;s built, and how to start; this
+            page is the numbers.
           </p>
           <p className={TLDR_P_LAST}>
             Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear
@@ -182,10 +179,13 @@ export default function Info() {
             label={tiles.docsSub}
           />
           <Metric accent value="10" label="releases shipped (v0.1.0 → v0.4.0)" />
-          <Metric value={tiles.commits} label={tiles.commitsSub} />
+          <Metric value={<span className="text-[19px]">$55/mo</span>} label="to self-host, measured" />
           <Metric value="906" label="tests across 52 files · CI on every push" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
-          <Metric value={tiles.adrs} label="architecture decision records" />
+          <Metric
+            value={<span className="text-[19px]">300&ndash;500ms</span>}
+            label="search latency, median"
+          />
           <Metric value="~25k" label="LOC · 53 modules · zero-dep client" />
         </div>
         <Verified>
@@ -194,10 +194,17 @@ export default function Info() {
               "Live data unavailable right now. Showing the last published repo figures, as of v0.4.0, 2026-07-22."
             ) : (
               <>
-                Live tiles pull from <code className={CODE}>/api/state</code>. Commits, decision
-                records and MCP tools refresh daily. {AS_OF}
+                Live tiles pull from <code className={CODE}>/api/state</code>. MCP tools refresh on
+                every load. {AS_OF}
               </>
             ))}
+        </Verified>
+        <Verified>
+          Cost and search latency are measured snapshots from the repo&apos;s{" "}
+          <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
+            bench harness
+          </a>
+          , not a live call: reproducible on demand, not a guess.
         </Verified>
       </Band>
 

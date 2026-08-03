@@ -224,6 +224,7 @@ section { padding-top: 66px; }
 .metric { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 18px 18px; }
 .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 500; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.1; color: var(--ink); }
 .metric .n small { font-size: 14px; color: var(--ink-3); font-weight: 400; }
+.metric .n.sm { font-size: 19px; }
 .metric .k { font-size: 12.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.4; }
 .metric.accent .n, .metric.tealn .n { color: var(--accent-ink); }
 .metric .n.pending { color: var(--ink-3); }

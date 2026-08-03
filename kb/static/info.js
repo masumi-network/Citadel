@@ -165,18 +165,14 @@
       var when = gh && gh.last_synced_at ? rel(gh.last_synced_at) : "";
       set("m-docs-sub", "GitHub org synced" + (when ? " · " + when : ""));
 
-      // ---- repo figures, refreshed daily from GitHub ----
+      // ---- repo figures ----
+      // mcp_tools is computed fresh on every /api/state call (a policy-table
+      // length, not a cache), so it carries no "refreshed X ago" note below.
+      // Commit and ADR counts used to live here too; they are gone from the
+      // page by design (repo trivia, not evidence the system works), but the
+      // weekly commit chart stays as recent git activity.
       var repo = d.repo || {};
-      if (typeof repo.adrs === "number") set("m-adrs", repo.adrs);
       if (typeof repo.mcp_tools === "number") set("m-tools", repo.mcp_tools);
-      if (typeof repo.commits_total === "number") {
-        set("m-commits", repo.commits_total);
-        // Say which commits. This counts the default branch over the window
-        // GitHub reports, which is not the same number as all-time commits,
-        // and a bare "commits" would read as if it were.
-        set("m-commits-sub", "commits on main · last " +
-          (repo.commits_window_weeks || 52) + " weeks");
-      }
       if (repo.weeks && repo.weeks.length) {
         // The layout fits ~12 columns; GitHub can report up to 52 weeks.
         // Newest win, so the chart stays readable whatever the API returns.
@@ -188,12 +184,12 @@
       var repoAge = repo.refreshed_at ? rel(repo.refreshed_at) : "";
       var repoNote;
       if (repo.source !== "github") {
-        // No successful fetch yet: the tiles are showing the stamped markup.
-        repoNote = " Commit figures are the last published values.";
+        // No successful fetch yet: the chart is showing the baked series.
+        repoNote = " The commit-activity chart has not refreshed yet.";
       } else if (repo.stale) {
-        repoNote = " Commit figures last refreshed " + repoAge + ".";
+        repoNote = " The commit-activity chart last refreshed " + repoAge + ".";
       } else {
-        repoNote = " Commits, decision records and MCP tools refreshed " + repoAge + ".";
+        repoNote = " The commit-activity chart refreshed " + repoAge + ".";
       }
 
       var upd = rel(d.updated_at);

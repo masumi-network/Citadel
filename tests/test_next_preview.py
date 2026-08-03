@@ -302,12 +302,18 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     a pre-rendered bar would carry a `style` attribute that `style-src 'self'`
     drops, so it is drawn after mount exactly as the hand-written page drew it
     from a deferred script.
+
+    Commit and ADR counts were dropped from these tiles: they are not evidence
+    the system works, and both had drifted stale in the past. Cost and search
+    latency, backed by a named, rerunnable harness, took their place.
     """
     body = _client().get("/next/info").text
 
     assert "v0.4.0" in body
-    assert "commits on main · last 52 weeks" in body
-    assert "architecture decision records" in body
+    assert "$55/mo" in body
+    assert "500ms" in body
+    assert "commits on main" not in body
+    assert "architecture decision records" not in body
     assert "Live tiles pull from" in body
 
 
