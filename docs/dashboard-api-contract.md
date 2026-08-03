@@ -72,7 +72,7 @@ adds `access`, `audit`, `settings` (sub-tabs of the Admin group) and `locked`.
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
 | `GET /api/me/summary` | `document_count` (fallback only), `recent_activity[]` (fallback only), `empty` | on view activation |
-| `GET /api/mesh` | `stats.documents`, `stats.since_restart.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
+| `GET /api/mesh` | `stats.tracked_sources`, `stats.since_restart.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
 | `GET /api/promotion/pending?status=pending` | `items[]` (see Review for fields) | boot |
 | `GET /api/sources` | `sources[].open_conflicts`, `.name`, `.id`, `.metadata.last_security_scan.{blocked,finding_count,highest_severity}` | boot |
 | `GET /api/github-sync` | `last_checked_at` | boot, refresh |
@@ -97,7 +97,7 @@ weight).
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `stats.{nodes,edges,documents,searches,feedback,upgrades,errors}`, `events[]`, `indexes[].{name,records,status}` | boot, SSE |
+| `GET /api/mesh` | `stats.{nodes,edges,tracked_sources,searches,feedback,upgrades,errors}`, `events[]`, `indexes[].{name,records,status}` | boot, SSE |
 | `GET /api/github-sync` | `last_checked_at`, `tracked_repositories`, `run_improve` | boot |
 | `GET /api/promotion/pending` | `items[].{seat_slug,preview,reference_reason,reference_status,id}`, `count` | boot |
 | `GET /api/access` | `tokens[].{name,role,scopes,prefix,revoked_at}`, `principals[].length` | boot (admin) |
@@ -139,7 +139,7 @@ budget shows skeletons until the server returns its own truncated payload.
 | --- | --- | --- |
 | `GET /api/github-sync` | `org`, `tracked_repositories`, `last_checked_at`, `last_digest_at` | boot, refresh |
 | `GET /api/sources?type=obsidian_vault` | `sources[].{name,documents,last_push_at,open_conflicts}`, `summary.{obsidian_documents,open_conflicts}` | boot |
-| `GET /api/mesh` | `stats.documents`, `stats.since_restart.errors`, `indexes[]`, `events[]` | boot, SSE |
+| `GET /api/mesh` | `stats.tracked_sources`, `stats.since_restart.errors`, `indexes[]`, `events[]` | boot, SSE |
 
 Nothing fetches on activation. Note the page shows sources and indexes; the mesh canvas
 is not here.
@@ -148,7 +148,7 @@ is not here.
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,last_indexed_at}`, `stats.since_restart.{pending_chunks,errors}` | boot, SSE, refresh |
+| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.last_indexed_at`, `stats.since_restart.{indexed_chunks,pending_chunks,errors}` | boot, SSE, refresh |
 
 `timelineEnvelope(event)` prefers a server-provided `event.timeline` object and
 otherwise synthesises `{kind, status, dataset, source, metrics}` from
@@ -321,10 +321,10 @@ Data the redesigned views in `docs/superpowers/specs/2026-07-29-app-ui-design.md
 that no current endpoint returns.
 
 1. **"Notes you can read" (Home number 1).** No endpoint returns a readable-corpus
-   count. `/api/mesh` `stats.documents` counts document nodes in a mesh that is
-   transient across process restarts; `/api/me/summary` `document_count` is Node-only.
-   *Would need:* `/api/me/summary` to return a `readable_document_count` computed from
-   the caller's resolved search datasets, not from mesh nodes.
+   count. `/api/mesh` `stats.tracked_sources` counts tracked github repos, repo-content
+   files and linear issues, not documents; `/api/me/summary` `document_count` is
+   Node-only. *Would need:* `/api/me/summary` to return a `readable_document_count`
+   computed from the caller's resolved search datasets, not from mesh nodes.
 
 2. **"Captured this week" (Home number 2).** Nothing returns a windowed count. It is
    currently derived client-side by filtering `/api/mesh` `events[]` for

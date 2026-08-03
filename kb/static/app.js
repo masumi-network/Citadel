@@ -836,7 +836,7 @@ function renderSnapshot(snapshot) {
   const sinceRestart = snapshot.stats.since_restart || {};
   document.getElementById("statNodes").textContent = snapshot.stats.nodes;
   document.getElementById("statEdges").textContent = snapshot.stats.edges;
-  document.getElementById("statDocuments").textContent = snapshot.stats.documents;
+  document.getElementById("statDocuments").textContent = snapshot.stats.tracked_sources;
   document.getElementById("statSearches").textContent = sinceRestart.searches || 0;
   document.getElementById("statFeedback").textContent = sinceRestart.feedback || 0;
   document.getElementById("statUpgrades").textContent = sinceRestart.upgrades || 0;
@@ -847,7 +847,7 @@ function renderSnapshot(snapshot) {
     knowledgeStatus.className = `status-chip ${errorCount ? "status-error" : "status-enabled"}`;
   }
   if (knowledgeSnapshotCount) {
-    knowledgeSnapshotCount.textContent = String(snapshot.stats.documents || 0);
+    knowledgeSnapshotCount.textContent = String(snapshot.stats.tracked_sources || 0);
   }
   eventCount.textContent = String(snapshot.events.length);
   renderDashboardIndexes(snapshot.indexes);
@@ -885,7 +885,10 @@ function renderTimelineStats(snapshot) {
   const events = snapshot.events || [];
   if (eventCount) eventCount.textContent = String(events.length);
   if (timelineStatValues.indexed) {
-    timelineStatValues.indexed.textContent = String(stats.indexed_chunks || 0);
+    // indexed_chunks is no longer published at the top level (it only ever
+    // duplicated `nodes`, by construction); the honest restart-scoped
+    // accumulator lives under since_restart, same as pending/failed below.
+    timelineStatValues.indexed.textContent = String(since.indexed_chunks || 0);
   }
   if (timelineStatValues.pending) {
     timelineStatValues.pending.textContent = String(since.pending_chunks || 0);
@@ -1148,7 +1151,7 @@ function analyticsStatusSeries(events) {
 function analyticsOpsSeries(stats = {}) {
   const since = stats.since_restart || {};
   return [
-    { label: "Notes", value: Number(stats.documents || 0), tone: "primary" },
+    { label: "Sources", value: Number(stats.tracked_sources || 0), tone: "primary" },
     { label: "Nodes", value: Number(stats.nodes || 0), tone: "info" },
     { label: "Searches", value: Number(since.searches || 0), tone: "ok" },
     { label: "Feedback", value: Number(since.feedback || 0), tone: "attention" },

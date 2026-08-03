@@ -123,7 +123,7 @@ def test_cli_mesh_renderer_reads_since_restart() -> None:
     rendered = _render_mesh(
         {
             "stats": {
-                "documents": 12,
+                "tracked_sources": 12,
                 "nodes": 30,
                 "edges": 45,
                 "since_restart": {"searches": 3, "errors": 1, "started_at": "2026-08-03T00:00:00Z"},
@@ -133,4 +133,4 @@ def test_cli_mesh_renderer_reads_since_restart() -> None:
     )
 
     assert "3 searches since restart" in rendered
-    assert "12 documents" in rendered
+    assert "12 tracked sources" in rendered

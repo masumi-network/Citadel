@@ -1759,7 +1759,7 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
         return value if isinstance(value, int) else 0
 
     parts = [
-        f"{paint(str(num(stats, 'documents')), 'bold', enable=color)} documents",
+        f"{paint(str(num(stats, 'tracked_sources')), 'bold', enable=color)} tracked sources",
         f"{num(stats, 'nodes')} nodes",
         f"{num(stats, 'edges')} edges",
         f"{num(since, 'searches')} searches since restart",

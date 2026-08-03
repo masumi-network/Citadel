@@ -4345,11 +4345,27 @@ async def _corpus_health() -> dict[str, Any]:
         tracked += int(linear_status.get("issue_count") or 0)
         counts = await get_citadel()._graph_counts()
         indexed = int(counts.get("nodes") or 0)
+        # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
+        # back in the same call for free. /api/mesh used to publish the in-memory
+        # projection's edge count at the top level instead (24x understated live),
+        # so this is the real total that field needs.
+        edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {"ok": ok, "tracked_sources": tracked, "indexed_docs": indexed}
+        return {
+            "ok": ok,
+            "tracked_sources": tracked,
+            "indexed_docs": indexed,
+            "indexed_edges": edges,
+        }
     except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
         logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": str(exc)}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": str(exc),
+        }
 
 
 @app.get("/readyz")
