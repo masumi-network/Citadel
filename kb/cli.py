@@ -36,7 +36,13 @@ from kb.capture_config import (
     normalize_tags,
     save_capture_config,
 )
-from kb.capture import build_capture_payload, capture_token, post_capture
+from kb.capture import (
+    build_capture_payload,
+    capture_token,
+    http_timeout_seconds,
+    is_timeout_error,
+    post_capture,
+)
 from kb.capture_roots_sync import sync_local_capture_roots_to_server, sync_warning_message
 from kb.onboard import (
     TOKEN_ENV,
@@ -1056,17 +1062,19 @@ async def _capture(args: argparse.Namespace) -> int:
     if not token:
         return _emit_no_token("capture", as_json=getattr(args, "json", False))
 
+    # Per-root truth contract: ok=True stored, ok=False definitively not stored
+    # (reason/error says why), ok=None unknown (client timed out; the server may
+    # still have completed the write). Exit 0 only when every root is stored or
+    # already present on the server; a duplicate skip is a no-op, not a failure.
     as_json = getattr(args, "json", False)
     results: list[dict[str, Any]] = []
     failures = 0
+    unknowns = 0
     auth_fail_code = 0
+    timeout_seconds = http_timeout_seconds()
     for root, payload in payloads:
         try:
             response = post_capture(config.node_url, token, payload)
-            status = response.get("cognee_result", {}).get("status") or response.get("status")
-            results.append({"root": root.path, "ok": True, "status": status, "tags": payload["tags"]})
-            if not as_json:
-                print(f"OK  {root.path} ({status})")
         except urllib.error.HTTPError as exc:
             failures += 1
             auth_fail_code = auth_fail_code or exc.code
@@ -1074,18 +1082,75 @@ async def _capture(args: argparse.Namespace) -> int:
             results.append({"root": root.path, "ok": False, "error": f"HTTP {exc.code} {detail}"})
             if not as_json:
                 print(f"FAIL {root.path}: HTTP {exc.code} {detail}", file=sys.stderr)
+            continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            # Node unreachable / DNS / timeout / non-HTTPS URL — isolate per root.
-            failures += 1
-            results.append({"root": root.path, "ok": False, "error": str(exc)})
+            if is_timeout_error(exc):
+                # A read timeout proves only that the client stopped waiting.
+                # A production write was observed landing after the deadline,
+                # so this outcome is unknown, never a claimed failure.
+                unknowns += 1
+                detail = (
+                    f"no response within {timeout_seconds:.0f}s; "
+                    "the write may still have completed on the server"
+                )
+                results.append({"root": root.path, "ok": None, "error": detail})
+                if not as_json:
+                    print(f"UNKNOWN {root.path}: {detail}", file=sys.stderr)
+            else:
+                # Node unreachable / DNS / non-HTTPS URL: isolate per root.
+                failures += 1
+                results.append({"root": root.path, "ok": False, "error": str(exc)})
+                if not as_json:
+                    print(f"FAIL {root.path}: {exc}", file=sys.stderr)
+            continue
+        # HTTP 200 is not proof of storage: the server states its decision in
+        # `accepted`. Only an explicit false is a rejection (legacy bodies
+        # without the field keep the old 200-means-stored contract).
+        accepted = response.get("accepted") is not False
+        reason = response.get("reason")
+        cognee_result = response.get("cognee_result")
+        status = (
+            cognee_result.get("status") if isinstance(cognee_result, dict) else None
+        ) or response.get("status")
+        if accepted:
+            results.append(
+                {"root": root.path, "ok": True, "status": status, "tags": payload["tags"]}
+            )
             if not as_json:
-                print(f"FAIL {root.path}: {exc}", file=sys.stderr)
+                print(f"OK  {root.path} ({status})")
+        elif reason == "duplicate_in_process":
+            # The server already holds identical content, so the desired end
+            # state exists. Visible skip, exit 0: failing here would teach
+            # automation to ignore exit codes on every unchanged re-run.
+            results.append(
+                {"root": root.path, "ok": False, "reason": reason, "tags": payload["tags"]}
+            )
+            if not as_json:
+                print(f"SKIP {root.path}: nothing stored ({reason})")
+        else:
+            failures += 1
+            results.append(
+                {
+                    "root": root.path,
+                    "ok": False,
+                    "reason": reason or "rejected",
+                    "tags": payload["tags"],
+                }
+            )
+            if not as_json:
+                print(f"FAIL {root.path}: nothing stored ({reason or 'rejected'})", file=sys.stderr)
     if not as_json and auth_fail_code:
         _print_auth_hint("capture", auth_fail_code)  # once, not per failing root
+    if not as_json and unknowns:
+        print(
+            "Re-run `citadel capture` to confirm: a write that landed after the "
+            "timeout will show as SKIP (duplicate_in_process).",
+            file=sys.stderr,
+        )
     if as_json:
-        _print_json({"ok": failures == 0, "results": results})
-    # Human mode already printed a per-root OK/FAIL line during the loop.
-    return 1 if failures else 0
+        _print_json({"ok": failures == 0 and unknowns == 0, "results": results})
+    # Human mode already printed a per-root OK/SKIP/UNKNOWN/FAIL line during the loop.
+    return 1 if failures or unknowns else 0
 
 
 def _promotion_base_url(args: argparse.Namespace) -> str:
