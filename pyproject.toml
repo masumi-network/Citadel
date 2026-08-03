@@ -29,9 +29,9 @@ dependencies = []
 [project.optional-dependencies]
 # `pip install citadel-archive[server]` — run the Node/MCP server + sync jobs.
 server = [
-    "aiohttp>=3.14.1,<4.0.0",
+    "aiohttp>=3.14.3,<4.0.0",
     "cognee[fastembed,postgres-binary]>=1.2.2,<2.0.0",
-    "cryptography>=48.0.1,<49.0.0",
+    "cryptography>=50.0.0,<51.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
     "mcp>=1.28.1,<2.0.0",
