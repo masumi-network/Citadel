@@ -77,10 +77,16 @@ def test_distill_produces_nonempty_short_note() -> None:
     assert "sync_session.py" in note
 
 
-def test_distill_empty_transcript_is_safe() -> None:
-    note = sync_session.distill_transcript([])
-    assert isinstance(note, str)
-    assert note.strip()  # still a valid (placeholder) note, never crashes
+def test_distill_empty_transcript_returns_empty() -> None:
+    # An empty session has nothing worth storing. Returning "" lets the hook
+    # skip the send instead of shipping a constant placeholder note.
+    assert sync_session.distill_transcript([]) == ""
+
+
+def test_distill_files_only_session_still_produces_note() -> None:
+    # A session with edits but no prompt/outcome text is NOT empty.
+    note = sync_session.distill_transcript([_assistant_edit("a.py")])
+    assert "a.py" in note
 
 
 # --- size cap ---------------------------------------------------------------
@@ -254,3 +260,138 @@ def test_run_swallows_post_errors(monkeypatch: Any, tmp_path: Path) -> None:
 def test_run_handles_garbage_stdin() -> None:
     # Non-JSON STDIN must not crash; clean exit.
     assert sync_session.run(io.StringIO("not json at all {{{")) == 0
+
+
+# --- receipts tell the truth about what the server decided -------------------
+
+
+def _hook_payload(path: Path, tmp_path: Path) -> str:
+    return json.dumps(
+        {
+            "transcript_path": str(path),
+            "cwd": str(tmp_path),
+            "session_id": "s1",
+            "hook_event_name": "SessionEnd",
+        }
+    )
+
+
+def _fake_urlopen_with_body(monkeypatch: Any, body: bytes) -> None:
+    class _Resp:
+        def __enter__(self) -> "_Resp":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return body
+
+    monkeypatch.setattr(
+        sync_session.urllib.request, "urlopen", lambda request, timeout=None: _Resp()
+    )
+
+
+def _receipt_text() -> str:
+    from kb.hooks.receipt import activity_log_path
+
+    path = activity_log_path()
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_receipt_on_accepted_says_captured(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+    _fake_urlopen_with_body(
+        monkeypatch,
+        json.dumps({"accepted": True, "reason": "accepted", "cognee_result": {}}).encode(),
+    )
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "session captured" in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_records_rejection_not_capture(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+    _fake_urlopen_with_body(
+        monkeypatch,
+        json.dumps(
+            {
+                "accepted": False,
+                "reason": "duplicate_in_process",
+                "dataset": "seat:test",
+                "tags": ["dev-session"],
+                "cognee_result": None,
+            }
+        ).encode(),
+    )
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "not stored" in receipt
+    assert "duplicate_in_process" in receipt
+    assert "session captured" not in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_on_unreadable_body_does_not_claim_capture(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+    _fake_urlopen_with_body(monkeypatch, b"not json")
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "unreadable" in receipt
+    assert "session captured" not in receipt
+
+
+def test_receipt_on_timeout_says_write_may_have_completed(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(sync_session, "post_ingest", boom)
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "may still have completed" in receipt
+    assert "session captured" not in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_on_send_failure_names_class_only(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("boom with sensitive detail")
+
+    monkeypatch.setattr(sync_session, "post_ingest", boom)
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "not captured" in receipt
+    assert "RuntimeError" in receipt
+    assert "sensitive detail" not in receipt
+    assert "session captured" not in receipt
+
+
+def test_empty_session_is_not_sent(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    recorder = _RecordingPost()
+    monkeypatch.setattr(sync_session, "post_ingest", recorder)
+    path = _write_transcript(tmp_path, [], monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    assert recorder.calls == []  # nothing extractable -> nothing sent
+    receipt = _receipt_text()
+    assert "skipped" in receipt
+    assert "captured" not in receipt
