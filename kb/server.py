@@ -160,6 +160,9 @@ _INDEXED_FLOOR = 1
 # budget (both would 429). Same limiter shape, independent counters.
 _search_inflight = 0
 _mesh_graph_inflight = 0
+# The corpus census budget is separate for the same reason mesh's is: an admin
+# paging the corpus during an evolve pass must not eat /search's slots.
+_corpus_inflight = 0
 
 
 class _SearchSlot:
@@ -598,25 +601,25 @@ def _content_security_policy(style_src: str) -> str:
 
 CONTENT_SECURITY_POLICY = _content_security_policy("'self'")
 
-# The landing page carries an interactive pipeline diagram built on React Flow,
-# which positions every node and the viewport by writing an inline `transform`
-# style attribute. That is not something the library can be configured out of,
-# so the one page that renders it gets 'unsafe-inline' for styles and nothing
-# else. Script execution stays restricted to same-origin files on every page.
+# The relaxed variant is kept so a page can only ever reach it through the
+# explicit opt-in set below, never by accident. No page uses it today.
+#
+# The landing page's React Flow diagram was the one candidate: it positions
+# every node and the viewport by writing inline `transform` styles, and the
+# library cannot be configured out of that. But it writes them through the
+# CSSOM (element.style), which style-src does not govern; the directive
+# covers <style> elements and style attributes arriving in markup. Measured
+# before the exemption was removed: under style-src 'self' the diagram
+# rendered identically, with zero securitypolicyviolation events (Chrome;
+# the CSSOM carve-out is spec behaviour). Script execution stays restricted
+# to same-origin files on every page under both policies.
 CONTENT_SECURITY_POLICY_INLINE_STYLE = _content_security_policy("'self' 'unsafe-inline'")
 
 # Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-# Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-#
-# Only / is here, because only / renders the React Flow pipeline diagram, which
-# positions its nodes with inline `transform` styles and cannot be configured
-# out of it. The page holds no token and no user data, which is why this is an
-# acceptable trade there and would not be on /app or /login.
-CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset({"/"})
+# policy. It is empty: every route, / and its React Flow diagram included,
+# gets the strict policy above. Adding a path here is a security decision;
+# the tests pin this set so it cannot grow in passing.
+CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset()
 
 
 def content_security_policy_for(path: str) -> str:
@@ -805,8 +808,18 @@ class IngestBody(BaseModel):
     cognify: bool = False
 
 
+# Upper bound on a search query, in the same spirit as SearchBody's other
+# string fields (repo 200, path 400, mode 32) — it was the one that could grow
+# without limit. Sized against the longest queries this repo actually asks: 99
+# characters in the bench corpus (scripts/bench/golden_questions.json, "What is
+# the full postgres connection string ...") and 38 in the test suite. Queries
+# are typed or composed by an agent, never built by concatenating file content,
+# so 2000 leaves a pasted paragraph plenty of room while still being a bound.
+MAX_SEARCH_QUERY_LENGTH = 2000
+
+
 class SearchBody(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=MAX_SEARCH_QUERY_LENGTH)
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)
@@ -2959,6 +2972,23 @@ async def next_app_view(view: str, request: Request) -> Response:
     return next_app_page(request, f"app/{view}", minimum_role)
 
 
+# The theme bootstrap. Every exported page loads it from <head> before paint,
+# but it is neither a page (the `{page}` allow-list below serves HTML by exact
+# name and stays closed to other filenames) nor a build asset (the static
+# mount covers only /next/_next). So: one literal route, no path parameter.
+#
+# The media type is pinned rather than guessed from the filename, because the
+# site sends X-Content-Type-Options: nosniff and a browser refuses to execute
+# a script that arrives as anything but JavaScript.
+@app.get("/next/theme.js", include_in_schema=False)
+async def next_theme_js() -> FileResponse:
+    script = WEBUI_DIR / "theme.js"
+    if not script.is_file():
+        # A source checkout that has not run `npm run build:web`.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(script, media_type="text/javascript; charset=utf-8")
+
+
 # The rebuilt public pages, one preview route each. Exact names, not a path
 # parameter used as a filename: the export is a directory and "../" is a
 # filename too.
@@ -3506,6 +3536,203 @@ async def access_snapshot(
         # The oldest id on this page. Pass it back as `cursor` for the next,
         # older page. Null when there is nothing older left.
         "next_cursor": (page[0].get("id") if start > 0 and page and isinstance(page[0], dict) else None),
+    }
+
+
+CORPUS_DEFAULT_LIMIT = 200
+CORPUS_MAX_LIMIT = 1000
+CORPUS_INFLIGHT_LIMIT = 2
+# A census cursor is (created_at, id) and only moves forward. One row with a
+# future-dated created_at would otherwise become a cursor no real row can ever
+# exceed, stalling every later page while the endpoint reports ok. Clamp the
+# timestamp to now+skew when a cursor is BUILT and again when one is READ BACK
+# (a stored cursor outlives the request that built it). The cost is bounded:
+# rows inside the skew window can repeat across pages, which beats never
+# seeing a row again.
+CORPUS_CURSOR_MAX_SKEW_SECONDS = 300.0
+
+
+def _encode_corpus_cursor(created_at_iso: str, document_id: str) -> str:
+    import base64
+
+    payload = json.dumps(
+        {"t": created_at_iso, "id": document_id}, separators=(",", ":")
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_corpus_cursor(cursor: str | None) -> "tuple[Any, str] | None":
+    """(created_at, id) out of an opaque cursor, or None to start from the top.
+
+    Malformed and stale cursors restart the walk rather than 4xx — the same
+    stance /api/access takes, so a saved cursor can never wedge the caller.
+    """
+    import base64
+    from datetime import datetime, timezone
+
+    if not cursor:
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        created_at = datetime.fromisoformat(str(payload["t"]))
+        document_id = str(payload["id"])
+    except Exception:  # noqa: BLE001 - any malformed cursor means start over
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at, document_id
+
+
+def _clamp_corpus_cursor_time(created_at: Any) -> Any:
+    from datetime import datetime, timedelta, timezone
+
+    ceiling = datetime.now(timezone.utc) + timedelta(
+        seconds=CORPUS_CURSOR_MAX_SKEW_SECONDS
+    )
+    return min(created_at, ceiling)
+
+
+@app.get("/api/corpus")
+async def corpus_census(
+    request: Request,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Row-level census of the corpus, from the durable relational store.
+
+    Nothing else on the node can enumerate the corpus: /api/mesh/graph caps at
+    1000 nodes and returns labels only, and per-source "documents" counters
+    are sync-state bookkeeping. This pages over the rows cognee writes when it
+    accepts content, and marks each row with whether the vector store
+    (``chunk_count``) and the graph (``in_graph``) have actually seen it —
+    the difference between "accepted but never indexed" and "indexed".
+
+    Presence flags degrade to null with a top-level note, never to 0: a 0 is a
+    measurement ("we looked, nothing there") and null is "this node could not
+    look", and cleanup decisions hang on that difference. Totals report both
+    the unscoped corpus and the default-owner slice so rows under another
+    owner_id surface instead of silently vanishing from the count.
+    """
+    from datetime import datetime, timezone
+
+    require_access(request, "admin", "audit:read")
+
+    cognee_client = getattr(get_citadel(), "cognee", None)
+    corpus_page = getattr(cognee_client, "corpus_page", None)
+    corpus_totals = getattr(cognee_client, "corpus_totals", None)
+    if not callable(corpus_page) or not callable(corpus_totals):
+        raise HTTPException(
+            status_code=503, detail="Corpus census is unavailable on this node."
+        )
+
+    if limit is None:
+        page_size = CORPUS_DEFAULT_LIMIT
+    else:
+        page_size = max(1, min(int(limit), CORPUS_MAX_LIMIT))
+
+    after = _decode_corpus_cursor(cursor)
+    after_created_at: str | None = None
+    after_id: str | None = None
+    if after is not None:
+        after_created_at = _clamp_corpus_cursor_time(after[0]).isoformat()
+        after_id = after[1]
+
+    with _SearchSlot(CORPUS_INFLIGHT_LIMIT, "_corpus_inflight"):
+        # One extra row decides has_more, so next_cursor is null exactly at the
+        # end instead of costing every caller a final empty page.
+        rows = list(
+            await corpus_page(
+                after_created_at=after_created_at,
+                after_id=after_id,
+                limit=page_size + 1,
+            )
+            or []
+        )
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        totals = await corpus_totals()
+
+        notes: list[str] = []
+        document_ids = [str(row["id"]) for row in rows if row.get("id")]
+
+        chunk_counts: dict[str, int] | None = None
+        try:
+            chunk_counts_read = getattr(cognee_client, "corpus_chunk_counts", None)
+            if callable(chunk_counts_read):
+                chunk_counts = await chunk_counts_read(document_ids)
+        except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
+            logger.exception("corpus census: chunk-count lookup failed")
+        if chunk_counts is None:
+            notes.append(
+                "chunk_count was not determined for this page (vector store "
+                "lookup unavailable); null means not measured, not zero"
+            )
+
+        in_graph_ids: set[str] | None = None
+        try:
+            graph_presence_read = getattr(cognee_client, "corpus_graph_presence", None)
+            if callable(graph_presence_read):
+                in_graph_ids = await graph_presence_read(document_ids)
+        except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
+            logger.exception("corpus census: graph presence lookup failed")
+        if in_graph_ids is None:
+            notes.append(
+                "in_graph was not determined for this page (graph lookup "
+                "unavailable); null means not measured, not absent"
+            )
+        elif document_ids and not in_graph_ids:
+            # The graph adapter answers a FAILED batch lookup and a no-match
+            # batch identically (empty), so an all-absent page is a weaker
+            # claim than a mixed one. Say so instead of letting false read as
+            # fully attested.
+            notes.append(
+                "no document on this page was found in the graph; the graph "
+                "adapter reports a failed lookup the same way as no matches, "
+                "so treat an all-absent page as weakly attested"
+            )
+
+        for row in rows:
+            row_id = str(row.get("id"))
+            row["chunk_count"] = (
+                None if chunk_counts is None else int(chunk_counts.get(row_id, 0))
+            )
+            row["in_graph"] = (
+                None if in_graph_ids is None else (row_id in in_graph_ids)
+            )
+
+        next_cursor: str | None = None
+        if has_more and rows:
+            last = rows[-1]
+            last_created_at = last.get("created_at")
+            last_id = last.get("id")
+            if last_created_at and last_id:
+                parsed = datetime.fromisoformat(str(last_created_at))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                next_cursor = _encode_corpus_cursor(
+                    _clamp_corpus_cursor_time(parsed).isoformat(), str(last_id)
+                )
+            else:
+                notes.append(
+                    "pagination stopped early: the page ends on a row without "
+                    "created_at/id, which cannot form a cursor"
+                )
+
+        other_owner_rows = int(totals.get("documents_other_owners") or 0)
+        if other_owner_rows > 0:
+            notes.append(
+                f"{other_owner_rows} rows belong to owners other than the "
+                "default user and are invisible to owner-scoped reads"
+            )
+
+    return {
+        "ok": True,
+        "documents": rows,
+        "documents_returned": len(rows),
+        "documents_total": totals.get("documents"),
+        "next_cursor": next_cursor,
+        "totals": totals,
+        "notes": notes,
     }
 
 

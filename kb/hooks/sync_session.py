@@ -214,12 +214,17 @@ def build_tags(cwd: str) -> list[str]:
     return tags
 
 
-def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> None:
+def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[str, Any] | None:
     """POST {data, tags} to {base}/ingest over HTTPS. No dataset field.
 
     Personal-by-default: omitting ``dataset`` lets the seat-writer token's
     ``default_dataset=seat:{slug}`` route the write to the dev's private node.
-    HTTPS is required. Raises on any transport problem; the caller swallows it.
+    HTTPS is required. Raises on any transport problem; the caller handles it.
+
+    Returns the parsed JSON response body (or ``None`` when the 2xx body is not
+    a JSON object): a 2xx alone is not proof of storage, because the server
+    states its decision in the body's ``accepted``/``reason`` fields and the
+    receipt must record that decision, not the transport outcome.
     """
     if not base_url.lower().startswith("https://"):
         # HTTPS-only invariant: never send a token over plaintext.
@@ -236,8 +241,45 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> None:
         },
     )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        # Drain so the connection closes cleanly; status is enough.
-        response.read()
+        raw = response.read()
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def receipt_summary(response: dict[str, Any] | None) -> str:
+    """Receipt line for a completed POST, mirroring the server's decision."""
+    if response is None:
+        return "session sent: server replied 2xx but the response body was unreadable"
+    if response.get("accepted") is not False:
+        return "session captured → your Node"
+    reason = response.get("reason") or "rejected"
+    return f"session not stored: server rejected the write ({reason})"
+
+
+def _send_failure_summary(exc: BaseException) -> str:
+    """Receipt line for a POST that raised before a response was read."""
+    if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+        # A client timeout is not proof of failure: the server can finish the
+        # write after the deadline, so the honest verdict is "unconfirmed".
+        return (
+            f"session capture unconfirmed: no response within {HTTP_TIMEOUT_SECONDS}s; "
+            "the write may still have completed on the server"
+        )
+    # Class name only: an exception message could echo request details.
+    return f"session not captured: send failed ({exc.__class__.__name__})"
+
+
+def _write_receipt(summary: str) -> None:
+    """Best-effort DX-5 receipt (never raises, never surfaces the token)."""
+    try:
+        from kb.hooks.receipt import write_receipt
+
+        write_receipt("session", summary)
+    except Exception:
+        pass
 
 
 def run(stream_in: Any) -> int:
@@ -259,17 +301,24 @@ def run(stream_in: Any) -> int:
 
         note = distill_transcript(entries)
         if not note.strip():
+            # Nothing extractable, so nothing is sent. A constant placeholder
+            # note carries zero session content; the receipt still records that
+            # the hook ran and chose to skip.
+            _write_receipt("session skipped: no extractable session content (nothing sent)")
             return 0
 
         note = _truncate_utf8(note, _max_ingest_bytes())
         tags = build_tags(cwd if isinstance(cwd, str) else "")
 
-        post_ingest(_base_url(), token, note, tags)
-        # DX-5 receipt: make the silent session capture visible (never raises,
-        # never surfaces the token; any failure is caught below).
-        from kb.hooks.receipt import write_receipt
-
-        write_receipt("session", "session captured → your Node")
+        # DX-5 receipt: make the silent session capture visible AND truthful.
+        # The receipt records what the server said (or that we cannot know),
+        # never an unconditional "captured".
+        try:
+            response = post_ingest(_base_url(), token, note, tags)
+        except Exception as exc:
+            _write_receipt(_send_failure_summary(exc))
+            return 0
+        _write_receipt(receipt_summary(response))
     except Exception:
         # Fail-silent: never block session close, never surface the token.
         return 0

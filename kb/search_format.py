@@ -34,7 +34,15 @@ ACTIVITY_RE = re.compile(
 # its commit and its blob is source-linked repository documentation, whatever
 # else its text may coincidentally match.
 REPO_CONTENT_HEADER_RE = re.compile(
-    r"^#\s+[\w.-]+/[\w.-]+/\S+\s*\n\s*\n"
+    # The title line's trailing whitespace is `[^\S\n]*` (horizontal whitespace)
+    # rather than `\s*` so it cannot compete with the `\n` right after it for
+    # the same newline. With `\s*` a run of blank lines could be divided between
+    # the two in many ways and the engine tried them all, so matching cost grew
+    # faster than the document; pinning the split keeps it proportional. The
+    # PARSE variant below already spells this junction the same way. The set of
+    # accepted headers is unchanged: \r, \f and \v still match here, only \n is
+    # excluded, and \n is what the literal that follows consumes.
+    r"^#\s+[\w.-]+/[\w.-]+/\S+[^\S\n]*\n\s*\n"
     r"Repository:\s*\S+\s*\n"
     r"Source:\s*https?://\S+\s*\n"
     r"Commit:\s*\S+\s*\n"
@@ -141,7 +149,14 @@ HEX_ASSET_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{56,})(?![0-9a-fA-F])")
 TOKEN_ASSET_QUERY_RE = re.compile(
     r"\b("
     r"usdcx|usdm|tusdm|payment\s*token|asset\s*id|policy\s*id|token\s*unit|"
-    r"payment\s*unit|mainnet\s+asset|fingerprint|policy\s*\+?\s*asset"
+    # `policy\s*(?:\+\s*)?asset` rather than `policy\s*\+?\s*asset`: the optional
+    # `+` is grouped with the whitespace that may follow it, so a run of spaces
+    # between the two words has exactly one possible split instead of one per
+    # space. Every alternative here is now proportional to the length of the
+    # query rather than growing faster than it. The accepted strings are
+    # identical: policyasset, policy asset, policy+asset, policy + asset and
+    # policy  +  asset all still match.
+    r"payment\s*unit|mainnet\s+asset|fingerprint|policy\s*(?:\+\s*)?asset"
     r")\b",
     re.IGNORECASE,
 )

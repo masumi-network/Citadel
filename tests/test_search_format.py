@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import re
+import time
+from collections.abc import Callable
+
+import pytest
+
+from kb import search_format, session_trace
 from kb.search_format import (
+    DOC_TYPE_CANONICAL,
     apply_query_ranking,
     apply_spec_mode_ranking,
     extract_hex_needles,
@@ -486,3 +494,177 @@ def test_updated_at_survives_the_real_production_hit_shape() -> None:
     normalized = normalize_search_hit(hit)
     assert normalized["updated_at"] == "2026-06-29T14:10:08+00:00"
     assert isinstance(normalized["updated_at"], str)
+
+
+# --- input hardening: matching cost stays proportional to input size ---------
+#
+# Every pattern below is applied to text this module does not control: a query
+# the caller typed, or the body of a document some contributor got ingested.
+# A pattern whose cost grows faster than its input turns a merely long string
+# into a slow one, and these run on the request path where that time is not
+# otherwise bounded. The guard is a table so a newly added pattern has to
+# declare a worst-case input before it can ship (see the coverage test below).
+
+# Big enough that a pattern growing faster than its input misses the budget by
+# a wide margin, small enough that a proportional one finishes in ~1ms.
+_LARGE_INPUT = 40_000
+# Deliberately loose. On this machine every pattern below finishes in under
+# 10ms, so a ~200x cushion absorbs a slow or loaded CI box without letting a
+# disproportionate pattern through.
+_PROPORTIONAL_BUDGET_SECONDS = 2.0
+
+_HEX56 = "a" * 56
+
+# (pattern name, method, builder taking the input size)
+_WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = [
+    ("SPEC_QUERY_RE", "search", lambda n: "request" + " " * n),
+    ("SPEC_QUERY_RE", "search", lambda n: "status" + " " * n),
+    ("SPEC_QUERY_RE", "search", lambda n: "mip-" + "1" * n),
+    ("SPEC_PATH_RE", "search", lambda n: "mip-" + "1" * n),
+    ("SPEC_PATH_RE", "search", lambda n: "." * n + "yml"),
+    ("ACTIVITY_RE", "search", lambda n: "linear" + " " * n),
+    ("ACTIVITY_RE", "search", lambda n: "linear" + " " * n + "x"),
+    ("ACTIVITY_RE", "search", lambda n: "linear " * (n // 7)),
+    ("ACTIVITY_RE", "search", lambda n: "daily" + " " * n),
+    ("REPO_CONTENT_HEADER_RE", "search", lambda n: "# a/b/c" + "\n" * n),
+    ("REPO_CONTENT_HEADER_RE", "search", lambda n: "# a/b/c" + " \n" * (n // 2)),
+    ("REPO_CONTENT_HEADER_PARSE_RE", "match", lambda n: "# a/b/c" + "\n" * n),
+    ("REPO_CONTENT_HEADER_PARSE_RE", "match", lambda n: " " * n + "#x"),
+    ("LINEAR_HEADER_PARSE_RE", "match", lambda n: " " * n + "# Linear"),
+    ("LINEAR_HEADER_PARSE_RE", "match", lambda n: "# Linear" + "\t" * n),
+    ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **URL:** v" + " " * n),
+    ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **" + "A" * n),
+    ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "-" + " " * n),
+    ("HEX_ASSET_RE", "findall", lambda n: "a" * n),
+    ("HEX_ASSET_RE", "findall", lambda n: (_HEX56[:-1] + "z") * (n // 56)),
+    ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "policy" + " " * n),
+    ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "policy" + " " * n + "+"),
+    ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "policy" + " +" * (n // 2)),
+    ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "payment" + " " * n),
+    ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "mainnet" + " " * n),
+    ("_QUERY_TOKEN_RE", "findall", lambda n: "a" * n),
+    ("_QUERY_TOKEN_RE", "findall", lambda n: "a." * (n // 2)),
+    ("_GITHUB_REPO_URL_RE", "search", lambda n: "github.com/" + "a" * n),
+    ("_GITHUB_REPO_URL_RE", "search", lambda n: "github.com/" + "a/" * (n // 2)),
+    ("_GITHUB_REPO_URL_RE", "search", lambda n: "github.com/a/b " * (n // 15)),
+]
+
+_SESSION_TRACE_WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = [
+    ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:" + " " * n),
+    ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:" + "\n" * n),
+    ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:\n" * (n // 13)),
+]
+
+
+def _module_patterns(module: object) -> dict[str, re.Pattern[str]]:
+    return {
+        name: value
+        for name, value in vars(module).items()
+        if isinstance(value, re.Pattern)
+    }
+
+
+@pytest.mark.parametrize(
+    ("module", "table"),
+    [
+        (search_format, _WORST_CASE_INPUTS),
+        (session_trace, _SESSION_TRACE_WORST_CASE_INPUTS),
+    ],
+    ids=["search_format", "session_trace"],
+)
+def test_every_pattern_has_a_declared_worst_case_input(
+    module: object, table: list[tuple[str, str, Callable[[int], str]]]
+) -> None:
+    """A pattern added without a worst-case input fails here, not in production."""
+    declared = {name for name, _method, _build in table}
+    compiled = set(_module_patterns(module))
+
+    assert compiled - declared == set(), (
+        f"{getattr(module, '__name__', module)} patterns with no worst-case input "
+        f"declared in the timing guard: {sorted(compiled - declared)}"
+    )
+    assert declared - compiled == set(), (
+        f"timing guard names patterns that no longer exist: {sorted(declared - compiled)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "table"),
+    [
+        (search_format, _WORST_CASE_INPUTS),
+        (session_trace, _SESSION_TRACE_WORST_CASE_INPUTS),
+    ],
+    ids=["search_format", "session_trace"],
+)
+def test_pattern_cost_stays_proportional_to_input_size(
+    module: object, table: list[tuple[str, str, Callable[[int], str]]]
+) -> None:
+    """Matching a long input costs about what its length suggests, not more.
+
+    A pattern that can split the same run of whitespace many ways re-tries every
+    split, so its cost climbs far faster than the text it is reading. These are
+    read from caller-supplied queries and ingested document bodies, so the
+    length of the input is not something this module gets to assume.
+    """
+    patterns = _module_patterns(module)
+    over_budget: list[str] = []
+
+    for name, method, build in table:
+        text = build(_LARGE_INPUT)
+        run = getattr(patterns[name], method)
+        started = time.perf_counter()
+        run(text)
+        elapsed = time.perf_counter() - started
+        if elapsed > _PROPORTIONAL_BUDGET_SECONDS:
+            over_budget.append(f"{name}.{method} on {len(text)} chars took {elapsed:.2f}s")
+
+    assert not over_budget, (
+        "matching cost grew faster than the input for: " + "; ".join(over_budget)
+    )
+
+
+def test_token_asset_query_accepts_the_same_spellings_of_policy_asset() -> None:
+    """The linear spelling of the policy/asset alternative changes no verdicts."""
+    for query in (
+        "policyasset",
+        "policy asset",
+        "policy+asset",
+        "policy + asset",
+        "policy  +  asset",
+        "policy\t+\tasset",
+        "POLICY+ASSET",
+        "what is the policy+asset for usdm",
+    ):
+        assert is_token_asset_query(query), query
+
+    for query in (
+        "policyholder assets",
+        "the policy of the company",
+        "policy++asset",
+        "what did the team ship this week",
+    ):
+        assert not is_token_asset_query(query), query
+
+
+def test_repo_content_header_still_classifies_a_synced_document() -> None:
+    """Narrowing the title-line junction keeps real syncer output matching."""
+    header = (
+        "# masumi-network/Citadel/kb/server.py\n"
+        "\n"
+        "Repository: masumi-network/Citadel\n"
+        "Source: https://github.com/masumi-network/Citadel/blob/abc123/kb/server.py\n"
+        "Commit: abc123\n"
+        "Blob: deadbeef\n"
+        "\n"
+        "def search(): ...\n"
+    )
+    assert infer_doc_type({"text": header}) == DOC_TYPE_CANONICAL
+
+    # Carriage returns and extra blank lines still match, as they did before.
+    assert search_format.REPO_CONTENT_HEADER_RE.search(
+        header.replace("kb/server.py\n\n", "kb/server.py\r\n\n\n", 1)
+    )
+    # A document that only mentions the words does not.
+    assert not search_format.REPO_CONTENT_HEADER_RE.search(
+        "Repository: a/b talked about in prose\nSource: none\n"
+    )
