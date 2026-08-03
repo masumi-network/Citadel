@@ -1,5 +1,13 @@
 # Citadel Defines The Retrieval Interface; The Engine Is An Implementation
 
+- Status: Accepted
+- Date: 2026-08-03
+- Relates to: [ADR-0009](0009-mesh-read-isolation-presence-vs-content.md),
+  [ADR-0010](0010-structured-knowledge-durable-source-of-truth.md),
+  [ADR-0015](0015-one-process-owns-the-graph.md),
+  [ADR-0017](0017-structural-provenance-outranks-inherited-trust.md). Builds
+  the `RetrievalBackend` seam ADR-0010 named and left unbuilt.
+
 cognee is a library Citadel calls rather than a component Citadel contains.
 `kb/cognee_client.py` is 1784 lines carrying 45 separate `import cognee` /
 `from cognee ...` statements spread across 19 distinct functions and methods,
@@ -17,8 +25,8 @@ implementation behind it.** Ranking and provenance stamping live in Citadel's
 layer, not upstream's.
 
 The decisive evidence is that ranking cannot come from upstream at any version.
-In the pinned release, `PGVectorAdapter.retrieve()` returns
-`ScoredResult(..., score=0)` for every row
+In the pinned release, which is cognee 1.2.2 in the installed distribution,
+`PGVectorAdapter.retrieve()` returns `ScoredResult(..., score=0)` for every row
 (`cognee/infrastructure/databases/vector/pgvector/PGVectorAdapter.py:459`), and
 `ChunksRetriever.get_completion_from_context()` hands back
 `found_chunk.payload` only, dropping the vector engine's real cosine distance
@@ -26,11 +34,14 @@ before it can reach a caller. Both are still true in cognee 1.4.1, the current
 upstream release: the hardcoded zero moves to line 464 of the same file and
 `chunks_retriever.py` is byte-identical between the two versions, as is
 `SearchResultPayload`, which carries `result_object`, `context`, `completion`,
-and dataset identifiers, and no score field of any kind. The community pull
-request that would have exposed a real result score and a `max_distance` cutoff
-for chunks and summaries, topoteretes/cognee#2945, was closed on 2026-07-07
-without being merged. Upgrading the pin does not fix this. Upgrading twice does
-not fix it either.
+and dataset identifiers, and no score field of any kind. That comparison was
+established by byte-diffing 1.4.1 against the installed 1.2.2 on 2026-08-03;
+1.4.1 is not present in this repository, so the 1.4.1 half is not re-checkable
+from it. The community pull request that would have exposed a real result score
+and a `max_distance` cutoff for chunks and summaries, topoteretes/cognee#2945,
+was closed on 2026-07-07 without being merged, read from the pull request on
+2026-08-03. Upgrading the pin does not fix this. Upgrading twice does not fix
+it either.
 
 So the interface is not architecture for its own sake. It is where scoring has
 to live, because no upstream version puts a score where a caller can read one,
@@ -88,8 +99,9 @@ such type exists in `kb/` today, which is why in principle is where it stayed.
   handles, dataset row models, or any type imported from the implementation.
   Nothing above the boundary may learn which engine is behind it. Concretely,
   new code importing `cognee` outside the adapter is forbidden, and the one
-  remaining direct import outside the client (`kb/server.py:2421`) moves behind
-  it.
+  remaining direct import outside the client in `kb/` (`kb/server.py:2421`)
+  moves behind it. `tests/` carries more, and they move with the contract tests
+  rather than with this consequence.
 - A second implementation becomes benchmarkable rather than hypothetical. BM25
   over **Structured Knowledge**, the alternative ADR-0010 deferred to
   measurement, becomes a class that satisfies the same interface and runs
