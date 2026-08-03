@@ -1,9 +1,9 @@
 self.__BUILD_MANIFEST = {
   "/": [
-    "static/chunks/0b9x0yiqt9ynj.js"
+    "static/chunks/2ouee1khhcg0h.js"
   ],
   "/404": [
-    "static/chunks/2gr0jjm3cclrz.js"
+    "static/chunks/3e29hi797afh6.js"
   ],
   "/_error": [
     "static/chunks/0cqh_hxa4w8ol.js"
@@ -24,16 +24,16 @@ self.__BUILD_MANIFEST = {
     "static/chunks/3-rfqfyswui_y.js"
   ],
   "/contact": [
-    "static/chunks/206eginfy7eww.js"
+    "static/chunks/1mvxzpyz72079.js"
   ],
   "/info": [
-    "static/chunks/22nparh-216m1.js"
+    "static/chunks/1xkzqvkdpbuwm.js"
   ],
   "/login": [
-    "static/chunks/096diofbz90rc.js"
+    "static/chunks/1z4euy-zm8o7c.js"
   ],
   "/use-cases": [
-    "static/chunks/3wz9ewouvaffg.js"
+    "static/chunks/38r4mz24bg5_5.js"
   ],
   "__rewrites": {
     "afterFiles": [],
