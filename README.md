@@ -105,7 +105,7 @@ Do not quote the recall figure without its definition. `answer_recall` counts on
 
 The bad numbers are in the table on purpose. A third of the corpus is invisible to vector search, ranking does slightly worse than a coin flip on term coverage, the newest daily digest never reached the top 10, and inline writes take minutes.
 
-To reproduce the quality rows: [`scripts/bench/README.md`](scripts/bench/README.md) documents the harness. `python scripts/bench/search_bench.py run --out run.json` runs the 69 frozen questions against a node, `run --baseline previous_run.json` reports the delta against an earlier run, and `lint` validates the question set offline. The latency, write, freshness, and concurrency rows came from one-off probe scripts in the measuring session, so treat them as a dated snapshot rather than something the repo regenerates. Tracking issue: [#122](https://github.com/masumi-network/Citadel/issues/122).
+To reproduce the quality rows: [`scripts/bench/README.md`](scripts/bench/README.md) documents the harness. `python scripts/bench/search_bench.py run --out run.json` runs the 69 frozen questions against a node, `run --baseline previous_run.json` reports the delta against an earlier run, and `lint` validates the question set offline. `report run.json --markdown` regenerates the table above, and refuses to emit any metric that has no stated definition. The latency, write, freshness, and concurrency rows came from one-off probe scripts in the measuring session, so treat them as a dated snapshot rather than something the repo regenerates. Tracking issue: [#122](https://github.com/masumi-network/Citadel/issues/122).
 
 ## Quick start for teammates
 
