@@ -3140,6 +3140,14 @@ textarea[aria-invalid="true"] {
   font-weight: 500;
 }
 
+/* Why a number is missing, when it is. Dimmer than the label so it never
+   competes with a figure that is actually there. */
+.number-note {
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0.8;
+}
+
 /* Only the third number is ever coloured, and only when it is not zero. */
 .number-card.is-waiting {
   border-color: var(--warning-border);

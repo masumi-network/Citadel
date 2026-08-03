@@ -19,13 +19,13 @@ async def test_record_ingest_adds_document_node_and_event() -> None:
     await mesh.record_ingest(CONFIG, result, data="Runbook: rotate keys", dataset="notes", tags=["ops"])
     snapshot = await mesh.snapshot(CONFIG)
 
-    assert snapshot["stats"]["documents"] == 1
+    assert snapshot["stats"]["tracked_sources"] == 1
     document_nodes = [node for node in snapshot["nodes"] if node["type"] == "document"]
     assert document_nodes[0]["label"] == "Runbook: rotate keys"
     assert snapshot["events"][0]["type"] == "ingest"
     assert snapshot["events"][0]["details"]["dataset"] == "notes"
     assert snapshot["events"][0]["timeline"]["kind"] == "chunk_indexed"
-    assert snapshot["stats"]["indexed_chunks"] == 1
+    assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 1
 
 
 async def test_rejected_ingest_records_reject_event_without_document() -> None:
@@ -35,7 +35,7 @@ async def test_rejected_ingest_records_reject_event_without_document() -> None:
     await mesh.record_ingest(CONFIG, result, data="x", dataset="notes", tags=[])
     snapshot = await mesh.snapshot(CONFIG)
 
-    assert snapshot["stats"]["documents"] == 0
+    assert snapshot["stats"]["tracked_sources"] == 0
     assert snapshot["events"][0]["type"] == "reject"
     assert snapshot["events"][0]["details"]["reason"] == "too_short"
 
@@ -187,8 +187,8 @@ async def test_rehydrate_seeds_graph_and_timestamp_not_counters() -> None:
 
     # Counters are NOT seeded (that would double-count the github/repo data the
     # next live sync re-ingests); the graph projection + last_indexed_at carry it.
-    assert snapshot["stats"]["documents"] == 0
-    assert snapshot["stats"]["indexed_chunks"] == 0
+    assert snapshot["stats"]["tracked_sources"] == 0
+    assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 0
     assert snapshot["stats"]["last_indexed_at"] == "2026-06-25T00:00:00Z"
     # Graph projection is non-empty: source + repository nodes survive the "restart".
     source_nodes = [node for node in snapshot["nodes"] if node["type"] == "source"]
@@ -226,8 +226,8 @@ async def test_rehydrate_baseline_then_live_ingest_does_not_double_count() -> No
 
     # Counters are not seeded, so a live ingest just adds 1 — the baseline never
     # double-counts the github/repo data the next live sync will re-ingest.
-    assert snapshot["stats"]["documents"] == 1
-    assert snapshot["stats"]["indexed_chunks"] == 1
+    assert snapshot["stats"]["tracked_sources"] == 1
+    assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 1
 
 
 async def test_rehydrate_reads_state_files_and_tolerates_missing(tmp_path: Path) -> None:
@@ -267,8 +267,8 @@ async def test_rehydrate_reads_state_files_and_tolerates_missing(tmp_path: Path)
 
     # Counters are not seeded; last_indexed_at + the graph projection carry the
     # persistent state. Missing repo-content file is tolerated (contributes nothing).
-    assert snapshot["stats"]["documents"] == 0
-    assert snapshot["stats"]["indexed_chunks"] == 0
+    assert snapshot["stats"]["tracked_sources"] == 0
+    assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 0
     assert snapshot["stats"]["last_indexed_at"] == "2026-06-24T00:00:00Z"
     source_nodes = [node for node in snapshot["nodes"] if node["type"] == "source"]
     assert source_nodes  # github + linear sources projected from persistent state
@@ -325,9 +325,11 @@ async def test_snapshot_reports_authoritative_corpus_totals() -> None:
     )
     stats = snapshot["stats"]
 
-    assert stats["documents"] == 308
-    assert stats["indexed_chunks"] == 15641
+    assert stats["tracked_sources"] == 308
     assert stats["nodes"] == 15641
+    # No indexed_chunks at the top level: it only ever duplicated `nodes` (both
+    # were corpus["indexed_docs"]), so it is removed rather than published wrong.
+    assert "indexed_chunks" not in stats
     # The in-memory values are still available, correctly labelled.
     assert stats["since_restart"]["documents"] == 1
     assert stats["since_restart"]["indexed_chunks"] == 1
@@ -347,7 +349,7 @@ async def test_snapshot_falls_back_when_corpus_is_unavailable() -> None:
         config, corpus={"ok": True, "tracked_sources": None, "indexed_docs": None}
     )
 
-    assert snapshot["stats"]["documents"] == 4
+    assert snapshot["stats"]["tracked_sources"] == 4
 
 
 @pytest.mark.asyncio
@@ -358,7 +360,119 @@ async def test_snapshot_without_corpus_keeps_the_old_shape() -> None:
 
     snapshot = await mesh.snapshot(config)
 
-    assert snapshot["stats"]["documents"] == 7
+    assert snapshot["stats"]["tracked_sources"] == 7
+
+
+# --- /api/mesh published three counters that did not mean their names -------
+#
+# Verified live 2026-08-03. stats.edges and stats.since_restart.projection_edges
+# were the SAME expression (len(self.edges)): the in-memory projection sat at
+# the top level next to authoritative corpus figures, where it reads as a
+# corpus total. It was 5511 against a real 131843 graph edges (24x off).
+# Separately, stats.nodes and stats.indexed_chunks were BOTH assigned
+# corpus["indexed_docs"] — equal by construction, and nothing on this surface
+# ever counted a chunk. And stats.documents was corpus["tracked_sources"] (318:
+# github + repo-content + linear tracked counts) while the durable corpus store
+# held ~2876 rows — a name that promises a document count and delivers a
+# source count.
+
+
+@pytest.mark.asyncio
+async def test_snapshot_edges_reports_the_real_graph_total_not_the_projection() -> None:
+    config = CitadelConfig()
+    mesh = MeshState()
+    # A handful of in-memory projection edges, distinct from the real total below.
+    for i in range(3):
+        mesh.edges[f"e{i}"] = {"id": f"e{i}", "source": "a", "target": "b"}
+
+    snapshot = await mesh.snapshot(
+        config,
+        corpus={
+            "ok": True,
+            "tracked_sources": 308,
+            "indexed_docs": 15641,
+            "indexed_edges": 131843,
+        },
+    )
+    stats = snapshot["stats"]
+
+    assert stats["edges"] == 131843
+    # The in-memory projection is still available, correctly scoped, and
+    # distinct from the real total above (the base graph seeds a few edges of
+    # its own, so this asserts against the live in-memory count, not a magic
+    # number).
+    assert stats["since_restart"]["projection_edges"] == len(mesh.edges)
+    assert stats["since_restart"]["projection_edges"] < stats["edges"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_edges_falls_back_to_the_projection_without_a_real_total() -> None:
+    """No indexed_edges on the corpus payload (degraded read, or no corpus at
+    all) — the projection is the best available number, same as before.
+
+    Both branches are asserted against the SAME mesh, because the fallback
+    assertion alone does not discriminate: before this change `edges` was
+    unconditionally `len(self.edges)`, so `edges == len(mesh.edges)` held for
+    every payload. Pinning that the real total wins when it is present is what
+    makes the fallback a fallback rather than the only behaviour.
+    """
+    config = CitadelConfig()
+    mesh = MeshState()
+    for i in range(3):
+        mesh.edges[f"e{i}"] = {"id": f"e{i}", "source": "a", "target": "b"}
+
+    with_total = await mesh.snapshot(
+        config,
+        corpus={"ok": True, "tracked_sources": 308, "indexed_docs": 15641, "indexed_edges": 131843},
+    )
+    degraded = await mesh.snapshot(
+        config, corpus={"ok": True, "tracked_sources": None, "indexed_docs": None}
+    )
+
+    assert with_total["stats"]["edges"] == 131843
+    assert degraded["stats"]["edges"] == len(mesh.edges)
+    assert degraded["stats"]["edges"] == degraded["stats"]["since_restart"]["projection_edges"]
+    # The two disagree, so the second number is demonstrably the fallback and
+    # not the same expression under a different corpus payload.
+    assert degraded["stats"]["edges"] != with_total["stats"]["edges"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_drops_indexed_chunks_when_it_only_duplicates_nodes() -> None:
+    """indexed_chunks was assigned the same corpus['indexed_docs'] as nodes,
+    equal by construction. Removed, not renamed — the same call #206 made for
+    failed_chunks: nothing on this surface counts chunks, so nothing may claim
+    to. The honest restart-scoped accumulator stays under since_restart."""
+    config = CitadelConfig()
+    mesh = MeshState()
+    mesh.indexed_chunks = 9
+
+    snapshot = await mesh.snapshot(
+        config, corpus={"ok": True, "tracked_sources": 308, "indexed_docs": 15641}
+    )
+    stats = snapshot["stats"]
+
+    assert "indexed_chunks" not in stats
+    assert stats["nodes"] == 15641
+    assert stats["since_restart"]["indexed_chunks"] == 9
+
+
+@pytest.mark.asyncio
+async def test_snapshot_documents_field_is_named_for_what_it_measures() -> None:
+    """The old `documents` field held corpus['tracked_sources'] — github repos
+    + repo-content files + linear issues, a source count, not a document count
+    (live: 318 tracked sources vs ~2876 durable corpus rows). Renamed to match
+    what it actually reports."""
+    config = CitadelConfig()
+    mesh = MeshState()
+
+    snapshot = await mesh.snapshot(
+        config, corpus={"ok": True, "tracked_sources": 308, "indexed_docs": 15641}
+    )
+    stats = snapshot["stats"]
+
+    assert stats["tracked_sources"] == 308
+    assert "documents" not in stats
 
 
 # --- activity counters are restart-scoped, and must say so (#196, #197) -----

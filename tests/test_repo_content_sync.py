@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import time
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -1061,3 +1063,341 @@ async def test_status_reports_corrupt_state_instead_of_raising(tmp_path: Path) -
     assert status["ok"] is False
     assert "state.json" in status["state_error"]
     assert status["tracked_files"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_makes_no_github_call_on_the_event_loop(tmp_path: Path) -> None:
+    """No GitHub round trip may run on the event loop.
+
+    That is the whole guarantee, and the name says exactly that much. The loop
+    is NOT free for the duration of a run: ``scan_text_entries`` and the
+    per-file state checkpoint still execute inline. Both are bounded local
+    work, both run only for a file that actually changed, and neither ran at
+    all in the production incident below (ingested=0 means zero scans and zero
+    checkpoints), so 100% of that stall was network. Dispatching them would
+    also not buy what dispatching I/O buys: the scan is CPU-bound Python, so a
+    worker thread contends for the GIL instead of parking on a socket.
+
+    ``RepoContentSyncer.run`` is awaited from the web process's single event
+    loop by the evolve scheduler, and its GitHub client is synchronous urllib.
+    Called inline, each round trip freezes EVERY route on the node. Measured in
+    production 2026-08-03: ``Evolve stage repo_content_sync`` ran
+    18:14:06.578Z to 18:14:36.610Z, 30.03s, during which a ``POST /mcp/`` took
+    19.18s and a ``GET /api/contributions/recent`` gave up with a 499. That pass
+    ingested nothing at all (ingested=0 skipped=69), so the node was frozen for
+    half a minute to do no work.
+
+    This asserts the OBSERVABLE property rather than the implementation: while
+    ``run`` is in flight, a concurrent coroutine still gets scheduled. A
+    heartbeat is the only thing that can tell "dispatched to a thread" apart
+    from "still inline", because both return byte-identical results. Asserting
+    on the presence of ``to_thread`` in the source would pass just as happily
+    against a call that was moved but still awaited synchronously.
+    """
+    stall = 0.02
+
+    class BlockingClient(FakeRepoContentClient):
+        """Stands in for real urllib: every fetch blocks the calling thread."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocking_calls = 0
+
+        def _stall(self) -> None:
+            self.blocking_calls += 1
+            time.sleep(stall)
+
+        def fetch_default_branch(self, full_name: str) -> str:
+            self._stall()
+            return super().fetch_default_branch(full_name)
+
+        def fetch_commit_sha(self, full_name: str, *, ref: str) -> str:
+            self._stall()
+            return super().fetch_commit_sha(full_name, ref=ref)
+
+        def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
+            self._stall()
+            return super().fetch_tree(full_name, ref=ref)
+
+        def fetch_last_commit_sha(self, full_name: str, path: str, *, ref: str) -> str:
+            self._stall()
+            return super().fetch_last_commit_sha(full_name, path, ref=ref)
+
+        def fetch_file_text(
+            self, full_name: str, path: str, *, ref: str
+        ) -> RepoContentFile | None:
+            self._stall()
+            return super().fetch_file_text(full_name, path, ref=ref)
+
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "repo_content_sync_state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+    )
+    client = BlockingClient()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.001)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        result = await syncer.run()
+    finally:
+        beat.cancel()
+
+    assert result["files_ingested"] == 2, "the fix must not change what the sync does"
+    assert client.blocking_calls >= 5, (
+        "the fake must actually block, or this test proves nothing: "
+        f"only {client.blocking_calls} blocking calls were made"
+    )
+
+    # Each stalled call holds a thread for 20ms. Off the loop, the heartbeat
+    # keeps ticking through every one of them (~20 ticks per call). Inline, the
+    # loop is frozen for the whole run and the heartbeat is starved. Five ticks
+    # per blocking call sits far below the threaded floor and far above the
+    # inline ceiling, so timing jitter cannot flip the verdict either way.
+    floor = client.blocking_calls * 5
+    assert ticks >= floor, (
+        f"event loop was starved: {ticks} heartbeats across "
+        f"{client.blocking_calls} blocking GitHub calls (need >= {floor}). "
+        "Synchronous urllib is running inline on the loop, so every route on "
+        "the node is frozen for the duration of the sync."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_autojoin_discovery_does_not_block_the_event_loop(tmp_path: Path) -> None:
+    """Auto-join discovery is the LARGEST blocking site, and it runs first.
+
+    ``_resolved_repos`` reads as a config accessor, but with
+    ``repo_content_sync_autojoin_enabled`` it calls ``discover_org_repos``,
+    which issues one synchronous ``fetch_repos`` plus one synchronous
+    ``file_exists`` probe per repo per marker. At the shipped defaults
+    (``repo_content_sync_autojoin_max_repos`` 100, three entries in
+    ``DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS``) that is up to 301 round trips,
+    all of them evaluated before ``run`` reaches its first dispatched call.
+
+    The sibling heartbeat test cannot see this: its config leaves autojoin at
+    the default False, so discovery never runs and the whole gap is invisible.
+
+    Only the discovery calls block here. Every other fetch is instant, so the
+    tick count measures discovery and nothing else, and a discovery left on
+    the loop starves the heartbeat outright instead of merely thinning it.
+    """
+    stall = 0.02
+
+    class BlockingAutoJoinClient(FakeRepoContentClient):
+        def __init__(self) -> None:
+            super().__init__()
+            # A root marker on the repo already in the allowlist, so discovery
+            # genuinely finds something and the union still dedups.
+            self.files["masumi-network/sokosumi-cli/AGENTS.md"] = {
+                "sha": "ghi",
+                "content": "# Agents\n\nHouse rules.",
+            }
+            self.autojoin_calls = 0
+
+        def _repo(self, name: str, *, archived: bool = False) -> GitHubRepo:
+            return GitHubRepo(
+                name=name,
+                full_name=f"masumi-network/{name}",
+                html_url="",
+                description=None,
+                language=None,
+                pushed_at=None,
+                updated_at=None,
+                default_branch="main",
+                visibility="public",
+                archived=archived,
+                stargazers_count=0,
+                forks_count=0,
+                open_issues_count=0,
+                topics=(),
+                license_name=None,
+            )
+
+        def fetch_repos(
+            self, org: str, *, max_repos: int, include_private: bool = True
+        ) -> list[GitHubRepo]:
+            self.autojoin_calls += 1
+            time.sleep(stall)
+            return [
+                self._repo("no-markers-here"),
+                self._repo("also-no-markers"),
+                self._repo("archived-repo", archived=True),
+                self._repo("sokosumi-cli"),
+            ][:max_repos]
+
+        def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
+            self.autojoin_calls += 1
+            time.sleep(stall)
+            return f"{full_name}/{path}" in self.files
+
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "repo_content_sync_state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md", "AGENTS.md"),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_autojoin_enabled=True,
+        repo_content_sync_autojoin_markers=DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS,
+        repo_content_sync_autojoin_max_repos=50,
+    )
+    client = BlockingAutoJoinClient()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.001)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        result = await syncer.run()
+    finally:
+        beat.cancel()
+
+    # 1 fetch_repos + 3 misses + 3 misses + 0 (archived is skipped before any
+    # probe) + 1 hit on the first marker = 8.
+    assert client.autojoin_calls == 8, (
+        "discovery did not run as expected, so this test proves nothing: "
+        f"{client.autojoin_calls} blocking auto-join calls"
+    )
+    assert result["files_ingested"] == 3, "the fix must not change what the sync does"
+
+    # Each discovery call holds a thread for 20ms; nothing else in this run
+    # blocks. Off the loop the heartbeat ticks ~20 times per call. Inline the
+    # loop is frozen for all 160ms of it and only the handful of dispatched
+    # GitHub calls (which return instantly here) can let it through.
+    floor = client.autojoin_calls * 5
+    assert ticks >= floor, (
+        f"event loop was starved: {ticks} heartbeats across "
+        f"{client.autojoin_calls} blocking auto-join calls (need >= {floor}). "
+        "_resolved_repos is being evaluated inline on the loop, so every route "
+        "on the node is frozen for the whole org scan before the sync starts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_second_overlapping_run_is_refused_instead_of_losing_state(
+    tmp_path: Path,
+) -> None:
+    """Two passes over one state file must not race.
+
+    ``run`` snapshots ``tracked`` from the state file at the start and writes
+    the whole dict back at the end, so overlapping passes are a last-writer-
+    wins lost update: the loser's ingested entries vanish from state and those
+    files are fetched and re-sent on the next pass.
+
+    Before the GitHub calls moved off the loop this could not happen: a pass
+    that ingested nothing had no ``await`` that yielded, so a second caller
+    could not start until it finished. Freeing the loop is what opens the
+    window, which is why the guard ships in the same change.
+
+    The two syncers are deliberately SEPARATE instances sharing one state
+    path, because that is the real shape: ``get_repo_content_syncer`` in
+    kb.server builds a new syncer per call and ``LearningAgent.__init__``
+    builds its own, so a lock held as an instance attribute would guard
+    nothing while looking like a guard.
+    """
+    state_path = str(tmp_path / "repo_content_sync_state.json")
+
+    def _config() -> CitadelConfig:
+        return CitadelConfig(
+            repo_content_sync_enabled=True,
+            repo_content_sync_dataset="masumi-network",
+            repo_content_sync_session="masumi-repo-content",
+            repo_content_sync_state_path=state_path,
+            repo_content_sync_repos=("sokosumi-cli",),
+            repo_content_sync_root_paths=("README.md",),
+            repo_content_sync_tree_prefixes=("skills/",),
+            repo_content_sync_tree_extensions=(".md",),
+            repo_content_sync_max_files_per_repo=10,
+        )
+
+    class SlowClient(FakeRepoContentClient):
+        """Holds the first pass open long enough for a second to be attempted."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def fetch_default_branch(self, full_name: str) -> str:
+            self.calls += 1
+            time.sleep(0.2)
+            return super().fetch_default_branch(full_name)
+
+    first_client = SlowClient()
+    second_client = SlowClient()
+    second_learning = FakeLearningProcess()
+    first = RepoContentSyncer(
+        FakeCitadel(_config()),
+        client=first_client,
+        state_path=state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+    second = RepoContentSyncer(
+        FakeCitadel(_config()),
+        client=second_client,
+        state_path=state_path,
+        learning=second_learning,  # type: ignore[arg-type]
+    )
+
+    in_flight = asyncio.create_task(first.run())
+    # Let the first pass get inside its first dispatched call. It is only
+    # reachable at all because that call yields.
+    await asyncio.sleep(0.05)
+    assert not in_flight.done(), "the first pass finished too early to overlap"
+
+    overlapping = await second.run()
+    first_result = await in_flight
+
+    assert overlapping.get("skipped") is True
+    assert overlapping.get("reason") == "repo_content_sync_already_running"
+    assert second_client.calls == 0, "the refused pass must not touch GitHub"
+    assert second_learning.calls == [], "the refused pass must not ingest anything"
+    # Not recordable as a sync: no checked_at, no counts. kb.server must not
+    # stamp the source "synced" for a pass that did no work.
+    assert "checked_at" not in overlapping
+    assert "files_ingested" not in overlapping
+
+    assert first_result["files_ingested"] == 2
+    written = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    assert sorted(written["files"]) == [
+        "masumi-network/sokosumi-cli/README.md",
+        "masumi-network/sokosumi-cli/skills/sokosumi/SKILL.md",
+    ]
+
+    # And the lock frees afterwards: this is a guard, not a one-shot latch.
+    again = await second.run()
+    assert again.get("skipped") is None
+    assert again["files_skipped"] == 2

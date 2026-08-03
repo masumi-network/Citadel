@@ -670,6 +670,7 @@ LOGIN_HTML = """<!doctype html>
           <a href="/login" aria-current="page">Sign in</a>
         </div>
         <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+        <a class="navicon" href="https://github.com/masumi-network/Citadel" aria-label="GitHub repository" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg></a>
       </div>
     </nav>
     <main class="auth">
@@ -2594,6 +2595,11 @@ def document_endpoint_for_result(result_id: str) -> str | None:
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
     # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
     # no backing store, so they stay honestly non-drillable.
+    #
+    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
+    # its `document_id`. This still resolves because /api/documents walks
+    # chunk -> parent document, so a caller passing either id "works" — which
+    # hides that they are different ids for different things.
     if not result_id or result_id.startswith("chunk:"):
         return None
     return f"/api/documents/{result_id}"
@@ -2610,6 +2616,22 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
 
     Results that already supply an id (e.g. the GitHub digest fallback) are left
     untouched. Other dict results get a content-derived id for traceability.
+
+    ``id`` here is CHUNK-level: for cognee's CHUNKS query type a hit is the raw
+    chunk payload (see ``CogneeClient.recall``), and that payload also carries
+    its own ``document_id`` — the parent document's id, the same id
+    ``citadel ingest`` reports as ``data_id`` for the write. The two are
+    different granularities and neither field documents that on the wire
+    (verified live: a hit's ``id`` and ``document_id`` are always distinct
+    UUIDs). ``/api/documents/{id}`` resolves a chunk id by walking chunk ->
+    parent, so passing ``id`` "works" and hides the mismatch — a caller that
+    dedups or cites on ``id`` and later compares against a fetched document's
+    own ``.id`` (which is the document id, not the chunk id) will never match.
+    Use ``document_id`` for anything that needs to key off the document.
+
+    The field is optional, not guaranteed: the GitHub digest fallback above
+    (``search_github_sync_state``) supplies its own ``id`` and no
+    ``document_id``, because a digest section is not a stored document.
     """
     if result.get("id"):
         return result
@@ -4345,11 +4367,27 @@ async def _corpus_health() -> dict[str, Any]:
         tracked += int(linear_status.get("issue_count") or 0)
         counts = await get_citadel()._graph_counts()
         indexed = int(counts.get("nodes") or 0)
+        # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
+        # back in the same call for free. /api/mesh used to publish the in-memory
+        # projection's edge count at the top level instead (24x understated live),
+        # so this is the real total that field needs.
+        edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {"ok": ok, "tracked_sources": tracked, "indexed_docs": indexed}
+        return {
+            "ok": ok,
+            "tracked_sources": tracked,
+            "indexed_docs": indexed,
+            "indexed_edges": edges,
+        }
     except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
         logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": str(exc)}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": str(exc),
+        }
 
 
 @app.get("/readyz")
@@ -4959,7 +4997,11 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if not body.dry_run and result.get("enabled") is not False:
+    # ``skipped`` means another pass held the state file and this call did no
+    # work. Recording it would stamp the source "synced" with a null
+    # checked_at and null counts, which is the bookkeeping-success failure
+    # mode, not a sync.
+    if not body.dry_run and result.get("enabled") is not False and not result.get("skipped"):
         await mesh_state.record_repo_content_sync(citadel.config, result)
     get_access_store().record_event(
         action="repo_content_sync.run",
@@ -5626,6 +5668,7 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     if (
         isinstance(repo_content_result, dict)
         and repo_content_result.get("enabled") is not False
+        and not repo_content_result.get("skipped")
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)

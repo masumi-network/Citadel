@@ -1759,7 +1759,7 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
         return value if isinstance(value, int) else 0
 
     parts = [
-        f"{paint(str(num(stats, 'documents')), 'bold', enable=color)} documents",
+        f"{paint(str(num(stats, 'tracked_sources')), 'bold', enable=color)} tracked sources",
         f"{num(stats, 'nodes')} nodes",
         f"{num(stats, 'edges')} edges",
         f"{num(since, 'searches')} searches since restart",
@@ -1846,13 +1846,25 @@ def _render_presence(board: dict[str, Any], color: bool) -> str:
     return "\n".join(rows)
 
 
-async def _activity_global(node_url: str, token: str | None, color: bool, watch: bool) -> int:
+async def _activity_global(
+    node_url: str, token: str | None, color: bool, watch: bool, as_json: bool
+) -> int:
     """Live team-presence broadcast — Seat Presence only (ADR-0009), no content."""
     board = await asyncio.to_thread(fetch_presence, node_url, token)
     if board.get("error"):
         # An unreachable Node must not render as an empty-but-healthy board.
-        print(f"citadel activity: could not reach {node_url} — {board['error']}", file=sys.stderr)
-        return 1
+        return _emit_error(
+            "activity",
+            f"could not reach {node_url} — {board['error']}",
+            as_json=as_json,
+            code="NODE_UNREACHABLE",
+        )
+    if as_json and not watch:
+        # Matches the non-global path: --json prints the raw payload once and
+        # exits, instead of silently falling back to the human table (--json
+        # was previously ignored entirely on this branch).
+        _print_json(board)
+        return 0
     print(_render_presence(board, color))
     if not watch:
         return 0
@@ -1890,7 +1902,7 @@ async def _activity(args: argparse.Namespace) -> int:
         return _emit_no_token("activity", as_json=bool(args.json))
 
     if getattr(args, "global_broadcast", False):
-        return await _activity_global(node_url, token, use_color, args.watch)
+        return await _activity_global(node_url, token, use_color, args.watch, bool(args.json))
 
     data = await asyncio.to_thread(fetch_events, node_url, token, limit=limit, event_type=args.type)
     failure = data.get("error") or (None if data else "empty response from the Node")

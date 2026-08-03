@@ -66,7 +66,7 @@ async def test_learn_ingests_and_records_mesh_activity(tmp_path: Path) -> None:
     assert outcome.conflict is None
     assert outcome.improve is None
     assert citadel.ingest_calls[0]["tags"] == ["ops"]
-    assert snapshot["stats"]["documents"] == 1
+    assert snapshot["stats"]["tracked_sources"] == 1
     assert snapshot["events"][0]["type"] == "ingest"
 
 
