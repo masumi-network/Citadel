@@ -4996,7 +4996,11 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if not body.dry_run and result.get("enabled") is not False:
+    # ``skipped`` means another pass held the state file and this call did no
+    # work. Recording it would stamp the source "synced" with a null
+    # checked_at and null counts, which is the bookkeeping-success failure
+    # mode, not a sync.
+    if not body.dry_run and result.get("enabled") is not False and not result.get("skipped"):
         await mesh_state.record_repo_content_sync(citadel.config, result)
     get_access_store().record_event(
         action="repo_content_sync.run",
@@ -5663,6 +5667,7 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     if (
         isinstance(repo_content_result, dict)
         and repo_content_result.get("enabled") is not False
+        and not repo_content_result.get("skipped")
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)
