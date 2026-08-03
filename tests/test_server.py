@@ -6367,3 +6367,286 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     stats = response.json()["stats"]
     assert stats["documents"] is not None
     assert stats["indexed_chunks"] is not None
+
+
+class FakeCorpusCognee:
+    """Fake at the kb.cognee_client METHOD boundary.
+
+    Every shape here (row dicts, totals dict, counts mapping, presence set) is
+    the contract corpus_page/corpus_totals/corpus_chunk_counts/
+    corpus_graph_presence themselves declare — cognee's own row shapes are
+    pinned by the real-import tests in test_cognee_client.py, never invented
+    here.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        totals: dict[str, Any],
+        chunk_counts: dict[str, int] | None = None,
+        graph_ids: set[str] | None = None,
+        chunk_lookup_raises: bool = False,
+    ) -> None:
+        self.rows = rows
+        self.totals = totals
+        self.chunk_counts = chunk_counts
+        self.graph_ids = graph_ids
+        self.chunk_lookup_raises = chunk_lookup_raises
+        self.seen_after: list[tuple[str | None, str | None]] = []
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple[Any, str]:
+        from datetime import datetime
+
+        return (datetime.fromisoformat(row["created_at"]), row["id"])
+
+    async def corpus_page(
+        self,
+        *,
+        after_created_at: str | None = None,
+        after_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        from datetime import datetime
+
+        self.seen_after.append((after_created_at, after_id))
+        rows = sorted((dict(row) for row in self.rows), key=self._key)
+        if after_created_at and after_id:
+            boundary = (datetime.fromisoformat(after_created_at), after_id)
+            rows = [row for row in rows if self._key(row) > boundary]
+        return rows[:limit]
+
+    async def corpus_totals(self) -> dict[str, Any]:
+        return dict(self.totals)
+
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
+        if self.chunk_lookup_raises:
+            raise RuntimeError("vector store unavailable")
+        if self.chunk_counts is None:
+            return None
+        return {
+            document_id: self.chunk_counts[document_id]
+            for document_id in document_ids
+            if document_id in self.chunk_counts
+        }
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+        if self.graph_ids is None:
+            return None
+        return {doc_id for doc_id in document_ids if doc_id in self.graph_ids}
+
+
+def _corpus_row(row_id: str, created_at: str, **overrides: Any) -> dict[str, Any]:
+    row = {
+        "id": row_id,
+        "name": f"doc-{row_id}",
+        "content_hash": f"hash-{row_id}",
+        "raw_content_hash": None,
+        "mime_type": "text/plain",
+        "token_count": 10,
+        "data_size": 100,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "owner_id": "owner-1",
+        "datasets": ["masumi-network"],
+        "citadel_tags": [],
+    }
+    row.update(overrides)
+    return row
+
+
+def _corpus_totals(documents: int, default_owner: int | None = None) -> dict[str, Any]:
+    owned = documents if default_owner is None else default_owner
+    return {
+        "documents": documents,
+        "documents_default_owner": owned,
+        "documents_other_owners": documents - owned,
+        "by_dataset": {"masumi-network": documents},
+        "by_dataset_default_owner": {"masumi-network": owned},
+    }
+
+
+def _corpus_client(fake: FakeCorpusCognee) -> TestClient:
+    client = authed_client()
+    server_module.app.state.citadel.cognee = fake
+    return client
+
+
+def test_corpus_census_reports_rows_presence_and_totals() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(
+                "doc-a",
+                (now - timedelta(hours=2)).isoformat(),
+                citadel_tags=["alpha"],
+            ),
+            _corpus_row("doc-b", (now - timedelta(hours=1)).isoformat()),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={"doc-a": 3},
+        graph_ids={"doc-a"},
+    )
+    client = _corpus_client(fake)
+
+    response = client.get("/api/corpus")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["documents_returned"] == 2
+    assert body["documents_total"] == 2
+    assert body["next_cursor"] is None
+    assert body["totals"] == _corpus_totals(2)
+    first, second = body["documents"]
+    assert first["id"] == "doc-a"
+    assert first["citadel_tags"] == ["alpha"]
+    assert first["datasets"] == ["masumi-network"]
+    assert first["chunk_count"] == 3
+    assert first["in_graph"] is True
+    # doc-b was measured and has nothing indexed: 0/False, not null.
+    assert second["chunk_count"] == 0
+    assert second["in_graph"] is False
+    assert body["notes"] == []
+
+
+def test_corpus_census_pages_with_an_opaque_cursor() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    all_ids = ["doc-a", "doc-b", "doc-c"]
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(row_id, (now - timedelta(hours=hours)).isoformat())
+            for row_id, hours in (("doc-a", 3), ("doc-b", 2), ("doc-c", 1))
+        ],
+        totals=_corpus_totals(3),
+        chunk_counts={},
+        graph_ids=set(all_ids),
+    )
+    client = _corpus_client(fake)
+
+    page_one = client.get("/api/corpus?limit=2").json()
+    assert [row["id"] for row in page_one["documents"]] == ["doc-a", "doc-b"]
+    assert page_one["documents_returned"] == 2
+    assert page_one["next_cursor"]
+
+    page_two = client.get(f"/api/corpus?limit=2&cursor={page_one['next_cursor']}").json()
+    assert [row["id"] for row in page_two["documents"]] == ["doc-c"]
+    assert page_two["next_cursor"] is None
+
+
+def test_corpus_census_clamps_a_future_dated_cursor_so_later_rows_land() -> None:
+    """One future-dated created_at must not pin the cursor past every real row.
+
+    doc-future sits 30 days ahead and ends the first page. Unclamped, its
+    timestamp becomes a cursor that no row written in the next month can
+    exceed, so the walk silently stalls while reporting ok. Clamped to
+    now+skew, a row that lands after the cursor was minted still comes back on
+    the next page (rows inside the skew window may repeat, which is the
+    accepted cost).
+    """
+    import base64 as _base64
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row("doc-a", (now - timedelta(hours=1)).isoformat()),
+            _corpus_row("doc-future", (now + timedelta(days=30)).isoformat()),
+            _corpus_row("doc-far-future", (now + timedelta(days=60)).isoformat()),
+        ],
+        totals=_corpus_totals(3),
+        chunk_counts={},
+        graph_ids={"doc-a", "doc-future", "doc-far-future"},
+    )
+    client = _corpus_client(fake)
+
+    page_one = client.get("/api/corpus?limit=2").json()
+    assert [row["id"] for row in page_one["documents"]] == ["doc-a", "doc-future"]
+    cursor = page_one["next_cursor"]
+    assert cursor
+
+    decoded = json.loads(_base64.urlsafe_b64decode(cursor.encode("ascii")))
+    cursor_time = datetime.fromisoformat(decoded["t"])
+    ceiling = datetime.now(timezone.utc) + timedelta(
+        seconds=server_module.CORPUS_CURSOR_MAX_SKEW_SECONDS + 5
+    )
+    assert cursor_time <= ceiling, "cursor was not clamped to now+skew"
+
+    # A real row arrives after the cursor was handed out, just past the skew
+    # window. With the future-dated cursor it would never be seen.
+    fake.rows.append(
+        _corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat())
+    )
+
+    page_two = client.get(f"/api/corpus?limit=3&cursor={cursor}").json()
+    assert "doc-later" in [row["id"] for row in page_two["documents"]]
+
+
+def test_corpus_census_clamps_a_stored_future_cursor_on_read() -> None:
+    """The write-side clamp is not enough: a cursor minted elsewhere (or before
+    a clamp change) can still carry a far-future timestamp, so the read side
+    clamps too."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat()),
+            _corpus_row("doc-far-future", (now + timedelta(days=60)).isoformat()),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={},
+        graph_ids={"doc-later", "doc-far-future"},
+    )
+    client = _corpus_client(fake)
+    handcrafted = server_module._encode_corpus_cursor(
+        (now + timedelta(days=30)).isoformat(), "doc-zzz"
+    )
+
+    body = client.get(f"/api/corpus?cursor={handcrafted}").json()
+
+    assert "doc-later" in [row["id"] for row in body["documents"]]
+
+
+def test_corpus_census_degrades_presence_to_null_not_zero() -> None:
+    """0 and 'not measured' are different answers — the difference between
+    'accepted but never indexed' and 'we did not look'."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [_corpus_row("doc-a", (now - timedelta(hours=1)).isoformat())],
+        totals=_corpus_totals(1),
+        chunk_lookup_raises=True,
+        graph_ids=None,
+    )
+    client = _corpus_client(fake)
+
+    response = client.get("/api/corpus")
+
+    assert response.status_code == 200
+    body = response.json()
+    row = body["documents"][0]
+    assert row["chunk_count"] is None
+    assert row["in_graph"] is None
+    notes = " ".join(body["notes"])
+    assert "chunk_count" in notes and "not measured" in notes
+    assert "in_graph" in notes
+
+
+def test_corpus_census_requires_an_admin() -> None:
+    writer = authed_client("test-writer")
+
+    assert writer.get("/api/corpus").status_code == 403
+
+
+def test_corpus_census_rejects_unauthenticated_callers() -> None:
+    server_module.app.state.citadel = FakeCitadel()
+    client = TestClient(app, base_url="https://testserver")
+
+    assert client.get("/api/corpus").status_code == 401
