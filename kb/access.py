@@ -226,9 +226,37 @@ def _parse_time(value: str | None) -> datetime | None:
     return parsed
 
 
+def validate_expires_at(value: str | None) -> str | None:
+    """Reject an expiry the expiry check would not be able to read.
+
+    Stored raw, an unparseable value is indistinguishable from no expiry at all,
+    so the token outlives its stated lifetime while the dashboard still labels it
+    "Expires". Refusing it at the door is the only place the caller can be told.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if _parse_time(text) is None:
+        raise ValueError(
+            f"expires_at is not an ISO 8601 timestamp: {value!r}"
+        )
+    return text
+
+
 def _is_expired(value: str | None) -> bool:
+    if not value:
+        # No expiry set. Permanent by design.
+        return False
     parsed = _parse_time(value)
-    return bool(parsed and parsed <= datetime.now(timezone.utc))
+    if parsed is None:
+        # An expiry was set and cannot be read. Previously this returned False
+        # and the token authenticated forever. Treat unreadable as expired:
+        # validate_expires_at stops new ones being written, and this covers
+        # anything already stored, including a value edited in by hand.
+        return True
+    return parsed <= datetime.now(timezone.utc)
 
 
 def _dedupe(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -453,6 +481,7 @@ class AccessStore:
             raise KeyError(principal_id)
         resolved_role = role or principal.role
         validate_role(resolved_role)
+        resolved_expires_at = validate_expires_at(expires_at)
         resolved_scopes = (
             validate_role_scopes(resolved_role, scopes)
             if scopes is not None
@@ -472,7 +501,7 @@ class AccessStore:
             scopes=resolved_scopes,
             team_id=team_id if team_id is not None else principal.team_id,
             created_at=now_iso(),
-            expires_at=expires_at,
+            expires_at=resolved_expires_at,
             default_dataset=_normalize_optional_str(default_dataset),
             default_session=_normalize_optional_str(default_session),
             allowed_datasets=_dedupe(allowed_datasets or ()),
@@ -494,6 +523,10 @@ class AccessStore:
         default_session: str | None = None,
         allowed_datasets: tuple[str, ...] | list[str] | None = None,
     ) -> TokenCreation:
+        # Before create_principal, not after: create_token validates this too,
+        # but by then the principal exists and raising would strand it with no
+        # token attached.
+        validate_expires_at(expires_at)
         principal = self.create_principal(
             name=name,
             kind=kind,

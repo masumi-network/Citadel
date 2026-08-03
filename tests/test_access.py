@@ -76,6 +76,92 @@ def test_future_expiry_still_authenticates(tmp_path: Path) -> None:
     assert rejection_events(access_store) == []
 
 
+def test_no_expiry_is_still_permanent(tmp_path: Path) -> None:
+    """Omitting the field means permanent, and must stay that way.
+
+    Tightening the unreadable-expiry path must not touch this case.
+    """
+    access_store = store(tmp_path)
+    created = access_store.create_principal_token(
+        name="permanent-bot",
+        kind="service_account",
+        role="reader",
+        expires_at=None,
+    )
+
+    assert access_store.authenticate_token(created.token) is not None
+    assert rejection_events(access_store) == []
+
+
+def test_an_unreadable_expiry_is_refused_at_mint(tmp_path: Path) -> None:
+    """The value was stored raw while role and scopes beside it were validated.
+
+    An expiry the expiry check cannot parse is indistinguishable from no expiry,
+    so the token lived forever while the dashboard labelled it "Expires".
+    """
+    access_store = store(tmp_path)
+
+    with pytest.raises(ValueError, match="not an ISO 8601 timestamp"):
+        access_store.create_principal_token(
+            name="never-expires-bot",
+            kind="service_account",
+            role="reader",
+            expires_at="next friday",
+        )
+
+
+def test_a_refused_expiry_leaves_no_orphan_principal(tmp_path: Path) -> None:
+    """create_principal_token builds the principal before the token.
+
+    Validating only inside create_token would strand a principal with no token
+    attached every time an expiry is rejected.
+    """
+    access_store = store(tmp_path)
+    before = len(access_store.snapshot()["principals"])
+
+    with pytest.raises(ValueError):
+        access_store.create_principal_token(
+            name="orphan-bot",
+            kind="service_account",
+            role="reader",
+            expires_at="whenever",
+        )
+
+    assert len(access_store.snapshot()["principals"]) == before
+
+
+def test_an_unreadable_expiry_already_in_the_store_is_treated_as_expired(
+    tmp_path: Path,
+) -> None:
+    """Covers what mint-time validation cannot: a value edited in by hand.
+
+    Before, an unparseable stored expiry made _is_expired return False and the
+    token authenticated forever.
+    """
+    import json
+
+    path = tmp_path / "access.json"
+    access_store = AccessStore(path)
+    created = access_store.create_principal_token(
+        name="hand-edited-bot",
+        kind="service_account",
+        role="reader",
+        expires_at=iso_offset(hours=1),
+    )
+    assert access_store.authenticate_token(created.token) is not None
+
+    raw = json.loads(path.read_text())
+    for token in raw["tokens"]:
+        token["expires_at"] = "sometime next quarter"
+    path.write_text(json.dumps(raw))
+
+    reopened = AccessStore(path)
+
+    assert reopened.authenticate_token(created.token) is None
+    events = rejection_events(reopened)
+    assert events[-1]["detail"]["reason"] == "expired"
+
+
 def test_revoked_token_is_rejected_with_audit_event(tmp_path: Path) -> None:
     access_store = store(tmp_path)
     created = access_store.create_principal_token(
