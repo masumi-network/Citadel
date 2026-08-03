@@ -36,7 +36,13 @@ from kb.capture_config import (
     normalize_tags,
     save_capture_config,
 )
-from kb.capture import build_capture_payload, capture_token, post_capture
+from kb.capture import (
+    build_capture_payload,
+    capture_token,
+    http_timeout_seconds,
+    is_timeout_error,
+    post_capture,
+)
 from kb.capture_roots_sync import sync_local_capture_roots_to_server, sync_warning_message
 from kb.onboard import (
     TOKEN_ENV,
@@ -290,16 +296,39 @@ async def _ingest(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
-    from kb.status import ingest_node
+    from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
 
     # Cognify inline (server-side) by default so the note is immediately
     # searchable; the one request blocks until cognify finishes (--no-cognify skips).
     cognify = not getattr(args, "no_cognify", False)
     as_json = getattr(args, "json", False)
+    timeout_arg = getattr(args, "timeout", None)
+    if timeout_arg is not None:
+        timeout_s = max(1.0, float(timeout_arg))
+    else:
+        timeout_s = _COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT
+
+    def _timeout_exit() -> int:
+        # A client timeout proves only that no response arrived in the budget.
+        # It does NOT prove the write failed — the Node may still be processing
+        # (the capture-timeout lesson) — so claim neither outcome.
+        return _emit_error(
+            "ingest",
+            f"no response after {timeout_s:g}s — the Node may still be processing "
+            "(cognify is slow on cold nodes). A client timeout does not prove the "
+            "write failed: check `citadel activity` (or search for the note) to "
+            "confirm, or retry with a longer --timeout.",
+            as_json=as_json,
+            code="TIMEOUT",
+            extra={"timed_out": True, "write_state": "unknown", "timeout_s": timeout_s},
+        )
+
     spinner_msg = "Ingesting + building the graph…" if cognify else "Ingesting to your Node…"
     try:
         with _Spinner(spinner_msg):
-            result = await asyncio.to_thread(ingest_node, base_url, token, args.data, args.tag, cognify)
+            result = await asyncio.to_thread(
+                ingest_node, base_url, token, args.data, args.tag, cognify, timeout=timeout_s
+            )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
         if not as_json:
@@ -312,15 +341,12 @@ async def _ingest(args: argparse.Namespace) -> int:
             extra={"http_status": exc.code},
         )
     except TimeoutError:
-        return _emit_error(
-            "ingest",
-            "the Node is still working (cognify can be slow). Your note is saved — it'll "
-            "be searchable shortly; check `citadel search`.",
-            as_json=as_json,
-            code="TIMEOUT",
-            extra={"saved": True},
-        )
+        return _timeout_exit()
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        # urllib wraps connect-phase socket timeouts as URLError("timed out") —
+        # that is a budget expiry, not an unreachable Node.
+        if _is_timeout_exc(exc):
+            return _timeout_exit()
         return _emit_error("ingest", str(exc), as_json=as_json, code="NODE_UNREACHABLE")
     if not isinstance(result, dict):  # a misconfigured Node could return non-dict JSON
         result = {"accepted": False, "reason": "unexpected response from the Node"}
@@ -1036,17 +1062,19 @@ async def _capture(args: argparse.Namespace) -> int:
     if not token:
         return _emit_no_token("capture", as_json=getattr(args, "json", False))
 
+    # Per-root truth contract: ok=True stored, ok=False definitively not stored
+    # (reason/error says why), ok=None unknown (client timed out; the server may
+    # still have completed the write). Exit 0 only when every root is stored or
+    # already present on the server; a duplicate skip is a no-op, not a failure.
     as_json = getattr(args, "json", False)
     results: list[dict[str, Any]] = []
     failures = 0
+    unknowns = 0
     auth_fail_code = 0
+    timeout_seconds = http_timeout_seconds()
     for root, payload in payloads:
         try:
             response = post_capture(config.node_url, token, payload)
-            status = response.get("cognee_result", {}).get("status") or response.get("status")
-            results.append({"root": root.path, "ok": True, "status": status, "tags": payload["tags"]})
-            if not as_json:
-                print(f"OK  {root.path} ({status})")
         except urllib.error.HTTPError as exc:
             failures += 1
             auth_fail_code = auth_fail_code or exc.code
@@ -1054,18 +1082,75 @@ async def _capture(args: argparse.Namespace) -> int:
             results.append({"root": root.path, "ok": False, "error": f"HTTP {exc.code} {detail}"})
             if not as_json:
                 print(f"FAIL {root.path}: HTTP {exc.code} {detail}", file=sys.stderr)
+            continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            # Node unreachable / DNS / timeout / non-HTTPS URL — isolate per root.
-            failures += 1
-            results.append({"root": root.path, "ok": False, "error": str(exc)})
+            if is_timeout_error(exc):
+                # A read timeout proves only that the client stopped waiting.
+                # A production write was observed landing after the deadline,
+                # so this outcome is unknown, never a claimed failure.
+                unknowns += 1
+                detail = (
+                    f"no response within {timeout_seconds:.0f}s; "
+                    "the write may still have completed on the server"
+                )
+                results.append({"root": root.path, "ok": None, "error": detail})
+                if not as_json:
+                    print(f"UNKNOWN {root.path}: {detail}", file=sys.stderr)
+            else:
+                # Node unreachable / DNS / non-HTTPS URL: isolate per root.
+                failures += 1
+                results.append({"root": root.path, "ok": False, "error": str(exc)})
+                if not as_json:
+                    print(f"FAIL {root.path}: {exc}", file=sys.stderr)
+            continue
+        # HTTP 200 is not proof of storage: the server states its decision in
+        # `accepted`. Only an explicit false is a rejection (legacy bodies
+        # without the field keep the old 200-means-stored contract).
+        accepted = response.get("accepted") is not False
+        reason = response.get("reason")
+        cognee_result = response.get("cognee_result")
+        status = (
+            cognee_result.get("status") if isinstance(cognee_result, dict) else None
+        ) or response.get("status")
+        if accepted:
+            results.append(
+                {"root": root.path, "ok": True, "status": status, "tags": payload["tags"]}
+            )
             if not as_json:
-                print(f"FAIL {root.path}: {exc}", file=sys.stderr)
+                print(f"OK  {root.path} ({status})")
+        elif reason == "duplicate_in_process":
+            # The server already holds identical content, so the desired end
+            # state exists. Visible skip, exit 0: failing here would teach
+            # automation to ignore exit codes on every unchanged re-run.
+            results.append(
+                {"root": root.path, "ok": False, "reason": reason, "tags": payload["tags"]}
+            )
+            if not as_json:
+                print(f"SKIP {root.path}: nothing stored ({reason})")
+        else:
+            failures += 1
+            results.append(
+                {
+                    "root": root.path,
+                    "ok": False,
+                    "reason": reason or "rejected",
+                    "tags": payload["tags"],
+                }
+            )
+            if not as_json:
+                print(f"FAIL {root.path}: nothing stored ({reason or 'rejected'})", file=sys.stderr)
     if not as_json and auth_fail_code:
         _print_auth_hint("capture", auth_fail_code)  # once, not per failing root
+    if not as_json and unknowns:
+        print(
+            "Re-run `citadel capture` to confirm: a write that landed after the "
+            "timeout will show as SKIP (duplicate_in_process).",
+            file=sys.stderr,
+        )
     if as_json:
-        _print_json({"ok": failures == 0, "results": results})
-    # Human mode already printed a per-root OK/FAIL line during the loop.
-    return 1 if failures else 0
+        _print_json({"ok": failures == 0 and unknowns == 0, "results": results})
+    # Human mode already printed a per-root OK/SKIP/UNKNOWN/FAIL line during the loop.
+    return 1 if failures or unknowns else 0
 
 
 def _promotion_base_url(args: argparse.Namespace) -> str:
@@ -1656,6 +1741,10 @@ async def _status(args: argparse.Namespace) -> int:
 
 def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
     """Compact knowledge-mesh summary for `citadel status` (the 'your data' view)."""
+    if isinstance(mesh, dict) and mesh.get("error"):
+        # fetch_mesh marks failures as {"error": ...}; dropping the block made
+        # an unreachable mesh endpoint look like "no mesh data".
+        return paint(f"Knowledge mesh unavailable: {mesh['error']}", "yellow", enable=color)
     stats = (mesh or {}).get("stats")
     if not isinstance(stats, dict) or not stats:
         return ""
@@ -1681,7 +1770,11 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
 
 
 def _render_event(event: dict[str, Any], color: bool) -> str:
-    """One Vault Activity line: `HH:MM  <type>  <message>  (dataset)`."""
+    """One Vault Activity line: `HH:MM  <type>  <message>  (dataset)`.
+
+    Error events also carry which operation failed and its (already redacted)
+    reason — without them every failure renders as a bare "Operation failed".
+    """
     created = str(event.get("created_at") or "")
     stamp = created[11:16] if len(created) >= 16 else created[:5]
     etype = str(event.get("type") or "event")
@@ -1689,6 +1782,13 @@ def _render_event(event: dict[str, Any], color: bool) -> str:
     details = event.get("details") if isinstance(event.get("details"), dict) else {}
     timeline = event.get("timeline") if isinstance(event.get("timeline"), dict) else {}
     dataset = details.get("dataset") or timeline.get("dataset") or ""
+    if etype == "error":
+        operation = str(details.get("operation") or "").strip()
+        reason = " ".join(str(details.get("error") or "").split())[:120]
+        if operation:
+            message = f"{message}: {operation}" if message else operation
+        if reason:
+            message = f"{message} — {reason}" if message else reason
     line = (
         paint(f"{stamp:>5}", "dim", enable=color)
         + "  "
@@ -1744,9 +1844,11 @@ def _render_presence(board: dict[str, Any], color: bool) -> str:
 async def _activity_global(node_url: str, token: str | None, color: bool, watch: bool) -> int:
     """Live team-presence broadcast — Seat Presence only (ADR-0009), no content."""
     board = await asyncio.to_thread(fetch_presence, node_url, token)
+    if board.get("error"):
+        # An unreachable Node must not render as an empty-but-healthy board.
+        print(f"citadel activity: could not reach {node_url} — {board['error']}", file=sys.stderr)
+        return 1
     print(_render_presence(board, color))
-    if not token and not board.get("error") and not board.get("seats"):
-        print(paint("  (no token configured — run `citadel onboard`)", "yellow", enable=color))
     if not watch:
         return 0
     print(paint("— watching team presence (Ctrl-C to stop) —", "dim", enable=color))
@@ -1776,10 +1878,27 @@ async def _activity(args: argparse.Namespace) -> int:
     token = capture_token() or None
     use_color = supports_color()
 
+    if not token:
+        # Without a token the feed (and the presence board) can only ever be
+        # empty — that is an auth gap, not "no activity", so say so with exit 1
+        # (a JSON object under --json) instead of a bare `{}` / quiet feed.
+        return _emit_no_token("activity", as_json=bool(args.json))
+
     if getattr(args, "global_broadcast", False):
         return await _activity_global(node_url, token, use_color, args.watch)
 
     data = await asyncio.to_thread(fetch_events, node_url, token, limit=limit, event_type=args.type)
+    failure = data.get("error") or (None if data else "empty response from the Node")
+    if failure:
+        # fetch_events marks every transport/HTTP failure as {"error": ...}.
+        # Rendering that as "No recent activity." (exit 0) made a node outage
+        # indistinguishable from an empty vault — fail loudly on both surfaces.
+        return _emit_error(
+            "activity",
+            f"could not reach {node_url} — {failure}",
+            as_json=bool(args.json),
+            code="NODE_UNREACHABLE",
+        )
     if args.json and not args.watch:
         _print_json(data)
         return 0
@@ -1793,12 +1912,9 @@ async def _activity(args: argparse.Namespace) -> int:
 
     if not args.watch:
         if not events:
-            if data.get("error"):
-                print(paint(f"Couldn't reach the Node: {data['error']}", "yellow", enable=use_color))
-            else:
-                print(paint("No recent activity.", "dim", enable=use_color))
-                if not token:
-                    print(paint("  (no token configured — run `citadel onboard`)", "yellow", enable=use_color))
+            # The failure paths (no token / unreachable) exited above, so an
+            # empty feed here really is an empty-but-healthy vault.
+            print(paint("No recent activity.", "dim", enable=use_color))
         return 0
 
     print(paint("— watching your Node (Ctrl-C to stop) —", "dim", enable=use_color))
@@ -1904,8 +2020,17 @@ async def _doctor(args: argparse.Namespace) -> int:
         issues.append({"problem": f".mcp.json Node ({mcp_node}) disagrees with capture config ({cap_node})",
                        "fix": f"citadel onboard --node-url {cap_node}"})
 
-    if checks.get("pre_push_hook") and not checks["pre_push_hook"].ok:
-        issues.append({"problem": "git pre-push autosync hook missing", "fix": "citadel doctor --fix", "kind": "pre_push"})
+    hook_check = checks.get("pre_push_hook")
+    if hook_check and not hook_check.ok:
+        if (hook_check.data or {}).get("git_repo") is False:
+            # Not a git repo here — "hook missing" would read as "your hook is
+            # gone" when there was simply nothing to inspect at this cwd.
+            issues.append({
+                "problem": f"pre-push hook not checked — {hook_check.detail}",
+                "fix": "run `citadel doctor` from inside a git repo (or pass --repo)",
+            })
+        else:
+            issues.append({"problem": "git pre-push autosync hook missing", "fix": "citadel doctor --fix", "kind": "pre_push"})
     if checks.get("session_hook") and not checks["session_hook"].ok:
         issues.append({"problem": "Claude SessionEnd/SessionStart hooks missing", "fix": "citadel doctor --fix", "kind": "session"})
     if checks.get("mcp") and not checks["mcp"].ok:
@@ -2886,6 +3011,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cognify",
         action="store_true",
         help="Skip the post-ingest cognify (faster; data appears in search later)",
+    )
+    ingest.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Max seconds to wait for the Node (default: 180 while cognifying, 60 with --no-cognify)",
     )
     ingest.add_argument("--json", action="store_true", help="Machine-readable output")
     ingest.add_argument("--node-url", help="Override Node URL")

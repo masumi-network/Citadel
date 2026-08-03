@@ -601,25 +601,25 @@ def _content_security_policy(style_src: str) -> str:
 
 CONTENT_SECURITY_POLICY = _content_security_policy("'self'")
 
-# The landing page carries an interactive pipeline diagram built on React Flow,
-# which positions every node and the viewport by writing an inline `transform`
-# style attribute. That is not something the library can be configured out of,
-# so the one page that renders it gets 'unsafe-inline' for styles and nothing
-# else. Script execution stays restricted to same-origin files on every page.
+# The relaxed variant is kept so a page can only ever reach it through the
+# explicit opt-in set below, never by accident. No page uses it today.
+#
+# The landing page's React Flow diagram was the one candidate: it positions
+# every node and the viewport by writing inline `transform` styles, and the
+# library cannot be configured out of that. But it writes them through the
+# CSSOM (element.style), which style-src does not govern; the directive
+# covers <style> elements and style attributes arriving in markup. Measured
+# before the exemption was removed: under style-src 'self' the diagram
+# rendered identically, with zero securitypolicyviolation events (Chrome;
+# the CSSOM carve-out is spec behaviour). Script execution stays restricted
+# to same-origin files on every page under both policies.
 CONTENT_SECURITY_POLICY_INLINE_STYLE = _content_security_policy("'self' 'unsafe-inline'")
 
 # Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-# Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-#
-# Only / is here, because only / renders the React Flow pipeline diagram, which
-# positions its nodes with inline `transform` styles and cannot be configured
-# out of it. The page holds no token and no user data, which is why this is an
-# acceptable trade there and would not be on /app or /login.
-CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset({"/"})
+# policy. It is empty: every route, / and its React Flow diagram included,
+# gets the strict policy above. Adding a path here is a security decision;
+# the tests pin this set so it cannot grow in passing.
+CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset()
 
 
 def content_security_policy_for(path: str) -> str:
@@ -808,8 +808,18 @@ class IngestBody(BaseModel):
     cognify: bool = False
 
 
+# Upper bound on a search query, in the same spirit as SearchBody's other
+# string fields (repo 200, path 400, mode 32) — it was the one that could grow
+# without limit. Sized against the longest queries this repo actually asks: 99
+# characters in the bench corpus (scripts/bench/golden_questions.json, "What is
+# the full postgres connection string ...") and 38 in the test suite. Queries
+# are typed or composed by an agent, never built by concatenating file content,
+# so 2000 leaves a pasted paragraph plenty of room while still being a bound.
+MAX_SEARCH_QUERY_LENGTH = 2000
+
+
 class SearchBody(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=MAX_SEARCH_QUERY_LENGTH)
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)
@@ -2960,6 +2970,23 @@ async def next_app_view(view: str, request: Request) -> Response:
     if minimum_role is None:
         raise HTTPException(status_code=404, detail="Not Found")
     return next_app_page(request, f"app/{view}", minimum_role)
+
+
+# The theme bootstrap. Every exported page loads it from <head> before paint,
+# but it is neither a page (the `{page}` allow-list below serves HTML by exact
+# name and stays closed to other filenames) nor a build asset (the static
+# mount covers only /next/_next). So: one literal route, no path parameter.
+#
+# The media type is pinned rather than guessed from the filename, because the
+# site sends X-Content-Type-Options: nosniff and a browser refuses to execute
+# a script that arrives as anything but JavaScript.
+@app.get("/next/theme.js", include_in_schema=False)
+async def next_theme_js() -> FileResponse:
+    script = WEBUI_DIR / "theme.js"
+    if not script.is_file():
+        # A source checkout that has not run `npm run build:web`.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(script, media_type="text/javascript; charset=utf-8")
 
 
 # The rebuilt public pages, one preview route each. Exact names, not a path

@@ -305,37 +305,44 @@ def test_security_headers_are_applied_to_http_responses() -> None:
     )
 
 
-def test_only_the_landing_page_relaxes_style_src() -> None:
-    """/ is the single route allowed inline styles. Everything else is strict.
+def test_no_path_relaxes_style_src() -> None:
+    """Every route, / included, is served under the strict style-src.
 
-    The landing page renders a React Flow diagram, which positions nodes by
-    writing inline transform styles and cannot be configured out of it. That
-    buys exactly one directive on exactly one path, and / holds no token and no
-    user data. If this ever fails on a path other than /, a page has inherited
-    the relaxation, which is how a per-route exception becomes a site-wide one.
+    / renders a React Flow diagram that positions nodes by writing inline
+    `transform` styles, and for a while that bought it the site's one
+    'unsafe-inline' exemption. The exemption protected nothing: React writes
+    those transforms through the CSSOM (element.style), which style-src does
+    not govern. The directive covers <style> elements and style attributes
+    arriving in markup. With the exemption removed, the diagram rendered
+    identically and no securitypolicyviolation fired (measured in Chrome; the
+    CSSOM carve-out is spec behaviour). So / is pinned strict here alongside
+    everything else, and most deliberately of all: it is the one path that
+    would drift back.
     """
     client = authed_client()
 
-    relaxed = "style-src 'self' 'unsafe-inline';"
     strict = "style-src 'self';"
 
-    landing = client.get("/").headers["content-security-policy"]
-    assert relaxed in landing
-    assert strict not in landing
-    # Nothing else moved. Script execution in particular is untouched, so the
-    # exemption cannot be parlayed into running code.
-    assert "script-src 'self';" in landing
-    assert "default-src 'self';" in landing
-    assert "object-src 'none'" in landing
-
-    for path in ("/login", "/app", "/info", "/use-cases", "/contact", "/healthz", "/api/state"):
+    for path in (
+        "/",
+        "/login",
+        "/app",
+        "/info",
+        "/use-cases",
+        "/contact",
+        "/healthz",
+        "/api/state",
+    ):
         policy = client.get(path).headers["content-security-policy"]
         assert strict in policy, f"{path} lost the strict style-src"
-        assert "'unsafe-inline'" not in policy, f"{path} inherited the / relaxation"
+        assert "'unsafe-inline'" not in policy, f"{path} carries an inline-style relaxation"
+        # Script execution stays restricted to same-origin files everywhere.
+        assert "script-src 'self';" in policy, path
 
-    assert server_module.CSP_INLINE_STYLE_PATHS == frozenset({"/"}), (
+    assert server_module.CSP_INLINE_STYLE_PATHS == frozenset(), (
         "Adding a path here is a security decision. Update this test "
-        "deliberately, and check the page really renders something that needs it."
+        "deliberately, and check the page really renders something style-src "
+        "governs: inline styles written through the CSSOM are not it."
     )
 
 
@@ -2554,6 +2561,47 @@ def test_search_sets_ratelimit_headers_when_served() -> None:
     assert r.status_code == 200
     assert int(r.headers["X-RateLimit-Limit"]) >= 1
     assert "X-RateLimit-Remaining" in r.headers
+
+
+def test_search_query_length_is_bounded_like_its_sibling_filters() -> None:
+    """`query` is capped at the model boundary, as repo/path/mode already are.
+
+    The cap sits far above anything the product asks: the longest query in the
+    bench corpus is 99 characters and the longest in this suite is 38, against
+    a 2000 character ceiling. Everything a caller would plausibly type is still
+    accepted; only an unbounded body is refused, and refused before the request
+    reaches any of the work /search does per query.
+    """
+    client = authed_client("test-reader")
+
+    # Ordinary queries are untouched, including a long natural-language one.
+    for query in (
+        "q",
+        "MIP-003 availability type masumi-agent",
+        "What is the full postgres connection string for the production database?",
+        "policy + asset " * 20,
+    ):
+        assert len(query) <= server_module.MAX_SEARCH_QUERY_LENGTH
+        assert client.post("/search", json={"query": query}).status_code == 200, query
+
+    # Exactly at the cap is still a valid query.
+    at_cap = "a" * server_module.MAX_SEARCH_QUERY_LENGTH
+    assert client.post("/search", json={"query": at_cap}).status_code == 200
+
+    # One character over is rejected by validation, not served.
+    over_cap = "a" * (server_module.MAX_SEARCH_QUERY_LENGTH + 1)
+    rejected = client.post("/search", json={"query": over_cap})
+    assert rejected.status_code == 422
+
+    # The shape that costs the most to match is refused at the same boundary,
+    # so no amount of it reaches the query classifiers.
+    whitespace_heavy = client.post(
+        "/search", json={"query": "policy" + " " * server_module.MAX_SEARCH_QUERY_LENGTH}
+    )
+    assert whitespace_heavy.status_code == 422
+
+    # An empty query is still rejected too — the lower bound did not move.
+    assert client.post("/search", json={"query": ""}).status_code == 422
 
 
 def test_search_degrades_to_empty_on_timeout_budget() -> None:

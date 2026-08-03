@@ -658,3 +658,144 @@ def test_render_presence_board_sorts_by_count() -> None:
     assert "seat:sarthi" in out
     assert "23 docs" in out
     assert out.index("masumi-network") < out.index("seat:sarthi")
+
+
+# --- CLI fails loudly: activity / mesh / pre-push hook honesty ---------------
+
+
+def _activity_args(**kw) -> argparse.Namespace:
+    base = dict(
+        limit=20, local=False, config=None, node_url="https://node.example",
+        json=True, watch=False, type=None, global_broadcast=False,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_render_event_error_shows_operation_and_reason() -> None:
+    # `record_error` stores the operation + redacted reason in details; a bare
+    # "Operation failed" line is unactionable, so both must reach the feed.
+    from kb.cli import _render_event
+
+    event = {
+        "id": 6,
+        "type": "error",
+        "message": "Operation failed",
+        "details": {"operation": "search", "error": "DatasetNotFoundError:\n  no default dataset"},
+        "created_at": "2026-07-16T15:38:02Z",
+    }
+    line = _render_event(event, color=False)
+    assert "search" in line
+    # Newlines are collapsed so one event stays one line.
+    assert "DatasetNotFoundError: no default dataset" in line
+    assert "\n" not in line
+
+
+def test_activity_without_token_errors_as_json(monkeypatch, capsys) -> None:
+    # --json must stay machine-readable on the failure path: a bare `{}` with
+    # exit 0 reads as "no activity" when the real cause is a missing token.
+    from kb import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "capture_token", lambda: "")
+    code = asyncio.run(cli_mod._activity(_activity_args()))
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert "token" in payload["error"].lower()
+
+
+def test_activity_reports_unreachable_node_as_failure_json(monkeypatch, capsys) -> None:
+    # fetch_events marks transport errors as {"error": ...}; an outage must not
+    # render as an empty-but-healthy vault (exit 0).
+    from kb import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "capture_token", lambda: "ctdl_tok")
+    monkeypatch.setattr(cli_mod, "fetch_events", lambda *a, **k: {"error": "connection refused"})
+    code = asyncio.run(cli_mod._activity(_activity_args()))
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert "node.example" in payload["error"]
+
+
+def test_activity_unreachable_plain_prints_stderr_and_exits_one(monkeypatch, capsys) -> None:
+    from kb import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "capture_token", lambda: "ctdl_tok")
+    monkeypatch.setattr(cli_mod, "fetch_events", lambda *a, **k: {"error": "connection refused"})
+    code = asyncio.run(cli_mod._activity(_activity_args(json=False)))
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "could not reach" in captured.err
+    assert "No recent activity" not in captured.out
+
+
+def test_activity_empty_vault_still_exits_zero(monkeypatch, capsys) -> None:
+    # An outage must be loud, but a genuinely empty feed stays a quiet success —
+    # the two must never collapse into one another.
+    from kb import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "capture_token", lambda: "ctdl_tok")
+    monkeypatch.setattr(
+        cli_mod, "fetch_events", lambda *a, **k: {"events": [], "latest_event_id": 0}
+    )
+    code = asyncio.run(cli_mod._activity(_activity_args(json=False)))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "No recent activity" in captured.out
+
+    code = asyncio.run(cli_mod._activity(_activity_args()))
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["events"] == []
+
+
+def test_activity_global_unreachable_exits_one(monkeypatch, capsys) -> None:
+    from kb import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "capture_token", lambda: "ctdl_tok")
+    monkeypatch.setattr(cli_mod, "fetch_presence", lambda *a, **k: {"error": "no route to host"})
+    code = asyncio.run(cli_mod._activity(_activity_args(json=False, global_broadcast=True)))
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "no route to host" in captured.err
+
+
+def test_render_mesh_shows_unreachable_error() -> None:
+    # fetch_mesh marks failures as {"error": ...}; the human status view used to
+    # drop the whole block, which read as "no mesh data" instead of an outage.
+    from kb.cli import _render_mesh
+
+    out = _render_mesh({"error": "no route to host"}, color=False)
+    assert "no route to host" in out
+
+
+def test_pre_push_check_names_inspected_repo(tmp_path: Path) -> None:
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / ".git" / "hooks" / "pre-push").write_text("#!/bin/sh\n")
+    checks = {c.name: c for c in check_local_setup(tmp_path, tmp_path / "cap.json")}
+    hook = checks["pre_push_hook"]
+    assert hook.ok
+    assert str(tmp_path) in hook.detail
+    assert hook.data["git_repo"] is True
+
+
+def test_pre_push_check_missing_names_repo(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    checks = {c.name: c for c in check_local_setup(tmp_path, tmp_path / "cap.json")}
+    hook = checks["pre_push_hook"]
+    assert not hook.ok
+    assert "missing" in hook.detail
+    assert str(tmp_path) in hook.detail
+    assert hook.data["git_repo"] is True
+
+
+def test_pre_push_check_distinguishes_no_git_repo(tmp_path: Path) -> None:
+    # From a cwd with no .git the hook cannot be inspected at all — the check
+    # must say that plainly, never "missing" (which reads as "your hook is gone").
+    checks = {c.name: c for c in check_local_setup(tmp_path, tmp_path / "cap.json")}
+    hook = checks["pre_push_hook"]
+    assert not hook.ok
+    assert "no git repo" in hook.detail
+    assert str(tmp_path) in hook.detail
+    assert hook.data["git_repo"] is False

@@ -25,7 +25,11 @@ from kb.capture_config import CaptureRoot, normalize_tags
 CAPTURE_TAG = "capture"
 _README_NAMES = ("README.md", "README.rst", "README.txt", "README")
 _GIT_TIMEOUT_SECONDS = 8
-_HTTP_TIMEOUT_SECONDS = 120
+# Raised from 120: a production /ingest write was measured completing after
+# ~134s, so a 120s client read timeout reported "timed out" while the server
+# went on to store the document. Overridable per environment (see below).
+DEFAULT_HTTP_TIMEOUT_SECONDS = 300.0
+_HTTP_TIMEOUT_ENV = "CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS"
 _README_LINE_LIMIT = 6
 _README_LINE_MAX_CHARS = 500
 DEFAULT_MAX_INGEST_BYTES = 200_000
@@ -57,6 +61,30 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", "ignore")
+
+
+def http_timeout_seconds() -> float:
+    """Effective capture read timeout: ``CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS`` or default."""
+    raw = os.getenv(_HTTP_TIMEOUT_ENV)
+    if not raw:
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    return max(1.0, value)
+
+
+def is_timeout_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a client-side timeout (bare or URLError-wrapped).
+
+    A timeout only proves the client stopped waiting; the server may still
+    finish the write after the deadline, so callers must report the outcome as
+    unknown rather than failed.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(getattr(exc, "reason", None), TimeoutError)
 
 
 def capture_token() -> str:
@@ -163,9 +191,15 @@ def post_capture(
     token: str,
     payload: dict[str, Any],
     *,
-    timeout: float = _HTTP_TIMEOUT_SECONDS,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
-    """POST a capture summary to the Node `/ingest` endpoint (HTTPS-only)."""
+    """POST a capture summary to the Node `/ingest` endpoint (HTTPS-only).
+
+    ``timeout=None`` resolves to :func:`http_timeout_seconds` at call time so
+    the env override applies without threading a value through every caller.
+    """
+    if timeout is None:
+        timeout = http_timeout_seconds()
     if not node_url.lower().startswith("https://"):
         raise ValueError("refusing non-HTTPS Node URL")
     req = urllib.request.Request(
