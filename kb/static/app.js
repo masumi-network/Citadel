@@ -80,6 +80,10 @@ const state = {
   // Home and Review read these; whichever fetch lands first paints, the rest
   // fill in. Neither view blocks on the slowest request.
   meSummary: null,
+  // Distinguishes "the fetch failed" from "not fetched yet" / "field absent".
+  // Home renders a different note for each; a bare dash for all three would
+  // hide a broken endpoint.
+  meSummaryError: false,
   promotions: [],
   sources: [],
   auditFilter: "all",
@@ -3165,15 +3169,40 @@ function homeCapturedThisWeek() {
   }).length;
 }
 
+// "Notes you can read" is a readable-corpus count: this caller's Node plus
+// every dataset resolve_search_datasets() gives them (Central included).
+// /api/me/summary computes exactly that as `readable_document_count`, from the
+// durable relational store.
+//
+// This used to prefer the /api/mesh field now called `tracked_sources`, which
+// was never a document count at all — it is the sum of tracked github repos,
+// repo-content files and linear issues (ADR-0020). `document_count` is not the
+// right substitute either: it is Node-only, so it silently understates an
+// org-wide number by however much Central holds.
+//
+// Returns null, never 0, when the figure is not available. Zero is a claim
+// that the caller can read nothing, which is a different (and reassuring)
+// statement from "this node did not report a number".
 function homeReadableCount() {
-  // Used to prefer stats.documents from /api/mesh, but that field never held a
-  // document count (it was corpus["tracked_sources"] - github repos +
-  // repo-content files + linear issues; see ADR-0019). Renaming it to
-  // tracked_sources made this branch permanently dead code that never ran,
-  // not a working fallback path (#206 follow-up). document_count is
-  // Node-only (not org-wide), but it is an actual document count, which
-  // tracked_sources never was.
-  return Number((state.meSummary && state.meSummary.document_count) || 0);
+  const summary = state.meSummary;
+  if (!summary) return null;
+  const readable = summary.readable_document_count;
+  return typeof readable === "number" ? readable : null;
+}
+
+/** A number that is not there yet reads as a dash, never as zero. */
+function countOrDash(value) {
+  return typeof value === "number" ? String(value) : "—";
+}
+
+// Why the number is missing, or "" when it is not missing. Mirrors the Next
+// port's Home tile (web/src/pages/app/index.tsx): a failed fetch and a node
+// that did not report the field are different states and must not both render
+// as a bare dash.
+function homeReadableNote() {
+  if (state.meSummaryError) return "Unavailable";
+  if (homeReadableCount() === null) return "Not reported by this node yet";
+  return "";
 }
 
 function renderHomeRecent() {
@@ -3249,7 +3278,13 @@ function renderHome() {
   }
 
   const readable = document.getElementById("homeReadable");
-  if (readable) readable.textContent = String(homeReadableCount());
+  if (readable) readable.textContent = countOrDash(homeReadableCount());
+  const readableNote = document.getElementById("homeReadableNote");
+  if (readableNote) {
+    const note = homeReadableNote();
+    readableNote.textContent = note;
+    readableNote.hidden = !note;
+  }
   const captured = document.getElementById("homeCapturedWeek");
   if (captured) captured.textContent = String(homeCapturedThisWeek());
   const waiting = document.getElementById("homeWaiting");
@@ -3273,8 +3308,10 @@ async function loadSeatHome() {
   renderHome();
   try {
     state.meSummary = await api("/api/me/summary");
+    state.meSummaryError = false;
   } catch (error) {
     state.meSummary = null;
+    state.meSummaryError = true;
     showToast(error.message || "Could not load your Node summary", true);
   }
   renderHome();
