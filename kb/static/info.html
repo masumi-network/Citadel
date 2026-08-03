@@ -62,19 +62,23 @@
   <section class="band band-white" id="state">
     <div class="band-in">
       <div class="sechead"><span class="kicker">01 · Current state</span><h2>Where things stand today</h2></div>
-      <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are repo facts as of the last report.</p>
+      <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are dated measurements, and the line under them says when each was taken.</p>
       <div class="metrics">
         <div class="metric tealn"><div class="n" id="m-version">v0.4.0</div><div class="k">deployed &amp; healthy on Railway</div></div>
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
         <div class="metric accent"><div class="n">10</div><div class="k">releases shipped (v0.1.0 → v0.4.0)</div></div>
-        <div class="metric"><div class="n sm">$55/mo</div><div class="k">to self-host, measured</div></div>
-        <div class="metric"><div class="n">906</div><div class="k">tests across 52 files · CI on every push</div></div>
         <div class="metric"><div class="n" id="m-tools">22</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n sm">300&ndash;500ms</div><div class="k">search latency, median</div></div>
-        <div class="metric"><div class="n">~25k</div><div class="k">LOC · 53 modules · zero-dep client</div></div>
+        <div class="metric"><div class="n sm">~$55/mo</div><div class="k">to self-host, measured 2026-07-31</div></div>
+        <div class="metric"><div class="n">269 ms</div><div class="k">median search round-trip, from a client</div></div>
       </div>
-      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Tests, releases and LOC are as of v0.4.0, 2026-07-22.</span></p>
-      <p class="verified"><span class="vdot"></span>Cost and search latency are measured snapshots from the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>, not a live call: reproducible on demand, not a guess.</p>
+      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.4.0, 2026-07-22.</span></p>
+      <!-- Two different kinds of snapshot, and the sentence has to say which is
+           which. cost_model.py holds 2026-07-31's Railway averages as a constant,
+           so re-running it reprints the same total by construction and can never
+           show drift. search_bench.py really does re-measure. Calling both
+           "reproducible" flattened that difference, which is how a frozen number
+           starts reading as a live one. -->
+      <p class="verified"><span class="vdot"></span>Both are snapshots from 2026-07-31, not live calls, and the method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. The cost model carries that day's resource averages in its source, so re-running it reprints the figure rather than re-measuring it; the round-trip is re-measurable with <code>search_bench.py</code>, and being a client round-trip it reads higher than server-side timing does.</p>
     </div>
   </section>
 

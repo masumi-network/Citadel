@@ -303,17 +303,21 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     drops, so it is drawn after mount exactly as the hand-written page drew it
     from a deferred script.
 
-    Commit and ADR counts were dropped from these tiles: they are not evidence
-    the system works, and both had drifted stale in the past. Cost and search
-    latency, backed by a named, rerunnable harness, took their place.
+    Four counts were dropped from these tiles: commits, decision records, a test
+    count and a LOC count. None was evidence the system works and every one of
+    them had drifted stale on the page. A dated cost snapshot and a dated search
+    round-trip, both traceable to `scripts/bench/`, took two of the slots and the
+    row went from eight tiles to six.
     """
     body = _client().get("/next/info").text
 
     assert "v0.4.0" in body
-    assert "$55/mo" in body
-    assert "500ms" in body
+    assert "~$55/mo" in body
+    assert "269 ms" in body
     assert "commits on main" not in body
     assert "architecture decision records" not in body
+    assert "tests across 52 files" not in body
+    assert "53 modules" not in body
     assert "Live tiles pull from" in body
 
 

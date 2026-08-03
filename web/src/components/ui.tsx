@@ -123,7 +123,11 @@ export function Card({ title, children }: { title: ReactNode; children: ReactNod
 
 /* --- metrics ------------------------------------------------------------ */
 
-export const METRICS = "grid grid-cols-4 gap-3 max-[760px]:grid-cols-2";
+/* Three across, because there are six of them. The row was four across while
+   two of the tiles were repo trivia (a test count and a LOC count) that had
+   gone stale on the page; dropping those left six, and six in a four-column
+   grid is a full row and a stranded pair. */
+export const METRICS = "grid grid-cols-3 gap-3 max-[760px]:grid-cols-2";
 const METRIC_N =
   "font-mono text-[26px] font-medium leading-[1.1] tracking-[-.02em] tabular-nums min-[1120px]:text-[28px]";
 

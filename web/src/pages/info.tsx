@@ -53,7 +53,7 @@ const STAMPED = {
   mcpTools: 22,
 };
 
-const AS_OF = "Tests, releases and LOC are as of v0.4.0, 2026-07-22.";
+const AS_OF = "Releases are as of v0.4.0, 2026-07-22.";
 
 /* A closing footer that is itself a band is full-bleed, so it carries no top
    margin: the gap an in-column footer wants would show as a stripe of --ground
@@ -162,7 +162,7 @@ export default function Info() {
         <SecHead kicker="01 · Current state" title="Where things stand today" />
         <p className={LEDE}>
           Health and scale. The live tiles below refresh from the running node each time this page
-          loads; the rest are repo facts as of the last report.
+          loads; the rest are dated measurements, and the line under them says when each was taken.
         </p>
         <div className={METRICS}>
           <Metric accent value={tiles.version} label="deployed & healthy on Railway" />
@@ -179,14 +179,12 @@ export default function Info() {
             label={tiles.docsSub}
           />
           <Metric accent value="10" label="releases shipped (v0.1.0 → v0.4.0)" />
-          <Metric value={<span className="text-[19px]">$55/mo</span>} label="to self-host, measured" />
-          <Metric value="906" label="tests across 52 files · CI on every push" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
           <Metric
-            value={<span className="text-[19px]">300&ndash;500ms</span>}
-            label="search latency, median"
+            value={<span className="text-[19px]">~$55/mo</span>}
+            label="to self-host, measured 2026-07-31"
           />
-          <Metric value="~25k" label="LOC · 53 modules · zero-dep client" />
+          <Metric value="269 ms" label="median search round-trip, from a client" />
         </div>
         <Verified>
           {tiles.stateUpdated ??
@@ -199,12 +197,21 @@ export default function Info() {
               </>
             ))}
         </Verified>
+        {/* Two different kinds of snapshot, and the sentence has to say which
+            is which. cost_model.py holds 2026-07-31's Railway averages as a
+            constant, so re-running it reprints the same total by construction
+            and can never show drift. search_bench.py really does re-measure.
+            Calling both "reproducible" flattened that difference, which is how
+            a frozen number starts reading as a live one. */}
         <Verified>
-          Cost and search latency are measured snapshots from the repo&apos;s{" "}
+          Both are snapshots from 2026-07-31, not live calls, and the method is in the repo&apos;s{" "}
           <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
             bench harness
           </a>
-          , not a live call: reproducible on demand, not a guess.
+          . The cost model carries that day&apos;s resource averages in its source, so re-running it
+          reprints the figure rather than re-measuring it; the round-trip is re-measurable with{" "}
+          <code className={CODE}>search_bench.py</code>, and being a client round-trip it reads
+          higher than server-side timing does.
         </Verified>
       </Band>
 

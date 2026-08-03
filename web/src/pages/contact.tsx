@@ -84,10 +84,12 @@ export default function Contact() {
           </p>
 
           <footer className="mt-[34px] text-[15px] text-ink-2">
-            {/* The website and the city, and nothing else. A personal name, an
-                email and a registered address were placeholders here for a
-                while; the enquiry form above is the route in, and none of the
-                three needed publishing to make it work. */}
+            {/* The website and the city. A personal name, an email and a
+                registered address were placeholders here for a while, and the
+                name and the address stayed unpublished. The email did not: it
+                now sits above this footer, by request, because the form relays
+                into a team chat and someone who will not type into a form
+                still needs a route in. Two routes, one of them a person. */}
             <p>
               <b>utxo AG</b> · Zug, Switzerland · <a href="https://utxo.ag/">utxo.ag</a>
             </p>

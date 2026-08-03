@@ -194,7 +194,7 @@
 
       var upd = rel(d.updated_at);
       set("state-updated", "Live tiles updated" + (upd ? " " + upd : "") + "." +
-        repoNote + " Tests, releases and LOC are as of v0.4.0, 2026-07-22.");
+        repoNote + " Releases are as of v0.4.0, 2026-07-22.");
       set("foot-note", "State-of-the-vault report · live tiles from /api/state" +
         (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.4.0.");
     })

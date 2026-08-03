@@ -112,15 +112,15 @@ export default function Home() {
               <div className={TILE_K}>Open source, self-hosted</div>
             </div>
             <div className="border border-border bg-surface p-5">
-              <div className={TILE_N}>900</div>
-              <div className={TILE_K}>Tests, CI on every push</div>
+              <div className={TILE_N}>269 ms</div>
+              <div className={TILE_K}>Median search round-trip, from a client</div>
             </div>
             <div className="border border-border bg-surface p-5">
               <div className={TILE_N}>22</div>
               <div className={TILE_K}>MCP tools for agents</div>
             </div>
             <div className="border border-border bg-surface p-5">
-              <div className={`${TILE_N} text-[19px]`}>$55/mo</div>
+              <div className={`${TILE_N} text-[19px]`}>~$55/mo</div>
               <div className={TILE_K}>To self-host the whole node</div>
             </div>
           </div>
@@ -128,18 +128,25 @@ export default function Home() {
             This page is served by the system it describes. Live numbers, releases, and the roadmap
             are on the <a href="/info">status page</a>.
           </p>
+          {/* Both tiles above are dated snapshots, and the wording has to keep
+              them that way. The cost model has 2026-07-31's resource averages
+              written into its source, so re-running it reprints the same total
+              instead of re-measuring; the round-trip is what search_bench.py
+              timed from a laptop, which is not server-side latency. Claiming
+              either is live, or quoting the cost to the cent, would be false. */}
           <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
-            Search runs 300 to 500&nbsp;ms median depending on which surface asks, and the $55
-            figure above comes from measured resource use, not a list-price guess. Both are public,
-            including the parts that are not good yet, in the repo&apos;s{" "}
+            Both were measured against this deployment on 2026-07-31 and the method is in the
+            repo&apos;s{" "}
             <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
               bench harness
             </a>
-            . Self-hosting the whole server, not just the CLI, takes{" "}
-            <a href="https://github.com/masumi-network/Citadel#self-host-the-server">
-              three commands
-            </a>
-            .
+            . The cost applies Railway&apos;s published prices to 24-hour average resource use
+            across all three services of the project; a trailing-7-day basis comes out nearer $61,
+            so read it as about $55 rather than a figure to the cent. The 269&nbsp;ms is a
+            round-trip timed from a client, so it carries DNS, TLS and the network path with it,
+            and server-side timing on the same run was lower. Self-hosting the whole server, not
+            just the CLI, is covered in the{" "}
+            <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.
           </p>
         </div>
       </section>
