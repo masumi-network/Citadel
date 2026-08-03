@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import logging
 import os
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from time import monotonic, perf_counter
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
@@ -25,6 +27,47 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC.
+
+    Postgres returns ``data.created_at`` timezone-aware; sqlite (the test and
+    default local store) drops the offset and returns it naive. Every write
+    path stamps UTC, so pinning naive values to UTC keeps cursor comparisons
+    from mixing naive and aware datetimes (which raises) or shifting rows by a
+    local offset.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _isoformat_utc(value: Any) -> str | None:
+    if not isinstance(value, datetime):
+        return None
+    return _utc_datetime(value).isoformat()
+
+
+def _parse_citadel_tags(external_metadata: Any) -> list[str]:
+    """Our tags out of cognee's external_metadata, [] when absent or malformed.
+
+    cognee itself stores this column as a dict but tolerates JSON strings on
+    read (``parse_external_metadata``), so accept both. Display-only: a row
+    whose metadata does not parse still enumerates, just without tags.
+    """
+    metadata = external_metadata
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(metadata, dict):
+        return []
+    tags = metadata.get("citadel_tags")
+    if not isinstance(tags, list):
+        return []
+    return [str(tag) for tag in tags]
 
 
 # Dataset-attribution tuning (#50): /api/mesh/graph calls node_dataset_map on
@@ -85,6 +128,56 @@ def assert_cognee_dataset_api() -> None:
             raise RuntimeError(
                 f"cognee {model.__name__} no longer declares data_ingestion_info; "
                 "kb.repo_content_sync._cognee_data_ids needs updating"
+            )
+
+    # The corpus census (corpus_page / corpus_totals / corpus_chunk_counts /
+    # corpus_graph_presence) leans on more private surface than dataset
+    # attribution does: specific Data/Dataset/DatasetData columns, the pgvector
+    # adapter's table reflection + session, and the graph adapter's batched
+    # node lookup. Pin each one so a cognee bump that moves any of them fails
+    # loudly at boot and in CI instead of quietly breaking the census.
+    from cognee.infrastructure.databases.graph.ladybug.adapter import LadybugAdapter
+    from cognee.infrastructure.databases.vector import get_vector_engine  # noqa: F401
+    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
+        PGVectorAdapter,
+    )
+    from cognee.modules.data.models import Data
+
+    for model, required in (
+        (
+            Data,
+            {
+                "id",
+                "name",
+                "content_hash",
+                "raw_content_hash",
+                "mime_type",
+                "external_metadata",
+                "token_count",
+                "data_size",
+                "created_at",
+                "updated_at",
+                "owner_id",
+            },
+        ),
+        (Dataset, {"id", "name", "owner_id"}),
+        (DatasetData, {"dataset_id", "data_id"}),
+    ):
+        missing = required - set(model.__table__.c.keys())
+        if missing:
+            raise RuntimeError(
+                f"cognee {model.__name__} table no longer carries {sorted(missing)}; "
+                "the kb.cognee_client corpus census needs updating"
+            )
+    for adapter, method_name in (
+        (PGVectorAdapter, "get_table"),
+        (PGVectorAdapter, "get_async_session"),
+        (LadybugAdapter, "get_nodes"),
+    ):
+        if not callable(getattr(adapter, method_name, None)):
+            raise RuntimeError(
+                f"cognee {adapter.__name__} no longer exposes {method_name}; "
+                "the kb.cognee_client corpus census needs updating"
             )
 
 
@@ -777,6 +870,236 @@ class CogneePublicClient:
             for dataset_name, total in rows.all():
                 counts[str(dataset_name)] = int(total or 0)
         return counts
+
+    async def corpus_page(
+        self,
+        *,
+        after_created_at: str | None = None,
+        after_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """One keyset page of the relational corpus, ordered by (created_at, id).
+
+        The ``data`` table is the durable record of everything cognee accepted,
+        so it is the only store a row-level census can enumerate: the graph
+        endpoint caps at 1000 nodes and per-source "documents" counters are
+        sync bookkeeping, not corpus rows. Deliberately NOT filtered by
+        ``get_default_user()`` like the attribution reads above — an
+        owner-scoped census would silently drop rows held by another owner_id;
+        ``corpus_totals`` reports that split instead.
+
+        Keyset over (created_at, id) rather than OFFSET so a deep page does not
+        rescan everything before it. Both cursor parts cross this boundary as
+        strings (ISO timestamp, str UUID) like every other id in this module;
+        rows come back with ISO UTC timestamps, dataset names batched in via
+        one join query per page, and ``citadel_tags`` parsed out of
+        ``external_metadata`` (empty list when absent or unparseable).
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data, Dataset, DatasetData
+
+        from sqlalchemy import and_, or_, select
+
+        query = select(
+            Data.id,
+            Data.name,
+            Data.content_hash,
+            Data.raw_content_hash,
+            Data.mime_type,
+            Data.token_count,
+            Data.data_size,
+            Data.created_at,
+            Data.updated_at,
+            Data.owner_id,
+            Data.external_metadata,
+        ).order_by(Data.created_at.asc(), Data.id.asc())
+        if after_created_at and after_id:
+            after_dt = _utc_datetime(datetime.fromisoformat(after_created_at))
+            after_uuid = UUID(after_id)
+            query = query.where(
+                or_(
+                    Data.created_at > after_dt,
+                    and_(Data.created_at == after_dt, Data.id > after_uuid),
+                )
+            )
+        query = query.limit(max(1, int(limit)))
+
+        engine = get_relational_engine()
+        rows: list[dict[str, Any]] = []
+        async with engine.get_async_session() as session:
+            for row in (await session.execute(query)).all():
+                rows.append(
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "content_hash": row.content_hash,
+                        "raw_content_hash": row.raw_content_hash,
+                        "mime_type": row.mime_type,
+                        "token_count": row.token_count,
+                        "data_size": row.data_size,
+                        "created_at": _isoformat_utc(row.created_at),
+                        "updated_at": _isoformat_utc(row.updated_at),
+                        "owner_id": str(row.owner_id) if row.owner_id else None,
+                        "datasets": [],
+                        "citadel_tags": _parse_citadel_tags(row.external_metadata),
+                    }
+                )
+            if rows:
+                # Dataset names for the whole page in one join query, unscoped
+                # for the same reason as the page itself.
+                membership = await session.execute(
+                    select(DatasetData.data_id, Dataset.name)
+                    .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                    .where(
+                        DatasetData.data_id.in_([UUID(row["id"]) for row in rows])
+                    )
+                )
+                names_by_id: dict[str, list[str]] = {}
+                for data_id, dataset_name in membership.all():
+                    names_by_id.setdefault(str(data_id), []).append(str(dataset_name))
+                for row in rows:
+                    row["datasets"] = sorted(names_by_id.get(row["id"], []))
+        return rows
+
+    async def corpus_totals(self) -> dict[str, Any]:
+        """Corpus row counts, both unscoped and scoped to the default owner.
+
+        The attribution reads above filter by ``get_default_user().id``. The
+        census must not inherit that silently: rows under another owner_id
+        would vanish from a scoped count with nothing saying so. Return both
+        and let the endpoint surface the difference.
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data, Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import func, select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            documents = int(
+                (await session.execute(select(func.count()).select_from(Data))).scalar()
+                or 0
+            )
+            documents_default_owner = int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Data)
+                        .where(Data.owner_id == user.id)
+                    )
+                ).scalar()
+                or 0
+            )
+            by_dataset_query = select(
+                Dataset.name, func.count(DatasetData.data_id)
+            ).join(Dataset, Dataset.id == DatasetData.dataset_id)
+            by_dataset = {
+                str(name): int(total or 0)
+                for name, total in (
+                    await session.execute(by_dataset_query.group_by(Dataset.name))
+                ).all()
+            }
+            by_dataset_default_owner = {
+                str(name): int(total or 0)
+                for name, total in (
+                    await session.execute(
+                        by_dataset_query.where(Dataset.owner_id == user.id).group_by(
+                            Dataset.name
+                        )
+                    )
+                ).all()
+            }
+        return {
+            "documents": documents,
+            "documents_default_owner": documents_default_owner,
+            "documents_other_owners": documents - documents_default_owner,
+            "by_dataset": by_dataset,
+            "by_dataset_default_owner": by_dataset_default_owner,
+        }
+
+    async def corpus_chunk_counts(
+        self, document_ids: list[str]
+    ) -> dict[str, int] | None:
+        """Chunk rows per document from the vector store; None when not measured.
+
+        None and 0 are different answers: 0 claims cognee accepted a document
+        and indexed no chunk for it, None says this node could not look (the
+        provider is not pgvector, so there is no chunk table to count). A
+        MISSING chunk collection, by contrast, is a real measurement — nothing
+        was ever indexed — and returns an empty mapping (absent id = 0).
+
+        One grouped query per page over the ``DocumentChunk_text`` collection,
+        keyed on the ``document_id`` each chunk row carries in its payload; the
+        ids are compared as strings because that is how the payload stores them.
+        """
+        if not document_ids:
+            return {}
+        self._prepare_cognee_environment()
+        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+            return None
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.vector import get_vector_engine
+        from cognee.infrastructure.databases.vector.exceptions import (
+            CollectionNotFoundError,
+        )
+
+        from sqlalchemy import func, select
+
+        engine = get_vector_engine()
+        try:
+            table = await engine.get_table("DocumentChunk_text")
+        except CollectionNotFoundError:
+            return {}
+
+        payload_document_id = table.c.payload["document_id"].as_string()
+        wanted = [str(document_id) for document_id in document_ids]
+        counts: dict[str, int] = {}
+        async with engine.get_async_session() as session:
+            grouped = await session.execute(
+                select(payload_document_id, func.count())
+                .where(payload_document_id.in_(wanted))
+                .group_by(payload_document_id)
+            )
+            for document_id, total in grouped.all():
+                if document_id:
+                    counts[str(document_id)] = int(total or 0)
+        return counts
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+        """Which of these document ids exist as graph nodes; None when not measured.
+
+        A document graph node's id equals the relational ``Data.id``, so
+        presence here means the document was cognified, not merely accepted.
+        Uses the engine's batched ``get_nodes`` (one query per page) through
+        ``get_graph_engine()`` — never the graph file directly, which would
+        contend with the single writer — and passes str ids. An engine without
+        ``get_nodes`` returns None rather than pretending it looked.
+        """
+        if not document_ids:
+            return set()
+        engine = await self._graph_engine()
+        get_nodes = getattr(engine, "get_nodes", None)
+        if not callable(get_nodes):
+            return None
+        nodes = await get_nodes([str(document_id) for document_id in document_ids])
+        present: set[str] = set()
+        for node in nodes or []:
+            node_id = node.get("id") if isinstance(node, dict) else None
+            if node_id:
+                present.add(str(node_id))
+        return present
 
     async def ensure_dataset(self, name: str) -> bool:
         """Provision the cognee Dataset row for ``name``, returning whether it was new.
