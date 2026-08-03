@@ -645,3 +645,90 @@ async def test_duplicate_across_seats_skips_the_classifier_call(
     assert len(learning.central_writes) == 1, (
         "identical content must not be re-submitted to Central"
     )
+
+
+async def test_case_divergent_duplicate_still_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delivered-set key must match the ingest dedupe key exactly.
+
+    Citadel.ingest dedupes on sha256 of the RAW text (kb/service.py), while
+    candidate_hash() strips and lowercases first. Keying the delivered set on
+    the normalized hash is coarser than the guard it models: a case-variant of
+    promoted content hashes differently at ingest (Central would accept the
+    write) but identically under normalization (the engine would suppress it).
+    Two case-divergent candidates must cost two classifier calls and two
+    Central writes, exactly as on the base branch.
+    """
+    config = _github_state(tmp_path)
+    learning = FakeLearning()
+    store = AccessStore(str(tmp_path / "access.json"))
+    citadel = FakeCitadel(config, [_org_note()])
+    engine = PromotionEngine(citadel, learning, store, config)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+
+    first = await engine.run(SEAT, dry_run=False)
+    assert first["promoted"] == 1
+
+    variant = _org_note().replace("Org note", "ORG NOTE")
+    assert variant != _org_note()
+    assert variant.lower() == _org_note().lower()
+    citadel._nodes = [variant]
+
+    second = await engine.run(seat_dataset("bob"), dry_run=False)
+
+    assert second["promoted"] == 1, (
+        "a case-variant hashes differently at ingest, so Central would accept "
+        "it; the engine must not suppress the write"
+    )
+    assert second["proposals"][0]["decision"] == "promote"
+    assert len(learning.central_writes) == 2
+
+
+async def test_approve_pending_surfaces_the_write_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An approver must be able to tell a failed write from already-delivered.
+
+    approve_pending consumes the item either way (pre-existing contract), and
+    with honest write accounting a duplicate bounce returns ok=False. Without
+    the server's reason in the response, an admin approving two identical
+    pending items from different seats sees the second as a failure when
+    nothing failed. The write_reason must reach the caller, not only the
+    audit log.
+    """
+    summary = (
+        "# Capture summary: side project\n"
+        "- Remote: `https://github.com/other-org/new-app.git`\n"
+        "- Capture Root Tags: org-work\n"
+    )
+    state_path = tmp_path / "github-state.json"
+    state_path.write_text(
+        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
+    )
+    config = _config(github_sync_state_path=str(state_path))
+    learning = FakeLearning(central_reject_reason="duplicate_in_process")
+    store = AccessStore(str(tmp_path / "access.json"))
+    engine = PromotionEngine(FakeCitadel(config, [summary]), learning, store, config)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.95)
+
+    queued = await engine.run(SEAT, dry_run=False)
+    assert queued["queued"] == 1
+    item = store.list_promotion_pending(seat_slug="alice")[0]
+    actor = AccessIdentity(
+        role="writer",
+        actor_id="alice",
+        actor_kind="user",
+        actor_name="Alice",
+        source="token",
+        default_dataset=SEAT,
+        seat_slug="alice",
+    )
+
+    result = await engine.approve_pending(item.id, actor)
+
+    assert result["promoted"] is False
+    assert result["ok"] is False
+    assert result["write_reason"] == "duplicate_in_process"
+    # The item is consumed regardless, matching the contract on main.
+    assert store.get_promotion_pending(item.id).status != "pending"

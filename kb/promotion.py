@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from hashlib import sha256
 import logging
 from pathlib import Path
 from typing import Any
@@ -203,6 +204,21 @@ def _coerce_classification(parsed: Any) -> Classification | None:
     )
 
 
+def _central_write_key(text: str) -> str:
+    """sha256 of the raw text: exactly the key ``Citadel.ingest`` dedupes on.
+
+    NOT :func:`candidate_hash`, which strips and lowercases first. A key
+    coarser than the guard it models suppresses writes that guard would have
+    accepted: a case-variant of already-promoted content hashes differently
+    at ingest but identically after normalization, so the normalized key
+    changed a promotion decision. Promotion submits the candidate text
+    verbatim, so this key and the ingest key agree byte for byte (with LLM
+    enrichment enabled a full-tier write is chunked and ingest keys the
+    chunks; the skip then still stops re-delivery of identical source text).
+    """
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
 class PromotionEnumerationError(RuntimeError):
     """Every seed query for a seat failed, so its content could not be read.
 
@@ -238,12 +254,14 @@ class PromotionEngine:
         self.learning = learning
         self.access_store = access_store
         self.config = config
-        # Hashes of candidate text this engine has already landed in Central
-        # (written and accepted, or confirmed already-present by the ingest
-        # dedupe). Lets decide() skip the classifier for content whose Central
-        # write can only be rejected as duplicate_in_process. Instance-scoped
-        # on purpose: it can only UNDER-report what the ingest dedupe knows, so
-        # a stale entry is impossible and a miss just costs one honest write.
+        # _central_write_key hashes of candidate text this engine has already
+        # landed in Central (written and accepted, or confirmed already-present
+        # by the ingest dedupe). Lets decide() skip the classifier for content
+        # whose Central write can only be rejected as duplicate_in_process.
+        # Keyed on the raw text so it is never coarser than the ingest key it
+        # models, and instance-scoped on purpose: a fresh engine starts empty,
+        # so it can only UNDER-report what the ingest dedupe knows; a stale
+        # entry is impossible and a miss just costs one honest write.
         self._delivered_central_hashes: set[str] = set()
 
     async def enumerate(self, seat_dataset: str, max_items: int) -> list[PromotionCandidate]:
@@ -395,7 +413,7 @@ class PromotionEngine:
         if (
             reference.status == "known_org_work"
             and capture_block is None
-            and candidate_hash(candidate.text) in self._delivered_central_hashes
+            and _central_write_key(candidate.text) in self._delivered_central_hashes
         ):
             # This exact text already reached Central through this engine, and
             # on this reference path the only outcome a verdict could unlock is
@@ -594,7 +612,7 @@ class PromotionEngine:
         # The full-tier (Central) outcome is what "promoted" attests, so read
         # it instead of assuming the write landed. ``learn`` returns rejections
         # (duplicate_in_process, filter refusals) as accepted=False, not raises.
-        content_hash = candidate_hash(proposal.candidate)
+        content_hash = _central_write_key(proposal.candidate)
         if not primary.ingest.accepted:
             write_reason = primary.ingest.reason or "not_accepted"
             if write_reason == "duplicate_in_process":
@@ -814,7 +832,8 @@ class PromotionEngine:
             reference_status=item.reference_status,
         )
         identity = self._promotion_identity(item.seat_dataset)
-        promoted = await self._promote(item.seat_dataset, identity, proposal) == "promoted"
+        outcome = await self._promote(item.seat_dataset, identity, proposal)
+        promoted = outcome == "promoted"
         decided = self.access_store.decide_promotion_pending(
             item_id,
             decision=APPROVED_STATUS,
@@ -839,6 +858,11 @@ class PromotionEngine:
             "ok": promoted,
             "item": decided.to_dict(),
             "promoted": promoted,
+            # The item is consumed either way, so the caller needs the server's
+            # reason to tell "the write failed" from "this content is already
+            # in Central" (an approval of the second of two identical pending
+            # items is the ordinary way to hit the latter).
+            "write_reason": None if promoted else outcome,
         }
 
     async def reject_pending(
