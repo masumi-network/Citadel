@@ -328,7 +328,14 @@ def build_tags(cwd: str, branch: str = "") -> list[str]:
     return tags
 
 
-def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> None:
+def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[str, Any] | None:
+    """POST {data, tags} to {base}/ingest over HTTPS. No dataset field.
+
+    Returns the parsed JSON response body (or ``None`` when the 2xx body is not
+    a JSON object): a 2xx alone is not proof of storage, because the server
+    states its decision in the body's ``accepted``/``reason`` fields and the
+    receipt must record that decision, not the transport outcome.
+    """
     if not base_url.lower().startswith("https://"):
         raise ValueError("refusing non-HTTPS Citadel base URL")
     url = f"{base_url}/ingest"
@@ -343,7 +350,45 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> None:
         },
     )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        response.read()
+        raw = response.read()
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def receipt_summary(response: dict[str, Any] | None, *, short_sha: str, branch: str) -> str:
+    """Receipt line for a completed POST, mirroring the server's decision."""
+    if response is None:
+        return f"commit {short_sha} sent: server replied 2xx but the response body was unreadable"
+    if response.get("accepted") is not False:
+        return f"captured commit {short_sha} on {branch} → your Node"
+    reason = response.get("reason") or "rejected"
+    return f"commit {short_sha} not stored: server rejected the write ({reason})"
+
+
+def _send_failure_summary(exc: BaseException, *, short_sha: str) -> str:
+    """Receipt line for a POST that raised before a response was read."""
+    if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+        # A client timeout is not proof of failure: the server can finish the
+        # write after the deadline, so the honest verdict is "unconfirmed".
+        return (
+            f"commit {short_sha} capture unconfirmed: no response within "
+            f"{HTTP_TIMEOUT_SECONDS}s; the write may still have completed on the server"
+        )
+    # Class name only: an exception message could echo request details.
+    return f"commit {short_sha} not captured: send failed ({exc.__class__.__name__})"
+
+
+def _write_receipt(summary: str) -> None:
+    """Best-effort DX-5 receipt (never raises, never surfaces the token)."""
+    try:
+        from kb.hooks.receipt import write_receipt
+
+        write_receipt("push", summary)
+    except Exception:
+        pass
 
 
 def _sync_one(
@@ -371,12 +416,16 @@ def _sync_one(
     for tag in capture_tags:
         if tag not in tags:
             tags.append(tag)
-    post_ingest(_base_url(), token, note, tags)
-    # DX-5 receipt: make the silent capture visible. write_receipt never raises,
-    # and any import/call failure is caught by run()'s fail-silent except.
-    from kb.hooks.receipt import write_receipt
-
-    write_receipt("push", f"captured commit {sha[:7]} on {branch} → your Node")
+    # DX-5 receipt: make the silent capture visible AND truthful. The receipt
+    # records what the server said (or that we cannot know), never an
+    # unconditional "captured". A failed send is recorded here rather than
+    # raised, so one bad ref still leaves a receipt and never blocks the push.
+    try:
+        response = post_ingest(_base_url(), token, note, tags)
+    except Exception as exc:
+        _write_receipt(_send_failure_summary(exc, short_sha=sha[:7]))
+        return
+    _write_receipt(receipt_summary(response, short_sha=sha[:7], branch=branch))
 
 
 def run(stdin: Any, remote_name: str = "") -> int:
