@@ -3166,8 +3166,13 @@ function homeCapturedThisWeek() {
 }
 
 function homeReadableCount() {
-  const stats = (state.snapshot && state.snapshot.stats) || {};
-  if (stats.documents !== undefined && stats.documents !== null) return Number(stats.documents);
+  // Used to prefer stats.documents from /api/mesh, but that field never held a
+  // document count (it was corpus["tracked_sources"] - github repos +
+  // repo-content files + linear issues; see ADR-0019). Renaming it to
+  // tracked_sources made this branch permanently dead code that never ran,
+  // not a working fallback path (#206 follow-up). document_count is
+  // Node-only (not org-wide), but it is an actual document count, which
+  // tracked_sources never was.
   return Number((state.meSummary && state.meSummary.document_count) || 0);
 }
 
