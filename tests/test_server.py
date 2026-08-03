@@ -2556,6 +2556,47 @@ def test_search_sets_ratelimit_headers_when_served() -> None:
     assert "X-RateLimit-Remaining" in r.headers
 
 
+def test_search_query_length_is_bounded_like_its_sibling_filters() -> None:
+    """`query` is capped at the model boundary, as repo/path/mode already are.
+
+    The cap sits far above anything the product asks: the longest query in the
+    bench corpus is 99 characters and the longest in this suite is 38, against
+    a 2000 character ceiling. Everything a caller would plausibly type is still
+    accepted; only an unbounded body is refused, and refused before the request
+    reaches any of the work /search does per query.
+    """
+    client = authed_client("test-reader")
+
+    # Ordinary queries are untouched, including a long natural-language one.
+    for query in (
+        "q",
+        "MIP-003 availability type masumi-agent",
+        "What is the full postgres connection string for the production database?",
+        "policy + asset " * 20,
+    ):
+        assert len(query) <= server_module.MAX_SEARCH_QUERY_LENGTH
+        assert client.post("/search", json={"query": query}).status_code == 200, query
+
+    # Exactly at the cap is still a valid query.
+    at_cap = "a" * server_module.MAX_SEARCH_QUERY_LENGTH
+    assert client.post("/search", json={"query": at_cap}).status_code == 200
+
+    # One character over is rejected by validation, not served.
+    over_cap = "a" * (server_module.MAX_SEARCH_QUERY_LENGTH + 1)
+    rejected = client.post("/search", json={"query": over_cap})
+    assert rejected.status_code == 422
+
+    # The shape that costs the most to match is refused at the same boundary,
+    # so no amount of it reaches the query classifiers.
+    whitespace_heavy = client.post(
+        "/search", json={"query": "policy" + " " * server_module.MAX_SEARCH_QUERY_LENGTH}
+    )
+    assert whitespace_heavy.status_code == 422
+
+    # An empty query is still rejected too — the lower bound did not move.
+    assert client.post("/search", json={"query": ""}).status_code == 422
+
+
 def test_search_degrades_to_empty_on_timeout_budget() -> None:
     # #44: a recall slower than the budget degrades to empty-fast with a note,
     # instead of hanging for 100s+.
