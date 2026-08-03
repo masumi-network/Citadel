@@ -805,8 +805,18 @@ class IngestBody(BaseModel):
     cognify: bool = False
 
 
+# Upper bound on a search query, in the same spirit as SearchBody's other
+# string fields (repo 200, path 400, mode 32) — it was the one that could grow
+# without limit. Sized against the longest queries this repo actually asks: 99
+# characters in the bench corpus (scripts/bench/golden_questions.json, "What is
+# the full postgres connection string ...") and 38 in the test suite. Queries
+# are typed or composed by an agent, never built by concatenating file content,
+# so 2000 leaves a pasted paragraph plenty of room while still being a bound.
+MAX_SEARCH_QUERY_LENGTH = 2000
+
+
 class SearchBody(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=MAX_SEARCH_QUERY_LENGTH)
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)

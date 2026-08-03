@@ -1022,3 +1022,99 @@ def test_token_create_standalone_flags_skip_picker_on_tty(monkeypatch, capsys) -
     assert calls["standalone"]["role"] == "writer"
     assert calls["standalone"]["expires_at"] == "2027-01-01T00:00:00Z"
     assert "seat" not in calls
+
+
+# ---- citadel ingest --timeout / honest expiry ---------------------------------
+
+
+def test_ingest_timeout_flag_reaches_request(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, *, timeout=None):
+        seen["timeout"] = timeout
+        return {"accepted": True, "dataset": "seat:alice"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    rc = asyncio.run(_ingest(_ingest_args(timeout=5)))
+    assert rc == 0
+    assert seen["timeout"] == 5.0
+
+
+def test_ingest_timeout_does_not_claim_an_outcome(monkeypatch, capsys) -> None:
+    # A client timeout proves only that no response arrived in the budget — the
+    # write may or may not have landed. The old message claimed "Your note is
+    # saved" (and `saved: true`), which nothing verified.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args(timeout=2)))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "TIMEOUT"
+    assert out["write_state"] == "unknown"
+    assert "saved" not in out
+    assert "not prove" in out["error"]
+
+
+def test_ingest_timeout_plain_mode_is_honest(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args(json=False, timeout=2)))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "not prove" in captured.err
+    assert "is saved" not in captured.err
+    assert "is saved" not in captured.out
+
+
+def test_ingest_wrapped_socket_timeout_is_a_timeout(monkeypatch, capsys) -> None:
+    # urllib wraps connect-phase socket timeouts as URLError("timed out") — that
+    # is a budget expiry, not an unreachable Node, and must say so.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError("urlopen error timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args()))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["code"] == "TIMEOUT"
+
+
+def test_doctor_pre_push_from_non_repo_says_so(tmp_path: Path, monkeypatch, capsys) -> None:
+    # From a cwd with no git repo, doctor must not report "hook missing" —
+    # that reads as "your hook is gone" when there was simply nothing to inspect.
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_x")
+    checks = [
+        Check("node", True, "healthy"),
+        Check("auth", True, "valid"),
+        Check("mcp", True, "present"),
+        Check(
+            "pre_push_hook",
+            False,
+            f"no git repo at {tmp_path} — nothing to inspect (the hook is per-repo)",
+            data={"repo": str(tmp_path), "git_repo": False},
+        ),
+        Check("session_hook", True, "installed"),
+        Check("capture_roots", True, "none"),
+    ]
+    monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks))
+    args = argparse.Namespace(
+        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
+        node_url=None, json=True, fix=False,
+    )
+    rc = asyncio.run(_doctor(args))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert not any("hook missing" in i["problem"] for i in out["issues"])
+    assert any("no git repo" in i["problem"] for i in out["issues"])
