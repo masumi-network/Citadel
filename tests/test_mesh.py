@@ -408,16 +408,33 @@ async def test_snapshot_edges_reports_the_real_graph_total_not_the_projection() 
 @pytest.mark.asyncio
 async def test_snapshot_edges_falls_back_to_the_projection_without_a_real_total() -> None:
     """No indexed_edges on the corpus payload (degraded read, or no corpus at
-    all) — the projection is the best available number, same as before."""
+    all) — the projection is the best available number, same as before.
+
+    Both branches are asserted against the SAME mesh, because the fallback
+    assertion alone does not discriminate: before this change `edges` was
+    unconditionally `len(self.edges)`, so `edges == len(mesh.edges)` held for
+    every payload. Pinning that the real total wins when it is present is what
+    makes the fallback a fallback rather than the only behaviour.
+    """
     config = CitadelConfig()
     mesh = MeshState()
+    for i in range(3):
+        mesh.edges[f"e{i}"] = {"id": f"e{i}", "source": "a", "target": "b"}
 
-    snapshot = await mesh.snapshot(
+    with_total = await mesh.snapshot(
+        config,
+        corpus={"ok": True, "tracked_sources": 308, "indexed_docs": 15641, "indexed_edges": 131843},
+    )
+    degraded = await mesh.snapshot(
         config, corpus={"ok": True, "tracked_sources": None, "indexed_docs": None}
     )
 
-    assert snapshot["stats"]["edges"] == len(mesh.edges)
-    assert snapshot["stats"]["edges"] == snapshot["stats"]["since_restart"]["projection_edges"]
+    assert with_total["stats"]["edges"] == 131843
+    assert degraded["stats"]["edges"] == len(mesh.edges)
+    assert degraded["stats"]["edges"] == degraded["stats"]["since_restart"]["projection_edges"]
+    # The two disagree, so the second number is demonstrably the fallback and
+    # not the same expression under a different corpus payload.
+    assert degraded["stats"]["edges"] != with_total["stats"]["edges"]
 
 
 @pytest.mark.asyncio
