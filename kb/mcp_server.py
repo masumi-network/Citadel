@@ -946,6 +946,25 @@ def create_mcp_server(
         Each call automatically records implicit search telemetry (non-blocking)
         into the feedback mesh. Response may include ``search_id`` and a
         ``feedback`` hint for optional explicit ratings via citadel_record_feedback.
+
+        A hit from the indexed corpus carries two different ids, and they are
+        not interchangeable: ``id`` is CHUNK-level (the passage that matched);
+        ``document_id`` is DOCUMENT-level (the same id citadel_ingest reports
+        for the whole write, and what citadel_get_document's own ``.id``
+        returns). Passing ``id`` to citadel_get_document still resolves — it
+        walks chunk -> parent document — so the mismatch stays hidden until
+        something dedups or cites on ``id`` and compares it against a fetched
+        document's ``document_id``. Use ``document_id`` for anything
+        document-scoped (dedup across hits from the same document, citing "this
+        document", matching against citadel_ingest's result).
+
+        ``document_id`` is NOT on every hit. Hits that are not indexed corpus
+        documents supply their own ``id`` and no ``document_id`` — today that is
+        the github_sync digest fallback, which serves sections of the stored
+        sync digest when the github_sync dataset returns no indexed results. On
+        a hit with no ``document_id``, treat the hit's ``id`` as the unit and do
+        not synthesise a document id; ``citadel_get_document`` will not resolve
+        it either.
         """
         payload: dict[str, Any] = {
             "query": _require_non_empty(query, "query"),
@@ -988,7 +1007,19 @@ def create_mcp_server(
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_get_document"].annotations)
     async def citadel_get_document(document_id: str, ctx: Context) -> dict[str, Any]:
-        """Fetch a full source document by the ``id`` returned in a search result."""
+        """Fetch a full source document by the ``id`` returned in a search result.
+
+        Accepts either a hit's ``id`` (chunk-level) or its ``document_id``
+        (document-level) — a chunk id resolves by walking chunk -> parent
+        document automatically. The returned document's own ``id`` is always
+        the document-level id, so a caller comparing a hit's ``id`` against
+        this response's ``document.id`` should not expect them to match; the
+        hit's ``document_id`` is the one that will.
+
+        Only ids that came from the indexed corpus resolve. A hit with no
+        ``document_id`` (the github_sync digest fallback) is not a stored
+        document and has nothing to fetch here.
+        """
         normalized_id = _require_non_empty(document_id, "document_id")
         return await _call_async(
             "citadel_get_document",

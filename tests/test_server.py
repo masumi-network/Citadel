@@ -932,7 +932,7 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["documents"] == 1
+    assert mesh.json()["stats"]["tracked_sources"] == 1
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -6332,14 +6332,24 @@ def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
     client = authed_client()
 
     async def fake_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+        return {
+            "ok": True,
+            "tracked_sources": 317,
+            "indexed_docs": 17991,
+            "indexed_edges": 131843,
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
 
     stats = client.get("/api/mesh").json()["stats"]
 
-    assert stats["documents"] == 317, stats
-    assert stats["indexed_chunks"] == 17991, stats
+    assert stats["tracked_sources"] == 317, stats
+    assert stats["nodes"] == 17991, stats
+    assert stats["edges"] == 131843, stats
+    # indexed_chunks duplicated `nodes` by construction and never counted a
+    # chunk, so it is gone rather than published wrong (same call as
+    # failed_chunks below).
+    assert "indexed_chunks" not in stats
     # The uptime figures are still reported, just no longer disguised as totals.
     assert "since_restart" in stats
     assert stats["since_restart"]["documents"] != 317
@@ -6357,7 +6367,13 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     client = authed_client()
 
     async def degraded_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": "boom"}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": "boom",
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", degraded_corpus_health)
 
@@ -6365,8 +6381,8 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
 
     assert response.status_code == 200
     stats = response.json()["stats"]
-    assert stats["documents"] is not None
-    assert stats["indexed_chunks"] is not None
+    assert stats["tracked_sources"] is not None
+    assert stats["edges"] is not None
 
 
 def test_api_mesh_activity_counters_are_scoped_not_top_level(

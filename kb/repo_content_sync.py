@@ -43,6 +43,31 @@ logger = logging.getLogger(__name__)
 
 STATE_VERSION = 1
 
+# One lock per state file, NOT per syncer instance. ``get_repo_content_syncer``
+# in kb.server builds a fresh ``RepoContentSyncer`` on every call (app.state
+# .repo_content_syncer is never assigned anywhere), and ``LearningAgent``
+# constructs its own in __init__, so the evolve scheduler's syncer and the one
+# behind POST /api/repo-content-sync/run are different objects. An instance
+# attribute lock would therefore have shipped inert: it would guard nothing
+# while looking exactly like a working guard. The state file is the shared
+# resource, so it is what the key has to be.
+_RUN_LOCKS: dict[str, tuple[Any, asyncio.Lock]] = {}
+
+
+def _run_lock(state_path: Path) -> asyncio.Lock:
+    # An asyncio.Lock binds to the loop that first awaits it and raises if a
+    # different loop uses it afterwards, so the loop is part of the identity.
+    # The web process has exactly one loop for its whole life; the CLI runs a
+    # fresh asyncio.run per invocation.
+    key = str(Path(state_path).resolve())
+    loop = asyncio.get_running_loop()
+    entry = _RUN_LOCKS.get(key)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Lock())
+        _RUN_LOCKS[key] = entry
+    return entry[1]
+
+
 DEFAULT_REPO_CONTENT_REPOS = (
     "sokosumi",
     "Sokosumi-MCP",
@@ -554,6 +579,11 @@ class RepoContentSyncer:
             state = {}
             state_error = str(exc)
         files = state.get("files") if isinstance(state.get("files"), dict) else {}
+        # Off the loop for the same reason as in ``run``: with autojoin on this
+        # is up to 1 + max_repos * len(markers) synchronous urllib round trips,
+        # and GET /api/repo-content-sync is served from the web process's single
+        # event loop.
+        repos = await asyncio.to_thread(self._resolved_repos)
         return {
             "ok": state_error is None,
             "state_error": state_error,
@@ -568,7 +598,7 @@ class RepoContentSyncer:
                 self.config.repo_content_sync_autojoin_markers
                 or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
             ),
-            "repos": self._resolved_repos(),
+            "repos": repos,
             "root_paths": list(
                 self.config.repo_content_sync_root_paths or DEFAULT_REPO_CONTENT_ROOT_PATHS
             ),
@@ -587,6 +617,52 @@ class RepoContentSyncer:
         }
 
     async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """Serialise passes over one state file, then run.
+
+        Two overlapping passes are a lost update, not just wasted work:
+        ``tracked`` is snapshotted from the state file at the start of a pass
+        and the whole dict is written back at the end, so whichever pass
+        finishes last erases the entries the other one recorded. Those files
+        then look un-ingested and are fetched and re-sent on the next pass.
+
+        Before the GitHub calls moved off the event loop this was unreachable
+        by construction: a pass that ingested nothing contained no ``await``
+        that could yield (exactly the ingested=0 shape seen in production), so
+        a second caller could not start until the first had returned. Freeing
+        the loop is what makes the window real, so the guard belongs in the
+        same change.
+
+        The lock is keyed by state file rather than held on the instance
+        because callers do not share an instance: ``get_repo_content_syncer``
+        (kb/server.py) constructs a new ``RepoContentSyncer`` per call and
+        ``LearningAgent.__init__`` builds its own, so the evolve scheduler's
+        syncer and the one behind POST /api/repo-content-sync/run are
+        different objects.
+
+        A second caller is refused rather than queued. Queueing would park the
+        request behind a full pass, which is minutes of work against a request
+        ceiling, and would then redo the work the first pass just did.
+        """
+        lock = _run_lock(self.state_path)
+        if lock.locked():
+            logger.warning(
+                "Repo content sync already in progress for %s; skipping this run",
+                self.state_path,
+            )
+            return {
+                "ok": True,
+                "enabled": True,
+                # Callers must not record this as a sync: it has no
+                # checked_at and no counts, and writing it to the mesh would
+                # stamp the source "synced" for a pass that did nothing.
+                "skipped": True,
+                "reason": "repo_content_sync_already_running",
+                "dry_run": dry_run,
+            }
+        async with lock:
+            return await self._run_locked(force=force, dry_run=dry_run)
+
+    async def _run_locked(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
         if not self.config.repo_content_sync_enabled:
             return {
                 "ok": True,
@@ -643,7 +719,16 @@ class RepoContentSyncer:
             reasons[reason] = reasons.get(reason, 0) + 1
             skip_totals[reason] = skip_totals.get(reason, 0) + 1
 
-        for full_name in self._resolved_repos():
+        # Also off the loop, and it is the largest of the blocking sites, not
+        # the smallest. ``_resolved_repos`` looks like a config read, but with
+        # repo_content_sync_autojoin_enabled it calls ``discover_org_repos``,
+        # which issues one synchronous ``fetch_repos`` plus one synchronous
+        # ``file_exists`` probe per repo per marker: at the defaults
+        # (repo_content_sync_autojoin_max_repos=100, three markers in
+        # DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS) up to 301 round trips, all of
+        # them before the loop below reaches its first ``to_thread``.
+        repos = await asyncio.to_thread(self._resolved_repos)
+        for full_name in repos:
             repo_result: dict[str, Any] = {
                 "repo": full_name,
                 "paths_discovered": 0,
@@ -655,9 +740,25 @@ class RepoContentSyncer:
                 "errors": [],
             }
             try:
-                branch = self.client.fetch_default_branch(full_name)
-                ref = self.client.fetch_commit_sha(full_name, ref=branch)
-                paths = discover_repo_paths(
+                # Every ``self.client`` call below is SYNCHRONOUS urllib, and
+                # ``run`` is awaited from the web process's single event loop by
+                # the evolve scheduler. Called inline they freeze every route on
+                # the node for the whole sync: measured in production
+                # 2026-08-03 as a 30.03s stall (``Evolve stage
+                # repo_content_sync`` 18:14:06.578Z -> 18:14:36.610Z) in which a
+                # POST /mcp/ took 19.18s and a GET /api/contributions/recent
+                # gave up with a 499 — while that pass ingested nothing at all
+                # (ingested=0 skipped=69). ``to_thread`` hands each round trip
+                # to a worker and yields, so the loop keeps serving.
+                #
+                # ``discover_repo_paths`` is dispatched whole rather than
+                # per-request: it is a sync function that itself makes several
+                # calls (fetch_tree, then a probe fallback), so wrapping only
+                # its callees would leave the walk between them on the loop.
+                branch = await asyncio.to_thread(self.client.fetch_default_branch, full_name)
+                ref = await asyncio.to_thread(self.client.fetch_commit_sha, full_name, ref=branch)
+                paths = await asyncio.to_thread(
+                    discover_repo_paths,
                     self.client,
                     full_name,
                     ref=ref,
@@ -672,7 +773,9 @@ class RepoContentSyncer:
                 for path in paths:
                     key = f"{full_name}/{path}"
                     try:
-                        file = self.client.fetch_file_text(full_name, path, ref=ref)
+                        file = await asyncio.to_thread(
+                            self.client.fetch_file_text, full_name, path, ref=ref
+                        )
                     except GitHubAPIError as exc:
                         repo_result["errors"].append({"path": path, "error": str(exc)[:200]})
                         continue
@@ -769,8 +872,8 @@ class RepoContentSyncer:
                     # record the error and retry next sync rather than ever
                     # writing a document with a volatile ref.
                     try:
-                        file_ref = self.client.fetch_last_commit_sha(
-                            full_name, path, ref=ref
+                        file_ref = await asyncio.to_thread(
+                            self.client.fetch_last_commit_sha, full_name, path, ref=ref
                         )
                     except GitHubAPIError as exc:
                         repo_result["errors"].append({"path": path, "error": str(exc)[:200]})

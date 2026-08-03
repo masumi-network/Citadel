@@ -1,9 +1,14 @@
-"""No surface may read a restart-scoped activity counter from the top level
-of the mesh stats payload.
+"""No surface may read a removed or renamed field from the top level of the
+mesh stats payload.
 
 ADR-0019 publishes `searches`, `feedback`, `upgrades`, `errors` and
 `pending_chunks` only under `stats.since_restart`, and removes
-`failed_chunks`. A reader left on the old shape does not throw:
+`failed_chunks`. ADR-0020 does the same for the two remaining top-level names
+that did not mean what they said: `indexed_chunks` is removed (it duplicated
+`nodes` by construction, and the honest restart-scoped accumulator is
+`since_restart.indexed_chunks`), and `documents` is renamed `tracked_sources`
+(it held tracked github repos + repo-content files + linear issues, not a
+document count). A reader left on the old shape does not throw:
 `(stats || {}).errors` and `stats?.errors` both evaluate to undefined,
 coerce to 0, and paint the healthy state. The failure is silent and points
 in the reassuring direction, exactly the kind of number ADR-0019 exists to
@@ -30,7 +35,21 @@ from kb.cli import _render_mesh
 
 REPO = Path(server_module.__file__).resolve().parent.parent
 
-REMOVED = ("searches", "feedback", "upgrades", "errors", "pending_chunks", "failed_chunks")
+# Names that must never appear at the top level of `stats` again. The first six
+# are the ADR-0019 activity counters; the last two are the ADR-0020 totals.
+# `documents` and `indexed_chunks` still exist under `since_restart`, where they
+# are correct, which is exactly why the scan below has to be scope-aware rather
+# than a plain grep for the name.
+REMOVED = (
+    "searches",
+    "feedback",
+    "upgrades",
+    "errors",
+    "pending_chunks",
+    "failed_chunks",
+    "documents",
+    "indexed_chunks",
+)
 
 # `stats` (bare or as an identifier suffix, e.g. homeStats) followed within a
 # statement by an access of a removed field, with no `since_restart` hop in
@@ -82,8 +101,8 @@ def test_no_surface_reads_activity_counters_from_the_top_level() -> None:
                 offenders.append(f"{file.relative_to(REPO)}:{lineno}: {hit}")
 
     assert not offenders, (
-        "reader(s) still on the pre-ADR-0019 payload shape; these evaluate to "
-        "undefined and render as 0/healthy:\n" + "\n".join(offenders)
+        "reader(s) still on the pre-ADR-0019/ADR-0020 payload shape; these "
+        "evaluate to undefined and render as 0/healthy:\n" + "\n".join(offenders)
     )
 
 
@@ -102,6 +121,13 @@ def test_scanner_catches_the_idioms_that_evaded_review() -> None:
         'const searches = snapshot.stats["searches"];',
         # A reader that renamed the intermediate variable.
         "const n = Number((meshStats || {}).errors || 0);",
+        # ADR-0020. These four are the verbatim pre-rename readers: they are the
+        # ones a plain revert of kb/static restores, and each renders a number
+        # under a name the payload no longer uses.
+        'document.getElementById("statDocuments").textContent = snapshot.stats.documents;',
+        "knowledgeSnapshotCount.textContent = String(snapshot.stats.documents || 0);",
+        '{ label: "Notes", value: Number(stats.documents || 0), tone: "primary" },',
+        "timelineStatValues.indexed.textContent = String(stats.indexed_chunks || 0);",
     ]
     for snippet in evasive_readers:
         assert top_level_reads(snippet), f"scanner missed: {snippet}"
@@ -111,7 +137,13 @@ def test_scanner_catches_the_idioms_that_evaded_review() -> None:
         "const errors = mesh.data?.stats?.since_restart?.errors ?? 0;",
         "const sinceRestart = snapshot.stats.since_restart || {};",
         "timelineStatValues.pending.textContent = String(since.pending_chunks || 0);",
-        'document.getElementById("statDocuments").textContent = snapshot.stats.documents;',
+        # ADR-0020: the renamed field, the surviving since_restart accumulators,
+        # and a `documents` that has nothing to do with the stats payload
+        # (/api/sources rows carry a per-source document count).
+        'document.getElementById("statDocuments").textContent = snapshot.stats.tracked_sources;',
+        "timelineStatValues.indexed.textContent = String(since.indexed_chunks || 0);",
+        "const captured = snapshot.stats.since_restart.documents;",
+        "<p>${escapeHtml(source.documents || 0)} notes</p>",
     ]
     for snippet in correct_readers:
         assert not top_level_reads(snippet), f"false positive on: {snippet}"
@@ -123,7 +155,7 @@ def test_cli_mesh_renderer_reads_since_restart() -> None:
     rendered = _render_mesh(
         {
             "stats": {
-                "documents": 12,
+                "tracked_sources": 12,
                 "nodes": 30,
                 "edges": 45,
                 "since_restart": {"searches": 3, "errors": 1, "started_at": "2026-08-03T00:00:00Z"},
@@ -133,4 +165,4 @@ def test_cli_mesh_renderer_reads_since_restart() -> None:
     )
 
     assert "3 searches since restart" in rendered
-    assert "12 documents" in rendered
+    assert "12 tracked sources" in rendered
