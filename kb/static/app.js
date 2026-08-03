@@ -3226,7 +3226,9 @@ function renderHome() {
     syncedAt.textContent = last ? `Last sync ${formatDate(last)}` : "Never synced";
   }
 
-  const errors = Number(((state.snapshot || {}).stats || {}).errors || 0);
+  // Activity counters are published only under stats.since_restart (#196).
+  const homeStats = (state.snapshot || {}).stats || {};
+  const errors = Number((homeStats.since_restart || {}).errors || 0);
   if (!state.snapshot) {
     status.textContent = "Loading";
     status.className = "status-chip status-standby";
