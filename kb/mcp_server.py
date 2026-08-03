@@ -71,19 +71,41 @@ MCP_AGENT_INSTRUCTIONS = (
 def set_tools_list_session_resolver(
     resolver: Callable[[str], dict[str, Any] | None] | None,
 ) -> None:
-    """Register an in-process token→session lookup for tools/list role filtering."""
+    """Register an in-process token→session lookup for tools/list role filtering.
+
+    A resolver that returns None is answering authoritatively: this node does
+    not know the token (revoked, rotated, or never minted). A resolver that
+    cannot answer (store hiccup) must raise instead, so the caller can tell a
+    dead credential from a transient lookup failure (#171).
+    """
     global _tools_list_session_resolver
     _tools_list_session_resolver = resolver
 
 
-def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
-    """Resolve role/seat for tools/list without nested HTTP (avoids event-loop deadlock)."""
+class _UnknownToken:
+    """Sentinel: the access store authoritatively does not know this token."""
+
+
+_UNKNOWN_TOKEN = _UnknownToken()
+
+
+def _session_from_token_inprocess(
+    token: str,
+) -> dict[str, Any] | _UnknownToken | None:
+    """Resolve role/seat for tools/list without nested HTTP (avoids event-loop deadlock).
+
+    Returns the session dict, ``_UNKNOWN_TOKEN`` when the store definitively
+    does not know the token, or None when no in-process answer is available
+    (resolver errored, or kb.server is not importable) and the caller may try
+    the HTTP fallback.
+    """
     if _tools_list_session_resolver is not None:
         try:
-            return _tools_list_session_resolver(token)
-        except Exception as exc:  # noqa: BLE001 - fail open
+            session = _tools_list_session_resolver(token)
+        except Exception as exc:  # noqa: BLE001 - transient; caller may fall back
             logger.warning("tools/list in-process session resolver failed: %s", exc)
             return None
+        return session if session else _UNKNOWN_TOKEN
     # Late import: kb.server imports this module at load time.
     try:
         from kb.server import access_key_identity
@@ -95,7 +117,7 @@ def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
         logger.warning("tools/list access_key_identity failed: %s", exc)
         return None
     if not pair:
-        return None
+        return _UNKNOWN_TOKEN
     identity, _ = pair
     return {
         "ok": True,
@@ -105,7 +127,12 @@ def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
 
 
 class CitadelMcpError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        # HTTP status of the upstream Citadel response, when one arrived.
+        # Lets tools/list tell "the node rejected this token" (401) from
+        # "the node could not be asked" without parsing the message (#171).
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -431,18 +458,23 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
+def _request_from_context(ctx: Context | None) -> Any:
+    """The live HTTP request attached to the MCP context (None under stdio)."""
+    if ctx is None:
+        return None
+    try:
+        return ctx.request_context.request
+    except Exception:
+        return None
+
+
 def _bearer_from_context(ctx: Context | None) -> str | None:
     """Extract the caller's bearer token from the live HTTP request, if any.
 
     Returns None under stdio transport (no HTTP request is attached), which lets
     the server fall back to an env-configured client.
     """
-    if ctx is None:
-        return None
-    try:
-        request = ctx.request_context.request
-    except Exception:
-        return None
+    request = _request_from_context(ctx)
     if request is None:
         return None
     authorization = ""
@@ -625,7 +657,9 @@ def _filter_tools_for_session(
     never see the admin tools) and citadel_contribute for seat holders (Central
     is read-only from seat MCP). Returns the full list when the session is
     missing or carries an unknown role (fail open — call-time authz still
-    enforces). Tools absent from TOOL_POLICIES are never hidden by accident.
+    enforces); the tools/list handler decides when a failed resolution means
+    the reader floor instead (#171). Tools absent from TOOL_POLICIES are never
+    hidden by accident.
     """
     if not session:
         return all_tools
@@ -644,6 +678,18 @@ def _filter_tools_for_session(
                 continue
         visible.append(tool)
     return visible
+
+
+def _reader_floor(all_tools: list[Any]) -> list[Any]:
+    """The tool surface served when a hosted caller has no resolvable role (#171).
+
+    Reader-visible tools only: enough for a client to stay functional (search,
+    discovery, session) without advertising the write/admin surface to a caller
+    whose credential is missing or did not resolve. Deliberately not empty — a
+    blanked list breaks clients that register tools once (#100) — and server-side
+    authz still rejects the calls themselves.
+    """
+    return _filter_tools_for_session(all_tools, {"role": "reader", "seat_slug": None})
 
 
 def _validate_ingest_size(data: str) -> None:
@@ -762,7 +808,9 @@ class CitadelHttpClient:
             logger.warning(
                 "Citadel API call %s %s returned HTTP %s", method, path, exc.code
             )
-            raise CitadelMcpError(f"Citadel returned HTTP {exc.code}: {detail}") from exc
+            raise CitadelMcpError(
+                f"Citadel returned HTTP {exc.code}: {detail}", status_code=exc.code
+            ) from exc
         except URLError as exc:
             reason = redact_secrets(str(exc.reason), self.access_token)
             logger.error(
@@ -1455,9 +1503,15 @@ def create_mcp_server(
         A nested blocking ``GET /api/session`` self-deadlocks the hosted
         streamable-HTTP transport: it runs on the same loop that must serve it,
         so after the HTTP client's retries tools/list takes ~90s and clients
-        register zero tools. Server-side 403s remain the real enforcement; this
-        only stops 403 trial-and-error and fails OPEN on any resolution error so
-        a transient lookup never blanks the tool list. (#100)
+        register zero tools (#100). Server-side 403s remain the real
+        enforcement; this only stops 403 trial-and-error.
+
+        A hosted caller whose bearer is missing, unknown, or unresolvable gets
+        the READER floor, not the full list: failing open advertised the six
+        admin tools to any caller with a dead token (#171), while an empty list
+        would break clients that register tools once (#100). Stdio keeps the
+        full list — there is no per-request credential there, and the
+        env-configured client still authenticates every call.
         """
         all_tools = await mcp.list_tools()
         try:
@@ -1466,8 +1520,19 @@ def create_mcp_server(
             ctx = None
         token = _bearer_from_context(ctx)
         if not token:
-            return all_tools  # stdio / unauthenticated handshake — call-time authz still applies
+            if _request_from_context(ctx) is not None and fallback is None:
+                # Hosted node transport with no Authorization header: the
+                # caller cannot invoke a single tool (resolve_client refuses),
+                # so advertise the reader surface, not the admin one.
+                return _reader_floor(all_tools)
+            return all_tools  # stdio, or an env-authenticated bridge
         session = _session_from_token_inprocess(token)
+        if isinstance(session, _UnknownToken):
+            logger.warning(
+                "tools/list bearer token is not recognized by this node "
+                "(revoked or rotated?); serving reader-only tools"
+            )
+            return _reader_floor(all_tools)
         if session is None:
             try:
                 session = await asyncio.wait_for(
@@ -1480,9 +1545,19 @@ def create_mcp_server(
                     ),
                     timeout=_TOOLS_LIST_SESSION_WAIT,
                 )
-            except Exception as exc:  # noqa: BLE001 - fail open for availability
-                logger.warning("tools/list role filter could not resolve session: %s", exc)
-                return all_tools
+            except Exception as exc:  # noqa: BLE001 - degrade to the reader floor
+                if getattr(exc, "status_code", None) == 401:
+                    logger.warning(
+                        "tools/list bearer token is not recognized by this node "
+                        "(revoked or rotated?); serving reader-only tools"
+                    )
+                else:
+                    logger.warning(
+                        "tools/list could not resolve the caller's role (%s); "
+                        "serving reader-only tools",
+                        exc,
+                    )
+                return _reader_floor(all_tools)
         return _filter_tools_for_session(all_tools, session)
 
     return mcp

@@ -126,15 +126,19 @@ def test_tools_list_session_resolved_in_process_not_via_self_call(
     session = mcp_server._session_from_token_inprocess("ctdl_x")
     assert session == {"ok": True, "role": "reader", "seat_slug": "sarthi"}
 
-    # Fails open (no tool list blanking) when the store lookup errors or misses.
+    # A store ERROR returns None so the caller may try the HTTP fallback...
     def boom(token: str) -> Any:
         raise RuntimeError("store unavailable")
 
     monkeypatch.setattr(server_mod, "access_key_identity", boom)
     assert mcp_server._session_from_token_inprocess("ctdl_x") is None
 
+    # ...but a clean MISS is the store answering "this token does not exist",
+    # and must be distinguishable from the transient case (#171).
     monkeypatch.setattr(server_mod, "access_key_identity", lambda token: None)
-    assert mcp_server._session_from_token_inprocess("ctdl_x") is None
+    assert isinstance(
+        mcp_server._session_from_token_inprocess("ctdl_x"), mcp_server._UnknownToken
+    )
 
 
 def test_streamable_http_uses_json_response_not_sse() -> None:
@@ -843,15 +847,21 @@ def test_tools_list_protocol_handler_applies_role_filter(
         mcp_server.set_tools_list_session_resolver(None)
 
 
-def test_tools_list_uses_threaded_http_fallback_when_resolver_misses(
+def test_tools_list_uses_threaded_http_fallback_when_resolver_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A resolver ERROR (store hiccup) is transient, so the node is asked over
+    # HTTP; a successful answer still filters normally.
     from mcp import types as mcp_types
 
     server = create_mcp_server(FakeHttpClient())
     monkeypatch.setattr(server, "get_context", lambda: object())
     monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: "ctdl_tok")
-    mcp_server.set_tools_list_session_resolver(lambda _token: None)
+
+    def _boom(_token: str) -> Any:
+        raise RuntimeError("store unavailable")
+
+    mcp_server.set_tools_list_session_resolver(_boom)
 
     class _SessionClient:
         def __init__(self, **_: Any) -> None: ...
@@ -871,6 +881,106 @@ def test_tools_list_uses_threaded_http_fallback_when_resolver_misses(
         mcp_server.set_tools_list_session_resolver(None)
 
 
+def _assert_reader_floor(names: set[str]) -> None:
+    """#171: an unresolvable caller gets reader tools — never admin, never blank."""
+    assert not (_ADMIN_TOOLS & names)
+    assert "citadel_ingest" not in names
+    assert "citadel_contribute" not in names
+    assert "citadel_search" in names  # the floor must not blank the list (#100)
+    assert "citadel_session" in names
+
+
+def test_tools_list_unknown_token_gets_reader_floor_without_http_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #171: the resolver answering "no such token" is definitive. The old code
+    # collapsed it into the transient case, fell back to HTTP, failed, and
+    # served the full list — admin tools included — to a dead credential.
+    from mcp import types as mcp_types
+
+    server = create_mcp_server(FakeHttpClient())
+    monkeypatch.setattr(server, "get_context", lambda: object())
+    monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: "ctdl_dead")
+    mcp_server.set_tools_list_session_resolver(lambda _token: None)
+
+    http_calls: list[str] = []
+
+    class _SessionClient:
+        def __init__(self, **_: Any) -> None: ...
+
+        def get(self, path: str, **_: Any) -> dict[str, Any]:
+            http_calls.append(path)
+            raise AssertionError("a definitive miss must not trigger the HTTP fallback")
+
+    monkeypatch.setattr(mcp_server, "CitadelHttpClient", _SessionClient)
+    try:
+        handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+        result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
+        _assert_reader_floor({t.name for t in result.root.tools})
+        assert http_calls == []
+    finally:
+        mcp_server.set_tools_list_session_resolver(None)
+
+
+@pytest.mark.parametrize("failure", ["node-rejected-token", "node-unreachable"])
+def test_tools_list_resolution_failure_gets_reader_floor_not_full_list(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    # #171: the production symptom. Resolution fails end to end (resolver errors,
+    # HTTP fallback 401s or cannot connect) — the old fail-open branch served all
+    # 22 tools, admin tools included. Now it degrades to the reader floor.
+    from mcp import types as mcp_types
+
+    if failure == "node-rejected-token":
+        fallback_error = mcp_server.CitadelMcpError("Citadel returned HTTP 401: nope")
+        fallback_error.status_code = 401
+    else:
+        fallback_error = mcp_server.CitadelMcpError(
+            "Could not reach Citadel at http://127.0.0.1:8000: down"
+        )
+
+    server = create_mcp_server(FakeHttpClient())
+    monkeypatch.setattr(server, "get_context", lambda: object())
+    monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: "ctdl_tok")
+
+    def _boom(_token: str) -> Any:
+        raise RuntimeError("store unavailable")
+
+    mcp_server.set_tools_list_session_resolver(_boom)
+
+    class _SessionClient:
+        def __init__(self, **_: Any) -> None: ...
+
+        def get(self, path: str, **_: Any) -> dict[str, Any]:
+            raise fallback_error
+
+    monkeypatch.setattr(mcp_server, "CitadelHttpClient", _SessionClient)
+    try:
+        handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+        result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
+        _assert_reader_floor({t.name for t in result.root.tools})
+    finally:
+        mcp_server.set_tools_list_session_resolver(None)
+
+
+def test_tools_list_unauthenticated_hosted_caller_gets_reader_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #171: a hosted caller with no Authorization header cannot invoke a single
+    # tool (resolve_client refuses without a fallback client), so tools/list
+    # must not advertise the admin surface to it.
+    from mcp import types as mcp_types
+
+    server = create_mcp_server(None)  # hosted node shape: no env fallback client
+    monkeypatch.setattr(server, "get_context", lambda: object())
+    monkeypatch.setattr(mcp_server, "_bearer_from_context", lambda ctx: None)
+    monkeypatch.setattr(mcp_server, "_request_from_context", lambda ctx: object())
+
+    handler = server._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+    result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
+    _assert_reader_floor({t.name for t in result.root.tools})
+
+
 def test_tools_list_protocol_handler_fails_open_without_context() -> None:
     # No HTTP request context (stdio) → unfiltered, since call-time authz applies.
     from mcp import types as mcp_types
@@ -880,6 +990,123 @@ def test_tools_list_protocol_handler_fails_open_without_context() -> None:
     result = asyncio.run(handler(mcp_types.ListToolsRequest(method="tools/list")))
     names = {t.name for t in result.root.tools}
     assert _ADMIN_TOOLS <= names
+
+
+def test_hosted_transport_tools_list_filters_through_real_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """#171 end to end: the hosted /mcp transport with kb.server's REAL resolver.
+
+    Covers the path production actually runs — bearer lifted from the live
+    streamable-HTTP request, kb.server's registered resolver consulting the real
+    access store — which the handler-level tests above replace with fakes. The
+    prior coverage asserted _filter_tools_for_session's contract directly and
+    stayed green while the hosted transport served the full list, admin tools
+    included, to dead tokens and anonymous callers.
+
+    Runs kb.server's real FastMCP server behind a PRIVATE streamable-HTTP
+    session manager: the module-global one can only ever `.run()` once, and
+    consuming it here would break the lifespan tests that run it later.
+    """
+    import httpx
+    from mcp.server.fastmcp.server import StreamableHTTPASGIApp
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    import kb.server as server_mod
+    from kb.access import AccessStore
+    from kb.config import CitadelConfig
+
+    # Point the HTTP fallback at a dead port: a definitive in-process miss must
+    # not need it, and a developer's live node on :8000 would fake a pass.
+    monkeypatch.setenv("CITADEL_MCP_SELF_BASE_URL", "http://127.0.0.1:9")
+
+    class _ConfigOnlyCitadel:
+        config = CitadelConfig(
+            tenant_id="test",
+            default_dataset="notes",
+            admin_key="an-admin-key-long-enough-for-the-gate00",
+            reader_keys=(),
+            writer_keys=(),
+        )
+
+    server_mod.app.state.citadel = _ConfigOnlyCitadel()
+    store = AccessStore(tmp_path / "access.json")
+    server_mod.app.state.access_store = store
+    seat_token = store.create_seat(name="Probe Seat", slug="probe").token
+    # Earlier tests null the resolver in their cleanup; restore the one
+    # kb.server registers at import so this exercises the real wiring.
+    server_mod.set_tools_list_session_resolver(server_mod._mcp_tools_list_session)
+
+    async def list_tool_names(
+        client: httpx.AsyncClient, authorization: str | None
+    ) -> set[str]:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        }
+        if authorization:
+            headers["Authorization"] = authorization
+        init = await client.post(
+            "/mcp/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "probe", "version": "1"},
+                },
+            },
+        )
+        assert init.status_code == 200
+        sid = init.headers.get("mcp-session-id")
+        if sid:
+            headers["mcp-session-id"] = sid
+        await client.post(
+            "/mcp/",
+            headers=headers,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        resp = await client.post(
+            "/mcp/",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert resp.status_code == 200
+        return {tool["name"] for tool in resp.json()["result"]["tools"]}
+
+    manager = StreamableHTTPSessionManager(
+        app=server_mod.mcp_server._mcp_server,
+        json_response=True,
+        stateless=True,
+    )
+
+    async def scenario() -> dict[str, set[str]]:
+        async with manager.run():
+            transport = httpx.ASGITransport(app=StreamableHTTPASGIApp(manager))
+            async with httpx.AsyncClient(
+                transport=transport, base_url="https://testserver"
+            ) as client:
+                return {
+                    "seat": await list_tool_names(client, f"Bearer {seat_token}"),
+                    "unknown": await list_tool_names(client, "Bearer ctdl_rotated_away"),
+                    "anonymous": await list_tool_names(client, None),
+                }
+
+    results = asyncio.run(scenario())
+
+    # The #33 benefit, through the real resolution path: a writer seat sees its
+    # writer tools but never the admin surface or contribute.
+    assert not (_ADMIN_TOOLS & results["seat"])
+    assert "citadel_contribute" not in results["seat"]
+    assert "citadel_ingest" in results["seat"]
+
+    # #171: a dead token and an anonymous caller get the reader floor,
+    # not the full list.
+    _assert_reader_floor(results["unknown"])
+    _assert_reader_floor(results["anonymous"])
 
 
 def test_remote_http_base_url_is_rejected_without_escape_hatch(
