@@ -165,7 +165,13 @@ Python entry points remain the escape hatch for anything exotic.
 
 ## 14. Related records
 
-Architecture decisions arising from this document: ADR-0020 (graph store and dataset-scoped reads), ADR-0021 (retrieval interface owns ranking and provenance), ADR-0022 (evidence layer), ADR-0023 (control plane boundary).
+Architecture decisions arising from this document: ADR-0020 (graph store and dataset-scoped reads), ADR-0021 (retrieval interface owns ranking and provenance), ADR-0022 (evidence layer), ADR-0023 (control plane boundary). All four are indexed in [`docs/adr/README.md`](../../adr/README.md).
+
+Plans that execute this document, and where to go next:
+
+- [`2026-08-04-citadel-execution-plan.md`](2026-08-04-citadel-execution-plan.md) orders every open issue into the four stages of section 11 and states an exit criterion for each. Start here.
+- [`2026-08-04-graph-store-migration-runbook.md`](2026-08-04-graph-store-migration-runbook.md) executes ADR-0020 as nine gates, beginning with the privilege check that decides whether the plan holds its shape.
+- [`2026-08-04-control-plane-design.md`](2026-08-04-control-plane-design.md) designs the system ADR-0023 puts outside the application, and carries the cost model that decides where instances run.
 
 Existing records this builds on: ADR-0003 (seat, node, central), ADR-0009 (mesh read isolation), ADR-0010 (structured knowledge as durable source of truth), ADR-0012 (attested trust versus content hint), ADR-0015 (one process owns the graph), ADR-0017 (structural provenance outranks inherited trust).
 
