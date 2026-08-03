@@ -52,7 +52,7 @@ This keeps the first implementation simple while leaving room for a durable queu
 ## Shipped Surface
 
 - Backend: `GET /api/knowledge/events` returns a bounded, newest-first event timeline with `after_id`, `limit`, `type`, and `kind` filters.
-- Snapshot stats: `/api/mesh` includes `indexed_chunks`, `last_indexed_at`, and `latest_event_id`; restart-scoped activity counters (`searches`, `feedback`, `upgrades`, `errors`, `pending_chunks`) live under `stats.since_restart` (#196), and `failed_chunks` is gone — it duplicated `errors` (#197).
+- Snapshot stats: `/api/mesh` includes `last_indexed_at` and `latest_event_id`; restart-scoped counters (`searches`, `feedback`, `upgrades`, `errors`, `pending_chunks`, `indexed_chunks`) live under `stats.since_restart` (#196, ADR-0020), and `failed_chunks` is gone — it duplicated `errors` (#197). Top-level `indexed_chunks` was removed: it was assigned the same corpus figure as `nodes`, so it never counted chunks (ADR-0020).
 - SSE: `/events` still sends live mesh updates; emitted events now include the normalized `timeline` envelope.
 - UI: the Activity page is now the Live Knowledge Timeline with freshness counters, a selectable event list, event inspector, and graph focus.
 - Operational check: the production GitHub sync cron was run manually on June 11, 2026 and ingested new source activity into the production Citadel service.

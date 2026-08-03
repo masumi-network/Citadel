@@ -2627,6 +2627,10 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     dedups or cites on ``id`` and later compares against a fetched document's
     own ``.id`` (which is the document id, not the chunk id) will never match.
     Use ``document_id`` for anything that needs to key off the document.
+
+    The field is optional, not guaranteed: the GitHub digest fallback above
+    (``search_github_sync_state``) supplies its own ``id`` and no
+    ``document_id``, because a digest section is not a stored document.
     """
     if result.get("id"):
         return result
