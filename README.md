@@ -81,6 +81,32 @@ Citadel is a FastAPI application with multiple subsystems — not a thin wrapper
 
 Domain language: [`CONTEXT.md`](CONTEXT.md). Architecture decisions: [`docs/adr/`](docs/adr/). Deeper plan: [`docs/organization-vault-plan.md`](docs/organization-vault-plan.md).
 
+## Measured performance
+
+Measured 2026-08-03 against commit `a66cba8` on the production node, from a laptop over the public API, while five agents used the node concurrently. Every figure is a client round trip, not an idle server-side benchmark. Quality numbers come from a 69-question golden harness pinned to the same commit.
+
+| Metric | Value | What it measures |
+|---|---|---|
+| Search p50, direct API | 311 ms admin, 472 ms writer | Median round trip for one search: 24 runs per surface, same 12 queries |
+| Search p50, MCP and CLI | 504 ms, 627 ms | Same queries through hosted MCP (32 ms added by the extra hop) and the CLI (155 ms added, about 95 ms of it process start) |
+| Search p99 | 365 to 905 ms | Slowest end per surface: admin 365, writer 684, MCP 905, CLI 784 |
+| `answer_recall@5` | 0.8974 | Share of questions where a top-5 hit quotes a verbatim span from the expected document's body after the sync header is stripped. Harness lint rejects any span from a document's first line, so header matches earn no credit; residual header credit is 0.026 |
+| `doc_recall@5` | 0.9508 | Share of questions where the expected document shows up in the top 5 at all |
+| `mrr_body` | 0.7521 | Mean reciprocal rank of the first hit whose body contains the expected span |
+| Blocked probes | 8 of 8 empty | Queries for content that should never be retrievable, such as secret-shaped strings the ingest scanner blocks; all came back with nothing |
+| `duplicate_blob_rate@10` | 0.45 | Share of top-10 slots holding a duplicate of another hit's content |
+| Ranking inversion rate | 0.541 | Result pairs where the lower-ranked hit covers more of the query's terms (33 of 61 pairs). 0.5 is random ordering, so ranking currently does slightly worse than random on this measure. A separate 16-query suite still found the correct document in the top 5 for 14 of 16, with mean top-5 term coverage 0.679 |
+| Unindexed documents | 892 of 2867 (31.1%) | Corpus documents accepted but never vector-indexed (chunk count 0), which search cannot surface |
+| Digest freshness | 0 of 10 queries | Digest-relevant queries where the newest daily digest reached the top 10. Stale digests took 30 of 50 top-5 slots; the most common served age was 33 days |
+| Write latency | 0.5 to 0.7 s fast path, 100 s median inline | Time for an ingest to return. Inline graph processing ranged 27.5 to 146.8 s over 5 runs; all 9 write markers were retrievable on the first poll afterwards |
+| Concurrency | p50 562 ms at 1, 1226 ms at 4, 2264 ms at 8 | Search latency under burst load. The node runs 8 searches at once and immediately answers 429 beyond that; no 20 s budget timeouts across about 250 searches |
+
+Do not quote the recall figure without its definition. `answer_recall` counts only verbatim body spans, and the harness rejects any span that also appears in the document's first line. An earlier 0.95 figure counted those first-line matches and overstated retrieval quality.
+
+The bad numbers are in the table on purpose. A third of the corpus is invisible to vector search, ranking does slightly worse than a coin flip on term coverage, the newest daily digest never reached the top 10, and inline writes take minutes.
+
+To reproduce the quality rows: [`scripts/bench/README.md`](scripts/bench/README.md) documents the harness. `python scripts/bench/search_bench.py run --out run.json` runs the 69 frozen questions against a node, `run --baseline previous_run.json` reports the delta against an earlier run, and `lint` validates the question set offline. The latency, write, freshness, and concurrency rows came from one-off probe scripts in the measuring session, so treat them as a dated snapshot rather than something the repo regenerates. Tracking issue: [#122](https://github.com/masumi-network/Citadel/issues/122).
+
 ## Quick start for teammates
 
 ### Install and onboard
