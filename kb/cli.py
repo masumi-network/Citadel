@@ -296,16 +296,39 @@ async def _ingest(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
-    from kb.status import ingest_node
+    from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
 
     # Cognify inline (server-side) by default so the note is immediately
     # searchable; the one request blocks until cognify finishes (--no-cognify skips).
     cognify = not getattr(args, "no_cognify", False)
     as_json = getattr(args, "json", False)
+    timeout_arg = getattr(args, "timeout", None)
+    if timeout_arg is not None:
+        timeout_s = max(1.0, float(timeout_arg))
+    else:
+        timeout_s = _COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT
+
+    def _timeout_exit() -> int:
+        # A client timeout proves only that no response arrived in the budget.
+        # It does NOT prove the write failed — the Node may still be processing
+        # (the capture-timeout lesson) — so claim neither outcome.
+        return _emit_error(
+            "ingest",
+            f"no response after {timeout_s:g}s — the Node may still be processing "
+            "(cognify is slow on cold nodes). A client timeout does not prove the "
+            "write failed: check `citadel activity` (or search for the note) to "
+            "confirm, or retry with a longer --timeout.",
+            as_json=as_json,
+            code="TIMEOUT",
+            extra={"timed_out": True, "write_state": "unknown", "timeout_s": timeout_s},
+        )
+
     spinner_msg = "Ingesting + building the graph…" if cognify else "Ingesting to your Node…"
     try:
         with _Spinner(spinner_msg):
-            result = await asyncio.to_thread(ingest_node, base_url, token, args.data, args.tag, cognify)
+            result = await asyncio.to_thread(
+                ingest_node, base_url, token, args.data, args.tag, cognify, timeout=timeout_s
+            )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
         if not as_json:
@@ -318,15 +341,12 @@ async def _ingest(args: argparse.Namespace) -> int:
             extra={"http_status": exc.code},
         )
     except TimeoutError:
-        return _emit_error(
-            "ingest",
-            "the Node is still working (cognify can be slow). Your note is saved — it'll "
-            "be searchable shortly; check `citadel search`.",
-            as_json=as_json,
-            code="TIMEOUT",
-            extra={"saved": True},
-        )
+        return _timeout_exit()
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        # urllib wraps connect-phase socket timeouts as URLError("timed out") —
+        # that is a budget expiry, not an unreachable Node.
+        if _is_timeout_exc(exc):
+            return _timeout_exit()
         return _emit_error("ingest", str(exc), as_json=as_json, code="NODE_UNREACHABLE")
     if not isinstance(result, dict):  # a misconfigured Node could return non-dict JSON
         result = {"accepted": False, "reason": "unexpected response from the Node"}
@@ -1721,6 +1741,10 @@ async def _status(args: argparse.Namespace) -> int:
 
 def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
     """Compact knowledge-mesh summary for `citadel status` (the 'your data' view)."""
+    if isinstance(mesh, dict) and mesh.get("error"):
+        # fetch_mesh marks failures as {"error": ...}; dropping the block made
+        # an unreachable mesh endpoint look like "no mesh data".
+        return paint(f"Knowledge mesh unavailable: {mesh['error']}", "yellow", enable=color)
     stats = (mesh or {}).get("stats")
     if not isinstance(stats, dict) or not stats:
         return ""
@@ -1746,7 +1770,11 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
 
 
 def _render_event(event: dict[str, Any], color: bool) -> str:
-    """One Vault Activity line: `HH:MM  <type>  <message>  (dataset)`."""
+    """One Vault Activity line: `HH:MM  <type>  <message>  (dataset)`.
+
+    Error events also carry which operation failed and its (already redacted)
+    reason — without them every failure renders as a bare "Operation failed".
+    """
     created = str(event.get("created_at") or "")
     stamp = created[11:16] if len(created) >= 16 else created[:5]
     etype = str(event.get("type") or "event")
@@ -1754,6 +1782,13 @@ def _render_event(event: dict[str, Any], color: bool) -> str:
     details = event.get("details") if isinstance(event.get("details"), dict) else {}
     timeline = event.get("timeline") if isinstance(event.get("timeline"), dict) else {}
     dataset = details.get("dataset") or timeline.get("dataset") or ""
+    if etype == "error":
+        operation = str(details.get("operation") or "").strip()
+        reason = " ".join(str(details.get("error") or "").split())[:120]
+        if operation:
+            message = f"{message}: {operation}" if message else operation
+        if reason:
+            message = f"{message} — {reason}" if message else reason
     line = (
         paint(f"{stamp:>5}", "dim", enable=color)
         + "  "
@@ -1809,9 +1844,11 @@ def _render_presence(board: dict[str, Any], color: bool) -> str:
 async def _activity_global(node_url: str, token: str | None, color: bool, watch: bool) -> int:
     """Live team-presence broadcast — Seat Presence only (ADR-0009), no content."""
     board = await asyncio.to_thread(fetch_presence, node_url, token)
+    if board.get("error"):
+        # An unreachable Node must not render as an empty-but-healthy board.
+        print(f"citadel activity: could not reach {node_url} — {board['error']}", file=sys.stderr)
+        return 1
     print(_render_presence(board, color))
-    if not token and not board.get("error") and not board.get("seats"):
-        print(paint("  (no token configured — run `citadel onboard`)", "yellow", enable=color))
     if not watch:
         return 0
     print(paint("— watching team presence (Ctrl-C to stop) —", "dim", enable=color))
@@ -1841,10 +1878,27 @@ async def _activity(args: argparse.Namespace) -> int:
     token = capture_token() or None
     use_color = supports_color()
 
+    if not token:
+        # Without a token the feed (and the presence board) can only ever be
+        # empty — that is an auth gap, not "no activity", so say so with exit 1
+        # (a JSON object under --json) instead of a bare `{}` / quiet feed.
+        return _emit_no_token("activity", as_json=bool(args.json))
+
     if getattr(args, "global_broadcast", False):
         return await _activity_global(node_url, token, use_color, args.watch)
 
     data = await asyncio.to_thread(fetch_events, node_url, token, limit=limit, event_type=args.type)
+    failure = data.get("error") or (None if data else "empty response from the Node")
+    if failure:
+        # fetch_events marks every transport/HTTP failure as {"error": ...}.
+        # Rendering that as "No recent activity." (exit 0) made a node outage
+        # indistinguishable from an empty vault — fail loudly on both surfaces.
+        return _emit_error(
+            "activity",
+            f"could not reach {node_url} — {failure}",
+            as_json=bool(args.json),
+            code="NODE_UNREACHABLE",
+        )
     if args.json and not args.watch:
         _print_json(data)
         return 0
@@ -1858,12 +1912,9 @@ async def _activity(args: argparse.Namespace) -> int:
 
     if not args.watch:
         if not events:
-            if data.get("error"):
-                print(paint(f"Couldn't reach the Node: {data['error']}", "yellow", enable=use_color))
-            else:
-                print(paint("No recent activity.", "dim", enable=use_color))
-                if not token:
-                    print(paint("  (no token configured — run `citadel onboard`)", "yellow", enable=use_color))
+            # The failure paths (no token / unreachable) exited above, so an
+            # empty feed here really is an empty-but-healthy vault.
+            print(paint("No recent activity.", "dim", enable=use_color))
         return 0
 
     print(paint("— watching your Node (Ctrl-C to stop) —", "dim", enable=use_color))
@@ -1969,8 +2020,17 @@ async def _doctor(args: argparse.Namespace) -> int:
         issues.append({"problem": f".mcp.json Node ({mcp_node}) disagrees with capture config ({cap_node})",
                        "fix": f"citadel onboard --node-url {cap_node}"})
 
-    if checks.get("pre_push_hook") and not checks["pre_push_hook"].ok:
-        issues.append({"problem": "git pre-push autosync hook missing", "fix": "citadel doctor --fix", "kind": "pre_push"})
+    hook_check = checks.get("pre_push_hook")
+    if hook_check and not hook_check.ok:
+        if (hook_check.data or {}).get("git_repo") is False:
+            # Not a git repo here — "hook missing" would read as "your hook is
+            # gone" when there was simply nothing to inspect at this cwd.
+            issues.append({
+                "problem": f"pre-push hook not checked — {hook_check.detail}",
+                "fix": "run `citadel doctor` from inside a git repo (or pass --repo)",
+            })
+        else:
+            issues.append({"problem": "git pre-push autosync hook missing", "fix": "citadel doctor --fix", "kind": "pre_push"})
     if checks.get("session_hook") and not checks["session_hook"].ok:
         issues.append({"problem": "Claude SessionEnd/SessionStart hooks missing", "fix": "citadel doctor --fix", "kind": "session"})
     if checks.get("mcp") and not checks["mcp"].ok:
@@ -2951,6 +3011,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cognify",
         action="store_true",
         help="Skip the post-ingest cognify (faster; data appears in search later)",
+    )
+    ingest.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Max seconds to wait for the Node (default: 180 while cognifying, 60 with --no-cognify)",
     )
     ingest.add_argument("--json", action="store_true", help="Machine-readable output")
     ingest.add_argument("--node-url", help="Override Node URL")
