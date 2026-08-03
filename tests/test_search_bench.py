@@ -685,6 +685,395 @@ class TestLint:
 
 
 # --------------------------------------------------------------------------
+# Corpus census (/api/corpus walk)
+# --------------------------------------------------------------------------
+
+
+class TestCorpusCensus:
+    def _page(self, rows, next_cursor=None, total=None):
+        return {
+            "ok": True,
+            "documents": rows,
+            "documents_returned": len(rows),
+            "documents_total": total,
+            "next_cursor": next_cursor,
+            "totals": {"documents": total},
+            "notes": [],
+        }
+
+    def test_census_walks_pages_and_counts_zero_chunk_documents(self):
+        pages = [
+            self._page(
+                [
+                    {"id": "d1", "chunk_count": 0},
+                    {"id": "d2", "chunk_count": 3},
+                    {"id": "d3", "chunk_count": None},
+                ],
+                next_cursor="c1",
+                total=5,
+            ),
+            self._page(
+                [{"id": "d4", "chunk_count": 0}, {"id": "d5", "chunk_count": 7}],
+                next_cursor=None,
+                total=5,
+            ),
+        ]
+        calls = []
+
+        def fetch(cursor):
+            calls.append(cursor)
+            return pages[len(calls) - 1]
+
+        census = sb.corpus_census(fetch)
+        assert calls == [None, "c1"]
+        assert census["documents_total"] == 5
+        assert census["documents_walked"] == 5
+        assert census["chunk_count_zero"] == 2
+        assert census["chunk_count_unmeasured"] == 1
+        # Denominator is every walked document, matching the published
+        # "892 of 2867 (31.1%)" definition; unmeasured rows make it a floor.
+        assert census["chunk_count_zero_ratio"] == pytest.approx(2 / 5)
+        assert census["pages"] == 2
+        assert census["truncated"] is False
+
+    def test_census_http_error_degrades_to_error_dict(self):
+        import urllib.error
+
+        def fetch(cursor):
+            raise urllib.error.HTTPError("u", 403, "forbidden", None, None)
+
+        census = sb.corpus_census(fetch)
+        assert census["error"] == "HTTP 403"
+        assert "reason" in census
+
+    def test_census_stuck_cursor_stops_instead_of_looping(self):
+        def fetch(cursor):
+            return self._page([{"id": "d1", "chunk_count": 1}], next_cursor="same", total=1)
+
+        census = sb.corpus_census(fetch, max_pages=50)
+        assert census["truncated"] is True
+        assert census["pages"] == 2  # stopped when the cursor failed to advance
+
+    def test_census_page_cap_truncates_and_says_so(self):
+        def fetch(cursor):
+            return self._page(
+                [{"id": f"d{cursor}", "chunk_count": 0}],
+                next_cursor=f"c{len(str(cursor))}{cursor}",
+                total=None,
+            )
+
+        census = sb.corpus_census(fetch, max_pages=3)
+        assert census["truncated"] is True
+        assert census["pages"] == 3
+
+
+# --------------------------------------------------------------------------
+# Run JSON records when it ran
+# --------------------------------------------------------------------------
+
+
+class TestRunTimestamp:
+    def test_execute_benchmark_stamps_run_at_utc(self):
+        from datetime import datetime
+
+        span = "the unique answer sentence lives here"
+        qs = [question(spans=[span]), question("p01", recall=0)]
+        result = sb.execute_benchmark(
+            qs, lambda q, k: ({"results": []}, 1.0, None), quiet=True
+        )
+        stamped = datetime.fromisoformat(result["run_at"])
+        assert stamped.tzinfo is not None
+
+
+# --------------------------------------------------------------------------
+# Empty file map must not fingerprint as a real corpus
+# --------------------------------------------------------------------------
+
+
+class TestEmptyFileMapFingerprint:
+    def _empty_state(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"version": 1, "files": {}}))
+        return path
+
+    def test_empty_files_map_yields_no_sha(self, tmp_path):
+        fingerprint = sb.content_fingerprint(self._empty_state(tmp_path))
+        assert fingerprint["sha256"] is None
+        assert fingerprint["files"] == 0
+        assert "attests nothing" in fingerprint["reason"]
+
+    def test_two_empty_map_runs_are_not_comparable(self, tmp_path):
+        # Before the fix both runs recorded sha256("") and compared as
+        # COMPARABLE while attesting nothing about the corpus.
+        content = sb.content_fingerprint(self._empty_state(tmp_path))
+        fingerprint = {
+            "content": content,
+            "questions_sha256": "q" * 64,
+            "harness_git_sha": "deadbeef",
+        }
+        comparable, verdicts = sb.compare_fingerprints(fingerprint, dict(fingerprint))
+        assert comparable is False
+        assert any("NOT COMPARABLE" in line for line in verdicts)
+
+    def test_legacy_run_jsons_with_empty_string_sha_do_not_compare(self):
+        # Run JSONs written BEFORE the fail-closed fix (e.g. the 2026-08-03
+        # baseline) already carry sha256("") with files 0. compare must treat
+        # that recorded value as unavailable, not as a matching corpus.
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        fingerprint = {
+            "content": {"sha256": empty_sha, "files": 0},
+            "questions_sha256": "q" * 64,
+            "harness_git_sha": "deadbeef",
+        }
+        comparable, verdicts = sb.compare_fingerprints(fingerprint, dict(fingerprint))
+        assert comparable is False
+        assert any("NOT COMPARABLE" in line for line in verdicts)
+        assert any("empty" in line.lower() for line in verdicts)
+
+
+# --------------------------------------------------------------------------
+# Compare notes whole-corpus census drift
+# --------------------------------------------------------------------------
+
+
+class TestCompareCensusNote:
+    def _fingerprint(self, census=None):
+        fingerprint = {
+            "content": {"sha256": "f" * 64},
+            "questions_sha256": "q" * 64,
+            "harness_git_sha": "deadbeef",
+        }
+        if census is not None:
+            fingerprint["census"] = census
+        return fingerprint
+
+    def test_census_total_drift_is_noted_but_not_a_gate(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(census={"documents_total": 3100}),
+            self._fingerprint(census={"documents_total": 2867}),
+        )
+        # Repo-content fingerprint still matches, so the gate stays open, but
+        # whole-corpus movement must be said out loud.
+        assert comparable is True
+        assert any("census" in line and "2867" in line and "3100" in line for line in verdicts)
+
+    def test_missing_census_adds_no_note(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(), self._fingerprint()
+        )
+        assert comparable is True
+        assert not any("census" in line for line in verdicts)
+
+
+# --------------------------------------------------------------------------
+# Markdown report emission
+# --------------------------------------------------------------------------
+
+
+def make_run(
+    *,
+    run_at="2026-08-03T16:25:00+00:00",
+    content_sha="f" * 64,
+    census="default",
+    rows_count=69,
+):
+    if census == "default":
+        census = {
+            "documents_total": 2867,
+            "documents_walked": 2867,
+            "chunk_count_zero": 892,
+            "chunk_count_unmeasured": 0,
+            "chunk_count_zero_ratio": 0.3111,
+            "pages": 3,
+            "truncated": False,
+        }
+    run = {
+        "run_at": run_at,
+        "summary": {
+            "quality": {
+                "answer_recall_at_5": 0.8974,
+                "raw_page_recall_at_5": 0.7692,
+                "doc_recall_at_5": 0.9508,
+                "mrr_body": 0.7521,
+                "header_credit_rate": 0.0256,
+                "negative_hit_rate": 0.0,
+            },
+            "duplication": {
+                "duplicate_blob_rate_at_10": 0.45,
+                "distinct_files_at_10": 4.2,
+                "distinct_source_ratio_mean": 0.61,
+                "distinct_source_ratio_resolvable_only": 0.65,
+                "hits_with_unresolvable_source": 15,
+            },
+            "stability": {"hit_stability": None},
+            "counts": {
+                "questions_total": 69,
+                "questions_positive": 61,
+                "questions_with_spans": 39,
+                "questions_excluded_from_answer_recall": 22,
+                "questions_blocked_probe": 8,
+            },
+            "latency": {
+                "p50_ms": 504.0,
+                "p95_ms": 905.0,
+                "mean_ms": 540.0,
+                "samples": 69,
+                "errors": 0,
+            },
+            "repeats": 1,
+        },
+        "rows": [{"duplicate_blob_rate_at_10": 0.5}] * rows_count,
+        "fingerprint": {
+            "harness_git_sha": "a66cba8" + "0" * 33,
+            "questions_sha256": "q" * 64,
+            "content": (
+                {"sha256": content_sha, "files": 317}
+                if content_sha
+                else {"sha256": None, "reason": "state file missing"}
+            ),
+            "api": {"documents_tracked": 2867, "node_version": "9.9.9"},
+        },
+    }
+    if census is not None:
+        run["fingerprint"]["census"] = census
+    return run
+
+
+class TestMarkdownReport:
+    def test_every_table_metric_carries_its_definition(self):
+        markdown = sb.build_markdown_report(make_run())
+        for _section, key, _n_source in sb.REPORT_METRICS:
+            assert key in markdown
+            assert sb.METRIC_DEFINITIONS[key] in markdown
+
+    def test_each_row_is_self_contained_with_date_commit_and_n(self):
+        markdown = sb.build_markdown_report(make_run())
+        row = next(
+            line
+            for line in markdown.splitlines()
+            if "answer_recall_at_5" in line and "|" in line
+        )
+        # A row copied out of the table alone must still carry its value, the
+        # date, the commit, the sample count, and what it matched on.
+        assert "0.8974" in row
+        assert "2026-08-03" in row
+        assert "a66cba8" in row
+        assert "39" in row
+        assert sb.METRIC_DEFINITIONS["answer_recall_at_5"] in row
+
+    def test_report_refuses_a_metric_without_a_definition(self, monkeypatch):
+        trimmed = {
+            key: value
+            for key, value in sb.METRIC_DEFINITIONS.items()
+            if key != "mrr_body"
+        }
+        monkeypatch.setattr(sb, "METRIC_DEFINITIONS", trimmed)
+        with pytest.raises(sb.BenchError, match="mrr_body"):
+            sb.build_markdown_report(make_run())
+
+    def test_report_refuses_run_without_summary(self):
+        with pytest.raises(sb.BenchError, match="summary"):
+            sb.build_markdown_report({"rows": []})
+
+    def test_census_note_states_never_indexed_share(self):
+        markdown = sb.build_markdown_report(make_run())
+        assert "2867" in markdown
+        assert "892" in markdown
+        assert "31.1%" in markdown
+        assert "never vector-indexed" in markdown
+        assert "cannot" in markdown  # plain-language reachability consequence
+
+    def test_census_unavailable_is_stated_not_silently_dropped(self):
+        markdown = sb.build_markdown_report(
+            make_run(census={"error": "HTTP 403", "reason": "needs audit:read"})
+        )
+        assert "census unavailable" in markdown.lower()
+        assert "HTTP 403" in markdown
+
+    def test_missing_content_fingerprint_flags_not_comparable(self):
+        markdown = sb.build_markdown_report(make_run(content_sha=None))
+        assert "NOT comparable on content" in markdown
+
+    def test_latency_is_labelled_client_round_trip(self):
+        markdown = sb.build_markdown_report(make_run())
+        assert "round-trip" in markdown
+        assert "504.0" in markdown
+
+    def test_cmd_report_writes_markdown_file(self, tmp_path, capsys):
+        run_path = tmp_path / "run.json"
+        run_path.write_text(json.dumps(make_run()), encoding="utf-8")
+        out_path = tmp_path / "block.md"
+        exit_code = sb.main(
+            ["report", str(run_path), "--markdown", "--out", str(out_path)]
+        )
+        assert exit_code == 0
+        written = out_path.read_text(encoding="utf-8")
+        assert "answer_recall_at_5" in written
+        assert sb.METRIC_DEFINITIONS["answer_recall_at_5"] in written
+
+    def test_cmd_report_prints_to_stdout_without_out(self, tmp_path, capsys):
+        run_path = tmp_path / "run.json"
+        run_path.write_text(json.dumps(make_run()), encoding="utf-8")
+        assert sb.main(["report", str(run_path)]) == 0
+        printed = capsys.readouterr().out
+        assert "answer_recall_at_5" in printed
+
+
+# --------------------------------------------------------------------------
+# Published paths and prose stay honest
+# --------------------------------------------------------------------------
+
+
+class TestPublishedPathsAndProse:
+    def test_report_footer_documents_the_gitignored_out_path(self):
+        # The footer is copy-pasted from the repo root, where a bare
+        # runs/latest.json resolves to REPO_ROOT/runs/. Only
+        # scripts/bench/runs/ is gitignored, and a run JSON enumerates every
+        # served hit identity, so the documented path must be the ignored one.
+        markdown = sb.build_markdown_report(make_run())
+        assert "scripts/bench/runs/latest.json" in markdown
+        assert " runs/latest.json" not in markdown
+
+    def test_report_warns_on_legacy_empty_map_fingerprint(self):
+        # compare_fingerprints treats EMPTY_MAP_SHA256 as unavailable; the
+        # report must apply the same judgement or the two tools disagree
+        # about the same run JSON.
+        markdown = sb.build_markdown_report(
+            make_run(content_sha=sb.EMPTY_MAP_SHA256)
+        )
+        assert "NOT comparable on content" in markdown
+        assert "empty file map" in markdown
+
+    def test_published_mrr_wording_matches_the_harness_definition(self):
+        # docs/performance.md restates mrr_body in prose; pin it to METRIC_DEFINITIONS
+        # so the two cannot drift apart. The first character is skipped only
+        # because the README sentence starts uppercase.
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "performance.md").read_text(
+            encoding="utf-8"
+        )
+        assert sb.METRIC_DEFINITIONS["mrr_body"][1:] in readme
+
+    def test_published_quality_rows_state_their_denominators(self):
+        # answer_recall@5 and mrr_body are computed over the 39 span-bearing
+        # questions, doc_recall@5 over the 61 positives. A row without its n
+        # reads as "over all 69 questions", the head-line-0.95 failure again.
+        readme = (Path(__file__).resolve().parent.parent / "docs" / "performance.md").read_text(
+            encoding="utf-8"
+        )
+        # Assert on the VALUE cell, not the whole row: the definition cell also
+        # says "the 39 span-bearing questions", so a row-wide search passes even
+        # when the value loses its n, which is the drift this guards against.
+        values = {
+            line.split("|")[1].strip(): line.split("|")[2].strip()
+            for line in readme.splitlines()
+            if line.startswith("| `") and line.count("|") >= 4
+        }
+        assert "n=39" in values["`answer_recall@5`"]
+        assert "n=61" in values["`doc_recall@5`"]
+        assert "n=39" in values["`mrr_body`"]
+
+
+# --------------------------------------------------------------------------
 # The shipped golden set stays valid
 # --------------------------------------------------------------------------
 
