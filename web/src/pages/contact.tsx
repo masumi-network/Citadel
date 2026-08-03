@@ -72,6 +72,17 @@ export default function Contact() {
 
           <ContactForm />
 
+          <p className="mt-[18px] max-w-[640px] border border-border-2 px-[18px] py-3.5 text-[14.5px] text-ink-2">
+            Prefer email? Write to{" "}
+            <a
+              href="mailto:sarthi.borkar@nmkr.io"
+              className="border-b border-accent-ink font-medium text-accent-ink no-underline hover:border-transparent"
+            >
+              sarthi.borkar@nmkr.io
+            </a>
+            .
+          </p>
+
           <footer className="mt-[34px] text-[15px] text-ink-2">
             {/* The website and the city, and nothing else. A personal name, an
                 email and a registered address were placeholders here for a

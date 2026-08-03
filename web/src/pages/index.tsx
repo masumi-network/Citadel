@@ -120,13 +120,26 @@ export default function Home() {
               <div className={TILE_K}>MCP tools for agents</div>
             </div>
             <div className="border border-border bg-surface p-5">
-              <div className={TILE_N}>12</div>
-              <div className={TILE_K}>Architecture decision records</div>
+              <div className={`${TILE_N} text-[19px]`}>$55/mo</div>
+              <div className={TILE_K}>To self-host the whole node</div>
             </div>
           </div>
           <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
             This page is served by the system it describes. Live numbers, releases, and the roadmap
             are on the <a href="/info">status page</a>.
+          </p>
+          <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
+            Search runs 300 to 500&nbsp;ms median depending on which surface asks, and the $55
+            figure above comes from measured resource use, not a list-price guess. Both are public,
+            including the parts that are not good yet, in the repo&apos;s{" "}
+            <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
+              bench harness
+            </a>
+            . Self-hosting the whole server, not just the CLI, takes{" "}
+            <a href="https://github.com/masumi-network/Citadel#self-host-the-server">
+              three commands
+            </a>
+            .
           </p>
         </div>
       </section>
