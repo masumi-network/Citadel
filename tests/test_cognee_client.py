@@ -1387,3 +1387,169 @@ def test_cognee_public_client_derives_postgres_graph_env(monkeypatch: Any) -> No
     assert os.environ["GRAPH_DATABASE_NAME"] == "railway"
     assert os.environ["GRAPH_DATABASE_USERNAME"] == "postgres"
     assert os.environ["GRAPH_DATABASE_PASSWORD"] == "secret"
+
+
+async def _seed_corpus(user: Any) -> dict[str, Any]:
+    """Three real Data rows: two owned by the default user sharing one
+    created_at (so the id tie-break is exercised), one under ANOTHER owner —
+    the row an owner-scoped read would silently drop."""
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from cognee.infrastructure.databases.relational import get_relational_engine
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+
+    t_tied = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    t_late = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+    tied_ids = sorted((uuid4(), uuid4()), key=lambda item: item.hex)
+    other_owner = uuid4()
+    other_data_id = uuid4()
+
+    central = Dataset(
+        id=uuid4(), name="masumi-network", owner_id=user.id, tenant_id=user.tenant_id
+    )
+    ghost = Dataset(
+        id=uuid4(), name="seat:ghost", owner_id=other_owner, tenant_id=user.tenant_id
+    )
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(central)
+        session.add(ghost)
+        session.add(
+            Data(
+                id=tied_ids[0],
+                name="first",
+                content_hash="hash-1",
+                mime_type="text/plain",
+                token_count=10,
+                data_size=100,
+                created_at=t_tied,
+                owner_id=user.id,
+                tenant_id=user.tenant_id,
+                external_metadata={"citadel_tags": ["alpha", "beta"]},
+            )
+        )
+        session.add(
+            Data(
+                id=tied_ids[1],
+                name="second",
+                content_hash="hash-2",
+                mime_type="text/plain",
+                created_at=t_tied,
+                owner_id=user.id,
+                tenant_id=user.tenant_id,
+            )
+        )
+        session.add(
+            Data(
+                id=other_data_id,
+                name="ghost-note",
+                content_hash="hash-3",
+                mime_type="text/plain",
+                created_at=t_late,
+                owner_id=other_owner,
+                tenant_id=user.tenant_id,
+            )
+        )
+        session.add(DatasetData(dataset_id=central.id, data_id=tied_ids[0]))
+        session.add(DatasetData(dataset_id=central.id, data_id=tied_ids[1]))
+        session.add(DatasetData(dataset_id=ghost.id, data_id=other_data_id))
+        await session.commit()
+    return {
+        "t_tied": t_tied,
+        "tied_ids": tied_ids,
+        "other_owner": other_owner,
+        "other_data_id": other_data_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_corpus_page_enumerates_the_real_store_with_keyset_pages(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """The census read against the REAL relational stack.
+
+    Pins the row shape, the (created_at, id) ordering with the id tie-break,
+    the keyset boundary handoff, tag parsing out of external_metadata, and —
+    what the owner-scoped attribution reads above deliberately never claim —
+    that a row held by ANOTHER owner_id still enumerates.
+    """
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+    seeded = await _seed_corpus(user)
+    client = _real_cognee_client(monkeypatch)
+
+    page_one = await client.corpus_page(limit=2)
+
+    assert [row["id"] for row in page_one] == [str(uid) for uid in seeded["tied_ids"]]
+    first = page_one[0]
+    assert first["name"] == "first"
+    assert first["content_hash"] == "hash-1"
+    assert first["mime_type"] == "text/plain"
+    assert first["token_count"] == 10
+    assert first["data_size"] == 100
+    assert first["created_at"] == seeded["t_tied"].isoformat()
+    assert first["datasets"] == ["masumi-network"]
+    assert first["citadel_tags"] == ["alpha", "beta"]
+
+    boundary = page_one[-1]
+    page_two = await client.corpus_page(
+        after_created_at=boundary["created_at"],
+        after_id=boundary["id"],
+        limit=2,
+    )
+
+    assert [row["id"] for row in page_two] == [str(seeded["other_data_id"])]
+    assert page_two[0]["datasets"] == ["seat:ghost"]
+    assert page_two[0]["owner_id"] == str(seeded["other_owner"])
+
+    page_three = await client.corpus_page(
+        after_created_at=page_two[0]["created_at"],
+        after_id=page_two[0]["id"],
+        limit=2,
+    )
+
+    assert page_three == []
+
+
+@pytest.mark.asyncio
+async def test_corpus_totals_reports_the_owner_split(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """Both counts, so a row under another owner_id shows up as a difference
+    instead of silently missing from an owner-scoped number."""
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    user = await get_default_user()
+    await _seed_corpus(user)
+    client = _real_cognee_client(monkeypatch)
+
+    totals = await client.corpus_totals()
+
+    assert totals == {
+        "documents": 3,
+        "documents_default_owner": 2,
+        "documents_other_owners": 1,
+        "by_dataset": {"masumi-network": 2, "seat:ghost": 1},
+        "by_dataset_default_owner": {"masumi-network": 2},
+    }
+
+
+@pytest.mark.asyncio
+async def test_corpus_chunk_counts_says_not_measured_off_pgvector(
+    monkeypatch: Any,
+) -> None:
+    """None, never 0: on a node whose vector provider is not pgvector there is
+    no chunk table to count, and a 0 would read as 'accepted but never
+    indexed' — a claim nothing measured. An empty page needs no store at all
+    and is an honest empty measurement."""
+    monkeypatch.delenv("VECTOR_DB_PROVIDER", raising=False)
+    client = _real_cognee_client(monkeypatch)
+
+    assert await client.corpus_chunk_counts(["3b9c0d05-0000-0000-0000-000000000001"]) is None
+    assert await client.corpus_chunk_counts([]) == {}
