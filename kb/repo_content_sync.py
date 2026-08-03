@@ -655,9 +655,25 @@ class RepoContentSyncer:
                 "errors": [],
             }
             try:
-                branch = self.client.fetch_default_branch(full_name)
-                ref = self.client.fetch_commit_sha(full_name, ref=branch)
-                paths = discover_repo_paths(
+                # Every ``self.client`` call below is SYNCHRONOUS urllib, and
+                # ``run`` is awaited from the web process's single event loop by
+                # the evolve scheduler. Called inline they freeze every route on
+                # the node for the whole sync: measured in production
+                # 2026-08-03 as a 30.03s stall (``Evolve stage
+                # repo_content_sync`` 18:14:06.578Z -> 18:14:36.610Z) in which a
+                # POST /mcp/ took 19.18s and a GET /api/contributions/recent
+                # gave up with a 499 — while that pass ingested nothing at all
+                # (ingested=0 skipped=69). ``to_thread`` hands each round trip
+                # to a worker and yields, so the loop keeps serving.
+                #
+                # ``discover_repo_paths`` is dispatched whole rather than
+                # per-request: it is a sync function that itself makes several
+                # calls (fetch_tree, then a probe fallback), so wrapping only
+                # its callees would leave the walk between them on the loop.
+                branch = await asyncio.to_thread(self.client.fetch_default_branch, full_name)
+                ref = await asyncio.to_thread(self.client.fetch_commit_sha, full_name, ref=branch)
+                paths = await asyncio.to_thread(
+                    discover_repo_paths,
                     self.client,
                     full_name,
                     ref=ref,
@@ -672,7 +688,9 @@ class RepoContentSyncer:
                 for path in paths:
                     key = f"{full_name}/{path}"
                     try:
-                        file = self.client.fetch_file_text(full_name, path, ref=ref)
+                        file = await asyncio.to_thread(
+                            self.client.fetch_file_text, full_name, path, ref=ref
+                        )
                     except GitHubAPIError as exc:
                         repo_result["errors"].append({"path": path, "error": str(exc)[:200]})
                         continue
@@ -769,8 +787,8 @@ class RepoContentSyncer:
                     # record the error and retry next sync rather than ever
                     # writing a document with a volatile ref.
                     try:
-                        file_ref = self.client.fetch_last_commit_sha(
-                            full_name, path, ref=ref
+                        file_ref = await asyncio.to_thread(
+                            self.client.fetch_last_commit_sha, full_name, path, ref=ref
                         )
                     except GitHubAPIError as exc:
                         repo_result["errors"].append({"path": path, "error": str(exc)[:200]})

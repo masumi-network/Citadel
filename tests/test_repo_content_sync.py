@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import time
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -1061,3 +1063,111 @@ async def test_status_reports_corrupt_state_instead_of_raising(tmp_path: Path) -
     assert status["ok"] is False
     assert "state.json" in status["state_error"]
     assert status["tracked_files"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_leaves_the_event_loop_free(tmp_path: Path) -> None:
+    """Every GitHub round trip must run off the event loop.
+
+    ``RepoContentSyncer.run`` is awaited from the web process's single event
+    loop by the evolve scheduler, and its GitHub client is synchronous urllib.
+    Called inline, each round trip freezes EVERY route on the node. Measured in
+    production 2026-08-03: ``Evolve stage repo_content_sync`` ran
+    18:14:06.578Z to 18:14:36.610Z, 30.03s, during which a ``POST /mcp/`` took
+    19.18s and a ``GET /api/contributions/recent`` gave up with a 499. That pass
+    ingested nothing at all (ingested=0 skipped=69), so the node was frozen for
+    half a minute to do no work.
+
+    This asserts the OBSERVABLE property rather than the implementation: while
+    ``run`` is in flight, a concurrent coroutine still gets scheduled. A
+    heartbeat is the only thing that can tell "dispatched to a thread" apart
+    from "still inline", because both return byte-identical results. Asserting
+    on the presence of ``to_thread`` in the source would pass just as happily
+    against a call that was moved but still awaited synchronously.
+    """
+    stall = 0.02
+
+    class BlockingClient(FakeRepoContentClient):
+        """Stands in for real urllib: every fetch blocks the calling thread."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocking_calls = 0
+
+        def _stall(self) -> None:
+            self.blocking_calls += 1
+            time.sleep(stall)
+
+        def fetch_default_branch(self, full_name: str) -> str:
+            self._stall()
+            return super().fetch_default_branch(full_name)
+
+        def fetch_commit_sha(self, full_name: str, *, ref: str) -> str:
+            self._stall()
+            return super().fetch_commit_sha(full_name, ref=ref)
+
+        def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
+            self._stall()
+            return super().fetch_tree(full_name, ref=ref)
+
+        def fetch_last_commit_sha(self, full_name: str, path: str, *, ref: str) -> str:
+            self._stall()
+            return super().fetch_last_commit_sha(full_name, path, ref=ref)
+
+        def fetch_file_text(
+            self, full_name: str, path: str, *, ref: str
+        ) -> RepoContentFile | None:
+            self._stall()
+            return super().fetch_file_text(full_name, path, ref=ref)
+
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "repo_content_sync_state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+    )
+    client = BlockingClient()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.001)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        result = await syncer.run()
+    finally:
+        beat.cancel()
+
+    assert result["files_ingested"] == 2, "the fix must not change what the sync does"
+    assert client.blocking_calls >= 5, (
+        "the fake must actually block, or this test proves nothing: "
+        f"only {client.blocking_calls} blocking calls were made"
+    )
+
+    # Each stalled call holds a thread for 20ms. Off the loop, the heartbeat
+    # keeps ticking through every one of them (~20 ticks per call). Inline, the
+    # loop is frozen for the whole run and the heartbeat is starved. Five ticks
+    # per blocking call sits far below the threaded floor and far above the
+    # inline ceiling, so timing jitter cannot flip the verdict either way.
+    floor = client.blocking_calls * 5
+    assert ticks >= floor, (
+        f"event loop was starved: {ticks} heartbeats across "
+        f"{client.blocking_calls} blocking GitHub calls (need >= {floor}). "
+        "Synchronous urllib is running inline on the loop, so every route on "
+        "the node is frozen for the duration of the sync."
+    )
