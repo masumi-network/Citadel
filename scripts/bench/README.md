@@ -14,11 +14,16 @@ export GITHUB_TOKEN=...                      # only for refreshing ground truth
 
 python scripts/bench/fetch_ground_truth.py       # once, or when the corpus changes
 python scripts/bench/search_bench.py lint        # validate the golden set offline
-python scripts/bench/search_bench.py run --out runs/latest.json
-python scripts/bench/search_bench.py run --baseline runs/latest.json   # later, for a delta
+python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
+python scripts/bench/search_bench.py run --baseline scripts/bench/runs/latest.json   # later, for a delta
 python scripts/bench/search_bench.py compare run_a.json run_b.json
-python scripts/bench/search_bench.py report runs/latest.json --markdown
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
 ```
+
+Write run JSONs only under `scripts/bench/runs/`. That directory is
+gitignored; a bare `runs/` from the repo root is not the same place, and a
+run JSON enumerates every served hit identity, so it must never be committed
+(see Baselines below).
 
 Tracking issue for the harness: #122.
 
@@ -196,8 +201,8 @@ zero; the zero count is then a floor.
 ## Publishing numbers: `report`
 
 ```bash
-python scripts/bench/search_bench.py report runs/latest.json --markdown
-python scripts/bench/search_bench.py report runs/latest.json --markdown --out block.md
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown --out block.md
 ```
 
 Turns a saved run JSON into a README-ready markdown block. Every table row
@@ -215,8 +220,8 @@ when the run has no content fingerprint. Regenerating the block is the whole
 loop:
 
 ```bash
-python scripts/bench/search_bench.py run --out runs/latest.json
-python scripts/bench/search_bench.py report runs/latest.json --markdown
+python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
 ```
 
 ## Baselines

@@ -29,11 +29,14 @@ Scoring model:
 
 Usage:
     export CITADEL_MCP_ACCESS_TOKEN=...
-    python scripts/bench/search_bench.py run --repeats 3 --out run.json
+    python scripts/bench/search_bench.py run --repeats 3 --out scripts/bench/runs/latest.json
     python scripts/bench/search_bench.py run --baseline previous_run.json
     python scripts/bench/search_bench.py lint
     python scripts/bench/search_bench.py compare run_a.json run_b.json
-    python scripts/bench/search_bench.py report run.json --markdown
+    python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+
+Write run JSONs only under scripts/bench/runs/ (gitignored): a run JSON
+enumerates every served hit identity and must never be committed.
 """
 from __future__ import annotations
 
@@ -838,6 +841,15 @@ def build_fingerprint(
 EMPTY_MAP_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
+def usable_content_sha(sha: Any) -> Any:
+    """The empty-file-map sha attests nothing; treat it as unavailable.
+
+    Single point of judgement shared by compare and report, so the two can
+    never disagree about whether a run is comparable on content.
+    """
+    return None if sha == EMPTY_MAP_SHA256 else sha
+
+
 def compare_fingerprints(
     current: dict[str, Any], baseline: dict[str, Any]
 ) -> tuple[bool, list[str]]:
@@ -852,8 +864,8 @@ def compare_fingerprints(
             "file map (written before the fail-closed fix); it attests "
             "nothing and is treated as unavailable"
         )
-        current_sha = None if current_sha == EMPTY_MAP_SHA256 else current_sha
-        baseline_sha = None if baseline_sha == EMPTY_MAP_SHA256 else baseline_sha
+        current_sha = usable_content_sha(current_sha)
+        baseline_sha = usable_content_sha(baseline_sha)
     if current_sha is None or baseline_sha is None:
         comparable = False
         verdicts.append(
@@ -1546,8 +1558,19 @@ def build_markdown_report(run: dict[str, Any]) -> str:
             ),
         ]
 
-    content_sha = (fingerprint.get("content") or {}).get("sha256")
-    if content_sha is None:
+    raw_content_sha = (fingerprint.get("content") or {}).get("sha256")
+    content_sha = usable_content_sha(raw_content_sha)
+    if content_sha is None and raw_content_sha is not None:
+        lines += [
+            "",
+            (
+                "WARNING: this run's content fingerprint is the sha256 of an "
+                "empty file map (recorded before the fail-closed fix). It "
+                "attests nothing, so the run is NOT comparable on content to "
+                "any baseline; compare treats it as unavailable."
+            ),
+        ]
+    elif content_sha is None:
         lines += [
             "",
             (
@@ -1569,9 +1592,13 @@ def build_markdown_report(run: dict[str, Any]) -> str:
         "",
         (
             "Regenerate: `python scripts/bench/search_bench.py run --out "
-            "runs/latest.json` then `python scripts/bench/search_bench.py "
-            "report runs/latest.json --markdown`. Compare against a baseline "
-            "with `compare`; quote deltas only when it prints COMPARABLE."
+            "scripts/bench/runs/latest.json` then `python "
+            "scripts/bench/search_bench.py report "
+            "scripts/bench/runs/latest.json --markdown`. Only "
+            "scripts/bench/runs/ is gitignored; a run JSON enumerates every "
+            "served hit identity and must never be committed. Compare against "
+            "a baseline with `compare`; quote deltas only when it prints "
+            "COMPARABLE."
         ),
         "",
     ]

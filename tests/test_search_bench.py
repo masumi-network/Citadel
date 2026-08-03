@@ -1020,6 +1020,57 @@ class TestMarkdownReport:
 
 
 # --------------------------------------------------------------------------
+# Published paths and prose stay honest
+# --------------------------------------------------------------------------
+
+
+class TestPublishedPathsAndProse:
+    def test_report_footer_documents_the_gitignored_out_path(self):
+        # The footer is copy-pasted from the repo root, where a bare
+        # runs/latest.json resolves to REPO_ROOT/runs/. Only
+        # scripts/bench/runs/ is gitignored, and a run JSON enumerates every
+        # served hit identity, so the documented path must be the ignored one.
+        markdown = sb.build_markdown_report(make_run())
+        assert "scripts/bench/runs/latest.json" in markdown
+        assert " runs/latest.json" not in markdown
+
+    def test_report_warns_on_legacy_empty_map_fingerprint(self):
+        # compare_fingerprints treats EMPTY_MAP_SHA256 as unavailable; the
+        # report must apply the same judgement or the two tools disagree
+        # about the same run JSON.
+        markdown = sb.build_markdown_report(
+            make_run(content_sha=sb.EMPTY_MAP_SHA256)
+        )
+        assert "NOT comparable on content" in markdown
+        assert "empty file map" in markdown
+
+    def test_root_readme_mrr_wording_matches_the_harness_definition(self):
+        # README.md restates mrr_body in prose; pin it to METRIC_DEFINITIONS
+        # so the two cannot drift apart. The first character is skipped only
+        # because the README sentence starts uppercase.
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        assert sb.METRIC_DEFINITIONS["mrr_body"][1:] in readme
+
+    def test_root_readme_quality_rows_state_their_denominators(self):
+        # answer_recall@5 and mrr_body are computed over the 39 span-bearing
+        # questions, doc_recall@5 over the 61 positives. A row without its n
+        # reads as "over all 69 questions", the head-line-0.95 failure again.
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        rows = {
+            line.split("|")[1].strip(): line
+            for line in readme.splitlines()
+            if line.startswith("| `")
+        }
+        assert "39" in rows["`answer_recall@5`"]
+        assert "61" in rows["`doc_recall@5`"]
+        assert "39" in rows["`mrr_body`"]
+
+
+# --------------------------------------------------------------------------
 # The shipped golden set stays valid
 # --------------------------------------------------------------------------
 
