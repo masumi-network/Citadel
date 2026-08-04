@@ -359,13 +359,26 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[s
 
 
 def receipt_summary(response: dict[str, Any] | None, *, short_sha: str, branch: str) -> str:
-    """Receipt line for a completed POST, mirroring the server's decision."""
+    """Receipt line for a completed POST, mirroring the server's decision.
+
+    Only an explicit ``accepted: true`` is reported as a capture. The test used
+    to be ``is not False``, which reads a MISSING key as success — so an older
+    Node, a proxy, or any response-shape change would have written "captured"
+    for a write nobody ever confirmed. A verdict we did not observe is unknown,
+    and unknown is not the optimistic value.
+    """
     if response is None:
         return f"commit {short_sha} sent: server replied 2xx but the response body was unreadable"
-    if response.get("accepted") is not False:
+    accepted = response.get("accepted")
+    if accepted is True:
         return f"captured commit {short_sha} on {branch} → your Node"
-    reason = response.get("reason") or "rejected"
-    return f"commit {short_sha} not stored: server rejected the write ({reason})"
+    if accepted is False:
+        reason = response.get("reason") or "rejected"
+        return f"commit {short_sha} not stored: server rejected the write ({reason})"
+    return (
+        f"commit {short_sha} capture unconfirmed: the server's 2xx response did not "
+        "state whether the write was accepted"
+    )
 
 
 def _send_failure_summary(exc: BaseException, *, short_sha: str) -> str:
@@ -381,12 +394,21 @@ def _send_failure_summary(exc: BaseException, *, short_sha: str) -> str:
     return f"commit {short_sha} not captured: send failed ({exc.__class__.__name__})"
 
 
-def _write_receipt(summary: str) -> None:
+# Receipt kinds. A capture attempt, a deliberate skip, and a crash are three
+# different events; they shared one kind (or, for skips and crashes, produced no
+# line at all), so `citadel activity --local` could not tell "ran and had nothing
+# to send" from "the token got unset" or "it blew up".
+RECEIPT_KIND = "push"
+RECEIPT_KIND_SKIP = "push-skip"
+RECEIPT_KIND_ERROR = "push-error"
+
+
+def _write_receipt(summary: str, kind: str = RECEIPT_KIND) -> None:
     """Best-effort DX-5 receipt (never raises, never surfaces the token)."""
     try:
         from kb.hooks.receipt import write_receipt
 
-        write_receipt("push", summary)
+        write_receipt(kind, summary)
     except Exception:
         pass
 
@@ -409,6 +431,10 @@ def _sync_one(
         remote_ref=remote_ref,
     )
     if not note.strip():
+        _write_receipt(
+            f"commit {sha[:7]} skipped: no snapshot could be built from git metadata",
+            kind=RECEIPT_KIND_SKIP,
+        )
         return
     note = _truncate_utf8(note, _max_ingest_bytes())
     branch = ref_branch_name(local_ref) if local_ref else _git_branch(cwd)
@@ -429,10 +455,22 @@ def _sync_one(
 
 
 def run(stdin: Any, remote_name: str = "") -> int:
-    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking."""
+    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking.
+
+    Fail-silent means never blocking the push, not leaving no trace. Every exit
+    below writes a receipt, because exit 0 with no output was the same observable
+    outcome for "ran and legitimately had nothing to send", "the token env var is
+    unset", "capture.json is corrupt", and "it crashed" — and the product's
+    "capture runs without you" promise rests on being able to tell those apart.
+    """
     try:
         token = os.getenv(TOKEN_ENV)
         if not token:
+            _write_receipt(
+                f"push skipped: {TOKEN_ENV} is not set in this environment "
+                "(run `citadel onboard`)",
+                kind=RECEIPT_KIND_SKIP,
+            )
             return 0
 
         cwd = git_toplevel()
@@ -446,12 +484,24 @@ def run(stdin: Any, remote_name: str = "") -> int:
                 "citadel: no Approved Capture Roots configured; skipping "
                 "capture (run `citadel onboard` or `citadel setup`).\n"
             )
+            _write_receipt(
+                "push skipped: no Approved Capture Roots configured "
+                "(run `citadel onboard` or `citadel setup`)",
+                kind=RECEIPT_KIND_SKIP,
+            )
             return 0
         match = matched_root(cwd, roots)
         if match is None:
             sys.stderr.write(
                 f"citadel: {cwd} is not an Approved Capture Root; skipping "
                 "capture (run `citadel setup` to approve it).\n"
+            )
+            # Basename only: stderr is ephemeral, the receipt log is not, and the
+            # full path adds nothing a dev running in the repo cannot already see.
+            _write_receipt(
+                f"push skipped: {os.path.basename(cwd.rstrip(os.sep)) or cwd} is not an "
+                "Approved Capture Root (run `citadel setup` to approve it)",
+                kind=RECEIPT_KIND_SKIP,
             )
             return 0
         capture_tags = list(match["tags"])
@@ -479,10 +529,12 @@ def run(stdin: Any, remote_name: str = "") -> int:
 
         # Manual invocation (no pre-push stdin): snapshot HEAD once.
         head = _git_run(cwd, "rev-parse", "HEAD")
-        if head.returncode != 0:
-            return 0
-        sha = head.stdout.strip()
+        sha = head.stdout.strip() if head.returncode == 0 else ""
         if not sha:
+            _write_receipt(
+                "push skipped: git could not resolve HEAD, so there is nothing to snapshot",
+                kind=RECEIPT_KIND_SKIP,
+            )
             return 0
         _sync_one(
             cwd,
@@ -493,7 +545,13 @@ def run(stdin: Any, remote_name: str = "") -> int:
             token=token,
             capture_tags=capture_tags,
         )
-    except Exception:
+    except Exception as exc:
+        # Class name only: an exception message can echo local paths or request
+        # details, and this line lands in a file that outlives the push.
+        _write_receipt(
+            f"push not run: the hook failed before sending ({exc.__class__.__name__})",
+            kind=RECEIPT_KIND_ERROR,
+        )
         return 0
     return 0
 
