@@ -113,8 +113,8 @@ counter reports and no code review would surface. The defect is an absence.
      can select HNSW when a filter beats it on every axis.
      AMENDED by [ADR-0021](0021-seat-nodes-are-mutually-readable.md), which
      withdraws BOTH of this intervention's justifications for `org-work`
-     content. The security ground goes first: that content is meant to be
-     mutually readable, so a filter no longer closes an isolation gap for it.
+     content. The scoping ground goes first: that content is meant to be
+     mutually readable, so scoping it per seat stops being a goal for it.
      The latency ground goes with it, and an earlier version of this amendment
      missed that. A dataset filter shrinks a scan only when the reader's
      entitlement is narrower than the collection; once `org-work` is readable by
@@ -201,8 +201,8 @@ counter reports and no code review would surface. The defect is an absence.
   would a dataset filter cost? For pgvector that requires an expression index
   matching the runtime `cast(payload, JSONB)`, since `payload` is `Column(JSON)`.
   For qdrant the documented mechanism is an `is_tenant` payload index on a
-  `keyword` or `uuid` field. The output attaches to the isolation work, not to a
-  winner.
+  `keyword` or `uuid` field. The output attaches to the dataset-scoping work,
+  not to a winner.
 - **Corpus growth is extrapolated, not faked.** The obvious method,
   replicating the fixture to 2x/4x, is invalid and biased. Duplicated vectors sit at
   distance 0 from each other, which collapses an HNSW proximity graph into
@@ -289,7 +289,7 @@ counter reports and no code review would surface. The defect is an absence.
   adapter interface decides whether a filter is passed, and cognee passes none,
   so an `is_tenant` index would sit unused until Citadel's call path changes.
   The constraint lives upstream of the store: swapping the Index backend cannot
-  by itself fix isolation.
+  by itself move where dataset scoping is resolved.
 - Qdrant is not a drop-in. VERIFIED: cognee 1.2.2 ships no qdrant adapter:
   `cognee/infrastructure/databases/vector/supported_databases.py` is literally
   `supported_databases = {}`, and `create_vector_engine.py` branches only on

@@ -11,8 +11,8 @@
   nodes". Both remain in force for everything else they say. Also supersedes
   [ADR-0011](0011-shared-session-traces.md)'s statement that "reads never cross
   seat Nodes holds literally and without exception", and the CONTEXT.md glossary
-  entries asserting that seats cannot read each other's Nodes. Those become
-  false on merge and must be revised in the same change.
+  entries stating that seats are not intended to read each other's Nodes. Those
+  are superseded on merge and must be revised in the same change.
 - Unaffected: [ADR-0007](0007-seat-capture-promotion-write-policy.md). The write
   path does not change.
 - Relates to: [ADR-0011](0011-shared-session-traces.md),
@@ -98,21 +98,21 @@ another **Seat**'s `org-work` content.
 
 That framing is not the real objection, and an earlier draft of this ADR stopped
 there. ADR-0009's pentest concern is **blast radius**, and this decision
-increases it. Before: a stolen or leaked seat token reads one **Node** plus
-**Central**. After: the same token reads the whole organisation's `org-work`
-working memory. Nothing about the attack gets easier; everything about the
-consequence gets larger. That is the actual cost of the decision and it is
-accepted deliberately rather than argued away.
+increases it. What changes is the unit of read access: under this proposal one
+seat's access covers the organisation's whole `org-work` working memory, where
+the design it replaces scopes a seat to its own **Node** plus **Central**. The
+attack surface is unchanged; the consequence of anything going wrong on it is
+larger. That is the actual cost of the decision and it is accepted deliberately
+rather than argued away.
 
 Three things follow, and they are conditions of the change rather than optional
 hardening. Token lifetime and rotation must be revisited, because a
-never-expiring token now holds a materially larger prize; the existing
-long-lived admin tokens that bypass dataset gates are the sharpest case and are
-tracked separately. Detection matters more than it did: reading an entire
-organisation's memory through one token should be visible in telemetry, which is
-one of the few places this decision and ADR-0022 genuinely reinforce each other.
-And the carve-out has to get stronger, because it inherits the whole burden the
-seat boundary used to carry.
+never-expiring token would then hold a materially larger prize; long-lived
+tokens are the sharpest case and are tracked separately. Detection matters more
+than it did: reading an entire organisation's memory through one token should be
+visible in telemetry, which is one of the few places this decision and ADR-0022
+genuinely reinforce each other. And the carve-out has to get stronger, because
+it inherits the whole burden the seat boundary used to carry.
 
 A reader weighing this ADR should weigh that trade explicitly: the vault becomes
 more useful to twelve people and more valuable to one attacker.
@@ -149,11 +149,12 @@ more useful to twelve people and more valuable to one attacker.
   currently reaches the vector layer, so the cheaper option's prerequisite does
   not exist yet. The post-flip arity must be settled before ADR-0020's latency
   model can be trusted, because that model assumes an arity nobody has fixed.
-- **Some behaviour previously recorded as defective becomes the
-  specification** for `org-work` content, while remaining defective with respect
-  to the private partition. That asymmetry is precisely why the partition must
-  exist before the flip, and why this ADR does not license relaxing anything
-  ahead of that sequence.
+- **The specification stops having a single shape.** For `org-work` content
+  the target behaviour becomes mutual readability; for the private partition it
+  stays exclusion. One chokepoint has to express both, and neither can be
+  asserted until the partition exists. That asymmetry is precisely why the
+  partition must be built before the flip, and why this ADR does not license
+  relaxing anything ahead of that sequence.
 - **`session-traces` is reframed, not retired.** Sharing stops being a
   visibility act, but the tier still provides enrichment (dead-end distillation)
   and an attested demotion that raw **Node** traces do not carry. Retiring it
