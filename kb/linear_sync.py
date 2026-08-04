@@ -21,6 +21,7 @@ from kb.secure_http import open_secure
 from kb.access import CENTRAL_DATASET, SEAT_DATASET_PREFIX, AccessStore, seat_dataset
 from kb.cognee_client import _suppress_inline_cognify
 from kb.learning import LearningProcess
+from kb.security_scan import SecretContentError
 from kb.service import Citadel
 from kb.state_io import StateFileError, load_state_file, save_state_file
 
@@ -473,19 +474,35 @@ class LinearSyncer:
         # that stormed the writer lock and starved the request into a timeout. Write
         # ADD-ONLY here (defer_cognify=True) and schedule ONE cognify over every
         # dataset touched after the loop instead.
+        # Secret-scan containment (#117): learning.learn scans every document
+        # (ADR-0005) and raises SecretContentError on a blocking finding. The
+        # sibling syncers (github_sync, repo_content_sync) record a block and
+        # keep going; here ONE poisoned issue used to kill the entire sync —
+        # one refused entry out of 200 zeroing the whole Linear surface.
+        # Blocked items are recorded by identifier only, never content, and
+        # simply retried whenever the issue next changes.
+        blocked: list[str] = []
+
         central_outcome = None
         if force or changed_ids or removed_ids:
             digest = format_workspace_digest(issues)
-            central_outcome = await learning.learn(
-                digest,
-                dataset=central_dataset,
-                tags=["linear-workspace", "linear-sync"],
-                session_id=session_id,
-                operation="linear_sync",
-                run_improve=self.config.linear_sync_run_improve,
-                tier="full",
-                defer_cognify=True,
-            )
+            try:
+                central_outcome = await learning.learn(
+                    digest,
+                    dataset=central_dataset,
+                    tags=["linear-workspace", "linear-sync"],
+                    session_id=session_id,
+                    operation="linear_sync",
+                    run_improve=self.config.linear_sync_run_improve,
+                    tier="full",
+                    defer_cognify=True,
+                )
+            except SecretContentError as exc:
+                blocked.append("workspace-digest")
+                logger.warning(
+                    "Linear workspace digest blocked by the secret scanner: %s",
+                    exc.public_message,
+                )
 
         mirrored = 0
         skipped_unchanged = 0
@@ -494,63 +511,104 @@ class LinearSyncer:
         for issue in issues:
             changed = issue.id in changed_ids
             mirror_dataset = resolve_mirror_dataset(issue, email_index, linear_user_map=user_map)
-            if mirror_dataset:
-                # The state mapping covers ALL fetched issues (issues_for_scope
-                # reads it), independent of whether this run rewrote the note.
-                mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+            prior_mirror_ids = prior_mirrors.get(mirror_dataset) if mirror_dataset else None
+            mirror_has_note = mirror_dataset is not None and (
+                isinstance(prior_mirror_ids, list)
+                and issue.identifier in {str(item) for item in prior_mirror_ids}
+            )
+
+            central_blocked = False
             if changed:
                 # Write each issue's full text (title + description) to Central so
                 # linear_search returns real issues org-wide — the digest only carried
                 # titles, leaving the 200 synced issues invisible to search (#52).
-                await learning.learn(
-                    format_issue_note(issue),
-                    dataset=central_dataset,
-                    tags=[
-                        "linear-issue",
-                        "linear-sync",
-                        f"linear:{issue.identifier}",
-                        # Team as a structured, filterable metadata tag so Central issues
-                        # are discoverable by team (e.g. "what is the marketing team
-                        # working on?"). The human team NAME also rides in the note body
-                        # (format_issue_note) for semantic search.
-                        f"team:{issue.team_key}" if issue.team_key else "linear",
-                    ],
-                    session_id=session_id,
-                    operation="linear_sync",
-                    run_improve=False,
-                    tier="light",
-                    defer_cognify=True,
-                )
+                try:
+                    await learning.learn(
+                        format_issue_note(issue),
+                        dataset=central_dataset,
+                        tags=[
+                            "linear-issue",
+                            "linear-sync",
+                            f"linear:{issue.identifier}",
+                            # Team as a structured, filterable metadata tag so Central issues
+                            # are discoverable by team (e.g. "what is the marketing team
+                            # working on?"). The human team NAME also rides in the note body
+                            # (format_issue_note) for semantic search.
+                            f"team:{issue.team_key}" if issue.team_key else "linear",
+                        ],
+                        session_id=session_id,
+                        operation="linear_sync",
+                        run_improve=False,
+                        tier="light",
+                        defer_cognify=True,
+                    )
+                except SecretContentError as exc:
+                    central_blocked = True
+                    blocked.append(issue.identifier)
+                    logger.warning(
+                        "Linear issue %s blocked by the secret scanner; its Central "
+                        "write and mirror are withheld this pass (content not "
+                        "stored): %s",
+                        issue.identifier,
+                        exc.public_message,
+                    )
             else:
                 skipped_unchanged += 1
+
             if not mirror_dataset:
                 continue
-            prior_mirror_ids = prior_mirrors.get(mirror_dataset)
-            mirror_has_note = isinstance(prior_mirror_ids, list) and issue.identifier in {
-                str(item) for item in prior_mirror_ids
-            }
+
+            if central_blocked:
+                # Refused content must not reach a seat mirror either. A note
+                # that already landed on a PRIOR (unblocked) pass stays listed
+                # — it is not overwritten with the now-refused text, it just
+                # goes stale until the issue changes again and passes clean.
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
             # Backfill a mirror the state has never recorded this issue in even
             # when the issue itself is unchanged — a seat created (or mapped)
             # AFTER the issue last changed would otherwise never receive it
             # until the issue next updates.
             if not changed and mirror_has_note:
+                mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
                 continue
+
             note = format_issue_note(issue)
-            await learning.learn(
-                note,
-                dataset=mirror_dataset,
-                tags=[
-                    "linear-assignee",
-                    "linear-issue",
-                    f"linear:{issue.identifier}",
-                    f"team:{issue.team_key}" if issue.team_key else "linear",
-                ],
-                session_id=f"linear-{mirror_dataset.removeprefix(SEAT_DATASET_PREFIX)}",
-                operation="linear_mirror",
-                run_improve=False,
-                tier="light",
-                defer_cognify=True,
-            )
+            try:
+                await learning.learn(
+                    note,
+                    dataset=mirror_dataset,
+                    tags=[
+                        "linear-assignee",
+                        "linear-issue",
+                        f"linear:{issue.identifier}",
+                        f"team:{issue.team_key}" if issue.team_key else "linear",
+                    ],
+                    session_id=f"linear-{mirror_dataset.removeprefix(SEAT_DATASET_PREFIX)}",
+                    operation="linear_mirror",
+                    run_improve=False,
+                    tier="light",
+                    defer_cognify=True,
+                )
+            except SecretContentError as exc:
+                blocked.append(issue.identifier)
+                logger.warning(
+                    "Linear issue %s mirror to %s blocked by the secret scanner "
+                    "(content not stored): %s",
+                    issue.identifier,
+                    mirror_dataset,
+                    exc.public_message,
+                )
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
+            # The state mapping covers every fetched issue whose mirror note is
+            # actually present — this pass or a prior one — since
+            # issues_for_scope reads it directly.
+            mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
             if mirror_dataset not in written_mirror_datasets:
                 written_mirror_datasets.append(mirror_dataset)
             mirrored += 1
@@ -661,5 +719,10 @@ class LinearSyncer:
             "auto_map_error": auto_map_error,
             "central_ingested": central_outcome.ingest.accepted if central_outcome else None,
             "mirrors": mirrors,
+            # Issues (or the workspace digest) the secret scanner refused this
+            # pass (#117): identifiers only, never content. A blocked write is
+            # contained, not silently dropped.
+            "blocked": blocked,
+            "blocked_count": len(blocked),
             "last_synced_at": payload["last_synced_at"],
         }

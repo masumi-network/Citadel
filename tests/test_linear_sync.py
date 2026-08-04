@@ -698,6 +698,101 @@ async def test_linear_sync_recovers_from_future_dated_stored_cursor(
     assert healed["last_seen_updated_at"] == "2026-06-25T10:00:00Z"
 
 
+# --- #117: a scanner-blocked issue must not kill the rest of the pass -------
+
+
+class FakeCogneeForScanTest:
+    """Minimal real-scan-path fake: records every write so a blocked write's
+    text can be asserted absent, without touching a real Cognee backend."""
+
+    def __init__(self) -> None:
+        self.remember_calls: list[dict[str, Any]] = []
+
+    async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+        self.remember_calls.append({"data": data, **kwargs})
+        return {"ok": True}
+
+    async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        return {"cognified": True}
+
+    def schedule_cognify(self, datasets: Any) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_contains_scanner_blocked_issue(tmp_path: Any) -> None:
+    """#117: LinearSyncer must route through the same ingest gate as its
+    sibling syncers AND contain a block the way they do — a scanner-blocked
+    issue must be skipped (never stored), while the rest of the pass still
+    lands. Uses the REAL LearningProcess/security_scan (no monkeypatch of
+    .learn) so this proves the gate actually runs, not that a mock was called.
+    """
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+        access_store_path=str(tmp_path / "access.json"),
+    )
+    fake_cognee = FakeCogneeForScanTest()
+    citadel = Citadel(config, cognee=fake_cognee)
+    store = AccessStore(config.access_store_path)
+    store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
+
+    # AWS's own published example key (docs.aws.amazon.com) — shape-valid,
+    # never a real credential (memory: never use real credentials as fixtures).
+    planted_secret = "AKIAIOSFODNN7EXAMPLE"
+    issues = [
+        {
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            "title": "Ordinary issue",
+            "description": "Nothing sensitive here.",
+            "url": "https://linear.app/acme/issue/ENG-1",
+            "priority": 2,
+            "updatedAt": "2026-06-25T10:00:00Z",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": None,
+        },
+        {
+            "id": "issue-2",
+            "identifier": "ENG-2",
+            "title": "Leaked credential",
+            "description": f"AWS key {planted_secret} leaked in a log paste.",
+            "url": "https://linear.app/acme/issue/ENG-2",
+            "priority": 1,
+            "updatedAt": "2026-06-25T09:00:00Z",
+            "state": {"name": "Backlog", "type": "backlog"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": {"id": "user-john", "name": "John Doe", "email": "john@example.com"},
+        },
+    ]
+
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(issues), access_store=store)
+    result = await syncer.run(force=True)
+
+    # The pass as a whole must not abort: the unaffected issue still lands.
+    assert result["ok"] is True
+    assert "ENG-2" in result.get("blocked", [])
+    assert result.get("blocked_count", 0) >= 1
+
+    # The planted secret must never reach the store, in ANY write (digest,
+    # Central issue note, or seat mirror note).
+    stored_texts = [str(call.get("data", "")) for call in fake_cognee.remember_calls]
+    assert not any(planted_secret in text for text in stored_texts)
+
+    # The unaffected issue's Central write still happened.
+    central_datasets = [
+        call.get("dataset_name")
+        for call in fake_cognee.remember_calls
+        if "ENG-1" in str(call.get("data", ""))
+    ]
+    assert "masumi-network" in central_datasets
+
+    # The blocked issue must not be recorded as mirrored to john — the mirror
+    # note was never actually written for it.
+    assert "ENG-2" not in result["mirrors"].get(seat_dataset("john"), [])
+
+
 @pytest.mark.asyncio
 async def test_linear_sync_warns_after_prolonged_write_less_streak(
     tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any, caplog: Any
