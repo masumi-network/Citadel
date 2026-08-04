@@ -190,3 +190,21 @@ def test_gateway_delivery_summary_falls_back_to_google_chat() -> None:
         run_github_sync._gateway_delivery_summary(result)
         == "google_chat:delivery_error"
     )
+
+
+def test_post_json_converts_read_timeout_to_clean_result(monkeypatch: Any) -> None:
+    # #116: a read-phase timeout is a bare TimeoutError, not a URLError, and
+    # would otherwise escape this helper's HTTPError/URLError-only handling
+    # as a raw traceback (the #39 bug, unbackported to this copy).
+    def boom(request: Any, timeout: int) -> None:
+        raise TimeoutError("the read operation timed out")
+
+    monkeypatch.setattr(run_github_sync, "urlopen", boom)
+    status, body = run_github_sync._post_json(
+        "https://citadel.example/api/learning-agent/run",
+        payload={},
+        access_key="secret",
+        timeout=5,
+    )
+    assert status == 599
+    assert "timed out" in body["detail"].lower()
