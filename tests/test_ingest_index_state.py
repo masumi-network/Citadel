@@ -75,8 +75,15 @@ def test_resolve_index_state_only_promotes_on_an_observed_cognify() -> None:
     assert resolve_index_state(INDEX_STATE_PENDING, "not_scheduled") == INDEX_STATE_NOT_SCHEDULED
     # Nothing observed leaves the state where it was — never promoted.
     assert resolve_index_state(INDEX_STATE_PENDING, None) == INDEX_STATE_PENDING
-    # A successful cognify cannot rescue a write that never landed.
+    # A write that never happened stays rejected whatever the cognify did: it is
+    # neither indexed nor a cognify failure.
     assert resolve_index_state(INDEX_STATE_REJECTED, "ok") == INDEX_STATE_REJECTED
+    assert resolve_index_state(INDEX_STATE_REJECTED, "failed") == INDEX_STATE_REJECTED
+    # An unknown write moves in the pessimistic direction only. A failed cognify
+    # means nothing reached the graph either way; a successful one is no
+    # evidence the write itself ever landed in the store.
+    assert resolve_index_state(INDEX_STATE_UNKNOWN, "failed") == "cognify_failed"
+    assert resolve_index_state(INDEX_STATE_UNKNOWN, "ok") == INDEX_STATE_UNKNOWN
 
 
 # --------------------------------------------------------------------------

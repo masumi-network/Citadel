@@ -73,10 +73,16 @@ def resolve_index_state(index_state: str, cognify_status: str | None) -> str:
     watched nothing. Only a status promotes the state; ``None`` leaves it where
     it was, because "I did not look" is not evidence of success.
 
-    A write that never landed cannot be rescued by a later cognify, so a
-    rejected or unstored write keeps its state whatever the cognify did.
+    A write that never happened is neither indexed nor a cognify failure, so a
+    rejected one keeps its state whatever the cognify did. An ``unknown`` write
+    can still be moved in the pessimistic direction — a cognify observed to
+    fail means nothing landed in the graph either way — but never to
+    ``indexed``, because there is no evidence the write itself reached the
+    store.
     """
-    if index_state in {INDEX_STATE_REJECTED, INDEX_STATE_UNKNOWN} and cognify_status != "failed":
+    if index_state == INDEX_STATE_REJECTED:
+        return index_state
+    if index_state == INDEX_STATE_UNKNOWN and cognify_status == "ok":
         return index_state
     if cognify_status == "ok":
         return INDEX_STATE_INDEXED
