@@ -201,6 +201,11 @@ def _cognify_via_api(url: str, *, force: bool) -> int:
     except URLError as exc:
         logger.error("Cognify API unreachable at %s: %s", endpoint, exc.reason)
         return 1
+    except TimeoutError as exc:
+        # A read-phase timeout is a bare TimeoutError, not a URLError, and
+        # would otherwise escape this handler as a raw traceback (#39/#116).
+        logger.error("Cognify API timed out after %ss: %s", _cognify_timeout(), exc)
+        return 1
 
     logger.info(
         "Cognify (API) finished: graph_before=%s graph_after=%s grew=%s",
