@@ -887,6 +887,7 @@ def make_run(
     content_sha="f" * 64,
     census="default",
     rows_count=69,
+    questions_pin="022b6b4f66c73af1" + "0" * 48,
 ):
     if census == "default":
         census = {
@@ -945,9 +946,28 @@ def make_run(
             "api": {"documents_tracked": 2867, "node_version": "9.9.9"},
         },
     }
+    if questions_pin is not None:
+        run["fingerprint"]["questions_pin"] = questions_pin
     if census is not None:
         run["fingerprint"]["census"] = census
     return run
+
+
+class TestReportNamesItsFrozenSet:
+    """The runbook told an operator to confirm the pin before reading any
+    delta, and named `report` as a surface that prints it. It did not. There
+    was no printed surface at all: `compare` gated on the file hash and the
+    markdown table named no question set."""
+
+    def test_the_report_prints_the_pin(self):
+        markdown = sb.build_markdown_report(make_run())
+        assert "questions_pin" in markdown
+        assert "022b6b4f66c73af1" in markdown
+
+    def test_a_run_without_a_pin_says_it_is_not_determinable(self):
+        markdown = sb.build_markdown_report(make_run(questions_pin=None))
+        assert "NOT RECORDED" in markdown
+        assert "not determinable" in markdown
 
 
 class TestMarkdownReport:
@@ -1183,6 +1203,78 @@ class TestRankingIsMeasuredSeparatelyFromRetrieval:
         assert row["answer_slot"] == 2
         assert row["outranked_by_coverage"] is None
 
+    def test_the_answer_slot_really_strips_the_sync_header(self):
+        """The test above never exercised the stripping: its span occurs in no
+        header, so `split_header_body` could be deleted and it stayed green.
+
+        This is the header-credit incident in miniature. A span whose text also
+        appears in the sync header must bind the answer slot to the hit whose
+        BODY carries it, not to whichever hit ranked highest carrying that
+        header. Without the stripping the rank-1 header carrier becomes the
+        answer, its low coverage becomes `answer_coverage`, and the inversion
+        for that question silently disappears -- rank_inversion_rate falls and
+        reads as a ranking improvement.
+        """
+        span = f"repository: {PATH_DOC.split('/')[0]}/{PATH_DOC.split('/')[1]}"
+        header_carrier = scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", 0.05)
+        body_carrier = scored_hit(PATH_DOC, BLOB_A, f"prose {span} prose", 1.0)
+        # The header carrier's FULL text really does contain the span; only the
+        # stripping keeps it out of the answer slot.
+        assert sb.normalize(span) in sb.normalize(sb.hit_text(header_carrier))
+        assert sb.normalize(span) not in sb.normalize(
+            sb.split_header_body(sb.hit_text(header_carrier))[1]
+        )
+        row = sb.score_question(
+            question(spans=[span]), [header_carrier, body_carrier], {}
+        )
+        assert row["answer_slot"] == 2
+        assert row["answer_term_coverage"] == 1.0
+        assert row["outranked_by_coverage"] == 0.05
+
+    def test_term_coverage_is_the_nodes_number_and_a_path_can_move_it(self):
+        """The published claim used to be that a path-header match "can neither
+        manufacture nor hide an inversion". It can do both.
+
+        The answer SLOT is header-immune. `term_coverage` is not: the node
+        computes it over a haystack that includes each hit's own path, source
+        url, provenance and the sync header still sitting in the chunk text
+        (kb/search_format.py `_hit_text`), and every hit carries a DIFFERENT
+        path. Executed both directions here so the real behaviour is pinned and
+        the immunity claim cannot come back.
+        """
+        # HIDING: a decoy whose body has zero query overlap, but whose path
+        # supplies coverage above the answer's, stops being an inversion.
+        answer = scored_hit(PATH_DOC, BLOB_A, f"prose {self.SPAN} prose", 0.40)
+        decoy_high = scored_hit(PATH_OTHER, BLOB_B, "filler", 0.60)
+        hidden = sb.score_question(
+            question(spans=[self.SPAN]), [decoy_high, answer], {}
+        )
+        assert hidden["answer_slot"] == 2
+        assert hidden["outranked_by_coverage"] is None
+        # Same page, same bodies, same order: only the decoy's reported
+        # coverage drops to what its BODY alone would earn.
+        decoy_low = scored_hit(PATH_OTHER, BLOB_B, "filler", 0.0)
+        revealed = sb.score_question(
+            question(spans=[self.SPAN]), [decoy_low, answer], {}
+        )
+        assert revealed["answer_slot"] == 2
+        assert revealed["outranked_by_coverage"] == 0.0
+
+        # MANUFACTURING: the same decoy at a fixed 0.60 becomes an inversion
+        # purely because the ANSWER's own filename lifts its coverage to 1.0.
+        answer_path_inflated = scored_hit(PATH_DOC, BLOB_A, f"prose {self.SPAN} prose", 1.0)
+        manufactured = sb.score_question(
+            question(spans=[self.SPAN]), [decoy_high, answer_path_inflated], {}
+        )
+        assert manufactured["outranked_by_coverage"] == 0.60
+
+        # And the published definition must say so, because the report table
+        # copies it verbatim next to the number.
+        definition = sb.METRIC_DEFINITIONS["rank_inversion_rate"]
+        assert "cannot manufacture or hide" not in definition
+        assert "header-immune" in definition
+        assert "path" in definition
+
     def test_missing_coverage_is_not_counted_as_an_inversion(self):
         hits = [
             scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", None),
@@ -1280,6 +1372,116 @@ class TestEmbeddingWindowPairs:
         assert window["pairs_head_only"] == 1
         assert window["pairs_both"] == 1
 
+    def test_a_dangling_half_pair_moves_no_published_window_rate(self):
+        """head_recall_at_5, tail_recall_at_5 and window_penalty are published
+        with `pairs_complete` as their sample count, so all three have to be
+        computed over complete pairs.
+
+        They used to be `rate()` over ALL head rows and ALL tail rows. One
+        dangling side turned window_penalty into a comparison across two
+        different document populations -- the one thing the metric exists to
+        avoid -- while `pairs_complete` stayed honest and the test named for
+        this kept passing. The report then printed a rate over 3 heads next to
+        n = 2.
+        """
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        complete = [plain, probe] + self._pair_rows(True, False, "w01")
+        baseline = sb.summarize(complete, [])
+        assert baseline["window"]["pairs_complete"] == 1
+        assert baseline["window"]["head_recall_at_5"] == 1.0
+        assert baseline["window"]["tail_recall_at_5"] == 0.0
+        assert baseline["window"]["window_penalty"] == 1.0
+
+        # A head with no tail: it is not a within-document comparison, so it
+        # must not move the rate, the penalty, or the count.
+        dangling_head = [row for row in self._pair_rows(False, False, "w02") if row["window_role"] == "head"]
+        with_head = sb.summarize(complete + dangling_head, [])
+        assert with_head["window"]["pairs_complete"] == 1
+        assert with_head["window"]["head_recall_at_5"] == 1.0
+        assert with_head["window"]["window_penalty"] == 1.0
+
+        # And a tail with no head, the other direction.
+        dangling_tail = [row for row in self._pair_rows(True, True, "w03") if row["window_role"] == "tail"]
+        with_tail = sb.summarize(complete + dangling_tail, [])
+        assert with_tail["window"]["pairs_complete"] == 1
+        assert with_tail["window"]["tail_recall_at_5"] == 0.0
+        assert with_tail["window"]["window_penalty"] == 1.0
+
+    def test_window_documents_counts_documents_not_pair_ids(self):
+        """`documents` said how many documents the window measurement covers.
+        It counted distinct window_pair ids, so two pairs quoting one document
+        reported 2 -- the name-versus-what-it-attests failure the harness
+        exists to catch."""
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        # Both pairs name PATH_DOC (see `question`'s default expect_any).
+        rows = [plain, probe] + self._pair_rows(True, False, "w01") + self._pair_rows(True, False, "w02")
+        summary = sb.summarize(rows, [])
+        assert summary["window"]["pairs_complete"] == 2
+        assert summary["window"]["documents"] == 1
+
+    def test_rank_inversion_rate_is_reported_split_by_window(self):
+        """The headline rate blends 36 verbatim-sentence window queries with
+        the real questions, while answer_recall_at_5 deliberately keeps them
+        apart. Publish the split so a movement can be attributed."""
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        rows = [plain, probe] + self._pair_rows(True, True, "w01")
+        summary = sb.summarize(rows, [])
+        ranking = summary["ranking"]
+        assert ranking["answers_ranked"] == 3
+        assert ranking["answers_ranked_excluding_window"] == 1
+        assert ranking["answers_ranked_window_only"] == 2
+        assert ranking["rank_inversion_rate_excluding_window"] == 0.0
+        assert ranking["rank_inversion_rate_window_only"] == 0.0
+
+    def test_only_the_span_scored_metrics_survive_the_v5_boundary(self):
+        """The exclusion protects `span_rows` and nothing else. Naming the
+        metrics that DO move stops someone reading a v5 doc_recall_at_5 drop as
+        the node degrading; `compare` refuses the cross-set comparison outright
+        because the pin differs."""
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        before = sb.summarize([plain, probe], [])
+        after = sb.summarize([plain, probe] + self._pair_rows(True, False, "w01"), [])
+        # Unmoved: computed from span_rows.
+        assert before["quality"]["answer_recall_at_5"] == after["quality"]["answer_recall_at_5"]
+        assert before["quality"]["mrr_body"] == after["quality"]["mrr_body"]
+        assert before["quality"]["header_credit_rate"] == after["quality"]["header_credit_rate"]
+        # Moved: computed from positives / rows. Both are in REPORT_METRICS.
+        assert after["quality"]["doc_recall_at_5"] != before["quality"]["doc_recall_at_5"]
+        assert {
+            key for _, key, _ in sb.REPORT_METRICS
+        } & {"doc_recall_at_5", "duplicate_blob_rate_at_10"} == {
+            "doc_recall_at_5",
+            "duplicate_blob_rate_at_10",
+        }
+
     def test_a_half_pair_does_not_contribute_to_the_penalty(self):
         """Only pairs whose BOTH sides ran are a within-document comparison."""
         probe = sb.score_question(
@@ -1353,10 +1555,106 @@ class TestWindowFixtureContract:
         problems, _ = sb.lint_questions(path, gt)
         assert any("appears in the question text" in p for p in problems)
 
+    # A quote that really sits early in the document. `alpha beta gamma` is
+    # inside HEAD_TEXT, so body.find puts it at offset 13.
+    SHALLOW_QUOTE = "alpha beta gamma delta epsilon alpha beta gamma delta"
+
     def test_tail_quote_too_shallow_fails(self, tmp_path):
-        path, gt = self._golden(tmp_path, self._tail_q(source_offset_chars=10))
+        """A tail quote that really sits in the head window is rejected, and
+        the message says BELOW the threshold. It used to read 'above the 0.4
+        threshold' while firing on depth < 0.4, sending an author fixing the
+        pair in the wrong direction."""
+        shallow = self._tail_q(
+            question=self.SHALLOW_QUOTE,
+            answer_spans=[self.SHALLOW_QUOTE],
+            source_offset_chars=self.BODY.find(self.SHALLOW_QUOTE),
+        )
+        path, gt = self._golden(tmp_path, shallow)
         problems, _ = sb.lint_questions(path, gt)
         assert any("too shallow to test the window" in p for p in problems)
+        assert any("BELOW" in p for p in problems)
+        assert not any("above the" in p for p in problems), problems
+
+    def test_a_declared_offset_cannot_smuggle_a_shallow_quote_into_the_tail(
+        self, tmp_path
+    ):
+        """`source_offset_chars` is a claim; body.find(quote) is the fact.
+
+        Trusting the claim let a quote inside the first 2000 characters ship
+        declared at 50% depth. lint returned no problems, the row landed in
+        tail_recall_at_5 and in the tail_recall_given_head_at_5 denominator,
+        and every artifact said it had tested a quote past 40% depth.
+        """
+        forged = self._tail_q(
+            question=self.SHALLOW_QUOTE,
+            answer_spans=[self.SHALLOW_QUOTE],
+            source_offset_chars=int(len(self.BODY) * 0.60),
+            depth_fraction=0.60,
+        )
+        real_offset = self.BODY.find(self.SHALLOW_QUOTE)
+        assert real_offset / len(self.BODY) < sb.TAIL_MIN_DEPTH
+        path, gt = self._golden(tmp_path, forged)
+        problems, notes = sb.lint_questions(path, gt)
+        assert any("too shallow to test the window" in p for p in problems), problems
+        # The disagreement itself is reported, so a stale fixture is visible
+        # rather than silently overridden.
+        assert any(str(real_offset) in note for note in notes), notes
+
+    def test_a_drifted_declared_offset_is_a_note_not_a_failure(self, tmp_path):
+        """ground_truth/ is refetched from an unpinned upstream HEAD, so a few
+        characters of whitespace drift move the real offset. That must not fail
+        lint on every machine that fetched on a different day -- the measured
+        offset is what the thresholds use, so a stale claim cannot change a
+        verdict."""
+        drifted = self._tail_q(source_offset_chars=self.BODY.find(self.TAIL_TEXT) - 3)
+        path, gt = self._golden(tmp_path, drifted)
+        problems, notes = sb.lint_questions(path, gt)
+        assert problems == []
+        assert any("drifted from the fixture" in note for note in notes), notes
+
+    def test_novel_terms_must_be_terms_of_the_quote(self, tmp_path):
+        """Three arbitrary words absent from the head satisfied the control
+        while saying nothing about this sentence. A word the quote does not
+        contain cannot make the quote novel."""
+        path, gt = self._golden(
+            tmp_path,
+            self._tail_q(
+                novel_terms_absent_from_head=["absolute", "meridian", "portcullis"]
+            ),
+        )
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("are not terms of the quote" in p for p in problems), problems
+
+    def test_a_quote_absent_from_the_body_fails(self, tmp_path):
+        """The window-specific verbatim check is case- and whitespace-exact,
+        and stricter than the generic normalize()-based span check. Nothing
+        exercised it, so it could be deleted with the suite still green."""
+        missing = "this exact sentence is nowhere in the cached body at all"
+        path, gt = self._golden(
+            tmp_path, self._tail_q(question=missing, answer_spans=[missing])
+        )
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("not present verbatim in the cached body" in p for p in problems)
+
+    def test_a_window_role_without_the_category_is_still_linted(self, tmp_path):
+        """lint used to decide 'is this a window question' from `category`
+        while summarize buckets on `window_role`. A question carrying only
+        window_role was invisible to every window check and still entered
+        head/tail recall and the tail_recall_given_head_at_5 arithmetic."""
+        sneaky = self._tail_q(
+            question=self.SHALLOW_QUOTE,
+            answer_spans=[self.SHALLOW_QUOTE],
+            source_offset_chars=self.BODY.find(self.SHALLOW_QUOTE),
+        )
+        sneaky.pop("category")
+        assert sb.is_window_question(sneaky) is True
+        path, gt = self._golden(tmp_path, sneaky)
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("needs category 'window_tail'" in p for p in problems), problems
+        assert any("too shallow to test the window" in p for p in problems), problems
+        # And summarize really would have bucketed it, which is why lint has to.
+        row = sb.score_question(sneaky, [], {})
+        assert row["window_role"] == "tail"
 
     def test_tail_without_enough_novel_terms_fails(self, tmp_path):
         path, gt = self._golden(
@@ -1404,11 +1702,22 @@ class TestWindowFixtureContract:
         for q in window:
             assert q["answer_spans"] == [q["question"]], q["id"]
             assert len(q["expect_any"]) == 1, q["id"]
+            # The two surfaces have to agree. lint keys on category, summarize
+            # buckets on window_role; a set where they disagree is one where a
+            # row is scored without ever being validated. This runs in CI,
+            # where ground_truth/ does not exist and `lint` cannot.
+            expected_category = (
+                "window_head" if q["window_role"] == "head" else "window_tail"
+            )
+            assert q["category"] == expected_category, q["id"]
             if q["window_role"] == "tail":
                 assert q["depth_fraction"] >= sb.TAIL_MIN_DEPTH, q["id"]
-                assert (
-                    len(q["novel_terms_absent_from_head"]) >= sb.TAIL_MIN_NOVEL_TERMS
-                ), q["id"]
+                novel = q["novel_terms_absent_from_head"]
+                assert len(novel) >= sb.TAIL_MIN_NOVEL_TERMS, q["id"]
+                # Declared novel terms must be terms of the quote itself. This
+                # one IS checkable offline: it needs the quote, not the body.
+                quote_terms = sb.distinctive_terms(q["question"])
+                assert set(map(str, novel)) <= quote_terms, q["id"]
             else:
                 assert q["source_offset_chars"] < sb.HEAD_WINDOW_CHARS, q["id"]
 
@@ -1454,6 +1763,54 @@ class TestFrozenFixtureSet:
         assert data["frozen"]["questions_sha256"] == sb.questions_pin(data["questions"])
 
 
+class TestAnswerProvenanceIsRecorded:
+    """`answer_pass_at_5` scores the first served identity whose body contains
+    a span, and never consults `expect_any`. Span uniqueness is enforced by
+    lint only across the ~49 files in the gitignored ground-truth cache, never
+    across the corpus, so a second render of a file, an org digest or any
+    uncached document quoting the sentence scores the pass. That is a real
+    blind spot of the method; counting it is what makes it visible."""
+
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def _probe(self):
+        return sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+
+    def test_an_answer_off_an_unexpected_document_is_counted(self):
+        q = question("q1", spans=[self.SPAN], expect=[PATH_OTHER])
+        row = sb.score_question(q, [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)], {})
+        # The pass still counts: answer_recall asks whether the answer TEXT
+        # came back, doc_recall asks whether the named document did.
+        assert row["answer_pass_at_5"] is True
+        assert row["doc_rank"] is None
+        assert row["answer_from_expected_document"] is False
+        summary = sb.summarize([row, self._probe()], [])
+        assert summary["quality"]["answers_from_unexpected_documents"] == 1
+
+    def test_an_answer_off_the_expected_document_is_not_counted(self):
+        q = question("q1", spans=[self.SPAN])
+        row = sb.score_question(q, [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)], {})
+        assert row["answer_from_expected_document"] is True
+        summary = sb.summarize([row, self._probe()], [])
+        assert summary["quality"]["answers_from_unexpected_documents"] == 0
+
+    def test_a_shingle_matched_later_chunk_still_counts_as_expected(self):
+        """A later chunk carries no sync header, so identity falls back to the
+        document id. The cached-body shingle test is what recognises it, and
+        the answer-provenance check has to use the SAME definition doc_rank
+        uses or the two disagree about what 'the expected document' means."""
+        body = " ".join(f"word{i}" for i in range(60)) + " " + self.SPAN
+        hit = repo_hit(PATH_DOC, BLOB_A, body, first_chunk=False)
+        hit["_citadel"]["relevance"] = {"term_coverage": 1.0, "matched_terms": []}
+        gt = {PATH_DOC: sb.shingles(body)}
+        row = sb.score_question(question("q1", spans=[self.SPAN]), [hit], gt)
+        assert row["answer_pass_at_5"] is True
+        assert row["doc_rank"] == 1
+        assert row["answer_from_expected_document"] is True
+
+
 class TestPerRequestMetadataStability:
     def test_same_chunk_same_sha_different_tier_is_flagged(self):
         span = "the subsystem persists attempted charges with a null transaction id"
@@ -1472,6 +1829,32 @@ class TestPerRequestMetadataStability:
         assert meta["chunks_observed"] == 1
         assert meta["chunks_with_unstable_trust_tier"] == 1
         assert meta["unstable_examples"][0]["tiers"] == ["reference-only", "unattested"]
+
+    def test_the_same_chunk_at_a_DIFFERENT_sha_is_not_instability(self):
+        """The key is (result_id, content_sha256) and both halves are load
+        bearing. Every fixture shared sha="deadbeef", so the sha half was
+        untested: degrading the key to result_id alone kept the suite green.
+
+        A chunk whose CONTENT legitimately changed between two requests, and
+        whose trust_tier legitimately changed with it, is not per-request
+        metadata instability. Counting it turns this metric into a false
+        positive generator on any corpus that is being re-indexed -- which is
+        exactly when it will be read.
+        """
+        span = "the subsystem persists attempted charges with a null transaction id"
+        a = scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="reference-only", sha="1111")
+        b = scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="unattested", sha="2222")
+        assert a["_citadel"]["result_id"] == b["_citadel"]["result_id"]
+        rows = [
+            sb.score_question(question("q1", spans=[span]), [a], {}),
+            sb.score_question(question("q2", spans=[span]), [b], {}),
+            sb.score_question(
+                {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+            ),
+        ]
+        meta = sb.summarize(rows, [])["metadata_stability"]
+        assert meta["chunks_observed"] == 2
+        assert meta["chunks_with_unstable_trust_tier"] == 0
 
     def test_a_consistent_tier_is_not_flagged(self):
         span = "the subsystem persists attempted charges with a null transaction id"
@@ -1611,3 +1994,105 @@ class TestRunRecordsWhichFrozenSetItAnswered:
         assert sb.questions_pin(sb.load_questions(path)) == sb.questions_pin(
             sb.load_questions(reformatted)
         )
+
+    def _fingerprint(self, tmp_path, monkeypatch, questions=None, gt_dir=None):
+        """build_fingerprint with only the two network calls stubbed.
+
+        The test above never called build_fingerprint, so the key that actually
+        records which frozen set a run answered was untested: renaming it left
+        every run JSON silently pinless with the suite still green.
+        """
+        questions = questions or [{"id": "q1", "question": "text", "expected_recall": 1}]
+        path = tmp_path / "golden.json"
+        path.write_text(json.dumps({"version": 5, "questions": questions}))
+        monkeypatch.setattr(sb, "api_fingerprint", lambda *a, **k: {"node_version": "x"})
+        monkeypatch.setattr(sb, "corpus_census", lambda *a, **k: {"documents_total": 1})
+        monkeypatch.setattr(sb, "make_corpus_fetcher", lambda *a, **k: None)
+        if gt_dir is not None:
+            monkeypatch.setattr(sb, "GROUND_TRUTH", gt_dir)
+        return sb.build_fingerprint("http://node", "tok", 1.0, path, None), path
+
+    def test_build_fingerprint_records_the_pin(self, tmp_path, monkeypatch):
+        fingerprint, path = self._fingerprint(tmp_path, monkeypatch)
+        assert "questions_pin" in fingerprint
+        assert fingerprint["questions_pin"] == sb.questions_pin(sb.load_questions(path))
+
+    def test_build_fingerprint_records_the_ground_truth_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """ground_truth/ is gitignored, refetched from an unpinned upstream
+        HEAD, and feeds doc_rank's shingle fallback and legacy_rank. Two runs
+        at the same pin against the same node can therefore score differently.
+        The fingerprint has to say which cache was used."""
+        gt = tmp_path / "gt"
+        gt.mkdir()
+        (gt / "org__repo__a.md").write_text("first body")
+        before, _ = self._fingerprint(tmp_path, monkeypatch, gt_dir=gt)
+        assert before["ground_truth"]["files"] == 1
+        assert before["ground_truth"]["sha256"]
+        (gt / "org__repo__a.md").write_text("upstream edited this body")
+        after, _ = self._fingerprint(tmp_path, monkeypatch, gt_dir=gt)
+        assert after["ground_truth"]["sha256"] != before["ground_truth"]["sha256"]
+
+    def test_an_absent_ground_truth_cache_says_so(self, tmp_path, monkeypatch):
+        fingerprint, _ = self._fingerprint(
+            tmp_path, monkeypatch, gt_dir=tmp_path / "nope"
+        )
+        assert fingerprint["ground_truth"]["sha256"] is None
+        assert "NOT" in fingerprint["ground_truth"]["reason"]
+
+
+class TestCompareGatesOnThePinNotTheFileBytes:
+    """`questions_pin` says which frozen set was answered. The file hash says
+    whether the file was touched. Gating on the second withheld the entire
+    delta in precisely the case the pin was introduced to fix."""
+
+    def _fingerprint(self, *, pin="p" * 64, file_sha="q" * 64, gt="g" * 64):
+        fingerprint = {
+            "content": {"sha256": "f" * 64},
+            "questions_sha256": file_sha,
+            "harness_git_sha": "deadbeef",
+            "ground_truth": {"sha256": gt, "files": 3},
+        }
+        if pin is not None:
+            fingerprint["questions_pin"] = pin
+        return fingerprint
+
+    def test_same_pin_different_file_bytes_stays_comparable(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(file_sha="a" * 64), self._fingerprint(file_sha="b" * 64)
+        )
+        assert comparable is True
+        assert any("questions_pin is identical" in line for line in verdicts)
+        assert not any("QUESTIONS CHANGED" in line for line in verdicts)
+
+    def test_a_different_pin_is_not_comparable(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(pin="1" * 64), self._fingerprint(pin="2" * 64)
+        )
+        assert comparable is False
+        assert any("QUESTIONS CHANGED" in line for line in verdicts)
+
+    def test_a_run_without_a_pin_falls_back_to_the_file_hash(self):
+        """An artifact that cannot say which set it answered is not comparable
+        on anybody's word, so the older, blunter gate still applies there."""
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(pin=None, file_sha="a" * 64),
+            self._fingerprint(pin=None, file_sha="b" * 64),
+        )
+        assert comparable is False
+        assert any("predates questions_pin" in line for line in verdicts)
+
+    def test_a_moved_ground_truth_cache_is_noted_but_not_a_gate(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(gt="1" * 64), self._fingerprint(gt="2" * 64)
+        )
+        assert comparable is True
+        assert any("ground-truth cache differs" in line for line in verdicts)
+
+    def test_a_missing_ground_truth_fingerprint_is_noted(self):
+        current = self._fingerprint()
+        current.pop("ground_truth")
+        comparable, verdicts = sb.compare_fingerprints(current, self._fingerprint())
+        assert comparable is True
+        assert any("ground-truth cache fingerprint unavailable" in line for line in verdicts)

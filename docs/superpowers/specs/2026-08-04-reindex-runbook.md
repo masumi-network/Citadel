@@ -36,6 +36,13 @@ latency p50 592.2 ms / p95 791.5 ms   (client round-trip, NOT server-side)
 
 `tail_recall_given_head_at_5` conditions on documents whose HEAD quote retrieved. Every document it counts is one the index demonstrably holds and returns. Zero of eleven retrieve from a verbatim quote taken at 40% depth or deeper. **None of those eleven is in the 892**, because a document with no chunks cannot retrieve on its head quote either and is excluded before the metric is computed. So a run scoped to the 892 leaves that number at 0 of 11 by construction, and the most direct evidence of the defect goes untouched.
 
+**What each of those numbers does and does not attest**, after an adversarial pass over the harness on 2026-08-05:
+
+- The three window figures **stand**. Every one of the 36 shipped window fixtures was re-derived from the real cached bodies without trusting a single declared field: the quote is present verbatim in all 36, all 18 heads really sit inside the first 2,000 characters, all 18 tails really sit past 0.40 depth, every declared novel term really is a term of its own quote and really is absent from the head, and all 18 pairs are complete and back 18 distinct documents. Zero threshold violations. **VERIFIED** by recomputation on 2026-08-05.
+- Seven fixtures declare an offset a few characters off from where the quote now sits, and one (`w05t`, declared 4435, measured 4679) is off by 244 because its upstream document was edited on 2026-08-03. The thresholds were never satisfied by the declared values, so the figures do not move: `w05t`'s measured depth is 0.8330 against a 0.40 threshold. `lint` now measures instead of trusting and reports each drift as a note.
+- `rank_inversion_rate 0.1489` **must not be quoted as a body-relevance figure.** It reads `_citadel.relevance.term_coverage`, which the node computes over a haystack including each hit's own path and sync header, and every hit carries a different path. A filename can both hide a real inversion and manufacture one; both directions were executed against the node's own coverage function on 2026-08-05. The number is a correct measurement of what it measures (the node's published relevance signal disagreeing with the node's own ordering) and the earlier claim that a path-header match "can neither manufacture nor hide an inversion" was wrong. It is not a gate for this run; it is context.
+- `answer_recall_at_5 0.8974` is scored on the first served identity whose body contains a span, without checking that identity is one the question named. Span uniqueness is proven only across the ~49 cached ground-truth files, never across the corpus. Runs now publish `quality.answers_from_unexpected_documents`; read it before quoting the recall figure.
+
 **The cause is the budget every pre-`a7376dd` document was chunked at, not a pipeline that skipped some rows.** A 13,477-character source file is stored as ONE chunk (`chunk_index: 0`, `text_full_chars: 13790`), and a 34,152-character document ingested at 19:11Z became TWO chunks of 19,529 and 14,616 characters (**REPORTED**, measured in production on 2026-08-04). The embedder window is 512 wordpieces. That is not an accident that befell some documents. It is what the shipped budget of 8191 GPT-4o BPE tokens produces, applied uniformly to everything ingested before `a7376dd`.
 
 **Measured multiplier, this session.** Running cognee's own `chunk_by_paragraph` over 132 files of this repository (`docs/**/*.md`, `*.md`, `kb/*.py`), 2,225,267 characters total, through `.venv/bin/python`:
@@ -98,6 +105,8 @@ Section 6 is the reason. The short version: the re-index overwrites chunk rows i
 The baseline was produced by harness `ea2948a`. **VERIFIED** on 2026-08-04: `git merge-base --is-ancestor ea2948a origin/main` answers NO, and `git branch -a --contains ea2948a` lists only `feat/retrieval-eval-harness`. The metrics that name this defect (`head_recall_at_5`, `tail_recall_at_5`, `tail_recall_given_head_at_5`) do not exist in `scripts/bench/search_bench.py` on `a7376dd`; grep returns nothing. **VERIFIED.**
 
 So the "after" run cannot be produced from main as it stands. Either merge that branch first, or run the harness from a checkout of `ea2948a`. Decide which before the re-index starts, because discovering it afterwards means the run cannot be evaluated against the number it was scheduled to move.
+
+That premise is true only while the harness PR is open. The instant it merges, main carries the metrics and this section is satisfied by doing nothing. Re-check with `git merge-base --is-ancestor` before acting on it rather than assuming it still holds.
 
 ### 2.5 The window is announced
 
@@ -232,7 +241,20 @@ Three operational facts about that call:
 
 1. **The CLI cannot do this.** `citadel cognify` takes `--dataset` and `--verify` and no force flag (`kb/cli.py:3170-3180`), and `_cognify` calls `cognify_dataset(dataset=..., verify=args.verify)` with no `force` (`kb/cli.py:854-858`). **VERIFIED.** The HTTP endpoint is the only surface that can force.
 2. **The response's `ok` field proves nothing when `verify` is false.** `cognify_dataset` returns `"ok": True if verification is None else bool(verification["ok"])` (`kb/service.py:370`). **VERIFIED.** With `verify: false` it is unconditionally true. Read `graph_before` and `graph_after` in the same payload for a number that is at least a measurement, and read the census for one that is authoritative.
-3. **One request will not survive the window.** At the section 3.3 timings a single dataset's force cognify runs for hours, and a client timeout says nothing about whether the write succeeded. Issue #229 recorded that exact confusion and is closed, but the property remains: a timed-out client and a failed write look the same from the client. Drive this from something that tolerates a disconnected caller, and judge the outcome from the census.
+3. **One request will not survive the window.** At the section 3.3 timings a single dataset's force cognify runs for hours, and a client timeout says nothing about whether the write succeeded. Issue #229 recorded that exact confusion and is closed, but the property remains: a timed-out client and a failed write look the same from the client.
+
+   Issue that request from something that outlives your terminal, for example:
+
+   ```bash
+   nohup curl -sS -X POST "$CITADEL_NODE_URL/api/cognify/run" \
+     -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \
+     -H "Content-Type: application/json" \
+     --max-time 0 \
+     -d '{"dataset": "<name>", "force": true, "verify": false}' \
+     > cognify-<name>.json 2>&1 &
+   ```
+
+   **NOT DETERMINED: whether the server-side write survives a client disconnect.** `run_cognify` awaits `cognify_dataset` inline with no handler-level timeout (`kb/server.py:5765-5771`), so nothing in this document establishes what the platform's proxy does to an in-flight handler when the client goes away. Treat that as unknown, and never retry on a timeout: a second `force: true` restarts the whole dataset from zero and pays the full price again. Judge the outcome from the census, per section 7.
 
 One dataset at a time, because the writer lock serializes them anyway and a per-dataset boundary is the only resumable checkpoint this path has.
 
@@ -314,9 +336,16 @@ embed window exceeded: %d tokens against a %d window (%.2fx), %d characters, chu
 Re-run the frozen set at the same pin against the same node:
 
 ```bash
-# The metrics live on ea2948a (branch feat/retrieval-eval-harness), not on main.
-# Either merge that branch first or run from a checkout of it.
-git checkout ea2948a -- scripts/bench/
+# Run from a tree that carries the harness. Once this PR merges, main does,
+# and nothing extra is needed. Before it merges, work from a separate checkout
+# of the branch instead of pulling files into your current index:
+#
+#   git worktree add /tmp/bench-ea2948a ea2948a && cd /tmp/bench-ea2948a
+#
+# `git checkout <ref> -- scripts/bench/` also works but writes the index as
+# well as the working tree, which leaves a dirty staged state mid-maintenance
+# window with no instruction to undo it, and becomes a silent no-op the moment
+# this PR is merged.
 
 export CITADEL_MCP_ACCESS_TOKEN=...        # kb:search, plus admin or audit:read for the census block
 export CITADEL_NODE_URL=https://citadel-archive-production.up.railway.app
@@ -333,7 +362,15 @@ python scripts/bench/search_bench.py compare \
 
 Run JSONs go under `scripts/bench/runs/` only. That directory is gitignored and a run JSON enumerates every served hit identity, so it must never be committed (`scripts/bench/README.md`). **VERIFIED** by reading it.
 
-**Confirm the pin before reading any delta.** The run's fingerprint carries `questions_pin` and it must read `022b6b4f66c73af1`. `compare` recomputes it and refuses on a mismatch (`scripts/bench/search_bench.py:1400` on `ea2948a`), and `report` prints it (`:1645`). **VERIFIED** by reading both on that ref. A comparison against a different question set is not a comparison.
+**Confirm the pin before reading any delta.** The run's fingerprint carries `questions_pin` and it must read `022b6b4f66c73af1`. A comparison against a different question set is not a comparison.
+
+Three surfaces show it, and an earlier revision of this document named two of them wrongly. The correction is recorded here rather than silently overwritten, because the wrong version was tagged VERIFIED and would otherwise be quoted again:
+
+- `run` prints it at the end of the run (`cmd_run`). **VERIFIED**: that was true then and is true now.
+- `report` prints `Frozen question set \`<pin>\`` directly above the metric table, and prints `NOT RECORDED` when a run predates the pin. **VERIFIED** by `tests/test_search_bench.py::TestReportNamesItsFrozenSet`. The earlier revision cited `:1645` for this; that line is inside `cmd_run`, and `build_markdown_report` contained no reference to the pin at all, so an operator following the old instruction would have found nothing and fallen back to trusting `compare`.
+- `compare` gates on `questions_pin` and refuses on a mismatch. **VERIFIED** by `tests/test_search_bench.py::TestCompareGatesOnThePinNotTheFileBytes`. The earlier revision cited `:1400`, which is inside `_lint_freeze_pin` (the `lint` command). `compare_fingerprints` did not read the pin; it gated on `questions_sha256`, the FILE-bytes hash. Two runs of the byte-identical frozen set whose JSON had been reindented between them were declared `QUESTIONS CHANGED: golden sets differ. NOT COMPARABLE.` and the whole delta was withheld, which is the exact case `questions_pin` was introduced to fix.
+
+`compare` also now notes when the two runs used different `ground_truth/` caches. That cache is gitignored and refetched from an unpinned upstream HEAD, and it feeds `doc_recall_at_5` and `header_credit_rate`, so those two can move without the node changing. A note, not a gate.
 
 Compare against:
 
@@ -345,6 +382,8 @@ rank_inversion_rate          0.1489   (47 ranked answers, worst slot 10)
 answer_recall_at_5           0.8974
 latency p50 592.2 ms / p95 791.5 ms   (client round-trip, NOT server-side)
 ```
+
+Read section 2's caveats before quoting any row of that block. In particular `rank_inversion_rate` is context, not a gate, and it is not a body-relevance figure.
 
 **Passes when:** `tail_recall_given_head_at_5` is above 0.0, and the census reports the expected chunk-count delta from section 6 for a sampled set of documents. Both, not either. The metric alone could move for an unrelated reason; the census alone proves rows exist without proving they are reachable.
 

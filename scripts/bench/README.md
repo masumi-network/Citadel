@@ -117,33 +117,78 @@ never a silent drift between two runs that both call themselves the baseline.
 Two hashes appear in a run's fingerprint and they are not the same thing.
 `questions_sha256` is over the FILE bytes, so reindenting moves it.
 `questions_pin` is over the canonical question list, so it moves only when a
-question really changes. The pin says which frozen set a run answered.
+question really changes. The pin says which frozen set a run answered, and it
+is the authority `compare` gates on: two runs whose pin matches stay comparable
+even if the file bytes differ, and the file difference is reported as a note.
+A run predating the pin has none, so the file hash still gates there. `report`
+prints the pin above the metric table, and says so plainly when a run carries
+none.
+
+The fingerprint also records `ground_truth`, a hash of the cached bodies the run
+scored against. `ground_truth/` is gitignored and `fetch_ground_truth.py` pulls
+each file from GitHub at HEAD with no ref, then skips anything already on disk,
+so two machines bake in whatever HEAD was current the day they first fetched.
+That cache is not decoration: it feeds `doc_rank`'s shingle fallback and
+`legacy_rank`, so it moves `doc_recall_at_5` and `header_credit_rate`. `compare`
+notes a difference rather than gating on it, because every run taken before the
+key existed would otherwise be refused. Re-fetch by deleting the cache, not by
+re-running the script over it.
 
 ## Embedding-window pairs
 
 18 pairs, one per document, added in v5. Each pair quotes the SAME document
 twice: once from inside the first 2000 characters (`window_head`), once from at
-least 40% through it (`window_tail`). Both quotes are verbatim and unique across
-every cached body, so exactly one document can answer either, and the quote IS
-the query, which is the strongest retrieval signal available.
+least 40% through it (`window_tail`). Both quotes are verbatim, and the quote IS
+the query, which is the strongest retrieval signal available. `lint` proves each
+quote unique across the CACHED ground-truth bodies, which is roughly 49 files,
+never across the corpus: a second render of a file or an uncached document
+quoting the same sentence would also score the pass. `run` counts that case as
+`quality.answers_from_unexpected_documents`, so the blind spot is readable per
+run rather than assumed away.
 
 The control that makes a tail miss mean something: a tail quote qualifies only
 when at least 3 of its distinctive terms are ABSENT from that document's head.
 Without it, a passing tail could be the head embedding answering the query and
 the comparison would prove nothing about how much of a document is reachable.
-`lint` enforces the offset, the depth, and every declared novel term, and
-rejects a pair whose "novel" terms turn out to occur in the head.
+
+`lint` enforces the depth threshold, the head window and the novelty control on
+a MEASURED offset (`body.find(quote)`), never on the fixture's declared
+`source_offset_chars`, and it requires every declared novel term to be a term of
+the quote itself. A declared offset that disagrees with the measured one is
+reported as a note: `ground_truth/` is refetched from an unpinned upstream HEAD,
+so a few characters of whitespace drift are ordinary and must not fail lint on
+every machine that fetched on a different day.
 
 Window questions are scored in their own block and are EXCLUDED from
 `answer_recall_at_5`. They fail by design against current behaviour; folding
 them into the headline would move it for a reason that has nothing to do with
-the node changing, and would break comparability with every baseline taken
-before v5.
+the node changing.
+
+That exclusion covers `span_rows` and nothing else. Precisely:
+`answer_recall_at_5`, `raw_page_recall_at_5`, `mrr_body` and
+`header_credit_rate` are unmoved by v5. `doc_recall_at_5`,
+`duplicate_blob_rate_at_10`, `distinct_files_at_10`, both
+`distinct_source_ratio` figures, `hit_stability` and `rank_inversion_rate` all
+moved when the 36 window questions landed, and none of them is comparable
+across the v5 boundary. `compare` is what enforces that: two runs answering
+different question sets differ in `questions_pin` and are refused outright.
 
 Read `tail_recall_given_head_at_5` rather than `tail_recall_at_5`. A document
 that missed on BOTH sides may simply never have been indexed, so its tail miss
 is not evidence about position. Conditioning on a head that retrieved keeps only
 documents the index demonstrably holds.
+
+What that conditioning does NOT control for: the pair holds the DOCUMENT
+constant and replaces the QUERY entirely. Head and tail are different sentences
+with different tokenisations facing different corpus competition, so a tail miss
+is positional OR lexical and this measurement cannot separate the two. On the
+2026-08-04 set the confound runs the other way in aggregate (head queries
+averaged 7.1 extracted terms against the tails' 6.8, and faced more cached-body
+competitors, 8.9 against 6.3), so it does not explain that day's 0 of 11.
+
+Every published window rate is computed over COMPLETE pairs only, so
+`head_recall_at_5`, `tail_recall_at_5`, `window_penalty` and the `pairs_complete`
+printed as their sample count stay consistent by construction.
 
 ## Ranking is not retrieval
 
@@ -155,10 +200,26 @@ both.
 
 An inversion is: a hit ranked ABOVE the one that verifiably contains the answer,
 while the node ITSELF reports that hit matched a strictly smaller share of the
-query terms (`_citadel.relevance.term_coverage`). The answer slot is fixed by a
-body span match with the sync header stripped, and the comparison uses the
-node's own numbers, so a match on the path header can neither manufacture nor
-hide an inversion.
+query terms (`_citadel.relevance.term_coverage`).
+
+**What the path header can and cannot do here.** The answer SLOT is
+header-immune: it is bound to a body span match with the sync header stripped,
+so a hit whose only overlap is the path never becomes the answer.
+`term_coverage` is NOT header-immune. The node computes it over a haystack that
+includes each hit's own `path`, `source`, `url`, provenance fields and the sync
+header still sitting in the chunk text (`kb/search_format.py`, `_hit_text`), and
+every hit on a page carries a different path, so a filename moves either side of
+the comparison: a decoy whose path matches three query terms stops being an
+inversion, and an answer whose path matches becomes one. Both directions are
+executed in `tests/test_search_bench.py`. Read `rank_inversion_rate` as the
+node's published relevance signal disagreeing with the node's own ordering, not
+as a body-only measure of relevance.
+
+The rate blends the 36 verbatim-sentence window queries with the real questions,
+while `answer_recall_at_5` deliberately keeps them apart. `run` therefore also
+publishes `rank_inversion_rate_excluding_window` and
+`rank_inversion_rate_window_only` with their own denominators, so a movement can
+be attributed to a set instead of guessed at.
 
 ## The golden set
 
