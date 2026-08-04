@@ -1,12 +1,18 @@
 # Seat Nodes Are Mutually Readable; Promotion Guards Curation, Not Secrecy
 
-- Status: Accepted as a decision. Implementation is gated on the sequence in
-  Consequences, and the visibility flip must not ship before it.
+- Status: Proposed. The direction is decided; this document is not yet sound
+  enough to accept. Consent has no success criterion (see Decision), the
+  post-flip search arity depends on a filter primitive ADR-0020 says does not
+  exist, and the blast-radius analysis below is new and unreviewed.
 - Date: 2026-08-04
 - Supersedes: the READ-isolation half of
   [ADR-0009](0009-mesh-read-isolation-presence-vs-content.md) and
   [ADR-0003](0003-seat-node-central-private-memory.md)'s "reads never cross seat
-  nodes". Both remain in force for everything else they say.
+  nodes". Both remain in force for everything else they say. Also supersedes
+  [ADR-0011](0011-shared-session-traces.md)'s statement that "reads never cross
+  seat Nodes holds literally and without exception", and the CONTEXT.md glossary
+  entries asserting that seats cannot read each other's Nodes. Those become
+  false on merge and must be revised in the same change.
 - Unaffected: [ADR-0007](0007-seat-capture-promotion-write-policy.md). The write
   path does not change.
 - Relates to: [ADR-0011](0011-shared-session-traces.md),
@@ -65,10 +71,15 @@ and promotion becomes more load-bearing under this ADR, not less.
   boundary moves from "whose Node is it" to "what did you declare this directory
   to be", which is both more permissive and more defensible, because the person
   who owns the content made the declaration.
-- **The privacy promise is retired explicitly, not quietly.** ADR-0009 rejected
-  this option partly because a promise was made to the team mid-rollout. That
-  promise is withdrawn by telling the team before anything changes and giving
-  them the chance to re-tag, not by shipping a flag. Consent is a precondition.
+- **The privacy promise is retired explicitly, not quietly, and consent has a
+  definition.** ADR-0009 rejected this option partly because a promise was made
+  to the team mid-rollout. Withdrawing it requires all of: every current seat
+  holder is told in writing before any code changes; each is given a stated
+  window to re-tag or purge their own **Node**; and each acknowledges. A seat
+  holder who declines keeps their **Node** private, which the per-deployment
+  setting already permits at seat granularity, so one refusal does not veto the
+  change and does not force anyone to publish. Silence is not consent, and an
+  unacknowledged seat stays private by default.
 - **This is masumi's policy, not the product's only policy.** The isolation
   mechanism is kept and the default is what changes. Any future deployment
   serving another organisation may need genuine isolation, so the behaviour is a
@@ -78,14 +89,33 @@ and promotion becomes more load-bearing under this ADR, not less.
   exposes material people would have tagged differently had they known. See the
   sequencing note on the backlog below.
 
-**On the pentest posture**
+**On the pentest posture, and on blast radius**
 
-ADR-0009's second objection stands and is answered by scope, not by dismissal.
 Nothing here weakens authentication, the dataset allowlist as a *write* gate,
-the no-existence-oracle property of drill-down, or **Seat Presence**. What
-changes is one predicate: whether a **Seat** may read another **Seat**'s
-`org-work` content. The security posture that must get *stronger* is the
-carve-out, because it inherits the whole burden the seat boundary used to carry.
+the no-existence-oracle property of drill-down, or **Seat Presence**. In terms
+of which predicate changes, the answer is one: whether a **Seat** may read
+another **Seat**'s `org-work` content.
+
+That framing is not the real objection, and an earlier draft of this ADR stopped
+there. ADR-0009's pentest concern is **blast radius**, and this decision
+increases it. Before: a stolen or leaked seat token reads one **Node** plus
+**Central**. After: the same token reads the whole organisation's `org-work`
+working memory. Nothing about the attack gets easier; everything about the
+consequence gets larger. That is the actual cost of the decision and it is
+accepted deliberately rather than argued away.
+
+Three things follow, and they are conditions of the change rather than optional
+hardening. Token lifetime and rotation must be revisited, because a
+never-expiring token now holds a materially larger prize; the existing
+long-lived admin tokens that bypass dataset gates are the sharpest case and are
+tracked separately. Detection matters more than it did: reading an entire
+organisation's memory through one token should be visible in telemetry, which is
+one of the few places this decision and ADR-0022 genuinely reinforce each other.
+And the carve-out has to get stronger, because it inherits the whole burden the
+seat boundary used to carry.
+
+A reader weighing this ADR should weigh that trade explicitly: the vault becomes
+more useful to twelve people and more valuable to one attacker.
 
 **Consequences**
 
@@ -104,15 +134,21 @@ carve-out, because it inherits the whole burden the seat boundary used to carry.
   tags. Each seat holder then reviews their own **Node** and releases what they
   choose. This avoids both an impossible audit and a retroactive consent
   violation, and it puts the judgement with the person who created the content.
-- **The search fan-out should collapse, not multiply.** `resolve_search_datasets`
-  (`kb/server.py:1702-1727`) returns three datasets for a seat today. The naive
-  reading of this ADR is to add every seat, which would multiply ADR-0020's
-  exact-scan cost linearly. The correct reading is the opposite: if everything is
-  readable, partitioning the *search* buys nothing, and `dataset` becomes a
-  per-document attribute for provenance and filtering. All datasets already share
-  one `DocumentChunk_text` collection with no filter passed, so the partition is
-  already logical rather than physical. This is ADR-0020's remedy reached from
-  the other direction.
+- **The search fan-out shrinks to two, not to one, and even that is not free.**
+  `resolve_search_datasets` (`kb/server.py:1702-1727`) returns three datasets for
+  a seat today. The naive reading of this ADR is to add every seat, which would
+  multiply ADR-0020's exact-scan cost linearly. But the opposite reading, that
+  the fan-out collapses to a single unfiltered scan, is also wrong and an earlier
+  draft of this ADR claimed it. "Everything is readable" is false under this
+  ADR's own decisions at every point in time after the flip: `personal` roots
+  stay private, and the whole pre-flip backlog stays seat-private permanently.
+  A reader's set is therefore the shared `org-work` pool plus their own private
+  partition, which is not one contiguous region. One unfiltered scan would
+  over-return other seats' private rows. The honest floor is **two** scans, or
+  one scan plus a vector-layer filter. ADR-0020 establishes that no filter
+  currently reaches the vector layer, so the cheaper option's prerequisite does
+  not exist yet. The post-flip arity must be settled before ADR-0020's latency
+  model can be trusted, because that model assumes an arity nobody has fixed.
 - **Some behaviour previously recorded as defective becomes the
   specification** for `org-work` content, while remaining defective with respect
   to the private partition. That asymmetry is precisely why the partition must
@@ -124,9 +160,13 @@ carve-out, because it inherits the whole burden the seat boundary used to carry.
   before extending demotion to seat datasets would make cross-seat consumption
   *less* honest than today. Note also that ADR-0011's TTL and `citadel unshare`
   were never implemented, so the retraction story it describes does not exist.
-- **`author_seat` becomes attested.** Today it is parsed from the body. Derived
-  from the dataset name it is a fact the server knows, which is a genuine
-  improvement that arrives free with this change.
+- **`author_seat` needs a source that survives this change, and the dataset
+  name is not it.** Today it is parsed from the body, which is forgeable. Reading
+  it from the dataset name would be attested, but only while each seat has its
+  own dataset; if `org-work` content merges into one shared pool, the dataset
+  name stops identifying an author. Attribution must therefore come from a
+  per-document field written at ingest, not from the partition layout. This is
+  unresolved and blocks the traceability the decision is partly motivated by.
 - **Tests are split, not inverted.** The same chokepoint gates reads and writes,
   and several tests assert both in one body. Inverting them wholesale would
   silently delete write-isolation coverage, which is this codebase's documented

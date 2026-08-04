@@ -1,7 +1,12 @@
-# Telemetry Is Self-Hosted, Because A Redactor Would Be Security-Critical Code
+# Telemetry Is Self-Hosted So A Control Failure Stays Inside The Node
 
 - Status: Accepted
 - Date: 2026-08-04
+- Provenance: claims about external projects (OpenLIT, ClickHouse, Grafana
+  Cloud, Tetragon, RisingWave, Promscale) are REPORTED from vendor docs and
+  source read on 2026-08-04, not re-derived here. Claims citing `kb/` paths are
+  VERIFIED. Cost figures are estimates, not quotes. ADR-0020's tagging standard
+  applies to this document too.
 - Relates to: [ADR-0009](0009-mesh-read-isolation-presence-vs-content.md),
   [ADR-0015](0015-one-process-owns-the-graph.md).
 - Design detail: `docs/superpowers/specs/2026-08-04-citadel-observability-design.md`.
@@ -39,6 +44,14 @@ instrumentation and swap the viewer.
 - **The UI is the tool's own**, run as its own service, not rebuilt inside
   Citadel. The frontend already exists twice (`kb/static/app.js` and the `web/`
   Next.js port); a dashboard built in either would have to be built twice.
+- **The telemetry UI is admin-only and gets no public domain until that is
+  enforced.** Even with content capture off, spans carry dataset names, seat
+  identifiers, and per-seat query timing and volume. That is exactly the
+  presence-versus-content line ADR-0009 draws, and a trace backend is a shared
+  reader. ADR-0020 criticised cognee's `queries` table as a privacy surface
+  nobody chose; this ADR must not create a second one by default. Until the
+  authentication story is verified, the service is reachable only over Railway's
+  private network.
 
 **Why not a free hosted backend**
 
@@ -49,12 +62,17 @@ OpenTelemetry Collector could make export safe in principle: the `redaction`
 processor with `allow_all_keys:false` deletes any attribute not explicitly
 listed.
 
-It was rejected because that redactor becomes security-critical code, and this
-repository has three confirmed cases of guards that shipped inert. A redactor
-that silently passes everything looks identical to one that is working, and the
-cost of being wrong is content leaving the node. Self-hosting removes the
-boundary instead of guarding it. Paying $25 to $45 a month is cheaper than
-building a filter and continuously proving it still fires.
+It was rejected on irreversibility, not on a general objection to guards. A
+redactor that silently passes everything looks identical to one that is working,
+and the cost of being wrong is content that has left the node and cannot be
+recalled. Self-hosting does not remove the need for a guard; it shrinks the
+guard and shrinks what a failure costs. That distinction matters, because this
+ADR still relies on guards: `capture_message_content=False` is itself a
+redaction control, and ADR-0021's safety case rests on a regex secret scanner.
+An argument that forbade guards outright would forbid those too. The claim here
+is narrower and survives: when a control fails, prefer the failure that stays
+inside your own infrastructure. Cost is a secondary consideration, and the
+estimate omits the operating burden of running ClickHouse in a small team.
 
 **Consequences**
 

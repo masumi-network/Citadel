@@ -92,13 +92,19 @@ counter reports and no code review would surface. The defect is an absence.
      dataset count and keeps recall exact. It was previously demoted to a
      "cost-to-fix probe", which was wrong: a rule that measures only index arms
      can select HNSW when a filter beats it on every axis.
-     AMENDED by [ADR-0021](0021-seat-nodes-are-mutually-readable.md): this was
-     also justified as closing the ADR-0009 isolation gap, and for `org-work`
-     content it no longer is, because that content is meant to be mutually
-     readable. The security justification survives only for the private
-     partition ADR-0021 requires. Note that ADR-0021 reaches this same remedy
-     from the opposite direction: if everything is readable, partitioning the
-     *search* buys nothing and the fan-out collapses to one scan.
+     AMENDED by [ADR-0021](0021-seat-nodes-are-mutually-readable.md), which
+     withdraws BOTH of this intervention's justifications for `org-work`
+     content. The security ground goes first: that content is meant to be
+     mutually readable, so a filter no longer closes an isolation gap for it.
+     The latency ground goes with it, and an earlier version of this amendment
+     missed that. A dataset filter shrinks a scan only when the reader's
+     entitlement is narrower than the collection; once `org-work` is readable by
+     everyone, filtering to it removes almost nothing. Both justifications
+     survive ONLY for the private partition ADR-0021 requires, whose reader set
+     genuinely is narrower. Consequence for this ADR's own numbers: the
+     post-flip search arity is unsettled (ADR-0021 puts the floor at two scans,
+     not one), and every latency figure here assumes an arity nobody has fixed.
+     The arity must be decided before this harness's results mean anything.
   Sequencing matters and runs this way round: adopting HNSW first makes filtered
   retrieval harder, since a filtered ANN search must over-fetch and loses recall
   in a way a filtered exact scan does not.
