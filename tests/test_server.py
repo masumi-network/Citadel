@@ -6733,3 +6733,112 @@ def test_corpus_census_rejects_unauthenticated_callers() -> None:
     client = TestClient(app, base_url="https://testserver")
 
     assert client.get("/api/corpus").status_code == 401
+
+
+def test_api_mesh_publishes_the_real_graph_edge_total_not_the_projection() -> None:
+    """`stats.edges` must come from the graph, not from the in-memory projection.
+
+    This pins the PRODUCER half of the #232 fix. `_corpus_health` supplies
+    `indexed_edges` and `kb/mesh.py` consumes it with a silent fallback to
+    `len(self.edges)`, so reverting the producer alone changes nothing that any
+    other test observes: every mesh unit test injects the corpus dict directly.
+    That is the shape a guard takes when it ships inert.
+
+    The projection and the graph are given deliberately different edge counts,
+    so the assertion can only pass when the real total is the one published.
+    Live production before the fix: `stats.edges` 5511 against 131843 real, and
+    5511 was byte-identical to `since_restart.projection_edges`.
+    """
+    real_edges = 131843
+
+    class PopulatedCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 21086, "edges": real_edges}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 49, "tracked_files": 69, "issue_count": 200}
+
+    client = authed_client("test-reader")
+    app.state.citadel = PopulatedCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    stats = client.get("/api/mesh").json()["stats"]
+    projection = stats["since_restart"]["projection_edges"]
+
+    assert projection != real_edges, (
+        "the fixture no longer discriminates: the projection and the graph agree, "
+        "so this test would pass with the producer reverted"
+    )
+    assert stats["edges"] == real_edges, (
+        f"stats.edges is {stats['edges']}, the in-memory projection, not the "
+        f"graph's {real_edges}. _corpus_health stopped supplying indexed_edges "
+        "and kb/mesh.py fell back silently."
+    )
+    assert stats["tracked_sources"] == 318
+
+
+def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
+    """A pass that did no work must not be stamped onto the source.
+
+    `run()` returns `skipped: True` when another pass already holds the state
+    file. That result carries no checked_at and no counts, so recording it marks
+    the source "synced" for a pass that ingested nothing: the bookkeeping-success
+    failure mode this repo has produced more than once.
+
+    The control run comes FIRST and must record. Without it this test asserts an
+    empty list against a spy that may never have been wired to the object the
+    route actually uses, which is exactly how the first version of it passed with
+    the guard removed.
+    """
+    recorded: list[dict[str, Any]] = []
+
+    class ScriptedSyncer:
+        def __init__(self, result: dict[str, Any]) -> None:
+            self._result = result
+
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_files": 0}
+
+        async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+            return dict(self._result, dry_run=dry_run)
+
+    admin = authed_client("test-admin")
+    mesh = server_module.get_mesh()
+    original = mesh.record_repo_content_sync
+
+    async def spy(config: Any, result: dict[str, Any]) -> None:
+        recorded.append(result)
+
+    mesh.record_repo_content_sync = spy  # type: ignore[method-assign]
+    try:
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {"ok": True, "enabled": True, "files_ingested": 2, "repositories": []}
+        )
+        control = admin.post("/api/repo-content-sync/run", json={})
+        assert control.status_code == 200
+        assert len(recorded) == 1, (
+            "the spy never fired on a real pass, so this test cannot detect the "
+            "defect it exists for: it is not wired to the object the route uses"
+        )
+
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {
+                "ok": True,
+                "enabled": True,
+                "skipped": True,
+                "reason": "repo_content_sync_already_running",
+            }
+        )
+        response = admin.post("/api/repo-content-sync/run", json={})
+    finally:
+        mesh.record_repo_content_sync = original  # type: ignore[method-assign]
+
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert len(recorded) == 1, (
+        "a skipped pass was recorded to the mesh, stamping the source 'synced' "
+        f"with no checked_at and no counts: {recorded[1:]}"
+    )
