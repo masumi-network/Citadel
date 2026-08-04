@@ -50,7 +50,11 @@ from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, matched_capture_root
 from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPublishError
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
-from kb.cognee_client import assert_cognee_dataset_api
+from kb.cognee_client import (
+    assert_cognee_dataset_api,
+    background_cognify_stats,
+    ingest_indexing_state,
+)
 from kb.config import CitadelConfig
 from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
@@ -4431,8 +4435,22 @@ async def readyz(request: Request) -> Any:
     config = get_citadel().config
     corpus = await _corpus_health()
     canary = _LAST_CANARY
+    # Three distinct canary states, because "never ran" and "passed" used to
+    # answer identically: _LAST_CANARY is written only by the evolve scheduler,
+    # which is off by default, so a node that never exercised the end-to-end
+    # ingest+cognify+search check reported the same green as one that proved
+    # it. "never_ran" is reported, not failed — readiness gates rotation, and
+    # 503ing every default-config node would take healthy nodes out of service,
+    # which is worse than the gap. A probe that wants the stronger guarantee
+    # must branch on canary_state, which now exists for exactly that.
+    if canary is None:
+        canary_state = "never_ran"
+    elif canary.get("ok"):
+        canary_state = "passed"
+    else:
+        canary_state = "failed"
     # RED when the corpus gate trips or the last end-to-end canary failed.
-    ok = corpus["ok"] and (canary is None or bool(canary.get("ok", True)))
+    ok = corpus["ok"] and canary_state != "failed"
     payload = {
         "ok": ok,
         "service": "citadel",
@@ -4442,6 +4460,12 @@ async def readyz(request: Request) -> Any:
         "build_global_context_index": config.build_global_context_index,
         "corpus": corpus,
         "canary": canary,
+        "canary_state": canary_state,
+        # Observed outcomes of the detached post-ingest graph writes. A node
+        # whose scheduled cognifies never complete shows runs_scheduled
+        # climbing while runs_completed stays flat — previously that node and
+        # a healthy one were indistinguishable on every HTTP surface.
+        "background_cognify": background_cognify_stats(),
     }
     return JSONResponse(payload, status_code=200 if ok else 503)
 
@@ -5239,6 +5263,15 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
                 "document_id": accepted["document_id"],
                 "accepted": ingest_result.accepted,
                 "reason": ingest_result.reason,
+                # `accepted` says the store took the add; the graph write that
+                # makes the note searchable is asynchronous. This is the
+                # disposition of that request ("scheduled"/"deferred"/
+                # "suppressed"/"unknown"), never a confirmation.
+                "indexing": (
+                    ingest_indexing_state(ingest_result.cognee_result)
+                    if ingest_result.accepted
+                    else None
+                ),
                 "dataset": ingest_result.dataset,
                 "tags": list(ingest_result.tags),
             }
@@ -6059,15 +6092,23 @@ async def ingest(body: IngestBody, request: Request) -> Any:
         },
     )
     payload = jsonable_encoder(result)
+    # `accepted` describes the add request; the graph write that makes the
+    # data searchable is asynchronous. Report the disposition of that request
+    # explicitly so no caller reads acceptance as "indexed". Only the inline
+    # cognify below OBSERVES an outcome and may overwrite this.
+    if result.accepted:
+        payload["indexing"] = ingest_indexing_state(result.cognee_result)
     # Inline cognify (opt-in) so the just-written data is immediately searchable.
     # The write already succeeded; a cognify failure must NOT fail the ingest.
     if body.cognify and result.accepted:
         try:
             await citadel.cognify_dataset(dataset=outcome.dataset)
             payload["cognified"] = True
+            payload["indexing"] = "completed"
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee state
             logger.error("inline cognify after ingest failed: %s", exc.__class__.__name__)
             payload["cognified"] = False
+            payload["indexing"] = "failed"
     return payload
 
 
@@ -6405,6 +6446,25 @@ async def contribute(body: ContributeBody, request: Request) -> Any:
         {
             "ok": True,
             "accepted": accepted,
+            # Disposition of the asynchronous graph-indexing request behind
+            # the accepted add(s) — never a confirmation that anything became
+            # searchable. None when nothing was accepted. Read from an
+            # ACCEPTED ingest because `accepted` is any-of-chunks and a
+            # rejected primary carries no outcome to observe.
+            "indexing": (
+                ingest_indexing_state(
+                    next(
+                        (
+                            result.cognee_result
+                            for result in outcome.all_ingests
+                            if result.accepted
+                        ),
+                        None,
+                    )
+                )
+                if accepted
+                else None
+            ),
             "chunks": outcome.accepted_chunks,
             "conflict": outcome.conflict,
             "dataset": outcome.dataset,

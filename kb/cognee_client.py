@@ -6,7 +6,7 @@ import contextvars
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from time import monotonic, perf_counter
 from typing import Any, Protocol
@@ -18,6 +18,93 @@ logger = logging.getLogger(__name__)
 # Strong refs to detached background cognify tasks so the loop does not GC them
 # mid-flight (and so they can be awaited/observed in tests).
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
+
+# OBSERVED outcomes of the detached background cognifies (process-lifetime).
+# remember() returns before the graph write in every branch, so an ingest-time
+# surface can only ever report that a cognify was REQUESTED. These counters are
+# where the request and its outcome stop being the same number: on a working
+# node runs_completed tracks runs_scheduled; on a node whose detached tasks die
+# (or never get a loop) the two diverge. Surfaced via /readyz so the divergence
+# is visible on the wire instead of only in a log line.
+_BACKGROUND_COGNIFY_STATS: dict[str, Any] = {
+    "runs_scheduled": 0,
+    "runs_completed": 0,
+    "runs_failed": 0,
+    # The no-running-loop branch of schedule_cognify: data stored, cognify
+    # never even scheduled. Previously a single error log was the only trace.
+    "runs_not_scheduled": 0,
+    "last_scheduled_at": None,
+    "last_completed_at": None,
+    "last_failed_at": None,
+    "last_error": None,
+}
+
+
+def background_cognify_stats() -> dict[str, Any]:
+    """Snapshot of observed background-cognify outcomes.
+
+    Counts what actually happened (completed/failed), next to what was merely
+    requested (scheduled), so a reader can tell a node that indexes from one
+    that only queues.
+    """
+    return dict(_BACKGROUND_COGNIFY_STATS)
+
+
+def _stamp_cognify_stat(event: str, *, error: str | None = None) -> None:
+    _BACKGROUND_COGNIFY_STATS[f"runs_{event}"] += 1
+    now = datetime.now(timezone.utc).isoformat()
+    if event == "scheduled":
+        _BACKGROUND_COGNIFY_STATS["last_scheduled_at"] = now
+    elif event == "completed":
+        _BACKGROUND_COGNIFY_STATS["last_completed_at"] = now
+    elif event in {"failed", "not_scheduled"}:
+        _BACKGROUND_COGNIFY_STATS["last_failed_at"] = now
+        _BACKGROUND_COGNIFY_STATS["last_error"] = error
+
+
+def ingest_indexing_state(cognee_result: Any) -> str:
+    """Disposition of the graph-indexing request behind an accepted ingest.
+
+    ``"scheduled"`` / ``"deferred"`` / ``"suppressed"`` describe what happened
+    to the cognify REQUEST — none of them mean the content is searchable yet,
+    because remember() returns before the graph write in every branch.
+    ``"unknown"`` is the explicit fallback when the outcome payload carries no
+    observation at all (older writers, fakes, results stripped in transport):
+    callers must surface it rather than defaulting to the optimistic value.
+    """
+    if isinstance(cognee_result, Mapping):
+        disposition = cognee_result.get("cognify")
+        if isinstance(disposition, str) and disposition:
+            return disposition
+        if cognee_result.get("background_cognify"):
+            return "scheduled"
+    return "unknown"
+
+
+def _remember_result(
+    added: Any, *, cognify: str, background_cognify: bool = False
+) -> dict[str, Any]:
+    """Uniform remember() outcome: what was observed vs what was requested.
+
+    Every branch of remember() returns BEFORE the graph write happens
+    (suppressed: another process cognifies later; deferred: the caller
+    schedules one; scheduled: a detached background task runs later), so
+    ``indexed`` is always False here and ``cognify`` records only the
+    disposition of the indexing request. A caller that needs the real outcome
+    must observe it (the repo-sync cognee_data_ids guard, the census chunk
+    count, :func:`background_cognify_stats`) instead of reading acceptance as
+    "in the index" — which is how 892 accepted documents sat unfindable at
+    chunk_count 0 while every counter reported success.
+    """
+    result: dict[str, Any] = {
+        "added": added,
+        "cognify": cognify,
+        "indexed": False,
+        "status": f"indexing_{cognify}",
+    }
+    if background_cognify:
+        result["background_cognify"] = True
+    return result
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -524,16 +611,16 @@ class CogneePublicClient:
         #    writer lock (kept non-blocking for the caller, #56), so concurrent
         #    in-process ingests and the evolve scheduler never collide.
         if _suppress_inline_cognify():
-            return {"added": added, "cognify": "suppressed"}
+            return _remember_result(added, cognify="suppressed")
         if defer_cognify:
             # The caller (e.g. a bulk Linear resync) coalesces ONE cognify over every
             # dataset it touched at the end, instead of scheduling one-per-write — a
             # 200-issue resync otherwise fires 200 background cognifies that storm the
             # writer lock and starve the request (#46/#52). Add-only here; the caller
             # calls schedule_cognify() once when the batch is done.
-            return {"added": added, "cognify": "deferred"}
+            return _remember_result(added, cognify="deferred")
         self._schedule_background_cognify(dataset_name)
-        return {"added": added, "background_cognify": True}
+        return _remember_result(added, cognify="scheduled", background_cognify=True)
 
     def _schedule_background_cognify(self, dataset_name: str) -> None:
         """Schedule a tracked, writer-lock-guarded cognify so ingest stays fast.
@@ -569,13 +656,15 @@ class CogneePublicClient:
                 "is stored but will not be searchable until a cognify runs.",
                 wanted,
             )
+            _stamp_cognify_stat("not_scheduled", error="no_running_event_loop")
             return
 
         async def _run() -> None:
             try:
                 await self.cognify(datasets=wanted)
-            except Exception:  # noqa: BLE001 - background task: log, never crash the loop
+            except Exception as exc:  # noqa: BLE001 - background task: log, never crash the loop
                 logger.exception("background cognify for datasets %s failed", wanted)
+                _stamp_cognify_stat("failed", error=exc.__class__.__name__)
             else:
                 # Log SUCCESS too. Previously only failures were logged, so a
                 # cognify that never ran — because the process exited before this
@@ -583,8 +672,14 @@ class CogneePublicClient:
                 # from one that completed. That is how a whole repository stayed
                 # missing from the index while every surface reported it synced.
                 logger.info("background cognify finished for datasets %s", wanted)
+                _stamp_cognify_stat("completed")
 
         task = loop.create_task(_run())
+        # Observed request/outcome ledger: `scheduled` is stamped here, and only
+        # _run() itself can stamp `completed`/`failed` — so a task that dies
+        # unrun leaves a visible scheduled-minus-completed gap instead of
+        # nothing.
+        _stamp_cognify_stat("scheduled")
         _BACKGROUND_COGNIFY_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_COGNIFY_TASKS.discard)
 

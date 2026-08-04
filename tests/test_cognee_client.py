@@ -998,7 +998,12 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
     assert isinstance(captured["data"], DataItem)
     assert captured["data"].data == "real digest"
     assert captured["data"].external_metadata == {"citadel_tags": ["github"]}
-    assert result == {"added": {"ok": True}, "cognify": "suppressed"}
+    assert result == {
+        "added": {"ok": True},
+        "cognify": "suppressed",
+        "indexed": False,
+        "status": "indexing_suppressed",
+    }
 
 
 @pytest.mark.asyncio
@@ -1031,7 +1036,13 @@ async def test_remember_schedules_lock_guarded_background_cognify(monkeypatch: A
     client = CogneePublicClient()
 
     result = await client.remember("note", dataset_name="seat:sarthi", tags=())
-    assert result == {"added": {"ok": True}, "background_cognify": True}
+    assert result == {
+        "added": {"ok": True},
+        "cognify": "scheduled",
+        "indexed": False,
+        "status": "indexing_scheduled",
+        "background_cognify": True,
+    }
     # Drain the scheduled background cognify and confirm it ran via cognify().
     await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == [["seat:sarthi"]]
