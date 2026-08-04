@@ -1172,7 +1172,16 @@ def create_mcp_server(
         ctx: Context,
         top_k: int = 10,
     ) -> dict[str, Any]:
-        """Search org-wide Linear issues synced to shared Central."""
+        """Search org-wide Linear issues synced to shared Central.
+
+        Scoped server-side to hits the Linear syncer wrote (`source=linear-issue`),
+        so a repo document that merely discusses Linear is not returned. The scope
+        is read from the issue header at the start of the document, which is body
+        text and therefore author-influenced: it selects what to search, it
+        attests nothing. The `filtering` block in the response reports how many
+        candidates the scope kept. The Linear workspace DIGEST carries no
+        per-issue header and is excluded; use citadel_search for it.
+        """
         return await _call_async(
             "citadel_linear_search",
             lambda: resolve_client(ctx).post(
@@ -1181,6 +1190,10 @@ def create_mcp_server(
                     "query": _require_non_empty(query, "query"),
                     "dataset": "masumi-network",
                     "top_k": _clamp_top_k(top_k),
+                    # Dataset alone is not a scope: shared Central holds every
+                    # synced source, so an unfiltered search here answered a
+                    # Linear question with another repo's documentation.
+                    "source": "linear-issue",
                 },
                 tool_name="citadel_linear_search",
             ),

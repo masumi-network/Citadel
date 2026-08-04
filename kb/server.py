@@ -828,6 +828,10 @@ class SearchBody(BaseModel):
     types: list[str] | None = None
     repo: str | None = Field(default=None, max_length=200)
     path: str | None = Field(default=None, max_length=400)
+    # Which syncer wrote the hit (``linear-issue``, ``repo-content``): the scope
+    # a source-specific tool needs. Fail-closed — a hit that cannot say where it
+    # came from never satisfies it.
+    source: str | None = Field(default=None, max_length=64)
     canonical_only: bool = False
     exclude_ambient: bool = False
     mode: str | None = Field(default=None, max_length=32)
@@ -851,6 +855,11 @@ class SearchBody(BaseModel):
             "types": self.cleaned_types(),
             "repo": self.repo.strip() if isinstance(self.repo, str) and self.repo.strip() else None,
             "path": self.path.strip() if isinstance(self.path, str) and self.path.strip() else None,
+            "source": (
+                self.source.strip().lower()
+                if isinstance(self.source, str) and self.source.strip()
+                else None
+            ),
             "canonical_only": bool(self.canonical_only),
             "exclude_ambient": exclude_ambient,
         }
