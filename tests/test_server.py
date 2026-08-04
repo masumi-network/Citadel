@@ -22,7 +22,7 @@ from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.mesh import MeshState
-from kb.models import FeedbackResult, IngestResult
+from kb.models import INDEX_STATE_PENDING, FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
 from kb.server import app
 
@@ -39,7 +39,17 @@ class FakeCitadel:
     )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
-        return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
+        # What the real Citadel.ingest returns for an ordinary write: stored,
+        # with the graph write still owed. A fake that left index_state at the
+        # default would let every /ingest response look unobservable rather
+        # than merely not-yet-observed.
+        return IngestResult(
+            True,
+            "accepted",
+            kwargs["dataset"] or "notes",
+            tuple(kwargs["tags"]),
+            index_state=INDEX_STATE_PENDING,
+        )
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
@@ -1153,10 +1163,17 @@ def test_ingest_inline_cognify_flag() -> None:
     plain = client.post("/ingest", json={"data": "note one", "tags": []})
     assert plain.status_code == 200
     assert "cognified" not in plain.json()
+    # Without an inline cognify nothing has watched the graph write, so the
+    # write may not be reported as indexed — `accepted` covers the request only.
+    assert plain.json()["accepted"] is True
+    assert plain.json()["indexed"] is not True
     # cognify=True → the Node cognifies inline (server-side) and reports it.
     with_cognify = client.post("/ingest", json={"data": "note two", "tags": [], "cognify": True})
     assert with_cognify.status_code == 200
     assert with_cognify.json()["cognified"] is True
+    # And only THAT run may claim the note is indexed, because it observed it.
+    assert with_cognify.json()["index_state"] == "indexed"
+    assert with_cognify.json()["indexed"] is True
 
 
 def test_ingest_and_contribute_reject_oversized_payloads(monkeypatch: Any) -> None:
@@ -2526,14 +2543,14 @@ def test_readyz_ok_when_graph_populated() -> None:
     assert ready.json()["corpus"]["ok"] is True
 
 
-def test_readyz_reports_canary_never_ran_as_distinct_state() -> None:
-    # A node that never ran the end-to-end canary and one that passed it used
-    # to answer with the same ok bit: _LAST_CANARY is written only by the
-    # evolve scheduler, which is off by default. "never_ran" is now an
-    # explicit, branchable state. It is reported, NOT failed — 503ing every
-    # default-config node would evict healthy nodes from rotation, which is
-    # worse than the gap.
-    import kb.server as server_module
+def test_readyz_publishes_the_observed_background_cognify_ledger() -> None:
+    # Every ingest surface returns BEFORE the graph write, so none of them can
+    # report that a document became findable. The detached cognify that would
+    # make it findable used to leave no trace on any HTTP surface: a node whose
+    # background tasks all died answered /readyz identically to one indexing
+    # everything. The ledger is where the request count and the outcome count
+    # stop being the same number.
+    import kb.cognee_client as cognee_client_module
 
     class PopulatedCitadel(FakeCitadel):
         async def _graph_counts(self) -> dict[str, int]:
@@ -2549,34 +2566,19 @@ def test_readyz_reports_canary_never_ran_as_distinct_state() -> None:
     app.state.repo_content_syncer = BusySyncer()
     app.state.linear_syncer = BusySyncer()
 
-    original = server_module._LAST_CANARY
-    try:
-        server_module._LAST_CANARY = None
-        ready = client.get("/readyz")
-        assert ready.status_code == 200
-        body = ready.json()
-        assert body["ok"] is True
-        assert body["canary"] is None
-        assert body["canary_state"] == "never_ran"
-        # The observed background-cognify ledger rides along, so a node whose
-        # scheduled graph writes never complete is visible on the wire.
-        assert "background_cognify" in body
-        assert "runs_scheduled" in body["background_cognify"]
-        assert "runs_completed" in body["background_cognify"]
+    body = client.get("/readyz").json()
+    ledger = body["background_cognify"]
+    for counter in ("runs_scheduled", "runs_completed", "runs_failed", "runs_not_scheduled"):
+        assert counter in ledger, counter
 
-        server_module._LAST_CANARY = {"ok": True, "search_hit": True}
-        body = client.get("/readyz").json()
-        assert body["ok"] is True
-        assert body["canary_state"] == "passed"
-
-        server_module._LAST_CANARY = {"ok": False, "search_hit": False}
-        ready = client.get("/readyz")
-        assert ready.status_code == 503
-        body = ready.json()
-        assert body["ok"] is False
-        assert body["canary_state"] == "failed"
-    finally:
-        server_module._LAST_CANARY = original
+    # A scheduled run that never completes must MOVE the two counters apart.
+    before = (ledger["runs_scheduled"], ledger["runs_completed"])
+    cognee_client_module._stamp_cognify_stat("scheduled")
+    after_body = client.get("/readyz").json()["background_cognify"]
+    assert (after_body["runs_scheduled"], after_body["runs_completed"]) == (
+        before[0] + 1,
+        before[1],
+    )
 
 
 def test_search_across_datasets_runs_concurrently() -> None:

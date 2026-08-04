@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from hashlib import sha256
 import logging
 import re
@@ -11,7 +11,13 @@ from typing import Any
 from kb.cognee_client import CogneeGateway, CogneePublicClient
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
-from kb.models import FeedbackRequest, FeedbackResult, IngestResult
+from kb.models import (
+    INDEX_STATE_REJECTED,
+    INDEX_STATE_UNKNOWN,
+    FeedbackRequest,
+    FeedbackResult,
+    IngestResult,
+)
 from kb.security_scan import (
     SecretContentError,
     SecurityScanEntry,
@@ -79,7 +85,13 @@ class Citadel:
             logger.info(
                 "Ingest rejected for dataset %s: %s", target_dataset, decision.reason
             )
-            return IngestResult(False, decision.reason, target_dataset, merged_tags)
+            return IngestResult(
+                False,
+                decision.reason,
+                target_dataset,
+                merged_tags,
+                index_state=INDEX_STATE_REJECTED,
+            )
 
         self._guard_content(data, target_dataset)
 
@@ -89,7 +101,13 @@ class Citadel:
             logger.info(
                 "Ingest rejected for dataset %s: duplicate_in_process", target_dataset
             )
-            return IngestResult(False, "duplicate_in_process", target_dataset, merged_tags)
+            return IngestResult(
+                False,
+                "duplicate_in_process",
+                target_dataset,
+                merged_tags,
+                index_state=INDEX_STATE_REJECTED,
+            )
         # Claimed BEFORE the await so two concurrent ingests of identical content
         # cannot both pass the check, and released again if the write fails. It
         # used to be added and never removed, so one failed remember() marked that
@@ -108,7 +126,26 @@ class Citadel:
         except BaseException:
             self._seen_ingest_keys.discard(ingest_key)
             raise
-        return IngestResult(True, "accepted", target_dataset, merged_tags, result)
+        # ``accepted`` says the WRITE was requested and cognee.add() returned.
+        # It says nothing about the graph write that makes the document
+        # retrievable, and cognify never runs synchronously here. Carry through
+        # what the client observed instead of letting every connector read
+        # ``accepted`` as "indexed" — an unreadable client result stays
+        # ``unknown``, never the optimistic value.
+        index_state = INDEX_STATE_UNKNOWN
+        data_ids: tuple[str, ...] = ()
+        if isinstance(result, Mapping):
+            index_state = str(result.get("index_state") or INDEX_STATE_UNKNOWN)
+            data_ids = tuple(str(item) for item in (result.get("data_ids") or ()))
+        return IngestResult(
+            True,
+            "accepted",
+            target_dataset,
+            merged_tags,
+            result,
+            index_state=index_state,
+            cognee_data_ids=data_ids,
+        )
 
     def _guard_content(self, data: str, dataset: str) -> None:
         """Block storing content that carries a blocking-severity secret.
@@ -134,6 +171,16 @@ class Citadel:
                 findings=scan.get("findings", []),  # type: ignore[arg-type]
             )
 
+    def resolve_search_dataset(self, dataset: str | None) -> str:
+        """The dataset ``search`` will actually read from.
+
+        Exposed because callers have to report which dataset a hit came out of
+        (it is the only attested provenance signal a local hit carries), and a
+        caller re-deriving ``dataset or default_dataset`` on its own drifts the
+        moment this rule changes.
+        """
+        return dataset or self.config.default_dataset
+
     async def search(
         self,
         query: str,
@@ -143,7 +190,7 @@ class Citadel:
         top_k: int = 10,
     ) -> list[Any]:
         top_k = min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
-        target_dataset = dataset or self.config.default_dataset
+        target_dataset = self.resolve_search_dataset(dataset)
         results = await self.cognee.recall(
             query,
             dataset=target_dataset,

@@ -94,3 +94,41 @@ def test_fetch_failure_skips_digest_but_keeps_policy(monkeypatch, capsys) -> Non
 def test_fetch_recent_refuses_non_https() -> None:
     with pytest.raises(ValueError, match="non-HTTPS"):
         sync_start.fetch_recent("http://node.example", "ctdl_x")
+
+
+# --- a swallowed digest failure still leaves a trace -------------------------
+
+
+def _receipt_text() -> str:
+    from kb.hooks.receipt import activity_log_path
+
+    path = activity_log_path()
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_a_swallowed_digest_failure_is_recorded(monkeypatch) -> None:
+    """"The vault had nothing recent" and "the fetch blew up" looked identical.
+
+    Both printed the policy and nothing else, so a dev whose warm-start context
+    silently stopped arriving had no way to find out.
+    """
+
+    def boom(*a, **k):
+        raise ConnectionError("timeout against a host we must not log")
+
+    monkeypatch.setenv(sync_start.TOKEN_ENV, "ctdl_x")
+    monkeypatch.setattr(sync_start, "fetch_recent", boom)
+    assert sync_start.run(io.StringIO("{}")) == 0
+    receipt = _receipt_text()
+    assert "ConnectionError" in receipt
+    assert "must not log" not in receipt
+    assert "ctdl_x" not in receipt
+    assert [line.split()[1] for line in receipt.splitlines() if line.split()] == ["start-error"]
+
+
+def test_a_quiet_successful_start_writes_no_receipt(monkeypatch) -> None:
+    """SessionStart runs constantly; only a real failure is worth a line."""
+    monkeypatch.setenv(sync_start.TOKEN_ENV, "ctdl_x")
+    monkeypatch.setattr(sync_start, "fetch_recent", lambda *a, **k: [])
+    assert sync_start.run(io.StringIO("{}")) == 0
+    assert _receipt_text() == ""

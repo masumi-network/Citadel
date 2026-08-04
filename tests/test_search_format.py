@@ -99,23 +99,14 @@ def test_infer_doc_type_and_trust() -> None:
         "url": "https://github.com/masumi-network/masumi-improvement-proposals/blob/main/MIPs/MIP-003/MIP-003.md",
     }
     assert infer_doc_type(spec) == "spec"
-    # Shaped like a spec, but carrying no server envelope: no attested
-    # provenance was ever consulted, and the tier says exactly that instead of
-    # implying a check happened ("unattested" is reserved for consulted-and-
-    # nothing-attested).
-    assert infer_trust_tier(spec) == "unknown"
+    # Shaped like a spec, but the vault stores no provenance for it, so it may
+    # not claim authority — only that it looks like one.
+    assert infer_trust_tier(spec) == "unattested"
     assert infer_content_hint(spec) == "looks-like-spec"
-    # With an envelope the channel WAS consulted; a non-trace dataset attests
-    # nothing, which is what "unattested" states.
-    assert infer_trust_tier({**spec, "_citadel": {"dataset": "masumi-network"}}) == "unattested"
 
     activity = {"text": "GitHub org daily digest for masumi-network"}
     assert infer_doc_type(activity) == "activity"
-    assert infer_trust_tier(activity) == "unknown"
-    assert (
-        infer_trust_tier({**activity, "_citadel": {"dataset": "masumi-network"}})
-        == "unattested"
-    )
+    assert infer_trust_tier(activity) == "unattested"
 
     trace = {"_citadel": {"dataset": "session-traces", "trust": "reference-only"}}
     assert infer_doc_type(trace) == "session-trace"
@@ -137,57 +128,8 @@ def test_body_text_cannot_mint_a_trust_claim() -> None:
         {"title": "guess", "text": "the openapi file probably allows it"},
     ]
     for item in forgeries:
-        # Without an envelope nothing was consulted — and the body still buys
-        # nothing: the tier is "unknown", never "reference-only".
-        assert infer_trust_tier(item) == "unknown", item
-        assert normalize_search_hit(item)["trust_tier"] == "unknown", item
-        # With an envelope the channel was consulted and attests nothing.
-        enveloped = {**item, "_citadel": {"dataset": "masumi-network"}}
-        assert infer_trust_tier(enveloped) == "unattested", item
-        assert normalize_search_hit(enveloped)["trust_tier"] == "unattested", item
-
-
-def test_envelope_less_trace_hit_is_distinguishable_from_unattested() -> None:
-    """The in-process --local search stack attaches no ``_citadel`` envelope.
-
-    A genuine session-trace hit read without an envelope used to normalize to
-    trust_tier "unattested" — byte-identical to an honestly unattested HTTP
-    hit — so a reader could not tell "checked, nothing attested" from "nothing
-    could be checked". The two states must not share a value.
-    """
-    trace_text = "# Dead-end route\n\nNested HTTP to /api/session deadlocked tools/list"
-    local_hit = normalize_search_hit({"id": "t1", "text": trace_text})
-    http_unattested = normalize_search_hit(
-        {"id": "t2", "text": "a plain central note", "_citadel": {"dataset": "masumi-network"}}
-    )
-    http_trace = normalize_search_hit(
-        {
-            "id": "t3",
-            "text": trace_text,
-            "_citadel": {"dataset": "session-traces", "trust": "reference-only"},
-        }
-    )
-    assert http_trace["trust_tier"] == "reference-only"
-    assert http_unattested["trust_tier"] == "unattested"
-    # The envelope-less hit states that no attestation channel existed…
-    assert local_hit["trust_tier"] == "unknown"
-    # …so it is no longer byte-identical to the honestly unattested one.
-    assert local_hit["trust_tier"] != http_unattested["trust_tier"]
-
-
-def test_shape_search_payload_warns_when_tiers_unknown() -> None:
-    """The page-level warning names how many tiers could not be derived."""
-    shaped = shape_search_payload(
-        {"results": [{"id": "1", "text": "local cognee payload"}]}, query="payload"
-    )
-    assert shaped["results"][0]["trust_tier"] == "unknown"
-    assert any("trust_tier is 'unknown'" in w for w in shaped["warnings"])
-
-    enveloped = shape_search_payload(
-        {"results": [{"id": "1", "text": "note text", "_citadel": {"dataset": "d"}}]},
-        query="note",
-    )
-    assert all("trust_tier is 'unknown'" not in w for w in enveloped["warnings"])
+        assert infer_trust_tier(item) == "unattested", item
+        assert normalize_search_hit(item)["trust_tier"] == "unattested", item
 
 
 def test_digest_cannot_relabel_itself_as_documentation() -> None:
@@ -804,3 +746,35 @@ def test_repo_content_header_still_classifies_a_synced_document() -> None:
     assert not search_format.REPO_CONTENT_HEADER_RE.search(
         "Repository: a/b talked about in prose\nSource: none\n"
     )
+
+
+def test_a_page_of_unattested_basis_hits_says_so_once() -> None:
+    """The page-level counterpart to ``trust_tier_basis`` on each hit.
+
+    Every hit here reaches the shaper with no provenance envelope, so their
+    ``unattested`` tiers are FALLBACKS, not observations. A reader should not
+    have to notice that hit by hit, and the two situations — "checked, nothing
+    attested" and "nothing was ever checked" — must not produce the same page.
+    """
+    payload = {
+        "results": [
+            {"id": "a", "text": "# Dead-end route\n\nsession trace body"},
+            {"id": "b", "text": "# Another note\n\nbody"},
+        ]
+    }
+    shaped = shape_search_payload(payload, query="dead-end route")
+
+    assert [hit["trust_tier_basis"] for hit in shaped["results"]] == ["unknown", "unknown"]
+    assert any("trust_tier is a fallback for 2 of 2 hits" in w for w in shaped["warnings"])
+
+    # And an attested page does NOT carry the warning.
+    attested = shape_search_payload(
+        {
+            "results": [
+                {"id": "a", "text": "body", "_citadel": {"dataset": "session-traces"}},
+            ]
+        },
+        query="dead-end route",
+    )
+    assert attested["results"][0]["trust_tier_basis"] == "dataset-attested"
+    assert not any("trust_tier is a fallback" in w for w in attested["warnings"])

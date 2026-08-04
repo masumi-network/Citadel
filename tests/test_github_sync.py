@@ -190,9 +190,11 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
     assert result["event_count"] == 1
     assert result["commit_count"] == 1
     assert result["ingested"] is True
-    # FakeCitadel returns no cognee outcome payload, so the indexing
-    # disposition must be the explicit "unknown" — never an implied success.
-    assert result["indexing"] == "unknown"
+    # `ingested` is the REQUEST. FakeCitadel returns no cognee outcome payload,
+    # so nothing about the graph write was observed: the state is the explicit
+    # "unknown" and `indexed` is null. Neither may read as success.
+    assert result["index_state"] == "unknown"
+    assert result["indexed"] is None
     assert result["improved"] is True
     assert "masumi-network/agent" in citadel.ingest_calls[0]["data"]
     assert "teach the archive about commits" in citadel.ingest_calls[0]["data"]

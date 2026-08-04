@@ -734,13 +734,13 @@ async def test_approve_pending_surfaces_the_write_reason(
     assert store.get_promotion_pending(item.id).status != "pending"
 
 
-async def test_decision_audit_states_the_user_approval_signal(
+async def test_decision_audit_states_the_user_confirmation_signal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """promotion.approve / promotion.reject events must state what the engine
-    was handed about user approval: the caller's signal, or the explicit
-    not_recorded marker. Never silence, because an absent field reads the same
-    as an event from before the field existed."""
+    """promotion.approve AND promotion.reject must state what the engine was
+    handed about user confirmation: the caller's reported answer, or the
+    explicit unknown marker. Never silence, because an absent field reads the
+    same as an event written before the field existed."""
     summary_a = (
         "# Capture summary: side project\n"
         "- Remote: `https://github.com/other-org/new-app.git`\n"
@@ -771,10 +771,11 @@ async def test_decision_audit_states_the_user_approval_signal(
         seat_slug=None,
     )
 
-    await engine.approve_pending(items[0].id, actor, user_approval="yes, promote it")
+    await engine.approve_pending(items[0].id, actor, user_confirmation="confirmed")
+    # No signal handed over: the trail records "unknown", not consent.
     await engine.reject_pending(items[1].id, actor)
 
     approve_event = store.recent_audit_events(action="promotion.approve")[0]
     reject_event = store.recent_audit_events(action="promotion.reject")[0]
-    assert approve_event["detail"]["user_approval"] == "yes, promote it"
-    assert reject_event["detail"]["user_approval"] == promotion.USER_APPROVAL_NOT_RECORDED
+    assert approve_event["detail"]["user_confirmation"] == "confirmed"
+    assert reject_event["detail"]["user_confirmation"] == promotion.USER_CONFIRMATION_UNKNOWN

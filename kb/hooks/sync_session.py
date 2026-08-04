@@ -252,10 +252,11 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[s
 def receipt_summary(response: dict[str, Any] | None) -> str:
     """Receipt line for a completed POST, mirroring the server's decision.
 
-    "captured" is claimed only on an explicit ``accepted: true`` — an
-    observation the server actually stated. A body that omits the field (or
-    carries a non-boolean) states no decision, and the receipt says storage is
-    unconfirmed rather than defaulting to the optimistic verdict.
+    Only an explicit ``accepted: true`` is reported as a capture. The test used
+    to be ``is not False``, which reads a MISSING key as success — so an older
+    Node, a proxy, or any response-shape change would have written "captured"
+    for a write nobody ever confirmed. A verdict we did not observe is unknown,
+    and unknown is not the optimistic value.
     """
     if response is None:
         return "session sent: server replied 2xx but the response body was unreadable"
@@ -265,7 +266,10 @@ def receipt_summary(response: dict[str, Any] | None) -> str:
     if accepted is False:
         reason = response.get("reason") or "rejected"
         return f"session not stored: server rejected the write ({reason})"
-    return "session sent: server reply had no accepted field; storage not confirmed"
+    return (
+        "session capture unconfirmed: the server's 2xx response did not state "
+        "whether the write was accepted"
+    )
 
 
 def _send_failure_summary(exc: BaseException) -> str:
@@ -281,12 +285,21 @@ def _send_failure_summary(exc: BaseException) -> str:
     return f"session not captured: send failed ({exc.__class__.__name__})"
 
 
-def _write_receipt(summary: str) -> None:
+# Receipt kinds. A capture attempt, a deliberate skip, and a crash are three
+# different events; they shared one kind (or, for the token and crash paths,
+# produced no line at all), so `citadel activity --local` could not tell "ran and
+# had nothing to send" from "the token got unset" or "it blew up".
+RECEIPT_KIND = "session"
+RECEIPT_KIND_SKIP = "session-skip"
+RECEIPT_KIND_ERROR = "session-error"
+
+
+def _write_receipt(summary: str, kind: str = RECEIPT_KIND) -> None:
     """Best-effort DX-5 receipt (never raises, never surfaces the token)."""
     try:
         from kb.hooks.receipt import write_receipt
 
-        write_receipt("session", summary)
+        write_receipt(kind, summary)
     except Exception:
         pass
 
@@ -294,20 +307,21 @@ def _write_receipt(summary: str) -> None:
 def run(stream_in: Any) -> int:
     """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking.
 
-    Fail-silent means "never block session close", not "leave no trace": every
-    exit path below writes a receipt naming what was observed, so ``citadel
-    activity --local`` can distinguish a clean skip from a broken config from a
-    crash. Absent that, all of them look identical to a capture that worked.
+    Fail-silent means never blocking session close, not leaving no trace. Every
+    exit below writes a receipt, because exit 0 with no output was the same
+    observable outcome for "ran and legitimately had nothing to send", "the token
+    env var is unset", and "it crashed".
     """
     try:
         payload = read_hook_payload(stream_in)
         token = os.getenv(TOKEN_ENV)
         if not token:
-            # No token configured -> nothing to sync, but say so: an unset env
-            # var is otherwise indistinguishable from a session with nothing in it.
+            # No token configured -> nothing to sync, but say so: a hook that was
+            # installed and then lost its token is not the same as a quiet session.
             _write_receipt(
-                f"session skipped: no capture token in the environment ({TOKEN_ENV} unset); "
-                "nothing sent"
+                f"session skipped: {TOKEN_ENV} is not set in this environment "
+                "(run `citadel onboard`)",
+                kind=RECEIPT_KIND_SKIP,
             )
             return 0
 
@@ -320,7 +334,8 @@ def run(stream_in: Any) -> int:
                 # identical to "session had nothing worth sending".
                 _write_receipt(
                     "session skipped: transcript path not under an allowed agent "
-                    "directory; nothing read or sent"
+                    "directory; nothing read or sent",
+                    kind=RECEIPT_KIND_SKIP,
                 )
                 return 0
             entries = _iter_transcript(transcript_path)
@@ -330,7 +345,10 @@ def run(stream_in: Any) -> int:
             # Nothing extractable, so nothing is sent. A constant placeholder
             # note carries zero session content; the receipt still records that
             # the hook ran and chose to skip.
-            _write_receipt("session skipped: no extractable session content (nothing sent)")
+            _write_receipt(
+                "session skipped: no extractable session content (nothing sent)",
+                kind=RECEIPT_KIND_SKIP,
+            )
             return 0
 
         note = _truncate_utf8(note, _max_ingest_bytes())
@@ -346,11 +364,12 @@ def run(stream_in: Any) -> int:
             return 0
         _write_receipt(receipt_summary(response))
     except Exception as exc:
-        # Fail-silent: never block session close, never surface the token —
-        # but a crash still leaves a receipt (class name only: a message could
-        # echo transcript content or request details).
+        # Fail-silent: never block session close, never surface the token. Class
+        # name only — an exception message can echo transcript paths or content,
+        # and this line lands in a file that outlives the session.
         _write_receipt(
-            f"session hook crashed: {exc.__class__.__name__}; capture state unknown"
+            f"session not run: the hook failed before sending ({exc.__class__.__name__})",
+            kind=RECEIPT_KIND_ERROR,
         )
         return 0
     return 0

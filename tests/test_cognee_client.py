@@ -998,11 +998,13 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
     assert isinstance(captured["data"], DataItem)
     assert captured["data"].data == "real digest"
     assert captured["data"].external_metadata == {"citadel_tags": ["github"]}
+    # "suppressed" names WHICH branch ran; index_state says what that means for
+    # the caller — stored, graph write still owed, and never "indexed".
     assert result == {
         "added": {"ok": True},
         "cognify": "suppressed",
-        "indexed": False,
-        "status": "indexing_suppressed",
+        "data_ids": (),
+        "index_state": "pending_cognify",
     }
 
 
@@ -1038,10 +1040,9 @@ async def test_remember_schedules_lock_guarded_background_cognify(monkeypatch: A
     result = await client.remember("note", dataset_name="seat:sarthi", tags=())
     assert result == {
         "added": {"ok": True},
-        "cognify": "scheduled",
-        "indexed": False,
-        "status": "indexing_scheduled",
         "background_cognify": True,
+        "data_ids": (),
+        "index_state": "pending_cognify",
     }
     # Drain the scheduled background cognify and confirm it ran via cognify().
     await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)

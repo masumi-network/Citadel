@@ -397,67 +397,104 @@ def test_empty_session_is_not_sent(monkeypatch: Any, tmp_path: Path) -> None:
     assert "captured" not in receipt
 
 
-def test_receipt_when_server_states_no_decision(monkeypatch: Any, tmp_path: Path) -> None:
-    """A 2xx body that OMITS `accepted` states no decision — never "captured".
+# --- a receipt reports what the server said, not what we hoped it said -------
 
-    The receipt used to read `accepted is not False`, so a response missing the
-    key reported capture from nothing the server ever said.
-    """
+
+def test_receipt_treats_a_missing_accepted_key_as_unconfirmed(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A 2xx body that never states a verdict is not a capture."""
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
     monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
-    _fake_urlopen_with_body(monkeypatch, json.dumps({"ok": True}).encode())
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"reason": "stored"}).encode())
     path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
     assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
     receipt = _receipt_text()
-    assert "storage not confirmed" in receipt
+    assert "unconfirmed" in receipt
     assert "session captured" not in receipt
 
 
-# --- every exit path leaves a distinguishable receipt ------------------------
+def test_receipt_summary_is_unconfirmed_for_a_non_boolean_accepted() -> None:
+    summary = sync_session.receipt_summary({"accepted": "yes"})
+    assert "unconfirmed" in summary
+    assert "session captured" not in summary
 
 
-def test_missing_token_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
+# --- an early exit is still a run, and must leave a trace --------------------
+
+
+def _receipt_kinds() -> list[str]:
+    """The ``kind`` column of every receipt line."""
+    return [line.split()[1] for line in _receipt_text().splitlines() if line.split()]
+
+
+def test_receipt_records_a_run_with_no_token(monkeypatch: Any, tmp_path: Path) -> None:
+    """"Nothing to send" and "the token env var got unset" must not look alike."""
     monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
     path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
     assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
     receipt = _receipt_text()
-    assert "session skipped" in receipt
     assert "CITADEL_MCP_ACCESS_TOKEN" in receipt
+    assert _receipt_kinds() == ["session-skip"]
+
+
+def test_receipt_records_a_crash_and_the_hook_still_exits_zero(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The outer ``except Exception: return 0`` used to erase the whole event."""
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+
+    def boom(entries: Any) -> None:
+        raise ValueError("transcript held sensitive detail")
+
+    monkeypatch.setattr(sync_session, "distill_transcript", boom)
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    receipt = _receipt_text()
+    assert "ValueError" in receipt
+    assert "sensitive detail" not in receipt
     assert "session captured" not in receipt
+    assert _receipt_kinds() == ["session-error"]
 
 
-def test_refused_transcript_path_leaves_distinct_receipt(
+def test_a_real_capture_keeps_the_plain_session_kind(monkeypatch: Any, tmp_path: Path) -> None:
+    """Skips are a distinct kind; an actual capture must not be relabelled."""
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"accepted": True}).encode())
+    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    assert _receipt_kinds() == ["session"]
+
+
+def test_skipped_empty_session_uses_the_skip_kind(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_session, "post_ingest", _RecordingPost())
+    path = _write_transcript(tmp_path, [], monkeypatch)
+    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+    assert _receipt_kinds() == ["session-skip"]
+
+
+def test_refused_transcript_path_leaves_its_own_receipt(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     """An out-of-allowlist transcript is refused, not read — and says so.
 
-    Without its own receipt this silence read as "session had nothing to send".
+    Without its own receipt this silence was byte-identical to "the session had
+    nothing worth sending", so a misconfigured allow-root looked like a quiet
+    day's work.
     """
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
     monkeypatch.delenv("CITADEL_TRANSCRIPT_ALLOW_ROOT", raising=False)
     recorder = _RecordingPost()
     monkeypatch.setattr(sync_session, "post_ingest", recorder)
     path = _write_transcript(tmp_path, _sample_entries())  # no allow-root set
+
     assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
+
     assert recorder.calls == []
     receipt = _receipt_text()
     assert "transcript path" in receipt
     assert "no extractable session content" not in receipt  # a different silence
     assert "session captured" not in receipt
-
-
-def test_crash_inside_run_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
-    """The outer except used to swallow the crash with no trace at all."""
-    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
-
-    def boom(entries: Any) -> str:
-        raise RuntimeError("crash with sensitive detail")
-
-    monkeypatch.setattr(sync_session, "distill_transcript", boom)
-    path = _write_transcript(tmp_path, _sample_entries(), monkeypatch)
-    assert sync_session.run(io.StringIO(_hook_payload(path, tmp_path))) == 0
-    receipt = _receipt_text()
-    assert "session hook crashed" in receipt
-    assert "RuntimeError" in receipt
-    assert "sensitive detail" not in receipt
-    assert "session captured" not in receipt
+    assert _receipt_kinds() == ["session-skip"]

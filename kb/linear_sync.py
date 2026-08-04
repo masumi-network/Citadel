@@ -21,6 +21,7 @@ from kb.secure_http import open_secure
 from kb.access import CENTRAL_DATASET, SEAT_DATASET_PREFIX, AccessStore, seat_dataset
 from kb.cognee_client import _suppress_inline_cognify
 from kb.learning import LearningProcess
+from kb.models import INDEX_STATE_UNKNOWN, index_flag, resolve_index_state
 from kb.service import Citadel
 from kb.state_io import StateFileError, load_state_file, save_state_file
 
@@ -563,6 +564,12 @@ class LinearSyncer:
         if central_outcome is not None:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
+        # What this run OBSERVED happen to the graph write, in the vocabulary
+        # kb.models.resolve_index_state understands: ok / failed / not_scheduled
+        # / None for "did not look". Everything the writes land in is a
+        # relational + vector row until a cognify runs, so this is the only
+        # thing that turns "we wrote 200 issues" into "200 issues are findable".
+        cognify_status: str | None = None
         if touched_datasets and not _suppress_inline_cognify():
             cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
@@ -572,14 +579,26 @@ class LinearSyncer:
                 # — the writes already landed in Postgres, so a cognify failure (e.g. a
                 # cross-process Kuzu lock if the web is writing, #47) is logged, not
                 # raised; the next evolve pass folds the data into the graph.
+                #
+                # Swallowing the exception is right. Reporting central_ingested:true
+                # afterwards and nothing else was not: this run WATCHED the graph
+                # write fail and then discarded the observation, so the payload was
+                # identical to a run that indexed everything.
                 try:
                     await self.citadel.cognee.cognify(datasets=cognify_datasets)
                 except Exception:  # noqa: BLE001 - writes succeeded; cognify is a follow-on
                     logger.exception("Linear sync coalesced cognify failed")
+                    cognify_status = "failed"
+                else:
+                    cognify_status = "ok"
             else:
                 # On-demand endpoint / evolve: background it so the request returns
-                # without waiting on the graph write.
-                self.citadel.cognee.schedule_cognify(cognify_datasets)
+                # without waiting on the graph write. Scheduling can DECLINE (no
+                # running loop), which leaves the writes permanently unindexed —
+                # a distinct outcome from one still in flight, so it gets a
+                # distinct status rather than sharing "we backgrounded it".
+                scheduled = self.citadel.cognee.schedule_cognify(cognify_datasets)
+                cognify_status = None if scheduled else "not_scheduled"
 
         # Advance the cursor to the newest updatedAt seen (keep the prior one
         # when a pass sees nothing newer, e.g. an empty or truncated fetch),
@@ -631,9 +650,29 @@ class LinearSyncer:
                 len(issues),
             )
 
+        # Refine the write's own state with the cognify outcome this run
+        # observed. `resolve_index_state` only promotes to "indexed" when
+        # something was actually watched; "I did not look" leaves it pending.
+        central_index_state = INDEX_STATE_UNKNOWN
+        central_data_ids: tuple[str, ...] = ()
+        if central_outcome is not None:
+            central_index_state = resolve_index_state(
+                central_outcome.ingest.index_state, cognify_status
+            )
+            central_data_ids = tuple(central_outcome.ingest.cognee_data_ids)
+
         payload = {
             "version": STATE_VERSION,
             "last_synced_at": utc_now(),
+            # The ids cognee assigned plus what was observed about the graph
+            # write, so the next pass can check this run's claim against the
+            # index rather than trusting `last_synced_at` — which records the
+            # decision to sync, not a successful one.
+            "last_central_index": {
+                "index_state": central_index_state,
+                "cognee_data_ids": list(central_data_ids),
+                "cognify_status": cognify_status,
+            },
             "last_seen_updated_at": new_cursor,
             "unchanged_pass_streak": streak,
             "last_error": None,  # clear any prior failure on a successful sync
@@ -659,7 +698,16 @@ class LinearSyncer:
             # member fetch also leaves this at 0 (#148).
             "auto_mapped_assignees": auto_mapped,
             "auto_map_error": auto_map_error,
+            # `central_ingested` describes the REQUEST (cognee.add() returned).
+            # `central_indexed` describes the OUTCOME and stays null until a
+            # cognify was watched, false when one was watched to fail. Both are
+            # reported, because collapsing them is exactly how a sync whose
+            # graph write died looked identical to one that worked.
             "central_ingested": central_outcome.ingest.accepted if central_outcome else None,
+            "central_index_state": central_index_state,
+            "central_indexed": index_flag(central_index_state),
+            "cognify_status": cognify_status,
+            "cognee_data_ids": list(central_data_ids),
             "mirrors": mirrors,
             "last_synced_at": payload["last_synced_at"],
         }

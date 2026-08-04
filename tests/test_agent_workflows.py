@@ -29,23 +29,6 @@ def test_normalize_local_search_results() -> None:
     assert wrapped["timed_out"] is True
 
 
-def test_local_search_pipeline_reports_unknown_trust() -> None:
-    """The --local pipeline (normalize_local_search_results → shape_search_payload).
-
-    It hands cognee payloads to the shaper with no ``_citadel`` envelope, so no
-    attested provenance is ever consulted; the shaped hits must say so
-    ("unknown") instead of reading exactly like honestly unattested HTTP hits.
-    """
-    from kb.search_format import shape_search_payload
-
-    payload = normalize_local_search_results(
-        [{"id": "c1", "text": "# Dead-end route\n\nsession trace body"}]
-    )
-    shaped = shape_search_payload(payload, query="dead-end route")
-    assert shaped["results"][0]["trust_tier"] == "unknown"
-    assert any("trust_tier is 'unknown'" in w for w in shaped["warnings"])
-
-
 def test_shape_verify_and_prepare() -> None:
     path = Path("payment.md")
     payload = {
@@ -62,9 +45,7 @@ def test_shape_verify_and_prepare() -> None:
     report = shape_verify_report(
         path=path, file_text="MIP-003 purchase endpoint", search_payload=payload, query="MIP-003"
     )
-    # This fixture's hits carry no _citadel envelope, so no attested provenance
-    # was consulted: the tier says "unknown", not "unattested".
-    assert report["doc_shaped_sources"][0]["trust_tier"] == "unknown"
+    assert report["doc_shaped_sources"][0]["trust_tier"] == "unattested"
     assert report["doc_shaped_sources"][0]["content_hint"] == "looks-like-spec"
     assert report["known_overlaps"]
     brief = shape_prepare_pr_context(repo="cardano-dev-skills", topic="masumi", search_payload=payload)

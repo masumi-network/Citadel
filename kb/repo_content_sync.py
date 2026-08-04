@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from kb.cognee_client import ingest_indexing_state
 from kb.github_sync import GitHubAPIError, GitHubOrgClient, utc_now
 from kb.learning import LearningProcess
+from kb.models import INDEX_STATE_UNKNOWN, index_flag, worst_index_state
 from kb.security_scan import SecurityScanEntry, scan_text_entries
 from kb.service import Citadel
 from kb.state_io import StateFileError, load_state_file, save_state_file
@@ -152,6 +152,14 @@ def _cognee_data_ids(outcome: Any) -> list[str]:
             if data_id:
                 ids.append(str(data_id))
     return list(dict.fromkeys(ids))
+
+
+def _worst_index_state(outcome: Any) -> str:
+    """The least-indexed state across every chunk this file was written as."""
+    return worst_index_state(
+        getattr(result, "index_state", INDEX_STATE_UNKNOWN)
+        for result in getattr(outcome, "all_ingests", ()) or ()
+    )
 
 
 def format_repo_content_document(file: RepoContentFile) -> str:
@@ -691,14 +699,21 @@ class RepoContentSyncer:
 
         repo_results: list[dict[str, Any]] = []
         ingested_files = 0
-        # Split of ingested_files by what this run OBSERVED about the add:
-        # cognee assigned data ids (confirmed) or it did not (unconfirmed — the
-        # cognee_data_ids guard makes the next pass re-ingest those).
+        # ingested_files counts WRITES REQUESTED — it increments when
+        # cognee.add() returned, which is before the graph write that makes a
+        # file findable. These two count what was OBSERVED about that graph
+        # write, so a pass that stored 40 files and indexed none stops
+        # reporting the same number as a pass that indexed all 40.
+        indexed_files = 0
+        index_failed_files = 0
+        # A second, independent observation about the same adds: did the store
+        # hand back data ids for them? The ids are cognee's own receipt for the
+        # relational/vector write, which the graph state above does not answer —
+        # an id exists as soon as the row does, and no id at all means this run
+        # cannot check its own claim later (the cognee_data_ids guard then
+        # re-ingests the file next pass).
         add_confirmed_files = 0
         add_unconfirmed_files = 0
-        # Disposition(s) of the graph-indexing requests behind the accepted
-        # adds. Normally one value; a set so a mixed run cannot misreport.
-        indexing_states: set[str] = set()
         skipped_files = 0
         blocked_files = 0
         improved = False
@@ -742,6 +757,8 @@ class RepoContentSyncer:
                 "repo": full_name,
                 "paths_discovered": 0,
                 "ingested": 0,
+                "indexed": 0,
+                "index_failed": 0,
                 "skipped": 0,
                 "skipped_reasons": {},
                 "blocked": 0,
@@ -928,21 +945,19 @@ class RepoContentSyncer:
                     if any(result.accepted for result in outcome.all_ingests):
                         ingested_files += 1
                         repo_result["ingested"] += 1
+                        file_index_state = _worst_index_state(outcome)
+                        file_indexed = index_flag(file_index_state)
+                        if file_indexed is True:
+                            indexed_files += 1
+                            repo_result["indexed"] += 1
+                        elif file_indexed is False:
+                            index_failed_files += 1
+                            repo_result["index_failed"] += 1
                         data_ids = _cognee_data_ids(outcome)
-                        # Count from the observation, not the request:
-                        # `accepted` only says cognee.add() returned. Data ids
-                        # in the outcome are the store's own receipt for the
-                        # add; their absence is reported as unconfirmed instead
-                        # of being folded into the success counter.
                         if data_ids:
                             add_confirmed_files += 1
                         else:
                             add_unconfirmed_files += 1
-                        for result in outcome.all_ingests:
-                            if result.accepted:
-                                indexing_states.add(
-                                    ingest_indexing_state(result.cognee_result)
-                                )
                         tracked[key] = {
                             "sha": file.sha,
                             "content_hash": file.content_hash,
@@ -952,6 +967,10 @@ class RepoContentSyncer:
                             # state file holding only sha and content_hash can
                             # never verify what it asserted.
                             "cognee_data_ids": data_ids,
+                            # And what was observed about the graph write, which
+                            # the ids alone do not say: an id exists as soon as
+                            # the row does.
+                            "index_state": file_index_state,
                         }
                         # Checkpoint immediately. State used to be written only
                         # after every repo finished, so a run killed part-way
@@ -1012,16 +1031,19 @@ class RepoContentSyncer:
             "checked_at": checked_at,
             "repos_scanned": len(repo_results),
             "repos_errored": len(repos_errored),
+            # files_ingested counts writes REQUESTED; the two below count what
+            # was observed about the graph write that makes them findable.
+            # files_ingested - files_indexed - files_index_failed is the number
+            # still in flight, and that is a real state, not a rounding error.
             "files_ingested": ingested_files,
-            # files_ingested counts adds the store ACCEPTED; it does not
-            # observe that anything became searchable. The split below is what
-            # this run actually saw: cognee returned data ids for the add
-            # (confirmed) or it did not (unconfirmed → re-ingested next pass
-            # via the cognee_data_ids guard). `indexing` is the disposition of
-            # the asynchronous graph-write request(s), never their outcome.
+            "files_indexed": indexed_files,
+            "files_index_failed": index_failed_files,
+            # Whether the store returned ids for the add at all. Unconfirmed is
+            # not a failure — some clients return a shape we cannot read ids
+            # from — but a run that confirms none of its adds also cannot audit
+            # itself later, and that is worth seeing.
             "files_add_confirmed": add_confirmed_files,
             "files_add_unconfirmed": add_unconfirmed_files,
-            "indexing": sorted(indexing_states),
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_blocked": blocked_files,

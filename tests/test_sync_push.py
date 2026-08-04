@@ -414,46 +414,125 @@ def test_unreachable_node_still_exits_zero(monkeypatch: Any, tmp_path: Path) -> 
     assert "captured commit" not in receipt
 
 
-def test_receipt_when_server_states_no_decision(monkeypatch: Any, tmp_path: Path) -> None:
-    """A 2xx body that OMITS `accepted` states no decision — never "captured".
-
-    The receipt used to read `accepted is not False`, so a response missing the
-    key reported capture from nothing the server ever said.
-    """
-    _approve_repo_for_real_sync(monkeypatch, tmp_path)
-    _fake_urlopen_with_body(monkeypatch, json.dumps({"ok": True}).encode())
-    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
-    receipt = _receipt_text()
-    assert "storage not confirmed" in receipt
-    assert "captured commit" not in receipt
+# --- a receipt reports what the server said, not what we hoped it said -------
 
 
-def test_receipt_when_accepted_is_not_a_boolean(monkeypatch: Any, tmp_path: Path) -> None:
-    _approve_repo_for_real_sync(monkeypatch, tmp_path)
-    _fake_urlopen_with_body(monkeypatch, json.dumps({"accepted": "yes"}).encode())
-    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
-    receipt = _receipt_text()
-    assert "storage not confirmed" in receipt
-    assert "captured commit" not in receipt
-
-
-# --- every exit path leaves a distinguishable receipt ------------------------
-
-
-def test_missing_token_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
-    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
-    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(tmp_path / "capture.json"))
-    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
-    receipt = _receipt_text()
-    assert "push skipped" in receipt
-    assert "CITADEL_MCP_ACCESS_TOKEN" in receipt
-    assert "captured commit" not in receipt
-
-
-def test_missing_vs_malformed_config_leave_distinct_receipts(
+def test_receipt_treats_a_missing_accepted_key_as_unconfirmed(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    """"Never onboarded" and "the config broke" are different silences."""
+    """A 2xx body that never states a verdict is not a capture.
+
+    ``accepted`` describes the server's decision. Reading "not False" made an
+    ABSENT key report success, so a proxy, an older Node, or any response shape
+    change would have printed "captured" for a write nobody confirmed.
+    """
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"reason": "stored"}).encode())
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "unconfirmed" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_receipt_summary_is_unconfirmed_for_a_non_boolean_accepted() -> None:
+    summary = sync_push.receipt_summary({"accepted": "yes"}, short_sha="abc1234", branch="main")
+    assert "unconfirmed" in summary
+    assert "captured commit" not in summary
+
+
+# --- an early exit is still a run, and must leave a trace --------------------
+
+
+def _receipt_kinds() -> list[str]:
+    """The ``kind`` column of every receipt line."""
+    return [line.split()[1] for line in _receipt_text().splitlines() if line.split()]
+
+
+def test_receipt_records_a_run_with_no_token(monkeypatch: Any, tmp_path: Path) -> None:
+    """"Nothing to send" and "the token env var got unset" must not look alike."""
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "CITADEL_MCP_ACCESS_TOKEN" in receipt
+    assert _receipt_kinds() == ["push-skip"]
+
+
+def test_receipt_records_an_empty_capture_allowlist(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/some-repo")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    assert "Approved Capture Roots" in _receipt_text()
+    assert _receipt_kinds() == ["push-skip"]
+
+
+def test_receipt_records_a_repo_outside_the_allowlist(monkeypatch: Any, tmp_path: Path) -> None:
+    config = tmp_path / "capture.json"
+    _write_capture_config(config, [{"path": "/some/approved", "tags": []}])
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/other-repo")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "not an Approved Capture Root" in receipt
+    assert "other-repo" in receipt
+    assert _receipt_kinds() == ["push-skip"]
+
+
+def test_receipt_records_a_crash_and_the_hook_still_exits_zero(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The outer ``except Exception: return 0`` used to erase the whole event."""
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+
+    def boom() -> None:
+        raise ValueError("capture.json is a directory with sensitive detail")
+
+    # Patch what run() actually calls. load_capture_roots is a thin wrapper
+    # kept for callers that only want the list; patching it would prove nothing.
+    monkeypatch.setattr(sync_push, "capture_roots_state", boom)
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/some-repo")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "ValueError" in receipt
+    assert "sensitive detail" not in receipt
+    assert "captured commit" not in receipt
+    assert _receipt_kinds() == ["push-error"]
+
+
+def test_receipt_records_a_head_that_cannot_be_resolved(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Manual invocation with no pre-push stdin and no resolvable HEAD."""
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(sync_push, "_git_run", lambda cwd, *args: _Failed())
+    assert sync_push.run(io.StringIO(""), remote_name="origin") == 0
+    assert _receipt_kinds() == ["push-skip"]
+    assert "captured commit" not in _receipt_text()
+
+
+def test_a_real_capture_keeps_the_plain_push_kind(monkeypatch: Any, tmp_path: Path) -> None:
+    """Skips are a distinct kind; an actual capture must not be relabelled."""
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"accepted": True}).encode())
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    assert _receipt_kinds() == ["push"]
+
+
+def test_missing_vs_malformed_capture_config_leave_distinct_receipts(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """"Never onboarded" and "the config broke" are different silences.
+
+    Both produce an empty allowlist and the same skip, so the receipt is the
+    only place they can be told apart — and only one of them is a fault the dev
+    has to go and repair.
+    """
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
     monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
     config = tmp_path / "capture.json"
@@ -464,39 +543,7 @@ def test_missing_vs_malformed_config_leave_distinct_receipts(
     assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0  # malformed
 
     receipt = _receipt_text()
-    assert "capture.json missing" in receipt
+    assert "capture.json is missing" in receipt
     assert "unreadable or malformed" in receipt
     assert "captured commit" not in receipt
-
-
-def test_unapproved_repo_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
-    config = tmp_path / "capture.json"
-    _write_capture_config(config, [{"path": "/some/approved", "tags": []}])
-    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
-    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
-    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/other-repo")
-    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
-    receipt = _receipt_text()
-    assert "not an Approved Capture Root" in receipt
-    assert "nothing sent" in receipt
-    assert "captured commit" not in receipt
-
-
-def test_crash_inside_run_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
-    """The outer except used to swallow the crash with no trace at all."""
-    config = tmp_path / "capture.json"
-    _write_capture_config(config, [{"path": "/tmp/repo", "tags": []}])
-    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
-    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
-    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
-
-    def boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("crash with sensitive detail")
-
-    monkeypatch.setattr(sync_push, "_sync_one", boom)
-    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
-    receipt = _receipt_text()
-    assert "push hook crashed" in receipt
-    assert "RuntimeError" in receipt
-    assert "sensitive detail" not in receipt
-    assert "captured commit" not in receipt
+    assert _receipt_kinds() == ["push-skip", "push-skip"]

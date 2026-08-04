@@ -4,15 +4,15 @@
 deferred / scheduled), so for years `accepted` doubled as "indexed" on every
 connector surface while 892 of 2867 documents sat at chunk_count 0 — accepted
 and never cognified — and a working node and a silently broken one emitted
-byte-identical output. These tests pin the two halves of the fix:
+byte-identical output. These tests pin the ledger half of the fix: the detached background cognify
+stamps its OBSERVED outcome into a module-level ledger
+(`background_cognify_stats`) surfaced on /readyz, so a node whose scheduled
+graph writes never complete shows runs_scheduled climbing while runs_completed
+stays flat, instead of leaving no trace anywhere.
 
-1. remember() states the indexing outcome explicitly (`indexed: False` plus a
-   request disposition), and `ingest_indexing_state` maps any outcome payload
-   to a disposition with an explicit "unknown" fallback — never an implied
-   success.
-2. The detached background cognify stamps its OBSERVED outcome into a
-   module-level ledger (`background_cognify_stats`), so scheduled-but-never-
-   completed runs become visible instead of leaving no trace.
+The per-write state that a caller branches on lives on `IngestResult`
+(`index_state` / `indexed`) and is covered by tests/test_ingest_index_state.py;
+this file covers only what the process itself watched happen.
 
 The modules are imported as modules (not names) on purpose: reverting the
 source must FAIL these tests, not error collection.
@@ -63,20 +63,6 @@ def _install_fake_cognee(monkeypatch: Any, *, cognify: Any = None) -> None:
     )
 
 
-def test_ingest_indexing_state_never_defaults_to_success() -> None:
-    # The three request dispositions pass through verbatim.
-    assert cc.ingest_indexing_state({"cognify": "scheduled"}) == "scheduled"
-    assert cc.ingest_indexing_state({"cognify": "deferred"}) == "deferred"
-    assert cc.ingest_indexing_state({"cognify": "suppressed"}) == "suppressed"
-    # Legacy scheduled-branch payloads carried only the background_cognify flag.
-    assert cc.ingest_indexing_state({"background_cognify": True}) == "scheduled"
-    # No observation → the explicit unknown state, never an optimistic value.
-    assert cc.ingest_indexing_state(None) == "unknown"
-    assert cc.ingest_indexing_state({}) == "unknown"
-    assert cc.ingest_indexing_state({"added": {"ok": True}}) == "unknown"
-    assert cc.ingest_indexing_state("accepted") == "unknown"
-
-
 @pytest.mark.asyncio
 async def test_remember_deferred_states_indexing_outcome_explicitly(
     monkeypatch: Any,
@@ -96,8 +82,8 @@ async def test_remember_deferred_states_indexing_outcome_explicitly(
     assert result == {
         "added": {"ok": True},
         "cognify": "deferred",
-        "indexed": False,
-        "status": "indexing_deferred",
+        "data_ids": (),
+        "index_state": "pending_cognify",
     }
 
 
@@ -114,8 +100,9 @@ async def test_background_cognify_completion_is_observed(monkeypatch: Any) -> No
     client = cc.CogneePublicClient()
 
     result = await client.remember("note", dataset_name="seat:sarthi", tags=())
-    assert result["indexed"] is False
-    assert result["status"] == "indexing_scheduled"
+    # A graph write is owed, so the state is pending — never "indexed".
+    assert result["index_state"] == "pending_cognify"
+    assert result["background_cognify"] is True
 
     stats = cc.background_cognify_stats()
     assert stats["runs_scheduled"] == 1

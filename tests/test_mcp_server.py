@@ -62,6 +62,9 @@ class FakeHttpClient:
         self.public_gets.append({"path": path, "extra_headers": extra_headers or {}})
         return {"ok": True, "path": path, "public": True}
 
+    # Mirrors CitadelHttpClient.post exactly, user_confirmed included: a fake
+    # narrower than the real client turns a wiring change into a TypeError in
+    # unrelated tests instead of a finding.
     def post(
         self,
         path: str,
@@ -69,9 +72,16 @@ class FakeHttpClient:
         *,
         tool_name: str | None = None,
         timeout: float | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         self.posts.append(
-            {"path": path, "payload": payload, "tool_name": tool_name, "timeout": timeout}
+            {
+                "path": path,
+                "payload": payload,
+                "tool_name": tool_name,
+                "timeout": timeout,
+                "user_confirmed": user_confirmed,
+            }
         )
         return {"ok": True, "path": path, "payload": payload, "tool_name": tool_name}
 
@@ -862,124 +872,79 @@ _APPROVAL_GUARDED_TOOLS = (
 )
 
 
-def test_user_approval_stays_optional_in_every_guarded_tool_schema() -> None:
-    """The signal is recorded, not enforced: a required parameter would fail
-    every existing client at schema validation, so user_approval must stay
-    optional on all five guarded write tools."""
+def test_user_confirmed_stays_optional_in_every_guarded_tool_schema() -> None:
+    """The signal is RECORDED, not enforced.
+
+    Making the parameter required would fail every existing client at schema
+    validation and turn a reporting change into an outage, so it must stay
+    optional on all five guarded write tools.
+    """
     server = create_mcp_server(FakeHttpClient())
 
     for name in _APPROVAL_GUARDED_TOOLS:
         schema = server._tool_manager.get_tool(name).parameters
-        assert "user_approval" in schema["properties"], name
-        assert "user_approval" not in (schema.get("required") or []), name
+        assert "user_confirmed" in schema["properties"], name
+        assert "user_confirmed" not in (schema.get("required") or []), name
 
 
-def test_ingest_forwards_and_reports_the_user_approval_signal() -> None:
-    """A write made with a stated user approval and one made without must not
-    produce identical requests or results: the signal rides the payload and is
-    mirrored into the tool result."""
+def test_a_reported_confirmation_comes_back_in_the_tool_result() -> None:
+    """The calling agent must be able to SEE what the node recorded.
+
+    Without the mirror the agent has to trust that its argument arrived, and a
+    call that reported a confirmation returns bytes identical to one that
+    reported nothing.
+    """
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    approved = run_tool(
-        server,
-        "citadel_ingest",
-        "a durable note",
-        None,
-        user_approval="  yes,   save that  ",
-    )
+    result = run_tool(server, "citadel_ingest", "a durable note", None, user_confirmed=True)
 
-    assert client.posts[0]["payload"]["user_approval"] == "yes, save that"
-    assert approved["user_approval"] == {"provided": True, "signal": "yes, save that"}
-    assert not any("user_approval" in w for w in approved.get("warnings") or [])
+    assert client.posts[0]["user_confirmed"] is True
+    assert result["user_confirmation"] == {"reported": True, "recorded_as": "confirmed"}
+    assert not any("user_confirmed" in w for w in result.get("warnings") or [])
 
 
-def test_ingest_without_user_approval_is_marked_not_confirmed() -> None:
+def test_an_unreported_confirmation_is_recorded_as_unknown_and_warned_about() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
     result = run_tool(server, "citadel_ingest", "a durable note", None)
 
-    assert client.posts[0]["payload"]["user_approval"] is None
-    assert result["user_approval"] == {"provided": False, "signal": None}
-    assert any("user_approval" in w for w in result["warnings"])
+    # Omitted on the wire: "false" and "nothing was said" are different facts.
+    assert client.posts[0]["user_confirmed"] is None
+    assert result["user_confirmation"] == {"reported": False, "recorded_as": "unknown"}
+    assert any("user_confirmed" in w for w in result["warnings"])
 
 
-def test_contribute_and_share_session_carry_the_approval_signal() -> None:
+def test_a_declined_confirmation_is_reported_as_declined_not_missing() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    contributed = run_tool(
-        server,
-        "citadel_contribute",
-        "Title",
-        "Body",
-        None,
-        user_approval="yes, contribute it",
-    )
-    shared = run_tool(
-        server,
-        "citadel_share_session",
-        None,
-        "/repo",
-        data="# Compact Session Context",
-        capture_roots=["/repo"],
-    )
+    result = run_tool(server, "citadel_ingest", "a durable note", None, user_confirmed=False)
 
-    contribute_post = next(p for p in client.posts if p["path"] == "/api/contribute")
-    share_post = next(p for p in client.posts if p["path"] == "/api/share-session")
-    assert contribute_post["payload"]["user_approval"] == "yes, contribute it"
-    assert contributed["user_approval"]["provided"] is True
-    assert share_post["payload"]["user_approval"] is None
-    assert shared["user_approval"] == {"provided": False, "signal": None}
-    assert any("user_approval" in w for w in shared["warnings"])
+    assert client.posts[0]["user_confirmed"] is False
+    assert result["user_confirmation"] == {"reported": True, "recorded_as": "not_confirmed"}
+    # A declined answer IS an answer, so it draws no missing-signal warning.
+    assert not any("user_confirmed" in w for w in result.get("warnings") or [])
 
 
-def test_promotion_decisions_lead_the_audit_note_with_the_approval_signal() -> None:
-    """The decision note is what the node writes to its audit trail, so it must
-    state the signal either way: the user's quote, or the explicit "not
-    stated" marker. An asked-first approval and a skipped-ask approval then
-    stop looking identical in the trail."""
+def test_every_guarded_tool_mirrors_the_recorded_value() -> None:
+    """A tool wired to the client but not to the mirror satisfies neither test above."""
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    run_tool(
-        server,
-        "citadel_promotion_approve",
-        "item-1",
-        None,
-        note="checked for duplicates",
-        user_approval="yes, promote it",
-    )
-    run_tool(server, "citadel_promotion_reject", "item-2", None)
-
-    approve_post = next(p for p in client.posts if p["path"].endswith("/approve"))
-    reject_post = next(p for p in client.posts if p["path"].endswith("/reject"))
-    assert approve_post["payload"]["note"] == (
-        "user approval: yes, promote it | note: checked for duplicates"
-    )
-    assert approve_post["payload"]["user_approval"] == "yes, promote it"
-    assert reject_post["payload"]["note"] == (
-        f"user approval: {mcp_server.APPROVAL_NOT_STATED}"
-    )
-    assert reject_post["payload"]["user_approval"] is None
-
-
-def test_decision_note_never_exceeds_the_server_note_bound() -> None:
-    # PromotionDecisionBody caps note at 400 chars server-side; an oversized
-    # composition would turn a valid decision into a 422, so the composed note
-    # clamps the quote first (160) and the total second (400).
-    signal = mcp_server._normalized_approval("y" * 500)
-    assert signal == "y" * mcp_server.MAX_USER_APPROVAL_CHARS
-
-    composed = mcp_server._decision_note(signal, "n" * 500)
-    assert len(composed) == mcp_server.MAX_DECISION_NOTE_CHARS
-    assert composed.startswith(f"user approval: {signal}")
-
-    assert mcp_server._normalized_approval("   ") is None
-    assert mcp_server._decision_note(None, None) == (
-        f"user approval: {mcp_server.APPROVAL_NOT_STATED}"
-    )
+    calls = {
+        "citadel_share_session": (
+            (None, "/repo"),
+            {"data": "# Compact Session Context", "capture_roots": ["/repo"]},
+        ),
+        "citadel_contribute": (("Title", "Body", None), {}),
+        "citadel_promotion_approve": (("item-1", None), {}),
+        "citadel_promotion_reject": (("item-2", None), {}),
+    }
+    for tool, (args, kwargs) in calls.items():
+        result = run_tool(server, tool, *args, user_confirmed=True, **kwargs)
+        assert result["user_confirmation"]["recorded_as"] == "confirmed", tool
 
 
 def test_tools_list_protocol_handler_applies_role_filter(
