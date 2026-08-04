@@ -34,6 +34,9 @@ MAX_AUDIT_LIMIT = 100
 DEFAULT_MAX_INGEST_BYTES = 200_000
 LOCAL_MCP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 TRUTHY = frozenset({"1", "true", "yes", "on"})
+# The provenance kind the Linear syncer's per-issue documents resolve to
+# (kb.search_format.parse_content_header). citadel_linear_search scopes to it.
+LINEAR_ISSUE_SOURCE = "linear-issue"
 AUDIT_VIEWS = frozenset({"all", "mcp", "access", "failures"})
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
 # tools/list must never block the hosted event loop on a nested self-HTTP call
@@ -71,19 +74,41 @@ MCP_AGENT_INSTRUCTIONS = (
 def set_tools_list_session_resolver(
     resolver: Callable[[str], dict[str, Any] | None] | None,
 ) -> None:
-    """Register an in-process token→session lookup for tools/list role filtering."""
+    """Register an in-process token→session lookup for tools/list role filtering.
+
+    A resolver that returns None is answering authoritatively: this node does
+    not know the token (revoked, rotated, or never minted). A resolver that
+    cannot answer (store hiccup) must raise instead, so the caller can tell a
+    dead credential from a transient lookup failure (#171).
+    """
     global _tools_list_session_resolver
     _tools_list_session_resolver = resolver
 
 
-def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
-    """Resolve role/seat for tools/list without nested HTTP (avoids event-loop deadlock)."""
+class _UnknownToken:
+    """Sentinel: the access store authoritatively does not know this token."""
+
+
+_UNKNOWN_TOKEN = _UnknownToken()
+
+
+def _session_from_token_inprocess(
+    token: str,
+) -> dict[str, Any] | _UnknownToken | None:
+    """Resolve role/seat for tools/list without nested HTTP (avoids event-loop deadlock).
+
+    Returns the session dict, ``_UNKNOWN_TOKEN`` when the store definitively
+    does not know the token, or None when no in-process answer is available
+    (resolver errored, or kb.server is not importable) and the caller may try
+    the HTTP fallback.
+    """
     if _tools_list_session_resolver is not None:
         try:
-            return _tools_list_session_resolver(token)
-        except Exception as exc:  # noqa: BLE001 - fail open
+            session = _tools_list_session_resolver(token)
+        except Exception as exc:  # noqa: BLE001 - transient; caller may fall back
             logger.warning("tools/list in-process session resolver failed: %s", exc)
             return None
+        return session if session else _UNKNOWN_TOKEN
     # Late import: kb.server imports this module at load time.
     try:
         from kb.server import access_key_identity
@@ -95,7 +120,7 @@ def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
         logger.warning("tools/list access_key_identity failed: %s", exc)
         return None
     if not pair:
-        return None
+        return _UNKNOWN_TOKEN
     identity, _ = pair
     return {
         "ok": True,
@@ -105,7 +130,26 @@ def _session_from_token_inprocess(token: str) -> dict[str, Any] | None:
 
 
 class CitadelMcpError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        # HTTP status of the upstream Citadel response, when one arrived.
+        # Lets tools/list tell "the node rejected this token" (401) from
+        # "the node could not be asked" without parsing the message (#171).
+        self.status_code = status_code
+
+
+class CitadelMcpTimeout(CitadelMcpError):
+    """The budget expired before a response arrived.
+
+    Distinct from every other transport failure because it says nothing about
+    what the Node did: the request was written to the socket, so a write may
+    have landed, be landing, or never have been applied. A caller that treats
+    this as a failure retries and duplicates the write.
+    """
+
+    def __init__(self, message: str, *, timeout_s: float | None = None) -> None:
+        super().__init__(message)
+        self.timeout_s = timeout_s
 
 
 @dataclass(frozen=True)
@@ -431,18 +475,23 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
+def _request_from_context(ctx: Context | None) -> Any:
+    """The live HTTP request attached to the MCP context (None under stdio)."""
+    if ctx is None:
+        return None
+    try:
+        return ctx.request_context.request
+    except Exception:
+        return None
+
+
 def _bearer_from_context(ctx: Context | None) -> str | None:
     """Extract the caller's bearer token from the live HTTP request, if any.
 
     Returns None under stdio transport (no HTTP request is attached), which lets
     the server fall back to an env-configured client.
     """
-    if ctx is None:
-        return None
-    try:
-        request = ctx.request_context.request
-    except Exception:
-        return None
+    request = _request_from_context(ctx)
     if request is None:
         return None
     authorization = ""
@@ -625,7 +674,9 @@ def _filter_tools_for_session(
     never see the admin tools) and citadel_contribute for seat holders (Central
     is read-only from seat MCP). Returns the full list when the session is
     missing or carries an unknown role (fail open — call-time authz still
-    enforces). Tools absent from TOOL_POLICIES are never hidden by accident.
+    enforces); the tools/list handler decides when a failed resolution means
+    the reader floor instead (#171). Tools absent from TOOL_POLICIES are never
+    hidden by accident.
     """
     if not session:
         return all_tools
@@ -646,6 +697,18 @@ def _filter_tools_for_session(
     return visible
 
 
+def _reader_floor(all_tools: list[Any]) -> list[Any]:
+    """The tool surface served when a hosted caller has no resolvable role (#171).
+
+    Reader-visible tools only: enough for a client to stay functional (search,
+    discovery, session) without advertising the write/admin surface to a caller
+    whose credential is missing or did not resolve. Deliberately not empty — a
+    blanked list breaks clients that register tools once (#100) — and server-side
+    authz still rejects the calls themselves.
+    """
+    return _filter_tools_for_session(all_tools, {"role": "reader", "seat_slug": None})
+
+
 def _validate_ingest_size(data: str) -> None:
     max_bytes = _max_ingest_bytes()
     byte_count = len(data.encode("utf-8"))
@@ -659,6 +722,64 @@ def _validate_ingest_size(data: str) -> None:
 # default 30s client timeout, so the ingest tool extends its budget to match the
 # CLI's cognify timeout (kb.status._COGNIFY_TIMEOUT). Keep the two in sync.
 _INGEST_COGNIFY_TIMEOUT = 180.0
+
+
+def _ingest_cognify_timeout() -> float:
+    """Budget for one inline-cognify ingest, in seconds.
+
+    Overridable because the budget that decides what the caller sees is the
+    SMALLER of this one and the MCP client's own tool timeout. When the client
+    gives up first, the agent gets that client's opaque error and this tool
+    never runs its timeout path, so a deployment whose clients cut off earlier
+    than 180s should set this below their limit to keep the honest,
+    "outcome unconfirmed" answer reachable.
+    """
+    raw = os.getenv("CITADEL_MCP_INGEST_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _INGEST_COGNIFY_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _INGEST_COGNIFY_TIMEOUT
+    return value if value > 0 else _INGEST_COGNIFY_TIMEOUT
+
+
+def _unconfirmed_ingest(
+    data: str,
+    tags: list[str],
+    dataset: str | None,
+    timeout_s: float | None,
+) -> dict[str, Any]:
+    """What a caller may honestly conclude when the ingest budget expired.
+
+    Not an error: an error means "this did not happen", and that is precisely
+    what a timeout cannot establish. The note went out on the wire, so the two
+    live possibilities are "landed" and "still landing"; the caller is given
+    the fingerprint needed to tell which, and told not to retry until it has.
+    """
+    budget = f"{timeout_s:g}s" if timeout_s else "the configured budget"
+    first_line = " ".join(data.strip().splitlines()[0].split())[:120]
+    return {
+        "ok": False,
+        "accepted": None,
+        "write_state": "unknown",
+        "timed_out": True,
+        "timeout_s": timeout_s,
+        "code": "TIMEOUT",
+        "submitted": {
+            "first_line": first_line,
+            "tags": list(tags),
+            "dataset": dataset,
+        },
+        "message": (
+            f"No response from your Node within {budget}. The note was SUBMITTED and its "
+            "outcome is not confirmed — inline cognify can outlast the budget, and a write "
+            "that timed out has been observed to land anyway. Do not re-ingest yet: a retry "
+            "duplicates a note that succeeded. Confirm first with citadel_recent_contributions "
+            "(mine=true), or citadel_search for a distinctive phrase from the note; re-ingest "
+            "only if neither finds it."
+        ),
+    }
 
 
 class CitadelHttpClient:
@@ -762,8 +883,37 @@ class CitadelHttpClient:
             logger.warning(
                 "Citadel API call %s %s returned HTTP %s", method, path, exc.code
             )
-            raise CitadelMcpError(f"Citadel returned HTTP {exc.code}: {detail}") from exc
+            raise CitadelMcpError(
+                f"Citadel returned HTTP {exc.code}: {detail}", status_code=exc.code
+            ) from exc
+        except TimeoutError as exc:
+            # A read timeout escapes urlopen unwrapped (only the connect phase
+            # is turned into URLError), so this used to leave the tool as a
+            # bare TimeoutError — "The operation timed out." with no statement
+            # about the request's fate. Name it so callers can tell an expired
+            # budget from a refused or unreachable Node.
+            logger.warning(
+                "Citadel API call %s %s exceeded its %.0fs budget",
+                method,
+                path,
+                effective_timeout,
+            )
+            raise CitadelMcpTimeout(
+                f"No response from Citadel within {effective_timeout:g}s.",
+                timeout_s=effective_timeout,
+            ) from exc
         except URLError as exc:
+            if isinstance(exc.reason, TimeoutError) or "timed out" in str(exc.reason).lower():
+                logger.warning(
+                    "Citadel API call %s %s exceeded its %.0fs budget",
+                    method,
+                    path,
+                    effective_timeout,
+                )
+                raise CitadelMcpTimeout(
+                    f"No response from Citadel within {effective_timeout:g}s.",
+                    timeout_s=effective_timeout,
+                ) from exc
             reason = redact_secrets(str(exc.reason), self.access_token)
             logger.error(
                 "Citadel API call %s %s failed: %s: %s",
@@ -898,6 +1048,25 @@ def create_mcp_server(
         Each call automatically records implicit search telemetry (non-blocking)
         into the feedback mesh. Response may include ``search_id`` and a
         ``feedback`` hint for optional explicit ratings via citadel_record_feedback.
+
+        A hit from the indexed corpus carries two different ids, and they are
+        not interchangeable: ``id`` is CHUNK-level (the passage that matched);
+        ``document_id`` is DOCUMENT-level (the same id citadel_ingest reports
+        for the whole write, and what citadel_get_document's own ``.id``
+        returns). Passing ``id`` to citadel_get_document still resolves — it
+        walks chunk -> parent document — so the mismatch stays hidden until
+        something dedups or cites on ``id`` and compares it against a fetched
+        document's ``document_id``. Use ``document_id`` for anything
+        document-scoped (dedup across hits from the same document, citing "this
+        document", matching against citadel_ingest's result).
+
+        ``document_id`` is NOT on every hit. Hits that are not indexed corpus
+        documents supply their own ``id`` and no ``document_id`` — today that is
+        the github_sync digest fallback, which serves sections of the stored
+        sync digest when the github_sync dataset returns no indexed results. On
+        a hit with no ``document_id``, treat the hit's ``id`` as the unit and do
+        not synthesise a document id; ``citadel_get_document`` will not resolve
+        it either.
         """
         payload: dict[str, Any] = {
             "query": _require_non_empty(query, "query"),
@@ -940,7 +1109,19 @@ def create_mcp_server(
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_get_document"].annotations)
     async def citadel_get_document(document_id: str, ctx: Context) -> dict[str, Any]:
-        """Fetch a full source document by the ``id`` returned in a search result."""
+        """Fetch a full source document by the ``id`` returned in a search result.
+
+        Accepts either a hit's ``id`` (chunk-level) or its ``document_id``
+        (document-level) — a chunk id resolves by walking chunk -> parent
+        document automatically. The returned document's own ``id`` is always
+        the document-level id, so a caller comparing a hit's ``id`` against
+        this response's ``document.id`` should not expect them to match; the
+        hit's ``document_id`` is the one that will.
+
+        Only ids that came from the indexed corpus resolve. A hit with no
+        ``document_id`` (the github_sync digest fallback) is not a stored
+        document and has nothing to fetch here.
+        """
         normalized_id = _require_non_empty(document_id, "document_id")
         return await _call_async(
             "citadel_get_document",
@@ -994,19 +1175,50 @@ def create_mcp_server(
         ctx: Context,
         top_k: int = 10,
     ) -> dict[str, Any]:
-        """Search org-wide Linear issues synced to shared Central."""
-        return await _call_async(
-            "citadel_linear_search",
-            lambda: resolve_client(ctx).post(
+        """Search org-wide Linear issues synced to shared Central.
+
+        Scoped server-side to hits the Linear syncer wrote (`source=linear-issue`),
+        so a repo document that merely discusses Linear is not returned. The scope
+        is read from the issue header at the start of the document, which is body
+        text and therefore author-influenced: it selects what to search, it
+        attests nothing. The `filtering` block in the response reports how many
+        candidates the scope kept. The Linear workspace DIGEST carries no
+        per-issue header and is excluded; use citadel_search for it.
+        """
+        def search_linear() -> dict[str, Any]:
+            payload = resolve_client(ctx).post(
                 "/search",
                 {
                     "query": _require_non_empty(query, "query"),
                     "dataset": "masumi-network",
                     "top_k": _clamp_top_k(top_k),
+                    # Dataset alone is not a scope: shared Central holds every
+                    # synced source, so an unfiltered search here answered a
+                    # Linear question with another repo's documentation.
+                    "source": LINEAR_ISSUE_SOURCE,
                 },
                 tool_name="citadel_linear_search",
-            ),
-        )
+            )
+            # Asking for the scope is not getting it: a Node older than this
+            # tool drops the unknown field (pydantic ignores extras) and answers
+            # with an unscoped page. Report the scope the Node confirms applying,
+            # never the one the request asked for.
+            filtering = payload.get("filtering") if isinstance(payload, dict) else None
+            applied = filtering.get("applied") if isinstance(filtering, dict) else None
+            confirmed = (
+                isinstance(applied, dict) and applied.get("source") == LINEAR_ISSUE_SOURCE
+            )
+            scoped: dict[str, Any] = {**payload, "scope_applied": confirmed}
+            if not confirmed:
+                warnings = [w for w in (payload.get("warnings") or []) if w]
+                warnings.append(
+                    "This Node did not confirm the linear-issue scope, so these results "
+                    "are NOT Linear-only — treat them as a general Central search."
+                )
+                scoped["warnings"] = warnings
+            return scoped
+
+        return await _call_async("citadel_linear_search", search_linear)
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_ingest"].annotations)
     async def citadel_ingest(
@@ -1037,18 +1249,30 @@ def create_mcp_server(
         def post_ingest() -> dict[str, Any]:
             normalized_data = _require_non_empty(data, "data")
             _validate_ingest_size(normalized_data)
-            return resolve_client(ctx).post(
-                "/ingest",
-                {
-                    "data": normalized_data,
-                    "dataset": dataset,
-                    "tags": tags or [],
-                    "session_id": session_id,
-                    "cognify": cognify,
-                },
-                tool_name="citadel_ingest",
-                timeout=_INGEST_COGNIFY_TIMEOUT if cognify else None,
-            )
+            try:
+                return resolve_client(ctx).post(
+                    "/ingest",
+                    {
+                        "data": normalized_data,
+                        "dataset": dataset,
+                        "tags": tags or [],
+                        "session_id": session_id,
+                        "cognify": cognify,
+                    },
+                    tool_name="citadel_ingest",
+                    timeout=_ingest_cognify_timeout() if cognify else None,
+                )
+            except CitadelMcpTimeout as exc:
+                # An expired budget proves only that no response arrived. The
+                # request was already on the wire, and a note whose ingest
+                # "failed" this way was afterwards retrievable by id with a
+                # matching body and tags — so raising here taught agents to
+                # retry a write that had landed, duplicating it. Report what is
+                # known instead: submitted, outcome unconfirmed, here is how to
+                # settle it.
+                return _unconfirmed_ingest(
+                    normalized_data, tags or [], dataset, exc.timeout_s
+                )
 
         return await _call_async(
             "citadel_ingest",
@@ -1455,9 +1679,15 @@ def create_mcp_server(
         A nested blocking ``GET /api/session`` self-deadlocks the hosted
         streamable-HTTP transport: it runs on the same loop that must serve it,
         so after the HTTP client's retries tools/list takes ~90s and clients
-        register zero tools. Server-side 403s remain the real enforcement; this
-        only stops 403 trial-and-error and fails OPEN on any resolution error so
-        a transient lookup never blanks the tool list. (#100)
+        register zero tools (#100). Server-side 403s remain the real
+        enforcement; this only stops 403 trial-and-error.
+
+        A hosted caller whose bearer is missing, unknown, or unresolvable gets
+        the READER floor, not the full list: failing open advertised the six
+        admin tools to any caller with a dead token (#171), while an empty list
+        would break clients that register tools once (#100). Stdio keeps the
+        full list — there is no per-request credential there, and the
+        env-configured client still authenticates every call.
         """
         all_tools = await mcp.list_tools()
         try:
@@ -1466,8 +1696,19 @@ def create_mcp_server(
             ctx = None
         token = _bearer_from_context(ctx)
         if not token:
-            return all_tools  # stdio / unauthenticated handshake — call-time authz still applies
+            if _request_from_context(ctx) is not None and fallback is None:
+                # Hosted node transport with no Authorization header: the
+                # caller cannot invoke a single tool (resolve_client refuses),
+                # so advertise the reader surface, not the admin one.
+                return _reader_floor(all_tools)
+            return all_tools  # stdio, or an env-authenticated bridge
         session = _session_from_token_inprocess(token)
+        if isinstance(session, _UnknownToken):
+            logger.warning(
+                "tools/list bearer token is not recognized by this node "
+                "(revoked or rotated?); serving reader-only tools"
+            )
+            return _reader_floor(all_tools)
         if session is None:
             try:
                 session = await asyncio.wait_for(
@@ -1480,9 +1721,19 @@ def create_mcp_server(
                     ),
                     timeout=_TOOLS_LIST_SESSION_WAIT,
                 )
-            except Exception as exc:  # noqa: BLE001 - fail open for availability
-                logger.warning("tools/list role filter could not resolve session: %s", exc)
-                return all_tools
+            except Exception as exc:  # noqa: BLE001 - degrade to the reader floor
+                if getattr(exc, "status_code", None) == 401:
+                    logger.warning(
+                        "tools/list bearer token is not recognized by this node "
+                        "(revoked or rotated?); serving reader-only tools"
+                    )
+                else:
+                    logger.warning(
+                        "tools/list could not resolve the caller's role (%s); "
+                        "serving reader-only tools",
+                        exc,
+                    )
+                return _reader_floor(all_tools)
         return _filter_tools_for_session(all_tools, session)
 
     return mcp

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -201,3 +202,179 @@ def test_git_helper_survives_missing_git(monkeypatch) -> None:
 
     monkeypatch.setattr(capture_mod.subprocess, "run", boom)
     assert capture_mod._git("/tmp", "status") is None
+
+
+# --- server-decision truth: accepted / rejected / timeout --------------------
+
+
+def _configured_args(tmp_path: Path, *, as_json: bool) -> argparse.Namespace:
+    config_path = tmp_path / "capture.json"
+    save_capture_config(
+        CaptureConfig(node_url="https://node.example").with_root(str(tmp_path), ["personal"]),
+        path=config_path,
+    )
+    return argparse.Namespace(config=str(config_path), root=None, dry_run=False, json=as_json)
+
+
+def _rejection(reason: str) -> dict[str, Any]:
+    # Shape of a rejected /ingest write: cognee_result is null, NOT absent.
+    return {
+        "accepted": False,
+        "reason": reason,
+        "dataset": "seat:test",
+        "tags": ["personal", "capture"],
+        "cognee_result": None,
+    }
+
+
+def test_capture_duplicate_rejection_reports_ok_false_with_reason(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    monkeypatch.setattr(
+        "kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process")
+    )
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
+    out = json.loads(capsys.readouterr().out)
+    entry = out["results"][0]
+    assert entry["ok"] is False
+    assert entry["reason"] == "duplicate_in_process"
+    # The desired end state (content on the server) already holds, so an
+    # unchanged root is a visible no-op, not a failure.
+    assert rc == 0
+    assert out["ok"] is True
+
+
+def test_capture_duplicate_human_output_says_nothing_stored(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    monkeypatch.setattr(
+        "kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process")
+    )
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=False)))
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "nothing stored" in captured.out
+    assert "duplicate_in_process" in captured.out
+
+
+def test_capture_non_duplicate_rejection_is_a_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: _rejection("content_too_short"))
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=False)))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "nothing stored" in captured.err
+    assert "content_too_short" in captured.err
+
+
+def test_capture_accepted_reports_ok_true(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    monkeypatch.setattr(
+        "kb.cli.post_capture",
+        lambda *a, **k: {
+            "accepted": True,
+            "reason": "accepted",
+            "dataset": "seat:test",
+            "tags": ["personal", "capture"],
+            "cognee_result": {"status": "ok"},
+        },
+    )
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["ok"] is True
+    assert out["results"][0]["ok"] is True
+    assert out["results"][0]["status"] == "ok"
+
+
+def test_capture_response_without_accepted_field_still_ok(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Legacy shape: a 200 body with no explicit rejection reads as accepted.
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: {"status": "ok"})
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["results"][0]["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError("The read operation timed out"),
+        urllib.error.URLError(TimeoutError("timed out")),
+    ],
+    ids=["read-timeout", "urlerror-wrapped-timeout"],
+)
+def test_capture_timeout_is_reported_unknown_not_failed(
+    tmp_path: Path, monkeypatch, capsys, exc: Exception
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+
+    def boom(*a: Any, **k: Any) -> None:
+        raise exc
+
+    monkeypatch.setattr("kb.cli.post_capture", boom)
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
+    out = json.loads(capsys.readouterr().out)
+    entry = out["results"][0]
+    # A timeout proves only that the client stopped waiting, so the outcome is
+    # unknown (null), never a claimed failure.
+    assert entry["ok"] is None
+    assert "may still have completed" in entry["error"]
+    assert out["ok"] is False
+    assert rc == 1
+
+
+def test_capture_timeout_human_output_is_unknown_not_fail(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+
+    def boom(*a: Any, **k: Any) -> None:
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr("kb.cli.post_capture", boom)
+    rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=False)))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "UNKNOWN" in captured.err
+    assert "may still have completed" in captured.err
+    assert "FAIL" not in captured.err
+
+
+def test_http_timeout_default_raised_and_env_override(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS", raising=False)
+    assert capture_mod.http_timeout_seconds() == 300.0
+    monkeypatch.setenv("CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS", "45")
+    assert capture_mod.http_timeout_seconds() == 45.0
+    monkeypatch.setenv("CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS", "not-a-number")
+    assert capture_mod.http_timeout_seconds() == 300.0
+
+
+def test_post_capture_uses_configured_timeout(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    class _FakeResp:
+        def __enter__(self) -> "_FakeResp":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
+        seen["timeout"] = timeout
+        return _FakeResp()
+
+    monkeypatch.setattr(capture_mod._OPENER, "open", fake_open)
+    monkeypatch.setenv("CITADEL_CAPTURE_HTTP_TIMEOUT_SECONDS", "77")
+    post_capture("https://node.example", "ctdl_t", {"data": "d", "tags": []})
+    assert seen["timeout"] == 77.0

@@ -292,6 +292,12 @@ def distill_node_note(entries: list[dict[str, Any]]) -> str:
                         decisions.append(snippet)
 
     first_prompt = first_user_prompt(entries)
+    if not (first_prompt or last_assistant_text or decisions or files):
+        # Nothing extractable. Return "" so the caller can skip the send: a
+        # placeholder note would be byte-identical for every empty session, so
+        # it could be stored at most once and each later send would be refused
+        # as already-seen content while the receipt claimed capture.
+        return ""
     lines: list[str] = ["# Dev session note"]
     recap_bits: list[str] = []
     if first_prompt:

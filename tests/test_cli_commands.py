@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from kb.cli import _doctor, _ingest, _search, _token_set, _update, _wizard_roots
+from kb.cli import _activity, _doctor, _ingest, _search, _token_set, _update, _wizard_roots
 from kb.status import Check, StatusReport
 
 
@@ -1022,3 +1022,156 @@ def test_token_create_standalone_flags_skip_picker_on_tty(monkeypatch, capsys) -
     assert calls["standalone"]["role"] == "writer"
     assert calls["standalone"]["expires_at"] == "2027-01-01T00:00:00Z"
     assert "seat" not in calls
+
+
+# ---- citadel ingest --timeout / honest expiry ---------------------------------
+
+
+def test_ingest_timeout_flag_reaches_request(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, *, timeout=None):
+        seen["timeout"] = timeout
+        return {"accepted": True, "dataset": "seat:alice"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    rc = asyncio.run(_ingest(_ingest_args(timeout=5)))
+    assert rc == 0
+    assert seen["timeout"] == 5.0
+
+
+def test_ingest_timeout_does_not_claim_an_outcome(monkeypatch, capsys) -> None:
+    # A client timeout proves only that no response arrived in the budget — the
+    # write may or may not have landed. The old message claimed "Your note is
+    # saved" (and `saved: true`), which nothing verified.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args(timeout=2)))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "TIMEOUT"
+    assert out["write_state"] == "unknown"
+    assert "saved" not in out
+    assert "not prove" in out["error"]
+
+
+def test_ingest_timeout_plain_mode_is_honest(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args(json=False, timeout=2)))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "not prove" in captured.err
+    assert "is saved" not in captured.err
+    assert "is saved" not in captured.out
+
+
+def test_ingest_wrapped_socket_timeout_is_a_timeout(monkeypatch, capsys) -> None:
+    # urllib wraps connect-phase socket timeouts as URLError("timed out") — that
+    # is a budget expiry, not an unreachable Node, and must say so.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.URLError("urlopen error timed out")
+
+    monkeypatch.setattr("kb.status.ingest_node", boom)
+    rc = asyncio.run(_ingest(_ingest_args()))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["code"] == "TIMEOUT"
+
+
+def test_doctor_pre_push_from_non_repo_says_so(tmp_path: Path, monkeypatch, capsys) -> None:
+    # From a cwd with no git repo, doctor must not report "hook missing" —
+    # that reads as "your hook is gone" when there was simply nothing to inspect.
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_x")
+    checks = [
+        Check("node", True, "healthy"),
+        Check("auth", True, "valid"),
+        Check("mcp", True, "present"),
+        Check(
+            "pre_push_hook",
+            False,
+            f"no git repo at {tmp_path} — nothing to inspect (the hook is per-repo)",
+            data={"repo": str(tmp_path), "git_repo": False},
+        ),
+        Check("session_hook", True, "installed"),
+        Check("capture_roots", True, "none"),
+    ]
+    monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks))
+    args = argparse.Namespace(
+        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
+        node_url=None, json=True, fix=False,
+    )
+    rc = asyncio.run(_doctor(args))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert not any("hook missing" in i["problem"] for i in out["issues"])
+    assert any("no git repo" in i["problem"] for i in out["issues"])
+
+
+def _activity_args(**kw):
+    base = dict(
+        local=False, config=None, node_url="https://node.example",
+        watch=False, type=None, limit=20, json=True, global_broadcast=True,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_activity_global_json_emits_json_not_table(monkeypatch, capsys) -> None:
+    # `citadel activity --global --json` must emit machine-readable JSON, not
+    # the human "Team presence" table — a script parsing this got silent
+    # garbage with exit 0 and no signal --json was ignored.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"seats": [{"seat": "alice", "documents": 5}]},
+    )
+    rc = asyncio.run(_activity(_activity_args()))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Team presence" not in out
+    payload = json.loads(out)
+    assert payload["seats"] == [{"seat": "alice", "documents": 5}]
+
+
+def test_activity_global_json_flag_order_independent(monkeypatch, capsys) -> None:
+    # argparse.Namespace carries no flag-order info, so `--json --global` and
+    # `--global --json` reach this handler identically — assert both parse
+    # paths (represented by the same Namespace) take the JSON branch.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"seats": [{"seat": "bob", "documents": 2}]},
+    )
+    rc = asyncio.run(_activity(_activity_args(json=True, global_broadcast=True)))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["seats"][0]["seat"] == "bob"
+
+
+def test_activity_global_json_error_is_parseable(monkeypatch, capsys) -> None:
+    # An unreachable Node under --global --json must still exit with a
+    # parseable JSON object (matching the non-global error path), not a bare
+    # stderr line with stdout empty.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"error": "connection refused"},
+    )
+    rc = asyncio.run(_activity(_activity_args()))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "NODE_UNREACHABLE"

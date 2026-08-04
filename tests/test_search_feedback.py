@@ -153,7 +153,7 @@ async def test_mesh_record_search_telemetry_increments_feedback_index() -> None:
     snapshot = await mesh.snapshot(CONFIG)
 
     assert feedback_id.startswith("feedback:")
-    assert snapshot["stats"]["feedback"] == 1
+    assert snapshot["stats"]["since_restart"]["feedback"] == 1
     feedback_nodes = [n for n in snapshot["nodes"] if n["type"] == "feedback"]
     assert len(feedback_nodes) == 1
     assert feedback_nodes[0]["metadata"]["kind"] == "search_telemetry"
@@ -241,7 +241,7 @@ def test_search_endpoint_records_telemetry_and_survives_feedback_failure(
     assert str(body.get("search_id", "")).startswith("search:")
 
     mesh = client.get("/api/mesh").json()
-    assert mesh["stats"]["feedback"] >= 1
+    assert mesh["stats"]["since_restart"]["feedback"] >= 1
 
     async def failing(self: Any, *args: Any, **kwargs: Any) -> str:
         raise RuntimeError("telemetry store down")

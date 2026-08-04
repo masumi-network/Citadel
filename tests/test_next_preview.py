@@ -69,9 +69,8 @@ def test_every_preview_route_is_served_under_the_strict_policy() -> None:
         assert "object-src 'none'" in policy, path
 
     # No preview path is in the one opt-in list that can relax the policy, and
-    # none may join it: the pages they preview include the page that holds the
-    # opt-in today, so this is exactly where it would be copied across by
-    # reflex.
+    # none may join it. The list is empty today; while / held the opt-in, this
+    # is exactly where it would have been copied across by reflex.
     assert not any(
         path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS
     )
@@ -84,6 +83,36 @@ def test_the_preview_route_set_is_closed() -> None:
 
     for path in ("/next/nope", "/next/..%2f..%2fserver.py", "/next/index"):
         assert client.get(path).status_code == 404, path
+
+
+def test_the_theme_bootstrap_is_served_as_executable_javascript() -> None:
+    """Every exported page loads /next/theme.js from <head>, before paint.
+
+    The site sends X-Content-Type-Options: nosniff, so the browser executes
+    this file only if it arrives with a JavaScript media type. Anything else
+    (the JSON body of a 404 included) is refused, the bootstrap never runs,
+    and a visitor whose remembered choice is dark gets light on every /next
+    page while the live pages still honour it.
+    """
+    client = _client()
+
+    response = client.get("/next/theme.js")
+
+    assert response.status_code == 200
+    media_type = response.headers["content-type"].split(";")[0].strip()
+    assert media_type in {"text/javascript", "application/javascript"}
+    assert response.content == (server_module.WEBUI_DIR / "theme.js").read_bytes()
+
+    # The route is one literal filename, not a pattern: the page allow-list
+    # below it stays closed to every other name.
+    assert client.get("/next/theme.css").status_code == 404
+    assert client.get("/next/landing.js").status_code == 404
+
+    # And every exported document really does depend on it.
+    for page in _exported_html():
+        assert 'src="/next/theme.js"' in page.read_text(encoding="utf-8"), (
+            f"{page.name} does not load the theme bootstrap"
+        )
 
 
 def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
@@ -273,12 +302,22 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     a pre-rendered bar would carry a `style` attribute that `style-src 'self'`
     drops, so it is drawn after mount exactly as the hand-written page drew it
     from a deferred script.
+
+    Four counts were dropped from these tiles: commits, decision records, a test
+    count and a LOC count. None was evidence the system works and every one of
+    them had drifted stale on the page. A dated cost snapshot and a dated search
+    round-trip, both traceable to `scripts/bench/`, took two of the slots and the
+    row went from eight tiles to six.
     """
     body = _client().get("/next/info").text
 
     assert "v0.4.0" in body
-    assert "commits on main · last 52 weeks" in body
-    assert "architecture decision records" in body
+    assert "~$55/mo" in body
+    assert "269 ms" in body
+    assert "commits on main" not in body
+    assert "architecture decision records" not in body
+    assert "tests across 52 files" not in body
+    assert "53 modules" not in body
     assert "Live tiles pull from" in body
 
 

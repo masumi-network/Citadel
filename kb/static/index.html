@@ -194,8 +194,9 @@
 
             <section class="home-numbers" aria-label="Your numbers">
               <div class="number-card">
-                <span class="number-value" id="homeReadable">0</span>
+                <span class="number-value" id="homeReadable">—</span>
                 <span class="number-label">Notes you can read</span>
+                <span class="number-note" id="homeReadableNote" hidden></span>
               </div>
               <div class="number-card">
                 <span class="number-value" id="homeCapturedWeek">0</span>
@@ -254,7 +255,7 @@
             <section class="metrics-window dashboard-metrics" aria-label="Dashboard status">
               <dl class="stats dashboard-stats">
                 <div><dt>Daily sync</dt><dd id="dashboardCronStatus">Checking</dd><span id="dashboardCronMeta">sync status</span></div>
-                <div><dt>Notes indexed</dt><dd id="statDocuments">0</dd><span>accepted records</span></div>
+                <div><dt>Tracked sources</dt><dd id="statDocuments">0</dd><span>repos, files &amp; issues</span></div>
                 <div><dt>Linked nodes</dt><dd id="statNodes">0</dd><span id="statEdgesMeta"><span id="statEdges">0</span> edges</span></div>
                 <div><dt>Shared access</dt><dd id="dashboardMcpClients">Role-gated</dd><span id="dashboardMcpMeta">admin only</span></div>
               </dl>
@@ -415,7 +416,7 @@
             <section class="metrics-window dashboard-metrics" aria-label="Knowledge status">
               <dl class="stats dashboard-stats">
                 <div><dt>Sources</dt><dd id="knowledgeSourceCount">0</dd><span>connected feeds</span></div>
-                <div><dt>Snapshots</dt><dd id="knowledgeSnapshotCount">0</dd><span>retained notes</span></div>
+                <div><dt>Tracked sources</dt><dd id="knowledgeSnapshotCount">0</dd><span>repos, files &amp; issues</span></div>
                 <div><dt>Conflicts</dt><dd id="knowledgeConflictCount">0</dd><span>open reviews</span></div>
                 <div><dt>Index records</dt><dd id="knowledgeRecordCount">0</dd><span>retrieval map</span></div>
               </dl>
@@ -1441,7 +1442,7 @@ args = [
                 <strong data-timeline-stat="pending">0</strong>
               </div>
               <div class="timeline-stat">
-                <span>Failed chunks</span>
+                <span>Failed ops · restart</span>
                 <strong data-timeline-stat="failed">0</strong>
               </div>
               <div class="timeline-stat">

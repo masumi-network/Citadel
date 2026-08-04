@@ -7,6 +7,7 @@ Keeps a stable hit schema agents can filter on without a second fetch.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -33,7 +34,15 @@ ACTIVITY_RE = re.compile(
 # its commit and its blob is source-linked repository documentation, whatever
 # else its text may coincidentally match.
 REPO_CONTENT_HEADER_RE = re.compile(
-    r"^#\s+[\w.-]+/[\w.-]+/\S+\s*\n\s*\n"
+    # The title line's trailing whitespace is `[^\S\n]*` (horizontal whitespace)
+    # rather than `\s*` so it cannot compete with the `\n` right after it for
+    # the same newline. With `\s*` a run of blank lines could be divided between
+    # the two in many ways and the engine tried them all, so matching cost grew
+    # faster than the document; pinning the split keeps it proportional. The
+    # PARSE variant below already spells this junction the same way. The set of
+    # accepted headers is unchanged: \r, \f and \v still match here, only \n is
+    # excluded, and \n is what the literal that follows consumes.
+    r"^#\s+[\w.-]+/[\w.-]+/\S+[^\S\n]*\n\s*\n"
     r"Repository:\s*\S+\s*\n"
     r"Source:\s*https?://\S+\s*\n"
     r"Commit:\s*\S+\s*\n"
@@ -140,7 +149,14 @@ HEX_ASSET_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{56,})(?![0-9a-fA-F])")
 TOKEN_ASSET_QUERY_RE = re.compile(
     r"\b("
     r"usdcx|usdm|tusdm|payment\s*token|asset\s*id|policy\s*id|token\s*unit|"
-    r"payment\s*unit|mainnet\s+asset|fingerprint|policy\s*\+?\s*asset"
+    # `policy\s*(?:\+\s*)?asset` rather than `policy\s*\+?\s*asset`: the optional
+    # `+` is grouped with the whitespace that may follow it, so a run of spaces
+    # between the two words has exactly one possible split instead of one per
+    # space. Every alternative here is now proportional to the length of the
+    # query rather than growing faster than it. The accepted strings are
+    # identical: policyasset, policy asset, policy+asset, policy + asset and
+    # policy  +  asset all still match.
+    r"payment\s*unit|mainnet\s+asset|fingerprint|policy\s*(?:\+\s*)?asset"
     r")\b",
     re.IGNORECASE,
 )
@@ -557,6 +573,43 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
+# Epoch windows for _first_timestamp. A number is read in whichever unit puts
+# it inside [2001-09-09, 2096-10-02]; the two windows are three orders of
+# magnitude apart, so no value is valid in both and a unit can never be
+# guessed wrong by decades.
+_EPOCH_SECONDS_MIN = 1_000_000_000  # 2001-09-09T01:46:40+00:00
+_EPOCH_SECONDS_MAX = 4_000_000_000  # 2096-10-02T07:06:40+00:00
+_EPOCH_MILLIS_MIN = _EPOCH_SECONDS_MIN * 1000
+_EPOCH_MILLIS_MAX = _EPOCH_SECONDS_MAX * 1000
+
+
+def _first_timestamp(*values: Any) -> str | None:
+    """First usable timestamp as an ISO-8601 UTC string.
+
+    Strings pass through like ``_first_str``. Numbers are epoch seconds or
+    epoch millis (cognee DataPoint ``updated_at``/``created_at`` are millis),
+    disambiguated by the windows above. Anything outside both windows — 0,
+    negatives, small counters, far-future junk — yields None rather than a
+    date: a missing date is recoverable, a wrong one gets trusted. ``bool``
+    is an ``int`` subclass and is never a timestamp.
+    """
+    for value in values:
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if _EPOCH_SECONDS_MIN <= value <= _EPOCH_SECONDS_MAX:
+            seconds = float(value)
+        elif _EPOCH_MILLIS_MIN <= value <= _EPOCH_MILLIS_MAX:
+            seconds = value / 1000.0
+        else:
+            continue
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat(timespec="seconds")
+    return None
+
+
 def _hit_chunk_index(hit: dict[str, Any]) -> Any:
     """The hit's own chunk_index (CHUNKS payloads carry one), else None."""
     if "chunk_index" in hit:
@@ -666,7 +719,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         "repo": repo,
         "path": path,
         "doc_type": doc_type,
-        "updated_at": _first_str(
+        "updated_at": _first_timestamp(
             item.get("updated_at"),
             envelope.get("created_at"),
             metadata.get("updated_at"),
@@ -777,11 +830,33 @@ def _hit_path_identity(hit: dict[str, Any]) -> str | None:
     return header.get("path") or header.get("title")
 
 
+def _hit_source_identity(hit: dict[str, Any]) -> str | None:
+    """WHICH syncer wrote this hit — from the server envelope or the header.
+
+    The kind of source a hit IS, not what its body discusses: a repository's
+    ``docs/agents/issue-tracker.md`` is about Linear on every line and is still
+    repo content. Prefer the server's resolved provenance, fall back to parsing
+    the structural header the syncer wrote (start of chunk 0 only, so a quoted
+    or mid-document header cannot claim another source's identity).
+
+    Header-derived, therefore author-controlled: this scopes a search, it does
+    not attest anything, and it must never feed ``trust_tier``.
+    """
+    provenance = _hit_provenance(hit)
+    source = _first_str(provenance.get("source"), hit.get("source"), hit.get("source_type"))
+    if source:
+        return source.strip().lower()
+    header = parse_content_header(_hit_raw_text(hit), chunk_index=_hit_chunk_index(hit))
+    kind = header.get("kind")
+    return kind.strip().lower() if isinstance(kind, str) and kind.strip() else None
+
+
 def compact_search_filters(
     *,
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
     mode: str | None = None,
@@ -799,6 +874,8 @@ def compact_search_filters(
         filters["repo"] = repo.strip()
     if isinstance(path, str) and path.strip():
         filters["path"] = path.strip()
+    if isinstance(source, str) and source.strip():
+        filters["source"] = source.strip()
     if canonical_only:
         filters["canonical_only"] = True
     if exclude_ambient:
@@ -820,10 +897,17 @@ def filter_hits(
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
 ) -> list[dict[str, Any]]:
     filtered = hits
+    if source:
+        # Fail-closed, like repo=: a hit that cannot state which source it came
+        # from does not satisfy a source filter. A tool that promises one
+        # source must return nothing rather than something else.
+        wanted_source = source.strip().lower()
+        filtered = [h for h in filtered if _hit_source_identity(h) == wanted_source]
     if types:
         wanted = {t.strip().lower() for t in types if t.strip()}
         filtered = [h for h in filtered if _hit_doc_type(h) in wanted]

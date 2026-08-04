@@ -41,8 +41,10 @@ class MeshState:
     errors: int = 0
     indexed_chunks: int = 0
     pending_chunks: int = 0
-    failed_chunks: int = 0
     last_indexed_at: str | None = None
+    # When this process (and therefore every counter above) started counting.
+    # Published with the since_restart block so consumers can see the window.
+    started_at: str = field(default_factory=utc_now)
     _rehydrated: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -224,23 +226,59 @@ class MeshState:
         and ``citadel status`` already report). When present they are reported as
         the totals and the in-memory versions move under ``since_restart``, which
         is what they have always actually measured.
+
+        The activity counters — ``searches``, ``feedback``, ``upgrades``,
+        ``errors``, ``pending_chunks`` — appear ONLY under ``since_restart``
+        (#196): they reset with the process, and a top-level position reads as
+        a lifetime total (verified live: after a redeploy the top-level and
+        since-restart values were identical). ``since_restart.started_at``
+        publishes the window they cover. There is no ``failed_chunks`` (#197):
+        it was the ``errors`` counter incremented a second time in the same
+        code path and never counted chunks.
+
+        Three more top-level fields didn't mean their names (verified live
+        2026-08-03) and got the same #196/#197 treatment:
+
+        - ``edges`` was ``len(self.edges)`` — the same in-memory, restart-reset
+          projection already published honestly as
+          ``since_restart.projection_edges`` — sitting at the top level next to
+          corpus totals, where it read as one (5511 vs a real 131843 graph
+          edges: 24x off). ``corpus["indexed_edges"]`` is now threaded through
+          from the same graph read ``indexed_docs`` already comes from, so this
+          reports the real total when it's available and falls back to the
+          projection otherwise, exactly like ``nodes``.
+        - ``indexed_chunks`` was ``authoritative_nodes`` — the exact same value
+          as ``nodes`` — so it was equal to ``nodes`` by construction and never
+          measured a chunk count. Removed, not renamed: the same call made for
+          ``failed_chunks``. The honest restart-scoped accumulator is still
+          ``since_restart.indexed_chunks``.
+        - ``documents`` was ``corpus["tracked_sources"]`` — the sum of tracked
+          github repos, repo-content files and linear issues (318 live), not a
+          document count (the durable corpus store held ~2876 rows at the same
+          moment). Renamed to ``tracked_sources`` to match what it actually
+          reports; nothing on this hot, reader-scoped surface can cheaply
+          compute a real document-row total (that requires the admin-scoped
+          corpus census).
         """
         async with self._lock:
             self._ensure_base_graph(config)
             indexes = self._indexes(config)
             since_restart = {
+                "started_at": self.started_at,
                 "documents": self.documents,
                 "searches": self.searches,
                 "feedback": self.feedback_items,
                 "upgrades": self.upgrades,
                 "errors": self.errors,
                 "indexed_chunks": self.indexed_chunks,
+                "pending_chunks": self.pending_chunks,
                 "projection_nodes": len(self.nodes),
                 "projection_edges": len(self.edges),
             }
             corpus = corpus or {}
             authoritative_nodes = corpus.get("indexed_docs")
             authoritative_docs = corpus.get("tracked_sources")
+            authoritative_edges = corpus.get("indexed_edges")
             return {
                 "revision": self.revision,
                 "generated_at": utc_now(),
@@ -250,21 +288,12 @@ class MeshState:
                     "nodes": (
                         authoritative_nodes if authoritative_nodes is not None else len(self.nodes)
                     ),
-                    "edges": len(self.edges),
-                    "documents": (
+                    "edges": (
+                        authoritative_edges if authoritative_edges is not None else len(self.edges)
+                    ),
+                    "tracked_sources": (
                         authoritative_docs if authoritative_docs is not None else self.documents
                     ),
-                    "searches": self.searches,
-                    "feedback": self.feedback_items,
-                    "upgrades": self.upgrades,
-                    "errors": self.errors,
-                    "indexed_chunks": (
-                        authoritative_nodes
-                        if authoritative_nodes is not None
-                        else self.indexed_chunks
-                    ),
-                    "pending_chunks": self.pending_chunks,
-                    "failed_chunks": self.failed_chunks,
                     "last_indexed_at": self.last_indexed_at,
                     "latest_event_id": self.revision,
                     "since_restart": since_restart,
@@ -877,10 +906,13 @@ class MeshState:
         self._publish(event)
 
     def _timeline_stats(self) -> dict[str, Any]:
+        # No failed_chunks here (#197): the only events with timeline status
+        # "failed" are record_error's, so a "failed chunks" figure would just
+        # be the errors counter under a name that promises chunk granularity.
         return {
             "indexed_chunks": self.indexed_chunks,
             "pending_chunks": self.pending_chunks,
-            "failed_chunks": self.failed_chunks,
+            "errors": self.errors,
             "last_indexed_at": self.last_indexed_at,
             "latest_event_id": self.revision,
         }
@@ -890,8 +922,6 @@ class MeshState:
             chunks = timeline["metrics"].get("chunks")
             self.indexed_chunks += max(int(chunks or 1), 0)
             self.last_indexed_at = created_at
-        if timeline["status"] == "failed":
-            self.failed_chunks += 1
 
     def _timeline_envelope(self, event_type: str, details: dict[str, Any]) -> dict[str, Any]:
         profiles = {

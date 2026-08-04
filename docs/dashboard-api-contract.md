@@ -71,19 +71,26 @@ adds `access`, `audit`, `settings` (sub-tabs of the Admin group) and `locked`.
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/me/summary` | `document_count` (fallback only), `recent_activity[]` (fallback only), `empty` | on view activation |
-| `GET /api/mesh` | `stats.documents`, `stats.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
+| `GET /api/me/summary` | `readable_document_count`, `recent_activity[]` (fallback only), `empty` | on view activation |
+| `GET /api/mesh` | `stats.tracked_sources`, `stats.since_restart.errors`, `events[].type`, `events[].message`, `events[].created_at`, `events[].dataset` | boot, SSE, refresh |
 | `GET /api/promotion/pending?status=pending` | `items[]` (see Review for fields) | boot |
 | `GET /api/sources` | `sources[].open_conflicts`, `.name`, `.id`, `.metadata.last_security_scan.{blocked,finding_count,highest_severity}` | boot |
 | `GET /api/github-sync` | `last_checked_at` | boot, refresh |
 
-`/api/me/summary` returns 11 fields; Home renders 3, and two of those only as a fallback
-when the mesh has no events. `node_label`, `node_dataset`, `search_datasets`,
-`pending_promotions`, `last_ingest_at` and `checklist` are fetched and dropped. The
-checklist died with the phase 3 rebuild.
+`/api/me/summary` returns 13 fields; Home renders 3, and one of those (`recent_activity`)
+only as a fallback when the mesh has no events. `node_label`, `node_dataset`,
+`search_datasets`, `document_count`, `captured_last_7d`, `pending_promotions`,
+`last_ingest_at` and `checklist` are fetched and dropped. The checklist died with the
+phase 3 rebuild.
 
-Errors: a failed `/api/me/summary` shows a toast and leaves the numbers at their
-last-rendered values. `/api/sources` failures are swallowed to `[]`, so a broken sources
+"Notes you can read" reads `readable_document_count`, which is summed over the caller's
+resolved search datasets (Node plus Central). It is not `document_count`, which is
+Node-only and would understate the tile by whatever Central holds.
+
+Errors: a failed `/api/me/summary` shows a toast, and "Notes you can read" renders `—`
+with an `Unavailable` note rather than a number. When the endpoint answers but reports no
+`readable_document_count`, the note reads `Not reported by this node yet`. Neither state
+renders 0: zero is a claim that the caller can read nothing. `/api/sources` failures are swallowed to `[]`, so a broken sources
 endpoint reads as "nothing is failing", which is exactly backwards. Empty: the Needs-you
 list renders a plain sentence, not a card. Slow: Home paints immediately from whatever
 state has arrived and re-renders as each fetch lands.
@@ -97,7 +104,7 @@ weight).
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `stats.{nodes,edges,documents,searches,feedback,upgrades,errors}`, `events[]`, `indexes[].{name,records,status}` | boot, SSE |
+| `GET /api/mesh` | `stats.{nodes,edges,tracked_sources}`, `stats.since_restart.{searches,feedback,upgrades,errors}`, `events[]`, `indexes[].{name,records,status}` | boot, SSE |
 | `GET /api/github-sync` | `last_checked_at`, `tracked_repositories`, `run_improve` | boot |
 | `GET /api/promotion/pending` | `items[].{seat_slug,preview,reference_reason,reference_status,id}`, `count` | boot |
 | `GET /api/access` | `tokens[].{name,role,scopes,prefix,revoked_at}`, `principals[].length` | boot (admin) |
@@ -122,6 +129,22 @@ Per-hit fields rendered: `_citadel.rank`, `_citadel.dataset`, `_citadel.trust` o
 `_citadel.document_endpoint`, top-level `score`, and the body text. The whole raw hit is
 also dumped into a `<details>` block.
 
+A hit from the indexed corpus also carries two undocumented, easy-to-confuse ids at the
+top level: `id` is CHUNK-level (the passage that matched the query), and `document_id` is
+DOCUMENT-level (the same id `citadel_ingest` reports for the whole write, and what a
+fetched document's own `.id` is). `_citadel.result_id` and `_citadel.document_endpoint`
+are both built from `id`, not `document_id` — `/api/documents/{id}` still resolves a chunk
+id by walking chunk -> parent, which hides the distinction. Anything that dedups hits from
+the same document, or compares a hit's id against a fetched document's `.id`, must use
+`document_id`; comparing on `id` will never match.
+
+`document_id` is not on every hit. `search_github_sync_state` (kb/source_search.py), which
+`Citadel.search` falls back to when the `github_sync` dataset returns no indexed results,
+emits digest sections with their own `id` and no `document_id` at all; `with_result_id`
+leaves any hit that already supplies an `id` untouched. A consumer must treat the field as
+optional: when it is absent the hit is not a stored document, so key on `id`, and expect
+`/api/documents/{id}` not to resolve it.
+
 Errors: renders an error card with a Retry button that re-submits the form. 401/403 land
 there too, with no sign-in prompt. Empty: an empty-state card that lists
 `known_datasets` when present and offers "Review sources" and "Add note" buttons. Slow:
@@ -139,7 +162,7 @@ budget shows skeletons until the server returns its own truncated payload.
 | --- | --- | --- |
 | `GET /api/github-sync` | `org`, `tracked_repositories`, `last_checked_at`, `last_digest_at` | boot, refresh |
 | `GET /api/sources?type=obsidian_vault` | `sources[].{name,documents,last_push_at,open_conflicts}`, `summary.{obsidian_documents,open_conflicts}` | boot |
-| `GET /api/mesh` | `stats.documents`, `stats.errors`, `indexes[]`, `events[]` | boot, SSE |
+| `GET /api/mesh` | `stats.tracked_sources`, `stats.since_restart.errors`, `indexes[]`, `events[]` | boot, SSE |
 
 Nothing fetches on activation. Note the page shows sources and indexes; the mesh canvas
 is not here.
@@ -148,7 +171,7 @@ is not here.
 
 | Endpoint | Fields rendered | Fires |
 | --- | --- | --- |
-| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.{indexed_chunks,pending_chunks,failed_chunks,last_indexed_at,errors}` | boot, SSE, refresh |
+| `GET /api/mesh` | `events[].{id,type,message,created_at,details.*,timeline?}`, `stats.last_indexed_at`, `stats.since_restart.{indexed_chunks,pending_chunks,errors}` | boot, SSE, refresh |
 
 `timelineEnvelope(event)` prefers a server-provided `event.timeline` object and
 otherwise synthesises `{kind, status, dataset, source, metrics}` from
@@ -320,11 +343,13 @@ No endpoints. The fallback `setPage` renders when `canUse` fails.
 Data the redesigned views in `docs/superpowers/specs/2026-07-29-app-ui-design.md` need
 that no current endpoint returns.
 
-1. **"Notes you can read" (Home number 1).** No endpoint returns a readable-corpus
-   count. `/api/mesh` `stats.documents` counts document nodes in a mesh that is
-   transient across process restarts; `/api/me/summary` `document_count` is Node-only.
-   *Would need:* `/api/me/summary` to return a `readable_document_count` computed from
-   the caller's resolved search datasets, not from mesh nodes.
+1. **"Notes you can read" (Home number 1). CLOSED.** `/api/me/summary` returns
+   `readable_document_count`, summed over `resolve_search_datasets(identity)` from the
+   durable store, and both dashboards render it. Neither of the fields that were reached
+   for first is the number: `/api/mesh` `stats.tracked_sources` counts tracked github
+   repos, repo-content files and linear issues, not documents, and `document_count` is
+   Node-only. The field is nullable, and both dashboards render `—` plus a reason rather
+   than a zero when it is null.
 
 2. **"Captured this week" (Home number 2).** Nothing returns a windowed count. It is
    currently derived client-side by filtering `/api/mesh` `events[]` for
@@ -339,7 +364,7 @@ that no current endpoint returns.
 
 4. **Last sync time and the health pill (Home title row).** `last_checked_at` on
    `/api/github-sync` is GitHub-only; there is no vault-wide "last sync". Health is
-   inferred from `/api/mesh` `stats.errors`.
+   inferred from `/api/mesh` `stats.since_restart.errors`.
    *Would need:* a small `/api/health` or fields on `/api/me/summary`.
 
 5. **Per-hit score (Search).** `score` is whatever the retrieval layer attached and is
@@ -409,8 +434,8 @@ that no current endpoint returns.
   every refresh. Those four writes have never been visible.
 - **The `.hidden-stats` block** (`index.html:257`, `display: none` in CSS) receives
   `statSearches`, `statFeedback`, `statUpgrades` and `statErrors` from every
-  `renderSnapshot`. Only `stats.errors` is read again, from the snapshot object rather
-  than the DOM.
+  `renderSnapshot`. Only the since-restart error count is read again, from the
+  snapshot object rather than the DOM.
 
 **Server endpoints the dashboard never calls.**
 

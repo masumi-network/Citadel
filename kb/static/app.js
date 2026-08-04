@@ -80,6 +80,10 @@ const state = {
   // Home and Review read these; whichever fetch lands first paints, the rest
   // fill in. Neither view blocks on the slowest request.
   meSummary: null,
+  // Distinguishes "the fetch failed" from "not fetched yet" / "field absent".
+  // Home renders a different note for each; a bare dash for all three would
+  // hide a broken endpoint.
+  meSummaryError: false,
   promotions: [],
   sources: [],
   auditFilter: "all",
@@ -831,20 +835,23 @@ function renderSnapshot(snapshot) {
   meshAlert.hidden = true;
   canvasEmpty.hidden = state.graphMode !== "live" || snapshot.nodes.length > 4;
   updateGraphMeta();
+  // Activity counters reset with the process and are published only under
+  // stats.since_restart (#196) — corpus totals stay top-level.
+  const sinceRestart = snapshot.stats.since_restart || {};
   document.getElementById("statNodes").textContent = snapshot.stats.nodes;
   document.getElementById("statEdges").textContent = snapshot.stats.edges;
-  document.getElementById("statDocuments").textContent = snapshot.stats.documents;
-  document.getElementById("statSearches").textContent = snapshot.stats.searches;
-  document.getElementById("statFeedback").textContent = snapshot.stats.feedback;
-  document.getElementById("statUpgrades").textContent = snapshot.stats.upgrades;
-  document.getElementById("statErrors").textContent = snapshot.stats.errors;
+  document.getElementById("statDocuments").textContent = snapshot.stats.tracked_sources;
+  document.getElementById("statSearches").textContent = sinceRestart.searches || 0;
+  document.getElementById("statFeedback").textContent = sinceRestart.feedback || 0;
+  document.getElementById("statUpgrades").textContent = sinceRestart.upgrades || 0;
+  document.getElementById("statErrors").textContent = sinceRestart.errors || 0;
   if (knowledgeStatus) {
-    const errorCount = Number(snapshot.stats.errors || 0);
+    const errorCount = Number(sinceRestart.errors || 0);
     knowledgeStatus.textContent = errorCount ? "Review" : "Current";
     knowledgeStatus.className = `status-chip ${errorCount ? "status-error" : "status-enabled"}`;
   }
   if (knowledgeSnapshotCount) {
-    knowledgeSnapshotCount.textContent = String(snapshot.stats.documents || 0);
+    knowledgeSnapshotCount.textContent = String(snapshot.stats.tracked_sources || 0);
   }
   eventCount.textContent = String(snapshot.events.length);
   renderDashboardIndexes(snapshot.indexes);
@@ -878,16 +885,22 @@ function renderSnapshot(snapshot) {
 
 function renderTimelineStats(snapshot) {
   const stats = snapshot.stats || {};
+  const since = stats.since_restart || {};
   const events = snapshot.events || [];
   if (eventCount) eventCount.textContent = String(events.length);
   if (timelineStatValues.indexed) {
-    timelineStatValues.indexed.textContent = String(stats.indexed_chunks || 0);
+    // indexed_chunks is no longer published at the top level (it only ever
+    // duplicated `nodes`, by construction); the honest restart-scoped
+    // accumulator lives under since_restart, same as pending/failed below.
+    timelineStatValues.indexed.textContent = String(since.indexed_chunks || 0);
   }
   if (timelineStatValues.pending) {
-    timelineStatValues.pending.textContent = String(stats.pending_chunks || 0);
+    timelineStatValues.pending.textContent = String(since.pending_chunks || 0);
   }
   if (timelineStatValues.failed) {
-    timelineStatValues.failed.textContent = String(stats.failed_chunks || 0);
+    // failed_chunks was the errors counter surfaced twice (#197); the single
+    // failure figure is the failed-operation count since restart.
+    timelineStatValues.failed.textContent = String(since.errors || 0);
   }
   if (timelineStatValues.lastIndexed) {
     timelineStatValues.lastIndexed.textContent = stats.last_indexed_at
@@ -895,7 +908,7 @@ function renderTimelineStats(snapshot) {
       : "waiting";
   }
   if (timelineFreshness) {
-    const failed = Number(stats.failed_chunks || 0) + Number(stats.errors || 0);
+    const failed = Number(since.errors || 0);
     timelineFreshness.textContent = failed ? "Review" : events.length ? "Live" : "Waiting";
     timelineFreshness.className = `status-chip ${failed ? "status-error" : events.length ? "status-enabled" : "status-standby"}`;
   }
@@ -1140,12 +1153,13 @@ function analyticsStatusSeries(events) {
 }
 
 function analyticsOpsSeries(stats = {}) {
+  const since = stats.since_restart || {};
   return [
-    { label: "Notes", value: Number(stats.documents || 0), tone: "primary" },
+    { label: "Sources", value: Number(stats.tracked_sources || 0), tone: "primary" },
     { label: "Nodes", value: Number(stats.nodes || 0), tone: "info" },
-    { label: "Searches", value: Number(stats.searches || 0), tone: "ok" },
-    { label: "Feedback", value: Number(stats.feedback || 0), tone: "attention" },
-    { label: "Errors", value: Number(stats.errors || 0), tone: "failed" },
+    { label: "Searches", value: Number(since.searches || 0), tone: "ok" },
+    { label: "Feedback", value: Number(since.feedback || 0), tone: "attention" },
+    { label: "Errors", value: Number(since.errors || 0), tone: "failed" },
   ];
 }
 
@@ -1279,7 +1293,7 @@ function renderOverviewAnalytics(snapshot) {
   const opsTotal = ops.reduce((sum, row) => sum + row.value, 0);
   setAnalyticsMeta(
     document.getElementById("overviewAnalyticsOpsMeta"),
-    opsTotal ? `${opsTotal} total` : "Empty",
+    opsTotal ? `${opsTotal} · activity since restart` : "Empty",
     opsTotal ? "enabled" : "standby",
   );
   const failed = status.find((row) => row.tone === "failed")?.value || 0;
@@ -1439,12 +1453,12 @@ function renderAuditRuntimeEvents(events = []) {
 
 function renderDashboardOpenIssue(snapshot) {
   if (!dashboardOpenIssue) return;
-  const errorCount = Number(snapshot.stats.errors || 0);
+  const errorCount = Number((snapshot.stats.since_restart || {}).errors || 0);
   const hasEvents = Boolean(snapshot.events.length);
   if (errorCount > 0) {
     dashboardOpenIssue.className = "dashboard-event-card issue-card";
     dashboardOpenIssue.innerHTML = `
-      <strong>${escapeHtml(errorCount)} runtime error${errorCount === 1 ? "" : "s"}</strong>
+      <strong>${escapeHtml(errorCount)} runtime error${errorCount === 1 ? "" : "s"} since restart</strong>
       <p>Open the events page to inspect failed operations.</p>
     `;
     return;
@@ -3155,10 +3169,40 @@ function homeCapturedThisWeek() {
   }).length;
 }
 
+// "Notes you can read" is a readable-corpus count: this caller's Node plus
+// every dataset resolve_search_datasets() gives them (Central included).
+// /api/me/summary computes exactly that as `readable_document_count`, from the
+// durable relational store.
+//
+// This used to prefer the /api/mesh field now called `tracked_sources`, which
+// was never a document count at all — it is the sum of tracked github repos,
+// repo-content files and linear issues (ADR-0020). `document_count` is not the
+// right substitute either: it is Node-only, so it silently understates an
+// org-wide number by however much Central holds.
+//
+// Returns null, never 0, when the figure is not available. Zero is a claim
+// that the caller can read nothing, which is a different (and reassuring)
+// statement from "this node did not report a number".
 function homeReadableCount() {
-  const stats = (state.snapshot && state.snapshot.stats) || {};
-  if (stats.documents !== undefined && stats.documents !== null) return Number(stats.documents);
-  return Number((state.meSummary && state.meSummary.document_count) || 0);
+  const summary = state.meSummary;
+  if (!summary) return null;
+  const readable = summary.readable_document_count;
+  return typeof readable === "number" ? readable : null;
+}
+
+/** A number that is not there yet reads as a dash, never as zero. */
+function countOrDash(value) {
+  return typeof value === "number" ? String(value) : "—";
+}
+
+// Why the number is missing, or "" when it is not missing. Mirrors the Next
+// port's Home tile (web/src/pages/app/index.tsx): a failed fetch and a node
+// that did not report the field are different states and must not both render
+// as a bare dash.
+function homeReadableNote() {
+  if (state.meSummaryError) return "Unavailable";
+  if (homeReadableCount() === null) return "Not reported by this node yet";
+  return "";
 }
 
 function renderHomeRecent() {
@@ -3219,7 +3263,9 @@ function renderHome() {
     syncedAt.textContent = last ? `Last sync ${formatDate(last)}` : "Never synced";
   }
 
-  const errors = Number(((state.snapshot || {}).stats || {}).errors || 0);
+  // Activity counters are published only under stats.since_restart (#196).
+  const homeStats = (state.snapshot || {}).stats || {};
+  const errors = Number((homeStats.since_restart || {}).errors || 0);
   if (!state.snapshot) {
     status.textContent = "Loading";
     status.className = "status-chip status-standby";
@@ -3232,7 +3278,13 @@ function renderHome() {
   }
 
   const readable = document.getElementById("homeReadable");
-  if (readable) readable.textContent = String(homeReadableCount());
+  if (readable) readable.textContent = countOrDash(homeReadableCount());
+  const readableNote = document.getElementById("homeReadableNote");
+  if (readableNote) {
+    const note = homeReadableNote();
+    readableNote.textContent = note;
+    readableNote.hidden = !note;
+  }
   const captured = document.getElementById("homeCapturedWeek");
   if (captured) captured.textContent = String(homeCapturedThisWeek());
   const waiting = document.getElementById("homeWaiting");
@@ -3256,8 +3308,10 @@ async function loadSeatHome() {
   renderHome();
   try {
     state.meSummary = await api("/api/me/summary");
+    state.meSummaryError = false;
   } catch (error) {
     state.meSummary = null;
+    state.meSummaryError = true;
     showToast(error.message || "Could not load your Node summary", true);
   }
   renderHome();

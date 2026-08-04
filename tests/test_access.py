@@ -76,6 +76,92 @@ def test_future_expiry_still_authenticates(tmp_path: Path) -> None:
     assert rejection_events(access_store) == []
 
 
+def test_no_expiry_is_still_permanent(tmp_path: Path) -> None:
+    """Omitting the field means permanent, and must stay that way.
+
+    Tightening the unreadable-expiry path must not touch this case.
+    """
+    access_store = store(tmp_path)
+    created = access_store.create_principal_token(
+        name="permanent-bot",
+        kind="service_account",
+        role="reader",
+        expires_at=None,
+    )
+
+    assert access_store.authenticate_token(created.token) is not None
+    assert rejection_events(access_store) == []
+
+
+def test_an_unreadable_expiry_is_refused_at_mint(tmp_path: Path) -> None:
+    """The value was stored raw while role and scopes beside it were validated.
+
+    An expiry the expiry check cannot parse is indistinguishable from no expiry,
+    so the token lived forever while the dashboard labelled it "Expires".
+    """
+    access_store = store(tmp_path)
+
+    with pytest.raises(ValueError, match="not an ISO 8601 timestamp"):
+        access_store.create_principal_token(
+            name="never-expires-bot",
+            kind="service_account",
+            role="reader",
+            expires_at="next friday",
+        )
+
+
+def test_a_refused_expiry_leaves_no_orphan_principal(tmp_path: Path) -> None:
+    """create_principal_token builds the principal before the token.
+
+    Validating only inside create_token would strand a principal with no token
+    attached every time an expiry is rejected.
+    """
+    access_store = store(tmp_path)
+    before = len(access_store.snapshot()["principals"])
+
+    with pytest.raises(ValueError):
+        access_store.create_principal_token(
+            name="orphan-bot",
+            kind="service_account",
+            role="reader",
+            expires_at="whenever",
+        )
+
+    assert len(access_store.snapshot()["principals"]) == before
+
+
+def test_an_unreadable_expiry_already_in_the_store_is_treated_as_expired(
+    tmp_path: Path,
+) -> None:
+    """Covers what mint-time validation cannot: a value edited in by hand.
+
+    Before, an unparseable stored expiry made _is_expired return False and the
+    token authenticated forever.
+    """
+    import json
+
+    path = tmp_path / "access.json"
+    access_store = AccessStore(path)
+    created = access_store.create_principal_token(
+        name="hand-edited-bot",
+        kind="service_account",
+        role="reader",
+        expires_at=iso_offset(hours=1),
+    )
+    assert access_store.authenticate_token(created.token) is not None
+
+    raw = json.loads(path.read_text())
+    for token in raw["tokens"]:
+        token["expires_at"] = "sometime next quarter"
+    path.write_text(json.dumps(raw))
+
+    reopened = AccessStore(path)
+
+    assert reopened.authenticate_token(created.token) is None
+    events = rejection_events(reopened)
+    assert events[-1]["detail"]["reason"] == "expired"
+
+
 def test_revoked_token_is_rejected_with_audit_event(tmp_path: Path) -> None:
     access_store = store(tmp_path)
     created = access_store.create_principal_token(
@@ -113,6 +199,128 @@ def test_capture_roots_store_refuses_more_than_the_api_accepts(tmp_path: Path) -
         access_store.set_approved_capture_roots(
             "sarthi", paths=[*at_limit, "/Users/sarthi/one-too-many"], actor_id="a"
         )
+
+
+def test_concurrent_writers_do_not_lose_events(tmp_path: Path) -> None:
+    """Two writers must not silently discard each other's edits.
+
+    The web process and the Railway cron services all construct an AccessStore
+    over the same file, and every mutation is load-modify-save. Without a lock
+    spanning all three steps the second save writes back a snapshot taken before
+    the first, and the first edit is gone.
+
+    Measured before the fix: 60 of 120 events survived with two writers, 44 of
+    160 with four, plus FileNotFoundError raised into callers because every
+    writer shared one fixed `.tmp` path.
+    """
+    import threading
+
+    path = tmp_path / "access.json"
+    AccessStore(path).create_principal_token(
+        name="seed", kind="service_account", role="reader"
+    )
+
+    def writer(tag: str) -> None:
+        # A separate instance per thread, which is the cross-process shape.
+        local = AccessStore(path)
+        for index in range(40):
+            local.record_event(
+                action=f"probe.{tag}", actor=None, success=True, detail={"i": index}
+            )
+
+    threads = [threading.Thread(target=writer, args=(f"w{n}",)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    events = AccessStore(path).snapshot()["audit_events"]
+    probes = [e for e in events if e["action"].startswith("probe.")]
+    assert len(probes) == 160, f"{160 - len(probes)} events lost to concurrent writes"
+
+
+def test_a_concurrent_write_cannot_resurrect_a_revoked_token(tmp_path: Path) -> None:
+    """The lost update that matters: a vanished revocation fails OPEN.
+
+    authenticate_token refreshes last_used_at. If that refresh writes back a
+    snapshot taken before a revocation landed, the revocation is erased and the
+    token works again. This is why the stamping path re-reads under the lock
+    rather than reusing the snapshot it authenticated from.
+    """
+    import threading
+
+    path = tmp_path / "access.json"
+    store = AccessStore(path)
+    created = store.create_principal_token(
+        name="victim", kind="service_account", role="writer"
+    )
+
+    # Authenticate (loads a pre-revocation snapshot), revoke concurrently, then
+    # let the stamp write land.
+    barrier = threading.Barrier(2)
+
+    def revoke() -> None:
+        barrier.wait()
+        AccessStore(path).revoke_token(created.api_token.id)
+
+    def authenticate() -> None:
+        other = AccessStore(path)
+        barrier.wait()
+        for _ in range(20):
+            other.authenticate_token(created.token)
+
+    threads = [threading.Thread(target=revoke), threading.Thread(target=authenticate)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert AccessStore(path).authenticate_token(created.token) is None, (
+        "the revocation was overwritten by a concurrent last_used_at stamp"
+    )
+    assert AccessStore(path).has_tokens() is False
+
+
+def test_save_uses_a_unique_temp_file(tmp_path: Path) -> None:
+    """A shared temp path lets one writer truncate another's half-written file.
+
+    open("w") truncates, so with a fixed `<name>.tmp` two writers could
+    interleave into the same file and then rename the result into place. That
+    produced an unparseable access.json in testing, which takes authentication
+    down for everyone.
+    """
+    path = tmp_path / "access.json"
+    store = AccessStore(path)
+    store.create_principal_token(name="a", kind="service_account", role="reader")
+
+    assert not (tmp_path / "access.json.tmp").exists(), "still using a fixed temp path"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
+
+
+def test_last_used_is_stamped_but_not_on_every_request(tmp_path: Path) -> None:
+    """Stamping every request made each auth rewrite the whole store (#105).
+
+    First use still stamps, so "when was this last used" stays answerable. A
+    burst of subsequent authentications inside the interval writes nothing, and
+    the file is left byte-identical.
+    """
+    path = tmp_path / "access.json"
+    store = AccessStore(path)
+    created = store.create_principal_token(
+        name="hot", kind="service_account", role="reader"
+    )
+
+    assert store.authenticate_token(created.token) is not None
+    stamped = store.snapshot()["tokens"][0]["last_used_at"]
+    assert stamped is not None, "first use must record last_used_at"
+
+    before = path.read_bytes()
+    for _ in range(25):
+        assert store.authenticate_token(created.token) is not None
+
+    assert path.read_bytes() == before, "an authentication rewrote the store"
+    assert store.snapshot()["tokens"][0]["last_used_at"] == stamped
 
 
 def test_token_session_lookup_enforces_expiry(tmp_path: Path) -> None:
