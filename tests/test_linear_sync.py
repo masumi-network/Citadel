@@ -776,6 +776,7 @@ class FakeCogneeForScanTest:
 
     def __init__(self) -> None:
         self.remember_calls: list[dict[str, Any]] = []
+        self.scheduled_datasets: list[list[str]] = []
 
     async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
         self.remember_calls.append({"data": data, **kwargs})
@@ -785,7 +786,7 @@ class FakeCogneeForScanTest:
         return {"cognified": True}
 
     def schedule_cognify(self, datasets: Any) -> None:
-        return None
+        self.scheduled_datasets.append(list(datasets))
 
 
 @pytest.mark.asyncio
@@ -942,6 +943,7 @@ async def test_linear_sync_marks_central_touched_after_digest_rejection(
     # The bug: central_outcome (the digest's own result) is None, but a real
     # Central write happened via ENG-2. Central must still be scheduled for
     # cognify and must still reset the write-less streak.
+    assert any("masumi-network" in batch for batch in fake_cognee.scheduled_datasets)
     state_raw = (tmp_path / "linear_state.json").read_text()
     state = json.loads(state_raw)
     assert state["unchanged_pass_streak"] == 0
