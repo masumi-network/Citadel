@@ -6194,6 +6194,24 @@ def share_session_tags_from_body(seat_slug: str, body: ShareSessionBody) -> list
     return tags
 
 
+# Every action name under which an accepted write into the Vault is recorded.
+# One act carries several names, and selecting a single one hid whole surfaces:
+#
+#   /api/contribute       -> "contribute"            (both HTTP and MCP)
+#   /ingest, CLI or HTTP  -> "ingest"
+#   /ingest via MCP       -> "mcp.citadel_ingest"    ONLY: the durable "ingest"
+#                            row is deliberately skipped for MCP requests to
+#                            avoid a second store write per call (see the
+#                            `not mcp_tool_name(request)` guard in ingest()).
+#   /api/share-session    -> "share_session"         (both HTTP and MCP)
+#
+# The MCP twins of contribute and share_session are excluded because their
+# non-MCP row is always written too, and listing both double-counts one write.
+CONTRIBUTION_ACTIONS = frozenset(
+    {"contribute", "ingest", "share_session", "mcp.citadel_ingest"}
+)
+
+
 @app.get("/api/contributions/recent")
 async def recent_contributions(
     request: Request,
@@ -6202,15 +6220,24 @@ async def recent_contributions(
 ) -> Any:
     actor = require_access(request, "reader", "kb:read")
     actor_id = actor.actor_id if mine else None
+    # success=True only: several of these surfaces audit their rejections under
+    # the same action (a secret-blocked ingest records success=False), and a
+    # write that was refused is not a contribution.
     events = get_access_store().recent_audit_events(
-        action="contribute",
+        actions=CONTRIBUTION_ACTIONS,
         actor_id=actor_id,
+        success=True,
         limit=limit,
     )
     return {
         "ok": True,
         "contributions": events,
-        "filter": {"mine": mine, "limit": limit},
+        "filter": {
+            "mine": mine,
+            "limit": limit,
+            "actions": sorted(CONTRIBUTION_ACTIONS),
+            "accepted_only": True,
+        },
     }
 
 

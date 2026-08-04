@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -906,15 +907,29 @@ class AccessStore:
         self,
         *,
         action: str | None = None,
+        actions: Iterable[str] | None = None,
         actor_id: str | None = None,
+        success: bool | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
+        """Newest-first audit rows, optionally narrowed.
+
+        ``actions`` accepts a SET of action names because one act can be
+        recorded under several of them: a write reaches the store as
+        ``ingest``, ``contribute``, ``share_session`` or ``mcp.<tool>``
+        depending on the surface it arrived on, and a reader that names one of
+        them sees only that surface.
+        """
+        wanted = {name for name in (actions or ()) if name}
+        if action:
+            wanted.add(action)
         events = self._audit_events(self._load())
         filtered = [
             asdict(event)
             for event in reversed(events)
-            if (action is None or event.action == action)
+            if (not wanted or event.action in wanted)
             and (actor_id is None or event.actor_id == actor_id)
+            and (success is None or bool(event.success) is success)
         ]
         return filtered[: max(1, min(limit, 100))]
 
