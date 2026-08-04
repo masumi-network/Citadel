@@ -849,3 +849,38 @@ async def test_improve_runs_when_graph_has_data() -> None:
     await kb.improve()
 
     assert fake.improve_calls, "cognee.improve should run on a non-empty graph"
+
+
+@pytest.mark.asyncio
+async def test_every_rejection_line_in_ingest_escapes_the_dataset_name(
+    caplog: Any,
+) -> None:
+    """``Citadel.ingest`` logs the caller's dataset name on three refusal paths.
+
+    CodeQL raised ``py/log-injection`` on one of them (the un-chunkable branch);
+    the other two are the same variable, in the same function, reported on main as
+    open alerts of the same rule. Escaping one and not the others closes an alert
+    without closing the hole: a dataset name carrying a newline still writes a
+    second line that looks exactly like a genuine record, in a project that reads
+    its own logs back as evidence.
+    """
+    import logging
+
+    forged = "notes\n2026-08-04 INFO kb.service Ingest accepted for dataset central"
+    kb = Citadel(CitadelConfig(), cognee=FakeCognee())
+
+    with caplog.at_level(logging.INFO, logger="kb.service"):
+        # 1. the pre-ingest filter refuses it
+        empty = await kb.ingest("   ", dataset=forged)
+        # 2. the same bytes arrive twice in one process
+        await kb.ingest("a real note", dataset=forged)
+        duplicate = await kb.ingest("a real note", dataset=forged)
+
+    assert empty.reason == "empty"
+    assert duplicate.reason == "duplicate_in_process"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2, messages
+    for message in messages:
+        assert "\n" not in message, "a caller-supplied value opened a new log line"
+        assert "\\n" in message, "the value must survive the escaping, not be deleted"

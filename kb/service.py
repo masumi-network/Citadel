@@ -78,8 +78,13 @@ class Citadel:
         merged_tags = merge_tags(self.config.default_tags, tags)
         decision = self.filter.check(data)
         if not decision.accepted:
+            # Escaped for the same reason as the un-chunkable branch below: the
+            # dataset name is whatever the caller sent, and an unescaped newline
+            # in it writes a second log line indistinguishable from a real one.
             logger.info(
-                "Ingest rejected for dataset %s: %s", target_dataset, decision.reason
+                "Ingest rejected for dataset %s: %s",
+                safe_log_value(target_dataset),
+                decision.reason,
             )
             return IngestResult(False, decision.reason, target_dataset, merged_tags)
 
@@ -93,7 +98,8 @@ class Citadel:
         ingest_key = (target_dataset, content_hash)
         if ingest_key in self._seen_ingest_keys:
             logger.info(
-                "Ingest rejected for dataset %s: duplicate_in_process", target_dataset
+                "Ingest rejected for dataset %s: duplicate_in_process",
+                safe_log_value(target_dataset),
             )
             return IngestResult(False, "duplicate_in_process", target_dataset, merged_tags)
         # Claimed BEFORE the await so two concurrent ingests of identical content
