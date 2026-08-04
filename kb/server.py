@@ -262,7 +262,7 @@ class _McpAcceptShim:
         await self.app({**scope, "headers": kept}, receive, send)
 
 
-async def _evolve_scheduler_loop(interval_seconds: int) -> None:
+async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
     """Run the evolve cycle every ``interval_seconds``: heavy stages in a
     subprocess, then cognify in-loop.
 
@@ -283,8 +283,21 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
 
+    from kb.evolve_state import first_sleep_seconds, read_last_completed, record_completed
+
+    # Resume the interval rather than restart it. The boot delay stays: a
+    # redeploy must not trigger a heavy cycle. What changes is that the clock
+    # carries across restarts, so a day of deploys closer together than the
+    # interval still reaches a pass (#153).
+    last = read_last_completed(state_path)
+    delay = first_sleep_seconds(interval_seconds, last)
+    logger.info(
+        "Evolve scheduler: first pass in %.0fs of a %ss interval (last pass: %s)",
+        delay, interval_seconds, last or "none recorded",
+    )
     while True:
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(delay)
+        delay = float(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
         # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
         # across them so no interactive cognify (an ingest's, /api/cognify/run)
@@ -353,6 +366,14 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
             raise
         except Exception:
             logger.exception("Evolve scheduler: cognify failed")
+        finally:
+            # Stamp the pass even when a stage failed. This records that the
+            # cycle RAN, which is what the next boot needs to resume the
+            # interval; whether the stages succeeded is already on the "Evolve
+            # finished" line and in /readyz. Recording only clean passes would
+            # make a node with one broken stage restart its clock forever, which
+            # is the bug this fixes (#153).
+            record_completed(state_path)
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
@@ -370,7 +391,10 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
         return None
     interval = max(60, config.evolve_interval_seconds)
     logger.info("Evolve scheduler enabled: interval=%ss", interval)
-    task = asyncio.create_task(_evolve_scheduler_loop(interval), name="evolve-scheduler")
+    task = asyncio.create_task(
+        _evolve_scheduler_loop(interval, config.evolve_state_path),
+        name="evolve-scheduler",
+    )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_forget_background_task)
     return task
@@ -4726,7 +4750,17 @@ def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
 async def sources(request: Request, type: str | None = None) -> Any:
     require_access(request, "reader", "sources:read")
     sources_payload: list[dict[str, Any]] = []
-    summary: dict[str, Any] = {}
+    # When the evolve cycle last completed. Without it, a node that has not
+    # evolved in a week looks identical to one that evolved five minutes ago,
+    # and every per-source "last synced" figure below is a stale number with no
+    # way to tell (#153). Reader-scoped deliberately: staleness is exactly what
+    # a teammate needs before trusting a search result.
+    from kb.evolve_state import staleness as _evolve_staleness
+
+    _cfg = get_citadel().config
+    summary: dict[str, Any] = {
+        "evolve": _evolve_staleness(_cfg.evolve_state_path, _cfg.evolve_interval_seconds)
+    }
 
     if type in {None, "github"}:
         github_status = await get_github_syncer().status()
