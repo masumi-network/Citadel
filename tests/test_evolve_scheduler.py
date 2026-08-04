@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 from kb.config import CitadelConfig
@@ -30,11 +31,17 @@ def test_evolve_scheduler_config_defaults(monkeypatch: Any) -> None:
 # --- scheduler wiring ------------------------------------------------------
 
 
-def _fake_citadel(*, enabled: bool, interval: int = 21600) -> SimpleNamespace:
+def _fake_citadel(
+    *, enabled: bool, interval: int = 21600, state_path: str = ""
+) -> SimpleNamespace:
     return SimpleNamespace(
         config=SimpleNamespace(
             evolve_scheduler_enabled=enabled,
             evolve_interval_seconds=interval,
+            # #153: the scheduler resumes its interval from this file, so the
+            # fake config has to carry it. Empty means "nowhere to persist",
+            # which read/record both tolerate.
+            evolve_state_path=state_path,
         )
     )
 
@@ -107,7 +114,7 @@ def _patch_phase1(monkeypatch: Any, *, code: int = 0, raises: bool = False) -> l
 
 
 async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
-    monkeypatch: Any,
+    monkeypatch: Any, tmp_path: Path
 ) -> None:
     """Phase 1 runs in THIS process now, not a subprocess (#88).
 
@@ -129,7 +136,7 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", forbidden_exec)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
-    task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
+    task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
     try:
         for _ in range(300):
             if len(cognify_calls) >= 2:
@@ -150,7 +157,7 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
 
 
-async def test_add_only_mode_does_not_leak_outside_the_pass() -> None:
+async def test_add_only_mode_does_not_leak_outside_the_pass(tmp_path: Path) -> None:
     """The suppression is scoped to the task tree, never process-wide (#88).
 
     It used to be an env var on a subprocess. In the web process an env var
@@ -173,14 +180,16 @@ async def test_add_only_mode_does_not_leak_outside_the_pass() -> None:
     assert await asyncio.create_task(observer()) is False
 
 
-async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(monkeypatch: Any) -> None:
+async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
     import kb.server as server
 
     cognify_calls: list[bool] = []
     _patch_phase1(monkeypatch, raises=True)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
-    task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
+    task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
     try:
         for _ in range(300):
             if len(cognify_calls) >= 2:
@@ -196,7 +205,7 @@ async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(monkeypatch
 
 
 async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
-    monkeypatch: Any, caplog: Any
+    monkeypatch: Any, caplog: Any, tmp_path: Path
 ) -> None:
     """A partially failed cycle must be loud (#89).
 
@@ -213,7 +222,7 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
     with caplog.at_level(logging.ERROR, logger=server.logger.name):
-        task = asyncio.create_task(server._evolve_scheduler_loop(0.001))
+        task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
         try:
             for _ in range(300):
                 if cognify_calls:
@@ -241,7 +250,7 @@ async def test_a_dying_scheduler_task_is_logged(monkeypatch: Any, caplog: Any) -
 
     import kb.server as server
 
-    async def boom(_interval: float) -> None:
+    async def boom(_interval: float, _state_path: str) -> None:
         raise RuntimeError("scheduler could not start")
 
     monkeypatch.setattr(server, "_evolve_scheduler_loop", boom)
