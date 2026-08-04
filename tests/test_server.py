@@ -3617,6 +3617,61 @@ def test_recent_contributions_lists_audit_events(tmp_path: Any) -> None:
     assert payload["contributions"][0]["detail"]["title"] == "WIP: MCP docs"
 
 
+def test_recent_contributions_lists_an_mcp_ingest(tmp_path: Any) -> None:
+    """A write through MCP is a contribution, and the feed must show it.
+
+    /ingest from the MCP surface records ONLY ``mcp.citadel_ingest`` (the
+    durable ``ingest`` row is suppressed for MCP requests), and the feed
+    selected the single action ``contribute`` — so a seat that ingested through
+    MCP saw an empty "recent contributions" list right after a write that was
+    independently proven to exist.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    ingested = writer.post(
+        "/ingest",
+        json={"data": "Runbook: rotate the sync token before minting seats.", "tags": ["runbook"]},
+        headers={"X-Citadel-MCP-Tool": "citadel_ingest"},
+    )
+    assert ingested.status_code == 200
+    assert ingested.json()["accepted"] is True
+
+    recent = writer.get("/api/contributions/recent?limit=10&mine=true")
+    assert recent.status_code == 200
+    payload = recent.json()
+    actions = [event["action"] for event in payload["contributions"]]
+    assert actions == ["mcp.citadel_ingest"], payload
+
+
+def test_recent_contributions_omits_rejected_writes(tmp_path: Any) -> None:
+    """The feed lists writes that landed, not writes that were attempted.
+
+    Widening the selection past ``contribute`` pulls in surfaces that audit
+    their failures too (a secret-blocked ingest records success=False), and a
+    rejected write listed as a contribution is the same dishonesty in the
+    other direction.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    # The row a secret-blocked MCP ingest writes (kb/server.py record_mcp_audit,
+    # success=bool(result.accepted)), recorded through the same store API.
+    store.record_event(
+        action="mcp.citadel_ingest",
+        actor=None,
+        success=False,
+        dataset="seat:test-writer",
+        detail={"surface": "mcp", "operation": "ingest", "blocked": "secret_content"},
+    )
+
+    recent = writer.get("/api/contributions/recent?limit=10")
+    assert recent.status_code == 200
+    assert recent.json()["contributions"] == []
+
+
 def test_contribute_routes_through_learning_process_and_audits(tmp_path: Any) -> None:
     client = authed_client("test-writer")
     store = AccessStore(str(tmp_path / "access.json"))
