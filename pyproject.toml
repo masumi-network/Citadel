@@ -30,7 +30,15 @@ dependencies = []
 # `pip install citadel-archive[server]` — run the Node/MCP server + sync jobs.
 server = [
     "aiohttp>=3.14.3,<4.0.0",
-    "cognee[fastembed,postgres-binary]>=1.2.2,<2.0.0",
+    # Must match requirements.txt exactly (#150). The 1.2.x cap is load-bearing:
+    # ADR-0009 dataset attribution reads cognee PRIVATE internals
+    # (cognee.modules.data.models, get_default_user) that a 1.3.x could move,
+    # silently fail-closed, and blank every scoped caller's vault. Railway
+    # installs from requirements.txt, so a looser bound here is inert in
+    # production — but it bites any `pip install -e .`, and a dev env resolving
+    # a newer cognee against the production DATABASE_URL re-stamps the
+    # migration row forward (the 2026-07-13 cognee-1.3.0 incident).
+    "cognee[fastembed,postgres-binary]>=1.2.2,<1.3.0",
     "cryptography>=50.0.0,<51.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",

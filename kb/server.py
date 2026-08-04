@@ -916,6 +916,8 @@ class GitHubSyncBody(BaseModel):
 
 
 class LinearSyncBody(BaseModel):
+    # force=True rewrites every fetched issue; the default incremental pass skips
+    # issues unchanged since the stored updatedAt cursor (#90).
     force: bool = False
 
 
