@@ -3,6 +3,15 @@
 - Status: Accepted
 - Date: 2026-07-31
 - Relates to: [ADR-0015](0015-one-process-owns-the-graph.md).
+- Amended by: [ADR-0019](0019-activity-counters-are-named-by-their-scope.md) —
+  the activity counters no longer "stay where they are"; they publish only
+  under `since_restart`.
+- Amended by: [ADR-0020](0020-a-total-is-named-for-what-it-counts.md) — the
+  consequence below that names `stats.documents` and `stats.indexed_chunks` as
+  corpus figures no longer holds. `documents` is now `tracked_sources` (it
+  counted tracked sources, not documents), top-level `indexed_chunks` is
+  removed (it was the same value as `nodes`), and `edges` reports the real
+  graph total instead of the in-memory projection.
 
 Any figure a surface presents as a size of the **Organization Vault** must be
 read from the vault. A counter that resets when the process restarts may be

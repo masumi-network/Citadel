@@ -160,6 +160,9 @@ _INDEXED_FLOOR = 1
 # budget (both would 429). Same limiter shape, independent counters.
 _search_inflight = 0
 _mesh_graph_inflight = 0
+# The corpus census budget is separate for the same reason mesh's is: an admin
+# paging the corpus during an evolve pass must not eat /search's slots.
+_corpus_inflight = 0
 
 
 class _SearchSlot:
@@ -259,7 +262,7 @@ class _McpAcceptShim:
         await self.app({**scope, "headers": kept}, receive, send)
 
 
-async def _evolve_scheduler_loop(interval_seconds: int) -> None:
+async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
     """Run the evolve cycle every ``interval_seconds``: heavy stages in a
     subprocess, then cognify in-loop.
 
@@ -280,8 +283,21 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
 
+    from kb.evolve_state import first_sleep_seconds, read_last_completed, record_completed
+
+    # Resume the interval rather than restart it. The boot delay stays: a
+    # redeploy must not trigger a heavy cycle. What changes is that the clock
+    # carries across restarts, so a day of deploys closer together than the
+    # interval still reaches a pass (#153).
+    last = read_last_completed(state_path)
+    delay = first_sleep_seconds(interval_seconds, last)
+    logger.info(
+        "Evolve scheduler: first pass in %.0fs of a %ss interval (last pass: %s)",
+        delay, interval_seconds, last or "none recorded",
+    )
     while True:
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(delay)
+        delay = float(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
         # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
         # across them so no interactive cognify (an ingest's, /api/cognify/run)
@@ -350,6 +366,14 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
             raise
         except Exception:
             logger.exception("Evolve scheduler: cognify failed")
+        finally:
+            # Stamp the pass even when a stage failed. This records that the
+            # cycle RAN, which is what the next boot needs to resume the
+            # interval; whether the stages succeeded is already on the "Evolve
+            # finished" line and in /readyz. Recording only clean passes would
+            # make a node with one broken stage restart its clock forever, which
+            # is the bug this fixes (#153).
+            record_completed(state_path)
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
@@ -367,7 +391,10 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
         return None
     interval = max(60, config.evolve_interval_seconds)
     logger.info("Evolve scheduler enabled: interval=%ss", interval)
-    task = asyncio.create_task(_evolve_scheduler_loop(interval), name="evolve-scheduler")
+    task = asyncio.create_task(
+        _evolve_scheduler_loop(interval, config.evolve_state_path),
+        name="evolve-scheduler",
+    )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_forget_background_task)
     return task
@@ -598,25 +625,25 @@ def _content_security_policy(style_src: str) -> str:
 
 CONTENT_SECURITY_POLICY = _content_security_policy("'self'")
 
-# The landing page carries an interactive pipeline diagram built on React Flow,
-# which positions every node and the viewport by writing an inline `transform`
-# style attribute. That is not something the library can be configured out of,
-# so the one page that renders it gets 'unsafe-inline' for styles and nothing
-# else. Script execution stays restricted to same-origin files on every page.
+# The relaxed variant is kept so a page can only ever reach it through the
+# explicit opt-in set below, never by accident. No page uses it today.
+#
+# The landing page's React Flow diagram was the one candidate: it positions
+# every node and the viewport by writing inline `transform` styles, and the
+# library cannot be configured out of that. But it writes them through the
+# CSSOM (element.style), which style-src does not govern; the directive
+# covers <style> elements and style attributes arriving in markup. Measured
+# before the exemption was removed: under style-src 'self' the diagram
+# rendered identically, with zero securitypolicyviolation events (Chrome;
+# the CSSOM carve-out is spec behaviour). Script execution stays restricted
+# to same-origin files on every page under both policies.
 CONTENT_SECURITY_POLICY_INLINE_STYLE = _content_security_policy("'self' 'unsafe-inline'")
 
 # Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-# Exact paths, not prefixes, and this set is the only way to reach the relaxed
-# policy. Everything absent from it (/app, /login, /info, /use-cases, /contact,
-# every API route, every static file) gets the strict policy above.
-#
-# Only / is here, because only / renders the React Flow pipeline diagram, which
-# positions its nodes with inline `transform` styles and cannot be configured
-# out of it. The page holds no token and no user data, which is why this is an
-# acceptable trade there and would not be on /app or /login.
-CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset({"/"})
+# policy. It is empty: every route, / and its React Flow diagram included,
+# gets the strict policy above. Adding a path here is a security decision;
+# the tests pin this set so it cannot grow in passing.
+CSP_INLINE_STYLE_PATHS: frozenset[str] = frozenset()
 
 
 def content_security_policy_for(path: str) -> str:
@@ -667,6 +694,7 @@ LOGIN_HTML = """<!doctype html>
           <a href="/login" aria-current="page">Sign in</a>
         </div>
         <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+        <a class="navicon" href="https://github.com/masumi-network/Citadel" aria-label="GitHub repository" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg></a>
       </div>
     </nav>
     <main class="auth">
@@ -805,8 +833,18 @@ class IngestBody(BaseModel):
     cognify: bool = False
 
 
+# Upper bound on a search query, in the same spirit as SearchBody's other
+# string fields (repo 200, path 400, mode 32) — it was the one that could grow
+# without limit. Sized against the longest queries this repo actually asks: 99
+# characters in the bench corpus (scripts/bench/golden_questions.json, "What is
+# the full postgres connection string ...") and 38 in the test suite. Queries
+# are typed or composed by an agent, never built by concatenating file content,
+# so 2000 leaves a pasted paragraph plenty of room while still being a bound.
+MAX_SEARCH_QUERY_LENGTH = 2000
+
+
 class SearchBody(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=MAX_SEARCH_QUERY_LENGTH)
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)
@@ -814,6 +852,10 @@ class SearchBody(BaseModel):
     types: list[str] | None = None
     repo: str | None = Field(default=None, max_length=200)
     path: str | None = Field(default=None, max_length=400)
+    # Which syncer wrote the hit (``linear-issue``, ``repo-content``): the scope
+    # a source-specific tool needs. Fail-closed — a hit that cannot say where it
+    # came from never satisfies it.
+    source: str | None = Field(default=None, max_length=64)
     canonical_only: bool = False
     exclude_ambient: bool = False
     mode: str | None = Field(default=None, max_length=32)
@@ -837,6 +879,11 @@ class SearchBody(BaseModel):
             "types": self.cleaned_types(),
             "repo": self.repo.strip() if isinstance(self.repo, str) and self.repo.strip() else None,
             "path": self.path.strip() if isinstance(self.path, str) and self.path.strip() else None,
+            "source": (
+                self.source.strip().lower()
+                if isinstance(self.source, str) and self.source.strip()
+                else None
+            ),
             "canonical_only": bool(self.canonical_only),
             "exclude_ambient": exclude_ambient,
         }
@@ -902,6 +949,8 @@ class GitHubSyncBody(BaseModel):
 
 
 class LinearSyncBody(BaseModel):
+    # force=True rewrites every fetched issue; the default incremental pass skips
+    # issues unchanged since the stored updatedAt cursor (#90).
     force: bool = False
 
 
@@ -2581,6 +2630,11 @@ def document_endpoint_for_result(result_id: str) -> str | None:
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
     # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
     # no backing store, so they stay honestly non-drillable.
+    #
+    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
+    # its `document_id`. This still resolves because /api/documents walks
+    # chunk -> parent document, so a caller passing either id "works" — which
+    # hides that they are different ids for different things.
     if not result_id or result_id.startswith("chunk:"):
         return None
     return f"/api/documents/{result_id}"
@@ -2597,6 +2651,22 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
 
     Results that already supply an id (e.g. the GitHub digest fallback) are left
     untouched. Other dict results get a content-derived id for traceability.
+
+    ``id`` here is CHUNK-level: for cognee's CHUNKS query type a hit is the raw
+    chunk payload (see ``CogneeClient.recall``), and that payload also carries
+    its own ``document_id`` — the parent document's id, the same id
+    ``citadel ingest`` reports as ``data_id`` for the write. The two are
+    different granularities and neither field documents that on the wire
+    (verified live: a hit's ``id`` and ``document_id`` are always distinct
+    UUIDs). ``/api/documents/{id}`` resolves a chunk id by walking chunk ->
+    parent, so passing ``id`` "works" and hides the mismatch — a caller that
+    dedups or cites on ``id`` and later compares against a fetched document's
+    own ``.id`` (which is the document id, not the chunk id) will never match.
+    Use ``document_id`` for anything that needs to key off the document.
+
+    The field is optional, not guaranteed: the GitHub digest fallback above
+    (``search_github_sync_state``) supplies its own ``id`` and no
+    ``document_id``, because a digest section is not a stored document.
     """
     if result.get("id"):
         return result
@@ -2957,6 +3027,23 @@ async def next_app_view(view: str, request: Request) -> Response:
     if minimum_role is None:
         raise HTTPException(status_code=404, detail="Not Found")
     return next_app_page(request, f"app/{view}", minimum_role)
+
+
+# The theme bootstrap. Every exported page loads it from <head> before paint,
+# but it is neither a page (the `{page}` allow-list below serves HTML by exact
+# name and stays closed to other filenames) nor a build asset (the static
+# mount covers only /next/_next). So: one literal route, no path parameter.
+#
+# The media type is pinned rather than guessed from the filename, because the
+# site sends X-Content-Type-Options: nosniff and a browser refuses to execute
+# a script that arrives as anything but JavaScript.
+@app.get("/next/theme.js", include_in_schema=False)
+async def next_theme_js() -> FileResponse:
+    script = WEBUI_DIR / "theme.js"
+    if not script.is_file():
+        # A source checkout that has not run `npm run build:web`.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(script, media_type="text/javascript; charset=utf-8")
 
 
 # The rebuilt public pages, one preview route each. Exact names, not a path
@@ -3506,6 +3593,203 @@ async def access_snapshot(
         # The oldest id on this page. Pass it back as `cursor` for the next,
         # older page. Null when there is nothing older left.
         "next_cursor": (page[0].get("id") if start > 0 and page and isinstance(page[0], dict) else None),
+    }
+
+
+CORPUS_DEFAULT_LIMIT = 200
+CORPUS_MAX_LIMIT = 1000
+CORPUS_INFLIGHT_LIMIT = 2
+# A census cursor is (created_at, id) and only moves forward. One row with a
+# future-dated created_at would otherwise become a cursor no real row can ever
+# exceed, stalling every later page while the endpoint reports ok. Clamp the
+# timestamp to now+skew when a cursor is BUILT and again when one is READ BACK
+# (a stored cursor outlives the request that built it). The cost is bounded:
+# rows inside the skew window can repeat across pages, which beats never
+# seeing a row again.
+CORPUS_CURSOR_MAX_SKEW_SECONDS = 300.0
+
+
+def _encode_corpus_cursor(created_at_iso: str, document_id: str) -> str:
+    import base64
+
+    payload = json.dumps(
+        {"t": created_at_iso, "id": document_id}, separators=(",", ":")
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_corpus_cursor(cursor: str | None) -> "tuple[Any, str] | None":
+    """(created_at, id) out of an opaque cursor, or None to start from the top.
+
+    Malformed and stale cursors restart the walk rather than 4xx — the same
+    stance /api/access takes, so a saved cursor can never wedge the caller.
+    """
+    import base64
+    from datetime import datetime, timezone
+
+    if not cursor:
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        created_at = datetime.fromisoformat(str(payload["t"]))
+        document_id = str(payload["id"])
+    except Exception:  # noqa: BLE001 - any malformed cursor means start over
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at, document_id
+
+
+def _clamp_corpus_cursor_time(created_at: Any) -> Any:
+    from datetime import datetime, timedelta, timezone
+
+    ceiling = datetime.now(timezone.utc) + timedelta(
+        seconds=CORPUS_CURSOR_MAX_SKEW_SECONDS
+    )
+    return min(created_at, ceiling)
+
+
+@app.get("/api/corpus")
+async def corpus_census(
+    request: Request,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Row-level census of the corpus, from the durable relational store.
+
+    Nothing else on the node can enumerate the corpus: /api/mesh/graph caps at
+    1000 nodes and returns labels only, and per-source "documents" counters
+    are sync-state bookkeeping. This pages over the rows cognee writes when it
+    accepts content, and marks each row with whether the vector store
+    (``chunk_count``) and the graph (``in_graph``) have actually seen it —
+    the difference between "accepted but never indexed" and "indexed".
+
+    Presence flags degrade to null with a top-level note, never to 0: a 0 is a
+    measurement ("we looked, nothing there") and null is "this node could not
+    look", and cleanup decisions hang on that difference. Totals report both
+    the unscoped corpus and the default-owner slice so rows under another
+    owner_id surface instead of silently vanishing from the count.
+    """
+    from datetime import datetime, timezone
+
+    require_access(request, "admin", "audit:read")
+
+    cognee_client = getattr(get_citadel(), "cognee", None)
+    corpus_page = getattr(cognee_client, "corpus_page", None)
+    corpus_totals = getattr(cognee_client, "corpus_totals", None)
+    if not callable(corpus_page) or not callable(corpus_totals):
+        raise HTTPException(
+            status_code=503, detail="Corpus census is unavailable on this node."
+        )
+
+    if limit is None:
+        page_size = CORPUS_DEFAULT_LIMIT
+    else:
+        page_size = max(1, min(int(limit), CORPUS_MAX_LIMIT))
+
+    after = _decode_corpus_cursor(cursor)
+    after_created_at: str | None = None
+    after_id: str | None = None
+    if after is not None:
+        after_created_at = _clamp_corpus_cursor_time(after[0]).isoformat()
+        after_id = after[1]
+
+    with _SearchSlot(CORPUS_INFLIGHT_LIMIT, "_corpus_inflight"):
+        # One extra row decides has_more, so next_cursor is null exactly at the
+        # end instead of costing every caller a final empty page.
+        rows = list(
+            await corpus_page(
+                after_created_at=after_created_at,
+                after_id=after_id,
+                limit=page_size + 1,
+            )
+            or []
+        )
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        totals = await corpus_totals()
+
+        notes: list[str] = []
+        document_ids = [str(row["id"]) for row in rows if row.get("id")]
+
+        chunk_counts: dict[str, int] | None = None
+        try:
+            chunk_counts_read = getattr(cognee_client, "corpus_chunk_counts", None)
+            if callable(chunk_counts_read):
+                chunk_counts = await chunk_counts_read(document_ids)
+        except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
+            logger.exception("corpus census: chunk-count lookup failed")
+        if chunk_counts is None:
+            notes.append(
+                "chunk_count was not determined for this page (vector store "
+                "lookup unavailable); null means not measured, not zero"
+            )
+
+        in_graph_ids: set[str] | None = None
+        try:
+            graph_presence_read = getattr(cognee_client, "corpus_graph_presence", None)
+            if callable(graph_presence_read):
+                in_graph_ids = await graph_presence_read(document_ids)
+        except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
+            logger.exception("corpus census: graph presence lookup failed")
+        if in_graph_ids is None:
+            notes.append(
+                "in_graph was not determined for this page (graph lookup "
+                "unavailable); null means not measured, not absent"
+            )
+        elif document_ids and not in_graph_ids:
+            # The graph adapter answers a FAILED batch lookup and a no-match
+            # batch identically (empty), so an all-absent page is a weaker
+            # claim than a mixed one. Say so instead of letting false read as
+            # fully attested.
+            notes.append(
+                "no document on this page was found in the graph; the graph "
+                "adapter reports a failed lookup the same way as no matches, "
+                "so treat an all-absent page as weakly attested"
+            )
+
+        for row in rows:
+            row_id = str(row.get("id"))
+            row["chunk_count"] = (
+                None if chunk_counts is None else int(chunk_counts.get(row_id, 0))
+            )
+            row["in_graph"] = (
+                None if in_graph_ids is None else (row_id in in_graph_ids)
+            )
+
+        next_cursor: str | None = None
+        if has_more and rows:
+            last = rows[-1]
+            last_created_at = last.get("created_at")
+            last_id = last.get("id")
+            if last_created_at and last_id:
+                parsed = datetime.fromisoformat(str(last_created_at))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                next_cursor = _encode_corpus_cursor(
+                    _clamp_corpus_cursor_time(parsed).isoformat(), str(last_id)
+                )
+            else:
+                notes.append(
+                    "pagination stopped early: the page ends on a row without "
+                    "created_at/id, which cannot form a cursor"
+                )
+
+        other_owner_rows = int(totals.get("documents_other_owners") or 0)
+        if other_owner_rows > 0:
+            notes.append(
+                f"{other_owner_rows} rows belong to owners other than the "
+                "default user and are invisible to owner-scoped reads"
+            )
+
+    return {
+        "ok": True,
+        "documents": rows,
+        "documents_returned": len(rows),
+        "documents_total": totals.get("documents"),
+        "next_cursor": next_cursor,
+        "totals": totals,
+        "notes": notes,
     }
 
 
@@ -4118,11 +4402,27 @@ async def _corpus_health() -> dict[str, Any]:
         tracked += int(linear_status.get("issue_count") or 0)
         counts = await get_citadel()._graph_counts()
         indexed = int(counts.get("nodes") or 0)
+        # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
+        # back in the same call for free. /api/mesh used to publish the in-memory
+        # projection's edge count at the top level instead (24x understated live),
+        # so this is the real total that field needs.
+        edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {"ok": ok, "tracked_sources": tracked, "indexed_docs": indexed}
+        return {
+            "ok": ok,
+            "tracked_sources": tracked,
+            "indexed_docs": indexed,
+            "indexed_edges": edges,
+        }
     except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
         logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": str(exc)}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": str(exc),
+        }
 
 
 @app.get("/readyz")
@@ -4452,17 +4752,33 @@ def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
 async def sources(request: Request, type: str | None = None) -> Any:
     require_access(request, "reader", "sources:read")
     sources_payload: list[dict[str, Any]] = []
-    summary: dict[str, Any] = {}
+    # When the evolve cycle last completed. Without it, a node that has not
+    # evolved in a week looks identical to one that evolved five minutes ago,
+    # and every per-source "last synced" figure below is a stale number with no
+    # way to tell (#153). Reader-scoped deliberately: staleness is exactly what
+    # a teammate needs before trusting a search result.
+    from kb.evolve_state import staleness as _evolve_staleness
+
+    _cfg = get_citadel().config
+    summary: dict[str, Any] = {
+        "evolve": _evolve_staleness(_cfg.evolve_state_path, _cfg.evolve_interval_seconds)
+    }
 
     if type in {None, "github"}:
         github_status = await get_github_syncer().status()
         github_error, github_error_at = _last_source_error("github")
+        # A corrupt state file outranks the audit trail: the source is not
+        # "ready", it is refusing to run until an operator intervenes (#148).
+        if github_status.get("state_error"):
+            github_error = redact_secrets(str(github_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "github-org",
                 "source_type": "github",
                 "name": github_status.get("org"),
-                "status": "tracked" if github_status.get("last_checked_at") else "ready",
+                "status": "error"
+                if github_status.get("state_error")
+                else ("tracked" if github_status.get("last_checked_at") else "ready"),
                 "url": github_status.get("source_url"),
                 "last_checked_at": github_status.get("last_checked_at"),
                 "documents": github_status.get("tracked_repositories", 0),
@@ -4477,12 +4793,16 @@ async def sources(request: Request, type: str | None = None) -> Any:
     if type in {None, "github_repo_content"}:
         repo_content_status = await get_repo_content_syncer().status()
         repo_content_error, repo_content_error_at = _last_source_error("github_repo_content")
+        if repo_content_status.get("state_error"):
+            repo_content_error = redact_secrets(str(repo_content_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "github-repo-content",
                 "source_type": "github_repo_content",
                 "name": repo_content_status.get("org"),
-                "status": "tracked" if repo_content_status.get("last_checked_at") else "ready",
+                "status": "error"
+                if repo_content_status.get("state_error")
+                else ("tracked" if repo_content_status.get("last_checked_at") else "ready"),
                 "last_checked_at": repo_content_status.get("last_checked_at"),
                 "documents": repo_content_status.get("tracked_files", 0),
                 "open_conflicts": 0,
@@ -4499,12 +4819,16 @@ async def sources(request: Request, type: str | None = None) -> Any:
         if linear_status.get("last_error"):
             linear_error = redact_secrets(str(linear_status["last_error"])[:300])
             linear_error_at = linear_status.get("last_synced_at") or linear_error_at
+        if linear_status.get("state_error"):
+            linear_error = redact_secrets(str(linear_status["state_error"])[:300])
         sources_payload.append(
             {
                 "id": "linear-workspace",
                 "source_type": "linear",
                 "name": "Linear workspace",
-                "status": "tracked" if linear_status.get("last_synced_at") else "ready",
+                "status": "error"
+                if linear_status.get("state_error")
+                else ("tracked" if linear_status.get("last_synced_at") else "ready"),
                 "last_checked_at": linear_status.get("last_synced_at"),
                 "documents": linear_status.get("issue_count", 0),
                 "open_conflicts": 0,
@@ -4718,7 +5042,11 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if not body.dry_run and result.get("enabled") is not False:
+    # ``skipped`` means another pass held the state file and this call did no
+    # work. Recording it would stamp the source "synced" with a null
+    # checked_at and null counts, which is the bookkeeping-success failure
+    # mode, not a sync.
+    if not body.dry_run and result.get("enabled") is not False and not result.get("skipped"):
         await mesh_state.record_repo_content_sync(citadel.config, result)
     get_access_store().record_event(
         action="repo_content_sync.run",
@@ -5385,9 +5713,17 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     if (
         isinstance(repo_content_result, dict)
         and repo_content_result.get("enabled") is not False
+        and not repo_content_result.get("skipped")
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)
+    # The response body already carries WHY the gateway did or did not send
+    # (`notifications.google_chat.reason`: "google_chat_disabled",
+    # "no_meaningful_updates", "dry_run", "preview_only", or None on an actual
+    # send). Recording only `sent` here would collapse all of those distinct,
+    # legitimate states into one boolean in the one place — the audit trail —
+    # that survives after the response is gone (#149, #151).
+    google_chat_notification = (result.get("notifications") or {}).get("google_chat") or {}
     get_access_store().record_event(
         action="learning_agent.run",
         actor=actor,
@@ -5402,9 +5738,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
                 repo_content_result.get("files_ingested") if isinstance(repo_content_result, dict) else None
             ),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     record_mcp_audit(
@@ -5420,9 +5755,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             "ingested": result.get("ingested"),
             "improved": result.get("improved"),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     return jsonable_encoder(result)
@@ -5910,6 +6244,24 @@ def share_session_tags_from_body(seat_slug: str, body: ShareSessionBody) -> list
     return tags
 
 
+# Every action name under which an accepted write into the Vault is recorded.
+# One act carries several names, and selecting a single one hid whole surfaces:
+#
+#   /api/contribute       -> "contribute"            (both HTTP and MCP)
+#   /ingest, CLI or HTTP  -> "ingest"
+#   /ingest via MCP       -> "mcp.citadel_ingest"    ONLY: the durable "ingest"
+#                            row is deliberately skipped for MCP requests to
+#                            avoid a second store write per call (see the
+#                            `not mcp_tool_name(request)` guard in ingest()).
+#   /api/share-session    -> "share_session"         (both HTTP and MCP)
+#
+# The MCP twins of contribute and share_session are excluded because their
+# non-MCP row is always written too, and listing both double-counts one write.
+CONTRIBUTION_ACTIONS = frozenset(
+    {"contribute", "ingest", "share_session", "mcp.citadel_ingest"}
+)
+
+
 @app.get("/api/contributions/recent")
 async def recent_contributions(
     request: Request,
@@ -5918,15 +6270,24 @@ async def recent_contributions(
 ) -> Any:
     actor = require_access(request, "reader", "kb:read")
     actor_id = actor.actor_id if mine else None
+    # success=True only: several of these surfaces audit their rejections under
+    # the same action (a secret-blocked ingest records success=False), and a
+    # write that was refused is not a contribution.
     events = get_access_store().recent_audit_events(
-        action="contribute",
+        actions=CONTRIBUTION_ACTIONS,
         actor_id=actor_id,
+        success=True,
         limit=limit,
     )
     return {
         "ok": True,
         "contributions": events,
-        "filter": {"mine": mine, "limit": limit},
+        "filter": {
+            "mine": mine,
+            "limit": limit,
+            "actions": sorted(CONTRIBUTION_ACTIONS),
+            "accepted_only": True,
+        },
     }
 
 

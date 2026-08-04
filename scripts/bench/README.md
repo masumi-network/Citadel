@@ -14,10 +14,18 @@ export GITHUB_TOKEN=...                      # only for refreshing ground truth
 
 python scripts/bench/fetch_ground_truth.py       # once, or when the corpus changes
 python scripts/bench/search_bench.py lint        # validate the golden set offline
-python scripts/bench/search_bench.py run --out run.json
-python scripts/bench/search_bench.py run --baseline run.json   # later, for a delta
+python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
+python scripts/bench/search_bench.py run --baseline scripts/bench/runs/latest.json   # later, for a delta
 python scripts/bench/search_bench.py compare run_a.json run_b.json
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
 ```
+
+Write run JSONs only under `scripts/bench/runs/`. That directory is
+gitignored; a bare `runs/` from the repo root is not the same place, and a
+run JSON enumerates every served hit identity, so it must never be committed
+(see Baselines below).
+
+Tracking issue for the harness: #122.
 
 ### What a first run needs
 
@@ -37,9 +45,19 @@ python scripts/bench/search_bench.py compare run_a.json run_b.json
    `--repo-state PATH` or `CITADEL_REPO_STATE_PATH`, else
    `./.citadel/repo_content_sync_state.json`. The authoritative copy is the
    node's own `/data/.cognee_system/repo_content_sync_state.json` (per
-   `/api/sources`); the local file in this repo has an empty `files` map, so a
-   run pointed at it records a fingerprint over zero files. Without a real one
-   the run still completes, but records `NOT COMPARABLE` on content.
+   `/api/sources`); the local file in this repo has an empty `files` map. A
+   state file with an empty map records `sha256: null` with a reason, exactly
+   like a missing file: a fingerprint over zero files is the sha256 of the
+   empty string, identical on every such run, and the 2026-08-03 baseline
+   recorded it and would have compared as "same corpus" while attesting
+   nothing. Without a real state file the run still completes, but `compare`
+   says NOT COMPARABLE on content and withholds deltas. Old run JSONs that
+   still carry the empty-string sha are treated as unavailable by `compare`.
+4. **For the corpus census: a token with `admin` or `audit:read`.** `run`
+   walks `GET /api/corpus` (about 1.8 s over 3 pages at the 2026-08-03 corpus
+   size) and records how many documents the index cannot reach. With a
+   search-only token the census records `unavailable` and the run continues;
+   nothing else degrades.
 
 `--repeats N` costs N searches per question (69 questions in v4) and feeds only
 latency and `hit_stability`. Start at `--repeats 1`.
@@ -141,18 +159,84 @@ public repo.
 Two runs are only comparable if the corpus did not move between them. Each run
 records:
 
+- `run_at`: a UTC timestamp stamped when the searches begin, so no one ever
+  reconstructs a run's date from file mtimes.
 - an API snapshot (`documents_tracked`, per-source counts, node version). This
   is what the node CLAIMS; sync bookkeeping has reported success while content
   was absent from the index, so treat it as a change signal.
+- a corpus census from `GET /api/corpus` (below): whole-corpus document total
+  and the count of documents with `chunk_count` 0.
 - a content fingerprint: sha256 over sorted `key:blob_sha` lines from the
   repo-content syncer's per-file checkpoint
   (`.citadel/repo_content_sync_state.json`, `--repo-state` or
-  `CITADEL_REPO_STATE_PATH` to point at it). Without that file the run is
-  recorded as not comparable on content.
+  `CITADEL_REPO_STATE_PATH` to point at it). Without that file, or with an
+  empty `files` map, the run is recorded as not comparable on content.
 - the harness git sha, the questions-file sha256, and the Python version.
 
 `--baseline previous_run.json` prints COMPARABLE, CORPUS MOVED, or NOT
-COMPARABLE and withholds metric deltas for non-comparable runs.
+COMPARABLE and withholds metric deltas for non-comparable runs. The content
+fingerprint covers repo-content files only, so `compare` also prints a note
+when the census document totals differ between two otherwise comparable runs:
+whole-corpus metrics (duplication, digest staleness) move with the corpus
+even while repo-content stands still. It stays a note rather than a gate
+because the digest count grows daily by design.
+
+## The corpus census
+
+`run` walks `GET /api/corpus` (needs `admin` or `audit:read`) and records, in
+`fingerprint.census`: `documents_total`, `documents_walked`,
+`chunk_count_zero`, `chunk_count_unmeasured`, `chunk_count_zero_ratio`, page
+count, and whether the walk was truncated.
+
+A document with `chunk_count` 0 was accepted into the durable store but never
+vector-indexed, so search cannot return it, ever. On 2026-08-03 that was 892
+of 2867 documents (31.1%). A recall figure quoted without that share
+overstates coverage: recall is measured over golden questions whose targets
+are reachable, and says nothing about content stranded outside the index. The
+census line therefore appears in both `run` output and the `report` block,
+with the plain-language consequence attached. `chunk_count` null means the
+vector store could not be asked, and is counted as unmeasured rather than
+zero; the zero count is then a floor.
+
+## Publishing numbers: `report`
+
+```bash
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown --out block.md
+```
+
+Turns a saved run JSON into a README-ready markdown block. Every table row
+carries the value, the run date, the harness commit, the sample count, and a
+one-line statement of WHAT THE METRIC MATCHES ON, so a row copied out of the
+table alone stays honest. The definition column is mandatory by construction:
+`report` refuses (BenchError) to print any metric that has no entry in
+`METRIC_DEFINITIONS`. That rule exists because a recall@5 of 0.95 was once
+published without its definition, and it turned out to be head-of-document
+header credit, not content quality.
+
+The block also states the census share of never-indexed documents (or that
+the census was unavailable), labels latency as client round-trip, and warns
+when the run has no content fingerprint. Regenerating the block is the whole
+loop:
+
+```bash
+python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
+python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+```
+
+## Baselines
+
+Run JSONs live in `scripts/bench/runs/`, which is gitignored, and long-lived
+baselines belong in private storage outside the repo. They are never
+committed: `rows` records the identity (source path, blob, document id) of
+every hit served for every question, and `fingerprint.api.sources` lists
+every tracked source by name. That enumerates what the vault contains, which
+does not belong in a public repo even though no secret values appear.
+
+To compare against a baseline later: keep the baseline JSON wherever you keep
+private artifacts, then `run --baseline path/to/baseline.json` or
+`compare baseline.json new.json`. Quote deltas only when the output says
+COMPARABLE.
 
 ## Reading the results honestly
 
@@ -170,4 +254,8 @@ COMPARABLE and withholds metric deltas for non-comparable runs.
 stripping, the lint rules, the empty-probe refusal, first-attempt-only
 scoring, and fingerprint comparability, with fixtures that mirror the real
 `/search` hit shape (`id` distinct from `document_id`, full
-Repository/Source/Commit/Blob header, no top-level `dataset` key).
+Repository/Source/Commit/Blob header, no top-level `dataset` key). It also
+covers the census walk (pagination, degraded modes, stuck cursors), the
+empty-file-map fail-closed path on both new and legacy run JSONs, the census
+drift note in `compare`, and the markdown report (definition present in every
+row, refusal on an undefined metric, census and comparability warnings).

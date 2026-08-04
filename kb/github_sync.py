@@ -37,6 +37,7 @@ from kb.repository_update import (
 from kb.retry import run_with_retries
 from kb.security_scan import SecurityScanEntry, redact_secrets, scan_text_entries
 from kb.service import Citadel
+from kb.state_io import StateFileError, load_state_file
 
 __all__ = [
     "GitHubAPIError",
@@ -269,9 +270,16 @@ class GitHubOrgSyncer:
         return cls(Citadel.from_env())
 
     async def status(self) -> dict[str, Any]:
-        state = self._load_state()
+        # A corrupt state file must show as a red source, not a 500 (#148).
+        state_error: str | None = None
+        try:
+            state = self._load_state()
+        except StateFileError as exc:
+            state = {}
+            state_error = str(exc)
         return {
-            "ok": True,
+            "ok": state_error is None,
+            "state_error": state_error,
             "org": self.org,
             "source_url": SOURCE_URL_TEMPLATE.format(org=self.org),
             "dataset": self.config.github_sync_dataset,
@@ -579,26 +587,12 @@ class GitHubOrgSyncer:
         return result
 
     def _load_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            return {
-                "version": STATE_VERSION,
-                "org": self.org,
-                "repos": {},
-                "commits": {},
-                "seen_event_ids": [],
-            }
-        try:
-            with self.state_path.open("r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError):
-            return {
-                "version": STATE_VERSION,
-                "org": self.org,
-                "repos": {},
-                "commits": {},
-                "seen_event_ids": [],
-            }
-        if not isinstance(data, dict):
+        # Absent file = genuine first run. A file that exists but cannot be
+        # parsed raises StateFileError instead of flattening to this default:
+        # an empty state would mark every repo changed and every event new,
+        # then ingest and post a false "everything changed" digest (#148).
+        data = load_state_file(self.state_path)
+        if data is None:
             return {
                 "version": STATE_VERSION,
                 "org": self.org,

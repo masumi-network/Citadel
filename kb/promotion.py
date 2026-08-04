@@ -18,7 +18,9 @@ classification failures degrade to a safe SKIP rather than raising.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from hashlib import sha256
 import logging
 from pathlib import Path
 from typing import Any
@@ -202,6 +204,21 @@ def _coerce_classification(parsed: Any) -> Classification | None:
     )
 
 
+def _central_write_key(text: str) -> str:
+    """sha256 of the raw text: exactly the key ``Citadel.ingest`` dedupes on.
+
+    NOT :func:`candidate_hash`, which strips and lowercases first. A key
+    coarser than the guard it models suppresses writes that guard would have
+    accepted: a case-variant of already-promoted content hashes differently
+    at ingest but identically after normalization, so the normalized key
+    changed a promotion decision. Promotion submits the candidate text
+    verbatim, so this key and the ingest key agree byte for byte (with LLM
+    enrichment enabled a full-tier write is chunked and ingest keys the
+    chunks; the skip then still stops re-delivery of identical source text).
+    """
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
 class PromotionEnumerationError(RuntimeError):
     """Every seed query for a seat failed, so its content could not be read.
 
@@ -237,6 +254,15 @@ class PromotionEngine:
         self.learning = learning
         self.access_store = access_store
         self.config = config
+        # _central_write_key hashes of candidate text this engine has already
+        # landed in Central (written and accepted, or confirmed already-present
+        # by the ingest dedupe). Lets decide() skip the classifier for content
+        # whose Central write can only be rejected as duplicate_in_process.
+        # Keyed on the raw text so it is never coarser than the ingest key it
+        # models, and instance-scoped on purpose: a fresh engine starts empty,
+        # so it can only UNDER-report what the ingest dedupe knows; a stale
+        # entry is impossible and a miss just costs one honest write.
+        self._delivered_central_hashes: set[str] = set()
 
     async def enumerate(self, seat_dataset: str, max_items: int) -> list[PromotionCandidate]:
         """Best-effort list of a seat node's promotable content, capped at ``max_items``."""
@@ -311,6 +337,11 @@ class PromotionEngine:
         Returns ``None`` on ANY failure (missing key, HTTP/URL/timeout error,
         unparseable output, or a missing/malformed field) so the caller can
         deterministically SKIP. Never raises.
+
+        Synchronous by design (plain urllib under run_with_retries, a 60s
+        timeout per attempt plus backoff sleeps). Callers running on the event
+        loop must dispatch it via ``asyncio.to_thread``; awaiting it inline
+        stalls every other request for the duration of the call.
         """
         try:
             content = openrouter_chat(
@@ -379,7 +410,35 @@ class PromotionEngine:
             github_org=self.config.github_org,
         )
 
-        verdict = self.classify(candidate.text)
+        if (
+            reference.status == "known_org_work"
+            and capture_block is None
+            and _central_write_key(candidate.text) in self._delivered_central_hashes
+        ):
+            # This exact text already reached Central through this engine, and
+            # on this reference path the only outcome a verdict could unlock is
+            # a Central write the ingest dedupe will reject as
+            # duplicate_in_process. Skip before paying for the classifier call.
+            # One pass re-classified and re-submitted identical cross-seat
+            # content ~150 times; every write bounced. Other reference statuses
+            # (pending-approval queueing, no_reference_signal) still classify,
+            # so no selection path changes; only doomed re-deliveries stop.
+            return ProposedPromotion(
+                candidate=candidate.text,
+                decision="skip",
+                reason="duplicate_in_process",
+                reference_status=reference.status,
+                capture_tags=candidate.tags,
+            )
+
+        # classify() blocks in urllib for up to 60s per retry attempt. Off the
+        # loop it goes: this is plain HTTP to OpenRouter, NOT a cognee call, so
+        # a worker thread is safe. The cognee reads above (enumerate, the
+        # reference searches) must stay on this loop: cognee binds its async
+        # engine to the first loop that touches it and Kuzu is single-writer.
+        # Nine consecutive evolve passes spent 16-27 minutes here with the call
+        # inline, and every route on the node queued behind it.
+        verdict = await asyncio.to_thread(self.classify, candidate.text)
         if verdict is None:
             return ProposedPromotion(
                 candidate=candidate.text,
@@ -470,7 +529,7 @@ class PromotionEngine:
         seat_dataset: str,
         identity: AccessIdentity,
         proposal: ProposedPromotion,
-    ) -> bool:
+    ) -> str:
         """Promote one qualifying item via the org-ready dual-write path.
 
         Reuses ``resolve_write_targets`` (is_promotion -> [seat light, Central
@@ -478,6 +537,14 @@ class PromotionEngine:
         re-runs inside ``learning.learn``. Records one audit event per promotion.
         On a secret block at write time the item is recorded as skipped, not
         promoted. Never raises out of the run loop.
+
+        Returns ``"promoted"`` only when the Central write was actually
+        accepted, ``"write_blocked"`` on a secret block or write error, and
+        otherwise the ingest rejection reason (e.g. ``duplicate_in_process``).
+        The outcome of ``execute_learning_writes`` used to be discarded, so a
+        pass whose Central writes all bounced as duplicate_in_process still
+        logged every one as ``success=True, accepted=True`` and inflated the
+        promoted= count.
         """
         # Imported lazily to avoid a circular import (server imports promotion).
         from kb.security_scan import SecretContentError
@@ -501,7 +568,7 @@ class PromotionEngine:
                 (t.dataset for t in targets if t.tier == "full"),
                 targets[-1].dataset,
             )
-            await execute_learning_writes(
+            primary, _outcomes = await execute_learning_writes(
                 self.learning,
                 data=proposal.candidate,
                 targets=targets,
@@ -526,7 +593,7 @@ class PromotionEngine:
                     "reason": proposal.reason,
                 },
             )
-            return False
+            return "write_blocked"
         except Exception as exc:  # pragma: no cover - depends on Cognee runtime.
             self.access_store.record_event(
                 action="promotion.promote",
@@ -540,8 +607,36 @@ class PromotionEngine:
                     "reason": proposal.reason,
                 },
             )
-            return False
+            return "write_blocked"
 
+        # The full-tier (Central) outcome is what "promoted" attests, so read
+        # it instead of assuming the write landed. ``learn`` returns rejections
+        # (duplicate_in_process, filter refusals) as accepted=False, not raises.
+        content_hash = _central_write_key(proposal.candidate)
+        if not primary.ingest.accepted:
+            write_reason = primary.ingest.reason or "not_accepted"
+            if write_reason == "duplicate_in_process":
+                # Central already holds this exact text in this process, so
+                # later identical candidates can skip their classifier call.
+                self._delivered_central_hashes.add(content_hash)
+            self.access_store.record_event(
+                action="promotion.promote",
+                actor=identity,
+                success=False,
+                dataset=central,
+                detail={
+                    "seat": seat_dataset,
+                    "accepted": False,
+                    "write_reason": write_reason,
+                    "score": proposal.score,
+                    "relevant": proposal.relevant,
+                    "sensitive": proposal.sensitive,
+                    "reason": proposal.reason,
+                },
+            )
+            return write_reason
+
+        self._delivered_central_hashes.add(content_hash)
         self.access_store.record_event(
             action="promotion.promote",
             actor=identity,
@@ -559,7 +654,7 @@ class PromotionEngine:
                 "capture_tags": list(proposal.capture_tags),
             },
         )
-        return True
+        return "promoted"
 
     async def run(
         self,
@@ -574,7 +669,9 @@ class PromotionEngine:
         writes NOTHING. ``dry_run=False`` actually promotes qualifying items via
         the org-ready dual-write and records one audit event each. Gated on
         ``config.promotion_enabled`` (opt-in): when disabled, returns a disabled
-        status and does nothing.
+        status and does nothing. ``promoted`` counts only writes Central
+        actually accepted; a rejected write settles as a skip carrying the
+        server's rejection reason.
         """
         if not self.config.promotion_enabled:
             return {
@@ -611,8 +708,8 @@ class PromotionEngine:
                 if proposal.decision != "promote":
                     settled.append(proposal)
                     continue
-                ok = await self._promote(seat_dataset, identity, proposal)
-                if ok:
+                outcome = await self._promote(seat_dataset, identity, proposal)
+                if outcome == "promoted":
                     promoted += 1
                     settled.append(
                         ProposedPromotion(
@@ -627,7 +724,7 @@ class PromotionEngine:
                             capture_tags=proposal.capture_tags,
                         )
                     )
-                else:
+                elif outcome == "write_blocked":
                     settled.append(
                         ProposedPromotion(
                             candidate=proposal.candidate,
@@ -637,6 +734,22 @@ class PromotionEngine:
                             sensitive=proposal.sensitive,
                             score=proposal.score,
                             secret_blocked=True,
+                            reference_status=proposal.reference_status,
+                            capture_tags=proposal.capture_tags,
+                        )
+                    )
+                else:
+                    # The write ran but Central refused the content (e.g.
+                    # duplicate_in_process). Not a secret block, and not a
+                    # delivery: record what the server actually returned.
+                    settled.append(
+                        ProposedPromotion(
+                            candidate=proposal.candidate,
+                            decision="skip",
+                            reason=outcome,
+                            relevant=proposal.relevant,
+                            sensitive=proposal.sensitive,
+                            score=proposal.score,
                             reference_status=proposal.reference_status,
                             capture_tags=proposal.capture_tags,
                         )
@@ -719,7 +832,8 @@ class PromotionEngine:
             reference_status=item.reference_status,
         )
         identity = self._promotion_identity(item.seat_dataset)
-        promoted = await self._promote(item.seat_dataset, identity, proposal)
+        outcome = await self._promote(item.seat_dataset, identity, proposal)
+        promoted = outcome == "promoted"
         decided = self.access_store.decide_promotion_pending(
             item_id,
             decision=APPROVED_STATUS,
@@ -744,6 +858,11 @@ class PromotionEngine:
             "ok": promoted,
             "item": decided.to_dict(),
             "promoted": promoted,
+            # The item is consumed either way, so the caller needs the server's
+            # reason to tell "the write failed" from "this content is already
+            # in Central" (an approval of the second of two identical pending
+            # items is the ordinary way to hit the latter).
+            "write_reason": None if promoted else outcome,
         }
 
     async def reject_pending(

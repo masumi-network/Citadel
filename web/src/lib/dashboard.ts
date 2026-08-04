@@ -54,7 +54,10 @@ export type ActivityEvent = {
 /* --- mesh --------------------------------------------------------------- */
 
 export type Mesh = {
-  stats?: { documents?: number; errors?: number };
+  // Activity counters (errors among them) are restart-scoped and published
+  // only under stats.since_restart (ADR-0019); top-level stats carries corpus
+  // figures.
+  stats?: { documents?: number; since_restart?: { errors?: number } };
   events?: Array<{
     id?: string;
     type?: string;
