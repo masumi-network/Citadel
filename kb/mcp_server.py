@@ -34,6 +34,9 @@ MAX_AUDIT_LIMIT = 100
 DEFAULT_MAX_INGEST_BYTES = 200_000
 LOCAL_MCP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 TRUTHY = frozenset({"1", "true", "yes", "on"})
+# The provenance kind the Linear syncer's per-issue documents resolve to
+# (kb.search_format.parse_content_header). citadel_linear_search scopes to it.
+LINEAR_ISSUE_SOURCE = "linear-issue"
 AUDIT_VIEWS = frozenset({"all", "mcp", "access", "failures"})
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
 # tools/list must never block the hosted event loop on a nested self-HTTP call
@@ -1182,9 +1185,8 @@ def create_mcp_server(
         candidates the scope kept. The Linear workspace DIGEST carries no
         per-issue header and is excluded; use citadel_search for it.
         """
-        return await _call_async(
-            "citadel_linear_search",
-            lambda: resolve_client(ctx).post(
+        def search_linear() -> dict[str, Any]:
+            payload = resolve_client(ctx).post(
                 "/search",
                 {
                     "query": _require_non_empty(query, "query"),
@@ -1193,11 +1195,30 @@ def create_mcp_server(
                     # Dataset alone is not a scope: shared Central holds every
                     # synced source, so an unfiltered search here answered a
                     # Linear question with another repo's documentation.
-                    "source": "linear-issue",
+                    "source": LINEAR_ISSUE_SOURCE,
                 },
                 tool_name="citadel_linear_search",
-            ),
-        )
+            )
+            # Asking for the scope is not getting it: a Node older than this
+            # tool drops the unknown field (pydantic ignores extras) and answers
+            # with an unscoped page. Report the scope the Node confirms applying,
+            # never the one the request asked for.
+            filtering = payload.get("filtering") if isinstance(payload, dict) else None
+            applied = filtering.get("applied") if isinstance(filtering, dict) else None
+            confirmed = (
+                isinstance(applied, dict) and applied.get("source") == LINEAR_ISSUE_SOURCE
+            )
+            scoped: dict[str, Any] = {**payload, "scope_applied": confirmed}
+            if not confirmed:
+                warnings = [w for w in (payload.get("warnings") or []) if w]
+                warnings.append(
+                    "This Node did not confirm the linear-issue scope, so these results "
+                    "are NOT Linear-only — treat them as a general Central search."
+                )
+                scoped["warnings"] = warnings
+            return scoped
+
+        return await _call_async("citadel_linear_search", search_linear)
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_ingest"].annotations)
     async def citadel_ingest(

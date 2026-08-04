@@ -1315,6 +1315,63 @@ def test_linear_search_description_does_not_overclaim() -> None:
     assert "header" in description.lower()
 
 
+def test_linear_search_says_so_when_the_node_did_not_apply_the_scope() -> None:
+    """Asking for a scope is not the same as getting one.
+
+    A node older than this tool ignores the unknown ``source`` field (pydantic
+    drops extras) and answers with an unscoped page. Trusting the request would
+    label those results Linear-only, which is the defect this filter fixes.
+    """
+
+    class UnscopedNode(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            super().post(path, payload, tool_name=tool_name, timeout=timeout)
+            return {"results": [{"id": "1"}], "dataset": "masumi-network"}
+
+    server = create_mcp_server(UnscopedNode())
+
+    result = run_tool(server, "citadel_linear_search", "subscription credits", None)
+
+    assert result["scope_applied"] is False
+    assert any("scope" in str(w).lower() for w in result["warnings"])
+
+
+def test_linear_search_reports_the_scope_the_node_confirms() -> None:
+    class ScopedNode(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            super().post(path, payload, tool_name=tool_name, timeout=timeout)
+            return {
+                "results": [{"id": "1"}],
+                "filtering": {
+                    "applied": {"source": "linear-issue"},
+                    "candidates_fetched": 30,
+                    "candidates_matched": 1,
+                    "returned": 1,
+                },
+            }
+
+    server = create_mcp_server(ScopedNode())
+
+    result = run_tool(server, "citadel_linear_search", "subscription credits", None)
+
+    assert result["scope_applied"] is True
+    assert "warnings" not in result
+
+
 def test_contribute_tool_rejects_empty_or_oversized_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
