@@ -8,6 +8,7 @@ import re
 from uuid import uuid4
 from typing import Any
 
+from kb import chunk_window
 from kb.cognee_client import CogneeGateway, CogneePublicClient
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
@@ -83,6 +84,10 @@ class Citadel:
 
         self._guard_content(data, target_dataset)
 
+        unchunkable = self._guard_chunkable(data, target_dataset)
+        if unchunkable is not None:
+            return IngestResult(False, unchunkable, target_dataset, merged_tags)
+
         content_hash = sha256(data.encode("utf-8")).hexdigest()
         ingest_key = (target_dataset, content_hash)
         if ingest_key in self._seen_ingest_keys:
@@ -133,6 +138,43 @@ class Citadel:
                 block_severity=self.config.content_scan_block_severity,
                 findings=scan.get("findings", []),  # type: ignore[arg-type]
             )
+
+    def _guard_chunkable(self, data: str, dataset: str) -> str | None:
+        """Refuse content the chunker cannot fit in the budget, and say why (#227).
+
+        cognee breaks words on a single space and on sentence endings only, so one
+        line of minified output is one word to it. A word over the budget either
+        raises ``ValueError`` out of ``chunk_by_sentence`` — which ``run_tasks``
+        escalates into a failure of the entire dataset's pipeline run, so one
+        document blocks every other document in that dataset from being indexed —
+        or is emitted verbatim as an over-budget chunk that the embedder truncates.
+
+        The choice here is refuse and record, not split. A splitter that edits
+        content to make it fit has already corrupted two of this project's own
+        documents inside fenced config blocks, turning ``SEVERITY=high`` into
+        ``SEVERITY=hig h`` and removing ``CITADEL_GOOGLE_CHAT_SPACE_NAME`` from
+        the index entirely. Content that is stored wrong is worse than content
+        that is visibly refused, because only one of the two tells anyone.
+
+        Returns a rejection reason, or None to let the write proceed.
+        """
+        if not chunk_window.guard_enabled():
+            return None
+        span = chunk_window.check_chunkable(data)
+        if span is None:
+            return None
+        logger.warning(
+            "Ingest refused for dataset %s: unchunkable_content. One unbroken word is "
+            "%d BPE tokens against a budget of %d (%d characters, %s). cognee cannot "
+            "split it, so accepting it would either fail this dataset's next cognify "
+            "pass outright or store text the embedder silently truncates.",
+            dataset,
+            span.tokens,
+            span.budget,
+            span.char_length,
+            span.fingerprint,
+        )
+        return "unchunkable_content"
 
     async def search(
         self,
