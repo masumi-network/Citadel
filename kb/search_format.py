@@ -182,6 +182,14 @@ DOC_TYPE_OTHER = "other"
 # ``content_hint``, which makes no authority claim.
 TRUST_REFERENCE = "reference-only"
 TRUST_UNATTESTED = "unattested"
+# The attestation channel itself was absent. ``unattested`` states the server
+# envelope was consulted and attested nothing; ``unknown`` states no envelope
+# existed to consult (hits handed straight to this module by the in-process
+# ``--local`` search stack, or degraded payloads). The two must not share a
+# value: a genuine session-trace hit read without an envelope used to come back
+# ``unattested`` — byte-identical to an honestly unattested hit — so a reader
+# could not tell "checked, nothing attested" from "nothing could be checked".
+TRUST_UNKNOWN = "unknown"
 
 # Retained so older parsers and stored telemetry keep resolving; never assigned.
 TRUST_CANONICAL = "canonical"
@@ -427,10 +435,20 @@ def infer_trust_tier(item: dict[str, Any], doc_type: str | None = None) -> str:
 
     ``reference-only`` is the one tier the server can actually attest today: it
     comes from the dataset a hit was read out of (session traces), not from the
-    hit's content. Everything else is ``unattested`` — the vault stores no
-    per-document provenance yet, so no hit can honestly claim more.
+    hit's content. Everything else the envelope covers is ``unattested`` — the
+    vault stores no per-document provenance yet, so no hit can honestly claim
+    more.
+
+    A hit with no ``_citadel`` envelope at all is ``unknown``, never
+    ``unattested``: this function derives the tier from the envelope, so when
+    the envelope is absent the tier was not derived from anything. Reporting
+    ``unattested`` there would state an observation nothing made — the CLI
+    ``--local`` path hands cognee payloads straight here, and its session-trace
+    hits came back indistinguishable from honestly unattested ones.
     """
-    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
+    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else None
+    if envelope is None:
+        return TRUST_UNKNOWN
     if envelope.get("trust") == TRUST_REFERENCE:
         return TRUST_REFERENCE
     if str(envelope.get("dataset") or "") == "session-traces":
@@ -644,7 +662,8 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
             "score": None,
             "snippet": text[:SNIPPET_CHARS],
             "content_hint": HINT_UNCLASSIFIED,
-            "trust_tier": TRUST_UNATTESTED,
+            # A bare string carries no envelope, so no attestation was consulted.
+            "trust_tier": TRUST_UNKNOWN,
             "rank": index + 1,
         }
 
@@ -1002,6 +1021,15 @@ def shape_search_payload(
         warnings.append("search timed out; results may be incomplete")
     if relevance["no_lexical_match"]:
         warnings.append(NO_LEXICAL_MATCH_WARNING)
+    # Say at page level when tiers could not be derived, so a caller does not
+    # have to notice the per-hit ``unknown`` values one by one.
+    unknown_tier = sum(1 for h in hits if h.get("trust_tier") == TRUST_UNKNOWN)
+    if unknown_tier:
+        warnings.append(
+            f"trust_tier is 'unknown' for {unknown_tier} of {len(hits)} hits: they "
+            "carried no server envelope, so attested provenance was never consulted "
+            "(expected for --local searches)"
+        )
     authority = token_asset_authority_warning(query)
     if authority:
         warnings.append(authority)

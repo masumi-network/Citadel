@@ -250,13 +250,22 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[s
 
 
 def receipt_summary(response: dict[str, Any] | None) -> str:
-    """Receipt line for a completed POST, mirroring the server's decision."""
+    """Receipt line for a completed POST, mirroring the server's decision.
+
+    "captured" is claimed only on an explicit ``accepted: true`` — an
+    observation the server actually stated. A body that omits the field (or
+    carries a non-boolean) states no decision, and the receipt says storage is
+    unconfirmed rather than defaulting to the optimistic verdict.
+    """
     if response is None:
         return "session sent: server replied 2xx but the response body was unreadable"
-    if response.get("accepted") is not False:
+    accepted = response.get("accepted")
+    if accepted is True:
         return "session captured → your Node"
-    reason = response.get("reason") or "rejected"
-    return f"session not stored: server rejected the write ({reason})"
+    if accepted is False:
+        reason = response.get("reason") or "rejected"
+        return f"session not stored: server rejected the write ({reason})"
+    return "session sent: server reply had no accepted field; storage not confirmed"
 
 
 def _send_failure_summary(exc: BaseException) -> str:
@@ -283,21 +292,38 @@ def _write_receipt(summary: str) -> None:
 
 
 def run(stream_in: Any) -> int:
-    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking."""
+    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking.
+
+    Fail-silent means "never block session close", not "leave no trace": every
+    exit path below writes a receipt naming what was observed, so ``citadel
+    activity --local`` can distinguish a clean skip from a broken config from a
+    crash. Absent that, all of them look identical to a capture that worked.
+    """
     try:
         payload = read_hook_payload(stream_in)
         token = os.getenv(TOKEN_ENV)
         if not token:
-            # No token configured -> nothing to sync. Clean no-op exit.
+            # No token configured -> nothing to sync, but say so: an unset env
+            # var is otherwise indistinguishable from a session with nothing in it.
+            _write_receipt(
+                f"session skipped: no capture token in the environment ({TOKEN_ENV} unset); "
+                "nothing sent"
+            )
             return 0
 
         transcript_path = payload.get("transcript_path")
         cwd = payload.get("cwd") or os.getcwd()
-        entries = (
-            _iter_transcript(transcript_path)
-            if isinstance(transcript_path, str) and transcript_path
-            else []
-        )
+        entries: list[dict[str, Any]] = []
+        if isinstance(transcript_path, str) and transcript_path:
+            if not transcript_path_allowed(transcript_path):
+                # Refused, not read. Without its own receipt this looked
+                # identical to "session had nothing worth sending".
+                _write_receipt(
+                    "session skipped: transcript path not under an allowed agent "
+                    "directory; nothing read or sent"
+                )
+                return 0
+            entries = _iter_transcript(transcript_path)
 
         note = distill_transcript(entries)
         if not note.strip():
@@ -319,8 +345,13 @@ def run(stream_in: Any) -> int:
             _write_receipt(_send_failure_summary(exc))
             return 0
         _write_receipt(receipt_summary(response))
-    except Exception:
-        # Fail-silent: never block session close, never surface the token.
+    except Exception as exc:
+        # Fail-silent: never block session close, never surface the token —
+        # but a crash still leaves a receipt (class name only: a message could
+        # echo transcript content or request details).
+        _write_receipt(
+            f"session hook crashed: {exc.__class__.__name__}; capture state unknown"
+        )
         return 0
     return 0
 

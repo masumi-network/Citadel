@@ -526,7 +526,9 @@ def test_verify_and_prepare_pr_context(monkeypatch, tmp_path, capsys) -> None:
     verify_out = json.loads(capsys.readouterr().out)
     assert verify_out["ok"] is True
     assert verify_out["doc_shaped_sources"]
-    assert verify_out["doc_shaped_sources"][0]["trust_tier"] == "unattested"
+    # This fixture's hits carry no _citadel envelope, so no attested provenance
+    # was consulted: the tier says "unknown", not "unattested".
+    assert verify_out["doc_shaped_sources"][0]["trust_tier"] == "unknown"
     assert "agent_instruction" in verify_out
 
     p_args = argparse.Namespace(

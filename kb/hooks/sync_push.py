@@ -133,22 +133,23 @@ def _norm_path(value: str) -> str:
     return os.path.realpath(os.path.abspath(expanded))
 
 
-def load_capture_roots() -> list[dict[str, Any]]:
-    """Approved Capture Roots from the local config.
+def capture_roots_state() -> tuple[list[dict[str, Any]], str]:
+    """(Approved Capture Roots, why the list may be empty).
 
-    Always fail-closed: missing, empty, or corrupt ``capture.json`` returns
-    ``[]`` (approve nothing). Global capture without an explicit allowlist is
-    never enabled — run ``citadel onboard`` or ``citadel setup`` first.
+    The state names what was OBSERVED about ``capture.json`` — ``ok`` /
+    ``missing`` / ``invalid`` (unreadable or malformed) / ``empty`` — so a
+    receipt can distinguish "never onboarded" from "the config broke", which an
+    empty list alone collapses into one silence.
     """
     path = capture_config_path()
     if not path.exists():
-        return []
+        return [], "missing"
     try:
         data = json.loads(path.read_text())
     except Exception:
-        return []
+        return [], "invalid"
     if not isinstance(data, dict):
-        return []
+        return [], "invalid"
     roots: list[dict[str, Any]] = []
     for item in data.get("roots") or []:
         if not isinstance(item, dict):
@@ -166,7 +167,19 @@ def load_capture_roots() -> list[dict[str, Any]]:
                 ],
             }
         )
-    return roots
+    if not roots:
+        return [], "empty"
+    return roots, "ok"
+
+
+def load_capture_roots() -> list[dict[str, Any]]:
+    """Approved Capture Roots from the local config.
+
+    Always fail-closed: missing, empty, or corrupt ``capture.json`` returns
+    ``[]`` (approve nothing). Global capture without an explicit allowlist is
+    never enabled — run ``citadel onboard`` or ``citadel setup`` first.
+    """
+    return capture_roots_state()[0]
 
 
 def matched_root(repo_root: str, roots: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -359,13 +372,25 @@ def post_ingest(base_url: str, token: str, data: str, tags: list[str]) -> dict[s
 
 
 def receipt_summary(response: dict[str, Any] | None, *, short_sha: str, branch: str) -> str:
-    """Receipt line for a completed POST, mirroring the server's decision."""
+    """Receipt line for a completed POST, mirroring the server's decision.
+
+    "captured" is claimed only on an explicit ``accepted: true`` — an
+    observation the server actually stated. A body that omits the field (or
+    carries a non-boolean) states no decision, and the receipt says storage is
+    unconfirmed rather than defaulting to the optimistic verdict.
+    """
     if response is None:
         return f"commit {short_sha} sent: server replied 2xx but the response body was unreadable"
-    if response.get("accepted") is not False:
+    accepted = response.get("accepted")
+    if accepted is True:
         return f"captured commit {short_sha} on {branch} → your Node"
-    reason = response.get("reason") or "rejected"
-    return f"commit {short_sha} not stored: server rejected the write ({reason})"
+    if accepted is False:
+        reason = response.get("reason") or "rejected"
+        return f"commit {short_sha} not stored: server rejected the write ({reason})"
+    return (
+        f"commit {short_sha} sent: server reply had no accepted field; "
+        "storage not confirmed"
+    )
 
 
 def _send_failure_summary(exc: BaseException, *, short_sha: str) -> str:
@@ -409,6 +434,9 @@ def _sync_one(
         remote_ref=remote_ref,
     )
     if not note.strip():
+        # `git show` gave us nothing to snapshot — say so instead of leaving a
+        # silence identical to a successful capture's absence.
+        _write_receipt(f"commit {sha[:7]} skipped: could not read commit metadata; nothing sent")
         return
     note = _truncate_utf8(note, _max_ingest_bytes())
     branch = ref_branch_name(local_ref) if local_ref else _git_branch(cwd)
@@ -429,29 +457,48 @@ def _sync_one(
 
 
 def run(stdin: Any, remote_name: str = "") -> int:
-    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking."""
+    """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking.
+
+    Fail-silent means "never block the push", not "leave no trace": every exit
+    path below writes a receipt naming what was observed, so ``citadel activity
+    --local`` can distinguish a clean skip from a broken config from a crash.
+    Absent that, all of them look identical to a capture that worked.
+    """
     try:
         token = os.getenv(TOKEN_ENV)
         if not token:
+            _write_receipt(
+                f"push skipped: no capture token in the environment ({TOKEN_ENV} unset); "
+                "nothing sent"
+            )
             return 0
 
         cwd = git_toplevel()
 
         # ADR-0007 P4.3 (fail-closed): only push from an Approved Capture Root.
         # Missing/empty/corrupt ~/.citadel/capture.json → capture nothing.
-        roots = load_capture_roots()
+        roots, roots_state = capture_roots_state()
         capture_tags: list[str] = []
         if not roots:
             sys.stderr.write(
                 "citadel: no Approved Capture Roots configured; skipping "
                 "capture (run `citadel onboard` or `citadel setup`).\n"
             )
+            detail = {
+                "missing": "capture.json missing (run `citadel onboard` or `citadel setup`)",
+                "invalid": "capture.json unreadable or malformed",
+                "empty": "capture.json lists no approved roots",
+            }.get(roots_state, roots_state)
+            _write_receipt(f"push skipped: {detail}; nothing sent")
             return 0
         match = matched_root(cwd, roots)
         if match is None:
             sys.stderr.write(
                 f"citadel: {cwd} is not an Approved Capture Root; skipping "
                 "capture (run `citadel setup` to approve it).\n"
+            )
+            _write_receipt(
+                f"push skipped: {cwd} is not an Approved Capture Root; nothing sent"
             )
             return 0
         capture_tags = list(match["tags"])
@@ -479,10 +526,9 @@ def run(stdin: Any, remote_name: str = "") -> int:
 
         # Manual invocation (no pre-push stdin): snapshot HEAD once.
         head = _git_run(cwd, "rev-parse", "HEAD")
-        if head.returncode != 0:
-            return 0
-        sha = head.stdout.strip()
+        sha = head.stdout.strip() if head.returncode == 0 else ""
         if not sha:
+            _write_receipt("push skipped: could not resolve HEAD to snapshot; nothing sent")
             return 0
         _sync_one(
             cwd,
@@ -493,7 +539,11 @@ def run(stdin: Any, remote_name: str = "") -> int:
             token=token,
             capture_tags=capture_tags,
         )
-    except Exception:
+    except Exception as exc:
+        # Class name only — a message could echo repo content or the token.
+        _write_receipt(
+            f"push hook crashed: {exc.__class__.__name__}; capture state unknown"
+        )
         return 0
     return 0
 
