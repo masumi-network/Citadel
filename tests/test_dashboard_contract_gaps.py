@@ -495,3 +495,74 @@ def test_every_dashboard_page_is_reachable_from_the_ui() -> None:
         "Add a nav entry or a data-page-target button, or list it as "
         "intentionally unreachable with a reason."
     )
+
+
+def test_a_corrupt_sync_state_file_shows_red_instead_of_500(tmp_path: Any) -> None:
+    """#148: a state file that fails to parse must surface as an error'd
+    source. Before this, status() flattened corruption to an empty state, so
+    the source showed "ready" with zero documents — indistinguishable from a
+    node that had never synced."""
+    from kb.config import CitadelConfig
+    from kb.github_sync import GitHubOrgSyncer
+    from kb.service import Citadel
+
+    client = authed_client()
+    state_path = tmp_path / "github_state.json"
+    state_path.write_text('{"version": 1, "repos"', encoding="utf-8")
+    config = CitadelConfig(github_sync_state_path=str(state_path))
+    app.state.github_syncer = GitHubOrgSyncer(Citadel(config), org="masumi-network")
+
+    response = client.get("/api/sources?type=github")
+
+    assert response.status_code == 200
+    source = response.json()["sources"][0]
+    assert source["status"] == "error"
+    assert "github_state.json" in source["last_error"]
+
+
+def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
+    """Gap 1, on the client side.
+
+    The server field exists and is tested above; this pins that the
+    hand-written dashboard actually renders it. Both wrong sources are numbers
+    that are present, plausible and adjacent on payloads Home already fetches:
+    `/api/mesh` `stats.tracked_sources` counts sources, not documents, and
+    `/api/me/summary` `document_count` is Node-only, so it drops everything the
+    caller can read in Central. Neither failure throws or renders blank; each
+    just paints a confident wrong figure, which is why the guard has to name the
+    field rather than assert the tile is non-empty.
+
+    Also pins the null handling: a missing count renders a dash with a reason,
+    never `0`, matching web/src/pages/app/index.tsx.
+    """
+    import re
+    from pathlib import Path
+
+    import kb.server as server_module
+
+    repo = Path(server_module.__file__).resolve().parent.parent
+    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+
+    body = re.search(r"function homeReadableCount\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
+    assert body, "homeReadableCount() not found in kb/static/app.js"
+    source = body.group(1)
+
+    assert "readable_document_count" in source, (
+        "Home's 'Notes you can read' does not read readable_document_count"
+    )
+    assert "document_count" not in source.replace("readable_document_count", ""), (
+        "Home fell back to the Node-only document_count; that number excludes Central"
+    )
+    assert "tracked_sources" not in source, (
+        "Home read a source count for a document tile"
+    )
+    # Null renders as a dash plus a reason, not as zero.
+    assert "return null" in source, "a missing count must be null, never 0"
+    assert 'id="homeReadableNote"' in index_html, "no element to render why the count is missing"
+    assert "countOrDash(homeReadableCount())" in app_js, (
+        "the tile does not route the count through countOrDash"
+    )
+    assert "Not reported by this node yet" in app_js and "Unavailable" in app_js, (
+        "a failed fetch and an absent field must render different reasons"
+    )

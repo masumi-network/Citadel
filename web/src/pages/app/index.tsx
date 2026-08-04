@@ -63,7 +63,8 @@ export default function AppHome() {
   const needsYouBroke = Boolean(pending.error || sources.error);
   const waitingOnYou = needsYouBroke ? null : promotions.length + failing.length;
 
-  const errors = mesh.data?.stats?.errors ?? 0;
+  // Activity counters are published only under stats.since_restart (ADR-0019).
+  const errors = mesh.data?.stats?.since_restart?.errors ?? 0;
   const syncedAt = relativeTime(github.data?.last_checked_at);
 
   // The mesh feed is the real one; me/summary's recent_activity is the fallback

@@ -2,3 +2,9 @@
 # Not vendored: they would go stale against their source repos and the script
 # reproduces them in one command.
 ground_truth/
+
+# Saved run JSONs and baselines. Never committed: rows enumerate served
+# corpus identities and the fingerprint lists every tracked source, which a
+# public repo must not carry. Long-lived baselines belong in private storage
+# outside the repo (see README, "Baselines").
+runs/

@@ -207,6 +207,19 @@ Admin:
 - `GET /api/backup-mirror`, `POST /api/backup-mirror/run`
 - `GET /api/linear-sync`, `POST /api/linear-sync/run`
 
+Examples:
+
+```bash
+export CITADEL_BASE_URL=https://citadel-archive-production.up.railway.app
+
+curl -fsS -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \
+  "$CITADEL_BASE_URL/api/knowledge?q=payment+flow&limit=5"
+
+curl -fsS -X POST "$CITADEL_BASE_URL/api/contribute" \
+  -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" -H "Content-Type: application/json" \
+  --data '{"title":"Decision: deepseek-v4-flash","content":"Standardized on it via OpenRouter.","tags":["decision"]}'
+```
+
 `GET /api/mesh/graph` (reader+) returns `{nodes, edges, ...}` from Cognee's graph
 engine with a node cap (`CITADEL_MESH_GRAPH_MAX_NODES`, default 200, or `?limit=`).
 With no data or no graph access it returns an empty graph with `fallback: true`.

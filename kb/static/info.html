@@ -27,6 +27,7 @@
           <a href="/login">Sign in</a>
         </div>
         <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+        <a class="navicon" href="https://github.com/masumi-network/Citadel" aria-label="GitHub repository" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg></a>
       </div>
     </nav>
     <div class="band-in">
@@ -40,7 +41,7 @@
 
         <div class="tldr">
           <p class="lbl">TL;DR: read this, skim the rest</p>
-          <p>This is the running node reporting on itself: what is deployed right now, what shipped across v0.2.0 → v0.4.0, and what is being built next. If you are new to Citadel, the <a href="/">home page</a> covers what it is and how to start; this page is the numbers.</p>
+          <p>This is the running node reporting on itself: what is deployed right now, what shipped across v0.2.0 → v0.4.0, and what is being built next. If you are new to Citadel, the <a href="/">home page</a> covers what it is, how it's built, and how to start; this page is the numbers.</p>
           <p>Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear sync, read-side isolation, and <b>Shared Session Traces</b> (share a dead end, reference-only, without leaking private memory). Next: a <b>GitHub App</b> for PR context + checks, a <b>Google Chat digest bot</b>, and one <b>central agent hub</b> over all org knowledge. Every section below expands. Open the ones you care about.</p>
         </div>
       </header>
@@ -61,18 +62,23 @@
   <section class="band band-white" id="state">
     <div class="band-in">
       <div class="sechead"><span class="kicker">01 · Current state</span><h2>Where things stand today</h2></div>
-      <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are repo facts as of the last report.</p>
+      <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are dated measurements, and the line under them says when each was taken.</p>
       <div class="metrics">
         <div class="metric tealn"><div class="n" id="m-version">v0.4.0</div><div class="k">deployed &amp; healthy on Railway</div></div>
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
         <div class="metric accent"><div class="n">10</div><div class="k">releases shipped (v0.1.0 → v0.4.0)</div></div>
-        <div class="metric"><div class="n" id="m-commits">340</div><div class="k" id="m-commits-sub">commits on main · last 52 weeks</div></div>
-        <div class="metric"><div class="n">906</div><div class="k">tests across 52 files · CI on every push</div></div>
         <div class="metric"><div class="n" id="m-tools">22</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n" id="m-adrs">13</div><div class="k">architecture decision records</div></div>
-        <div class="metric"><div class="n">~25k</div><div class="k">LOC · 53 modules · zero-dep client</div></div>
+        <div class="metric"><div class="n sm">~$55/mo</div><div class="k">to self-host, measured 2026-07-31</div></div>
+        <div class="metric"><div class="n">269 ms</div><div class="k">median search round-trip, from a client</div></div>
       </div>
-      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. Commits, decision records and MCP tools refresh daily. Tests, releases and LOC are as of v0.4.0, 2026-07-22.</span></p>
+      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.4.0, 2026-07-22.</span></p>
+      <!-- Two different kinds of snapshot, and the sentence has to say which is
+           which. cost_model.py holds 2026-07-31's Railway averages as a constant,
+           so re-running it reprints the same total by construction and can never
+           show drift. search_bench.py really does re-measure. Calling both
+           "reproducible" flattened that difference, which is how a frozen number
+           starts reading as a live one. -->
+      <p class="verified"><span class="vdot"></span>Both are snapshots from 2026-07-31, not live calls, and the method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. The cost model carries that day's resource averages in its source, so re-running it reprints the figure rather than re-measuring it; the round-trip is re-measurable with <code>search_bench.py</code>, and being a client round-trip it reads higher than server-side timing does.</p>
     </div>
   </section>
 

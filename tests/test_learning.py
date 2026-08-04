@@ -66,7 +66,7 @@ async def test_learn_ingests_and_records_mesh_activity(tmp_path: Path) -> None:
     assert outcome.conflict is None
     assert outcome.improve is None
     assert citadel.ingest_calls[0]["tags"] == ["ops"]
-    assert snapshot["stats"]["documents"] == 1
+    assert snapshot["stats"]["tracked_sources"] == 1
     assert snapshot["events"][0]["type"] == "ingest"
 
 
@@ -139,7 +139,7 @@ async def test_learn_records_mesh_error_and_reraises_on_ingest_failure(tmp_path:
         await learning.learn("Anything", operation="obsidian_sync")
     snapshot = await mesh.snapshot(config)
 
-    assert snapshot["stats"]["errors"] == 1
+    assert snapshot["stats"]["since_restart"]["errors"] == 1
     assert snapshot["events"][0]["details"]["operation"] == "obsidian_sync"
 
 

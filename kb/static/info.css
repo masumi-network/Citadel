@@ -219,11 +219,15 @@ section { padding-top: 66px; }
 .kicker { order: 2; font-size: 11.5px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); }
 .lede { color: var(--ink-2); max-width: 64ch; margin: 0 0 30px; font-size: 16px; line-height: 1.6; }
 
-/* metrics */
-.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+/* metrics — three across, because there are six of them. The row was four
+   across while two of the tiles were repo trivia (a test count and a LOC
+   count) that had gone stale on the page; dropping those left six, and six in
+   a four-column grid is a full row and a stranded pair. */
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .metric { background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 18px 18px; }
 .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 500; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.1; color: var(--ink); }
 .metric .n small { font-size: 14px; color: var(--ink-3); font-weight: 400; }
+.metric .n.sm { font-size: 19px; }
 .metric .k { font-size: 12.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.4; }
 .metric.accent .n, .metric.tealn .n { color: var(--accent-ink); }
 .metric .n.pending { color: var(--ink-3); }
@@ -686,6 +690,12 @@ footer.band { margin-top: 0; }
 /* Honeypot. Off-screen rather than display:none, which some bots skip. */
 .contact-trap { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
 
+/* The email fallback. A bordered block, not footer print, because it is the
+   route that currently works. */
+.contact-alt { max-width: 640px; margin: 18px 0 0; padding: 14px 18px; border: 1px solid var(--border-2); font-size: 14.5px; color: var(--ink-2); }
+.contact-alt a { color: var(--accent-ink); font-weight: 500; text-decoration: none; border-bottom: 1px solid currentColor; }
+.contact-alt a:hover { border-bottom-color: transparent; }
+
 @media (max-width: 620px) { .contact-row { grid-template-columns: 1fr; } }
 
 /* --- /login — seat access ------------------------------------------------
@@ -759,6 +769,13 @@ footer.band { margin-top: 0; }
 /* the toggle moves into the bar instead of floating over the page */
 .topnav .themebtn { position: static; margin-left: 4px; padding: 6px 10px; font-size: 12px; }
 
+/* the repo link, last in the bar. Sized to the other controls on a pointer,
+   widened to a 44px tap target under the 620px breakpoint below. */
+.navicon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; margin-left: 4px; color: var(--ink-2); border-radius: 0; transition: color .15s; }
+.navicon svg { display: block; }
+.navicon:hover { color: var(--accent-ink); }
+.navicon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* the bar is sticky, so anchor jumps must clear it or land under it */
 section[id] { scroll-margin-top: 62px; }
 
@@ -774,6 +791,7 @@ section[id] { scroll-margin-top: 62px; }
   .topnav-in { padding: 9px 16px; gap: 8px; }
   .topnav-brand .wordmark { display: none; }
   .topnav-links a { padding: 6px 8px; font-size: 12.5px; }
+  .navicon { width: 44px; height: 44px; }
 }
 
 /* --- phones (320-470px) ---------------------------------------------------
