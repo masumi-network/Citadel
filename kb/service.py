@@ -171,6 +171,16 @@ class Citadel:
                 findings=scan.get("findings", []),  # type: ignore[arg-type]
             )
 
+    def resolve_search_dataset(self, dataset: str | None) -> str:
+        """The dataset ``search`` will actually read from.
+
+        Exposed because callers have to report which dataset a hit came out of
+        (it is the only attested provenance signal a local hit carries), and a
+        caller re-deriving ``dataset or default_dataset`` on its own drifts the
+        moment this rule changes.
+        """
+        return dataset or self.config.default_dataset
+
     async def search(
         self,
         query: str,
@@ -180,7 +190,7 @@ class Citadel:
         top_k: int = 10,
     ) -> list[Any]:
         top_k = min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
-        target_dataset = dataset or self.config.default_dataset
+        target_dataset = self.resolve_search_dataset(dataset)
         results = await self.cognee.recall(
             query,
             dataset=target_dataset,

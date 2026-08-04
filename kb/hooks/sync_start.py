@@ -37,6 +37,11 @@ from typing import Any
 
 DEFAULT_BASE_URL = "https://citadel-archive-production.up.railway.app"
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
+# Deliberately shorter than the 10s the capture hooks use (sync_push /
+# sync_session): those run at push and session close and their payload is lost if
+# the send is abandoned, whereas this one runs in front of the developer at every
+# session start and its payload is a nice-to-have digest. A slow Node must delay
+# startup by seconds, not by ten.
 HTTP_TIMEOUT_SECONDS = 5
 RECENT_LIMIT = 8
 # Static agent policy — no cross-seat content; always injected (digest is optional).
@@ -127,6 +132,19 @@ def format_digest(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+RECEIPT_KIND_ERROR = "start-error"
+
+
+def _write_receipt(summary: str) -> None:
+    """Best-effort receipt (never raises, never surfaces the token)."""
+    try:
+        from kb.hooks.receipt import write_receipt
+
+        write_receipt(RECEIPT_KIND_ERROR, summary)
+    except Exception:
+        pass
+
+
 def run(stream_in: Any) -> int:
     """Hook entrypoint. ALWAYS returns 0 — fail-silent, non-blocking."""
     try:
@@ -139,8 +157,16 @@ def run(stream_in: Any) -> int:
             items = fetch_recent(_base_url(), token)
             if items:
                 sys.stdout.write(format_digest(items) + "\n\n")
-        except Exception:
-            pass  # digest optional; policy still injected below
+        except Exception as exc:
+            # The digest stays optional — the policy below still prints — but a
+            # swallowed failure looked exactly like a quiet vault, so a dev whose
+            # warm-start context stopped arriving had nothing to find. Only real
+            # failures get a line; this hook runs at every session start and an
+            # empty vault is not an event. Class name only: the message can carry
+            # the node URL.
+            _write_receipt(
+                f"warm-start digest unavailable: fetch failed ({exc.__class__.__name__})"
+            )
     sys.stdout.write(AGENT_POLICY_REMINDER + "\n")
     return 0
 

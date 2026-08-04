@@ -183,6 +183,16 @@ DOC_TYPE_OTHER = "other"
 TRUST_REFERENCE = "reference-only"
 TRUST_UNATTESTED = "unattested"
 
+# WHICH AUTHORITY produced ``trust_tier`` — reported next to it because the two
+# possible reasons for ``unattested`` are not the same fact. ``dataset-attested``
+# means a reading authority named the dataset the hit came out of, so the tier
+# reports an observation. ``unknown`` means no envelope reached this hit at all:
+# ``unattested`` is then the fallback value and a caller must NOT read it as
+# "this hit was checked and has no provenance". Without the distinction a path
+# that never wired the envelope up is byte-identical to one that checked.
+TRUST_BASIS_ATTESTED = "dataset-attested"
+TRUST_BASIS_UNKNOWN = "unknown"
+
 # Retained so older parsers and stored telemetry keep resolving; never assigned.
 TRUST_CANONICAL = "canonical"
 TRUST_VERIFIED = "verified"
@@ -440,6 +450,22 @@ def infer_trust_tier(item: dict[str, Any], doc_type: str | None = None) -> str:
     return TRUST_UNATTESTED
 
 
+def trust_tier_basis(item: dict[str, Any]) -> str:
+    """Whether ``infer_trust_tier`` OBSERVED anything, or fell back to a default.
+
+    ``infer_trust_tier`` reads only ``item["_citadel"]``. A hit that reaches it
+    without an envelope therefore always returns ``unattested``, whatever it
+    actually is — which is exactly what the CLI ``--local`` path did to genuine
+    session traces. Reporting the basis alongside the tier is what lets a caller
+    tell "checked, no provenance attested" (``dataset-attested``) from "the
+    attesting authority was never consulted" (``unknown``).
+    """
+    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
+    if envelope.get("trust") or envelope.get("dataset"):
+        return TRUST_BASIS_ATTESTED
+    return TRUST_BASIS_UNKNOWN
+
+
 def spec_mode_boost(item: dict[str, Any]) -> float:
     """Higher is better — used to re-order hits for API/spec verification queries."""
     kind = infer_doc_type(item)
@@ -645,6 +671,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
             "snippet": text[:SNIPPET_CHARS],
             "content_hint": HINT_UNCLASSIFIED,
             "trust_tier": TRUST_UNATTESTED,
+            "trust_tier_basis": TRUST_BASIS_UNKNOWN,
             "rank": index + 1,
         }
 
@@ -730,6 +757,9 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         "text": snippet,
         "content_hint": infer_content_hint(item, doc_type),
         "trust_tier": trust_tier,
+        # Say which authority produced the tier, so a path that never attached
+        # an envelope stops looking identical to one that checked and found none.
+        "trust_tier_basis": trust_tier_basis(item),
         "rank": envelope.get("rank") or (index + 1),
         "dataset": envelope.get("dataset"),
         "_citadel": envelope or None,
