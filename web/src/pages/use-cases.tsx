@@ -185,10 +185,7 @@ export default function UseCases() {
               </p>
               <GoDeeper title="The technical version">
                 <ul className={DEEP_UL}>
-                  <DeepLi>
-                    Apache-2.0, public repository: 377 commits, 807 tests across 52 files, CI on
-                    every push.
-                  </DeepLi>
+                  <DeepLi>Apache-2.0, public repository, CI on every push.</DeepLi>
                   <DeepLi>
                     Live hosted node with a public state report and a no-secrets status endpoint.
                   </DeepLi>
@@ -206,13 +203,9 @@ export default function UseCases() {
                     tracker.
                   </DeepLi>
                   <DeepLi>
-                    Three access surfaces: hosted MCP with 25 tools, a zero-dependency CLI, and an
-                    HTTP API.
+                    Three access surfaces: hosted MCP, a zero-dependency CLI, and an HTTP API.
                   </DeepLi>
-                  <DeepLi>
-                    Basic conflict detection across ingested documents; ten architecture decision
-                    records.
-                  </DeepLi>
+                  <DeepLi>Basic conflict detection across ingested documents.</DeepLi>
                 </ul>
               </GoDeeper>
             </div>

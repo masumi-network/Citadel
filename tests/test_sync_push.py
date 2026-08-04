@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -259,3 +260,155 @@ def test_run_captures_approved_repo_with_root_tags(monkeypatch: Any, tmp_path: P
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert len(calls) == 1
     assert calls[0]["capture_tags"] == ["org-work"]
+
+
+# --- receipts tell the truth about what the server decided -------------------
+
+
+_PUSH_STDIN = (
+    "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
+)
+
+
+def _approve_repo_for_real_sync(monkeypatch: Any, tmp_path: Path) -> None:
+    """Approve /tmp/repo and stub git so _sync_one runs for real up to the POST."""
+    config = tmp_path / "capture.json"
+    _write_capture_config(config, [{"path": "/tmp/repo", "tags": []}])
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
+    monkeypatch.setattr(
+        sync_push,
+        "build_commit_snapshot",
+        lambda *args, **kwargs: "# Git commit snapshot\n\n**test**",
+    )
+    monkeypatch.setattr(sync_push, "build_tags", lambda cwd, branch="": ["git-push"])
+
+
+def _fake_urlopen_with_body(monkeypatch: Any, body: bytes) -> None:
+    class _Resp:
+        def __enter__(self) -> "_Resp":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return body
+
+    monkeypatch.setattr(
+        sync_push.urllib.request, "urlopen", lambda request, timeout=None: _Resp()
+    )
+
+
+def _receipt_text() -> str:
+    from kb.hooks.receipt import activity_log_path
+
+    path = activity_log_path()
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_receipt_on_accepted_says_captured(monkeypatch: Any, tmp_path: Path) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(
+        monkeypatch,
+        json.dumps({"accepted": True, "reason": "accepted", "cognee_result": {}}).encode(),
+    )
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "captured commit abcdef0" in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_records_rejection_not_capture(monkeypatch: Any, tmp_path: Path) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(
+        monkeypatch,
+        json.dumps(
+            {
+                "accepted": False,
+                "reason": "duplicate_in_process",
+                "dataset": "seat:test",
+                "tags": ["git-push"],
+                "cognee_result": None,
+            }
+        ).encode(),
+    )
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "not stored" in receipt
+    assert "duplicate_in_process" in receipt
+    assert "captured commit" not in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_on_unreadable_body_does_not_claim_capture(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(monkeypatch, b"not json")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "unreadable" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_receipt_on_timeout_says_write_may_have_completed(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+
+    def boom(request: Any, timeout: int | None = None) -> None:
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(sync_push.urllib.request, "urlopen", boom)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "may still have completed" in receipt
+    assert "captured commit" not in receipt
+    assert "ctdl_test_token" not in receipt
+
+
+def test_receipt_on_wrapped_timeout_says_write_may_have_completed(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # urllib wraps a connect timeout as URLError(reason=TimeoutError).
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+
+    def boom(request: Any, timeout: int | None = None) -> None:
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(sync_push.urllib.request, "urlopen", boom)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "may still have completed" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_receipt_on_send_failure_names_class_only(monkeypatch: Any, tmp_path: Path) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+
+    def boom(request: Any, timeout: int | None = None) -> None:
+        raise RuntimeError("boom with sensitive detail")
+
+    monkeypatch.setattr(sync_push.urllib.request, "urlopen", boom)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "not captured" in receipt
+    assert "RuntimeError" in receipt
+    assert "sensitive detail" not in receipt
+    assert "captured commit" not in receipt
+
+
+def test_unreachable_node_still_exits_zero(monkeypatch: Any, tmp_path: Path) -> None:
+    # The pre-push hook must never block a `git push`, whatever the network does.
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+
+    def boom(request: Any, timeout: int | None = None) -> None:
+        raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+    monkeypatch.setattr(sync_push.urllib.request, "urlopen", boom)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "not captured" in receipt
+    assert "captured commit" not in receipt

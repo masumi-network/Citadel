@@ -305,37 +305,44 @@ def test_security_headers_are_applied_to_http_responses() -> None:
     )
 
 
-def test_only_the_landing_page_relaxes_style_src() -> None:
-    """/ is the single route allowed inline styles. Everything else is strict.
+def test_no_path_relaxes_style_src() -> None:
+    """Every route, / included, is served under the strict style-src.
 
-    The landing page renders a React Flow diagram, which positions nodes by
-    writing inline transform styles and cannot be configured out of it. That
-    buys exactly one directive on exactly one path, and / holds no token and no
-    user data. If this ever fails on a path other than /, a page has inherited
-    the relaxation, which is how a per-route exception becomes a site-wide one.
+    / renders a React Flow diagram that positions nodes by writing inline
+    `transform` styles, and for a while that bought it the site's one
+    'unsafe-inline' exemption. The exemption protected nothing: React writes
+    those transforms through the CSSOM (element.style), which style-src does
+    not govern. The directive covers <style> elements and style attributes
+    arriving in markup. With the exemption removed, the diagram rendered
+    identically and no securitypolicyviolation fired (measured in Chrome; the
+    CSSOM carve-out is spec behaviour). So / is pinned strict here alongside
+    everything else, and most deliberately of all: it is the one path that
+    would drift back.
     """
     client = authed_client()
 
-    relaxed = "style-src 'self' 'unsafe-inline';"
     strict = "style-src 'self';"
 
-    landing = client.get("/").headers["content-security-policy"]
-    assert relaxed in landing
-    assert strict not in landing
-    # Nothing else moved. Script execution in particular is untouched, so the
-    # exemption cannot be parlayed into running code.
-    assert "script-src 'self';" in landing
-    assert "default-src 'self';" in landing
-    assert "object-src 'none'" in landing
-
-    for path in ("/login", "/app", "/info", "/use-cases", "/contact", "/healthz", "/api/state"):
+    for path in (
+        "/",
+        "/login",
+        "/app",
+        "/info",
+        "/use-cases",
+        "/contact",
+        "/healthz",
+        "/api/state",
+    ):
         policy = client.get(path).headers["content-security-policy"]
         assert strict in policy, f"{path} lost the strict style-src"
-        assert "'unsafe-inline'" not in policy, f"{path} inherited the / relaxation"
+        assert "'unsafe-inline'" not in policy, f"{path} carries an inline-style relaxation"
+        # Script execution stays restricted to same-origin files everywhere.
+        assert "script-src 'self';" in policy, path
 
-    assert server_module.CSP_INLINE_STYLE_PATHS == frozenset({"/"}), (
+    assert server_module.CSP_INLINE_STYLE_PATHS == frozenset(), (
         "Adding a path here is a security decision. Update this test "
-        "deliberately, and check the page really renders something that needs it."
+        "deliberately, and check the page really renders something style-src "
+        "governs: inline styles written through the CSSOM are not it."
     )
 
 
@@ -925,7 +932,7 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["documents"] == 1
+    assert mesh.json()["stats"]["tracked_sources"] == 1
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -940,8 +947,48 @@ def test_api_uses_configured_citadel_service() -> None:
     assert feedback.json() == {"recorded": True, "improved": True, "ok": True, "reason": None}
     assert updated_mesh.status_code == 200
     # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
-    assert updated_mesh.json()["stats"]["feedback"] >= 2
+    assert updated_mesh.json()["stats"]["since_restart"]["feedback"] >= 2
     assert upgrade.status_code == 200
+
+
+def test_learning_agent_run_audit_records_gateway_skip_reason() -> None:
+    """A digest that posts nowhere must say why in the audit trail, not just that.
+
+    The response body from POST /api/learning-agent/run already carries a
+    ``reason`` on ``notifications.google_chat`` (e.g. "google_chat_disabled").
+    The audit record written for that same call is the only trace left once
+    nobody is watching the response — it must not collapse that reason down to
+    a bare ``sent: false`` with no explanation.
+    """
+    client = authed_client()
+
+    class SkippedGatewayAgent(FakeLearningAgent):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().run(**kwargs)
+            result["notifications"] = {
+                "google_chat": {
+                    "enabled": False,
+                    "sent": False,
+                    "reason": "google_chat_disabled",
+                }
+            }
+            return result
+
+    server_module.app.state.learning_agent = SkippedGatewayAgent()
+
+    response = client.post("/api/learning-agent/run", json={"post_to_chat": True})
+    assert response.status_code == 200
+    assert response.json()["notifications"]["google_chat"]["reason"] == "google_chat_disabled"
+
+    events = server_module.app.state.access_store.snapshot()["audit_events"]
+    run_events = [event for event in events if event["action"] == "learning_agent.run"]
+    assert run_events, "expected a learning_agent.run audit event"
+    detail = run_events[-1]["detail"]
+    assert detail["google_chat_sent"] is False
+    assert detail["google_chat_reason"] == "google_chat_disabled", (
+        "the audit trail must carry why the gateway did not send, not just that "
+        f"it did not: {detail}"
+    )
 
 
 def test_linear_sync_api_endpoints() -> None:
@@ -2556,6 +2603,47 @@ def test_search_sets_ratelimit_headers_when_served() -> None:
     assert "X-RateLimit-Remaining" in r.headers
 
 
+def test_search_query_length_is_bounded_like_its_sibling_filters() -> None:
+    """`query` is capped at the model boundary, as repo/path/mode already are.
+
+    The cap sits far above anything the product asks: the longest query in the
+    bench corpus is 99 characters and the longest in this suite is 38, against
+    a 2000 character ceiling. Everything a caller would plausibly type is still
+    accepted; only an unbounded body is refused, and refused before the request
+    reaches any of the work /search does per query.
+    """
+    client = authed_client("test-reader")
+
+    # Ordinary queries are untouched, including a long natural-language one.
+    for query in (
+        "q",
+        "MIP-003 availability type masumi-agent",
+        "What is the full postgres connection string for the production database?",
+        "policy + asset " * 20,
+    ):
+        assert len(query) <= server_module.MAX_SEARCH_QUERY_LENGTH
+        assert client.post("/search", json={"query": query}).status_code == 200, query
+
+    # Exactly at the cap is still a valid query.
+    at_cap = "a" * server_module.MAX_SEARCH_QUERY_LENGTH
+    assert client.post("/search", json={"query": at_cap}).status_code == 200
+
+    # One character over is rejected by validation, not served.
+    over_cap = "a" * (server_module.MAX_SEARCH_QUERY_LENGTH + 1)
+    rejected = client.post("/search", json={"query": over_cap})
+    assert rejected.status_code == 422
+
+    # The shape that costs the most to match is refused at the same boundary,
+    # so no amount of it reaches the query classifiers.
+    whitespace_heavy = client.post(
+        "/search", json={"query": "policy" + " " * server_module.MAX_SEARCH_QUERY_LENGTH}
+    )
+    assert whitespace_heavy.status_code == 422
+
+    # An empty query is still rejected too — the lower bound did not move.
+    assert client.post("/search", json={"query": ""}).status_code == 422
+
+
 def test_search_degrades_to_empty_on_timeout_budget() -> None:
     # #44: a recall slower than the budget degrades to empty-fast with a note,
     # instead of hanging for 100s+.
@@ -3567,6 +3655,61 @@ def test_recent_contributions_lists_audit_events(tmp_path: Any) -> None:
     assert len(payload["contributions"]) == 1
     assert payload["contributions"][0]["action"] == "contribute"
     assert payload["contributions"][0]["detail"]["title"] == "WIP: MCP docs"
+
+
+def test_recent_contributions_lists_an_mcp_ingest(tmp_path: Any) -> None:
+    """A write through MCP is a contribution, and the feed must show it.
+
+    /ingest from the MCP surface records ONLY ``mcp.citadel_ingest`` (the
+    durable ``ingest`` row is suppressed for MCP requests), and the feed
+    selected the single action ``contribute`` — so a seat that ingested through
+    MCP saw an empty "recent contributions" list right after a write that was
+    independently proven to exist.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    ingested = writer.post(
+        "/ingest",
+        json={"data": "Runbook: rotate the sync token before minting seats.", "tags": ["runbook"]},
+        headers={"X-Citadel-MCP-Tool": "citadel_ingest"},
+    )
+    assert ingested.status_code == 200
+    assert ingested.json()["accepted"] is True
+
+    recent = writer.get("/api/contributions/recent?limit=10&mine=true")
+    assert recent.status_code == 200
+    payload = recent.json()
+    actions = [event["action"] for event in payload["contributions"]]
+    assert actions == ["mcp.citadel_ingest"], payload
+
+
+def test_recent_contributions_omits_rejected_writes(tmp_path: Any) -> None:
+    """The feed lists writes that landed, not writes that were attempted.
+
+    Widening the selection past ``contribute`` pulls in surfaces that audit
+    their failures too (a secret-blocked ingest records success=False), and a
+    rejected write listed as a contribution is the same dishonesty in the
+    other direction.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    # The row a secret-blocked MCP ingest writes (kb/server.py record_mcp_audit,
+    # success=bool(result.accepted)), recorded through the same store API.
+    store.record_event(
+        action="mcp.citadel_ingest",
+        actor=None,
+        success=False,
+        dataset="seat:test-writer",
+        detail={"surface": "mcp", "operation": "ingest", "blocked": "secret_content"},
+    )
+
+    recent = writer.get("/api/contributions/recent?limit=10")
+    assert recent.status_code == 200
+    assert recent.json()["contributions"] == []
 
 
 def test_contribute_routes_through_learning_process_and_audits(tmp_path: Any) -> None:
@@ -6284,14 +6427,24 @@ def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
     client = authed_client()
 
     async def fake_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+        return {
+            "ok": True,
+            "tracked_sources": 317,
+            "indexed_docs": 17991,
+            "indexed_edges": 131843,
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
 
     stats = client.get("/api/mesh").json()["stats"]
 
-    assert stats["documents"] == 317, stats
-    assert stats["indexed_chunks"] == 17991, stats
+    assert stats["tracked_sources"] == 317, stats
+    assert stats["nodes"] == 17991, stats
+    assert stats["edges"] == 131843, stats
+    # indexed_chunks duplicated `nodes` by construction and never counted a
+    # chunk, so it is gone rather than published wrong (same call as
+    # failed_chunks below).
+    assert "indexed_chunks" not in stats
     # The uptime figures are still reported, just no longer disguised as totals.
     assert "since_restart" in stats
     assert stats["since_restart"]["documents"] != 317
@@ -6309,7 +6462,13 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     client = authed_client()
 
     async def degraded_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": "boom"}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": "boom",
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", degraded_corpus_health)
 
@@ -6317,5 +6476,424 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
 
     assert response.status_code == 200
     stats = response.json()["stats"]
-    assert stats["documents"] is not None
-    assert stats["indexed_chunks"] is not None
+    assert stats["tracked_sources"] is not None
+    assert stats["edges"] is not None
+
+
+def test_api_mesh_activity_counters_are_scoped_not_top_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#196/#197 through the endpoint the dashboard reads.
+
+    The activity counters missed ADR-0018's treatment: `searches`, `feedback`,
+    `upgrades` and `errors` kept restart-scoped values at the top level of the
+    stats payload, where they read as lifetime totals (measured 2026-08-02:
+    top-level and since_restart `searches` were both 294). And `failed_chunks`
+    was the `errors` counter surfaced a second time — it never counted chunks,
+    so it is gone rather than renamed.
+    """
+    client = authed_client()
+
+    async def fake_corpus_health() -> dict[str, Any]:
+        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+
+    monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
+
+    stats = client.get("/api/mesh").json()["stats"]
+
+    for counter in ("searches", "feedback", "upgrades", "errors", "failed_chunks"):
+        assert counter not in stats, f"{counter} is restart-scoped but top-level"
+    since = stats["since_restart"]
+    assert {"searches", "feedback", "upgrades", "errors"} <= set(since)
+    # The window the counters cover ships with them.
+    assert since["started_at"]
+class FakeCorpusCognee:
+    """Fake at the kb.cognee_client METHOD boundary.
+
+    Every shape here (row dicts, totals dict, counts mapping, presence set) is
+    the contract corpus_page/corpus_totals/corpus_chunk_counts/
+    corpus_graph_presence themselves declare — cognee's own row shapes are
+    pinned by the real-import tests in test_cognee_client.py, never invented
+    here.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        totals: dict[str, Any],
+        chunk_counts: dict[str, int] | None = None,
+        graph_ids: set[str] | None = None,
+        chunk_lookup_raises: bool = False,
+    ) -> None:
+        self.rows = rows
+        self.totals = totals
+        self.chunk_counts = chunk_counts
+        self.graph_ids = graph_ids
+        self.chunk_lookup_raises = chunk_lookup_raises
+        self.seen_after: list[tuple[str | None, str | None]] = []
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple[Any, str]:
+        from datetime import datetime
+
+        return (datetime.fromisoformat(row["created_at"]), row["id"])
+
+    async def corpus_page(
+        self,
+        *,
+        after_created_at: str | None = None,
+        after_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        from datetime import datetime
+
+        self.seen_after.append((after_created_at, after_id))
+        rows = sorted((dict(row) for row in self.rows), key=self._key)
+        if after_created_at and after_id:
+            boundary = (datetime.fromisoformat(after_created_at), after_id)
+            rows = [row for row in rows if self._key(row) > boundary]
+        return rows[:limit]
+
+    async def corpus_totals(self) -> dict[str, Any]:
+        return dict(self.totals)
+
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
+        if self.chunk_lookup_raises:
+            raise RuntimeError("vector store unavailable")
+        if self.chunk_counts is None:
+            return None
+        return {
+            document_id: self.chunk_counts[document_id]
+            for document_id in document_ids
+            if document_id in self.chunk_counts
+        }
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+        if self.graph_ids is None:
+            return None
+        return {doc_id for doc_id in document_ids if doc_id in self.graph_ids}
+
+
+def _corpus_row(row_id: str, created_at: str, **overrides: Any) -> dict[str, Any]:
+    row = {
+        "id": row_id,
+        "name": f"doc-{row_id}",
+        "content_hash": f"hash-{row_id}",
+        "raw_content_hash": None,
+        "mime_type": "text/plain",
+        "token_count": 10,
+        "data_size": 100,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "owner_id": "owner-1",
+        "datasets": ["masumi-network"],
+        "citadel_tags": [],
+    }
+    row.update(overrides)
+    return row
+
+
+def _corpus_totals(documents: int, default_owner: int | None = None) -> dict[str, Any]:
+    owned = documents if default_owner is None else default_owner
+    return {
+        "documents": documents,
+        "documents_default_owner": owned,
+        "documents_other_owners": documents - owned,
+        "by_dataset": {"masumi-network": documents},
+        "by_dataset_default_owner": {"masumi-network": owned},
+    }
+
+
+def _corpus_client(fake: FakeCorpusCognee) -> TestClient:
+    client = authed_client()
+    server_module.app.state.citadel.cognee = fake
+    return client
+
+
+def test_corpus_census_reports_rows_presence_and_totals() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(
+                "doc-a",
+                (now - timedelta(hours=2)).isoformat(),
+                citadel_tags=["alpha"],
+            ),
+            _corpus_row("doc-b", (now - timedelta(hours=1)).isoformat()),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={"doc-a": 3},
+        graph_ids={"doc-a"},
+    )
+    client = _corpus_client(fake)
+
+    response = client.get("/api/corpus")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["documents_returned"] == 2
+    assert body["documents_total"] == 2
+    assert body["next_cursor"] is None
+    assert body["totals"] == _corpus_totals(2)
+    first, second = body["documents"]
+    assert first["id"] == "doc-a"
+    assert first["citadel_tags"] == ["alpha"]
+    assert first["datasets"] == ["masumi-network"]
+    assert first["chunk_count"] == 3
+    assert first["in_graph"] is True
+    # doc-b was measured and has nothing indexed: 0/False, not null.
+    assert second["chunk_count"] == 0
+    assert second["in_graph"] is False
+    assert body["notes"] == []
+
+
+def test_corpus_census_pages_with_an_opaque_cursor() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    all_ids = ["doc-a", "doc-b", "doc-c"]
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(row_id, (now - timedelta(hours=hours)).isoformat())
+            for row_id, hours in (("doc-a", 3), ("doc-b", 2), ("doc-c", 1))
+        ],
+        totals=_corpus_totals(3),
+        chunk_counts={},
+        graph_ids=set(all_ids),
+    )
+    client = _corpus_client(fake)
+
+    page_one = client.get("/api/corpus?limit=2").json()
+    assert [row["id"] for row in page_one["documents"]] == ["doc-a", "doc-b"]
+    assert page_one["documents_returned"] == 2
+    assert page_one["next_cursor"]
+
+    page_two = client.get(f"/api/corpus?limit=2&cursor={page_one['next_cursor']}").json()
+    assert [row["id"] for row in page_two["documents"]] == ["doc-c"]
+    assert page_two["next_cursor"] is None
+
+
+def test_corpus_census_clamps_a_future_dated_cursor_so_later_rows_land() -> None:
+    """One future-dated created_at must not pin the cursor past every real row.
+
+    doc-future sits 30 days ahead and ends the first page. Unclamped, its
+    timestamp becomes a cursor that no row written in the next month can
+    exceed, so the walk silently stalls while reporting ok. Clamped to
+    now+skew, a row that lands after the cursor was minted still comes back on
+    the next page (rows inside the skew window may repeat, which is the
+    accepted cost).
+    """
+    import base64 as _base64
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row("doc-a", (now - timedelta(hours=1)).isoformat()),
+            _corpus_row("doc-future", (now + timedelta(days=30)).isoformat()),
+            _corpus_row("doc-far-future", (now + timedelta(days=60)).isoformat()),
+        ],
+        totals=_corpus_totals(3),
+        chunk_counts={},
+        graph_ids={"doc-a", "doc-future", "doc-far-future"},
+    )
+    client = _corpus_client(fake)
+
+    page_one = client.get("/api/corpus?limit=2").json()
+    assert [row["id"] for row in page_one["documents"]] == ["doc-a", "doc-future"]
+    cursor = page_one["next_cursor"]
+    assert cursor
+
+    decoded = json.loads(_base64.urlsafe_b64decode(cursor.encode("ascii")))
+    cursor_time = datetime.fromisoformat(decoded["t"])
+    ceiling = datetime.now(timezone.utc) + timedelta(
+        seconds=server_module.CORPUS_CURSOR_MAX_SKEW_SECONDS + 5
+    )
+    assert cursor_time <= ceiling, "cursor was not clamped to now+skew"
+
+    # A real row arrives after the cursor was handed out, just past the skew
+    # window. With the future-dated cursor it would never be seen.
+    fake.rows.append(
+        _corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat())
+    )
+
+    page_two = client.get(f"/api/corpus?limit=3&cursor={cursor}").json()
+    assert "doc-later" in [row["id"] for row in page_two["documents"]]
+
+
+def test_corpus_census_clamps_a_stored_future_cursor_on_read() -> None:
+    """The write-side clamp is not enough: a cursor minted elsewhere (or before
+    a clamp change) can still carry a far-future timestamp, so the read side
+    clamps too."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat()),
+            _corpus_row("doc-far-future", (now + timedelta(days=60)).isoformat()),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={},
+        graph_ids={"doc-later", "doc-far-future"},
+    )
+    client = _corpus_client(fake)
+    handcrafted = server_module._encode_corpus_cursor(
+        (now + timedelta(days=30)).isoformat(), "doc-zzz"
+    )
+
+    body = client.get(f"/api/corpus?cursor={handcrafted}").json()
+
+    assert "doc-later" in [row["id"] for row in body["documents"]]
+
+
+def test_corpus_census_degrades_presence_to_null_not_zero() -> None:
+    """0 and 'not measured' are different answers — the difference between
+    'accepted but never indexed' and 'we did not look'."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [_corpus_row("doc-a", (now - timedelta(hours=1)).isoformat())],
+        totals=_corpus_totals(1),
+        chunk_lookup_raises=True,
+        graph_ids=None,
+    )
+    client = _corpus_client(fake)
+
+    response = client.get("/api/corpus")
+
+    assert response.status_code == 200
+    body = response.json()
+    row = body["documents"][0]
+    assert row["chunk_count"] is None
+    assert row["in_graph"] is None
+    notes = " ".join(body["notes"])
+    assert "chunk_count" in notes and "not measured" in notes
+    assert "in_graph" in notes
+
+
+def test_corpus_census_requires_an_admin() -> None:
+    writer = authed_client("test-writer")
+
+    assert writer.get("/api/corpus").status_code == 403
+
+
+def test_corpus_census_rejects_unauthenticated_callers() -> None:
+    server_module.app.state.citadel = FakeCitadel()
+    client = TestClient(app, base_url="https://testserver")
+
+    assert client.get("/api/corpus").status_code == 401
+
+
+def test_api_mesh_publishes_the_real_graph_edge_total_not_the_projection() -> None:
+    """`stats.edges` must come from the graph, not from the in-memory projection.
+
+    This pins the PRODUCER half of the #232 fix. `_corpus_health` supplies
+    `indexed_edges` and `kb/mesh.py` consumes it with a silent fallback to
+    `len(self.edges)`, so reverting the producer alone changes nothing that any
+    other test observes: every mesh unit test injects the corpus dict directly.
+    That is the shape a guard takes when it ships inert.
+
+    The projection and the graph are given deliberately different edge counts,
+    so the assertion can only pass when the real total is the one published.
+    Live production before the fix: `stats.edges` 5511 against 131843 real, and
+    5511 was byte-identical to `since_restart.projection_edges`.
+    """
+    real_edges = 131843
+
+    class PopulatedCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 21086, "edges": real_edges}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 49, "tracked_files": 69, "issue_count": 200}
+
+    client = authed_client("test-reader")
+    app.state.citadel = PopulatedCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    stats = client.get("/api/mesh").json()["stats"]
+    projection = stats["since_restart"]["projection_edges"]
+
+    assert projection != real_edges, (
+        "the fixture no longer discriminates: the projection and the graph agree, "
+        "so this test would pass with the producer reverted"
+    )
+    assert stats["edges"] == real_edges, (
+        f"stats.edges is {stats['edges']}, the in-memory projection, not the "
+        f"graph's {real_edges}. _corpus_health stopped supplying indexed_edges "
+        "and kb/mesh.py fell back silently."
+    )
+    assert stats["tracked_sources"] == 318
+
+
+def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
+    """A pass that did no work must not be stamped onto the source.
+
+    `run()` returns `skipped: True` when another pass already holds the state
+    file. That result carries no checked_at and no counts, so recording it marks
+    the source "synced" for a pass that ingested nothing: the bookkeeping-success
+    failure mode this repo has produced more than once.
+
+    The control run comes FIRST and must record. Without it this test asserts an
+    empty list against a spy that may never have been wired to the object the
+    route actually uses, which is exactly how the first version of it passed with
+    the guard removed.
+    """
+    recorded: list[dict[str, Any]] = []
+
+    class ScriptedSyncer:
+        def __init__(self, result: dict[str, Any]) -> None:
+            self._result = result
+
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_files": 0}
+
+        async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+            return dict(self._result, dry_run=dry_run)
+
+    admin = authed_client("test-admin")
+    mesh = server_module.get_mesh()
+    original = mesh.record_repo_content_sync
+
+    async def spy(config: Any, result: dict[str, Any]) -> None:
+        recorded.append(result)
+
+    mesh.record_repo_content_sync = spy  # type: ignore[method-assign]
+    try:
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {"ok": True, "enabled": True, "files_ingested": 2, "repositories": []}
+        )
+        control = admin.post("/api/repo-content-sync/run", json={})
+        assert control.status_code == 200
+        assert len(recorded) == 1, (
+            "the spy never fired on a real pass, so this test cannot detect the "
+            "defect it exists for: it is not wired to the object the route uses"
+        )
+
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {
+                "ok": True,
+                "enabled": True,
+                "skipped": True,
+                "reason": "repo_content_sync_already_running",
+            }
+        )
+        response = admin.post("/api/repo-content-sync/run", json={})
+    finally:
+        mesh.record_repo_content_sync = original  # type: ignore[method-assign]
+
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert len(recorded) == 1, (
+        "a skipped pass was recorded to the mesh, stamping the source 'synced' "
+        f"with no checked_at and no counts: {recorded[1:]}"
+    )

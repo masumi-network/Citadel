@@ -50,6 +50,10 @@ postgres-data/
 *-export.csv
 vault-export.*
 backup.tar.gz
+# Bench run JSONs enumerate every served hit identity and tracked source
+# name. scripts/bench/.gitignore already covers scripts/bench/runs/; this
+# catches a runs/ created anywhere else by a copy-pasted bench command.
+runs/
 
 # ---------------------------------------------------------------------------
 # Editor and agent tool configs that commonly hold inline tokens

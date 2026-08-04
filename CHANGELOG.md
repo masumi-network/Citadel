@@ -85,6 +85,37 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Fixed
 
+- **`citadel activity` no longer reports an outage as an empty vault.**
+  `fetch_events` marks every transport/HTTP failure as `{"error": ...}`, but the
+  feed rendered that as `No recent activity.` (exit 0) and `--json` printed the
+  bare error object, also with exit 0, so an unreachable node was
+  indistinguishable from an empty vault. A missing token now takes the shared
+  no-token error path, and an unreachable node emits
+  `{"ok": false, "error": ..., "code": "NODE_UNREACHABLE"}` under `--json` (a
+  stderr line otherwise) with exit 1. `--global` fails the same way. A genuinely
+  empty feed still prints `No recent activity.` and exits 0.
+- **`citadel activity` shows which operation failed.** `record_error` stores the
+  operation and a redacted reason in the event details, but the feed rendered
+  only the label, so every failure read as a bare `Operation failed`. Error
+  lines now append both, newlines collapsed and the reason capped at 120 chars.
+- **`citadel status` names the repo behind the pre-push hook check.** The check
+  is cwd-scoped, so running from any directory outside the repo reported the
+  hook as `missing` even though it exists and works in the repo. The detail now
+  reads `installed (<repo>)` / `missing in <repo>`, or says plainly that there
+  is no git repo at the inspected path, and the check data carries
+  `{repo, git_repo}`. `citadel doctor` stops claiming "hook missing" when there
+  was no git repo to inspect.
+- **`citadel ingest` takes `--timeout SECONDS` and stops overclaiming on
+  expiry.** The default (cognify) mode blocked up to 180s with no way to bound
+  it, and the timeout message asserted "Your note is saved" (plus
+  `saved: true`), which nothing verified. On expiry the CLI now says the
+  outcome is unknown (`write_state: "unknown"`): a client timeout proves
+  neither that the write failed nor that it landed. urllib-wrapped socket
+  timeouts (`URLError("timed out")`) route to the same `TIMEOUT` path instead
+  of `NODE_UNREACHABLE`.
+- **`citadel status` (human view) says when the mesh block is unreachable.**
+  `fetch_mesh` failures were rendered by dropping the whole block, which read
+  as "no mesh data"; it now prints `Knowledge mesh unavailable: <reason>`.
 - **`requires-python` declared Python 3.10 support that never existed.** Seven
   `kb/` modules import `datetime.UTC` (added in 3.11) and the test suite
   imports `tomllib` (3.11 stdlib). Verified against a real 3.10 interpreter:

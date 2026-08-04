@@ -619,9 +619,25 @@ def check_local_setup(repo: Path, config_path: Path | None = None) -> list[Check
     )
     checks.append(assess_mcp_setup(repo))
 
-    pre_push = repo / ".git" / "hooks" / "pre-push"
+    # The hook is per-repo, so this check only ever sees the repo it was pointed
+    # at (the cwd's git toplevel by default). Name that repo in the detail —
+    # a bare "missing" from the wrong directory reads as "your hook is gone".
+    git_dir = repo / ".git"
+    is_git_repo = git_dir.exists()
+    pre_push = git_dir / "hooks" / "pre-push"
+    if not is_git_repo:
+        hook_ok = False
+        hook_detail = f"no git repo at {repo} — nothing to inspect (the hook is per-repo)"
+    else:
+        hook_ok = pre_push.exists()
+        hook_detail = f"installed ({repo})" if hook_ok else f"missing in {repo}"
     checks.append(
-        Check("pre_push_hook", ok=pre_push.exists(), detail="installed" if pre_push.exists() else "missing")
+        Check(
+            "pre_push_hook",
+            ok=hook_ok,
+            detail=hook_detail,
+            data={"repo": str(repo), "git_repo": is_git_repo},
+        )
     )
 
     # Session hooks live in user-scope ~/.claude/settings.json (cross-repo), not
