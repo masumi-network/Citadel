@@ -53,11 +53,23 @@ VERIFIED: the only search call Citadel makes is
 no dataset context, so `node_name` arrives at `PGVectorAdapter.py:529-534` as
 `None` and the adapter's `belongs_to_set` filter branch (`:505`, literal at
 `:524`) is unreachable. Every search therefore scans every **Seat**'s chunks in
-one collection. Note the precise form: in this configuration dataset scoping is
-not resolved *anywhere*: not by the Index and not by cognee above it, which is
-consistent with the existing record that the dataset parameter relabels rather
-than scopes. The Index enforces no isolation, and nothing else is enforcing it
-on the Index's behalf.
+one collection.
+
+CORRECTED 2026-08-04, later the same day. An earlier version of this paragraph
+concluded that "dataset scoping is not resolved anywhere: not by the Index and
+not by cognee above it". **That was wrong, and a live measurement refutes it.**
+One `citadel_search` produced three per-dataset searches returning 2, 1 and 0
+results respectively, and the merged hits carried different document ids from
+different datasets. Byte-identical queries against one unfiltered collection
+would return the same rows. They did not, so something above the adapter does
+resolve the dataset.
+
+What survives is narrower and still worth recording: the **Index** itself is
+given no filter and scans the whole collection regardless of dataset, so
+whatever scoping exists is applied above it rather than by it. The error was
+inferring, from the absence of a filter argument at one boundary, that no
+filtering happened at any boundary. Absence of evidence at the layer you
+inspected is not evidence of absence elsewhere.
 
 A third property multiplies both. **One user query issues N full scans, not
 one.** VERIFIED: `kb/server.py:1969-1979` fans out with `asyncio.gather`, one
@@ -66,11 +78,13 @@ the results above. The comment there reasons that concurrency makes a
 two-dataset search "cost ~one recall, not two"; that is true of wall-clock and
 false of database work. The scans are concurrent, unfiltered, and against the
 same collection, so they contend for the same buffers and CPU. Since the dataset
-parameter never reaches the vector layer (above), the degree to which those N
-scans return *identical* rows is NOT DETERMINED but is potentially total,
-because the `session_id` differs per dataset and may or may not change cognee's path. The
-settling measurement is cheap: count statements against the chunk collection per
-user query.
+parameter never reaches the vector layer, an earlier version of this ADR
+suspected the N scans might return identical rows. **Measured 2026-08-04: they
+do not.** One search returned 2, 1 and 0 results across its three arms, with
+different document ids. The scans are redundant in *work* (each is a full scan
+of the same collection) but not in *result*. Both halves of that matter: the
+N-fold cost is real, and the arms cannot simply be merged into one without
+replacing whatever scoping currently distinguishes them.
 
 Neither property was chosen. All three were inherited from a default and have
 gone unrecorded, which is why the corpus can grow into a latency problem that no
@@ -85,9 +99,14 @@ counter reports and no code review would surface. The defect is an absence.
 - **Two interventions are tried before any index arm, because both dominate the
   index arms on every axis.** Neither changes the store:
   1. **Collapse the query fan-out.** N concurrent full scans per user query is
-     an N-fold multiplier on every latency number in this document, it costs no
-     recall to remove, and it needs no index and no new service. This is the
-     largest available effect size and it was not in the original design at all.
+     an N-fold multiplier on every latency number in this document, and it needs
+     no index and no new service. AMENDED after measurement: an earlier version
+     claimed this "costs no recall to remove". It is not that simple. The arms
+     return different results (2, 1 and 0 on the measured query), so collapsing
+     them means replacing whatever distinguishes them, not deleting a redundant
+     loop. The win is still real and still the cheapest available, but it is a
+     change with a correctness question attached rather than pure waste
+     removal.
   2. **Filter or partition by dataset.** This shrinks each scan by roughly the
      dataset count and keeps recall exact. It was previously demoted to a
      "cost-to-fix probe", which was wrong: a rule that measures only index arms
