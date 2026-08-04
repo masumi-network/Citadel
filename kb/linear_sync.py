@@ -529,7 +529,7 @@ class LinearSyncer:
                 # linear_search returns real issues org-wide — the digest only carried
                 # titles, leaving the 200 synced issues invisible to search (#52).
                 try:
-                    await learning.learn(
+                    issue_outcome = await learning.learn(
                         format_issue_note(issue),
                         dataset=central_dataset,
                         tags=[
@@ -548,7 +548,11 @@ class LinearSyncer:
                         tier="light",
                         defer_cognify=True,
                     )
-                    central_issue_written = True
+                    if issue_outcome.ingest.accepted:
+                        # Only an ACCEPTED add is a write; a filter rejection or
+                        # in-process duplicate returns accepted=False without
+                        # raising and stores nothing.
+                        central_issue_written = True
                 except SecretContentError as exc:
                     central_blocked = True
                     blocked.append(issue.identifier)
@@ -628,6 +632,11 @@ class LinearSyncer:
         if central_outcome is not None or central_issue_written:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
+        # What this pass OBSERVED about the coalesced graph write, reported as
+        # `central_ingested` below. Only the awaited branch sees the cognify
+        # finish (or fail); the scheduled branch has merely REQUESTED one, and
+        # must say so instead of implying completion.
+        cognify_observed: str | None = None
         if touched_datasets and not _suppress_inline_cognify():
             cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
@@ -641,10 +650,18 @@ class LinearSyncer:
                     await self.citadel.cognee.cognify(datasets=cognify_datasets)
                 except Exception:  # noqa: BLE001 - writes succeeded; cognify is a follow-on
                     logger.exception("Linear sync coalesced cognify failed")
+                    cognify_observed = "cognify_failed"
+                else:
+                    cognify_observed = "cognified"
             else:
                 # On-demand endpoint / evolve: background it so the request returns
                 # without waiting on the graph write.
                 self.citadel.cognee.schedule_cognify(cognify_datasets)
+                cognify_observed = "queued_not_confirmed"
+        elif touched_datasets:
+            # Evolve Phase-1 subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY): add-only
+            # by design; the web cognifies in Phase 2 as the sole Kuzu writer.
+            cognify_observed = "suppressed"
 
         # Advance the cursor to the newest updatedAt seen (keep the prior one
         # when a pass sees nothing newer, e.g. an empty or truncated fetch),
@@ -729,7 +746,25 @@ class LinearSyncer:
             # member fetch also leaves this at 0 (#148).
             "auto_mapped_assignees": auto_mapped,
             "auto_map_error": auto_map_error,
-            "central_ingested": central_outcome.ingest.accepted if central_outcome else None,
+            # Fate of this pass's Central writes as OBSERVED, never assumed.
+            # This used to report cognee.add() acceptance as True, but add()
+            # only QUEUES the graph write (cognify never runs synchronously),
+            # so a pass whose graph write later died was byte-identical to a
+            # working one. States a caller can branch on:
+            #   "cognified"             awaited coalesced cognify completed
+            #   "cognify_failed"        awaited coalesced cognify raised
+            #   "queued_not_confirmed"  background cognify scheduled; outcome
+            #                           not observed by this pass
+            #   "suppressed"            add-only mode; evolve Phase 2 cognifies
+            #   None                    no accepted Central write this pass
+            "central_ingested": (
+                cognify_observed
+                if (
+                    (central_outcome is not None and central_outcome.ingest.accepted)
+                    or central_issue_written
+                )
+                else None
+            ),
             "mirrors": mirrors,
             # Issues (or the workspace digest) the secret scanner refused this
             # pass (#117): identifiers only, never content. A blocked write is

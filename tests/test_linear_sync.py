@@ -299,6 +299,9 @@ async def test_linear_sync_defers_coalesced_cognify_when_inline_suppressed(
     result = await syncer.run(force=True)
     assert result["ok"] is True
     assert scheduled == []  # suppressed: Phase 2 cognifies, not the subprocess
+    # And the pass says so: the graph write is deliberately deferred, so its
+    # outcome was not observed here.
+    assert result["central_ingested"] == "suppressed"
 
 
 @pytest.mark.asyncio
@@ -340,6 +343,71 @@ async def test_linear_sync_awaits_coalesced_cognify_when_requested(
     assert result["ok"] is True
     assert awaited == [["masumi-network"]]  # awaited inline over Central (no mirrors)
     assert scheduled == []  # awaited, not backgrounded
+
+
+# --- central_ingested reports an OBSERVED outcome, never a request -----------
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_reports_queued_not_confirmed_on_background_cognify(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    """central_ingested used to echo cognee.add() acceptance as True, but
+    add() only QUEUES the graph write (cognify never runs synchronously), so
+    a pass whose graph write later died silently was byte-identical to a
+    working one. On the scheduled path the pass observes nothing beyond the
+    request, and must report exactly that."""
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+
+    result = await syncer.run(force=True)
+    assert result["ok"] is True
+    assert scheduled  # the background cognify was requested...
+    # ...and the report claims no more than the request:
+    assert result["central_ingested"] == "queued_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_awaited_cognify_success_and_failure_report_differently(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    """The awaited path OBSERVES the coalesced cognify, so a completed graph
+    write and a failed one must produce different central_ingested values;
+    the two passes were previously indistinguishable."""
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "s.json"),
+        access_store_path=str(tmp_path / "a.json"),
+    )
+    citadel = Citadel(config)
+
+    async def fake_learn(self: Any, data: str, **_: Any) -> Any:
+        class Outcome:
+            class ingest:
+                accepted = True
+
+        return Outcome()
+
+    monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
+
+    async def good_cognify(*, datasets: Any, force: bool = False) -> dict[str, Any]:
+        return {"ok": True}
+
+    monkeypatch.setattr(citadel.cognee, "cognify", good_cognify)
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues))
+    healthy = await syncer.run(force=True, await_cognify=True)
+    assert healthy["ok"] is True
+    assert healthy["central_ingested"] == "cognified"
+
+    async def dead_cognify(*, datasets: Any, force: bool = False) -> dict[str, Any]:
+        raise RuntimeError("graph writer is down")
+
+    monkeypatch.setattr(citadel.cognee, "cognify", dead_cognify)
+    broken = await syncer.run(force=True, await_cognify=True)
+    # The pass still succeeds (the adds landed; cognify is a follow-on)...
+    assert broken["ok"] is True
+    # ...but the report now says what was actually observed.
+    assert broken["central_ingested"] == "cognify_failed"
+    assert broken["central_ingested"] != healthy["central_ingested"]
 
 
 @pytest.mark.asyncio
