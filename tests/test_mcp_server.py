@@ -647,6 +647,52 @@ def test_ingest_tool_honors_cognify_opt_out() -> None:
     assert post["timeout"] is None
 
 
+def test_ingest_timeout_reports_an_unconfirmed_write_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client budget expiry proves no response arrived — never that the write failed.
+
+    Reproduced live: the tool errored while the document was afterwards
+    retrievable by id with matching body and tags. An error tells the agent to
+    retry, and the retry duplicates the note, so the timeout path has to say
+    what is actually known (submitted, outcome unconfirmed) and how to check.
+    """
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        raise TimeoutError("The operation timed out.")
+
+    monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
+    server = create_mcp_server(
+        CitadelHttpClient(base_url="http://localhost:8000", access_token="ctdl_t")
+    )
+
+    result = run_tool(server, "citadel_ingest", "a durable note", None)
+
+    assert result["ok"] is False
+    assert result["timed_out"] is True
+    assert result["write_state"] == "unknown"
+    assert result["accepted"] is None
+    assert result["code"] == "TIMEOUT"
+    # The caller needs a way to check before writing again.
+    assert "citadel_recent_contributions" in result["message"]
+
+
+def test_ingest_timeout_budget_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The honest timeout payload only reaches the caller if OUR budget expires first.
+
+    The observed production cut-off was the MCP CLIENT's tool budget (~67s),
+    well under the 180s the tool asks urlopen for, so the tool never saw its
+    own expiry and the agent got an opaque error instead.
+    """
+    monkeypatch.setenv("CITADEL_MCP_INGEST_TIMEOUT_SECONDS", "45")
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    run_tool(server, "citadel_ingest", "a durable note", None)
+
+    assert client.posts[0]["timeout"] == 45.0
+
+
 class _OkResp:
     def __enter__(self) -> Any:
         return self
@@ -1236,6 +1282,94 @@ def test_recent_contributions_tool_reads_audit_feed() -> None:
 
     assert result["path"] == "/api/contributions/recent?limit=5&mine=true"
     assert client.gets[-1]["tool_name"] == "citadel_recent_contributions"
+
+
+def test_linear_search_asks_the_server_to_scope_to_linear() -> None:
+    """A tool that says it searches Linear must not run the general vault search.
+
+    Measured on production: the top hit for a Linear-shaped query was a
+    `docs/agents/issue-tracker.md` from an unrelated repo. Scoping by dataset
+    alone selects shared Central, which holds every synced source.
+    """
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    run_tool(server, "citadel_linear_search", "subscription credits missing", None)
+
+    post = client.posts[-1]
+    assert post["path"] == "/search"
+    assert post["payload"]["dataset"] == "masumi-network"
+    assert post["payload"]["source"] == "linear-issue"
+
+
+def test_linear_search_description_does_not_overclaim() -> None:
+    """The description is the contract an agent reads; it has to match the filter."""
+    server = create_mcp_server(FakeHttpClient())
+    all_tools = asyncio.run(server.list_tools())
+    tool = next(t for t in all_tools if t.name == "citadel_linear_search")
+    description = tool.description or ""
+
+    assert "linear-issue" in description.lower()
+    # The scope is derived from the header the syncer wrote into the body, and
+    # body text is author-controlled. Say so rather than implying attestation.
+    assert "header" in description.lower()
+
+
+def test_linear_search_says_so_when_the_node_did_not_apply_the_scope() -> None:
+    """Asking for a scope is not the same as getting one.
+
+    A node older than this tool ignores the unknown ``source`` field (pydantic
+    drops extras) and answers with an unscoped page. Trusting the request would
+    label those results Linear-only, which is the defect this filter fixes.
+    """
+
+    class UnscopedNode(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            super().post(path, payload, tool_name=tool_name, timeout=timeout)
+            return {"results": [{"id": "1"}], "dataset": "masumi-network"}
+
+    server = create_mcp_server(UnscopedNode())
+
+    result = run_tool(server, "citadel_linear_search", "subscription credits", None)
+
+    assert result["scope_applied"] is False
+    assert any("scope" in str(w).lower() for w in result["warnings"])
+
+
+def test_linear_search_reports_the_scope_the_node_confirms() -> None:
+    class ScopedNode(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            super().post(path, payload, tool_name=tool_name, timeout=timeout)
+            return {
+                "results": [{"id": "1"}],
+                "filtering": {
+                    "applied": {"source": "linear-issue"},
+                    "candidates_fetched": 30,
+                    "candidates_matched": 1,
+                    "returned": 1,
+                },
+            }
+
+    server = create_mcp_server(ScopedNode())
+
+    result = run_tool(server, "citadel_linear_search", "subscription credits", None)
+
+    assert result["scope_applied"] is True
+    assert "warnings" not in result
 
 
 def test_contribute_tool_rejects_empty_or_oversized_payloads(

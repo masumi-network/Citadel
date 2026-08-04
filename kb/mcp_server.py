@@ -34,6 +34,9 @@ MAX_AUDIT_LIMIT = 100
 DEFAULT_MAX_INGEST_BYTES = 200_000
 LOCAL_MCP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 TRUTHY = frozenset({"1", "true", "yes", "on"})
+# The provenance kind the Linear syncer's per-issue documents resolve to
+# (kb.search_format.parse_content_header). citadel_linear_search scopes to it.
+LINEAR_ISSUE_SOURCE = "linear-issue"
 AUDIT_VIEWS = frozenset({"all", "mcp", "access", "failures"})
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
 # tools/list must never block the hosted event loop on a nested self-HTTP call
@@ -133,6 +136,20 @@ class CitadelMcpError(RuntimeError):
         # Lets tools/list tell "the node rejected this token" (401) from
         # "the node could not be asked" without parsing the message (#171).
         self.status_code = status_code
+
+
+class CitadelMcpTimeout(CitadelMcpError):
+    """The budget expired before a response arrived.
+
+    Distinct from every other transport failure because it says nothing about
+    what the Node did: the request was written to the socket, so a write may
+    have landed, be landing, or never have been applied. A caller that treats
+    this as a failure retries and duplicates the write.
+    """
+
+    def __init__(self, message: str, *, timeout_s: float | None = None) -> None:
+        super().__init__(message)
+        self.timeout_s = timeout_s
 
 
 @dataclass(frozen=True)
@@ -707,6 +724,64 @@ def _validate_ingest_size(data: str) -> None:
 _INGEST_COGNIFY_TIMEOUT = 180.0
 
 
+def _ingest_cognify_timeout() -> float:
+    """Budget for one inline-cognify ingest, in seconds.
+
+    Overridable because the budget that decides what the caller sees is the
+    SMALLER of this one and the MCP client's own tool timeout. When the client
+    gives up first, the agent gets that client's opaque error and this tool
+    never runs its timeout path, so a deployment whose clients cut off earlier
+    than 180s should set this below their limit to keep the honest,
+    "outcome unconfirmed" answer reachable.
+    """
+    raw = os.getenv("CITADEL_MCP_INGEST_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _INGEST_COGNIFY_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _INGEST_COGNIFY_TIMEOUT
+    return value if value > 0 else _INGEST_COGNIFY_TIMEOUT
+
+
+def _unconfirmed_ingest(
+    data: str,
+    tags: list[str],
+    dataset: str | None,
+    timeout_s: float | None,
+) -> dict[str, Any]:
+    """What a caller may honestly conclude when the ingest budget expired.
+
+    Not an error: an error means "this did not happen", and that is precisely
+    what a timeout cannot establish. The note went out on the wire, so the two
+    live possibilities are "landed" and "still landing"; the caller is given
+    the fingerprint needed to tell which, and told not to retry until it has.
+    """
+    budget = f"{timeout_s:g}s" if timeout_s else "the configured budget"
+    first_line = " ".join(data.strip().splitlines()[0].split())[:120]
+    return {
+        "ok": False,
+        "accepted": None,
+        "write_state": "unknown",
+        "timed_out": True,
+        "timeout_s": timeout_s,
+        "code": "TIMEOUT",
+        "submitted": {
+            "first_line": first_line,
+            "tags": list(tags),
+            "dataset": dataset,
+        },
+        "message": (
+            f"No response from your Node within {budget}. The note was SUBMITTED and its "
+            "outcome is not confirmed — inline cognify can outlast the budget, and a write "
+            "that timed out has been observed to land anyway. Do not re-ingest yet: a retry "
+            "duplicates a note that succeeded. Confirm first with citadel_recent_contributions "
+            "(mine=true), or citadel_search for a distinctive phrase from the note; re-ingest "
+            "only if neither finds it."
+        ),
+    }
+
+
 class CitadelHttpClient:
     def __init__(
         self,
@@ -811,7 +886,34 @@ class CitadelHttpClient:
             raise CitadelMcpError(
                 f"Citadel returned HTTP {exc.code}: {detail}", status_code=exc.code
             ) from exc
+        except TimeoutError as exc:
+            # A read timeout escapes urlopen unwrapped (only the connect phase
+            # is turned into URLError), so this used to leave the tool as a
+            # bare TimeoutError — "The operation timed out." with no statement
+            # about the request's fate. Name it so callers can tell an expired
+            # budget from a refused or unreachable Node.
+            logger.warning(
+                "Citadel API call %s %s exceeded its %.0fs budget",
+                method,
+                path,
+                effective_timeout,
+            )
+            raise CitadelMcpTimeout(
+                f"No response from Citadel within {effective_timeout:g}s.",
+                timeout_s=effective_timeout,
+            ) from exc
         except URLError as exc:
+            if isinstance(exc.reason, TimeoutError) or "timed out" in str(exc.reason).lower():
+                logger.warning(
+                    "Citadel API call %s %s exceeded its %.0fs budget",
+                    method,
+                    path,
+                    effective_timeout,
+                )
+                raise CitadelMcpTimeout(
+                    f"No response from Citadel within {effective_timeout:g}s.",
+                    timeout_s=effective_timeout,
+                ) from exc
             reason = redact_secrets(str(exc.reason), self.access_token)
             logger.error(
                 "Citadel API call %s %s failed: %s: %s",
@@ -1073,19 +1175,50 @@ def create_mcp_server(
         ctx: Context,
         top_k: int = 10,
     ) -> dict[str, Any]:
-        """Search org-wide Linear issues synced to shared Central."""
-        return await _call_async(
-            "citadel_linear_search",
-            lambda: resolve_client(ctx).post(
+        """Search org-wide Linear issues synced to shared Central.
+
+        Scoped server-side to hits the Linear syncer wrote (`source=linear-issue`),
+        so a repo document that merely discusses Linear is not returned. The scope
+        is read from the issue header at the start of the document, which is body
+        text and therefore author-influenced: it selects what to search, it
+        attests nothing. The `filtering` block in the response reports how many
+        candidates the scope kept. The Linear workspace DIGEST carries no
+        per-issue header and is excluded; use citadel_search for it.
+        """
+        def search_linear() -> dict[str, Any]:
+            payload = resolve_client(ctx).post(
                 "/search",
                 {
                     "query": _require_non_empty(query, "query"),
                     "dataset": "masumi-network",
                     "top_k": _clamp_top_k(top_k),
+                    # Dataset alone is not a scope: shared Central holds every
+                    # synced source, so an unfiltered search here answered a
+                    # Linear question with another repo's documentation.
+                    "source": LINEAR_ISSUE_SOURCE,
                 },
                 tool_name="citadel_linear_search",
-            ),
-        )
+            )
+            # Asking for the scope is not getting it: a Node older than this
+            # tool drops the unknown field (pydantic ignores extras) and answers
+            # with an unscoped page. Report the scope the Node confirms applying,
+            # never the one the request asked for.
+            filtering = payload.get("filtering") if isinstance(payload, dict) else None
+            applied = filtering.get("applied") if isinstance(filtering, dict) else None
+            confirmed = (
+                isinstance(applied, dict) and applied.get("source") == LINEAR_ISSUE_SOURCE
+            )
+            scoped: dict[str, Any] = {**payload, "scope_applied": confirmed}
+            if not confirmed:
+                warnings = [w for w in (payload.get("warnings") or []) if w]
+                warnings.append(
+                    "This Node did not confirm the linear-issue scope, so these results "
+                    "are NOT Linear-only — treat them as a general Central search."
+                )
+                scoped["warnings"] = warnings
+            return scoped
+
+        return await _call_async("citadel_linear_search", search_linear)
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_ingest"].annotations)
     async def citadel_ingest(
@@ -1116,18 +1249,30 @@ def create_mcp_server(
         def post_ingest() -> dict[str, Any]:
             normalized_data = _require_non_empty(data, "data")
             _validate_ingest_size(normalized_data)
-            return resolve_client(ctx).post(
-                "/ingest",
-                {
-                    "data": normalized_data,
-                    "dataset": dataset,
-                    "tags": tags or [],
-                    "session_id": session_id,
-                    "cognify": cognify,
-                },
-                tool_name="citadel_ingest",
-                timeout=_INGEST_COGNIFY_TIMEOUT if cognify else None,
-            )
+            try:
+                return resolve_client(ctx).post(
+                    "/ingest",
+                    {
+                        "data": normalized_data,
+                        "dataset": dataset,
+                        "tags": tags or [],
+                        "session_id": session_id,
+                        "cognify": cognify,
+                    },
+                    tool_name="citadel_ingest",
+                    timeout=_ingest_cognify_timeout() if cognify else None,
+                )
+            except CitadelMcpTimeout as exc:
+                # An expired budget proves only that no response arrived. The
+                # request was already on the wire, and a note whose ingest
+                # "failed" this way was afterwards retrievable by id with a
+                # matching body and tags — so raising here taught agents to
+                # retry a write that had landed, duplicating it. Report what is
+                # known instead: submitted, outcome unconfirmed, here is how to
+                # settle it.
+                return _unconfirmed_ingest(
+                    normalized_data, tags or [], dataset, exc.timeout_s
+                )
 
         return await _call_async(
             "citadel_ingest",

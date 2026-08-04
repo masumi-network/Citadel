@@ -254,6 +254,84 @@ def test_filter_hits_path_substring() -> None:
     assert "MIP-003" in (filtered[0]["path"] or "")
 
 
+def test_filter_hits_source_scopes_to_the_syncer_that_wrote_the_hit() -> None:
+    """``source=`` selects what a hit IS, not what its body talks about.
+
+    Measured on production: citadel_linear_search for a Linear-shaped query
+    returned four copies of a repo's ``docs/agents/issue-tracker.md`` above the
+    one real Linear issue, because the tool ran the general vault search with
+    no source filter. Both texts below are production shapes.
+    """
+    repo_doc_about_linear = {
+        "id": "repo-1",
+        "chunk_index": 0,
+        "text": (
+            "# masumi-network/sokosumi/docs/agents/issue-tracker.md\n"
+            "\n"
+            "Repository: masumi-network/sokosumi\n"
+            "Source: https://github.com/masumi-network/sokosumi/blob/1e03b94/docs/agents/issue-tracker.md\n"
+            "Commit: 1e03b94\n"
+            "Blob: 354a0ab\n"
+            "\n"
+            "---\n"
+            "\n"
+            "# Issue tracker: Linear\n"
+            "\n"
+            "Issues and PRDs for this repo live in **Linear**, team **Sokosumi**.\n"
+        ),
+    }
+    linear_issue = {
+        "id": "issue-1",
+        "chunk_index": 0,
+        "text": (
+            "# Linear DES-144: Subscription Credits missing\n"
+            "\n"
+            "- **State:** Backlog (backlog)\n"
+            "- **Team:** Design\n"
+            "- **URL:** https://linear.app/masumi/issue/DES-144/subscription-credits-missing\n"
+        ),
+    }
+
+    filtered = filter_hits([repo_doc_about_linear, linear_issue], source="linear-issue")
+
+    assert [hit["id"] for hit in filtered] == ["issue-1"]
+
+
+def test_filter_hits_source_reads_the_server_provenance_envelope() -> None:
+    """The server already resolved provenance; the filter reads it, never re-guesses."""
+    hits = [
+        {
+            "id": "repo-1",
+            "text": "prose that names Linear a lot",
+            "_citadel": {"provenance": {"source": "repo-content", "basis": "content-header"}},
+        },
+        {
+            "id": "issue-1",
+            "text": "body without a parseable header of its own",
+            "_citadel": {
+                "provenance": {
+                    "source": "linear-issue",
+                    "issue": "DES-144",
+                    "basis": "content-header",
+                }
+            },
+        },
+    ]
+
+    assert [hit["id"] for hit in filter_hits(hits, source="linear-issue")] == ["issue-1"]
+
+
+def test_filter_hits_source_refuses_a_forged_header_on_a_later_chunk() -> None:
+    """Chunk 1+ starts are author-controlled text, so a header there is forgeable."""
+    forged = {
+        "id": "forged",
+        "chunk_index": 3,
+        "text": "# Linear DES-999: not really an issue\n\n- **Team:** Design\n",
+    }
+
+    assert filter_hits([forged], source="linear-issue") == []
+
+
 def test_filter_hits_reads_server_citadel_envelope() -> None:
     hits = [
         {

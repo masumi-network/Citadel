@@ -830,11 +830,33 @@ def _hit_path_identity(hit: dict[str, Any]) -> str | None:
     return header.get("path") or header.get("title")
 
 
+def _hit_source_identity(hit: dict[str, Any]) -> str | None:
+    """WHICH syncer wrote this hit — from the server envelope or the header.
+
+    The kind of source a hit IS, not what its body discusses: a repository's
+    ``docs/agents/issue-tracker.md`` is about Linear on every line and is still
+    repo content. Prefer the server's resolved provenance, fall back to parsing
+    the structural header the syncer wrote (start of chunk 0 only, so a quoted
+    or mid-document header cannot claim another source's identity).
+
+    Header-derived, therefore author-controlled: this scopes a search, it does
+    not attest anything, and it must never feed ``trust_tier``.
+    """
+    provenance = _hit_provenance(hit)
+    source = _first_str(provenance.get("source"), hit.get("source"), hit.get("source_type"))
+    if source:
+        return source.strip().lower()
+    header = parse_content_header(_hit_raw_text(hit), chunk_index=_hit_chunk_index(hit))
+    kind = header.get("kind")
+    return kind.strip().lower() if isinstance(kind, str) and kind.strip() else None
+
+
 def compact_search_filters(
     *,
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
     mode: str | None = None,
@@ -852,6 +874,8 @@ def compact_search_filters(
         filters["repo"] = repo.strip()
     if isinstance(path, str) and path.strip():
         filters["path"] = path.strip()
+    if isinstance(source, str) and source.strip():
+        filters["source"] = source.strip()
     if canonical_only:
         filters["canonical_only"] = True
     if exclude_ambient:
@@ -873,10 +897,17 @@ def filter_hits(
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
 ) -> list[dict[str, Any]]:
     filtered = hits
+    if source:
+        # Fail-closed, like repo=: a hit that cannot state which source it came
+        # from does not satisfy a source filter. A tool that promises one
+        # source must return nothing rather than something else.
+        wanted_source = source.strip().lower()
+        filtered = [h for h in filtered if _hit_source_identity(h) == wanted_source]
     if types:
         wanted = {t.strip().lower() for t in types if t.strip()}
         filtered = [h for h in filtered if _hit_doc_type(h) in wanted]
