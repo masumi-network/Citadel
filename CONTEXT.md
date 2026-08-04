@@ -53,7 +53,7 @@ A licensed team member slot; equals one **Principal** (one human, one seat). Cre
 _Avoid_: user account, shared login, license bundle
 
 **Node**:
-A seat's private mini knowledge base; logically isolated storage for that seat's agent memory. **Nodes** do not collide; seats cannot read each other's **Nodes**.
+A seat's mini knowledge base; logically isolated storage for that seat's agent memory. **Nodes** do not collide. Seats are *not intended* to read each other's **Nodes**, though that is intent rather than an enforced property: the read boundary is not fully enforced today (ADR-0020), and ADR-0021 proposes removing it deliberately for `org-work` content while keeping `personal`-tagged capture roots private. Writes never cross **Nodes** under any of these readings (ADR-0007), and that boundary does hold.
 _Avoid_: organization vault, central, shared memory
 
 **Central**:
@@ -65,7 +65,7 @@ The org-visible operational footprint of a **Seat**: it exists, its activity lev
 _Avoid_: activity feed, people report, session list, surveillance
 
 **Session Trace**:
-A structured record of how a **Seat**'s agent session approached a problem: the task, the approaches tried, which of them were dead ends, and the files touched. Not the conversation itself — a distilled, typed record of the route taken. Light-tier **Node** content, private to its **Seat** by default.
+A structured record of how a **Seat**'s agent session approached a problem: the task, the approaches tried, which of them were dead ends, and the files touched. Not the conversation itself — a distilled, typed record of the route taken. Light-tier **Node** content, intended to be private to its **Seat** by default, subject to the enforcement caveat on **Node**.
 _Avoid_: transcript, chat log, conversation history, raw session
 
 **Shared Session Trace**:
@@ -204,7 +204,7 @@ _Avoid_: approval status, promotion gate, workflow stage, review state
 - When **Promotion** detects a **New Org Project**, it must obtain **Promotion Approval** (dashboard, MCP with user confirm, or CLI) before syncing to **Central**; **Vault Members** respond to agent-proposed queue items — they do not add items manually.
 - **CLI** (`citadel onboard`, `setup`, `capture`, `status`) handles setup and Node capture over HTTP; **MCP** handles in-session search, deliberate ingest, and promotion approve/reject — hooks do not use MCP.
 - Integration sources (e.g. Linear) sync org-wide into **Central**; **Seat-Scoped Mirrors** copy assignee-relevant subsets into each seat's **Node** (e.g. John's assigned Linear issues appear in John's **Node** and in **Central**).
-- A **Session Trace** is private to its **Seat**'s **Node** by default; a **Shared Session Trace** is a volunteered copy in `session-traces` readable by every **Seat** via **`citadel_search`**, never **Central** and never another seat's **Node**.
+- A **Session Trace** is intended to be private to its **Seat**'s **Node** by default (see the enforcement caveat on **Node**); a **Shared Session Trace** is a volunteered copy in `session-traces` readable by every **Seat** via **`citadel_search`**, never **Central** and never another seat's **Node**.
 - **Shared Session Traces** do not become **Structured Knowledge** and do not feed the daily improve loop; **Central** stays curated org truth.
 
 ## Autonomous sync (Phase 2)
