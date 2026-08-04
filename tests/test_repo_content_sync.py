@@ -1401,3 +1401,196 @@ async def test_a_second_overlapping_run_is_refused_instead_of_losing_state(
     again = await second.run()
     assert again.get("skipped") is None
     assert again["files_skipped"] == 2
+
+
+# --------------------------------------------------------------------------
+# A refusal the content itself caused is terminal until the content changes.
+# --------------------------------------------------------------------------
+
+
+class RefusingLearningProcess(FakeLearningProcess):
+    """Refuses every document with a fixed reason, like the real ingest guards."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__()
+        self.reason = reason
+
+    async def learn(self, data: str, **kwargs: Any) -> Any:
+        self.calls.append({"data": data, **kwargs})
+        rejection = IngestResult(False, self.reason, kwargs.get("dataset", "x"), ())
+
+        class Outcome:
+            ingest = rejection
+            chunk_ingests = ()
+            improve = None
+
+            @property
+            def all_ingests(self) -> tuple[IngestResult, ...]:
+                return (self.ingest,)
+
+            @property
+            def improved(self) -> bool:
+                return False
+
+        return Outcome()
+
+
+def _refusal_config(state_path: Path) -> CitadelConfig:
+    return CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_records_the_reason_the_ingest_actually_gave(
+    tmp_path: Path,
+) -> None:
+    """``ingest_rejected`` is not a reason, it is a category.
+
+    Reading ``{"ingest_rejected": 2}`` in a sync report cannot tell anyone whether
+    a human has to look at a file (``unchunkable_content``) or whether the same
+    bytes were simply already in flight (``duplicate_in_process``).
+    """
+    state_path = tmp_path / "state.json"
+    config = _refusal_config(state_path)
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=RefusingLearningProcess("unchunkable_content"),  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+
+    assert result["files_ingested"] == 0
+    assert result["files_skipped_by_reason"] == {"ingest_rejected:unchunkable_content": 2}
+
+
+@pytest.mark.asyncio
+async def test_content_the_ingest_can_never_accept_is_not_resubmitted_every_sync(
+    tmp_path: Path,
+) -> None:
+    """The refusal branch used to record nothing in ``tracked``.
+
+    ``unchunkable_content`` is a function of the bytes, so re-submitting the same
+    bytes buys a second identical refusal. The cost is not the refusal: reaching
+    it spends a ``fetch_file_text`` and a ``fetch_last_commit_sha`` per file per
+    pass, on a scheduler that runs about every 1h45m, forever.
+    """
+    state_path = tmp_path / "state.json"
+    config = _refusal_config(state_path)
+    learning = RefusingLearningProcess("unchunkable_content")
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    await syncer.run()
+    assert len(learning.calls) == 2
+
+    second = await syncer.run()
+
+    assert len(learning.calls) == 2, "the same bytes were submitted for a second refusal"
+    assert second["files_skipped_by_reason"] == {
+        "refused_unchanged:unchunkable_content": 2
+    }
+    entry = json.loads(state_path.read_text(encoding="utf-8"))["files"][
+        "masumi-network/sokosumi-cli/README.md"
+    ]
+    assert entry["rejected_reason"] == "unchunkable_content"
+    assert entry["sha"] and entry["content_hash"]
+    assert not entry.get("cognee_data_ids"), "a refused file must not look ingested"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_is_not_about_the_content_is_retried(
+    tmp_path: Path,
+) -> None:
+    """``duplicate_in_process`` is scoped to one process, so it must not stick.
+
+    ``Citadel._seen_ingest_keys`` is per-process state. Recording it as terminal
+    would let one restart's bookkeeping suppress a file for every later run.
+    """
+    state_path = tmp_path / "state.json"
+    config = _refusal_config(state_path)
+    learning = RefusingLearningProcess("duplicate_in_process")
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    await syncer.run()
+    second = await syncer.run()
+
+    assert len(learning.calls) == 4, "a process-scoped refusal was made permanent"
+    assert second["files_skipped_by_reason"] == {
+        "ingest_rejected:duplicate_in_process": 2
+    }
+
+
+@pytest.mark.asyncio
+async def test_raising_the_chunk_budget_retries_what_the_old_budget_refused(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The budget is an observation, and the knob to change it has to do something.
+
+    ``kb.chunk_window`` says out loud to raise CITADEL_CHUNK_BUDGET_TOKENS when the
+    detector reports a content class its sweep did not contain. A terminal skip
+    that ignored the budget would make that raise a no-op for every file the old
+    budget had already refused, which is a guard shipping inert.
+    """
+    state_path = tmp_path / "state.json"
+    config = _refusal_config(state_path)
+    learning = RefusingLearningProcess("unchunkable_content")
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setenv("CITADEL_CHUNK_BUDGET_TOKENS", "256")
+    await syncer.run()
+    assert len(learning.calls) == 2
+
+    monkeypatch.setenv("CITADEL_CHUNK_BUDGET_TOKENS", "512")
+    await syncer.run()
+
+    assert len(learning.calls) == 4, "the raised budget never retried the refused files"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_file_is_not_counted_as_a_tracked_file(tmp_path: Path) -> None:
+    """``tracked_files`` is read as how much of the corpus this connector holds.
+
+    Refusal entries live in the same ``files`` map as ingested ones, so counting
+    the map would report a file as tracked precisely because it is absent from
+    the index. They are reported, but under their own name.
+    """
+    state_path = tmp_path / "state.json"
+    config = _refusal_config(state_path)
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=RefusingLearningProcess("unchunkable_content"),  # type: ignore[arg-type]
+    )
+
+    await syncer.run()
+    status = await syncer.status()
+
+    assert status["tracked_files"] == 0, "a refused file is not in the index"
+    assert status["refused_files"] == 2

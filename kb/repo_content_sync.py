@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from kb import chunk_window
 from kb.github_sync import GitHubAPIError, GitHubOrgClient, utc_now
 from kb.learning import LearningProcess
 from kb.security_scan import SecurityScanEntry, scan_text_entries
@@ -42,6 +43,19 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 STATE_VERSION = 1
+
+# Rejection reasons that are a function of the bytes we sent, so re-sending the
+# same bytes buys nothing but an identical second refusal. ``empty``,
+# ``excluded_path`` and ``too_short`` come from ``PreIngestFilter.check``;
+# ``unchunkable_content`` from ``Citadel._guard_chunkable``.
+#
+# ``duplicate_in_process`` is deliberately absent. It is decided against
+# ``Citadel._seen_ingest_keys``, which lives and dies with the process, so
+# treating it as terminal would let one restart's bookkeeping suppress a file
+# for every later run.
+TERMINAL_INGEST_REJECTIONS = frozenset(
+    {"empty", "excluded_path", "too_short", "unchunkable_content"}
+)
 
 # One lock per state file, NOT per syncer instance. ``get_repo_content_syncer``
 # in kb.server builds a fresh ``RepoContentSyncer`` on every call (app.state
@@ -579,6 +593,13 @@ class RepoContentSyncer:
             state = {}
             state_error = str(exc)
         files = state.get("files") if isinstance(state.get("files"), dict) else {}
+        # A refusal is recorded in the same map, so counting the map would report
+        # a file as tracked for the exact reason it is missing from the index.
+        refused = {
+            key
+            for key, entry in files.items()
+            if isinstance(entry, dict) and entry.get("rejected_reason")
+        }
         # Off the loop for the same reason as in ``run``: with autojoin on this
         # is up to 1 + max_repos * len(markers) synchronous urllib round trips,
         # and GET /api/repo-content-sync is served from the web process's single
@@ -612,7 +633,8 @@ class RepoContentSyncer:
             "max_bytes_per_file": self.config.repo_content_sync_max_bytes_per_file,
             "run_improve": self.config.repo_content_sync_run_improve,
             "last_checked_at": state.get("last_checked_at"),
-            "tracked_files": len(files),
+            "tracked_files": len(files) - len(refused),
+            "refused_files": len(refused),
             "state_path": str(self.state_path),
         }
 
@@ -816,6 +838,31 @@ class RepoContentSyncer:
                         _record_skip(repo_result, "unchanged")
                         continue
 
+                    # The same bytes were already refused for a reason the bytes
+                    # themselves cause, so submitting them again produces the
+                    # same refusal. Checked here rather than after the ingest so
+                    # the pass also skips the pin lookup, which is a second
+                    # GitHub round trip per file.
+                    #
+                    # Three things clear it, all of them ordinary: the file
+                    # changing (sha or content_hash), an operator raising or
+                    # lowering the chunk budget, and --force. The budget is
+                    # compared for every terminal reason, not only the one that
+                    # reads it, because retrying a handful of files after a
+                    # deliberate budget change costs one pass and being wrong in
+                    # the other direction is silent.
+                    refused_reason = previous.get("rejected_reason")
+                    if (
+                        not force
+                        and refused_reason
+                        and previous.get("sha") == file.sha
+                        and previous.get("content_hash") == file.content_hash
+                        and previous.get("rejected_at_budget")
+                        == chunk_window.resolve_chunk_budget()
+                    ):
+                        _record_skip(repo_result, f"refused_unchanged:{refused_reason}")
+                        continue
+
                     scan = scan_text_entries(
                         [
                             SecurityScanEntry(
@@ -936,7 +983,39 @@ class RepoContentSyncer:
                         # must be able to resume, not restart.
                         _checkpoint(tracked)
                     else:
-                        _record_skip(repo_result, "ingest_rejected")
+                        # "ingest_rejected" is a category, not a reason. Reading
+                        # it in a sync report cannot tell anyone whether a human
+                        # has to look at the file or whether the same bytes were
+                        # merely already in flight, so carry what ingest said.
+                        reasons = sorted(
+                            {result.reason for result in outcome.all_ingests}
+                        )
+                        reason = reasons[0] if len(reasons) == 1 else "+".join(reasons)
+                        if reasons and all(
+                            value in TERMINAL_INGEST_REJECTIONS for value in reasons
+                        ):
+                            # Record it so the next pass does not pay a
+                            # fetch_file_text and a fetch_last_commit_sha to
+                            # reach the identical refusal, on a scheduler that
+                            # runs about every 1h45m, forever. NOT written with
+                            # cognee_data_ids: nothing may mistake a refused
+                            # file for an indexed one.
+                            tracked[key] = {
+                                "sha": file.sha,
+                                "content_hash": file.content_hash,
+                                "rejected_reason": reason,
+                                "rejected_at": checked_at,
+                                # unchunkable_content is decided against a budget
+                                # that kb.chunk_window documents as an observation
+                                # an operator may raise. Storing the budget in
+                                # force means raising it retries these files on
+                                # the next ordinary pass instead of needing
+                                # --force, which is the difference between a knob
+                                # and a knob that does nothing.
+                                "rejected_at_budget": chunk_window.resolve_chunk_budget(),
+                            }
+                            _checkpoint(tracked)
+                        _record_skip(repo_result, f"ingest_rejected:{reason}")
             except GitHubAPIError as exc:
                 repo_result["errors"].append({"error": str(exc)[:240]})
             repo_results.append(repo_result)
