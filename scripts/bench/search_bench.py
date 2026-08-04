@@ -85,6 +85,65 @@ MIN_SHARED_SHINGLES = 3
 
 UNCONVERTED_KEY = "answer_spans_unconverted_reason"
 
+# --------------------------------------------------------------------------
+# Embedding-window pairs (v5)
+# --------------------------------------------------------------------------
+# A pair quotes ONE document twice: once from inside the first HEAD_WINDOW_CHARS
+# characters, once from at least TAIL_MIN_DEPTH through it. Both quotes are
+# verbatim and unique across every cached body, so exactly one document can
+# answer either. The pair is a controlled comparison: same document, same corpus,
+# same query shape, only the position of the quoted text changes.
+#
+# The control that makes a failing tail mean something: a tail quote qualifies
+# only when at least TAIL_MIN_NOVEL_TERMS of its distinctive terms are ABSENT
+# from the document head. Without that rule a tail could be answered by the head
+# embedding alone, and a pass would prove nothing about how much of the document
+# is reachable.
+#
+# These questions are scored in their own block and are EXCLUDED from
+# answer_recall_at_5 so the existing headline stays comparable with baselines
+# taken before v5.
+WINDOW_HEAD_CATEGORY = "window_head"
+WINDOW_TAIL_CATEGORY = "window_tail"
+WINDOW_CATEGORIES = frozenset({WINDOW_HEAD_CATEGORY, WINDOW_TAIL_CATEGORY})
+HEAD_WINDOW_CHARS = 2000
+TAIL_MIN_DEPTH = 0.40
+TAIL_MIN_NOVEL_TERMS = 3
+NOVEL_TERM_RE = re.compile(r"[a-z][a-z0-9]{3,}")
+NOVEL_TERM_STOPWORDS = frozenset(
+    "the a an and or of to in for is are be it this that with as on by from at "
+    "not you your we they if then than so but can will each any all when what "
+    "which who how why into out up down over under only same other more most "
+    "some such no nor too very just also its per".split()
+)
+
+
+def is_window_question(question: dict[str, Any]) -> bool:
+    return str(question.get("category", "")) in WINDOW_CATEGORIES
+
+
+def distinctive_terms(text: str) -> set[str]:
+    """Lowercase content words used for the head/tail novelty control."""
+    return {
+        word
+        for word in NOVEL_TERM_RE.findall(text.lower())
+        if word not in NOVEL_TERM_STOPWORDS
+    }
+
+
+def questions_pin(questions: list[dict[str, Any]]) -> str:
+    """sha256 over the canonical question list.
+
+    The pin is what makes the set FROZEN. Any edit to any question changes it,
+    so re-freezing is a deliberate act (update the pin, bump the version) rather
+    than a silent drift that would make two runs answer different questions
+    while both called themselves the baseline.
+    """
+    canonical = json.dumps(
+        questions, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
 
 class BenchError(RuntimeError):
     """A configuration or honesty violation that must stop the run."""
@@ -339,6 +398,45 @@ def resolve_probe_patterns(
 # --------------------------------------------------------------------------
 
 
+def hit_term_coverage(hit: dict[str, Any]) -> float | None:
+    """The node's OWN reported share of query terms this hit matched.
+
+    Read rather than recomputed on purpose: ranking is the node's decision, so
+    the inversion metric has to be expressed in the node's own units. A number
+    the harness derived itself would only prove the harness and the node
+    disagree about tokenization.
+    """
+    citadel = hit.get("_citadel")
+    if not isinstance(citadel, dict):
+        return None
+    relevance = citadel.get("relevance")
+    if not isinstance(relevance, dict):
+        return None
+    coverage = relevance.get("term_coverage")
+    return float(coverage) if isinstance(coverage, (int, float)) else None
+
+
+def trust_observations(hits: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """(result_id, content_sha256, trust_tier) for every hit that carries all three.
+
+    Free byproduct of a run: the same chunk is served across many questions, so
+    disagreement between two observations of the SAME id at the SAME content
+    hash is per-request metadata instability, caught without a single extra
+    query.
+    """
+    out: list[tuple[str, str, str]] = []
+    for hit in hits:
+        citadel = hit.get("_citadel")
+        if not isinstance(citadel, dict):
+            continue
+        result_id = citadel.get("result_id") or hit.get("id")
+        sha = citadel.get("content_sha256")
+        tier = citadel.get("trust_tier")
+        if isinstance(result_id, str) and isinstance(sha, str) and isinstance(tier, str):
+            out.append((result_id, sha, tier))
+    return out
+
+
 def score_question(
     question: dict[str, Any],
     hits: list[dict[str, Any]],
@@ -364,6 +462,37 @@ def score_question(
             body = normalize(split_header_body(hit_text(hit))[1])
             if any(span in body for span in spans):
                 raw_page_pass = True
+                break
+
+    # ---- Ranking, measured separately from retrieval -----------------------
+    # Retrieval asks whether the answering document came back at all. Ranking
+    # asks whether the node put it in the right place. They are different
+    # questions and a single recall number silently blends them, so the answer
+    # slot is anchored to a BODY span match (header stripped) and then compared
+    # against the node's own term_coverage for everything served above it.
+    #
+    # An inversion is: some hit ranked ABOVE the one that verifiably contains
+    # the answer, while the node itself reports that hit matched a STRICTLY
+    # SMALLER share of the query terms. That cannot be produced by a path-header
+    # match, because the header contributes to coverage identically for every
+    # hit on the page.
+    answer_slot: int | None = None
+    answer_coverage: float | None = None
+    outranked_by_coverage: float | None = None
+    outranked_by_slot: int | None = None
+    if spans:
+        for slot, hit in enumerate(hits, start=1):
+            body = normalize(split_header_body(hit_text(hit))[1])
+            if any(span in body for span in spans):
+                answer_slot = slot
+                answer_coverage = hit_term_coverage(hit)
+                break
+    if answer_slot is not None and answer_coverage is not None:
+        for slot, hit in enumerate(hits[: answer_slot - 1], start=1):
+            coverage = hit_term_coverage(hit)
+            if coverage is not None and coverage < answer_coverage:
+                outranked_by_coverage = coverage
+                outranked_by_slot = slot
                 break
 
     doc_rank: int | None = None
@@ -452,6 +581,14 @@ def score_question(
         "answer_rank": answer_rank,
         "answer_pass_at_5": answer_rank is not None and answer_rank <= K_ANSWER,
         "raw_page_pass_at_5": raw_page_pass,
+        "window_role": question.get("window_role"),
+        "window_pair": question.get("window_pair"),
+        "depth_fraction": question.get("depth_fraction"),
+        "answer_slot": answer_slot,
+        "answer_term_coverage": answer_coverage,
+        "outranked_by_coverage": outranked_by_coverage,
+        "outranked_by_slot": outranked_by_slot,
+        "trust_observations": trust_observations(hits),
         "doc_rank": doc_rank,
         "doc_pass_at_5": doc_rank is not None and doc_rank <= K_ANSWER,
         "legacy_rank": legacy_rank(hits, expected, gt_shingles),
@@ -489,7 +626,15 @@ def attempt_outcome(row: dict[str, Any]) -> bool:
 def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, Any]:
     positives = [row for row in rows if row["expected_recall"] == 1]
     probes = [row for row in rows if row["expected_recall"] == 0]
-    span_rows = [row for row in positives if row["has_spans"]]
+    window_rows = [row for row in positives if row.get("window_role") in ("head", "tail")]
+    # Window pairs are deliberately kept OUT of the headline. They were added in
+    # questions v5 and they fail by design against current behaviour; folding
+    # them in would move answer_recall_at_5 for a reason that has nothing to do
+    # with the node changing, and every baseline taken before v5 would stop
+    # being comparable.
+    span_rows = [
+        row for row in positives if row["has_spans"] and row.get("window_role") is None
+    ]
     if not probes:
         raise BenchError(
             "The blocked-probe/negatives list is empty (no expected_recall=0 "
@@ -538,6 +683,53 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
     )
     negative_hits = sum(1 for row in probes if row["doc_rank"] is not None)
 
+    # ---- Embedding window --------------------------------------------------
+    heads = [row for row in window_rows if row["window_role"] == "head"]
+    tails = [row for row in window_rows if row["window_role"] == "tail"]
+    head_recall = rate(heads, "answer_pass_at_5") if heads else None
+    tail_recall = rate(tails, "answer_pass_at_5") if tails else None
+    # Only pairs whose BOTH sides ran contribute to the penalty, so the figure
+    # is a within-document difference and never a comparison across two
+    # different document populations.
+    head_by_pair = {row["window_pair"]: row for row in heads}
+    tail_by_pair = {row["window_pair"]: row for row in tails}
+    complete_pairs = sorted(set(head_by_pair) & set(tail_by_pair))
+    head_only_pass = sum(
+        1
+        for pair in complete_pairs
+        if head_by_pair[pair]["answer_pass_at_5"] and not tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    both_pass = sum(
+        1
+        for pair in complete_pairs
+        if head_by_pair[pair]["answer_pass_at_5"] and tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    neither_pass = sum(
+        1
+        for pair in complete_pairs
+        if not head_by_pair[pair]["answer_pass_at_5"]
+        and not tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    tail_only_pass = len(complete_pairs) - head_only_pass - both_pass - neither_pass
+
+    # ---- Ranking, separate from retrieval ----------------------------------
+    ranked = [
+        row
+        for row in positives
+        if row["answer_slot"] is not None and row["answer_term_coverage"] is not None
+    ]
+    inverted = [row for row in ranked if row["outranked_by_coverage"] is not None]
+    zero_coverage_inversions = sum(
+        1 for row in inverted if row["outranked_by_coverage"] == 0.0
+    )
+
+    # ---- Per-request metadata stability ------------------------------------
+    tiers_seen: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        for result_id, sha, tier in row.get("trust_observations") or []:
+            tiers_seen.setdefault((result_id, sha), set()).add(tier)
+    unstable = {key: sorted(v) for key, v in tiers_seen.items() if len(v) > 1}
+
     return {
         "quality": {
             "answer_recall_at_5": round(rate(span_rows, "answer_pass_at_5"), 4),
@@ -568,6 +760,37 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             ),
             "hits_with_unresolvable_source": unresolvable_hits,
         },
+        "window": {
+            "head_recall_at_5": round(head_recall, 4) if head_recall is not None else None,
+            "tail_recall_at_5": round(tail_recall, 4) if tail_recall is not None else None,
+            "window_penalty": (
+                round(head_recall - tail_recall, 4)
+                if head_recall is not None and tail_recall is not None
+                else None
+            ),
+            "pairs_complete": len(complete_pairs),
+            "pairs_head_only": head_only_pass,
+            "pairs_both": both_pass,
+            "pairs_neither": neither_pass,
+            "pairs_tail_only": tail_only_pass,
+            "documents": len({row["window_pair"] for row in window_rows}),
+        },
+        "ranking": {
+            "answers_ranked": len(ranked),
+            "rank_inversion_rate": (
+                round(len(inverted) / len(ranked), 4) if ranked else None
+            ),
+            "inversions_by_zero_coverage": zero_coverage_inversions,
+            "answer_worst_slot": max((row["answer_slot"] for row in ranked), default=None),
+        },
+        "metadata_stability": {
+            "chunks_observed": len(tiers_seen),
+            "chunks_with_unstable_trust_tier": len(unstable),
+            "unstable_examples": [
+                {"result_id": key[0], "content_sha256": key[1], "tiers": value}
+                for key, value in sorted(unstable.items())[:5]
+            ],
+        },
         "stability": {
             "hit_stability": round(statistics.fmean(stability), 4) if stability else None,
         },
@@ -577,6 +800,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             "questions_with_spans": len(span_rows),
             "questions_excluded_from_answer_recall": len(positives) - len(span_rows),
             "questions_blocked_probe": len(probes),
+            "questions_window": len(window_rows),
         },
     }
 
@@ -1059,7 +1283,14 @@ def lint_questions(
                         f"{label}: appears in the first line of {repo_path} "
                         "(head-of-document credit, not an answer)"
                     )
-            if norm_span in normalize(question.get("question", "")):
+            # A window question IS its own quote: the query is the verbatim
+            # sentence, which is the strongest retrieval signal that exists. If
+            # that fails, retrieval failed. Every other question keeps the rule,
+            # because there the span appearing in the query would hand the
+            # scorer the answer.
+            if norm_span in normalize(question.get("question", "")) and not is_window_question(
+                question
+            ):
                 problems.append(f"{label}: appears in the question text")
             for other, body in cached_norm.items():
                 if other in expected:
@@ -1068,7 +1299,101 @@ def lint_questions(
                     problems.append(
                         f"{label}: not unique, also present in cached body {other}"
                     )
+
+        if is_window_question(question):
+            problems.extend(_lint_window_question(question, cached_raw))
+
+    problems.extend(_lint_freeze_pin(data))
     return problems, notes
+
+
+def _lint_window_question(
+    question: dict[str, Any], cached_raw: dict[str, str]
+) -> list[str]:
+    """The contract that makes a window pair a controlled comparison.
+
+    Without these checks a failing tail is just a failing question. With them a
+    failing tail means: an exact, corpus-unique sentence, sitting past the depth
+    threshold, carrying terms the head does not have, did not retrieve the one
+    document that contains it.
+    """
+    qid = question.get("id", "?")
+    role = question.get("window_role")
+    problems: list[str] = []
+    if role not in ("head", "tail"):
+        return [f"{qid}: window question needs window_role of 'head' or 'tail'"]
+    if not question.get("window_pair"):
+        problems.append(f"{qid}: window question needs a window_pair id")
+
+    expected = list(question.get("expect_any") or [])
+    body = next((cached_raw[p] for p in expected if p in cached_raw), None)
+    if body is None:
+        problems.append(f"{qid}: no expect_any document is cached; cannot verify offset")
+        return problems
+
+    offset = question.get("source_offset_chars")
+    if not isinstance(offset, int):
+        problems.append(f"{qid}: window question needs an integer source_offset_chars")
+        return problems
+
+    quote = str(question.get("question", ""))
+    if body.find(quote.strip()) < 0:
+        problems.append(f"{qid}: the quote is not present verbatim in the cached body")
+
+    depth = offset / len(body) if body else 0.0
+    if role == "head":
+        if offset >= HEAD_WINDOW_CHARS:
+            problems.append(
+                f"{qid}: head quote sits at offset {offset}, outside the first "
+                f"{HEAD_WINDOW_CHARS} characters; it is not a head control"
+            )
+    else:
+        if depth < TAIL_MIN_DEPTH:
+            problems.append(
+                f"{qid}: tail quote sits at depth {depth:.2f}, above the "
+                f"{TAIL_MIN_DEPTH} threshold; too shallow to test the window"
+            )
+        novel = question.get("novel_terms_absent_from_head")
+        if not isinstance(novel, list) or len(novel) < TAIL_MIN_NOVEL_TERMS:
+            problems.append(
+                f"{qid}: tail quote needs at least {TAIL_MIN_NOVEL_TERMS} "
+                "novel_terms_absent_from_head; without them a pass could be the "
+                "head embedding answering the query"
+            )
+        else:
+            head_terms = distinctive_terms(body[:HEAD_WINDOW_CHARS])
+            leaked = sorted(set(map(str, novel)) & head_terms)
+            if leaked:
+                problems.append(
+                    f"{qid}: terms declared novel DO occur in the document head "
+                    f"({', '.join(leaked)}); the control is void"
+                )
+    return problems
+
+
+def _lint_freeze_pin(data: dict[str, Any]) -> list[str]:
+    """The fixtures are frozen or they are not. This is what enforces it."""
+    frozen = data.get("frozen")
+    if not isinstance(frozen, dict):
+        return [
+            "questions file has no `frozen` block; without a pin the set can "
+            "drift between two runs that both call themselves the baseline"
+        ]
+    pinned = frozen.get("questions_sha256")
+    actual = questions_pin(list(data.get("questions") or []))
+    if not pinned:
+        return [
+            "frozen.questions_sha256 is missing; set it to the current pin "
+            f"({actual}) to freeze this set"
+        ]
+    if pinned != actual:
+        return [
+            "FROZEN SET CHANGED: frozen.questions_sha256 is "
+            f"{pinned} but the questions hash to {actual}. A baseline taken "
+            "before this edit answered different questions. Bump `version`, "
+            "update the pin deliberately, and re-take the baseline."
+        ]
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -1227,6 +1552,33 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print("\n--- duplication ---")
     for key, value in summary["duplication"].items():
         print(f"{key:>28}: {value}")
+    window = summary.get("window") or {}
+    if window.get("pairs_complete"):
+        print("\n--- embedding window (same document, head quote vs tail quote) ---")
+        for key, value in window.items():
+            print(f"{key:>28}: {value}")
+        print(
+            f"{'reads as':>28}: a tail miss is an exact, corpus-unique sentence "
+            "failing to retrieve the one document containing it"
+        )
+    ranking = summary.get("ranking") or {}
+    if ranking.get("answers_ranked"):
+        print("\n--- ranking (separate question from retrieval) ---")
+        for key, value in ranking.items():
+            print(f"{key:>28}: {value}")
+        print(
+            f"{'reads as':>28}: share of answers the node ranked BELOW a hit it "
+            "itself scored as matching fewer query terms"
+        )
+    meta = summary.get("metadata_stability") or {}
+    if meta.get("chunks_observed"):
+        print("\n--- per-request metadata stability ---")
+        print(f"{'chunks_observed':>28}: {meta['chunks_observed']}")
+        print(
+            f"{'unstable_trust_tier':>28}: "
+            f"{meta.get('chunks_with_unstable_trust_tier')} "
+            "(same chunk id + same content_sha256, different trust_tier)"
+        )
     print("\n--- stability ---")
     for key, value in summary["stability"].items():
         print(f"{key:>28}: {value}")
@@ -1408,6 +1760,31 @@ METRIC_DEFINITIONS: dict[str, str] = {
         "a pass that the body scorer refuses; phantom credit measured so it "
         "can never silently re-enter recall"
     ),
+    "head_recall_at_5": (
+        "share of window pairs where a verbatim quote taken from the first "
+        f"{HEAD_WINDOW_CHARS} characters of a document retrieves that document "
+        "into the top 5 distinct identities; the quote is the whole query and "
+        "is unique across every cached body, so exactly one document answers"
+    ),
+    "tail_recall_at_5": (
+        "the same measurement with the quote taken from at least "
+        f"{int(TAIL_MIN_DEPTH * 100)}% through the SAME document, and only "
+        f"where at least {TAIL_MIN_NOVEL_TERMS} of the quote's distinctive "
+        "terms are absent from that document's head, so a pass cannot be the "
+        "head embedding answering the query"
+    ),
+    "window_penalty": (
+        "head_recall_at_5 minus tail_recall_at_5 over the same documents: how "
+        "much of a document stops being reachable purely because the text sits "
+        "later in it. 0 means position does not matter"
+    ),
+    "rank_inversion_rate": (
+        "share of answers the node ranked BELOW a hit that the node ITSELF "
+        "reports matched a strictly smaller share of the query terms. The "
+        "answer slot is fixed by a body span match with the header stripped, "
+        "and the comparison uses the node's own _citadel.relevance."
+        "term_coverage, so a path-header match cannot manufacture or hide one"
+    ),
 }
 
 # (summary section, metric key, sample-count source). The report refuses any
@@ -1419,6 +1796,10 @@ REPORT_METRICS: list[tuple[str, str, str]] = [
     ("quality", "negative_hit_rate", "probes"),
     ("duplication", "duplicate_blob_rate_at_10", "dup_rows"),
     ("quality", "header_credit_rate", "spans"),
+    ("window", "head_recall_at_5", "window_pairs"),
+    ("window", "tail_recall_at_5", "window_pairs"),
+    ("window", "window_penalty", "window_pairs"),
+    ("ranking", "rank_inversion_rate", "ranked"),
 ]
 
 
@@ -1430,6 +1811,10 @@ def _metric_sample_count(run: dict[str, Any], n_source: str) -> Any:
         return counts.get("questions_positive")
     if n_source == "probes":
         return counts.get("questions_blocked_probe")
+    if n_source == "window_pairs":
+        return ((run.get("summary") or {}).get("window") or {}).get("pairs_complete")
+    if n_source == "ranked":
+        return ((run.get("summary") or {}).get("ranking") or {}).get("answers_ranked")
     if n_source == "dup_rows":
         rows = run.get("rows")
         if not isinstance(rows, list):
@@ -1528,6 +1913,16 @@ def build_markdown_report(run: dict[str, Any]) -> str:
                 "the head-line-credit incident happened; add the definition "
                 "before reporting it."
             )
+        if section not in summary:
+            # A run taken before this metric existed did not measure it. Saying
+            # so is accurate; refusing the whole report would make every older
+            # baseline unreportable, and printing a bare "n/a" would blur "we
+            # measured nothing" into "we measured and got nothing".
+            lines.append(
+                f"| {key} | not measured in this run | {run_date} | "
+                f"`{short_sha}` | n/a | {definition} |"
+            )
+            continue
         section_values = summary.get(section) or {}
         if key not in section_values:
             raise BenchError(
