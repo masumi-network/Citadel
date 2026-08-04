@@ -42,6 +42,7 @@ from kb.access import (
     default_scopes,
     hash_api_token,
     is_seat_dataset,
+    now_iso,
     seat_dataset,
     validate_seat_slug,
 )
@@ -145,7 +146,9 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
 # search stops working — not only when node/auth are down (#27). None until the
-# first scheduled pass runs.
+# first scheduled pass runs, and that is the common case: the scheduler is off
+# by default, so most nodes never produce one. /readyz therefore reports
+# "never_ran" explicitly instead of folding it into a pass.
 _LAST_CANARY: dict[str, Any] | None = None
 # Corpus-volume gate: if at least this many sources are tracked but the graph holds
 # fewer than the floor of indexed nodes, the data plane is broken (green dashboards
@@ -355,6 +358,10 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 "search_hit": verification.get("search_hit"),
                 "graph_grew": result.get("graph_grew"),
                 "marker": verification.get("marker"),
+                # A pass with no timestamp is nearly as unactionable as none at
+                # all: one that succeeded nine days ago reads identically to one
+                # from six minutes ago. Stamp it so a consumer can judge staleness.
+                "checked_at": now_iso(),
             }
             logger.info(
                 "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
@@ -600,6 +607,11 @@ async def mcp_trailing_slash_redirect() -> RedirectResponse:
 app.mount("/mcp", _McpAcceptShim(mcp_app))
 ADMIN_COOKIE = "citadel_admin"
 MCP_TOOL_HEADER = "x-citadel-mcp-tool"
+# The caller's answer to a tool's "ask the user first" instruction. Recorded in
+# the audit trail, never consulted for authorization: the value is asserted by
+# the calling agent, so it says what was REPORTED, not what the node observed.
+MCP_USER_CONFIRMED_HEADER = "x-citadel-user-confirmed"
+USER_CONFIRMATION_UNKNOWN = "unknown"
 AUDIT_VIEWS = frozenset({"all", "mcp", "access", "failures"})
 AUDIT_LIMIT_MAX = 500
 PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=300"}
@@ -2263,6 +2275,28 @@ def mcp_tool_name(request: Request) -> str | None:
     return tool_name
 
 
+def user_confirmation(request: Request) -> str:
+    """What the caller reports about the user's approval for this write.
+
+    ``confirmed`` / ``not_confirmed`` / ``unknown``. Five MCP tools instruct the
+    agent to obtain explicit approval before writing, but that instruction is
+    prose handed to a model: nothing carried the answer back, so an approved
+    write and an unattended one produced identical audit rows and the trail
+    could not answer "was this confirmed?" for any of them.
+
+    The absent header is ``unknown``, never the optimistic value. An older
+    client that cannot report, and a user who said yes, are different facts.
+    Anything other than the two known values is also ``unknown``: a header this
+    function cannot read is not evidence of consent.
+    """
+    raw = (request.headers.get(MCP_USER_CONFIRMED_HEADER) or "").strip().lower()
+    if raw == "true":
+        return "confirmed"
+    if raw == "false":
+        return "not_confirmed"
+    return USER_CONFIRMATION_UNKNOWN
+
+
 async def capture_search_feedback(
     *,
     mesh_state: MeshState,
@@ -2355,6 +2389,10 @@ def record_mcp_audit(
         "required_scope": policy.scope,
         "risk": policy.risk,
     }
+    # Only tools that ask for approval carry the field. A search has nothing to
+    # confirm, so stamping one on its row would answer a question nobody asked.
+    if policy.requires_user_approval:
+        event_detail["user_confirmation"] = user_confirmation(request)
     if detail:
         event_detail.update(detail)
     get_access_store().record_event(
@@ -4425,14 +4463,57 @@ async def _corpus_health() -> dict[str, Any]:
         }
 
 
+def _canary_health(config: CitadelConfig) -> dict[str, Any]:
+    """The end-to-end canary's state, as three distinguishable outcomes.
+
+    The old payload sent ``"canary": null`` for a node that never ran one and
+    folded it into ``ok`` with ``canary is None or bool(canary.get("ok", True))``.
+    Both defaults were optimistic, and the scheduler that sets ``_LAST_CANARY``
+    is off unless ``CITADEL_EVOLVE_SCHEDULER_ENABLED`` is set, so on a
+    default-config node the never-ran branch fired on every request and a node
+    that never checked was indistinguishable on the wire from one that passed.
+
+    Now: ``state`` is ``passed`` / ``failed`` / ``never_ran`` and ``ok`` is
+    True / False / None, so a monitoring consumer can branch. ``never_ran``
+    does not force RED (that would 503 every node running the default
+    configuration), but it can no longer be mistaken for a pass, and
+    ``scheduler_enabled`` says whether one was ever going to run.
+    """
+    scheduler_enabled = bool(config.evolve_scheduler_enabled)
+    canary = _LAST_CANARY
+    if canary is None:
+        return {
+            "state": "never_ran",
+            "ok": None,
+            "scheduler_enabled": scheduler_enabled,
+            "checked_at": None,
+            "reason": (
+                "evolve scheduler disabled: no end-to-end canary will run on this node"
+                if not scheduler_enabled
+                else "evolve scheduler enabled; no pass has completed yet"
+            ),
+        }
+    # `is True` rather than `.get("ok", True)`: a recorded verdict that does not
+    # say it passed has not observed a pass, and must not be read as one.
+    passed = canary.get("ok") is True
+    return {
+        **canary,
+        "state": "passed" if passed else "failed",
+        "ok": passed,
+        "scheduler_enabled": scheduler_enabled,
+        "checked_at": canary.get("checked_at"),
+    }
+
+
 @app.get("/readyz")
 async def readyz(request: Request) -> Any:
     require_access(request, "reader", "kb:read")
     config = get_citadel().config
     corpus = await _corpus_health()
-    canary = _LAST_CANARY
-    # RED when the corpus gate trips or the last end-to-end canary failed.
-    ok = corpus["ok"] and (canary is None or bool(canary.get("ok", True)))
+    canary = _canary_health(config)
+    # RED when the corpus gate trips or the last end-to-end canary failed. A
+    # canary that never ran is reported, not gated on.
+    ok = corpus["ok"] and canary["state"] != "failed"
     payload = {
         "ok": ok,
         "service": "citadel",
@@ -5546,6 +5627,23 @@ async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
                 "highest_severity": exc.highest_severity,
             },
         )
+        # Parity with /ingest. The generic middleware backstop already wrote an
+        # mcp.* row for this request, but it carried only status_code=422, so
+        # the MCP view of the trail could not say the run was stopped by the
+        # secret gate, nor how severe the finding was. Record the reason here so the
+        # row states what happened rather than only that something did.
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "operation": "promotion.run",
+                "dry_run": body.dry_run,
+                "blocked": "secret_content",
+                "highest_severity": exc.highest_severity,
+            },
+        )
         raise HTTPException(status_code=422, detail=exc.public_message) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -5617,6 +5715,7 @@ async def approve_promotion_pending(
             item_id,
             identity,
             delegate=delegate,
+            user_confirmation=user_confirmation(request),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -5651,6 +5750,7 @@ async def reject_promotion_pending(
             item_id,
             identity,
             delegate=delegate,
+            user_confirmation=user_confirmation(request),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

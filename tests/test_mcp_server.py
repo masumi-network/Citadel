@@ -62,6 +62,9 @@ class FakeHttpClient:
         self.public_gets.append({"path": path, "extra_headers": extra_headers or {}})
         return {"ok": True, "path": path, "public": True}
 
+    # Mirrors CitadelHttpClient.post exactly, user_confirmed included: a fake
+    # narrower than the real client turns a wiring change into a TypeError in
+    # unrelated tests instead of a finding.
     def post(
         self,
         path: str,
@@ -69,9 +72,16 @@ class FakeHttpClient:
         *,
         tool_name: str | None = None,
         timeout: float | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         self.posts.append(
-            {"path": path, "payload": payload, "tool_name": tool_name, "timeout": timeout}
+            {
+                "path": path,
+                "payload": payload,
+                "tool_name": tool_name,
+                "timeout": timeout,
+                "user_confirmed": user_confirmed,
+            }
         )
         return {"ok": True, "path": path, "payload": payload, "tool_name": tool_name}
 

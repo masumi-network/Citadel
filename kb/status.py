@@ -319,8 +319,23 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
     canary = data.get("canary")
     indexed = corpus.get("indexed_docs")
     tracked = corpus.get("tracked_sources")
-    ok = bool(corpus.get("ok", True)) and (canary is None or bool(canary.get("ok", True)))
+    # /readyz now names the canary's state: passed / failed / never_ran. Only
+    # "failed" is a RED signal. A node that never ran one has observed nothing,
+    # which is not a failure and is emphatically not a pass, so say which it is
+    # in the detail line rather than printing a bare "ok" over an unchecked
+    # data plane. Older nodes still send a bare verdict dict or null; the
+    # fallback keeps `citadel status` working against them.
+    state = canary.get("state") if isinstance(canary, dict) else None
+    if state is not None:
+        canary_ok = state != "failed"
+    else:
+        canary_ok = canary is None or bool(canary.get("ok", True))
+    ok = bool(corpus.get("ok", True)) and canary_ok
     detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
+    if state == "never_ran":
+        detail = f"{detail} (canary: never ran)"
+    elif state == "failed":
+        detail = f"{detail} (canary: failed)"
     return Check("corpus", ok=ok, detail=detail, latency_ms=latency, data={"canary": canary})
 
 
