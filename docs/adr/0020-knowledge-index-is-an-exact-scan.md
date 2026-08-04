@@ -14,7 +14,7 @@ be an approximate-nearest-neighbour index. It is not. VERIFIED against the
 installed cognee 1.2.2 (`cognee-1.2.2.dist-info`):
 
 - The strings `hnsw` and `ivfflat` appear nowhere in the installed cognee
-  package — not in the adapter, not in `cognee/alembic`, not in
+  package: not in the adapter, not in `cognee/alembic`, not in
   `cognee/migration`. The only `CREATE INDEX` occurrences are test fixtures
   (`cognee/tests/test_data/Chinook_PostgreSql.sql`) and a graph-store Cypher
   index on node id (`cognee/modules/migration/formats.py:121`); neither touches
@@ -26,7 +26,7 @@ installed cognee 1.2.2 (`cognee-1.2.2.dist-info`):
   are `id` (primary key), `payload = Column(JSON)`, and
   `vector = Column(Vector(vector_size))` (`:245-247`). The method whose name
   suggests an index, `create_vector_index()` (`:381-383`), calls
-  `create_collection()` — it creates a *table*.
+  `create_collection()`. It creates a *table*.
 - `search()` (`:463`) issues `select(...).order_by(cosine_distance(query_vector))`
   with a `LIMIT`.
 
@@ -34,7 +34,7 @@ The **vector column** is unindexed (the table does have an implicit primary-key
 btree, which no distance query can use). An unindexed vector column under
 `ORDER BY <distance>` gives the planner no ordered access path, so it computes a
 distance per row and top-N heapsorts. **Every Citadel search is an exact full
-scan of the whole chunk collection** — possibly a parallel scan, but a full one.
+scan of the whole chunk collection**, possibly a parallel scan, but a full one.
 Two properties follow, and both are the opposite of what a reader would assume:
 
 - Recall is 100% by construction. There is no approximation to lose.
@@ -42,7 +42,7 @@ Two properties follow, and both are the opposite of what a reader would assume:
   the corpus rather than appearing as a failure.
 
 Scope note: this describes what cognee creates. Whether someone has since added
-an index to the production database by hand is NOT DETERMINED — no repo-side DDL
+an index to the production database by hand is NOT DETERMINED. No repo-side DDL
 exists, and confirming prod requires querying it.
 
 A second absence compounds it. The vector layer is never given a filter.
@@ -54,27 +54,27 @@ no dataset context, so `node_name` arrives at `PGVectorAdapter.py:529-534` as
 `None` and the adapter's `belongs_to_set` filter branch (`:505`, literal at
 `:524`) is unreachable. Every search therefore scans every **Seat**'s chunks in
 one collection. Note the precise form: in this configuration dataset scoping is
-not resolved *anywhere* — not by the Index and not by cognee above it, which is
+not resolved *anywhere*: not by the Index and not by cognee above it, which is
 consistent with the existing record that the dataset parameter relabels rather
 than scopes. The Index enforces no isolation, and nothing else is enforcing it
 on the Index's behalf.
 
 A third property multiplies both. **One user query issues N full scans, not
 one.** VERIFIED: `kb/server.py:1969-1979` fans out with `asyncio.gather`, one
-`citadel.search()` per readable dataset — three for a writer seat — and merges
+`citadel.search()` per readable dataset (three for a writer seat), and merges
 the results above. The comment there reasons that concurrency makes a
 two-dataset search "cost ~one recall, not two"; that is true of wall-clock and
 false of database work. The scans are concurrent, unfiltered, and against the
 same collection, so they contend for the same buffers and CPU. Since the dataset
 parameter never reaches the vector layer (above), the degree to which those N
-scans return *identical* rows is NOT DETERMINED but is potentially total — the
-`session_id` differs per dataset and may or may not change cognee's path. The
+scans return *identical* rows is NOT DETERMINED but is potentially total,
+because the `session_id` differs per dataset and may or may not change cognee's path. The
 settling measurement is cheap: count statements against the chunk collection per
 user query.
 
 Neither property was chosen. All three were inherited from a default and have
 gone unrecorded, which is why the corpus can grow into a latency problem that no
-counter reports and no code review would surface — the defect is an absence.
+counter reports and no code review would surface. The defect is an absence.
 
 **Decision**
 
@@ -89,10 +89,16 @@ counter reports and no code review would surface — the defect is an absence.
      recall to remove, and it needs no index and no new service. This is the
      largest available effect size and it was not in the original design at all.
   2. **Filter or partition by dataset.** This shrinks each scan by roughly the
-     dataset count, keeps recall exact, and closes the ADR-0009 isolation gap
-     that no layer currently enforces. It was previously demoted to a
+     dataset count and keeps recall exact. It was previously demoted to a
      "cost-to-fix probe", which was wrong: a rule that measures only index arms
-     can select HNSW when a filter beats it on latency, recall, *and* security.
+     can select HNSW when a filter beats it on every axis.
+     AMENDED by [ADR-0021](0021-seat-nodes-are-mutually-readable.md): this was
+     also justified as closing the ADR-0009 isolation gap, and for `org-work`
+     content it no longer is, because that content is meant to be mutually
+     readable. The security justification survives only for the private
+     partition ADR-0021 requires. Note that ADR-0021 reaches this same remedy
+     from the opposite direction: if everything is readable, partitioning the
+     *search* buys nothing and the fan-out collapses to one scan.
   Sequencing matters and runs this way round: adopting HNSW first makes filtered
   retrieval harder, since a filtered ANN search must over-fetch and loses recall
   in a way a filtered exact scan does not.
@@ -105,7 +111,8 @@ counter reports and no code review would surface — the defect is an absence.
   capability rather than speed. Pre-registered: **arms 2 and 3 do not run unless
   arm 1 breaches the gate.**
 - **Arms are compared at matched recall, with a pre-registered floor.** Without
-  one, "faster" is undefined — `ef` can be tuned downward until any arm wins.
+  one, "faster" is undefined, since `ef` can be tuned downward until any arm
+  wins.
   The floor is recall@10 ≥ 0.98 against exhaustive cosine; latency below that
   floor is not a result. Ground truth is computed in float32 to match pgvector's
   storage, because a float64 reference reorders ties and would score the exact
@@ -131,14 +138,14 @@ counter reports and no code review would surface — the defect is an absence.
   mode**. VERIFIED: `_configured_search_type` (`kb/cognee_client.py:426`) reads
   `CITADEL_COGNEE_SEARCH_TYPE`, defaulting to `CHUNKS`, which `.env.example:31`
   also sets explicitly; that reaches cognee's `ChunksRetriever`, which selects
-  its collection at `chunks_retriever.py:117`. Other values route elsewhere —
+  its collection at `chunks_retriever.py:117`. Other values route elsewhere:
   `SUMMARIES` to `SummariesRetriever`, `CHUNKS_LEXICAL` to `BM25ChunksRetriever`,
   and `AUTO`/`RECALL` to `None`, which sends searches down `cognee.recall(...)`
   at `kb/cognee_client.py:627` entirely. One-collection scope is a property of
   the mode we run, not of Citadel in general. (`kb/cognee_client.py:1574`'s
   `_CHUNK_VECTOR_COLLECTION` names the same collection but is the drill-down
   fallback constant, not the search path; it is not evidence for this claim.)
-  The **Knowledge Mesh** is out of scope entirely — ADR-0010 keeps cognee as the
+  The **Knowledge Mesh** is out of scope entirely, since ADR-0010 keeps cognee as the
   Mesh builder regardless of the retrieval outcome.
 - Ground truth for recall is exhaustive cosine over the frozen fixture. It
   requires no human labelling and it is exact by definition. It replaces the
@@ -147,8 +154,8 @@ counter reports and no code review would surface — the defect is an absence.
   so it measured header formatting rather than retrieval.
 - **Recall is not a decision input.** The incumbent scores 100% by definition,
   so a rule that weighs recall across arms cannot be lost by the incumbent and
-  is decision-theatre. Recall's role here is to *price the cost of switching* —
-  how much exactness an ANN arm gives up — and it is reported alongside latency
+  is decision-theatre. Recall's role here is to *price the cost of switching*,
+  meaning how much exactness an ANN arm gives up, and it is reported alongside latency
   rather than traded against it. Only latency and capability can decide.
 - **The arms are parameter families, not points.** `m`, `ef_construct` and `ef`
   trade recall against latency continuously (qdrant's documented defaults: `m`
@@ -161,7 +168,7 @@ counter reports and no code review would surface — the defect is an absence.
   Consequences: cognee has been writing every query to a Postgres table since
   before this ADR. Corpus-derived queries are the fallback only if that table
   proves too sparse, and if used their bias must be stated wherever the numbers
-  appear — corpus-derived queries occupy tighter embedding neighbourhoods than
+  appear, because corpus-derived queries occupy tighter embedding neighbourhoods than
   real ones, so ANN recall reads optimistic.
 - Filtered search is measured as a cost-to-fix probe, not as a comparison of two
   implementations. Neither backend filters today, so a head-to-head would compare
@@ -171,14 +178,14 @@ counter reports and no code review would surface — the defect is an absence.
   For qdrant the documented mechanism is an `is_tenant` payload index on a
   `keyword` or `uuid` field. The output attaches to the isolation work, not to a
   winner.
-- **Corpus growth is extrapolated, not faked.** The obvious method — replicate
-  the fixture to 2x/4x — is invalid and biased. Duplicated vectors sit at
+- **Corpus growth is extrapolated, not faked.** The obvious method,
+  replicating the fixture to 2x/4x, is invalid and biased. Duplicated vectors sit at
   distance 0 from each other, which collapses an HNSW proximity graph into
   cliques that consume the `m` neighbour budget and destroy the long-range links
   the index navigates by, and it makes top-k a handful of distinct documents
   repeated with arbitrary tie ordering. It also flatters the incumbent, since
-  identical rows compress better and are more cache-friendly than real ones —
-  the bias runs toward "change nothing", which is already this rule's default.
+  identical rows compress better and are more cache-friendly than real ones.
+  The bias runs toward "change nothing", which is already this rule's default.
   Instead: measure every arm at 1x on real vectors, and extrapolate the
   exact-scan arm analytically, which is defensible precisely because a full scan
   is linear in rows. Validate that linearity with one perturbed 2x run (small
@@ -186,15 +193,15 @@ counter reports and no code review would surface — the defect is an absence.
   does not. The HNSW arms are never projected from duplicated data; if the gate
   breaches, a real synthetic corpus is built then.
 - Three thresholds, not one, because a target and a tripwire are different
-  things. **Target: p95 ≤ 25ms** store-level — what a competent ANN index does at
+  things. **Target: p95 ≤ 25ms** store-level, which is what a competent ANN index does at
   this scale, deliberately derived from nothing that can move, triggering no
-  action. **Ceiling: p95 ≥ 400ms** at any corpus size — act immediately, do not
+  action. **Ceiling: p95 ≥ 400ms** at any corpus size, meaning act immediately and do not
   wait for a projection. **Gate: store p95 ≥ 100ms at CURRENT corpus size**, with
   the production fan-out multiplier applied, comparing p95 against p95.
   An earlier draft set the gate at 150ms at a projected 4x and justified it as
   ~2% of a 6-9s end-to-end. That reasoning is void twice over. REPORTED from the
   2026-08-03 production bench, end-to-end p50 is 311-627ms by surface, so 150ms
-  would have been 24-48% of the entire user-visible request rather than 2% — and
+  would have been 24-48% of the entire user-visible request rather than 2%. And
   since the store may already account for most of that, the gate belongs at
   today's corpus size, not at a projection. The permissive-gate asymmetry
   inverts with it: when the store *is* the latency, a rule tolerating 150ms
@@ -214,8 +221,8 @@ counter reports and no code review would surface — the defect is an absence.
   search telemetry never persists query text and that no real query set existed.
   That was wrong.** cognee's `log_query`
   (`cognee/modules/search/operations/log_query.py:9-24`) constructs
-  `Query(text=query_text, ...)` and commits it through the relational engine —
-  our Postgres (`.env.example:244`) — into a `queries` table with a `text`
+  `Query(text=query_text, ...)` and commits it through the relational engine
+  (our Postgres, `.env.example:244`) into a `queries` table with a `text`
   column (`cognee/modules/search/models/Query.py:8,12`). It is the first
   statement of cognee's search body (`cognee/modules/search/methods/search.py:79`),
   reached from `kb/cognee_client.py:663`. Its only gate is
@@ -225,8 +232,8 @@ counter reports and no code review would surface — the defect is an absence.
   The error was not a missing file: `kb/cognee_client.py:650-652` already states
   in a comment that "the per-search writes that remain (log_query/log_result
   history) are unconditional". The earlier finding examined Citadel's own
-  telemetry path, found it ephemeral — which it is, `kb/mesh.py:449-458` writes
-  no `query` key and `MeshState` is in-process — and generalised from Citadel's
+  telemetry path, found it ephemeral (which it is: `kb/mesh.py:449-458` writes
+  no `query` key and `MeshState` is in-process), then generalised from Citadel's
   code to the system's behaviour without checking the engine underneath it. Two
   decisions were built on the false claim and are reversed above.
 - What remains NOT DETERMINED about the query set: whether the `queries` table
@@ -236,7 +243,7 @@ counter reports and no code review would surface — the defect is an absence.
   real or corpus-derived.
 - That table is also a privacy surface nobody chose. Every search string any
   seat has ever issued sits in the org's Postgres, unredacted, attributed by
-  `user_id`, with no retention policy — while Citadel's own telemetry path was
+  `user_id`, with no retention policy, while Citadel's own telemetry path was
   carefully built to strip query text (`kb/search_feedback.py`). Using it as a
   benchmark input is reasonable; leaving it undocumented is not. Out of scope
   here, and it needs its own decision.
@@ -247,8 +254,8 @@ counter reports and no code review would surface — the defect is an absence.
   HEAD (VERIFIED via `git merge-base --is-ancestor`), and the docstring at
   `:400-407` states the 6-9s was measured with the flag on. So the argument that
   "a store-level win is imperceptible against an LLM call" no longer stands on a
-  live number. Whether production sets `AUTO_FEEDBACK=true` explicitly — which
-  the setdefault permits — is NOT DETERMINED. Current end-to-end p50 must be
+  live number. Whether production sets `AUTO_FEEDBACK=true` explicitly, which
+  the setdefault permits, is NOT DETERMINED. Current end-to-end p50 must be
   re-measured before the gate threshold is set, and if the LLM call is genuinely
   gone, the store may now be a large fraction of search latency rather than a
   rounding error. That would raise the stakes of this whole exercise rather than
@@ -258,7 +265,7 @@ counter reports and no code review would surface — the defect is an absence.
   so an `is_tenant` index would sit unused until Citadel's call path changes.
   The constraint lives upstream of the store: swapping the Index backend cannot
   by itself fix isolation.
-- Qdrant is not a drop-in. VERIFIED: cognee 1.2.2 ships no qdrant adapter —
+- Qdrant is not a drop-in. VERIFIED: cognee 1.2.2 ships no qdrant adapter:
   `cognee/infrastructure/databases/vector/supported_databases.py` is literally
   `supported_databases = {}`, and `create_vector_engine.py` branches only on
   pgvector (`:207`), neptune_analytics (`:271`), and lancedb (`:299`); qdrant is
@@ -281,7 +288,7 @@ counter reports and no code review would surface — the defect is an absence.
   silently reverts it.** ADR-0010 makes drop-and-rebuild-from-Structured-
   Knowledge a first-class operation. An index we add by hand is not part of what
   cognee recreates, so a reindex would drop back to exact scan with no counter
-  reporting the change — the same shape as the green-stage defect class. Whether
+  reporting the change, the same shape as the green-stage defect class. Whether
   cognee's `create_collection` drops an existing table is NOT DETERMINED and is
   a required check before any index arm is adopted. If we adopt HNSW, recreating
   it becomes part of the reindex procedure or the procedure is broken.
