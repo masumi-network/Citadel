@@ -109,3 +109,35 @@ def test_staleness_is_reportable_so_a_stopped_cycle_is_visible(tmp_path: Path) -
     stopped = staleness(path, HOUR, now=NOW)
     assert stopped["overdue"] is True
     assert stopped["age_seconds"] == 7 * 24 * HOUR
+
+
+def test_a_failed_stamp_is_logged_rather_than_swallowed(tmp_path: Path, caplog) -> None:
+    """Degrading to a full interval is safe; degrading silently is not.
+
+    CodeQL flagged the bare `except: pass` here, and it was right for a reason
+    beyond style: if the completion cannot be written, the next boot restarts its
+    interval instead of resuming, which is exactly the defect this module exists
+    to fix. Swallowed without a word, #153 comes back while every counter still
+    reads healthy.
+    """
+    import logging
+
+    # A directory where the file should be: save cannot succeed, and the failure
+    # is a real OSError rather than a mocked one.
+    blocked = tmp_path / "evolve_state.json"
+    blocked.mkdir()
+
+    with caplog.at_level(logging.WARNING, logger="kb.evolve_state"):
+        record_completed(blocked, when=NOW)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("record the evolve completion" in m for m in messages), (
+        f"a failed stamp must say so; silence here reintroduces #153 invisibly: {messages}"
+    )
+    # The consequence has to be in the line, not just the fact of a failure:
+    # someone reading it at 2am needs to know what it costs them.
+    assert any("resuming" in m for m in messages)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kb.evolve_state"):
+        assert read_last_completed(blocked) is None
+    assert caplog.records, "an unreadable state file must be reported, not treated as a first boot"

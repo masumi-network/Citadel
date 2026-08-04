@@ -19,10 +19,13 @@ first sleep from it.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from typing import Any
 
 from kb.state_io import StateFileError, load_state_file, save_state_file
+
+logger = logging.getLogger(__name__)
 
 STATE_VERSION = 1
 
@@ -52,7 +55,16 @@ def read_last_completed(path: str | Path) -> datetime | None:
     """
     try:
         data = load_state_file(Path(path))
-    except (StateFileError, OSError):
+    except (StateFileError, OSError) as exc:
+        # Degrading to a full first interval is safe; degrading SILENTLY is not.
+        # Without this line an unreadable state file looks exactly like a first
+        # boot, and the resume this module exists for is quietly not happening.
+        logger.warning(
+            "Evolve state at %s is unreadable (%s); the interval will restart "
+            "rather than resume this boot",
+            path,
+            exc.__class__.__name__,
+        )
         return None
     if not isinstance(data, dict):
         return None
@@ -69,8 +81,18 @@ def record_completed(path: str | Path, when: datetime | None = None) -> None:
                 "last_completed_at": (when or _now()).isoformat().replace("+00:00", "Z"),
             },
         )
-    except (StateFileError, OSError):
-        pass
+    except (StateFileError, OSError) as exc:
+        # Swallowed on purpose: a bookkeeping write must never fail an evolve
+        # pass that has already done its work. But it is LOGGED, because the
+        # cost is the next boot restarting its interval instead of resuming,
+        # which is the defect this module fixes. A silent failure here would
+        # reintroduce #153 while every counter still read healthy.
+        logger.warning(
+            "Could not record the evolve completion at %s (%s); the next boot "
+            "will wait a full interval instead of resuming",
+            path,
+            exc.__class__.__name__,
+        )
 
 
 def first_sleep_seconds(
