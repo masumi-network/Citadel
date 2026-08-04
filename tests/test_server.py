@@ -22,7 +22,7 @@ from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.mesh import MeshState
-from kb.models import FeedbackResult, IngestResult
+from kb.models import INDEX_STATE_PENDING, FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
 from kb.server import app
 
@@ -39,7 +39,17 @@ class FakeCitadel:
     )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
-        return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
+        # What the real Citadel.ingest returns for an ordinary write: stored,
+        # with the graph write still owed. A fake that left index_state at the
+        # default would let every /ingest response look unobservable rather
+        # than merely not-yet-observed.
+        return IngestResult(
+            True,
+            "accepted",
+            kwargs["dataset"] or "notes",
+            tuple(kwargs["tags"]),
+            index_state=INDEX_STATE_PENDING,
+        )
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
@@ -1153,10 +1163,17 @@ def test_ingest_inline_cognify_flag() -> None:
     plain = client.post("/ingest", json={"data": "note one", "tags": []})
     assert plain.status_code == 200
     assert "cognified" not in plain.json()
+    # Without an inline cognify nothing has watched the graph write, so the
+    # write may not be reported as indexed — `accepted` covers the request only.
+    assert plain.json()["accepted"] is True
+    assert plain.json()["indexed"] is not True
     # cognify=True → the Node cognifies inline (server-side) and reports it.
     with_cognify = client.post("/ingest", json={"data": "note two", "tags": [], "cognify": True})
     assert with_cognify.status_code == 200
     assert with_cognify.json()["cognified"] is True
+    # And only THAT run may claim the note is indexed, because it observed it.
+    assert with_cognify.json()["index_state"] == "indexed"
+    assert with_cognify.json()["indexed"] is True
 
 
 def test_ingest_and_contribute_reject_oversized_payloads(monkeypatch: Any) -> None:

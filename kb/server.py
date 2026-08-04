@@ -68,7 +68,7 @@ from kb.mcp_server import (
     set_tools_list_session_resolver,
 )
 from kb.mesh import MeshState
-from kb.models import FeedbackRequest
+from kb.models import FeedbackRequest, index_flag, resolve_index_state
 from kb.obsidian_sync import ObsidianSyncStore, SyncPushDocument, normalize_path
 from kb.promotion import PromotionEngine
 from kb.promotion_queue import (
@@ -5237,7 +5237,15 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
         ingest_results.append(
             {
                 "document_id": accepted["document_id"],
+                # `accepted` is the REQUEST: cognee.add() returned. The graph
+                # write that makes the note findable happens later and can fail
+                # with nothing reported, so the vault client gets the observed
+                # state and the ids cognee assigned rather than a flag that
+                # reads as "your note is in the vault".
                 "accepted": ingest_result.accepted,
+                "index_state": ingest_result.index_state,
+                "indexed": ingest_result.indexed,
+                "cognee_data_ids": list(ingest_result.cognee_data_ids),
                 "reason": ingest_result.reason,
                 "dataset": ingest_result.dataset,
                 "tags": list(ingest_result.tags),
@@ -6059,15 +6067,24 @@ async def ingest(body: IngestBody, request: Request) -> Any:
         },
     )
     payload = jsonable_encoder(result)
+    # `indexed` is a property, so it is not a dataclass field jsonable_encoder
+    # would pick up. It is the field a client should read: `accepted` only says
+    # the write was requested.
+    payload["indexed"] = result.indexed
     # Inline cognify (opt-in) so the just-written data is immediately searchable.
     # The write already succeeded; a cognify failure must NOT fail the ingest.
     if body.cognify and result.accepted:
         try:
             await citadel.cognify_dataset(dataset=outcome.dataset)
             payload["cognified"] = True
+            # This request WATCHED the graph write happen, which is the one
+            # situation where a write surface may report the note as indexed.
+            payload["index_state"] = resolve_index_state(result.index_state, "ok")
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee state
             logger.error("inline cognify after ingest failed: %s", exc.__class__.__name__)
             payload["cognified"] = False
+            payload["index_state"] = resolve_index_state(result.index_state, "failed")
+        payload["indexed"] = index_flag(str(payload["index_state"]))
     return payload
 
 

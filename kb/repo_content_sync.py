@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 from kb.github_sync import GitHubAPIError, GitHubOrgClient, utc_now
 from kb.learning import LearningProcess
+from kb.models import INDEX_STATE_UNKNOWN, index_flag
 from kb.security_scan import SecurityScanEntry, scan_text_entries
 from kb.service import Citadel
 from kb.state_io import StateFileError, load_state_file, save_state_file
@@ -151,6 +152,24 @@ def _cognee_data_ids(outcome: Any) -> list[str]:
             if data_id:
                 ids.append(str(data_id))
     return list(dict.fromkeys(ids))
+
+
+def _worst_index_state(outcome: Any) -> str:
+    """The least-indexed state across every chunk this file was written as.
+
+    A document can be chunked into several ingests. It is findable only if all
+    of them are, so the file's state is the worst of them, never the best — the
+    opposite choice would let one indexed chunk vouch for a document whose rest
+    never reached the graph.
+    """
+    states = [
+        getattr(result, "index_state", INDEX_STATE_UNKNOWN)
+        for result in getattr(outcome, "all_ingests", ()) or ()
+    ]
+    if not states:
+        return INDEX_STATE_UNKNOWN
+    # False (observed not indexed) beats None (unobserved) beats True.
+    return min(states, key=lambda state: {False: 0, None: 1, True: 2}[index_flag(state)])
 
 
 def format_repo_content_document(file: RepoContentFile) -> str:
@@ -690,6 +709,13 @@ class RepoContentSyncer:
 
         repo_results: list[dict[str, Any]] = []
         ingested_files = 0
+        # ingested_files counts WRITES REQUESTED — it increments when
+        # cognee.add() returned, which is before the graph write that makes a
+        # file findable. These two count what was OBSERVED about that graph
+        # write, so a pass that stored 40 files and indexed none stops
+        # reporting the same number as a pass that indexed all 40.
+        indexed_files = 0
+        index_failed_files = 0
         skipped_files = 0
         blocked_files = 0
         improved = False
@@ -733,6 +759,8 @@ class RepoContentSyncer:
                 "repo": full_name,
                 "paths_discovered": 0,
                 "ingested": 0,
+                "indexed": 0,
+                "index_failed": 0,
                 "skipped": 0,
                 "skipped_reasons": {},
                 "blocked": 0,
@@ -919,6 +947,14 @@ class RepoContentSyncer:
                     if any(result.accepted for result in outcome.all_ingests):
                         ingested_files += 1
                         repo_result["ingested"] += 1
+                        file_index_state = _worst_index_state(outcome)
+                        file_indexed = index_flag(file_index_state)
+                        if file_indexed is True:
+                            indexed_files += 1
+                            repo_result["indexed"] += 1
+                        elif file_indexed is False:
+                            index_failed_files += 1
+                            repo_result["index_failed"] += 1
                         tracked[key] = {
                             "sha": file.sha,
                             "content_hash": file.content_hash,
@@ -928,6 +964,10 @@ class RepoContentSyncer:
                             # state file holding only sha and content_hash can
                             # never verify what it asserted.
                             "cognee_data_ids": _cognee_data_ids(outcome),
+                            # And what was observed about the graph write, which
+                            # the ids alone do not say: an id exists as soon as
+                            # the row does.
+                            "index_state": file_index_state,
                         }
                         # Checkpoint immediately. State used to be written only
                         # after every repo finished, so a run killed part-way
@@ -988,7 +1028,13 @@ class RepoContentSyncer:
             "checked_at": checked_at,
             "repos_scanned": len(repo_results),
             "repos_errored": len(repos_errored),
+            # files_ingested counts writes REQUESTED; the two below count what
+            # was observed about the graph write that makes them findable.
+            # files_ingested - files_indexed - files_index_failed is the number
+            # still in flight, and that is a real state, not a rounding error.
             "files_ingested": ingested_files,
+            "files_indexed": indexed_files,
+            "files_index_failed": index_failed_files,
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_blocked": blocked_files,

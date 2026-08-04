@@ -15,6 +15,7 @@ from kb.linear_sync import (
     resolve_mirror_dataset,
     seat_email_index,
 )
+from kb.models import INDEX_STATE_PENDING, IngestResult
 from kb.service import Citadel
 
 
@@ -134,11 +135,16 @@ async def test_linear_sync_ingests_central_and_mirror(
             }
         )
 
-        class FakeResult:
-            accepted = True
-
         class Outcome:
-            ingest = FakeResult()
+            # The real IngestResult: `accepted` alone cannot express the state
+            # the caller now branches on (stored vs actually indexed).
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -189,8 +195,17 @@ async def test_linear_sync_writes_each_issue_to_central(
         ingests.append({"dataset": dataset, "tags": tags or [], "data": data})
 
         class Outcome:
-            class ingest:
-                accepted = True
+            # The real IngestResult, not a bare stub with `accepted = True`.
+            # Every write here is deferred, so its honest state is "stored, the
+            # graph write is still owed" — a fake that only carries `accepted`
+            # cannot express the difference the caller now has to branch on.
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -248,8 +263,17 @@ async def test_linear_sync_auto_maps_assignee_by_member_email(
 
     async def fake_learn(self: Any, data: str, **_: Any) -> Any:
         class Outcome:
-            class ingest:
-                accepted = True
+            # The real IngestResult, not a bare stub with `accepted = True`.
+            # Every write here is deferred, so its honest state is "stored, the
+            # graph write is still owed" — a fake that only carries `accepted`
+            # cannot express the difference the caller now has to branch on.
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -283,8 +307,17 @@ async def test_linear_sync_defers_coalesced_cognify_when_inline_suppressed(
 
     async def fake_learn(self: Any, data: str, **_: Any) -> Any:
         class Outcome:
-            class ingest:
-                accepted = True
+            # The real IngestResult, not a bare stub with `accepted = True`.
+            # Every write here is deferred, so its honest state is "stored, the
+            # graph write is still owed" — a fake that only carries `accepted`
+            # cannot express the difference the caller now has to branch on.
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -316,8 +349,17 @@ async def test_linear_sync_awaits_coalesced_cognify_when_requested(
 
     async def fake_learn(self: Any, data: str, **_: Any) -> Any:
         class Outcome:
-            class ingest:
-                accepted = True
+            # The real IngestResult, not a bare stub with `accepted = True`.
+            # Every write here is deferred, so its honest state is "stored, the
+            # graph write is still owed" — a fake that only carries `accepted`
+            # cannot express the difference the caller now has to branch on.
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -433,11 +475,16 @@ async def test_member_fetch_failure_is_carried_not_a_neutral_zero(
     store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
 
     async def fake_learn(self: Any, data: str, **kwargs: Any) -> Any:
-        class FakeResult:
-            accepted = True
-
         class Outcome:
-            ingest = FakeResult()
+            # The real IngestResult: `accepted` alone cannot express the state
+            # the caller now branches on (stored vs actually indexed).
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
@@ -481,8 +528,17 @@ def _capture_learn(monkeypatch: Any, ingests: list[dict[str, Any]]) -> None:
         ingests.append({"dataset": dataset, "tags": tags or [], "data": data})
 
         class Outcome:
-            class ingest:
-                accepted = True
+            # The real IngestResult, not a bare stub with `accepted = True`.
+            # Every write here is deferred, so its honest state is "stored, the
+            # graph write is still owed" — a fake that only carries `accepted`
+            # cannot express the difference the caller now has to branch on.
+            ingest = IngestResult(
+                True,
+                "accepted",
+                "masumi-network",
+                (),
+                index_state=INDEX_STATE_PENDING,
+            )
 
         return Outcome()
 
