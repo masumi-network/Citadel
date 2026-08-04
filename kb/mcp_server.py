@@ -782,6 +782,66 @@ def _unconfirmed_ingest(
     }
 
 
+# The user-approval signal travels with every guarded write so the request, the
+# tool result, and (for promotion decisions) the audit trail all state whether
+# the calling agent presented a user confirmation. The quote is clamped well
+# under the node's 400-char decision-note bound (PromotionDecisionBody.note) so
+# composing it with the caller's own note never turns a valid call into a 422.
+MAX_USER_APPROVAL_CHARS = 160
+MAX_DECISION_NOTE_CHARS = 400
+APPROVAL_NOT_STATED = "not stated by calling agent"
+_MISSING_APPROVAL_WARNING = (
+    "This call carried no user_approval, so it is recorded as having no stated "
+    "user confirmation. Ask the user before writing durable context and pass "
+    "their approving reply (a short quote) as user_approval."
+)
+
+
+def _normalized_approval(user_approval: str | None) -> str | None:
+    """One bounded line of the user's approving reply, or None when not stated."""
+    if user_approval is None:
+        return None
+    collapsed = " ".join(str(user_approval).split())
+    return collapsed[:MAX_USER_APPROVAL_CHARS] or None
+
+
+def _with_approval_signal(payload: Any, signal: str | None) -> Any:
+    """Mirror the approval observation into the tool result.
+
+    The MCP layer attests only what it observed: the argument it was handed.
+    A call made with a stated approval and one made without must not produce
+    identical results, so the block is present either way and a missing signal
+    additionally raises a warning the operator can see. Non-dict payloads pass
+    through untouched.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    reported: dict[str, Any] = {
+        **payload,
+        "user_approval": {"provided": signal is not None, "signal": signal},
+    }
+    if signal is None:
+        warnings = [w for w in (payload.get("warnings") or []) if w]
+        warnings.append(_MISSING_APPROVAL_WARNING)
+        reported["warnings"] = warnings
+    return reported
+
+
+def _decision_note(signal: str | None, note: str | None) -> str:
+    """Compose a promotion decision note that leads with the approval signal.
+
+    The decision endpoints write the note into the node's audit trail, which
+    makes the note the channel that records the signal durably today. The lead
+    line states the caller's quote or the explicit "not stated" marker; the
+    caller's own note follows, and the whole string is clamped to the server's
+    note bound.
+    """
+    lead = f"user approval: {signal or APPROVAL_NOT_STATED}"
+    trimmed = " ".join(note.split()) if isinstance(note, str) else ""
+    combined = f"{lead} | note: {trimmed}" if trimmed else lead
+    return combined[:MAX_DECISION_NOTE_CHARS]
+
+
 class CitadelHttpClient:
     def __init__(
         self,
@@ -1228,10 +1288,15 @@ def create_mcp_server(
         tags: list[str] | None = None,
         session_id: str | None = None,
         cognify: bool = True,
+        user_approval: str | None = None,
     ) -> dict[str, Any]:
         """Stage durable context in the caller's personal seat node. Requires writer access.
 
-        **Always ask the user for explicit approval before calling this tool.**
+        **Always ask the user for explicit approval before calling this tool,
+        then pass their approving reply (a short quote, e.g. "yes, save that")
+        as `user_approval` so the confirmation is recorded with the request.**
+        A call without `user_approval` is reported in the result as carrying no
+        stated user confirmation.
 
         Seat-writer tokens: writes go to your personal node only (seat:{slug}). Do not
         pass `dataset` or Central/org tags — the server rejects them for seat MCP.
@@ -1249,18 +1314,23 @@ def create_mcp_server(
         def post_ingest() -> dict[str, Any]:
             normalized_data = _require_non_empty(data, "data")
             _validate_ingest_size(normalized_data)
+            approval = _normalized_approval(user_approval)
             try:
-                return resolve_client(ctx).post(
-                    "/ingest",
-                    {
-                        "data": normalized_data,
-                        "dataset": dataset,
-                        "tags": tags or [],
-                        "session_id": session_id,
-                        "cognify": cognify,
-                    },
-                    tool_name="citadel_ingest",
-                    timeout=_ingest_cognify_timeout() if cognify else None,
+                return _with_approval_signal(
+                    resolve_client(ctx).post(
+                        "/ingest",
+                        {
+                            "data": normalized_data,
+                            "dataset": dataset,
+                            "tags": tags or [],
+                            "session_id": session_id,
+                            "cognify": cognify,
+                            "user_approval": approval,
+                        },
+                        tool_name="citadel_ingest",
+                        timeout=_ingest_cognify_timeout() if cognify else None,
+                    ),
+                    approval,
                 )
             except CitadelMcpTimeout as exc:
                 # An expired budget proves only that no response arrived. The
@@ -1270,8 +1340,11 @@ def create_mcp_server(
                 # retry a write that had landed, duplicating it. Report what is
                 # known instead: submitted, outcome unconfirmed, here is how to
                 # settle it.
-                return _unconfirmed_ingest(
-                    normalized_data, tags or [], dataset, exc.timeout_s
+                return _with_approval_signal(
+                    _unconfirmed_ingest(
+                        normalized_data, tags or [], dataset, exc.timeout_s
+                    ),
+                    approval,
                 )
 
         return await _call_async(
@@ -1287,10 +1360,15 @@ def create_mcp_server(
         transcript_path: str | None = None,
         capture_roots: list[str] | None = None,
         has_tool_errors: bool = False,
+        user_approval: str | None = None,
     ) -> dict[str, Any]:
         """Volunteer a Shared Session Trace for teammates to find via search.
 
-        **Always ask the user for explicit approval before calling this tool.**
+        **Always ask the user for explicit approval before calling this tool,
+        then pass their approving reply (a short quote) as `user_approval` so
+        the confirmation is recorded with the request.** A call without
+        `user_approval` is reported in the result as carrying no stated user
+        confirmation.
 
         Provide either ``data`` (Compact Session Context markdown) or a local
         ``transcript_path`` to distill on this machine. Pass ``capture_roots``
@@ -1326,15 +1404,20 @@ def create_mcp_server(
                 raise ToolError("Provide data or a readable transcript_path.")
 
             _validate_ingest_size(payload_data)
-            return resolve_client(ctx).post(
-                "/api/share-session",
-                {
-                    "data": payload_data,
-                    "cwd": normalized_cwd,
-                    "capture_roots": roots,
-                    "has_tool_errors": tool_errors,
-                },
-                tool_name="citadel_share_session",
+            approval = _normalized_approval(user_approval)
+            return _with_approval_signal(
+                resolve_client(ctx).post(
+                    "/api/share-session",
+                    {
+                        "data": payload_data,
+                        "cwd": normalized_cwd,
+                        "capture_roots": roots,
+                        "has_tool_errors": tool_errors,
+                        "user_approval": approval,
+                    },
+                    tool_name="citadel_share_session",
+                ),
+                approval,
             )
 
         return await _call_async("citadel_share_session", post_share)
@@ -1347,10 +1430,15 @@ def create_mcp_server(
         tags: list[str] | None = None,
         source_url: str | None = None,
         dataset: str | None = None,
+        user_approval: str | None = None,
     ) -> dict[str, Any]:
         """Add a titled Vault Contribution through the Learning Process.
 
-        **Always ask the user for explicit approval before calling this tool.**
+        **Always ask the user for explicit approval before calling this tool,
+        then pass their approving reply (a short quote) as `user_approval` so
+        the confirmation is recorded with the request.** A call without
+        `user_approval` is reported in the result as carrying no stated user
+        confirmation.
 
         Not available to seat-writer MCP tokens (403). Seat devs use `citadel_ingest`
         for personal notes after user approval. Central contributions use this path
@@ -1361,16 +1449,21 @@ def create_mcp_server(
             normalized_title = _require_non_empty(title, "title")
             normalized_content = _require_non_empty(content, "content")
             _validate_ingest_size(normalized_content)
-            return resolve_client(ctx).post(
-                "/api/contribute",
-                {
-                    "title": normalized_title,
-                    "content": normalized_content,
-                    "tags": tags or [],
-                    "source_url": source_url,
-                    "dataset": dataset,
-                },
-                tool_name="citadel_contribute",
+            approval = _normalized_approval(user_approval)
+            return _with_approval_signal(
+                resolve_client(ctx).post(
+                    "/api/contribute",
+                    {
+                        "title": normalized_title,
+                        "content": normalized_content,
+                        "tags": tags or [],
+                        "source_url": source_url,
+                        "dataset": dataset,
+                        "user_approval": approval,
+                    },
+                    tool_name="citadel_contribute",
+                ),
+                approval,
             )
 
         return await _call_async("citadel_contribute", post_contribute)
@@ -1541,16 +1634,30 @@ def create_mcp_server(
         item_id: str,
         ctx: Context,
         note: str | None = None,
+        user_approval: str | None = None,
     ) -> dict[str, Any]:
-        """Approve a pending promotion item. Requires explicit user confirmation first."""
+        """Approve a pending promotion item. Requires explicit user confirmation first.
+
+        Ask the user, then pass their approving reply (a short quote, e.g.
+        "yes, promote it") as `user_approval`. The decision note written to the
+        node's audit trail leads with that signal, and reads "user approval:
+        not stated by calling agent" when the call omits it.
+        """
         normalized_id = _require_non_empty(item_id, "item_id")
+        approval = _normalized_approval(user_approval)
 
         def approve() -> dict[str, Any]:
-            payload = {"note": note} if note else {}
-            return resolve_client(ctx).post(
-                f"/api/promotion/pending/{quote(normalized_id, safe='')}/approve",
-                payload,
-                tool_name="citadel_promotion_approve",
+            payload = {
+                "note": _decision_note(approval, note),
+                "user_approval": approval,
+            }
+            return _with_approval_signal(
+                resolve_client(ctx).post(
+                    f"/api/promotion/pending/{quote(normalized_id, safe='')}/approve",
+                    payload,
+                    tool_name="citadel_promotion_approve",
+                ),
+                approval,
             )
 
         return await _call_async("citadel_promotion_approve", approve)
@@ -1560,16 +1667,30 @@ def create_mcp_server(
         item_id: str,
         ctx: Context,
         note: str | None = None,
+        user_approval: str | None = None,
     ) -> dict[str, Any]:
-        """Reject a pending promotion item. Requires explicit user confirmation first."""
+        """Reject a pending promotion item. Requires explicit user confirmation first.
+
+        Ask the user, then pass their approving reply (a short quote) as
+        `user_approval`. The decision note written to the node's audit trail
+        leads with that signal, and reads "user approval: not stated by calling
+        agent" when the call omits it.
+        """
         normalized_id = _require_non_empty(item_id, "item_id")
+        approval = _normalized_approval(user_approval)
 
         def reject() -> dict[str, Any]:
-            payload = {"note": note} if note else {}
-            return resolve_client(ctx).post(
-                f"/api/promotion/pending/{quote(normalized_id, safe='')}/reject",
-                payload,
-                tool_name="citadel_promotion_reject",
+            payload = {
+                "note": _decision_note(approval, note),
+                "user_approval": approval,
+            }
+            return _with_approval_signal(
+                resolve_client(ctx).post(
+                    f"/api/promotion/pending/{quote(normalized_id, safe='')}/reject",
+                    payload,
+                    tool_name="citadel_promotion_reject",
+                ),
+                approval,
             )
 
         return await _call_async("citadel_promotion_reject", reject)
