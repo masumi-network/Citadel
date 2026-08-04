@@ -223,9 +223,17 @@ def _clear_cognee_budget_caches() -> None:
         )
         return
 
-    get_embedding_config.cache_clear()
-    create_embedding_engine.cache_clear()
-    _create_vector_engine.cache_clear()
+    try:
+        get_embedding_config.cache_clear()
+        create_embedding_engine.cache_clear()
+        _create_vector_engine.cache_clear()
+    except Exception:
+        # Same degradation as the import guard above: a cognee bump that stops
+        # wrapping any of these in ``lru_cache`` must not break every write.
+        logger.exception(
+            "Could not clear cognee's embedding caches; the chunk budget may not "
+            "have taken effect in this process"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +348,8 @@ def _untruncated_counter(engine: Any) -> Callable[[str], int] | None:
     cached = getattr(engine, "_citadel_window_counter", None)
     if cached is not None:
         return cached
+    if getattr(engine, "_citadel_window_counter_failed", False):
+        return None
 
     tokenizer = _model_tokenizer(engine)
     if tokenizer is None:
@@ -349,8 +359,15 @@ def _untruncated_counter(engine: Any) -> Callable[[str], int] | None:
 
         clone = Tokenizer.from_str(tokenizer.to_str())
         clone.no_truncation()
-    except Exception:  # pragma: no cover - tokenizer shape changed
+    except Exception:
+        # Cache the failure too: without this marker every embed batch repeats
+        # the clone attempt and logs another traceback, so one bad cognify pass
+        # buries the log under identical stack traces.
         logger.exception("Could not build an untruncated counter for the embed detector")
+        try:
+            engine._citadel_window_counter_failed = True
+        except Exception:  # pragma: no cover - slotted engine
+            pass
         return None
 
     def count(text: str) -> int:

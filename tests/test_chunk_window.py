@@ -217,7 +217,6 @@ def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_
     clearing the config cache left it at 8191, clearing the embedding-engine cache
     as well left it at 8191, and only clearing the vector-engine cache moved it.
     """
-    from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
     from cognee.infrastructure.llm.utils import get_max_chunk_tokens
 
     # A cheap engine keeps this off the network and off the ONNX loader while
@@ -230,23 +229,30 @@ def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_
     monkeypatch.delenv(chunk_window.COGNEE_BUDGET_ENV, raising=False)
     monkeypatch.delenv(chunk_window.CHUNK_BUDGET_ENV, raising=False)
     chunk_window.reset_applied_budget()
-    get_embedding_config.cache_clear()
+    # Inherit no cache state: this test depends on all three caches, not just the
+    # config one, so an engine an earlier test left warm would decide `warm` here.
+    chunk_window._clear_cognee_budget_caches()
+    try:
+        # A cognee operation runs BEFORE the guard, warming every cache at 8191.
+        warm = get_max_chunk_tokens()
+        assert warm > chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS, (
+            f"expected the un-clamped default to be larger than the budget, got {warm}"
+        )
 
-    # A cognee operation runs BEFORE the guard, warming every cache at 8191.
-    warm = get_max_chunk_tokens()
-    assert warm > chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS, (
-        f"expected the un-clamped default to be larger than the budget, got {warm}"
-    )
+        monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "256")
+        applied = chunk_window.apply_chunk_budget()
 
-    monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "256")
-    applied = chunk_window.apply_chunk_budget()
-
-    assert applied == 256
-    assert os.environ[chunk_window.COGNEE_BUDGET_ENV] == "256"
-    assert get_max_chunk_tokens() == 256, (
-        "the clamp did not reach the real chunk budget: a warm create_vector_engine "
-        "entry is still serving an embedding engine built at the old budget"
-    )
+        assert applied == 256
+        assert os.environ[chunk_window.COGNEE_BUDGET_ENV] == "256"
+        assert get_max_chunk_tokens() == 256, (
+            "the clamp did not reach the real chunk budget: a warm create_vector_engine "
+            "entry is still serving an embedding engine built at the old budget"
+        )
+    finally:
+        # Export no cache state either: the engine above was built for openai +
+        # lancedb at budget 256 under monkeypatched env, and monkeypatch's env
+        # restore does not evict it for the next test.
+        chunk_window._clear_cognee_budget_caches()
 
 
 def test_an_explicit_cognee_budget_is_respected(monkeypatch: Any) -> None:
@@ -614,6 +620,57 @@ def test_the_refusal_log_line_cannot_be_forged_by_the_dataset_name(
     for message in messages:
         assert "\n" not in message, "a caller-supplied value opened a new log line"
     assert any("\\n" in message for message in messages), "the value must survive, escaped"
+
+
+def test_counter_build_failure_is_cached_not_repeated(caplog: Any) -> None:
+    """One broken tokenizer clone must not log one traceback per embed batch.
+
+    ``_untruncated_counter`` cached only the success. On a persistent clone
+    failure every embed batch repeated the ``to_str()``, the failed
+    ``Tokenizer.from_str`` and the ``logger.exception``, so one bad cognify pass
+    buried the log under identical stack traces.
+    """
+
+    class _BadTokenizer:
+        def to_str(self) -> str:
+            return "not a tokenizer serialization"
+
+    class _Model:
+        tokenizer = _BadTokenizer()
+
+    class _TextEmbedding:
+        model = _Model()
+
+    class _Engine:
+        embedding_model = _TextEmbedding()
+
+    engine = _Engine()
+    with caplog.at_level(logging.ERROR, logger="kb.chunk_window"):
+        assert chunk_window._untruncated_counter(engine) is None
+        assert chunk_window._untruncated_counter(engine) is None
+
+    failures = [rec for rec in caplog.records if "untruncated counter" in rec.getMessage()]
+    assert len(failures) == 1, "the second call must return the cached failure silently"
+
+
+def test_cache_clear_failure_is_contained(monkeypatch: Any, caplog: Any) -> None:
+    """A cognee bump that unwraps these callables must degrade, not break every write.
+
+    The import guard in ``_clear_cognee_budget_caches`` already logs and returns;
+    the ``cache_clear()`` calls sat outside it, so a symbol that stops being
+    ``lru_cache``-wrapped would raise ``AttributeError`` out of
+    ``apply_chunk_budget`` on every cognee operation.
+    """
+    import cognee.infrastructure.databases.vector.create_vector_engine as cve
+
+    def _plain(*args: Any, **kwargs: Any) -> None:  # no .cache_clear attribute
+        return None
+
+    monkeypatch.setattr(cve, "_create_vector_engine", _plain)
+    with caplog.at_level(logging.ERROR, logger="kb.chunk_window"):
+        chunk_window._clear_cognee_budget_caches()  # must not raise
+
+    assert any("chunk budget may not" in rec.getMessage() for rec in caplog.records)
 
 
 def test_word_segmentation_agrees_with_cognee() -> None:
