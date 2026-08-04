@@ -508,6 +508,12 @@ class LinearSyncer:
         skipped_unchanged = 0
         mirrors: dict[str, list[str]] = {}
         written_mirror_datasets: list[str] = []
+        # Tracked independently of central_outcome (the workspace digest's own
+        # result): the digest and each issue's Central note are separate
+        # learning.learn() calls, so the digest can be blocked while an
+        # unrelated issue's Central write still lands. touched_datasets must
+        # reflect that real write, not just the digest's fate.
+        central_issue_written = False
         for issue in issues:
             changed = issue.id in changed_ids
             mirror_dataset = resolve_mirror_dataset(issue, email_index, linear_user_map=user_map)
@@ -542,6 +548,7 @@ class LinearSyncer:
                         tier="light",
                         defer_cognify=True,
                     )
+                    central_issue_written = True
                 except SecretContentError as exc:
                     central_blocked = True
                     blocked.append(issue.identifier)
@@ -618,7 +625,7 @@ class LinearSyncer:
         # fold in) or inline cognify is suppressed (the evolve Phase-1 subprocess
         # is add-only and the web cognifies in Phase 2 as the sole Kuzu writer, #47).
         touched_datasets: list[str] = []
-        if central_outcome is not None:
+        if central_outcome is not None or central_issue_written:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
         if touched_datasets and not _suppress_inline_cognify():
@@ -697,7 +704,12 @@ class LinearSyncer:
             "last_error": None,  # clear any prior failure on a successful sync
             "last_attempt_at": utc_now(),
             "auto_map_error": auto_map_error,
-            "issues": [asdict(issue) for issue in issues],
+            # Scanner-blocked issues are excluded here, not just from Central/
+            # mirror writes: issues_for_scope() reads this list directly, so a
+            # blocked issue's title/description landing here would re-serve
+            # refused content through Linear search — identifier only (via
+            # `blocked` above), never content.
+            "issues": [asdict(issue) for issue in issues if issue.identifier not in blocked],
             "mirrors": mirrors,
         }
         self._save_state(payload)
