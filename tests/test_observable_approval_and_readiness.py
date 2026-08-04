@@ -228,6 +228,41 @@ def test_the_mcp_client_puts_the_confirmation_on_the_wire(
     assert "X-citadel-user-confirmed" not in seen[2]
 
 
+@pytest.mark.parametrize(
+    ("tool", "args", "kwargs"),
+    [
+        ("citadel_ingest", ("a durable note", None), {}),
+        ("citadel_contribute", ("A title", "Some content", None), {}),
+        ("citadel_promotion_approve", ("promo_1", None), {}),
+        ("citadel_promotion_reject", ("promo_1", None), {}),
+        (
+            "citadel_share_session",
+            (None, "/repo"),
+            {"data": "# Compact Session Context", "capture_roots": ["/repo"]},
+        ),
+    ],
+)
+def test_each_tool_hands_its_confirmation_to_the_client(
+    tool: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> None:
+    """The connective tissue between "the tool accepts it" and "the wire carries it".
+
+    A tool that takes ``user_confirmed`` and drops it on the floor satisfies
+    both of the tests either side of this one.
+    """
+    from test_mcp_server import FakeHttpClient, run_tool
+
+    from kb.mcp_server import create_mcp_server
+
+    http = FakeHttpClient()
+    server = create_mcp_server(http)
+
+    run_tool(server, tool, *args, user_confirmed=True, **kwargs)
+
+    assert http.posts, f"{tool} made no POST"
+    assert http.posts[-1]["user_confirmed"] is True
+
+
 @pytest.mark.asyncio
 async def test_promotion_approve_records_the_confirmation_in_its_audit_detail(
     tmp_path: Path,
