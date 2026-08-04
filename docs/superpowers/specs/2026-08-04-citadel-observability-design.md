@@ -36,8 +36,8 @@ are one missing capability.
 
 So v1's first user is us, debugging the vault. The same pipes serve seats later.
 That ordering means the work pays off against current release blockers instead of
-competing with them, and it is independent of the read-boundary direction
-ADR-0021 proposes, because it introduces no new content-bearing read surface.
+competing with them, and it can ship while cross-seat isolation is still broken,
+because it introduces no new content-bearing read surface.
 
 ## Decisions
 
