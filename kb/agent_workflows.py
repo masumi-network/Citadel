@@ -291,10 +291,45 @@ def shape_prepare_pr_context(
     }
 
 
-def normalize_local_search_results(results: Any) -> dict[str, Any]:
-    """Wrap local Citadel.search list into a payload shape_search_payload understands."""
+def _with_local_provenance(results: list[Any], dataset: str | None) -> list[Any]:
+    """Stamp each raw hit with the dataset it was actually read out of.
+
+    ``Citadel.search`` returns cognee's dicts untouched, so nothing downstream
+    could tell which dataset a local hit came from. ``infer_trust_tier`` /
+    ``infer_doc_type`` read exactly that field, so every local hit — including a
+    genuine session trace — came back ``unattested`` / ``other``, indistinguishable
+    from a hit that really has no provenance. The HTTP route has always passed the
+    dataset it read (``with_result_metadata``); this gives the local path the same
+    observed signal instead of a silent default.
+
+    Only a MISSING envelope is filled in: a hit that already carries provenance
+    keeps it, and no field beyond the dataset is invented here.
+    """
+    if not dataset:
+        return results
+    stamped: list[Any] = []
+    for item in results:
+        if isinstance(item, dict) and not isinstance(item.get("_citadel"), dict):
+            stamped.append({**item, "_citadel": {"dataset": dataset}})
+        else:
+            stamped.append(item)
+    return stamped
+
+
+def normalize_local_search_results(results: Any, *, dataset: str | None = None) -> dict[str, Any]:
+    """Wrap local Citadel.search list into a payload shape_search_payload understands.
+
+    ``dataset`` is the dataset ``Citadel.search`` actually searched. Pass it: it
+    is the only attested provenance signal the local path has, and without it
+    every hit is reported as unattested regardless of what it is.
+    """
     if isinstance(results, dict) and "results" in results:
         return results
     if isinstance(results, list):
-        return {"results": results, "timed_out": False, "truncated": False}
-    return {"results": [], "note": "unexpected local search payload"}
+        return {
+            "results": _with_local_provenance(results, dataset),
+            "dataset": dataset,
+            "timed_out": False,
+            "truncated": False,
+        }
+    return {"results": [], "dataset": dataset, "note": "unexpected local search payload"}
