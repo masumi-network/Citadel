@@ -1514,7 +1514,8 @@ class TestReportCoversTheNewMetrics:
             {
                 "window": {
                     "head_recall_at_5": 0.667, "tail_recall_at_5": 0.0,
-                    "window_penalty": 0.667, "pairs_complete": 18,
+                    "tail_recall_given_head_at_5": 0.0, "window_penalty": 0.667,
+                    "pairs_complete": 18, "pairs_head_reachable": 11,
                 },
                 "ranking": {"rank_inversion_rate": 0.63, "answers_ranked": 19},
             }
@@ -1531,3 +1532,82 @@ class TestReportCoversTheNewMetrics:
         markdown = sb.build_markdown_report(self._run({}))
         assert "not measured in this run" in markdown
         assert "n/a (not measured)" not in markdown.split("head_recall_at_5")[1][:80]
+
+
+class TestTailRecallIsConditionedOnAReachableDocument:
+    """The number that survives the obvious objection: a document whose head
+    quote ALSO missed may never have been indexed, so its tail miss says
+    nothing about where the text sits."""
+
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def _rows(self, pairs):
+        rows = [
+            sb.score_question(
+                {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0},
+                [],
+                {},
+            ),
+            sb.score_question(
+                question("q1", spans=[self.SPAN]),
+                [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+                {},
+            ),
+        ]
+        for pair, (head_pass, tail_pass) in pairs.items():
+            for role, passed in (("head", head_pass), ("tail", tail_pass)):
+                q = question(f"{pair}{role[0]}", spans=[self.SPAN])
+                q.update({"category": f"window_{role}", "window_role": role,
+                          "window_pair": pair})
+                hits = (
+                    [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)]
+                    if passed
+                    else [scored_hit(PATH_OTHER, BLOB_B, "unrelated filler", 0.1)]
+                )
+                rows.append(sb.score_question(q, hits, {}))
+        return rows
+
+    def test_unreachable_documents_are_excluded_from_the_conditional(self):
+        # w01 reachable, tail missed. w02 unreachable on both sides.
+        summary = sb.summarize(
+            self._rows({"w01": (True, False), "w02": (False, False)}), []
+        )
+        window = summary["window"]
+        assert window["pairs_complete"] == 2
+        assert window["pairs_neither"] == 1
+        assert window["tail_recall_at_5"] == 0.0          # 0 of 2, pessimistic
+        assert window["pairs_head_reachable"] == 1        # only w01 is evidence
+        assert window["tail_recall_given_head_at_5"] == 0.0
+
+    def test_conditional_counts_only_proven_reachable_documents(self):
+        summary = sb.summarize(
+            self._rows(
+                {"w01": (True, True), "w02": (True, False), "w03": (False, False)}
+            ),
+            [],
+        )
+        window = summary["window"]
+        assert window["pairs_head_reachable"] == 2
+        assert window["tail_recall_given_head_at_5"] == 0.5   # 1 of 2
+        assert window["tail_recall_at_5"] == round(1 / 3, 4)  # 1 of 3, pessimistic
+
+    def test_conditional_is_none_when_no_head_ever_retrieved(self):
+        summary = sb.summarize(self._rows({"w01": (False, False)}), [])
+        assert summary["window"]["tail_recall_given_head_at_5"] is None
+
+
+class TestRunRecordsWhichFrozenSetItAnswered:
+    def test_fingerprint_carries_the_pin_not_just_the_file_hash(self, tmp_path):
+        questions = [{"id": "q1", "question": "text", "expected_recall": 1}]
+        path = tmp_path / "golden.json"
+        path.write_text(json.dumps({"version": 5, "questions": questions}))
+        reformatted = tmp_path / "golden2.json"
+        reformatted.write_text(json.dumps({"questions": questions, "version": 5}, indent=4))
+        # Reformatting moves the file hash but must NOT move the pin: the run
+        # answered the same questions.
+        assert hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(
+            reformatted.read_bytes()
+        ).hexdigest()
+        assert sb.questions_pin(sb.load_questions(path)) == sb.questions_pin(
+            sb.load_questions(reformatted)
+        )

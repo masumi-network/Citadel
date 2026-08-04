@@ -763,6 +763,17 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
         "window": {
             "head_recall_at_5": round(head_recall, 4) if head_recall is not None else None,
             "tail_recall_at_5": round(tail_recall, 4) if tail_recall is not None else None,
+            # The figure that survives the obvious objection. A document whose
+            # HEAD quote also missed may simply not be in the index at all, and
+            # its tail miss says nothing about the window. Restricting to pairs
+            # whose head retrieved keeps only documents proven reachable, so a
+            # tail miss there is positional and nothing else.
+            "tail_recall_given_head_at_5": (
+                round(both_pass / (both_pass + head_only_pass), 4)
+                if (both_pass + head_only_pass)
+                else None
+            ),
+            "pairs_head_reachable": both_pass + head_only_pass,
             "window_penalty": (
                 round(head_recall - tail_recall, 4)
                 if head_recall is not None and tail_recall is not None
@@ -1053,7 +1064,13 @@ def build_fingerprint(
         "census": corpus_census(make_corpus_fetcher(node_url, token, timeout)),
         "content": content,
         "harness_git_sha": harness_git_sha(),
+        # Two different hashes on purpose. questions_sha256 is over the FILE
+        # bytes, so reformatting or a comment moves it. questions_pin is over
+        # the canonical question list, so it moves only when a question really
+        # changes. A run records both: the pin says which frozen set was
+        # answered, the file hash says whether the file was touched at all.
         "questions_sha256": hashlib.sha256(questions_path.read_bytes()).hexdigest(),
+        "questions_pin": questions_pin(load_questions(questions_path)),
         "python_version": platform.python_version(),
     }
 
@@ -1625,6 +1642,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"{'node_version':>28}: {fingerprint['api'].get('node_version')}")
     print(f"{'harness_git_sha':>28}: {fingerprint['harness_git_sha']}")
     print(f"{'questions_sha256':>28}: {fingerprint['questions_sha256'][:16]}...")
+    print(f"{'questions_pin (frozen set)':>28}: {fingerprint.get('questions_pin', '')[:16]}...")
 
     census = fingerprint.get("census") or {}
     print("\n--- corpus census (/api/corpus) ---")
@@ -1778,6 +1796,13 @@ METRIC_DEFINITIONS: dict[str, str] = {
         "much of a document stops being reachable purely because the text sits "
         "later in it. 0 means position does not matter"
     ),
+    "tail_recall_given_head_at_5": (
+        "tail_recall_at_5 restricted to documents whose head quote DID "
+        "retrieve, so every document counted is one the index demonstrably "
+        "holds. This is the figure to quote: a document missing from both "
+        "sides may simply never have been indexed, and its tail miss is not "
+        "evidence about position"
+    ),
     "rank_inversion_rate": (
         "share of answers the node ranked BELOW a hit that the node ITSELF "
         "reports matched a strictly smaller share of the query terms. The "
@@ -1798,6 +1823,7 @@ REPORT_METRICS: list[tuple[str, str, str]] = [
     ("quality", "header_credit_rate", "spans"),
     ("window", "head_recall_at_5", "window_pairs"),
     ("window", "tail_recall_at_5", "window_pairs"),
+    ("window", "tail_recall_given_head_at_5", "head_reachable"),
     ("window", "window_penalty", "window_pairs"),
     ("ranking", "rank_inversion_rate", "ranked"),
 ]
@@ -1813,6 +1839,8 @@ def _metric_sample_count(run: dict[str, Any], n_source: str) -> Any:
         return counts.get("questions_blocked_probe")
     if n_source == "window_pairs":
         return ((run.get("summary") or {}).get("window") or {}).get("pairs_complete")
+    if n_source == "head_reachable":
+        return ((run.get("summary") or {}).get("window") or {}).get("pairs_head_reachable")
     if n_source == "ranked":
         return ((run.get("summary") or {}).get("ranking") or {}).get("answers_ranked")
     if n_source == "dup_rows":
