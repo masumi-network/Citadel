@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -298,6 +299,9 @@ async def test_linear_sync_defers_coalesced_cognify_when_inline_suppressed(
     result = await syncer.run(force=True)
     assert result["ok"] is True
     assert scheduled == []  # suppressed: Phase 2 cognifies, not the subprocess
+    # And the pass says so: the graph write is deliberately deferred, so its
+    # outcome was not observed here.
+    assert result["central_ingested"] == "suppressed"
 
 
 @pytest.mark.asyncio
@@ -339,6 +343,71 @@ async def test_linear_sync_awaits_coalesced_cognify_when_requested(
     assert result["ok"] is True
     assert awaited == [["masumi-network"]]  # awaited inline over Central (no mirrors)
     assert scheduled == []  # awaited, not backgrounded
+
+
+# --- central_ingested reports an OBSERVED outcome, never a request -----------
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_reports_queued_not_confirmed_on_background_cognify(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    """central_ingested used to echo cognee.add() acceptance as True, but
+    add() only QUEUES the graph write (cognify never runs synchronously), so
+    a pass whose graph write later died silently was byte-identical to a
+    working one. On the scheduled path the pass observes nothing beyond the
+    request, and must report exactly that."""
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+
+    result = await syncer.run(force=True)
+    assert result["ok"] is True
+    assert scheduled  # the background cognify was requested...
+    # ...and the report claims no more than the request:
+    assert result["central_ingested"] == "queued_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_awaited_cognify_success_and_failure_report_differently(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    """The awaited path OBSERVES the coalesced cognify, so a completed graph
+    write and a failed one must produce different central_ingested values;
+    the two passes were previously indistinguishable."""
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "s.json"),
+        access_store_path=str(tmp_path / "a.json"),
+    )
+    citadel = Citadel(config)
+
+    async def fake_learn(self: Any, data: str, **_: Any) -> Any:
+        class Outcome:
+            class ingest:
+                accepted = True
+
+        return Outcome()
+
+    monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
+
+    async def good_cognify(*, datasets: Any, force: bool = False) -> dict[str, Any]:
+        return {"ok": True}
+
+    monkeypatch.setattr(citadel.cognee, "cognify", good_cognify)
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues))
+    healthy = await syncer.run(force=True, await_cognify=True)
+    assert healthy["ok"] is True
+    assert healthy["central_ingested"] == "cognified"
+
+    async def dead_cognify(*, datasets: Any, force: bool = False) -> dict[str, Any]:
+        raise RuntimeError("graph writer is down")
+
+    monkeypatch.setattr(citadel.cognee, "cognify", dead_cognify)
+    broken = await syncer.run(force=True, await_cognify=True)
+    # The pass still succeeds (the adds landed; cognify is a follow-on)...
+    assert broken["ok"] is True
+    # ...but the report now says what was actually observed.
+    assert broken["central_ingested"] == "cognify_failed"
+    assert broken["central_ingested"] != healthy["central_ingested"]
 
 
 @pytest.mark.asyncio
@@ -696,6 +765,238 @@ async def test_linear_sync_recovers_from_future_dated_stored_cursor(
     assert second["written_count"] == 2  # full pass, nothing silently skipped
     healed = json.loads(state_path.read_text(encoding="utf-8"))
     assert healed["last_seen_updated_at"] == "2026-06-25T10:00:00Z"
+
+
+# --- #117: a scanner-blocked issue must not kill the rest of the pass -------
+
+
+class FakeCogneeForScanTest:
+    """Minimal real-scan-path fake: records every write so a blocked write's
+    text can be asserted absent, without touching a real Cognee backend."""
+
+    def __init__(self) -> None:
+        self.remember_calls: list[dict[str, Any]] = []
+        self.scheduled_datasets: list[list[str]] = []
+
+    async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+        self.remember_calls.append({"data": data, **kwargs})
+        return {"ok": True}
+
+    async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        return {"cognified": True}
+
+    def schedule_cognify(self, datasets: Any) -> None:
+        self.scheduled_datasets.append(list(datasets))
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_contains_scanner_blocked_issue(tmp_path: Any) -> None:
+    """#117: LinearSyncer must route through the same ingest gate as its
+    sibling syncers AND contain a block the way they do — a scanner-blocked
+    issue must be skipped (never stored), while the rest of the pass still
+    lands. Uses the REAL LearningProcess/security_scan (no monkeypatch of
+    .learn) so this proves the gate actually runs, not that a mock was called.
+    """
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+        access_store_path=str(tmp_path / "access.json"),
+    )
+    fake_cognee = FakeCogneeForScanTest()
+    citadel = Citadel(config, cognee=fake_cognee)
+    store = AccessStore(config.access_store_path)
+    store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
+
+    # AWS's own published example key (docs.aws.amazon.com) — shape-valid,
+    # never a real credential (memory: never use real credentials as fixtures).
+    planted_secret = "AKIAIOSFODNN7EXAMPLE"
+    issues = [
+        {
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            "title": "Ordinary issue",
+            "description": "Nothing sensitive here.",
+            "url": "https://linear.app/acme/issue/ENG-1",
+            "priority": 2,
+            "updatedAt": "2026-06-25T10:00:00Z",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": None,
+        },
+        {
+            "id": "issue-2",
+            "identifier": "ENG-2",
+            "title": "Leaked credential",
+            "description": f"AWS key {planted_secret} leaked in a log paste.",
+            "url": "https://linear.app/acme/issue/ENG-2",
+            "priority": 1,
+            "updatedAt": "2026-06-25T09:00:00Z",
+            "state": {"name": "Backlog", "type": "backlog"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": {"id": "user-john", "name": "John Doe", "email": "john@example.com"},
+        },
+    ]
+
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(issues), access_store=store)
+    result = await syncer.run(force=True)
+
+    # The pass as a whole must not abort: the unaffected issue still lands.
+    assert result["ok"] is True
+    assert "ENG-2" in result.get("blocked", [])
+    assert result.get("blocked_count", 0) >= 1
+
+    # The planted secret must never reach the store, in ANY write (digest,
+    # Central issue note, or seat mirror note).
+    stored_texts = [str(call.get("data", "")) for call in fake_cognee.remember_calls]
+    assert not any(planted_secret in text for text in stored_texts)
+
+    # The unaffected issue's Central write still happened.
+    central_datasets = [
+        call.get("dataset_name")
+        for call in fake_cognee.remember_calls
+        if "ENG-1" in str(call.get("data", ""))
+    ]
+    assert "masumi-network" in central_datasets
+
+    # The blocked issue must not be recorded as mirrored to john — the mirror
+    # note was never actually written for it.
+    assert "ENG-2" not in result["mirrors"].get(seat_dataset("john"), [])
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_marks_central_touched_after_digest_rejection(
+    tmp_path: Any,
+) -> None:
+    """#117 follow-up: format_workspace_digest() carries TITLES (not
+    descriptions), so a secret in an issue's title blocks the workspace
+    digest itself (not just that issue's own Central/mirror write). A
+    sibling, unrelated issue's clean Central write must still count as a
+    real Central write: it must be cognified and it must reset the
+    write-less streak, even though central_outcome (the digest's own
+    result) stayed None. This is the workspace-digest rejection branch
+    CodeRabbit flagged as uncovered, and the touched-Central-after-partial-
+    failure bug it flagged as likely broken, exercised together.
+    """
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+        access_store_path=str(tmp_path / "access.json"),
+    )
+    fake_cognee = FakeCogneeForScanTest()
+    citadel = Citadel(config, cognee=fake_cognee)
+    store = AccessStore(config.access_store_path)
+
+    # AWS's own published example key (docs.aws.amazon.com) — shape-valid,
+    # never a real credential (memory: never use real credentials as fixtures).
+    planted_secret = "AKIAIOSFODNN7EXAMPLE"
+    issues = [
+        {
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            # Secret lives in the TITLE: format_workspace_digest() includes
+            # titles, so this poisons the digest itself, not just this
+            # issue's own note.
+            "title": f"Rotate leaked key {planted_secret}",
+            "description": "Nothing sensitive in the body.",
+            "url": "https://linear.app/acme/issue/ENG-1",
+            "priority": 2,
+            "updatedAt": "2026-06-25T10:00:00Z",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": None,
+        },
+        {
+            "id": "issue-2",
+            "identifier": "ENG-2",
+            "title": "Ordinary, unrelated issue",
+            "description": "Nothing sensitive here either.",
+            "url": "https://linear.app/acme/issue/ENG-2",
+            "priority": 1,
+            "updatedAt": "2026-06-25T09:00:00Z",
+            "state": {"name": "Backlog", "type": "backlog"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": None,
+        },
+    ]
+
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(issues), access_store=store)
+    result = await syncer.run(force=True)
+
+    assert result["ok"] is True
+    # The digest itself was rejected (title-borne secret).
+    assert "workspace-digest" in result.get("blocked", [])
+    # The poisoned issue's own Central write was refused too.
+    assert "ENG-1" in result.get("blocked", [])
+
+    # The secret must never reach the store, in any write.
+    stored_texts = [str(call.get("data", "")) for call in fake_cognee.remember_calls]
+    assert not any(planted_secret in text for text in stored_texts)
+
+    # ENG-2's clean Central write landed.
+    central_datasets = [
+        call.get("dataset_name")
+        for call in fake_cognee.remember_calls
+        if "ENG-2" in str(call.get("data", ""))
+    ]
+    assert "masumi-network" in central_datasets
+
+    # The bug: central_outcome (the digest's own result) is None, but a real
+    # Central write happened via ENG-2. Central must still be scheduled for
+    # cognify and must still reset the write-less streak.
+    assert any("masumi-network" in batch for batch in fake_cognee.scheduled_datasets)
+    state_raw = (tmp_path / "linear_state.json").read_text()
+    state = json.loads(state_raw)
+    assert state["unchanged_pass_streak"] == 0
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_blocked_issue_content_not_in_persisted_state(
+    tmp_path: Any,
+) -> None:
+    """A scanner-blocked issue's title/description must never reach the
+    persisted sync state — issues_for_scope() reads that state directly and
+    would otherwise re-serve the refused content through Linear search,
+    bypassing the scanner gate entirely. Blocked items are tracked by
+    identifier only (see the `blocked` field), never by content.
+    """
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+        access_store_path=str(tmp_path / "access.json"),
+    )
+    fake_cognee = FakeCogneeForScanTest()
+    citadel = Citadel(config, cognee=fake_cognee)
+    store = AccessStore(config.access_store_path)
+
+    # AWS's own published example key (docs.aws.amazon.com) — shape-valid,
+    # never a real credential (memory: never use real credentials as fixtures).
+    planted_secret = "AKIAIOSFODNN7EXAMPLE"
+    issues = [
+        {
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            "title": f"Rotate leaked key {planted_secret}",
+            "description": "Nothing sensitive in the body.",
+            "url": "https://linear.app/acme/issue/ENG-1",
+            "priority": 2,
+            "updatedAt": "2026-06-25T10:00:00Z",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"key": "ENG", "name": "Engineering"},
+            "assignee": None,
+        },
+    ]
+
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(issues), access_store=store)
+    result = await syncer.run(force=True)
+    assert "ENG-1" in result.get("blocked", [])
+
+    # Not in the raw persisted state file...
+    state_raw = (tmp_path / "linear_state.json").read_text()
+    assert planted_secret not in state_raw
+
+    # ...and not re-served through the org-scope read path either.
+    served = syncer.issues_for_scope(scope="org", seat_dataset_name=None)
+    assert not any(planted_secret in json.dumps(item) for item in served)
 
 
 @pytest.mark.asyncio

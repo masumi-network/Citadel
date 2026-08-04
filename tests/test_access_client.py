@@ -89,3 +89,28 @@ def test_http_error_maps_detail_and_status(monkeypatch) -> None:
         ac.create_seat(base_url="https://node.example", name="A", slug="a", key="owner-admin")
     assert excinfo.value.status == 422
     assert "already exists" in str(excinfo.value)
+
+
+def test_request_converts_read_timeout_to_client_error(monkeypatch) -> None:
+    # #116: a read-phase timeout is a bare TimeoutError (not a URLError) and
+    # escapes _request's HTTPError/URLError-only handling as a raw traceback
+    # instead of a clean AccessClientError — the same #39 bug, unbackported
+    # to this copy of the helper.
+    def boom(req: Any, timeout: float | None = None) -> None:
+        raise TimeoutError("the read operation timed out")
+
+    monkeypatch.setattr(ac._OPENER, "open", boom)
+    with pytest.raises(ac.AccessClientError) as excinfo:
+        ac.list_seats(base_url="https://node.example", key="owner-admin")
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert "timed out" in str(excinfo.value).lower()
+
+
+def test_request_converts_oserror_to_client_error(monkeypatch) -> None:
+    def boom(req: Any, timeout: float | None = None) -> None:
+        raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(ac._OPENER, "open", boom)
+    with pytest.raises(ac.AccessClientError) as excinfo:
+        ac.list_seats(base_url="https://node.example", key="owner-admin")
+    assert "connection reset by peer" in str(excinfo.value)

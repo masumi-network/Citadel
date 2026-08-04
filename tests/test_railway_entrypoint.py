@@ -513,3 +513,19 @@ def test_evolve_async_stages_are_all_coroutine_functions() -> None:
 
     for name, _, runner in run_railway.evolve_stages_async():
         assert inspect.iscoroutinefunction(runner), f"{name} is not awaitable"
+
+
+def test_cognify_via_api_converts_read_timeout_to_clean_failure(monkeypatch: Any) -> None:
+    # #116: a read-phase timeout is a bare TimeoutError, not a URLError, and
+    # would otherwise escape this helper's HTTPError/URLError-only handling
+    # as a raw traceback (the #39 bug, unbackported to this copy). The
+    # urlopen import is function-local, so patch the stdlib symbol itself.
+    import urllib.request
+
+    def boom(request: Any, timeout: int) -> None:
+        raise TimeoutError("the read operation timed out")
+
+    monkeypatch.setenv("CITADEL_ADMIN_KEY", "admin-key")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1

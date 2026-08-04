@@ -100,6 +100,10 @@ def _post_json(
         return exc.code, parsed
     except URLError as exc:
         return 599, {"detail": str(exc.reason)}
+    except TimeoutError as exc:
+        # A read-phase timeout is a bare TimeoutError, not a URLError, and
+        # would otherwise escape this handler as a raw traceback (#39/#116).
+        return 599, {"detail": f"timed out after {timeout}s: {exc}"}
 
 
 def _github_result(result: dict[str, Any]) -> dict[str, Any]:
