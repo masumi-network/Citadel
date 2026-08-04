@@ -201,6 +201,11 @@ def _cognify_via_api(url: str, *, force: bool) -> int:
     except URLError as exc:
         logger.error("Cognify API unreachable at %s: %s", endpoint, exc.reason)
         return 1
+    except TimeoutError as exc:
+        # A read-phase timeout is a bare TimeoutError, not a URLError, and
+        # would otherwise escape this handler as a raw traceback (#39/#116).
+        logger.error("Cognify API timed out after %ss: %s", _cognify_timeout(), exc)
+        return 1
 
     logger.info(
         "Cognify (API) finished: graph_before=%s graph_after=%s grew=%s",
@@ -334,8 +339,10 @@ async def _linear_sync_stage_async() -> int:
 
     No-op (exit 0) when ``CITADEL_LINEAR_API_KEY`` is unset, so the stage is safe
     to leave enabled. The Central write lands in shared Postgres/pgvector; the
-    evolve cognify stage then folds it into the graph. Incremental (``force=False``)
-    — the explicit ``CITADEL_RUN_MODE=linear-sync`` job stays a forced full sync.
+    evolve cognify stage then folds it into the graph. Incremental
+    (``force=False``, #90): issues whose ``updatedAt`` predates the stored
+    cursor are skipped — the explicit ``CITADEL_RUN_MODE=linear-sync`` job
+    stays a forced full sync.
     """
     from kb.access import AccessStore
     from kb.linear_sync import LinearSyncer
@@ -358,8 +365,10 @@ async def _linear_sync_stage_async() -> int:
             )
             return 1
         logger.info(
-            "Linear sync stage finished: issues=%s mirrored=%s",
+            "Linear sync stage finished: issues=%s written=%s skipped_unchanged=%s mirrored=%s",
             result.get("issue_count"),
+            result.get("written_count"),
+            result.get("skipped_unchanged"),
             result.get("mirrored_count"),
         )
         return 0

@@ -2,9 +2,39 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+# Everything left in C0/C1 once the three that have readable escapes are handled.
+# \x09 (tab) and \x0a (newline) are excluded from the range because the explicit
+# replacements below have already consumed them.
+_REMAINING_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# Long enough for a dataset name, a path or a source id; short enough that no one
+# value can push the rest of a line out of a log viewer.
+DEFAULT_LOG_VALUE_LIMIT = 200
+
+
+def safe_log_value(value: object, *, limit: int = DEFAULT_LOG_VALUE_LIMIT) -> str:
+    """Render an untrusted value as one line of a log record.
+
+    A log line is a record this project reads back as evidence. A value carrying
+    ``\\n`` writes a second line that looks exactly like a real one, and a value
+    carrying ``\\r`` can overwrite the first on a terminal. Callers reach this with
+    request-supplied strings: dataset names, tags, paths, source ids.
+
+    Escapes rather than strips, so ``"a\\nb"`` and ``"ab"`` stay distinguishable in
+    the record, and bounds the result so a large value cannot bury the fields
+    logged after it.
+    """
+    text = str(value).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+    text = text.replace("\t", "\\t")
+    text = _REMAINING_CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text)
+    if len(text) > limit:
+        return f"{text[:limit]}...(+{len(text) - limit} more characters)"
+    return text
 
 
 def resolve_log_level(value: str | None = None) -> str:

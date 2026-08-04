@@ -932,7 +932,7 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["documents"] == 1
+    assert mesh.json()["stats"]["tracked_sources"] == 1
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -949,6 +949,46 @@ def test_api_uses_configured_citadel_service() -> None:
     # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
     assert updated_mesh.json()["stats"]["since_restart"]["feedback"] >= 2
     assert upgrade.status_code == 200
+
+
+def test_learning_agent_run_audit_records_gateway_skip_reason() -> None:
+    """A digest that posts nowhere must say why in the audit trail, not just that.
+
+    The response body from POST /api/learning-agent/run already carries a
+    ``reason`` on ``notifications.google_chat`` (e.g. "google_chat_disabled").
+    The audit record written for that same call is the only trace left once
+    nobody is watching the response — it must not collapse that reason down to
+    a bare ``sent: false`` with no explanation.
+    """
+    client = authed_client()
+
+    class SkippedGatewayAgent(FakeLearningAgent):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().run(**kwargs)
+            result["notifications"] = {
+                "google_chat": {
+                    "enabled": False,
+                    "sent": False,
+                    "reason": "google_chat_disabled",
+                }
+            }
+            return result
+
+    server_module.app.state.learning_agent = SkippedGatewayAgent()
+
+    response = client.post("/api/learning-agent/run", json={"post_to_chat": True})
+    assert response.status_code == 200
+    assert response.json()["notifications"]["google_chat"]["reason"] == "google_chat_disabled"
+
+    events = server_module.app.state.access_store.snapshot()["audit_events"]
+    run_events = [event for event in events if event["action"] == "learning_agent.run"]
+    assert run_events, "expected a learning_agent.run audit event"
+    detail = run_events[-1]["detail"]
+    assert detail["google_chat_sent"] is False
+    assert detail["google_chat_reason"] == "google_chat_disabled", (
+        "the audit trail must carry why the gateway did not send, not just that "
+        f"it did not: {detail}"
+    )
 
 
 def test_linear_sync_api_endpoints() -> None:
@@ -3615,6 +3655,61 @@ def test_recent_contributions_lists_audit_events(tmp_path: Any) -> None:
     assert len(payload["contributions"]) == 1
     assert payload["contributions"][0]["action"] == "contribute"
     assert payload["contributions"][0]["detail"]["title"] == "WIP: MCP docs"
+
+
+def test_recent_contributions_lists_an_mcp_ingest(tmp_path: Any) -> None:
+    """A write through MCP is a contribution, and the feed must show it.
+
+    /ingest from the MCP surface records ONLY ``mcp.citadel_ingest`` (the
+    durable ``ingest`` row is suppressed for MCP requests), and the feed
+    selected the single action ``contribute`` — so a seat that ingested through
+    MCP saw an empty "recent contributions" list right after a write that was
+    independently proven to exist.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    ingested = writer.post(
+        "/ingest",
+        json={"data": "Runbook: rotate the sync token before minting seats.", "tags": ["runbook"]},
+        headers={"X-Citadel-MCP-Tool": "citadel_ingest"},
+    )
+    assert ingested.status_code == 200
+    assert ingested.json()["accepted"] is True
+
+    recent = writer.get("/api/contributions/recent?limit=10&mine=true")
+    assert recent.status_code == 200
+    payload = recent.json()
+    actions = [event["action"] for event in payload["contributions"]]
+    assert actions == ["mcp.citadel_ingest"], payload
+
+
+def test_recent_contributions_omits_rejected_writes(tmp_path: Any) -> None:
+    """The feed lists writes that landed, not writes that were attempted.
+
+    Widening the selection past ``contribute`` pulls in surfaces that audit
+    their failures too (a secret-blocked ingest records success=False), and a
+    rejected write listed as a contribution is the same dishonesty in the
+    other direction.
+    """
+    store = AccessStore(str(tmp_path / "access.json"))
+    app.state.access_store = store
+    writer = authed_client("test-writer")
+
+    # The row a secret-blocked MCP ingest writes (kb/server.py record_mcp_audit,
+    # success=bool(result.accepted)), recorded through the same store API.
+    store.record_event(
+        action="mcp.citadel_ingest",
+        actor=None,
+        success=False,
+        dataset="seat:test-writer",
+        detail={"surface": "mcp", "operation": "ingest", "blocked": "secret_content"},
+    )
+
+    recent = writer.get("/api/contributions/recent?limit=10")
+    assert recent.status_code == 200
+    assert recent.json()["contributions"] == []
 
 
 def test_contribute_routes_through_learning_process_and_audits(tmp_path: Any) -> None:
@@ -6332,14 +6427,24 @@ def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
     client = authed_client()
 
     async def fake_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": 317, "indexed_docs": 17991}
+        return {
+            "ok": True,
+            "tracked_sources": 317,
+            "indexed_docs": 17991,
+            "indexed_edges": 131843,
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", fake_corpus_health)
 
     stats = client.get("/api/mesh").json()["stats"]
 
-    assert stats["documents"] == 317, stats
-    assert stats["indexed_chunks"] == 17991, stats
+    assert stats["tracked_sources"] == 317, stats
+    assert stats["nodes"] == 17991, stats
+    assert stats["edges"] == 131843, stats
+    # indexed_chunks duplicated `nodes` by construction and never counted a
+    # chunk, so it is gone rather than published wrong (same call as
+    # failed_chunks below).
+    assert "indexed_chunks" not in stats
     # The uptime figures are still reported, just no longer disguised as totals.
     assert "since_restart" in stats
     assert stats["since_restart"]["documents"] != 317
@@ -6357,7 +6462,13 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     client = authed_client()
 
     async def degraded_corpus_health() -> dict[str, Any]:
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": "boom"}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": "boom",
+        }
 
     monkeypatch.setattr(server_module, "_corpus_health", degraded_corpus_health)
 
@@ -6365,8 +6476,8 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
 
     assert response.status_code == 200
     stats = response.json()["stats"]
-    assert stats["documents"] is not None
-    assert stats["indexed_chunks"] is not None
+    assert stats["tracked_sources"] is not None
+    assert stats["edges"] is not None
 
 
 def test_api_mesh_activity_counters_are_scoped_not_top_level(
@@ -6677,3 +6788,112 @@ def test_corpus_census_rejects_unauthenticated_callers() -> None:
     client = TestClient(app, base_url="https://testserver")
 
     assert client.get("/api/corpus").status_code == 401
+
+
+def test_api_mesh_publishes_the_real_graph_edge_total_not_the_projection() -> None:
+    """`stats.edges` must come from the graph, not from the in-memory projection.
+
+    This pins the PRODUCER half of the #232 fix. `_corpus_health` supplies
+    `indexed_edges` and `kb/mesh.py` consumes it with a silent fallback to
+    `len(self.edges)`, so reverting the producer alone changes nothing that any
+    other test observes: every mesh unit test injects the corpus dict directly.
+    That is the shape a guard takes when it ships inert.
+
+    The projection and the graph are given deliberately different edge counts,
+    so the assertion can only pass when the real total is the one published.
+    Live production before the fix: `stats.edges` 5511 against 131843 real, and
+    5511 was byte-identical to `since_restart.projection_edges`.
+    """
+    real_edges = 131843
+
+    class PopulatedCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 21086, "edges": real_edges}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 49, "tracked_files": 69, "issue_count": 200}
+
+    client = authed_client("test-reader")
+    app.state.citadel = PopulatedCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    stats = client.get("/api/mesh").json()["stats"]
+    projection = stats["since_restart"]["projection_edges"]
+
+    assert projection != real_edges, (
+        "the fixture no longer discriminates: the projection and the graph agree, "
+        "so this test would pass with the producer reverted"
+    )
+    assert stats["edges"] == real_edges, (
+        f"stats.edges is {stats['edges']}, the in-memory projection, not the "
+        f"graph's {real_edges}. _corpus_health stopped supplying indexed_edges "
+        "and kb/mesh.py fell back silently."
+    )
+    assert stats["tracked_sources"] == 318
+
+
+def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
+    """A pass that did no work must not be stamped onto the source.
+
+    `run()` returns `skipped: True` when another pass already holds the state
+    file. That result carries no checked_at and no counts, so recording it marks
+    the source "synced" for a pass that ingested nothing: the bookkeeping-success
+    failure mode this repo has produced more than once.
+
+    The control run comes FIRST and must record. Without it this test asserts an
+    empty list against a spy that may never have been wired to the object the
+    route actually uses, which is exactly how the first version of it passed with
+    the guard removed.
+    """
+    recorded: list[dict[str, Any]] = []
+
+    class ScriptedSyncer:
+        def __init__(self, result: dict[str, Any]) -> None:
+            self._result = result
+
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_files": 0}
+
+        async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+            return dict(self._result, dry_run=dry_run)
+
+    admin = authed_client("test-admin")
+    mesh = server_module.get_mesh()
+    original = mesh.record_repo_content_sync
+
+    async def spy(config: Any, result: dict[str, Any]) -> None:
+        recorded.append(result)
+
+    mesh.record_repo_content_sync = spy  # type: ignore[method-assign]
+    try:
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {"ok": True, "enabled": True, "files_ingested": 2, "repositories": []}
+        )
+        control = admin.post("/api/repo-content-sync/run", json={})
+        assert control.status_code == 200
+        assert len(recorded) == 1, (
+            "the spy never fired on a real pass, so this test cannot detect the "
+            "defect it exists for: it is not wired to the object the route uses"
+        )
+
+        app.state.repo_content_syncer = ScriptedSyncer(
+            {
+                "ok": True,
+                "enabled": True,
+                "skipped": True,
+                "reason": "repo_content_sync_already_running",
+            }
+        )
+        response = admin.post("/api/repo-content-sync/run", json={})
+    finally:
+        mesh.record_repo_content_sync = original  # type: ignore[method-assign]
+
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert len(recorded) == 1, (
+        "a skipped pass was recorded to the mesh, stamping the source 'synced' "
+        f"with no checked_at and no counts: {recorded[1:]}"
+    )

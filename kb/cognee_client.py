@@ -13,6 +13,8 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
+from kb import chunk_window
+
 logger = logging.getLogger(__name__)
 
 # Strong refs to detached background cognify tasks so the loop does not GC them
@@ -395,6 +397,24 @@ class CogneePublicClient:
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
         self._ensure_auto_feedback_default()
+        self._ensure_chunk_budget()
+
+    def _ensure_chunk_budget(self) -> None:
+        """Size chunks for the embedder, and watch the embed boundary (#227).
+
+        cognee counts the chunk budget in GPT-4o BPE tokens and defaults it to
+        8191; the deployed embedder truncates at 512 wordpieces and raises
+        nothing. See kb/chunk_window.py for the measurement and for why the
+        budget it ships is an observation rather than a bound.
+
+        Here rather than in the deploy environment for the same reason
+        AUTO_FEEDBACK is: a variable nobody sets is not a fix. An explicit
+        CITADEL_CHUNK_BUDGET_TOKENS or EMBEDDING_MAX_COMPLETION_TOKENS still
+        wins. Both calls are idempotent, so paying for them on every cognee
+        operation costs a dictionary lookup after the first.
+        """
+        chunk_window.apply_chunk_budget()
+        chunk_window.install_embed_window_detector()
 
     def _ensure_auto_feedback_default(self) -> None:
         """Default cognee's AUTO_FEEDBACK off, because it costs an LLM call per search.

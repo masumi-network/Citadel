@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import logging
 from pathlib import Path
@@ -21,6 +21,7 @@ from kb.secure_http import open_secure
 from kb.access import CENTRAL_DATASET, SEAT_DATASET_PREFIX, AccessStore, seat_dataset
 from kb.cognee_client import _suppress_inline_cognify
 from kb.learning import LearningProcess
+from kb.security_scan import SecretContentError
 from kb.service import Citadel
 from kb.state_io import StateFileError, load_state_file, save_state_file
 
@@ -29,9 +30,27 @@ logger = logging.getLogger(__name__)
 LINEAR_API = "https://api.linear.app/graphql"
 STATE_VERSION = 1
 
+# Tolerance for ordinary clock skew between Linear's clock and ours before an
+# updatedAt counts as future-dated and is excluded from cursor advancement.
+_CURSOR_SKEW_TOLERANCE = timedelta(minutes=5)
+# Consecutive incremental passes that wrote nothing before warning that the
+# sync may be stalled rather than the workspace merely quiet.
+_UNCHANGED_STREAK_WARN = 12
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a Linear ISO-8601 timestamp; None when absent or malformed."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _linear_state_path(configured: str | None) -> str:
@@ -333,6 +352,15 @@ class LinearSyncer:
         return []
 
     async def run(self, *, force: bool = False, await_cognify: bool = False) -> dict[str, Any]:
+        """Sync Linear issues into Central (+ assignee seat mirrors).
+
+        Incremental by default (#90): an issue is rewritten only when its
+        ``updatedAt`` is newer than the stored cursor, when it is new to the
+        local state, or when its seat mirror has never recorded it (a seat
+        created after the issue last changed). ``force=True`` rewrites every
+        fetched issue regardless — the pre-#90 unconditional behaviour, and
+        what ``CITADEL_RUN_MODE=linear-sync`` uses.
+        """
         if not self.config.linear_api_key:
             return {"ok": False, "enabled": False, "reason": "linear_api_key_missing"}
 
@@ -393,76 +421,224 @@ class LinearSyncer:
         central_dataset = self.config.linear_sync_dataset or CENTRAL_DATASET
         session_id = self.config.linear_sync_session
 
+        # Incremental sync (#90): rewrite an issue only when Linear's updatedAt is
+        # newer than the cursor the previous run stored. The cursor is the max
+        # updatedAt SEEN — Linear's clock, not ours — so an issue updated while a
+        # sync is in flight still sorts after the cursor and is caught next pass;
+        # comparing against our own wall clock would skip exactly those writes.
+        # An issue absent from the prior state is always written (new issue, or
+        # the max_issues window shifted onto it). force=True rewrites everything.
+        prior_state = self._load_state()
+        # Anything past this horizon is future-dated, not merely skewed. A cursor
+        # ahead of real time makes `updated > prior_cursor` False for EVERY issue
+        # forever — a permanent stall that still reports ok:true with a fresh
+        # last_synced_at — so future-dated values are barred from the cursor on
+        # both the read side (below) and the write side (cursor advancement).
+        horizon = datetime.now(UTC) + _CURSOR_SKEW_TOLERANCE
+        prior_cursor = None if force else _parse_iso(prior_state.get("last_seen_updated_at"))
+        if prior_cursor is not None and prior_cursor > horizon:
+            # Self-heal state poisoned before the clamp existed (or edited by
+            # hand): ignore the stored cursor and run this pass as a full sync.
+            logger.warning(
+                "Stored Linear sync cursor %s is future-dated; ignoring it and running a full pass",
+                prior_state.get("last_seen_updated_at"),
+            )
+            prior_cursor = None
+        prior_issues = prior_state.get("issues")
+        prior_ids = {
+            str(item.get("id"))
+            for item in (prior_issues if isinstance(prior_issues, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        prior_mirrors = (
+            prior_state.get("mirrors") if isinstance(prior_state.get("mirrors"), dict) else {}
+        )
+
+        def _changed(issue: LinearIssue) -> bool:
+            if prior_cursor is None or issue.id not in prior_ids:
+                return True
+            updated = _parse_iso(issue.updated_at)
+            # A malformed timestamp fails OPEN into a write: a redundant write is
+            # visible, a silently skipped issue is not.
+            return updated is None or updated > prior_cursor
+
+        changed_ids = {issue.id for issue in issues if _changed(issue)}
+        # A deletion changes the digest (the issue drops out of the listing)
+        # without moving any surviving issue's updatedAt, so it refreshes the
+        # digest too.
+        removed_ids = prior_ids - {issue.id for issue in issues}
+
         # Coalesce cognify (#46/#52): a full resync writes the digest + ~200 issues +
         # seat mirrors. Each write used to schedule its OWN background cognify, so
         # the on-demand POST /api/linear-sync/run fired ~200 Kuzu-writing cognifies
         # that stormed the writer lock and starved the request into a timeout. Write
         # ADD-ONLY here (defer_cognify=True) and schedule ONE cognify over every
         # dataset touched after the loop instead.
-        digest = format_workspace_digest(issues)
-        central_outcome = await learning.learn(
-            digest,
-            dataset=central_dataset,
-            tags=["linear-workspace", "linear-sync"],
-            session_id=session_id,
-            operation="linear_sync",
-            run_improve=self.config.linear_sync_run_improve,
-            tier="full",
-            defer_cognify=True,
-        )
+        # Secret-scan containment (#117): learning.learn scans every document
+        # (ADR-0005) and raises SecretContentError on a blocking finding. The
+        # sibling syncers (github_sync, repo_content_sync) record a block and
+        # keep going; here ONE poisoned issue used to kill the entire sync —
+        # one refused entry out of 200 zeroing the whole Linear surface.
+        # Blocked items are recorded by identifier only, never content, and
+        # simply retried whenever the issue next changes.
+        blocked: list[str] = []
+
+        central_outcome = None
+        if force or changed_ids or removed_ids:
+            digest = format_workspace_digest(issues)
+            try:
+                central_outcome = await learning.learn(
+                    digest,
+                    dataset=central_dataset,
+                    tags=["linear-workspace", "linear-sync"],
+                    session_id=session_id,
+                    operation="linear_sync",
+                    run_improve=self.config.linear_sync_run_improve,
+                    tier="full",
+                    defer_cognify=True,
+                )
+            except SecretContentError as exc:
+                blocked.append("workspace-digest")
+                logger.warning(
+                    "Linear workspace digest blocked by the secret scanner: %s",
+                    exc.public_message,
+                )
 
         mirrored = 0
+        skipped_unchanged = 0
         mirrors: dict[str, list[str]] = {}
+        written_mirror_datasets: list[str] = []
+        # Tracked independently of central_outcome (the workspace digest's own
+        # result): the digest and each issue's Central note are separate
+        # learning.learn() calls, so the digest can be blocked while an
+        # unrelated issue's Central write still lands. touched_datasets must
+        # reflect that real write, not just the digest's fate.
+        central_issue_written = False
         for issue in issues:
-            # Write each issue's full text (title + description) to Central so
-            # linear_search returns real issues org-wide — the digest only carried
-            # titles, leaving the 200 synced issues invisible to search (#52).
-            await learning.learn(
-                format_issue_note(issue),
-                dataset=central_dataset,
-                tags=[
-                    "linear-issue",
-                    "linear-sync",
-                    f"linear:{issue.identifier}",
-                    # Team as a structured, filterable metadata tag so Central issues
-                    # are discoverable by team (e.g. "what is the marketing team
-                    # working on?"). The human team NAME also rides in the note body
-                    # (format_issue_note) for semantic search.
-                    f"team:{issue.team_key}" if issue.team_key else "linear",
-                ],
-                session_id=session_id,
-                operation="linear_sync",
-                run_improve=False,
-                tier="light",
-                defer_cognify=True,
-            )
+            changed = issue.id in changed_ids
             mirror_dataset = resolve_mirror_dataset(issue, email_index, linear_user_map=user_map)
+            prior_mirror_ids = prior_mirrors.get(mirror_dataset) if mirror_dataset else None
+            mirror_has_note = mirror_dataset is not None and (
+                isinstance(prior_mirror_ids, list)
+                and issue.identifier in {str(item) for item in prior_mirror_ids}
+            )
+
+            central_blocked = False
+            if changed:
+                # Write each issue's full text (title + description) to Central so
+                # linear_search returns real issues org-wide — the digest only carried
+                # titles, leaving the 200 synced issues invisible to search (#52).
+                try:
+                    issue_outcome = await learning.learn(
+                        format_issue_note(issue),
+                        dataset=central_dataset,
+                        tags=[
+                            "linear-issue",
+                            "linear-sync",
+                            f"linear:{issue.identifier}",
+                            # Team as a structured, filterable metadata tag so Central issues
+                            # are discoverable by team (e.g. "what is the marketing team
+                            # working on?"). The human team NAME also rides in the note body
+                            # (format_issue_note) for semantic search.
+                            f"team:{issue.team_key}" if issue.team_key else "linear",
+                        ],
+                        session_id=session_id,
+                        operation="linear_sync",
+                        run_improve=False,
+                        tier="light",
+                        defer_cognify=True,
+                    )
+                    if issue_outcome.ingest.accepted:
+                        # Only an ACCEPTED add is a write; a filter rejection or
+                        # in-process duplicate returns accepted=False without
+                        # raising and stores nothing.
+                        central_issue_written = True
+                except SecretContentError as exc:
+                    central_blocked = True
+                    blocked.append(issue.identifier)
+                    logger.warning(
+                        "Linear issue %s blocked by the secret scanner; its Central "
+                        "write and mirror are withheld this pass (content not "
+                        "stored): %s",
+                        issue.identifier,
+                        exc.public_message,
+                    )
+            else:
+                skipped_unchanged += 1
+
             if not mirror_dataset:
                 continue
+
+            if central_blocked:
+                # Refused content must not reach a seat mirror either. A note
+                # that already landed on a PRIOR (unblocked) pass stays listed
+                # — it is not overwritten with the now-refused text, it just
+                # goes stale until the issue changes again and passes clean.
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
+            # Backfill a mirror the state has never recorded this issue in even
+            # when the issue itself is unchanged — a seat created (or mapped)
+            # AFTER the issue last changed would otherwise never receive it
+            # until the issue next updates.
+            if not changed and mirror_has_note:
+                mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
             note = format_issue_note(issue)
-            await learning.learn(
-                note,
-                dataset=mirror_dataset,
-                tags=[
-                    "linear-assignee",
-                    "linear-issue",
-                    f"linear:{issue.identifier}",
-                    f"team:{issue.team_key}" if issue.team_key else "linear",
-                ],
-                session_id=f"linear-{mirror_dataset.removeprefix(SEAT_DATASET_PREFIX)}",
-                operation="linear_mirror",
-                run_improve=False,
-                tier="light",
-                defer_cognify=True,
-            )
+            try:
+                await learning.learn(
+                    note,
+                    dataset=mirror_dataset,
+                    tags=[
+                        "linear-assignee",
+                        "linear-issue",
+                        f"linear:{issue.identifier}",
+                        f"team:{issue.team_key}" if issue.team_key else "linear",
+                    ],
+                    session_id=f"linear-{mirror_dataset.removeprefix(SEAT_DATASET_PREFIX)}",
+                    operation="linear_mirror",
+                    run_improve=False,
+                    tier="light",
+                    defer_cognify=True,
+                )
+            except SecretContentError as exc:
+                blocked.append(issue.identifier)
+                logger.warning(
+                    "Linear issue %s mirror to %s blocked by the secret scanner "
+                    "(content not stored): %s",
+                    issue.identifier,
+                    mirror_dataset,
+                    exc.public_message,
+                )
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
+            # The state mapping covers every fetched issue whose mirror note is
+            # actually present — this pass or a prior one — since
+            # issues_for_scope reads it directly.
             mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+            if mirror_dataset not in written_mirror_datasets:
+                written_mirror_datasets.append(mirror_dataset)
             mirrored += 1
 
         # One coalesced cognify over Central + every seat mirror we wrote — unless
-        # inline cognify is suppressed (the evolve Phase-1 subprocess is add-only and
-        # the web cognifies in Phase 2 as the sole Kuzu writer, #47).
-        if not _suppress_inline_cognify():
-            cognify_datasets = list(dict.fromkeys([central_dataset, *mirrors.keys()]))
+        # nothing was written (a fully-unchanged incremental pass has nothing to
+        # fold in) or inline cognify is suppressed (the evolve Phase-1 subprocess
+        # is add-only and the web cognifies in Phase 2 as the sole Kuzu writer, #47).
+        touched_datasets: list[str] = []
+        if central_outcome is not None or central_issue_written:
+            touched_datasets.append(central_dataset)
+        touched_datasets.extend(written_mirror_datasets)
+        # What this pass OBSERVED about the coalesced graph write, reported as
+        # `central_ingested` below. Only the awaited branch sees the cognify
+        # finish (or fail); the scheduled branch has merely REQUESTED one, and
+        # must say so instead of implying completion.
+        cognify_observed: str | None = None
+        if touched_datasets and not _suppress_inline_cognify():
+            cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
                 # Standalone CITADEL_RUN_MODE=linear-sync: AWAIT the single coalesced
                 # cognify so a manual forced run actually indexes the issues, instead
@@ -474,18 +650,83 @@ class LinearSyncer:
                     await self.citadel.cognee.cognify(datasets=cognify_datasets)
                 except Exception:  # noqa: BLE001 - writes succeeded; cognify is a follow-on
                     logger.exception("Linear sync coalesced cognify failed")
+                    cognify_observed = "cognify_failed"
+                else:
+                    cognify_observed = "cognified"
             else:
                 # On-demand endpoint / evolve: background it so the request returns
                 # without waiting on the graph write.
                 self.citadel.cognee.schedule_cognify(cognify_datasets)
+                cognify_observed = "queued_not_confirmed"
+        elif touched_datasets:
+            # Evolve Phase-1 subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY): add-only
+            # by design; the web cognifies in Phase 2 as the sole Kuzu writer.
+            cognify_observed = "suppressed"
+
+        # Advance the cursor to the newest updatedAt seen (keep the prior one
+        # when a pass sees nothing newer, e.g. an empty or truncated fetch),
+        # clamped to the present: one future-dated updatedAt (Linear-side clock
+        # trouble, a bad import, a migration stamping the wrong year) must never
+        # pin the cursor ahead of real time and stall every later pass. The
+        # future-dated issue itself keeps being rewritten each pass (`updated >
+        # cursor` stays true — fail open, same rule as malformed timestamps)
+        # and is named in the warning, so the anomaly stays visible.
+        new_cursor = None
+        best: datetime | None = None
+        stored_raw = prior_state.get("last_seen_updated_at")
+        stored = _parse_iso(stored_raw)
+        if stored is not None and stored <= horizon:
+            best = stored
+            new_cursor = stored_raw
+        for issue in issues:
+            parsed = _parse_iso(issue.updated_at)
+            if parsed is None:
+                continue
+            if parsed > horizon:
+                logger.warning(
+                    "Linear issue %s has a future-dated updatedAt (%s); "
+                    "not advancing the sync cursor past it",
+                    issue.identifier,
+                    issue.updated_at,
+                )
+                continue
+            if best is None or parsed > best:
+                best = parsed
+                new_cursor = issue.updated_at
+
+        # A long run of write-less passes is either a genuinely quiet workspace
+        # or a stalled cursor — the logs are otherwise identical, so say so and
+        # name the disambiguator. A force=True pass writes (resetting the
+        # streak) and rebuilds the cursor from scratch.
+        streak_raw = prior_state.get("unchanged_pass_streak")
+        streak = (streak_raw if isinstance(streak_raw, int) and streak_raw >= 0 else 0) + 1
+        if touched_datasets:
+            streak = 0
+        elif streak >= _UNCHANGED_STREAK_WARN:
+            logger.warning(
+                "Linear sync has written nothing for %s consecutive passes "
+                "(%s issues fetched each time). Either the workspace is quiet or "
+                "the incremental cursor is stalled — a force=True run "
+                "(POST /api/linear-sync/run or CITADEL_RUN_MODE=linear-sync) "
+                "distinguishes the two.",
+                streak,
+                len(issues),
+            )
 
         payload = {
             "version": STATE_VERSION,
             "last_synced_at": utc_now(),
+            "last_seen_updated_at": new_cursor,
+            "unchanged_pass_streak": streak,
             "last_error": None,  # clear any prior failure on a successful sync
             "last_attempt_at": utc_now(),
             "auto_map_error": auto_map_error,
-            "issues": [asdict(issue) for issue in issues],
+            # Scanner-blocked issues are excluded here, not just from Central/
+            # mirror writes: issues_for_scope() reads this list directly, so a
+            # blocked issue's title/description landing here would re-serve
+            # refused content through Linear search — identifier only (via
+            # `blocked` above), never content.
+            "issues": [asdict(issue) for issue in issues if issue.identifier not in blocked],
             "mirrors": mirrors,
         }
         self._save_state(payload)
@@ -494,6 +735,10 @@ class LinearSyncer:
             "ok": True,
             "enabled": True,
             "issue_count": len(issues),
+            # Incrementality diagnostics (#90): how many issues this pass actually
+            # rewrote vs skipped as unchanged since the stored cursor.
+            "written_count": len(changed_ids),
+            "skipped_unchanged": skipped_unchanged,
             "mirrored_count": mirrored,
             # Diagnostics for #46: how many assignees were auto-mapped to seats by
             # email. Only read 0 as "the Linear key cannot read member emails —
@@ -501,7 +746,30 @@ class LinearSyncer:
             # member fetch also leaves this at 0 (#148).
             "auto_mapped_assignees": auto_mapped,
             "auto_map_error": auto_map_error,
-            "central_ingested": central_outcome.ingest.accepted,
+            # Fate of this pass's Central writes as OBSERVED, never assumed.
+            # This used to report cognee.add() acceptance as True, but add()
+            # only QUEUES the graph write (cognify never runs synchronously),
+            # so a pass whose graph write later died was byte-identical to a
+            # working one. States a caller can branch on:
+            #   "cognified"             awaited coalesced cognify completed
+            #   "cognify_failed"        awaited coalesced cognify raised
+            #   "queued_not_confirmed"  background cognify scheduled; outcome
+            #                           not observed by this pass
+            #   "suppressed"            add-only mode; evolve Phase 2 cognifies
+            #   None                    no accepted Central write this pass
+            "central_ingested": (
+                cognify_observed
+                if (
+                    (central_outcome is not None and central_outcome.ingest.accepted)
+                    or central_issue_written
+                )
+                else None
+            ),
             "mirrors": mirrors,
+            # Issues (or the workspace digest) the secret scanner refused this
+            # pass (#117): identifiers only, never content. A blocked write is
+            # contained, not silently dropped.
+            "blocked": blocked,
+            "blocked_count": len(blocked),
             "last_synced_at": payload["last_synced_at"],
         }
