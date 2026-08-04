@@ -6,18 +6,93 @@ import contextvars
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from time import monotonic, perf_counter
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
+from kb.models import INDEX_STATE_NOT_SCHEDULED, INDEX_STATE_PENDING
+
 logger = logging.getLogger(__name__)
 
 # Strong refs to detached background cognify tasks so the loop does not GC them
 # mid-flight (and so they can be awaited/observed in tests).
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
+
+# OBSERVED outcomes of the detached background cognifies (process-lifetime).
+# remember() returns before the graph write in every branch, so an ingest-time
+# surface can only ever report that a cognify was REQUESTED. These counters are
+# where the request and its outcome stop being the same number: on a working
+# node runs_completed tracks runs_scheduled; on a node whose detached tasks die
+# (or never get a loop) the two diverge. Surfaced via /readyz so the divergence
+# is visible on the wire instead of only in a log line.
+_BACKGROUND_COGNIFY_STATS: dict[str, Any] = {
+    "runs_scheduled": 0,
+    "runs_completed": 0,
+    "runs_failed": 0,
+    # The no-running-loop branch of schedule_cognify: data stored, cognify
+    # never even scheduled. Previously a single error log was the only trace.
+    "runs_not_scheduled": 0,
+    "last_scheduled_at": None,
+    "last_completed_at": None,
+    "last_failed_at": None,
+    "last_error": None,
+}
+
+
+def background_cognify_stats() -> dict[str, Any]:
+    """Snapshot of observed background-cognify outcomes.
+
+    Counts what actually happened (completed/failed), next to what was merely
+    requested (scheduled), so a reader can tell a node that indexes from one
+    that only queues.
+    """
+    return dict(_BACKGROUND_COGNIFY_STATS)
+
+
+def _stamp_cognify_stat(event: str, *, error: str | None = None) -> None:
+    _BACKGROUND_COGNIFY_STATS[f"runs_{event}"] += 1
+    now = datetime.now(timezone.utc).isoformat()
+    if event == "scheduled":
+        _BACKGROUND_COGNIFY_STATS["last_scheduled_at"] = now
+    elif event == "completed":
+        _BACKGROUND_COGNIFY_STATS["last_completed_at"] = now
+    elif event in {"failed", "not_scheduled"}:
+        _BACKGROUND_COGNIFY_STATS["last_failed_at"] = now
+        _BACKGROUND_COGNIFY_STATS["last_error"] = error
+
+
+def _observed_data_ids(added: Any) -> tuple[str, ...]:
+    """Pull the data ids cognee assigned out of what ``cognee.add()`` returned.
+
+    ``add`` returns a ``PipelineRunInfo`` pydantic model (concretely a
+    ``PipelineRunCompleted``) on which ``data_ingestion_info`` is an ATTRIBUTE,
+    not a dict key. An earlier reader gated on ``isinstance(added, dict)``, so
+    the gate was always taken and it extracted nothing for every file ever
+    ingested. Read the attribute first and fall back to a mapping, so a future
+    cognee that returns a plain dict still works, and never gate on the
+    container type alone.
+
+    An empty result means "no ids readable here", NOT "the write failed": a
+    stub client returns a shape with no ids at all. Callers must treat it as
+    absence of evidence.
+    """
+    if added is None:
+        return ()
+    info_list = getattr(added, "data_ingestion_info", None)
+    if info_list is None and isinstance(added, Mapping):
+        info_list = added.get("data_ingestion_info")
+    ids: list[str] = []
+    for info in info_list or ():
+        data_id = (
+            info.get("data_id") if isinstance(info, Mapping) else getattr(info, "data_id", None)
+        )
+        if data_id:
+            ids.append(str(data_id))
+    return tuple(dict.fromkeys(ids))
+
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -268,7 +343,10 @@ class CogneeGateway(Protocol):
     ) -> Any:
         ...
 
-    def schedule_cognify(self, datasets: list[str]) -> None:
+    def schedule_cognify(self, datasets: list[str]) -> bool:
+        ...
+
+    def cognify_status(self, dataset: str) -> str | None:
         ...
 
     async def recall(
@@ -341,6 +419,12 @@ class CogneePublicClient:
         # single-flight lock so a burst of dashboard opens shares one Kuzu read.
         self._graph_data_cache: tuple[float, tuple[list[Any], list[Any]]] | None = None
         self._graph_data_lock = asyncio.Lock()
+        # Last OBSERVED cognify outcome per dataset: "ok" / "failed" /
+        # "not_scheduled". A background cognify finishes long after the write
+        # that scheduled it has already been reported, so its outcome has
+        # nowhere to be recorded — it was logged and lost. This is where the
+        # next pass looks to find out whether the promised graph write happened.
+        self._cognify_outcomes: dict[str, str] = {}
 
     def _copy_env_if_missing(self, target: str, *sources: str) -> None:
         if os.getenv(target):
@@ -523,28 +607,67 @@ class CogneePublicClient:
         # 2) Otherwise we schedule our OWN background cognify that serializes on the
         #    writer lock (kept non-blocking for the caller, #56), so concurrent
         #    in-process ingests and the evolve scheduler never collide.
+        #
+        # Every one of those three branches returns BEFORE the graph write, so
+        # none of them may report this write as indexed. ``index_state`` says
+        # which of them ran, in terms a caller can branch on: "pending_cognify"
+        # for a graph write that is genuinely owed, "cognify_not_scheduled" for
+        # one that nothing will ever perform. Those two used to be the same
+        # ``{"background_cognify": True}``, which is how a sync whose cognify
+        # silently died reported byte-identical success to one that indexed
+        # everything.
+        data_ids = _observed_data_ids(added)
         if _suppress_inline_cognify():
-            return {"added": added, "cognify": "suppressed"}
+            return {
+                "added": added,
+                "cognify": "suppressed",
+                "data_ids": data_ids,
+                "index_state": INDEX_STATE_PENDING,
+            }
         if defer_cognify:
             # The caller (e.g. a bulk Linear resync) coalesces ONE cognify over every
             # dataset it touched at the end, instead of scheduling one-per-write — a
             # 200-issue resync otherwise fires 200 background cognifies that storm the
             # writer lock and starve the request (#46/#52). Add-only here; the caller
             # calls schedule_cognify() once when the batch is done.
-            return {"added": added, "cognify": "deferred"}
-        self._schedule_background_cognify(dataset_name)
-        return {"added": added, "background_cognify": True}
+            return {
+                "added": added,
+                "cognify": "deferred",
+                "data_ids": data_ids,
+                "index_state": INDEX_STATE_PENDING,
+            }
+        scheduled = self._schedule_background_cognify(dataset_name)
+        return {
+            "added": added,
+            "background_cognify": scheduled,
+            "data_ids": data_ids,
+            "index_state": INDEX_STATE_PENDING if scheduled else INDEX_STATE_NOT_SCHEDULED,
+        }
 
-    def _schedule_background_cognify(self, dataset_name: str) -> None:
+    def _schedule_background_cognify(self, dataset_name: str) -> bool:
         """Schedule a tracked, writer-lock-guarded cognify so ingest stays fast.
 
         Replaces cognee's fire-and-forget run_in_background cognify with one that
         acquires our writer lock (via cognify()) — serializing the Kuzu write and
         surfacing failures instead of swallowing them (#47/#56).
-        """
-        self.schedule_cognify([dataset_name])
 
-    def schedule_cognify(self, datasets: list[str]) -> None:
+        Returns whether a cognify was actually scheduled, so the caller reports
+        the outcome it observed rather than the one it asked for.
+        """
+        return self.schedule_cognify([dataset_name])
+
+    def cognify_status(self, dataset: str) -> str | None:
+        """Last OBSERVED cognify outcome for ``dataset``: ok / failed / not_scheduled.
+
+        ``None`` means this process has not watched a cognify for that dataset,
+        which is not evidence either way. A background cognify finishes long
+        after the write that scheduled it has been reported, so this is where a
+        later pass looks to find out whether the graph write it was promised
+        ever happened.
+        """
+        return self._cognify_outcomes.get(dataset)
+
+    def schedule_cognify(self, datasets: list[str]) -> bool:
         """Schedule ONE tracked, writer-lock-guarded background cognify.
 
         Lets a bulk writer (the Linear resync) coalesce a single cognify over every
@@ -552,10 +675,14 @@ class CogneePublicClient:
         a storm of per-issue cognifies (#46/#52). The single cognify still serializes
         on the writer lock (single Kuzu writer, #47) and logs — never crashes — on
         failure. No-op with no running loop (sync caller) or no datasets.
+
+        Returns True only when a task was actually created. The caller reports
+        an outcome it observed, so "I declined to schedule" must be a value it
+        can read, not something buried in a log line.
         """
         wanted = list(dict.fromkeys(datasets))  # de-dup, preserve order
         if not wanted:
-            return
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -569,13 +696,17 @@ class CogneePublicClient:
                 "is stored but will not be searchable until a cognify runs.",
                 wanted,
             )
-            return
+            _stamp_cognify_stat("not_scheduled", error="no_running_event_loop")
+            self._record_cognify_outcome(wanted, "not_scheduled")
+            return False
 
         async def _run() -> None:
             try:
                 await self.cognify(datasets=wanted)
-            except Exception:  # noqa: BLE001 - background task: log, never crash the loop
+            except Exception as exc:  # noqa: BLE001 - background task: log, never crash the loop
                 logger.exception("background cognify for datasets %s failed", wanted)
+                _stamp_cognify_stat("failed", error=exc.__class__.__name__)
+                self._record_cognify_outcome(wanted, "failed")
             else:
                 # Log SUCCESS too. Previously only failures were logged, so a
                 # cognify that never ran — because the process exited before this
@@ -583,10 +714,22 @@ class CogneePublicClient:
                 # from one that completed. That is how a whole repository stayed
                 # missing from the index while every surface reported it synced.
                 logger.info("background cognify finished for datasets %s", wanted)
+                _stamp_cognify_stat("completed")
+                self._record_cognify_outcome(wanted, "ok")
 
         task = loop.create_task(_run())
+        # Observed request/outcome ledger: `scheduled` is stamped here, and only
+        # _run() itself can stamp `completed`/`failed` — so a task that dies
+        # unrun leaves a visible scheduled-minus-completed gap instead of
+        # nothing.
+        _stamp_cognify_stat("scheduled")
         _BACKGROUND_COGNIFY_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_COGNIFY_TASKS.discard)
+        return True
+
+    def _record_cognify_outcome(self, datasets: list[str], status: str) -> None:
+        for dataset in datasets:
+            self._cognify_outcomes[dataset] = status
 
     async def recall(
         self,

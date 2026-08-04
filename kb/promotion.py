@@ -52,6 +52,12 @@ PERSONAL_CAPTURE_TAG = "personal"
 ORG_WORK_CAPTURE_TAG = "org-work"
 CAPTURE_SUMMARY_MARKER = "# capture summary:"
 
+# Explicit unknown for the decision audit trail: the caller handed this engine
+# no user-confirmation signal. Recorded as its own value, never by omitting the
+# field, so a reader can branch on recorded-vs-not instead of inferring from
+# absence (which also looks like an event written before the field existed).
+USER_CONFIRMATION_UNKNOWN = "unknown"
+
 # Broad seed queries used to enumerate a seat node. cognee.recall is semantic,
 # not an exhaustive listing, so a few complementary seeds widen coverage; the
 # results are deduped and capped. This is best-effort top-N by design.
@@ -815,7 +821,16 @@ class PromotionEngine:
         actor: AccessIdentity,
         *,
         delegate: bool = False,
+        user_confirmation: str = USER_CONFIRMATION_UNKNOWN,
     ) -> dict[str, Any]:
+        """Promote a queued candidate into Central.
+
+        ``user_confirmation`` is what the caller reports about the user's
+        explicit approval ("confirmed" / "not_confirmed" / "unknown"). It is
+        recorded, not enforced: the value is asserted by the caller, so it
+        documents what was claimed and never stands in for authorization.
+        Role and seat checks still decide who may call this.
+        """
         item = self.access_store.get_promotion_pending(item_id)
         if item is None:
             raise ValueError(f"Promotion item not found: {item_id}")
@@ -852,6 +867,7 @@ class PromotionEngine:
                 "delegate": delegate,
                 "promoted": promoted,
                 "reference_status": item.reference_status,
+                "user_confirmation": user_confirmation,
             },
         )
         return {
@@ -871,7 +887,10 @@ class PromotionEngine:
         actor: AccessIdentity,
         *,
         delegate: bool = False,
+        user_confirmation: str = USER_CONFIRMATION_UNKNOWN,
     ) -> dict[str, Any]:
+        """Decline a queued candidate. See ``approve_pending`` for
+        ``user_confirmation``: recorded, never enforced."""
         item = self.access_store.get_promotion_pending(item_id)
         if item is None:
             raise ValueError(f"Promotion item not found: {item_id}")
@@ -893,6 +912,7 @@ class PromotionEngine:
                 "item_id": item_id,
                 "seat_slug": item.seat_slug,
                 "delegate": delegate,
+                "user_confirmation": user_confirmation,
             },
         )
         return {"ok": True, "item": decided.to_dict()}

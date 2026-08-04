@@ -252,6 +252,13 @@ async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None
 
     first = await syncer.run()
     assert first["files_ingested"] == 2
+    # What the run OBSERVED, next to the request counter: cognee handed back
+    # data ids for both adds (confirmed), and the graph write is still owed, so
+    # neither file may be counted as indexed.
+    assert first["files_add_confirmed"] == 2
+    assert first["files_add_unconfirmed"] == 0
+    assert first["files_indexed"] == 0
+    assert first["files_index_failed"] == 0
     assert len(learning.calls) == 2
     assert learning.calls[0]["tags"] == [
         "github",

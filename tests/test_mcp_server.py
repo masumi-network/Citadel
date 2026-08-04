@@ -62,6 +62,9 @@ class FakeHttpClient:
         self.public_gets.append({"path": path, "extra_headers": extra_headers or {}})
         return {"ok": True, "path": path, "public": True}
 
+    # Mirrors CitadelHttpClient.post exactly, user_confirmed included: a fake
+    # narrower than the real client turns a wiring change into a TypeError in
+    # unrelated tests instead of a finding.
     def post(
         self,
         path: str,
@@ -69,9 +72,16 @@ class FakeHttpClient:
         *,
         tool_name: str | None = None,
         timeout: float | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         self.posts.append(
-            {"path": path, "payload": payload, "tool_name": tool_name, "timeout": timeout}
+            {
+                "path": path,
+                "payload": payload,
+                "tool_name": tool_name,
+                "timeout": timeout,
+                "user_confirmed": user_confirmed,
+            }
         )
         return {"ok": True, "path": path, "payload": payload, "tool_name": tool_name}
 
@@ -851,6 +861,90 @@ def test_promotion_decision_tools_require_admin_in_policy() -> None:
         policy = TOOL_POLICIES[name]
         assert policy.role == "admin", name
         assert policy.scope == "sources:sync", name
+
+
+_APPROVAL_GUARDED_TOOLS = (
+    "citadel_ingest",
+    "citadel_share_session",
+    "citadel_contribute",
+    "citadel_promotion_approve",
+    "citadel_promotion_reject",
+)
+
+
+def test_user_confirmed_stays_optional_in_every_guarded_tool_schema() -> None:
+    """The signal is RECORDED, not enforced.
+
+    Making the parameter required would fail every existing client at schema
+    validation and turn a reporting change into an outage, so it must stay
+    optional on all five guarded write tools.
+    """
+    server = create_mcp_server(FakeHttpClient())
+
+    for name in _APPROVAL_GUARDED_TOOLS:
+        schema = server._tool_manager.get_tool(name).parameters
+        assert "user_confirmed" in schema["properties"], name
+        assert "user_confirmed" not in (schema.get("required") or []), name
+
+
+def test_a_reported_confirmation_comes_back_in_the_tool_result() -> None:
+    """The calling agent must be able to SEE what the node recorded.
+
+    Without the mirror the agent has to trust that its argument arrived, and a
+    call that reported a confirmation returns bytes identical to one that
+    reported nothing.
+    """
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_ingest", "a durable note", None, user_confirmed=True)
+
+    assert client.posts[0]["user_confirmed"] is True
+    assert result["user_confirmation"] == {"reported": True, "recorded_as": "confirmed"}
+    assert not any("user_confirmed" in w for w in result.get("warnings") or [])
+
+
+def test_an_unreported_confirmation_is_recorded_as_unknown_and_warned_about() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_ingest", "a durable note", None)
+
+    # Omitted on the wire: "false" and "nothing was said" are different facts.
+    assert client.posts[0]["user_confirmed"] is None
+    assert result["user_confirmation"] == {"reported": False, "recorded_as": "unknown"}
+    assert any("user_confirmed" in w for w in result["warnings"])
+
+
+def test_a_declined_confirmation_is_reported_as_declined_not_missing() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_ingest", "a durable note", None, user_confirmed=False)
+
+    assert client.posts[0]["user_confirmed"] is False
+    assert result["user_confirmation"] == {"reported": True, "recorded_as": "not_confirmed"}
+    # A declined answer IS an answer, so it draws no missing-signal warning.
+    assert not any("user_confirmed" in w for w in result.get("warnings") or [])
+
+
+def test_every_guarded_tool_mirrors_the_recorded_value() -> None:
+    """A tool wired to the client but not to the mirror satisfies neither test above."""
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    calls = {
+        "citadel_share_session": (
+            (None, "/repo"),
+            {"data": "# Compact Session Context", "capture_roots": ["/repo"]},
+        ),
+        "citadel_contribute": (("Title", "Body", None), {}),
+        "citadel_promotion_approve": (("item-1", None), {}),
+        "citadel_promotion_reject": (("item-2", None), {}),
+    }
+    for tool, (args, kwargs) in calls.items():
+        result = run_tool(server, tool, *args, user_confirmed=True, **kwargs)
+        assert result["user_confirmation"]["recorded_as"] == "confirmed", tool
 
 
 def test_tools_list_protocol_handler_applies_role_filter(

@@ -689,7 +689,12 @@ async def _search_local(args: argparse.Namespace) -> int:
     except TimeoutError as exc:
         return _emit_search_timeout(args, note=str(exc) or "local search timed out")
 
-    payload = normalize_local_search_results(results)
+    # Report the dataset that was READ, not the one that was asked for: with no
+    # dataset the hits carry no provenance and every one of them — session traces
+    # included — is labelled `unattested`, which the HTTP route never does.
+    payload = normalize_local_search_results(
+        results, dataset=kb.resolve_search_dataset(args.dataset)
+    )
     shaped = shape_search_payload(payload, **_shape_kwargs(args))
     _print_json(shaped)
     return 0 if shaped.get("ok") else 1

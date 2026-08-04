@@ -732,3 +732,50 @@ async def test_approve_pending_surfaces_the_write_reason(
     assert result["write_reason"] == "duplicate_in_process"
     # The item is consumed regardless, matching the contract on main.
     assert store.get_promotion_pending(item.id).status != "pending"
+
+
+async def test_decision_audit_states_the_user_confirmation_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """promotion.approve AND promotion.reject must state what the engine was
+    handed about user confirmation: the caller's reported answer, or the
+    explicit unknown marker. Never silence, because an absent field reads the
+    same as an event written before the field existed."""
+    summary_a = (
+        "# Capture summary: side project\n"
+        "- Remote: `https://github.com/other-org/new-app.git`\n"
+        "- Capture Root Tags: org-work\n"
+    )
+    summary_b = (
+        "# Capture summary: second project\n"
+        "- Remote: `https://github.com/other-org/second-app.git`\n"
+        "- Capture Root Tags: org-work\n"
+    )
+    engine, _learning, store = _engine(
+        tmp_path,
+        [summary_a, summary_b],
+        _github_state(tmp_path),
+    )
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.95)
+
+    queued = await engine.run(SEAT, dry_run=False)
+    assert queued["queued"] == 2
+    items = store.list_promotion_pending(seat_slug="alice")
+    actor = AccessIdentity(
+        role="admin",
+        actor_id="root",
+        actor_kind="user",
+        actor_name="Root",
+        source="token",
+        default_dataset=CENTRAL,
+        seat_slug=None,
+    )
+
+    await engine.approve_pending(items[0].id, actor, user_confirmation="confirmed")
+    # No signal handed over: the trail records "unknown", not consent.
+    await engine.reject_pending(items[1].id, actor)
+
+    approve_event = store.recent_audit_events(action="promotion.approve")[0]
+    reject_event = store.recent_audit_events(action="promotion.reject")[0]
+    assert approve_event["detail"]["user_confirmation"] == "confirmed"
+    assert reject_event["detail"]["user_confirmation"] == promotion.USER_CONFIRMATION_UNKNOWN

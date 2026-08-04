@@ -364,31 +364,44 @@ class MeshState:
             if result.accepted:
                 document_id = stable_id("document", f"{dataset}:{data}")
                 label = data.strip().splitlines()[0][:80] or "Untitled memory"
+                # The badge and the index:graph edge are both claims about the
+                # Kuzu write, and cognee.add() does not perform it. Drawing
+                # every accepted write as "indexed" and linked drew a picture of
+                # a graph write that had not happened yet — and, for the
+                # documents whose cognify silently never ran, never would.
+                indexed = result.indexed
                 self.nodes[document_id] = {
                     "id": document_id,
                     "label": label,
                     "type": "document",
-                    "status": "indexed",
+                    "status": (
+                        "indexed" if indexed else ("unindexed" if indexed is False else "pending")
+                    ),
                     "size": min(20 + len(data) // 40, 64),
                     "metadata": {
                         "dataset": dataset,
                         "tags": list(result.tags),
                         "characters": len(data),
+                        "index_state": result.index_state,
                     },
                 }
                 self._edge(dataset_id, document_id, "contains")
                 for tag in result.tags or tuple(tags):
                     tag_id = self._tag_node(tag)
                     self._edge(document_id, tag_id, "tagged")
+                # The vector write IS what add() performs, so that edge stands
+                # on its own. The graph edge waits for an observed cognify.
                 self._edge(document_id, "index:vector", "embedded")
-                self._edge(document_id, "index:graph", "linked")
+                if indexed:
+                    self._edge(document_id, "index:graph", "linked")
                 self.documents += 1
                 await self._record_event(
                     "ingest",
-                    "Memory indexed",
+                    "Memory indexed" if indexed else "Memory stored",
                     {
                         "dataset": dataset,
                         "reason": result.reason,
+                        "index_state": result.index_state,
                         "tags": list(result.tags),
                         "chunks": 1,
                     },

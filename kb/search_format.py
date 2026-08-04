@@ -183,6 +183,16 @@ DOC_TYPE_OTHER = "other"
 TRUST_REFERENCE = "reference-only"
 TRUST_UNATTESTED = "unattested"
 
+# WHICH AUTHORITY produced ``trust_tier`` — reported next to it because the two
+# possible reasons for ``unattested`` are not the same fact. ``dataset-attested``
+# means a reading authority named the dataset the hit came out of, so the tier
+# reports an observation. ``unknown`` means no envelope reached this hit at all:
+# ``unattested`` is then the fallback value and a caller must NOT read it as
+# "this hit was checked and has no provenance". Without the distinction a path
+# that never wired the envelope up is byte-identical to one that checked.
+TRUST_BASIS_ATTESTED = "dataset-attested"
+TRUST_BASIS_UNKNOWN = "unknown"
+
 # Retained so older parsers and stored telemetry keep resolving; never assigned.
 TRUST_CANONICAL = "canonical"
 TRUST_VERIFIED = "verified"
@@ -429,6 +439,11 @@ def infer_trust_tier(item: dict[str, Any], doc_type: str | None = None) -> str:
     comes from the dataset a hit was read out of (session traces), not from the
     hit's content. Everything else is ``unattested`` — the vault stores no
     per-document provenance yet, so no hit can honestly claim more.
+
+    A hit that arrives with no ``_citadel`` envelope also lands on
+    ``unattested``, because this function has nothing else to read. That value
+    is then a FALLBACK, not an observation, and :func:`trust_tier_basis`
+    reports which of the two it was — do not read the tier without it.
     """
     envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
     if envelope.get("trust") == TRUST_REFERENCE:
@@ -438,6 +453,22 @@ def infer_trust_tier(item: dict[str, Any], doc_type: str | None = None) -> str:
     if (doc_type or infer_doc_type(item)) == DOC_TYPE_TRACE:
         return TRUST_REFERENCE
     return TRUST_UNATTESTED
+
+
+def trust_tier_basis(item: dict[str, Any]) -> str:
+    """Whether ``infer_trust_tier`` OBSERVED anything, or fell back to a default.
+
+    ``infer_trust_tier`` reads only ``item["_citadel"]``. A hit that reaches it
+    without an envelope therefore always returns ``unattested``, whatever it
+    actually is — which is exactly what the CLI ``--local`` path did to genuine
+    session traces. Reporting the basis alongside the tier is what lets a caller
+    tell "checked, no provenance attested" (``dataset-attested``) from "the
+    attesting authority was never consulted" (``unknown``).
+    """
+    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
+    if envelope.get("trust") or envelope.get("dataset"):
+        return TRUST_BASIS_ATTESTED
+    return TRUST_BASIS_UNKNOWN
 
 
 def spec_mode_boost(item: dict[str, Any]) -> float:
@@ -645,6 +676,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
             "snippet": text[:SNIPPET_CHARS],
             "content_hint": HINT_UNCLASSIFIED,
             "trust_tier": TRUST_UNATTESTED,
+            "trust_tier_basis": TRUST_BASIS_UNKNOWN,
             "rank": index + 1,
         }
 
@@ -730,6 +762,9 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         "text": snippet,
         "content_hint": infer_content_hint(item, doc_type),
         "trust_tier": trust_tier,
+        # Say which authority produced the tier, so a path that never attached
+        # an envelope stops looking identical to one that checked and found none.
+        "trust_tier_basis": trust_tier_basis(item),
         "rank": envelope.get("rank") or (index + 1),
         "dataset": envelope.get("dataset"),
         "_citadel": envelope or None,
@@ -1002,6 +1037,17 @@ def shape_search_payload(
         warnings.append("search timed out; results may be incomplete")
     if relevance["no_lexical_match"]:
         warnings.append(NO_LEXICAL_MATCH_WARNING)
+    # Say at page level when no authority produced the tiers, so a caller does
+    # not have to notice the per-hit basis values one by one.
+    unattested_basis = sum(
+        1 for h in hits if h.get("trust_tier_basis") == TRUST_BASIS_UNKNOWN
+    )
+    if unattested_basis:
+        warnings.append(
+            f"trust_tier is a fallback for {unattested_basis} of {len(hits)} hits: they "
+            "carried no provenance envelope, so attested provenance was never consulted "
+            "— read trust_tier_basis before trusting the tier"
+        )
     authority = token_asset_authority_warning(query)
     if authority:
         warnings.append(authority)

@@ -152,12 +152,25 @@ class CitadelMcpTimeout(CitadelMcpError):
         self.timeout_s = timeout_s
 
 
+# Carries the caller's answer to the tool's "ask the user first" instruction.
+# The node records it in the audit trail; it is never treated as authorization.
+USER_CONFIRMED_HEADER = "X-Citadel-User-Confirmed"
+
+
 @dataclass(frozen=True)
 class ToolPolicy:
     role: str
     scope: str
     risk: str
     annotations: ToolAnnotations
+    # True for tools whose docstring instructs the agent to obtain the user's
+    # explicit approval first. That instruction is prose handed to a model, so
+    # the node cannot observe whether it was followed, but it can record the
+    # answer the caller reports. Declaring it here rather than inferring it from
+    # the docstring keeps the two from drifting: a new tool that asks for
+    # approval and forgets this flag writes audit rows that cannot answer
+    # "was this confirmed?".
+    requires_user_approval: bool = False
 
 
 TOOL_POLICIES: dict[str, ToolPolicy] = {
@@ -259,6 +272,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             idempotentHint=False,
             openWorldHint=False,
         ),
+        requires_user_approval=True,
     ),
     "citadel_share_session": ToolPolicy(
         role="writer",
@@ -270,6 +284,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             idempotentHint=False,
             openWorldHint=False,
         ),
+        requires_user_approval=True,
     ),
     "citadel_contribute": ToolPolicy(
         role="writer",
@@ -281,6 +296,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             idempotentHint=False,
             openWorldHint=False,
         ),
+        requires_user_approval=True,
     ),
     "citadel_record_feedback": ToolPolicy(
         role="writer",
@@ -393,6 +409,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             idempotentHint=False,
             openWorldHint=False,
         ),
+        requires_user_approval=True,
     ),
     "citadel_promotion_reject": ToolPolicy(
         role="admin",
@@ -404,6 +421,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             idempotentHint=False,
             openWorldHint=False,
         ),
+        requires_user_approval=True,
     ),
 }
 
@@ -782,6 +800,50 @@ def _unconfirmed_ingest(
     }
 
 
+# The value the node records for this call, in the node's own vocabulary (see
+# kb.server.user_confirmation). Mirrored back into the tool result so the
+# calling agent can SEE what was written, rather than having to trust that its
+# argument arrived: a call that reported a confirmation and one that reported
+# nothing must not return identical results.
+CONFIRMATION_CONFIRMED = "confirmed"
+CONFIRMATION_NOT_CONFIRMED = "not_confirmed"
+CONFIRMATION_UNKNOWN = "unknown"
+_MISSING_CONFIRMATION_WARNING = (
+    "This call set no user_confirmed, so the audit trail records it as "
+    "'unknown' — not as consent. Ask the user before writing durable context "
+    "and report their answer in user_confirmed."
+)
+
+
+def _confirmation_value(user_confirmed: bool | None) -> str:
+    """The audit value this call will produce. Mirrors kb.server.user_confirmation."""
+    if user_confirmed is None:
+        return CONFIRMATION_UNKNOWN
+    return CONFIRMATION_CONFIRMED if user_confirmed else CONFIRMATION_NOT_CONFIRMED
+
+
+def _with_confirmation_signal(payload: Any, user_confirmed: bool | None) -> Any:
+    """Mirror into the tool result what the node recorded for this call.
+
+    The MCP layer attests only what it observed: the argument it was handed. It
+    is reported either way, and an unreported answer additionally raises a
+    warning the calling agent can act on. Non-dict payloads pass through
+    untouched.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    value = _confirmation_value(user_confirmed)
+    reported: dict[str, Any] = {
+        **payload,
+        "user_confirmation": {"reported": user_confirmed is not None, "recorded_as": value},
+    }
+    if user_confirmed is None:
+        warnings = [w for w in (payload.get("warnings") or []) if w]
+        warnings.append(_MISSING_CONFIRMATION_WARNING)
+        reported["warnings"] = warnings
+    return reported
+
+
 class CitadelHttpClient:
     def __init__(
         self,
@@ -826,8 +888,16 @@ class CitadelHttpClient:
         *,
         tool_name: str | None = None,
         timeout: float | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", path, payload, tool_name=tool_name, timeout=timeout)
+        return self._request(
+            "POST",
+            path,
+            payload,
+            tool_name=tool_name,
+            timeout=timeout,
+            user_confirmed=user_confirmed,
+        )
 
     def _request(
         self,
@@ -839,6 +909,7 @@ class CitadelHttpClient:
         require_token: bool = True,
         extra_headers: dict[str, str] | None = None,
         timeout: float | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         if require_token and not self.access_token:
             raise CitadelMcpError("Set CITADEL_MCP_ACCESS_TOKEN to a Citadel access token.")
@@ -851,6 +922,11 @@ class CitadelHttpClient:
             headers["Authorization"] = f"Bearer {self.access_token}"
         if tool_name:
             headers["X-Citadel-MCP-Tool"] = tool_name
+        # Omitted when the tool did not report an answer, so the node records
+        # "unknown" rather than inheriting a stale or optimistic value. Sending
+        # "false" and sending nothing are different facts and stay different.
+        if user_confirmed is not None:
+            headers[USER_CONFIRMED_HEADER] = "true" if user_confirmed else "false"
         if extra_headers:
             headers.update(extra_headers)
         request = Request(
@@ -1228,10 +1304,14 @@ def create_mcp_server(
         tags: list[str] | None = None,
         session_id: str | None = None,
         cognify: bool = True,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         """Stage durable context in the caller's personal seat node. Requires writer access.
 
         **Always ask the user for explicit approval before calling this tool.**
+        Report the answer in ``user_confirmed`` (true when they said yes, false
+        when you proceeded without asking or they declined). It is written to
+        the audit trail; leaving it unset records "unknown", not consent.
 
         Seat-writer tokens: writes go to your personal node only (seat:{slug}). Do not
         pass `dataset` or Central/org tags — the server rejects them for seat MCP.
@@ -1250,17 +1330,21 @@ def create_mcp_server(
             normalized_data = _require_non_empty(data, "data")
             _validate_ingest_size(normalized_data)
             try:
-                return resolve_client(ctx).post(
-                    "/ingest",
-                    {
-                        "data": normalized_data,
-                        "dataset": dataset,
-                        "tags": tags or [],
-                        "session_id": session_id,
-                        "cognify": cognify,
-                    },
-                    tool_name="citadel_ingest",
-                    timeout=_ingest_cognify_timeout() if cognify else None,
+                return _with_confirmation_signal(
+                    resolve_client(ctx).post(
+                        "/ingest",
+                        {
+                            "data": normalized_data,
+                            "dataset": dataset,
+                            "tags": tags or [],
+                            "session_id": session_id,
+                            "cognify": cognify,
+                        },
+                        tool_name="citadel_ingest",
+                        timeout=_ingest_cognify_timeout() if cognify else None,
+                        user_confirmed=user_confirmed,
+                    ),
+                    user_confirmed,
                 )
             except CitadelMcpTimeout as exc:
                 # An expired budget proves only that no response arrived. The
@@ -1270,8 +1354,11 @@ def create_mcp_server(
                 # retry a write that had landed, duplicating it. Report what is
                 # known instead: submitted, outcome unconfirmed, here is how to
                 # settle it.
-                return _unconfirmed_ingest(
-                    normalized_data, tags or [], dataset, exc.timeout_s
+                return _with_confirmation_signal(
+                    _unconfirmed_ingest(
+                        normalized_data, tags or [], dataset, exc.timeout_s
+                    ),
+                    user_confirmed,
                 )
 
         return await _call_async(
@@ -1287,10 +1374,13 @@ def create_mcp_server(
         transcript_path: str | None = None,
         capture_roots: list[str] | None = None,
         has_tool_errors: bool = False,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         """Volunteer a Shared Session Trace for teammates to find via search.
 
         **Always ask the user for explicit approval before calling this tool.**
+        Report the answer in ``user_confirmed``; it is written to the audit
+        trail, and leaving it unset records "unknown", not consent.
 
         Provide either ``data`` (Compact Session Context markdown) or a local
         ``transcript_path`` to distill on this machine. Pass ``capture_roots``
@@ -1326,15 +1416,19 @@ def create_mcp_server(
                 raise ToolError("Provide data or a readable transcript_path.")
 
             _validate_ingest_size(payload_data)
-            return resolve_client(ctx).post(
-                "/api/share-session",
-                {
-                    "data": payload_data,
-                    "cwd": normalized_cwd,
-                    "capture_roots": roots,
-                    "has_tool_errors": tool_errors,
-                },
-                tool_name="citadel_share_session",
+            return _with_confirmation_signal(
+                resolve_client(ctx).post(
+                    "/api/share-session",
+                    {
+                        "data": payload_data,
+                        "cwd": normalized_cwd,
+                        "capture_roots": roots,
+                        "has_tool_errors": tool_errors,
+                    },
+                    tool_name="citadel_share_session",
+                    user_confirmed=user_confirmed,
+                ),
+                user_confirmed,
             )
 
         return await _call_async("citadel_share_session", post_share)
@@ -1347,10 +1441,13 @@ def create_mcp_server(
         tags: list[str] | None = None,
         source_url: str | None = None,
         dataset: str | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         """Add a titled Vault Contribution through the Learning Process.
 
         **Always ask the user for explicit approval before calling this tool.**
+        Report the answer in ``user_confirmed``; it is written to the audit
+        trail, and leaving it unset records "unknown", not consent.
 
         Not available to seat-writer MCP tokens (403). Seat devs use `citadel_ingest`
         for personal notes after user approval. Central contributions use this path
@@ -1361,16 +1458,20 @@ def create_mcp_server(
             normalized_title = _require_non_empty(title, "title")
             normalized_content = _require_non_empty(content, "content")
             _validate_ingest_size(normalized_content)
-            return resolve_client(ctx).post(
-                "/api/contribute",
-                {
-                    "title": normalized_title,
-                    "content": normalized_content,
-                    "tags": tags or [],
-                    "source_url": source_url,
-                    "dataset": dataset,
-                },
-                tool_name="citadel_contribute",
+            return _with_confirmation_signal(
+                resolve_client(ctx).post(
+                    "/api/contribute",
+                    {
+                        "title": normalized_title,
+                        "content": normalized_content,
+                        "tags": tags or [],
+                        "source_url": source_url,
+                        "dataset": dataset,
+                    },
+                    tool_name="citadel_contribute",
+                    user_confirmed=user_confirmed,
+                ),
+                user_confirmed,
             )
 
         return await _call_async("citadel_contribute", post_contribute)
@@ -1541,16 +1642,25 @@ def create_mcp_server(
         item_id: str,
         ctx: Context,
         note: str | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
-        """Approve a pending promotion item. Requires explicit user confirmation first."""
+        """Approve a pending promotion item. Requires explicit user confirmation first.
+
+        Report the answer in ``user_confirmed``; it is written to the audit
+        trail, and leaving it unset records "unknown", not consent.
+        """
         normalized_id = _require_non_empty(item_id, "item_id")
 
         def approve() -> dict[str, Any]:
             payload = {"note": note} if note else {}
-            return resolve_client(ctx).post(
-                f"/api/promotion/pending/{quote(normalized_id, safe='')}/approve",
-                payload,
-                tool_name="citadel_promotion_approve",
+            return _with_confirmation_signal(
+                resolve_client(ctx).post(
+                    f"/api/promotion/pending/{quote(normalized_id, safe='')}/approve",
+                    payload,
+                    tool_name="citadel_promotion_approve",
+                    user_confirmed=user_confirmed,
+                ),
+                user_confirmed,
             )
 
         return await _call_async("citadel_promotion_approve", approve)
@@ -1560,16 +1670,25 @@ def create_mcp_server(
         item_id: str,
         ctx: Context,
         note: str | None = None,
+        user_confirmed: bool | None = None,
     ) -> dict[str, Any]:
-        """Reject a pending promotion item. Requires explicit user confirmation first."""
+        """Reject a pending promotion item. Requires explicit user confirmation first.
+
+        Report the answer in ``user_confirmed``; it is written to the audit
+        trail, and leaving it unset records "unknown", not consent.
+        """
         normalized_id = _require_non_empty(item_id, "item_id")
 
         def reject() -> dict[str, Any]:
             payload = {"note": note} if note else {}
-            return resolve_client(ctx).post(
-                f"/api/promotion/pending/{quote(normalized_id, safe='')}/reject",
-                payload,
-                tool_name="citadel_promotion_reject",
+            return _with_confirmation_signal(
+                resolve_client(ctx).post(
+                    f"/api/promotion/pending/{quote(normalized_id, safe='')}/reject",
+                    payload,
+                    tool_name="citadel_promotion_reject",
+                    user_confirmed=user_confirmed,
+                ),
+                user_confirmed,
             )
 
         return await _call_async("citadel_promotion_reject", reject)

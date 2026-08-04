@@ -746,3 +746,35 @@ def test_repo_content_header_still_classifies_a_synced_document() -> None:
     assert not search_format.REPO_CONTENT_HEADER_RE.search(
         "Repository: a/b talked about in prose\nSource: none\n"
     )
+
+
+def test_a_page_of_unattested_basis_hits_says_so_once() -> None:
+    """The page-level counterpart to ``trust_tier_basis`` on each hit.
+
+    Every hit here reaches the shaper with no provenance envelope, so their
+    ``unattested`` tiers are FALLBACKS, not observations. A reader should not
+    have to notice that hit by hit, and the two situations — "checked, nothing
+    attested" and "nothing was ever checked" — must not produce the same page.
+    """
+    payload = {
+        "results": [
+            {"id": "a", "text": "# Dead-end route\n\nsession trace body"},
+            {"id": "b", "text": "# Another note\n\nbody"},
+        ]
+    }
+    shaped = shape_search_payload(payload, query="dead-end route")
+
+    assert [hit["trust_tier_basis"] for hit in shaped["results"]] == ["unknown", "unknown"]
+    assert any("trust_tier is a fallback for 2 of 2 hits" in w for w in shaped["warnings"])
+
+    # And an attested page does NOT carry the warning.
+    attested = shape_search_payload(
+        {
+            "results": [
+                {"id": "a", "text": "body", "_citadel": {"dataset": "session-traces"}},
+            ]
+        },
+        query="dead-end route",
+    )
+    assert attested["results"][0]["trust_tier_basis"] == "dataset-attested"
+    assert not any("trust_tier is a fallback" in w for w in attested["warnings"])

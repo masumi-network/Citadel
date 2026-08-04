@@ -24,6 +24,7 @@ from urllib.request import Request
 from kb.secure_http import open_secure
 
 from kb.learning import LearningProcess
+from kb.models import INDEX_STATE_UNKNOWN
 from kb.repository_update import (
     SOURCE_URL_TEMPLATE,
     GitHubCommit,
@@ -397,6 +398,20 @@ class GitHubOrgSyncer:
             if should_ingest:
                 state["last_digest_at"] = checked_at
                 state["last_digest"] = update.digest
+                # What was OBSERVED about the graph write, plus the ids cognee
+                # assigned. ``last_digest_at`` only ever recorded that a write
+                # was requested; with the digest reported as ingested the
+                # moment cognee.add() returned, a pass whose cognify silently
+                # never ran left a state file identical to a pass that indexed
+                # everything. Persisting the ids is what lets a later pass (or
+                # an operator) check this claim against the index instead of
+                # taking the connector's word for it — the same repair
+                # repo_content_sync already made for its skip decision.
+                state["last_digest_index"] = {
+                    "checked_at": checked_at,
+                    "index_state": getattr(ingest_result, "index_state", INDEX_STATE_UNKNOWN),
+                    "cognee_data_ids": list(getattr(ingest_result, "cognee_data_ids", ()) or ()),
+                }
             state["last_security_scan"] = {
                 "checked_at": checked_at,
                 "ok": security_scan.get("ok"),
@@ -406,15 +421,22 @@ class GitHubOrgSyncer:
             }
             self._save_state(state)
 
+        # `ingested` reports that the store ACCEPTED the digest (the add). The
+        # graph write that makes it searchable is asynchronous, so this run can
+        # only observe the state that write reached — never assume it finished.
+        indexing_state = (
+            ingest_result.index_state if ingest_result is not None else INDEX_STATE_UNKNOWN
+        )
         logger.info(
             "GitHub sync finished for org %s: %d repos scanned, %d changed, %d events, "
-            "%d commits, ingested=%s",
+            "%d commits, ingested=%s index_state=%s",
             self.org,
             len(repos),
             len(update.changed_repos),
             len(update.new_events),
             len(update.new_commits),
             bool(ingest_result and ingest_result.accepted),
+            indexing_state,
         )
         return {
             "ok": True,
@@ -442,7 +464,18 @@ class GitHubOrgSyncer:
             ],
             "active_repositories": update.active_repositories[:20],
             "recent_events": [event.summary_dict() for event in update.new_events[:20]],
+            # `ingested` describes the REQUEST: it is True the instant
+            # cognee.add() returned. `indexed` describes the OUTCOME, and is
+            # deliberately tri-state — null while the graph write is still owed,
+            # false when nothing will ever perform it. Reading `ingested` as
+            # "retrievable" is the mistake this pair exists to prevent, so the
+            # two are reported side by side rather than one replacing the other.
             "ingested": bool(ingest_result and ingest_result.accepted),
+            "index_state": indexing_state,
+            "indexed": (ingest_result.indexed if ingest_result is not None else None),
+            "cognee_data_ids": list(
+                getattr(ingest_result, "cognee_data_ids", ()) or ()
+            ),
             "ingest_reason": (
                 "blocked_by_security_scan"
                 if security_blocked
