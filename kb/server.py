@@ -262,7 +262,7 @@ class _McpAcceptShim:
         await self.app({**scope, "headers": kept}, receive, send)
 
 
-async def _evolve_scheduler_loop(interval_seconds: int) -> None:
+async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
     """Run the evolve cycle every ``interval_seconds``: heavy stages in a
     subprocess, then cognify in-loop.
 
@@ -283,8 +283,21 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
 
+    from kb.evolve_state import first_sleep_seconds, read_last_completed, record_completed
+
+    # Resume the interval rather than restart it. The boot delay stays: a
+    # redeploy must not trigger a heavy cycle. What changes is that the clock
+    # carries across restarts, so a day of deploys closer together than the
+    # interval still reaches a pass (#153).
+    last = read_last_completed(state_path)
+    delay = first_sleep_seconds(interval_seconds, last)
+    logger.info(
+        "Evolve scheduler: first pass in %.0fs of a %ss interval (last pass: %s)",
+        delay, interval_seconds, last or "none recorded",
+    )
     while True:
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(delay)
+        delay = float(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
         # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
         # across them so no interactive cognify (an ingest's, /api/cognify/run)
@@ -353,6 +366,14 @@ async def _evolve_scheduler_loop(interval_seconds: int) -> None:
             raise
         except Exception:
             logger.exception("Evolve scheduler: cognify failed")
+        finally:
+            # Stamp the pass even when a stage failed. This records that the
+            # cycle RAN, which is what the next boot needs to resume the
+            # interval; whether the stages succeeded is already on the "Evolve
+            # finished" line and in /readyz. Recording only clean passes would
+            # make a node with one broken stage restart its clock forever, which
+            # is the bug this fixes (#153).
+            record_completed(state_path)
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
@@ -370,7 +391,10 @@ def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
         return None
     interval = max(60, config.evolve_interval_seconds)
     logger.info("Evolve scheduler enabled: interval=%ss", interval)
-    task = asyncio.create_task(_evolve_scheduler_loop(interval), name="evolve-scheduler")
+    task = asyncio.create_task(
+        _evolve_scheduler_loop(interval, config.evolve_state_path),
+        name="evolve-scheduler",
+    )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_forget_background_task)
     return task
@@ -670,6 +694,7 @@ LOGIN_HTML = """<!doctype html>
           <a href="/login" aria-current="page">Sign in</a>
         </div>
         <button class="themebtn" id="themebtn" type="button" aria-label="Toggle light or dark theme">theme</button>
+        <a class="navicon" href="https://github.com/masumi-network/Citadel" aria-label="GitHub repository" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg></a>
       </div>
     </nav>
     <main class="auth">
@@ -827,6 +852,10 @@ class SearchBody(BaseModel):
     types: list[str] | None = None
     repo: str | None = Field(default=None, max_length=200)
     path: str | None = Field(default=None, max_length=400)
+    # Which syncer wrote the hit (``linear-issue``, ``repo-content``): the scope
+    # a source-specific tool needs. Fail-closed — a hit that cannot say where it
+    # came from never satisfies it.
+    source: str | None = Field(default=None, max_length=64)
     canonical_only: bool = False
     exclude_ambient: bool = False
     mode: str | None = Field(default=None, max_length=32)
@@ -850,6 +879,11 @@ class SearchBody(BaseModel):
             "types": self.cleaned_types(),
             "repo": self.repo.strip() if isinstance(self.repo, str) and self.repo.strip() else None,
             "path": self.path.strip() if isinstance(self.path, str) and self.path.strip() else None,
+            "source": (
+                self.source.strip().lower()
+                if isinstance(self.source, str) and self.source.strip()
+                else None
+            ),
             "canonical_only": bool(self.canonical_only),
             "exclude_ambient": exclude_ambient,
         }
@@ -915,6 +949,8 @@ class GitHubSyncBody(BaseModel):
 
 
 class LinearSyncBody(BaseModel):
+    # force=True rewrites every fetched issue; the default incremental pass skips
+    # issues unchanged since the stored updatedAt cursor (#90).
     force: bool = False
 
 
@@ -2594,6 +2630,11 @@ def document_endpoint_for_result(result_id: str) -> str | None:
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
     # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
     # no backing store, so they stay honestly non-drillable.
+    #
+    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
+    # its `document_id`. This still resolves because /api/documents walks
+    # chunk -> parent document, so a caller passing either id "works" — which
+    # hides that they are different ids for different things.
     if not result_id or result_id.startswith("chunk:"):
         return None
     return f"/api/documents/{result_id}"
@@ -2610,6 +2651,22 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
 
     Results that already supply an id (e.g. the GitHub digest fallback) are left
     untouched. Other dict results get a content-derived id for traceability.
+
+    ``id`` here is CHUNK-level: for cognee's CHUNKS query type a hit is the raw
+    chunk payload (see ``CogneeClient.recall``), and that payload also carries
+    its own ``document_id`` — the parent document's id, the same id
+    ``citadel ingest`` reports as ``data_id`` for the write. The two are
+    different granularities and neither field documents that on the wire
+    (verified live: a hit's ``id`` and ``document_id`` are always distinct
+    UUIDs). ``/api/documents/{id}`` resolves a chunk id by walking chunk ->
+    parent, so passing ``id`` "works" and hides the mismatch — a caller that
+    dedups or cites on ``id`` and later compares against a fetched document's
+    own ``.id`` (which is the document id, not the chunk id) will never match.
+    Use ``document_id`` for anything that needs to key off the document.
+
+    The field is optional, not guaranteed: the GitHub digest fallback above
+    (``search_github_sync_state``) supplies its own ``id`` and no
+    ``document_id``, because a digest section is not a stored document.
     """
     if result.get("id"):
         return result
@@ -4345,11 +4402,27 @@ async def _corpus_health() -> dict[str, Any]:
         tracked += int(linear_status.get("issue_count") or 0)
         counts = await get_citadel()._graph_counts()
         indexed = int(counts.get("nodes") or 0)
+        # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
+        # back in the same call for free. /api/mesh used to publish the in-memory
+        # projection's edge count at the top level instead (24x understated live),
+        # so this is the real total that field needs.
+        edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {"ok": ok, "tracked_sources": tracked, "indexed_docs": indexed}
+        return {
+            "ok": ok,
+            "tracked_sources": tracked,
+            "indexed_docs": indexed,
+            "indexed_edges": edges,
+        }
     except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
         logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {"ok": True, "tracked_sources": None, "indexed_docs": None, "degraded": str(exc)}
+        return {
+            "ok": True,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": str(exc),
+        }
 
 
 @app.get("/readyz")
@@ -4679,7 +4752,17 @@ def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
 async def sources(request: Request, type: str | None = None) -> Any:
     require_access(request, "reader", "sources:read")
     sources_payload: list[dict[str, Any]] = []
-    summary: dict[str, Any] = {}
+    # When the evolve cycle last completed. Without it, a node that has not
+    # evolved in a week looks identical to one that evolved five minutes ago,
+    # and every per-source "last synced" figure below is a stale number with no
+    # way to tell (#153). Reader-scoped deliberately: staleness is exactly what
+    # a teammate needs before trusting a search result.
+    from kb.evolve_state import staleness as _evolve_staleness
+
+    _cfg = get_citadel().config
+    summary: dict[str, Any] = {
+        "evolve": _evolve_staleness(_cfg.evolve_state_path, _cfg.evolve_interval_seconds)
+    }
 
     if type in {None, "github"}:
         github_status = await get_github_syncer().status()
@@ -4959,7 +5042,11 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if not body.dry_run and result.get("enabled") is not False:
+    # ``skipped`` means another pass held the state file and this call did no
+    # work. Recording it would stamp the source "synced" with a null
+    # checked_at and null counts, which is the bookkeeping-success failure
+    # mode, not a sync.
+    if not body.dry_run and result.get("enabled") is not False and not result.get("skipped"):
         await mesh_state.record_repo_content_sync(citadel.config, result)
     get_access_store().record_event(
         action="repo_content_sync.run",
@@ -5626,9 +5713,17 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     if (
         isinstance(repo_content_result, dict)
         and repo_content_result.get("enabled") is not False
+        and not repo_content_result.get("skipped")
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)
+    # The response body already carries WHY the gateway did or did not send
+    # (`notifications.google_chat.reason`: "google_chat_disabled",
+    # "no_meaningful_updates", "dry_run", "preview_only", or None on an actual
+    # send). Recording only `sent` here would collapse all of those distinct,
+    # legitimate states into one boolean in the one place — the audit trail —
+    # that survives after the response is gone (#149, #151).
+    google_chat_notification = (result.get("notifications") or {}).get("google_chat") or {}
     get_access_store().record_event(
         action="learning_agent.run",
         actor=actor,
@@ -5643,9 +5738,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
                 repo_content_result.get("files_ingested") if isinstance(repo_content_result, dict) else None
             ),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     record_mcp_audit(
@@ -5661,9 +5755,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             "ingested": result.get("ingested"),
             "improved": result.get("improved"),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     return jsonable_encoder(result)
@@ -6151,6 +6244,24 @@ def share_session_tags_from_body(seat_slug: str, body: ShareSessionBody) -> list
     return tags
 
 
+# Every action name under which an accepted write into the Vault is recorded.
+# One act carries several names, and selecting a single one hid whole surfaces:
+#
+#   /api/contribute       -> "contribute"            (both HTTP and MCP)
+#   /ingest, CLI or HTTP  -> "ingest"
+#   /ingest via MCP       -> "mcp.citadel_ingest"    ONLY: the durable "ingest"
+#                            row is deliberately skipped for MCP requests to
+#                            avoid a second store write per call (see the
+#                            `not mcp_tool_name(request)` guard in ingest()).
+#   /api/share-session    -> "share_session"         (both HTTP and MCP)
+#
+# The MCP twins of contribute and share_session are excluded because their
+# non-MCP row is always written too, and listing both double-counts one write.
+CONTRIBUTION_ACTIONS = frozenset(
+    {"contribute", "ingest", "share_session", "mcp.citadel_ingest"}
+)
+
+
 @app.get("/api/contributions/recent")
 async def recent_contributions(
     request: Request,
@@ -6159,15 +6270,24 @@ async def recent_contributions(
 ) -> Any:
     actor = require_access(request, "reader", "kb:read")
     actor_id = actor.actor_id if mine else None
+    # success=True only: several of these surfaces audit their rejections under
+    # the same action (a secret-blocked ingest records success=False), and a
+    # write that was refused is not a contribution.
     events = get_access_store().recent_audit_events(
-        action="contribute",
+        actions=CONTRIBUTION_ACTIONS,
         actor_id=actor_id,
+        success=True,
         limit=limit,
     )
     return {
         "ok": True,
         "contributions": events,
-        "filter": {"mine": mine, "limit": limit},
+        "filter": {
+            "mine": mine,
+            "limit": limit,
+            "actions": sorted(CONTRIBUTION_ACTIONS),
+            "accepted_only": True,
+        },
     }
 
 

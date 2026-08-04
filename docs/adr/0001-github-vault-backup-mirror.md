@@ -1,5 +1,7 @@
 # Use GitHub As The Phase 1 Vault Backup Mirror
 
+- Superseded by: [ADR-0022](0022-evidence-is-retained-and-attested-at-capture.md). The manifest-only mirror is replaced by retained attested evidence.
+
 Citadel uses a private GitHub repository as the Phase 1 **Vault Backup Mirror** for text-heavy, diffable vault history: source snapshots, repository daily updates, vault contributions, conflict resolutions, and manifests.
 
 **Canonical mirror repository (private):**  

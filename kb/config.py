@@ -65,6 +65,15 @@ def _repo_content_sync_state_path(value: str | None) -> str:
     return str(Path(_state_root()) / "repo_content_sync_state.json")
 
 
+def _evolve_state_path(value: str | None) -> str:
+    if value:
+        return value
+    # Beside the sync state, which on Railway is the mounted volume. It has to
+    # outlive the container: the whole point is that a redeploy resumes the
+    # interval instead of restarting it (#153).
+    return str(Path(_state_root()) / "evolve_state.json")
+
+
 def _repo_stats_state_path(value: str | None) -> str:
     if value:
         return value
@@ -230,6 +239,7 @@ class CitadelConfig:
     repo_content_sync_dataset: str = "masumi-network"
     repo_content_sync_session: str = "masumi-repo-content"
     repo_content_sync_state_path: str = ".citadel/repo_content_sync_state.json"
+    evolve_state_path: str = ".citadel/evolve_state.json"
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -434,6 +444,7 @@ class CitadelConfig:
             repo_content_sync_state_path=_repo_content_sync_state_path(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_STATE_PATH")
             ),
+            evolve_state_path=_evolve_state_path(os.getenv("CITADEL_EVOLVE_STATE_PATH")),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
             ),

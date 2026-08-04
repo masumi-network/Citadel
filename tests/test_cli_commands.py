@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from kb.cli import _doctor, _ingest, _search, _token_set, _update, _wizard_roots
+from kb.cli import _activity, _doctor, _ingest, _search, _token_set, _update, _wizard_roots
 from kb.status import Check, StatusReport
 
 
@@ -1118,3 +1118,60 @@ def test_doctor_pre_push_from_non_repo_says_so(tmp_path: Path, monkeypatch, caps
     assert rc == 1
     assert not any("hook missing" in i["problem"] for i in out["issues"])
     assert any("no git repo" in i["problem"] for i in out["issues"])
+
+
+def _activity_args(**kw):
+    base = dict(
+        local=False, config=None, node_url="https://node.example",
+        watch=False, type=None, limit=20, json=True, global_broadcast=True,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_activity_global_json_emits_json_not_table(monkeypatch, capsys) -> None:
+    # `citadel activity --global --json` must emit machine-readable JSON, not
+    # the human "Team presence" table — a script parsing this got silent
+    # garbage with exit 0 and no signal --json was ignored.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"seats": [{"seat": "alice", "documents": 5}]},
+    )
+    rc = asyncio.run(_activity(_activity_args()))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Team presence" not in out
+    payload = json.loads(out)
+    assert payload["seats"] == [{"seat": "alice", "documents": 5}]
+
+
+def test_activity_global_json_flag_order_independent(monkeypatch, capsys) -> None:
+    # argparse.Namespace carries no flag-order info, so `--json --global` and
+    # `--global --json` reach this handler identically — assert both parse
+    # paths (represented by the same Namespace) take the JSON branch.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"seats": [{"seat": "bob", "documents": 2}]},
+    )
+    rc = asyncio.run(_activity(_activity_args(json=True, global_broadcast=True)))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["seats"][0]["seat"] == "bob"
+
+
+def test_activity_global_json_error_is_parseable(monkeypatch, capsys) -> None:
+    # An unreachable Node under --global --json must still exit with a
+    # parseable JSON object (matching the non-global error path), not a bare
+    # stderr line with stdout empty.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.cli.fetch_presence",
+        lambda *a, **k: {"error": "connection refused"},
+    )
+    rc = asyncio.run(_activity(_activity_args()))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "NODE_UNREACHABLE"

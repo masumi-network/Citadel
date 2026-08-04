@@ -235,6 +235,30 @@ class MeshState:
         publishes the window they cover. There is no ``failed_chunks`` (#197):
         it was the ``errors`` counter incremented a second time in the same
         code path and never counted chunks.
+
+        Three more top-level fields didn't mean their names (verified live
+        2026-08-03) and got the same #196/#197 treatment:
+
+        - ``edges`` was ``len(self.edges)`` — the same in-memory, restart-reset
+          projection already published honestly as
+          ``since_restart.projection_edges`` — sitting at the top level next to
+          corpus totals, where it read as one (5511 vs a real 131843 graph
+          edges: 24x off). ``corpus["indexed_edges"]`` is now threaded through
+          from the same graph read ``indexed_docs`` already comes from, so this
+          reports the real total when it's available and falls back to the
+          projection otherwise, exactly like ``nodes``.
+        - ``indexed_chunks`` was ``authoritative_nodes`` — the exact same value
+          as ``nodes`` — so it was equal to ``nodes`` by construction and never
+          measured a chunk count. Removed, not renamed: the same call made for
+          ``failed_chunks``. The honest restart-scoped accumulator is still
+          ``since_restart.indexed_chunks``.
+        - ``documents`` was ``corpus["tracked_sources"]`` — the sum of tracked
+          github repos, repo-content files and linear issues (318 live), not a
+          document count (the durable corpus store held ~2876 rows at the same
+          moment). Renamed to ``tracked_sources`` to match what it actually
+          reports; nothing on this hot, reader-scoped surface can cheaply
+          compute a real document-row total (that requires the admin-scoped
+          corpus census).
         """
         async with self._lock:
             self._ensure_base_graph(config)
@@ -254,6 +278,7 @@ class MeshState:
             corpus = corpus or {}
             authoritative_nodes = corpus.get("indexed_docs")
             authoritative_docs = corpus.get("tracked_sources")
+            authoritative_edges = corpus.get("indexed_edges")
             return {
                 "revision": self.revision,
                 "generated_at": utc_now(),
@@ -263,14 +288,11 @@ class MeshState:
                     "nodes": (
                         authoritative_nodes if authoritative_nodes is not None else len(self.nodes)
                     ),
-                    "edges": len(self.edges),
-                    "documents": (
-                        authoritative_docs if authoritative_docs is not None else self.documents
+                    "edges": (
+                        authoritative_edges if authoritative_edges is not None else len(self.edges)
                     ),
-                    "indexed_chunks": (
-                        authoritative_nodes
-                        if authoritative_nodes is not None
-                        else self.indexed_chunks
+                    "tracked_sources": (
+                        authoritative_docs if authoritative_docs is not None else self.documents
                     ),
                     "last_indexed_at": self.last_indexed_at,
                     "latest_event_id": self.revision,
