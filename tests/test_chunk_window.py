@@ -305,7 +305,7 @@ def test_check_chunkable_never_rewrites_the_text(monkeypatch: Any) -> None:
     assert not any(isinstance(value, str) and "SEVERITY" in value for value in vars(span).values())
 
 
-def test_byte_prefilter_is_a_sound_lower_bound() -> None:
+def test_byte_length_is_an_upper_bound_on_token_count() -> None:
     """The prefilter skips words whose UTF-8 length is under the budget.
 
     That is sound only because every BPE token covers at least one UTF-8 byte,
@@ -417,6 +417,203 @@ def test_unchunkable_guard_can_be_turned_off(monkeypatch: Any) -> None:
 
     assert result.accepted
     assert len(fake.remember_calls) == 1
+
+
+# --------------------------------------------------------------------------
+# 5. The scan is on the ingest path, so its work has to be bounded.
+# --------------------------------------------------------------------------
+
+
+def test_the_scan_stops_at_the_first_word_it_can_refuse(monkeypatch: Any) -> None:
+    """Segment lazily. The verdict needs one word, not a list of every word.
+
+    Measured on this tree before this became lazy: segmenting 2,000,000 bytes
+    built a 166,667-entry list and peaked at 10.28 MB, all of it discarded the
+    moment the first word failed. ``Citadel.ingest`` is ``async`` and calls this
+    synchronously, so the whole node waits through it.
+    """
+    seen: list[str] = []
+    real = chunk_window._iter_cognee_words
+
+    def counting(text: str) -> Any:
+        for word in real(text):
+            seen.append(word)
+            yield word
+
+    monkeypatch.setattr(chunk_window, "_iter_cognee_words", counting)
+    document = ("a" * 40_000) + " " + ("ordinary prose here. " * 20_000)
+
+    span = chunk_window.check_chunkable(document, budget=256)
+
+    assert span is not None
+    assert len(seen) == 1, f"segmented {len(seen)} words to decide on the first one"
+
+
+def test_a_word_too_long_to_measure_exactly_is_still_refused() -> None:
+    """Refuse by arithmetic rather than tokenizing megabytes on the ingest path.
+
+    Every token this encoding emits covers at most ``max_token_bytes()`` UTF-8
+    bytes, so a word longer than ``budget * max_token_bytes()`` cannot fit the
+    budget however the merges fall. Measured: encoding one 2,000,000-byte word
+    costs 571 ms of the event loop, and the exact number is never used as a
+    number — only as "over".
+    """
+    ceiling = 256 * chunk_window.max_token_bytes()
+    span = chunk_window.check_chunkable("a" * (ceiling + 1), budget=256)
+
+    assert span is not None
+    assert span.tokens > 256
+    assert not span.tokens_are_exact
+    assert "at least" in span.describe_tokens()
+
+
+def test_a_word_inside_the_ceiling_still_gets_an_exact_count() -> None:
+    """The shortcut must not swallow the exact measurement where one is affordable."""
+    span = chunk_window.check_chunkable("a" * 4000, budget=64)
+
+    assert span is not None
+    assert span.tokens_are_exact
+    assert "at least" not in span.describe_tokens()
+
+    encoding = chunk_window._bpe_encoding()
+    assert span.tokens == len(encoding.encode("a" * 4000, disallowed_special=()))
+
+
+def test_the_arithmetic_floor_never_claims_more_tokens_than_there_are() -> None:
+    """Soundness of the shortcut, checked against the encoding rather than asserted.
+
+    The floor is ``ceil(bytes / max_token_bytes())``. It is sound because the token
+    byte strings concatenate back to the input, so no encoding of N bytes can use
+    fewer than N / (longest token) tokens.
+    """
+    encoding = chunk_window._bpe_encoding()
+    limit = chunk_window.max_token_bytes()
+    samples = [
+        "a" * 40_000,
+        "한국어 텍스트 " * 3000,
+        "🚀🔥💡" * 4000,
+        "{\"key\":\"value\"}," * 3000,
+        "0123456789" * 4000,
+        "The payment service escrows funds until the seller submits a result. " * 600,
+    ]
+    for sample in samples:
+        floor = -(-len(sample.encode("utf-8", "replace")) // limit)
+        exact = len(encoding.encode(sample, disallowed_special=()))
+        assert floor <= exact, f"floor {floor} claimed more tokens than the {exact} there are"
+
+
+def test_max_token_bytes_is_read_from_the_encoding_not_asserted() -> None:
+    """It must come off the vocabulary, because a cognee or tiktoken bump can move it."""
+    encoding = chunk_window._bpe_encoding()
+    assert chunk_window.max_token_bytes() == max(
+        len(token) for token in encoding._mergeable_ranks
+    )
+
+
+# --------------------------------------------------------------------------
+# 6. Module state that is written in one call and read in the next.
+# --------------------------------------------------------------------------
+
+
+def test_applying_the_budget_twice_evicts_the_caches_once(monkeypatch: Any) -> None:
+    """``_APPLIED_BUDGET`` is written on one call and read on the next.
+
+    Cache eviction is the expensive half of ``apply_chunk_budget`` and it runs on
+    every cognee operation, so the second call has to be a no-op.
+    """
+    calls: list[int] = []
+    monkeypatch.setattr(
+        chunk_window, "_clear_cognee_budget_caches", lambda: calls.append(1)
+    )
+    chunk_window.reset_applied_budget()
+
+    chunk_window.apply_chunk_budget()
+    chunk_window.apply_chunk_budget()
+
+    assert calls == [1]
+    chunk_window.apply_chunk_budget(force=True)
+    assert calls == [1, 1]
+
+
+def test_an_uncovered_embedding_provider_is_announced_once_per_process(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """``_DETECTOR_ANNOUNCED`` is written on one call and read on the next.
+
+    ``install_embed_window_detector`` runs on every cognee operation. Without the
+    flag the same warning would be emitted on each one.
+    """
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setattr(chunk_window, "_DETECTOR_ANNOUNCED", False)
+
+    with caplog.at_level(logging.WARNING, logger="kb.chunk_window"):
+        assert chunk_window.install_embed_window_detector() is None
+        assert chunk_window.install_embed_window_detector() is None
+
+    announcements = [r for r in caplog.records if "detector covers the fastembed" in r.getMessage()]
+    assert len(announcements) == 1
+
+
+def test_a_tokenizer_that_cannot_load_is_not_retried_on_every_document(
+    monkeypatch: Any,
+) -> None:
+    """``_BPE_ENCODING_FAILED`` is written on one call and read on the next.
+
+    ``check_chunkable`` runs per ingest. Retrying a failed import per document
+    would mean an exception and a traceback per document.
+    """
+    import sys
+    import types
+
+    attempts: list[int] = []
+
+    stub = types.ModuleType("tiktoken")
+
+    def encoding_for_model(_name: str) -> Any:
+        attempts.append(1)
+        raise RuntimeError("no vocabulary available")
+
+    stub.encoding_for_model = encoding_for_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tiktoken", stub)
+    monkeypatch.setattr(chunk_window, "_BPE_ENCODING", None)
+    monkeypatch.setattr(chunk_window, "_BPE_ENCODING_FAILED", False)
+
+    assert chunk_window._bpe_encoding() is None
+    assert chunk_window._bpe_encoding() is None
+    assert attempts == [1]
+
+    # And an unmeasurable document is let through rather than refused on a guess.
+    assert chunk_window.check_chunkable("a" * 40_000, budget=256) is None
+
+
+def test_the_refusal_log_line_cannot_be_forged_by_the_dataset_name(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """The dataset name is caller-supplied and lands in this warning.
+
+    Reported by CodeQL as ``py/log-injection`` at ``kb/service.py``. Several of
+    this project's findings came out of reading its own logs, so a value that can
+    open a new line can write a sentence into that evidence.
+    """
+    import asyncio
+
+    from kb.config import CitadelConfig
+    from kb.service import Citadel
+    from tests.test_service import FakeCognee
+
+    monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "64")
+    citadel = Citadel(CitadelConfig(default_dataset="notes"), cognee=FakeCognee())
+    forged = "notes\n2026-08-04 INFO kb.service Ingest accepted for dataset central"
+
+    with caplog.at_level(logging.WARNING, logger="kb.service"):
+        result = asyncio.run(citadel.ingest("A note.\n" + ("z" * 4000), dataset=forged))
+
+    assert result.reason == "unchunkable_content"
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages, "the refusal must still be logged"
+    for message in messages:
+        assert "\n" not in message, "a caller-supplied value opened a new log line"
+    assert any("\\n" in message for message in messages), "the value must survive, escaped"
 
 
 def test_word_segmentation_agrees_with_cognee() -> None:

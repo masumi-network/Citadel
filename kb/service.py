@@ -12,6 +12,7 @@ from kb import chunk_window
 from kb.cognee_client import CogneeGateway, CogneePublicClient
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
+from kb.logging_utils import safe_log_value
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
 from kb.security_scan import (
     SecretContentError,
@@ -163,13 +164,17 @@ class Citadel:
         span = chunk_window.check_chunkable(data)
         if span is None:
             return None
+        # The dataset name arrives from the caller and is not constrained to a
+        # charset anywhere on the way here, so it is escaped before it goes into a
+        # line this project later reads back as evidence (CodeQL py/log-injection).
+        # The document itself never reaches the log: only its digest and lengths.
         logger.warning(
             "Ingest refused for dataset %s: unchunkable_content. One unbroken word is "
-            "%d BPE tokens against a budget of %d (%d characters, %s). cognee cannot "
+            "%s against a budget of %d (%d characters, %s). cognee cannot "
             "split it, so accepting it would either fail this dataset's next cognify "
             "pass outright or store text the embedder silently truncates.",
-            dataset,
-            span.tokens,
+            safe_log_value(dataset),
+            span.describe_tokens(),
             span.budget,
             span.char_length,
             span.fingerprint,

@@ -54,6 +54,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from typing import Any, Callable, Iterable
 
@@ -95,9 +96,8 @@ DETECTOR_ENV = "CITADEL_EMBED_WINDOW_DETECTOR"
 GUARD_ENV = "CITADEL_UNCHUNKABLE_GUARD"
 
 # cognee's ``chunk_by_word`` breaks on a single space and on these sentence
-# endings, and on nothing else. Not on "\n", not on "\t". That is why one line
-# of minified JS is one word to it.
-_COGNEE_DELIMITERS = " .;!?…。！？"
+# endings — " .;!?…。！？" — and on nothing else. Not on "\n", not on "\t". That is
+# why one line of minified JS is one word to it.
 _WORD_SPLIT = re.compile(r"[^ .;!?…。！？]*(?:[.;!?…。！？] *|[ ])?")
 
 # Per-chunk warnings are capped so one bad cognify pass cannot bury the log.
@@ -448,18 +448,39 @@ class UnchunkableSpan:
     budget: int
     char_length: int
     fingerprint: str
+    # False when ``tokens`` is the arithmetic floor rather than a count, because
+    # the word was too long to hand to the tokenizer on the ingest path. The field
+    # exists so nothing downstream can quote a floor as a measurement.
+    tokens_are_exact: bool = True
+
+    def describe_tokens(self) -> str:
+        """How the number may be spoken out loud."""
+        if self.tokens_are_exact:
+            return f"{self.tokens} BPE tokens"
+        return f"at least {self.tokens} BPE tokens"
+
+
+def _iter_cognee_words(text: str) -> Iterable[str]:
+    """Yield segments exactly where cognee's ``chunk_by_word`` segments.
+
+    Lazy on purpose. ``check_chunkable`` needs the first word that fails, not a
+    list of every word: building the list for a 2,000,000-byte document allocated
+    166,667 strings and peaked at 10.28 MB on this tree, all of it thrown away.
+    """
+    for match in _WORD_SPLIT.finditer(text):
+        word = match.group(0)
+        if word:
+            yield word
 
 
 def split_cognee_words(text: str) -> list[str]:
-    """Segment exactly where cognee's ``chunk_by_word`` segments.
+    """The whole segmentation, as a list.
 
     Joining the result reproduces the input. Any coarser rule (``str.split()``, for
     one, which breaks on newlines that cognee ignores) under-measures the longest
     word and lets past the documents this check exists to catch.
     """
-    if not text:
-        return []
-    return [match.group(0) for match in _WORD_SPLIT.finditer(text) if match.group(0)]
+    return list(_iter_cognee_words(text))
 
 
 _BPE_ENCODING: Any | None = None
@@ -484,6 +505,32 @@ def _bpe_encoding() -> Any | None:
     return _BPE_ENCODING
 
 
+@lru_cache(maxsize=1)
+def max_token_bytes() -> int | None:
+    """The longest token in the encoding's vocabulary, in UTF-8 bytes.
+
+    Read off the vocabulary rather than written down, because a tiktoken or cognee
+    bump can move it. Cached because the scan over ~200,000 vocabulary entries costs
+    19 ms and ``check_chunkable`` runs per ingest.
+
+    Returns None when it cannot be read. None turns the shortcut in
+    ``check_chunkable`` off and leaves the exact measurement in its place: the
+    slower answer, never a different one.
+    """
+    encoding = _bpe_encoding()
+    if encoding is None:
+        return None
+    try:
+        longest = max(len(token) for token in encoding._mergeable_ranks)
+    except Exception:  # pragma: no cover - tiktoken moved the vocabulary
+        logger.exception(
+            "Could not read the encoding's longest token; the un-chunkable check "
+            "will measure every oversized word in full"
+        )
+        return None
+    return longest if longest > 0 else None
+
+
 def guard_enabled() -> bool:
     raw = os.getenv(GUARD_ENV)
     if raw is None:
@@ -502,19 +549,38 @@ def check_chunkable(text: str, *, budget: int | None = None) -> UnchunkableSpan 
     every later one. Anywhere else it is emitted verbatim as an over-budget chunk
     and the embedder truncates it.
 
-    The scan skips any word whose UTF-8 length is within the budget. That skip is
-    sound because a BPE token covers at least one UTF-8 byte, so byte length is an
-    upper bound on token count — it is a prefilter and never the verdict. The
-    verdict is taken in BPE tokens, which is the unit that actually raises.
+    Byte length brackets the answer from both sides, which is what keeps this
+    affordable on an ``async`` ingest path:
+
+    * a token covers **at least** one UTF-8 byte, so a word within ``budget``
+      bytes is within ``budget`` tokens and is skipped untokenized;
+    * a token covers **at most** ``max_token_bytes()`` UTF-8 bytes, and the token
+      byte strings concatenate back to the word, so a word longer than
+      ``budget * max_token_bytes()`` is over the budget however the merges fall.
+      Tokenizing a 2,000,000-byte word to learn that costs 571 ms of the event
+      loop, measured on this tree, and the answer is only ever read as "over".
+
+    Between those two the word is measured exactly. Neither bracket decides
+    differently from the tokenizer; they decide the same thing sooner.
     """
     limit = budget if budget is not None else resolve_chunk_budget()
     encoding = _bpe_encoding()
     if encoding is None:
         return None
+    ceiling = max_token_bytes()
 
-    for word in split_cognee_words(text):
-        if len(word.encode("utf-8", "replace")) <= limit:
+    for word in _iter_cognee_words(text):
+        span_bytes = len(word.encode("utf-8", "replace"))
+        if span_bytes <= limit:
             continue
+        if ceiling is not None and span_bytes > limit * ceiling:
+            return UnchunkableSpan(
+                tokens=-(-span_bytes // ceiling),
+                budget=limit,
+                char_length=len(word),
+                fingerprint=_fingerprint(word),
+                tokens_are_exact=False,
+            )
         tokens = len(encoding.encode(word, disallowed_special=()))
         if tokens > limit:
             return UnchunkableSpan(
