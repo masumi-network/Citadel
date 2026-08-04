@@ -5717,6 +5717,13 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)
+    # The response body already carries WHY the gateway did or did not send
+    # (`notifications.google_chat.reason`: "google_chat_disabled",
+    # "no_meaningful_updates", "dry_run", "preview_only", or None on an actual
+    # send). Recording only `sent` here would collapse all of those distinct,
+    # legitimate states into one boolean in the one place — the audit trail —
+    # that survives after the response is gone (#149, #151).
+    google_chat_notification = (result.get("notifications") or {}).get("google_chat") or {}
     get_access_store().record_event(
         action="learning_agent.run",
         actor=actor,
@@ -5731,9 +5738,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
                 repo_content_result.get("files_ingested") if isinstance(repo_content_result, dict) else None
             ),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     record_mcp_audit(
@@ -5749,9 +5755,8 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             "ingested": result.get("ingested"),
             "improved": result.get("improved"),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
-            "google_chat_sent": (
-                (result.get("notifications") or {}).get("google_chat") or {}
-            ).get("sent"),
+            "google_chat_sent": google_chat_notification.get("sent"),
+            "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
     return jsonable_encoder(result)

@@ -951,6 +951,46 @@ def test_api_uses_configured_citadel_service() -> None:
     assert upgrade.status_code == 200
 
 
+def test_learning_agent_run_audit_records_gateway_skip_reason() -> None:
+    """A digest that posts nowhere must say why in the audit trail, not just that.
+
+    The response body from POST /api/learning-agent/run already carries a
+    ``reason`` on ``notifications.google_chat`` (e.g. "google_chat_disabled").
+    The audit record written for that same call is the only trace left once
+    nobody is watching the response — it must not collapse that reason down to
+    a bare ``sent: false`` with no explanation.
+    """
+    client = authed_client()
+
+    class SkippedGatewayAgent(FakeLearningAgent):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            result = await super().run(**kwargs)
+            result["notifications"] = {
+                "google_chat": {
+                    "enabled": False,
+                    "sent": False,
+                    "reason": "google_chat_disabled",
+                }
+            }
+            return result
+
+    server_module.app.state.learning_agent = SkippedGatewayAgent()
+
+    response = client.post("/api/learning-agent/run", json={"post_to_chat": True})
+    assert response.status_code == 200
+    assert response.json()["notifications"]["google_chat"]["reason"] == "google_chat_disabled"
+
+    events = server_module.app.state.access_store.snapshot()["audit_events"]
+    run_events = [event for event in events if event["action"] == "learning_agent.run"]
+    assert run_events, "expected a learning_agent.run audit event"
+    detail = run_events[-1]["detail"]
+    assert detail["google_chat_sent"] is False
+    assert detail["google_chat_reason"] == "google_chat_disabled", (
+        "the audit trail must carry why the gateway did not send, not just that "
+        f"it did not: {detail}"
+    )
+
+
 def test_linear_sync_api_endpoints() -> None:
     client = authed_client()
 
