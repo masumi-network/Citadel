@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 
+from kb.cognee_client import ingest_indexing_state
 from kb.secure_http import open_secure
 
 from kb.learning import LearningProcess
@@ -406,15 +407,24 @@ class GitHubOrgSyncer:
             }
             self._save_state(state)
 
+        # `ingested` reports that the store ACCEPTED the digest (the add). The
+        # graph write that makes it searchable is asynchronous, so this run can
+        # only observe the disposition of that request — never its outcome.
+        indexing_state = (
+            ingest_indexing_state(ingest_result.cognee_result)
+            if ingest_result is not None and ingest_result.accepted
+            else None
+        )
         logger.info(
             "GitHub sync finished for org %s: %d repos scanned, %d changed, %d events, "
-            "%d commits, ingested=%s",
+            "%d commits, ingested=%s indexing=%s",
             self.org,
             len(repos),
             len(update.changed_repos),
             len(update.new_events),
             len(update.new_commits),
             bool(ingest_result and ingest_result.accepted),
+            indexing_state,
         )
         return {
             "ok": True,
@@ -443,6 +453,11 @@ class GitHubOrgSyncer:
             "active_repositories": update.active_repositories[:20],
             "recent_events": [event.summary_dict() for event in update.new_events[:20]],
             "ingested": bool(ingest_result and ingest_result.accepted),
+            # What happened to the graph-indexing request for that add
+            # ("scheduled"/"deferred"/"suppressed", or "unknown" when the
+            # outcome payload carries no observation). None when nothing was
+            # accepted. Not a confirmation: the index write happens later.
+            "indexing": indexing_state,
             "ingest_reason": (
                 "blocked_by_security_scan"
                 if security_blocked

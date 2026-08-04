@@ -252,6 +252,12 @@ async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None
 
     first = await syncer.run()
     assert first["files_ingested"] == 2
+    # The run reports what it OBSERVED about those adds, next to the request
+    # counter: cognee returned data ids for both (confirmed), and the graph
+    # write is only a scheduled request, never claimed as done.
+    assert first["files_add_confirmed"] == 2
+    assert first["files_add_unconfirmed"] == 0
+    assert first["indexing"] == ["scheduled"]
     assert len(learning.calls) == 2
     assert learning.calls[0]["tags"] == [
         "github",

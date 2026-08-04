@@ -2526,6 +2526,59 @@ def test_readyz_ok_when_graph_populated() -> None:
     assert ready.json()["corpus"]["ok"] is True
 
 
+def test_readyz_reports_canary_never_ran_as_distinct_state() -> None:
+    # A node that never ran the end-to-end canary and one that passed it used
+    # to answer with the same ok bit: _LAST_CANARY is written only by the
+    # evolve scheduler, which is off by default. "never_ran" is now an
+    # explicit, branchable state. It is reported, NOT failed — 503ing every
+    # default-config node would evict healthy nodes from rotation, which is
+    # worse than the gap.
+    import kb.server as server_module
+
+    class PopulatedCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    client = authed_client("test-reader")
+    app.state.citadel = PopulatedCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    original = server_module._LAST_CANARY
+    try:
+        server_module._LAST_CANARY = None
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        body = ready.json()
+        assert body["ok"] is True
+        assert body["canary"] is None
+        assert body["canary_state"] == "never_ran"
+        # The observed background-cognify ledger rides along, so a node whose
+        # scheduled graph writes never complete is visible on the wire.
+        assert "background_cognify" in body
+        assert "runs_scheduled" in body["background_cognify"]
+        assert "runs_completed" in body["background_cognify"]
+
+        server_module._LAST_CANARY = {"ok": True, "search_hit": True}
+        body = client.get("/readyz").json()
+        assert body["ok"] is True
+        assert body["canary_state"] == "passed"
+
+        server_module._LAST_CANARY = {"ok": False, "search_hit": False}
+        ready = client.get("/readyz")
+        assert ready.status_code == 503
+        body = ready.json()
+        assert body["ok"] is False
+        assert body["canary_state"] == "failed"
+    finally:
+        server_module._LAST_CANARY = original
+
+
 def test_search_across_datasets_runs_concurrently() -> None:
     # #50: per-dataset recalls run concurrently, not serially.
     import asyncio as aio
