@@ -542,7 +542,18 @@ class TestLint:
         (gt / PATH_DOC.replace("/", "__")).write_text(self.BODY)
         (gt / PATH_OTHER.replace("/", "__")).write_text(self.OTHER_BODY)
         path = tmp_path / "golden.json"
-        path.write_text(json.dumps({"version": 3, "questions": questions}))
+        # A frozen block with a matching pin is now part of a valid questions
+        # file, so the shared helper writes one; TestFrozenFixtureSet covers
+        # what happens when it is missing or stale.
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "questions": questions,
+                    "frozen": {"questions_sha256": sb.questions_pin(questions)},
+                }
+            )
+        )
         return path, gt
 
     def _q(self, **overrides):
@@ -1111,3 +1122,492 @@ class TestShippedGoldenSet:
             assert not probe.get("answer_spans"), probe["id"]
         for control in controls:
             assert control.get("expect_any"), control["id"]
+
+
+def scored_hit(path: str, blob: str, body: str, coverage: float | None,
+               *, tier: str = "unattested", sha: str | None = None) -> dict:
+    """A repo hit carrying the node's own reported term_coverage and trust tier."""
+    hit = repo_hit(path, blob, body)
+    hit["_citadel"]["relevance"] = (
+        {} if coverage is None else {"term_coverage": coverage, "matched_terms": []}
+    )
+    hit["_citadel"]["trust_tier"] = tier
+    hit["_citadel"]["content_sha256"] = sha or hashlib.sha256(body.encode()).hexdigest()
+    return hit
+
+
+class TestRankingIsMeasuredSeparatelyFromRetrieval:
+    """Retrieval asks whether the answer came back; ranking asks whether the node
+    put it in the right place. A single recall number blends the two."""
+
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def test_exact_answer_below_a_lower_coverage_hit_is_an_inversion(self):
+        hits = [
+            scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", 0.167),
+            scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0),
+        ]
+        row = sb.score_question(question(spans=[self.SPAN]), hits, {})
+        assert row["answer_slot"] == 2
+        assert row["answer_term_coverage"] == 1.0
+        assert row["outranked_by_coverage"] == 0.167
+        assert row["outranked_by_slot"] == 1
+
+    def test_answer_ranked_first_is_not_an_inversion(self):
+        hits = [
+            scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0),
+            scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", 0.167),
+        ]
+        row = sb.score_question(question(spans=[self.SPAN]), hits, {})
+        assert row["answer_slot"] == 1
+        assert row["outranked_by_coverage"] is None
+
+    def test_a_higher_coverage_hit_above_the_answer_is_not_an_inversion(self):
+        """Being outranked by something the node scored HIGHER is ordinary
+        ranking, not the defect. Only a strictly lower-coverage hit counts."""
+        hits = [
+            scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", 1.0),
+            scored_hit(PATH_DOC, BLOB_A, self.SPAN, 0.5),
+        ]
+        row = sb.score_question(question(spans=[self.SPAN]), hits, {})
+        assert row["answer_slot"] == 2
+        assert row["outranked_by_coverage"] is None
+
+    def test_a_path_header_match_cannot_manufacture_an_inversion(self):
+        """The answer slot is fixed by a BODY span match with the header
+        stripped, so a hit whose only overlap is the path header never becomes
+        the answer and never creates an inversion."""
+        header_only = scored_hit(PATH_DOC, BLOB_B, "no answer text in this body", 1.0)
+        hits = [header_only, scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)]
+        row = sb.score_question(question(spans=[self.SPAN]), hits, {})
+        assert row["answer_slot"] == 2
+        assert row["outranked_by_coverage"] is None
+
+    def test_missing_coverage_is_not_counted_as_an_inversion(self):
+        hits = [
+            scored_hit(PATH_OTHER, BLOB_B, "unrelated filler prose", None),
+            scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0),
+        ]
+        row = sb.score_question(question(spans=[self.SPAN]), hits, {})
+        assert row["outranked_by_coverage"] is None
+
+    def test_summary_rate_counts_only_answers_that_were_ranked(self):
+        span = self.SPAN
+        inverted = sb.score_question(
+            question("a1", spans=[span]),
+            [
+                scored_hit(PATH_OTHER, BLOB_B, "filler", 0.0),
+                scored_hit(PATH_DOC, BLOB_A, span, 1.0),
+            ],
+            {},
+        )
+        clean = sb.score_question(
+            question("a2", spans=[span]),
+            [scored_hit(PATH_DOC, BLOB_A, span, 1.0)],
+            {},
+        )
+        never_served = sb.score_question(
+            question("a3", spans=[span]),
+            [scored_hit(PATH_OTHER, BLOB_B, "filler", 0.2)],
+            {},
+        )
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0},
+            [],
+            {},
+        )
+        summary = sb.summarize([inverted, clean, never_served, probe], [])
+        assert summary["ranking"]["answers_ranked"] == 2
+        assert summary["ranking"]["rank_inversion_rate"] == 0.5
+        assert summary["ranking"]["inversions_by_zero_coverage"] == 1
+        assert summary["ranking"]["answer_worst_slot"] == 2
+
+
+class TestEmbeddingWindowPairs:
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def _pair_rows(self, head_pass: bool, tail_pass: bool, pair: str = "w01"):
+        def side(role, passed):
+            q = question(f"{pair}{role[0]}", spans=[self.SPAN])
+            q["category"] = f"window_{role}"
+            q["window_role"] = role
+            q["window_pair"] = pair
+            hits = (
+                [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)]
+                if passed
+                else [scored_hit(PATH_OTHER, BLOB_B, "unrelated filler", 0.1)]
+            )
+            return sb.score_question(q, hits, {})
+
+        return [side("head", head_pass), side("tail", tail_pass)]
+
+    def test_window_rows_are_excluded_from_the_headline(self):
+        """v5 added pairs that fail by design. Folding them into
+        answer_recall_at_5 would move the headline for a reason that has nothing
+        to do with the node changing."""
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        rows = [plain, probe] + self._pair_rows(head_pass=True, tail_pass=False)
+        summary = sb.summarize(rows, [])
+        assert summary["counts"]["questions_with_spans"] == 1
+        assert summary["quality"]["answer_recall_at_5"] == 1.0
+        assert summary["counts"]["questions_window"] == 2
+
+    def test_penalty_is_head_recall_minus_tail_recall(self):
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        rows = [plain, probe]
+        rows += self._pair_rows(True, False, "w01")
+        rows += self._pair_rows(True, True, "w02")
+        summary = sb.summarize(rows, [])
+        window = summary["window"]
+        assert window["head_recall_at_5"] == 1.0
+        assert window["tail_recall_at_5"] == 0.5
+        assert window["window_penalty"] == 0.5
+        assert window["pairs_complete"] == 2
+        assert window["pairs_head_only"] == 1
+        assert window["pairs_both"] == 1
+
+    def test_a_half_pair_does_not_contribute_to_the_penalty(self):
+        """Only pairs whose BOTH sides ran are a within-document comparison."""
+        probe = sb.score_question(
+            {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+        )
+        plain = sb.score_question(
+            question("q1", spans=[self.SPAN]),
+            [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+            {},
+        )
+        rows = [plain, probe] + self._pair_rows(True, False, "w01")
+        rows = [r for r in rows if r["window_role"] != "tail"]
+        summary = sb.summarize(rows, [])
+        assert summary["window"]["pairs_complete"] == 0
+
+
+class TestWindowFixtureContract:
+    """The rules that make a failing tail evidence rather than a failing question."""
+
+    HEAD_TEXT = "alpha beta gamma delta epsilon " * 40           # ~1200 chars
+    TAIL_TEXT = "zeta thermodynamic eigenvector quaternion sentence here to quote."
+    BODY = "# Doc Title\n\n" + HEAD_TEXT + ("filler padding words. " * 200) + TAIL_TEXT
+
+    def _golden(self, tmp_path, question_obj):
+        gt = tmp_path / "ground_truth"
+        gt.mkdir(exist_ok=True)
+        (gt / PATH_DOC.replace("/", "__")).write_text(self.BODY)
+        path = tmp_path / "golden.json"
+        questions = [question_obj]
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 5,
+                    "questions": questions,
+                    "frozen": {"questions_sha256": sb.questions_pin(questions)},
+                }
+            )
+        )
+        return path, gt
+
+    def _tail_q(self, **overrides):
+        base = {
+            "id": "w01t",
+            "question": self.TAIL_TEXT,
+            "expect_any": [PATH_DOC],
+            "category": "window_tail",
+            "expected_recall": 1,
+            "answer_spans": [self.TAIL_TEXT],
+            "window_pair": "w01",
+            "window_role": "tail",
+            "source_offset_chars": self.BODY.find(self.TAIL_TEXT),
+            "novel_terms_absent_from_head": [
+                "thermodynamic", "eigenvector", "quaternion",
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_valid_tail_fixture_passes(self, tmp_path):
+        path, gt = self._golden(tmp_path, self._tail_q())
+        problems, _ = sb.lint_questions(path, gt)
+        assert problems == []
+
+    def test_the_quote_being_the_query_is_allowed_only_for_window_questions(self, tmp_path):
+        """Every other question rejects a span that appears in its own query.
+        A window question IS its verbatim quote by design."""
+        plain = self._tail_q(category="repo_overview")
+        plain.pop("window_role")
+        plain.pop("window_pair")
+        path, gt = self._golden(tmp_path, plain)
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("appears in the question text" in p for p in problems)
+
+    def test_tail_quote_too_shallow_fails(self, tmp_path):
+        path, gt = self._golden(tmp_path, self._tail_q(source_offset_chars=10))
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("too shallow to test the window" in p for p in problems)
+
+    def test_tail_without_enough_novel_terms_fails(self, tmp_path):
+        path, gt = self._golden(
+            tmp_path, self._tail_q(novel_terms_absent_from_head=["quaternion"])
+        )
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("novel_terms_absent_from_head" in p for p in problems)
+
+    def test_a_term_that_actually_occurs_in_the_head_voids_the_control(self, tmp_path):
+        """This is the control the whole comparison rests on: if the tail's
+        terms are already in the head, the head embedding can answer the query
+        and a pass proves nothing about reach."""
+        path, gt = self._golden(
+            tmp_path,
+            self._tail_q(
+                novel_terms_absent_from_head=["thermodynamic", "eigenvector", "alpha"]
+            ),
+        )
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("the control is void" in p for p in problems)
+        assert any("alpha" in p for p in problems)
+
+    def test_head_fixture_outside_the_window_fails(self, tmp_path):
+        head = self._tail_q(
+            id="w01h", category="window_head", window_role="head",
+            question=self.TAIL_TEXT, answer_spans=[self.TAIL_TEXT],
+        )
+        head.pop("novel_terms_absent_from_head")
+        path, gt = self._golden(tmp_path, head)
+        problems, _ = sb.lint_questions(path, gt)
+        assert any("not a head control" in p for p in problems)
+
+    def test_shipped_window_pairs_satisfy_the_contract(self):
+        """The committed set, not a fixture: every pair has both sides, both
+        quotes are unique to one document, and every tail clears the controls."""
+        data = json.loads(
+            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
+        )
+        window = [q for q in data["questions"] if sb.is_window_question(q)]
+        assert len(window) >= 20
+        by_pair = {}
+        for q in window:
+            by_pair.setdefault(q["window_pair"], set()).add(q["window_role"])
+        assert all(roles == {"head", "tail"} for roles in by_pair.values()), by_pair
+        for q in window:
+            assert q["answer_spans"] == [q["question"]], q["id"]
+            assert len(q["expect_any"]) == 1, q["id"]
+            if q["window_role"] == "tail":
+                assert q["depth_fraction"] >= sb.TAIL_MIN_DEPTH, q["id"]
+                assert (
+                    len(q["novel_terms_absent_from_head"]) >= sb.TAIL_MIN_NOVEL_TERMS
+                ), q["id"]
+            else:
+                assert q["source_offset_chars"] < sb.HEAD_WINDOW_CHARS, q["id"]
+
+
+class TestFrozenFixtureSet:
+    """Frozen has to mean something. The pin is what enforces it."""
+
+    def _file(self, tmp_path, questions, frozen=...):
+        payload = {"version": 5, "questions": questions}
+        if frozen is not ...:
+            payload["frozen"] = frozen
+        path = tmp_path / "golden.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_pin_is_stable_under_key_order_and_formatting(self):
+        a = [{"id": "q1", "question": "text", "expected_recall": 1}]
+        b = [{"expected_recall": 1, "question": "text", "id": "q1"}]
+        assert sb.questions_pin(a) == sb.questions_pin(b)
+
+    def test_pin_moves_when_a_question_changes(self):
+        a = [{"id": "q1", "question": "text"}]
+        b = [{"id": "q1", "question": "text edited"}]
+        assert sb.questions_pin(a) != sb.questions_pin(b)
+
+    def test_edited_question_fails_lint_against_a_stale_pin(self, tmp_path):
+        original = [{"id": "q1", "question": "original text"}]
+        pin = sb.questions_pin(original)
+        edited = [{"id": "q1", "question": "quietly edited text"}]
+        path = self._file(tmp_path, edited, {"questions_sha256": pin})
+        problems, _ = sb.lint_questions(path, tmp_path / "missing_gt")
+        assert any("FROZEN SET CHANGED" in p for p in problems)
+
+    def test_missing_frozen_block_fails(self, tmp_path):
+        path = self._file(tmp_path, [{"id": "q1", "question": "text"}])
+        problems, _ = sb.lint_questions(path, tmp_path / "missing_gt")
+        assert any("no `frozen` block" in p for p in problems)
+
+    def test_shipped_questions_file_matches_its_own_pin(self):
+        data = json.loads(
+            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
+        )
+        assert data["frozen"]["questions_sha256"] == sb.questions_pin(data["questions"])
+
+
+class TestPerRequestMetadataStability:
+    def test_same_chunk_same_sha_different_tier_is_flagged(self):
+        span = "the subsystem persists attempted charges with a null transaction id"
+        a = scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="reference-only", sha="deadbeef")
+        b = scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="unattested", sha="deadbeef")
+        assert a["_citadel"]["result_id"] == b["_citadel"]["result_id"]
+        rows = [
+            sb.score_question(question("q1", spans=[span]), [a], {}),
+            sb.score_question(question("q2", spans=[span]), [b], {}),
+            sb.score_question(
+                {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+            ),
+        ]
+        summary = sb.summarize(rows, [])
+        meta = summary["metadata_stability"]
+        assert meta["chunks_observed"] == 1
+        assert meta["chunks_with_unstable_trust_tier"] == 1
+        assert meta["unstable_examples"][0]["tiers"] == ["reference-only", "unattested"]
+
+    def test_a_consistent_tier_is_not_flagged(self):
+        span = "the subsystem persists attempted charges with a null transaction id"
+        hit = scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="unattested", sha="deadbeef")
+        rows = [
+            sb.score_question(question("q1", spans=[span]), [hit], {}),
+            sb.score_question(question("q2", spans=[span]), [hit], {}),
+            sb.score_question(
+                {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0}, [], {}
+            ),
+        ]
+        summary = sb.summarize(rows, [])
+        assert summary["metadata_stability"]["chunks_with_unstable_trust_tier"] == 0
+
+
+class TestReportCoversTheNewMetrics:
+    def _run(self, summary_extra):
+        return {
+            "run_at": "2026-08-04T00:00:00+00:00",
+            "summary": {
+                "quality": {
+                    "answer_recall_at_5": 0.9, "raw_page_recall_at_5": 0.8,
+                    "doc_recall_at_5": 0.9, "mrr_body": 0.7,
+                    "header_credit_rate": 0.0, "negative_hit_rate": 0.0,
+                },
+                "duplication": {"duplicate_blob_rate_at_10": 0.3},
+                "counts": {
+                    "questions_with_spans": 39, "questions_positive": 61,
+                    "questions_blocked_probe": 8,
+                },
+                "latency": {"p50_ms": 600.0, "p95_ms": 900.0, "samples": 105},
+                **summary_extra,
+            },
+            "rows": [],
+            "fingerprint": {"harness_git_sha": "abc1234", "content": {"sha256": "x"}},
+        }
+
+    def test_window_and_ranking_rows_carry_their_definitions(self):
+        run = self._run(
+            {
+                "window": {
+                    "head_recall_at_5": 0.667, "tail_recall_at_5": 0.0,
+                    "tail_recall_given_head_at_5": 0.0, "window_penalty": 0.667,
+                    "pairs_complete": 18, "pairs_head_reachable": 11,
+                },
+                "ranking": {"rank_inversion_rate": 0.63, "answers_ranked": 19},
+            }
+        )
+        markdown = sb.build_markdown_report(run)
+        for key in ("head_recall_at_5", "tail_recall_at_5", "window_penalty",
+                    "rank_inversion_rate"):
+            assert key in markdown
+            assert sb.METRIC_DEFINITIONS[key][:40] in markdown
+        assert "| 18 |" in markdown
+        assert "| 19 |" in markdown
+
+    def test_a_run_predating_these_metrics_says_so_instead_of_guessing(self):
+        markdown = sb.build_markdown_report(self._run({}))
+        assert "not measured in this run" in markdown
+        assert "n/a (not measured)" not in markdown.split("head_recall_at_5")[1][:80]
+
+
+class TestTailRecallIsConditionedOnAReachableDocument:
+    """The number that survives the obvious objection: a document whose head
+    quote ALSO missed may never have been indexed, so its tail miss says
+    nothing about where the text sits."""
+
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def _rows(self, pairs):
+        rows = [
+            sb.score_question(
+                {"id": "p1", "question": "probe", "expect_any": [], "expected_recall": 0},
+                [],
+                {},
+            ),
+            sb.score_question(
+                question("q1", spans=[self.SPAN]),
+                [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)],
+                {},
+            ),
+        ]
+        for pair, (head_pass, tail_pass) in pairs.items():
+            for role, passed in (("head", head_pass), ("tail", tail_pass)):
+                q = question(f"{pair}{role[0]}", spans=[self.SPAN])
+                q.update({"category": f"window_{role}", "window_role": role,
+                          "window_pair": pair})
+                hits = (
+                    [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)]
+                    if passed
+                    else [scored_hit(PATH_OTHER, BLOB_B, "unrelated filler", 0.1)]
+                )
+                rows.append(sb.score_question(q, hits, {}))
+        return rows
+
+    def test_unreachable_documents_are_excluded_from_the_conditional(self):
+        # w01 reachable, tail missed. w02 unreachable on both sides.
+        summary = sb.summarize(
+            self._rows({"w01": (True, False), "w02": (False, False)}), []
+        )
+        window = summary["window"]
+        assert window["pairs_complete"] == 2
+        assert window["pairs_neither"] == 1
+        assert window["tail_recall_at_5"] == 0.0          # 0 of 2, pessimistic
+        assert window["pairs_head_reachable"] == 1        # only w01 is evidence
+        assert window["tail_recall_given_head_at_5"] == 0.0
+
+    def test_conditional_counts_only_proven_reachable_documents(self):
+        summary = sb.summarize(
+            self._rows(
+                {"w01": (True, True), "w02": (True, False), "w03": (False, False)}
+            ),
+            [],
+        )
+        window = summary["window"]
+        assert window["pairs_head_reachable"] == 2
+        assert window["tail_recall_given_head_at_5"] == 0.5   # 1 of 2
+        assert window["tail_recall_at_5"] == round(1 / 3, 4)  # 1 of 3, pessimistic
+
+    def test_conditional_is_none_when_no_head_ever_retrieved(self):
+        summary = sb.summarize(self._rows({"w01": (False, False)}), [])
+        assert summary["window"]["tail_recall_given_head_at_5"] is None
+
+
+class TestRunRecordsWhichFrozenSetItAnswered:
+    def test_fingerprint_carries_the_pin_not_just_the_file_hash(self, tmp_path):
+        questions = [{"id": "q1", "question": "text", "expected_recall": 1}]
+        path = tmp_path / "golden.json"
+        path.write_text(json.dumps({"version": 5, "questions": questions}))
+        reformatted = tmp_path / "golden2.json"
+        reformatted.write_text(json.dumps({"questions": questions, "version": 5}, indent=4))
+        # Reformatting moves the file hash but must NOT move the pin: the run
+        # answered the same questions.
+        assert hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(
+            reformatted.read_bytes()
+        ).hexdigest()
+        assert sb.questions_pin(sb.load_questions(path)) == sb.questions_pin(
+            sb.load_questions(reformatted)
+        )

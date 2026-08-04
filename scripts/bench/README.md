@@ -59,7 +59,7 @@ Tracking issue for the harness: #122.
    search-only token the census records `unavailable` and the run continues;
    nothing else degrades.
 
-`--repeats N` costs N searches per question (69 questions in v4) and feeds only
+`--repeats N` costs N searches per question (105 questions in v5) and feeds only
 latency and `hit_stability`. Start at `--repeats 1`.
 
 ## What it measures
@@ -76,6 +76,12 @@ latency and `hit_stability`. Start at `--repeats 1`.
 | `distinct_files_at_10` | mean distinct source files over the top 10 slots |
 | `distinct_source_ratio_mean` | distinct RESOLVABLE source paths per page divided by ALL hits. 1.00 means every slot is a different document; lower means one document occupies slots the caller pays context for. A hit whose source path cannot be resolved counts against this exactly like a duplicate does |
 | `distinct_source_ratio_resolvable_only` | the same ratio over hits whose source path resolved. Report both: the first is the pessimistic bound, this is what the resolvable evidence supports |
+| `head_recall_at_5` | share of embedding-window pairs whose HEAD quote (from the first 2000 characters) retrieves its own document |
+| `tail_recall_at_5` | the same for the TAIL quote (>= 40% depth) of the SAME document. Pessimistic: counts documents that may never have been indexed |
+| `tail_recall_given_head_at_5` | **quote this one.** `tail_recall_at_5` restricted to documents whose head quote DID retrieve, so every document counted is one the index demonstrably holds |
+| `window_penalty` | `head_recall_at_5 - tail_recall_at_5`: how much of a document stops being reachable purely because the text sits later in it |
+| `rank_inversion_rate` | share of answers ranked BELOW a hit the node itself reports matched a strictly smaller share of query terms. Ranking, not retrieval |
+| `chunks_with_unstable_trust_tier` | chunks served more than once at the same `content_sha256` that reported different `trust_tier` values |
 | `hit_stability` | with `--repeats N`: agreement of repeat outcomes with attempt 1 |
 | `latency p50/p95` | separate block; informational, never gates quality. **Client round-trip**, timed around `urlopen`, so it includes DNS, TCP, TLS and the network path from wherever you ran it. It is NOT server-side latency: on 2026-07-31 a run measuring 269ms from a laptop corresponded to 107-141ms in the Railway edge logs. Quote it as "round-trip from our client" and read server-side timing from the platform logs |
 
@@ -100,9 +106,64 @@ latency and `hit_stability`. Start at `--repeats 1`.
 Quality always comes from the first attempt. `--repeats` feeds latency and
 `hit_stability` only; there is no best-of-repeats path.
 
+## The frozen set
+
+The question set is FROZEN. `golden_questions.json` carries a `frozen` block
+whose `questions_sha256` pins the canonical question list, and `lint`
+recomputes it and fails when it moves. Editing a question is therefore a
+deliberate re-freeze (update the pin, bump `version`, re-take the baseline),
+never a silent drift between two runs that both call themselves the baseline.
+
+Two hashes appear in a run's fingerprint and they are not the same thing.
+`questions_sha256` is over the FILE bytes, so reindenting moves it.
+`questions_pin` is over the canonical question list, so it moves only when a
+question really changes. The pin says which frozen set a run answered.
+
+## Embedding-window pairs
+
+18 pairs, one per document, added in v5. Each pair quotes the SAME document
+twice: once from inside the first 2000 characters (`window_head`), once from at
+least 40% through it (`window_tail`). Both quotes are verbatim and unique across
+every cached body, so exactly one document can answer either, and the quote IS
+the query, which is the strongest retrieval signal available.
+
+The control that makes a tail miss mean something: a tail quote qualifies only
+when at least 3 of its distinctive terms are ABSENT from that document's head.
+Without it, a passing tail could be the head embedding answering the query and
+the comparison would prove nothing about how much of a document is reachable.
+`lint` enforces the offset, the depth, and every declared novel term, and
+rejects a pair whose "novel" terms turn out to occur in the head.
+
+Window questions are scored in their own block and are EXCLUDED from
+`answer_recall_at_5`. They fail by design against current behaviour; folding
+them into the headline would move it for a reason that has nothing to do with
+the node changing, and would break comparability with every baseline taken
+before v5.
+
+Read `tail_recall_given_head_at_5` rather than `tail_recall_at_5`. A document
+that missed on BOTH sides may simply never have been indexed, so its tail miss
+is not evidence about position. Conditioning on a head that retrieved keeps only
+documents the index demonstrably holds.
+
+## Ranking is not retrieval
+
+`answer_recall_at_5` asks whether the answering document came back.
+`rank_inversion_rate` asks whether the node put it in the right place. Search
+currently reports `retriever_scores_available: false` and orders by lexical term
+overlap, so these are genuinely different questions and one number cannot answer
+both.
+
+An inversion is: a hit ranked ABOVE the one that verifiably contains the answer,
+while the node ITSELF reports that hit matched a strictly smaller share of the
+query terms (`_citadel.relevance.term_coverage`). The answer slot is fixed by a
+body span match with the sync header stripped, and the comparison uses the
+node's own numbers, so a match on the path header can neither manufacture nor
+hide an inversion.
+
 ## The golden set
 
-`golden_questions.json` v4. 39 questions carry validated `answer_spans`; 22
+`golden_questions.json` v5. 39 non-window questions carry validated
+`answer_spans`, plus 36 window questions (18 pairs); 22
 Linear questions (`l01-l22`) are explicitly unconverted
 (`answer_spans_unconverted_reason`) because `fetch_ground_truth.py` skips
 `linear:` targets, so there is no cached body to quote. They count for
@@ -112,7 +173,10 @@ counted. 8 questions are probes (`expected_recall: 0`, below).
 `lint` validates every span offline against `ground_truth/`: present in the
 cached body, absent from the sync header and the document's first line (a
 head-line match is title credit, not an answer), absent from the question
-text, and unique across every other cached body. It also validates probes:
+text, and unique across every other cached body. The "absent from the question
+text" rule is waived for window questions ONLY, because a window question is
+its verbatim quote by design; every other question still rejects a span that
+appears in its own query. It also validates probes:
 every `blocked_pattern` must resolve against the live scanner, and a probe's
 question text must never itself match its rule. Lint fails loudly; run it
 after every edit to the golden set.
