@@ -412,3 +412,91 @@ def test_unreachable_node_still_exits_zero(monkeypatch: Any, tmp_path: Path) -> 
     receipt = _receipt_text()
     assert "not captured" in receipt
     assert "captured commit" not in receipt
+
+
+def test_receipt_when_server_states_no_decision(monkeypatch: Any, tmp_path: Path) -> None:
+    """A 2xx body that OMITS `accepted` states no decision — never "captured".
+
+    The receipt used to read `accepted is not False`, so a response missing the
+    key reported capture from nothing the server ever said.
+    """
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"ok": True}).encode())
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "storage not confirmed" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_receipt_when_accepted_is_not_a_boolean(monkeypatch: Any, tmp_path: Path) -> None:
+    _approve_repo_for_real_sync(monkeypatch, tmp_path)
+    _fake_urlopen_with_body(monkeypatch, json.dumps({"accepted": "yes"}).encode())
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "storage not confirmed" in receipt
+    assert "captured commit" not in receipt
+
+
+# --- every exit path leaves a distinguishable receipt ------------------------
+
+
+def test_missing_token_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(tmp_path / "capture.json"))
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "push skipped" in receipt
+    assert "CITADEL_MCP_ACCESS_TOKEN" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_missing_vs_malformed_config_leave_distinct_receipts(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """"Never onboarded" and "the config broke" are different silences."""
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
+    config = tmp_path / "capture.json"
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
+
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0  # missing
+    config.write_text("{ not json")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0  # malformed
+
+    receipt = _receipt_text()
+    assert "capture.json missing" in receipt
+    assert "unreadable or malformed" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_unapproved_repo_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
+    config = tmp_path / "capture.json"
+    _write_capture_config(config, [{"path": "/some/approved", "tags": []}])
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/other-repo")
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "not an Approved Capture Root" in receipt
+    assert "nothing sent" in receipt
+    assert "captured commit" not in receipt
+
+
+def test_crash_inside_run_leaves_receipt(monkeypatch: Any, tmp_path: Path) -> None:
+    """The outer except used to swallow the crash with no trace at all."""
+    config = tmp_path / "capture.json"
+    _write_capture_config(config, [{"path": "/tmp/repo", "tags": []}])
+    monkeypatch.setenv("CITADEL_CAPTURE_CONFIG_PATH", str(config))
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("crash with sensitive detail")
+
+    monkeypatch.setattr(sync_push, "_sync_one", boom)
+    assert sync_push.run(io.StringIO(_PUSH_STDIN), remote_name="origin") == 0
+    receipt = _receipt_text()
+    assert "push hook crashed" in receipt
+    assert "RuntimeError" in receipt
+    assert "sensitive detail" not in receipt
+    assert "captured commit" not in receipt
