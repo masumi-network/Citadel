@@ -537,3 +537,40 @@ async def test_repo_content_sync_counts_unindexed_files_separately(
     assert result["files_ingested"] == 2  # stored
     assert result["files_indexed"] == 0  # and retrievable: none of them
     assert result["files_index_failed"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("index_state", "expected_status", "expects_graph_edge"),
+    [
+        (INDEX_STATE_INDEXED, "indexed", True),
+        (INDEX_STATE_PENDING, "pending", False),
+        (INDEX_STATE_NOT_SCHEDULED, "unindexed", False),
+        (INDEX_STATE_UNKNOWN, "pending", False),
+    ],
+)
+async def test_mesh_document_status_follows_the_observed_index_state(
+    index_state: str, expected_status: str, expects_graph_edge: bool
+) -> None:
+    # The mesh drew every accepted write as status "indexed" with an edge to
+    # index:graph — a picture of a graph write that had not happened, and in
+    # the 892-document case would never happen. The badge and the edge are
+    # claims about the graph, so both wait for the observation.
+    from kb.mesh import MeshState
+
+    config = CitadelConfig(tenant_id="test", default_dataset="notes")
+    mesh = MeshState()
+    result = IngestResult(True, "accepted", "notes", ("ops",), index_state=index_state)
+
+    await mesh.record_ingest(config, result, data="Runbook", dataset="notes", tags=["ops"])
+    snapshot = await mesh.snapshot(config)
+
+    document = next(node for node in snapshot["nodes"] if node["type"] == "document")
+    assert document["status"] == expected_status
+    graph_edges = [
+        edge
+        for edge in snapshot["edges"]
+        if edge["target"] == "index:graph" and edge["source"] == document["id"]
+    ]
+    assert bool(graph_edges) is expects_graph_edge
+    assert snapshot["events"][0]["details"]["index_state"] == index_state
