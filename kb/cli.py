@@ -18,7 +18,6 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -2484,12 +2483,12 @@ async def _onboard(args: argparse.Namespace) -> int:
 
 
 def _cli_version() -> str:
-    try:
-        return _pkg_version("citadel-archive")
-    except PackageNotFoundError:
-        from kb import __version__
+    # Source is authoritative. Editable environments can retain stale
+    # distribution metadata after a version bump, while the CLI is running
+    # directly from this source tree.
+    from kb import __version__
 
-        return __version__
+    return __version__
 
 
 def _install_channel() -> tuple[str, str]:

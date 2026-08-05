@@ -409,9 +409,9 @@ def test_landing_flow_bundle_is_committed_and_served() -> None:
 
     assert script.status_code == 200
     assert styles.status_code == 200
-    # esbuild is configured with globalName CitadelFlow; landing.js calls
-    # window.CitadelFlow.mount() once the script has loaded.
-    assert script.text.startswith("var CitadelFlow=")
+    # esbuild may prepend a strict-mode directive, but globalName must expose
+    # CitadelFlow; landing.js calls window.CitadelFlow.mount() after loading.
+    assert script.text.startswith(("var CitadelFlow=", '"use strict";var CitadelFlow='))
     assert ".react-flow" in styles.text
 
 

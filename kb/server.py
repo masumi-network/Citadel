@@ -14,8 +14,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -32,6 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from kb import __version__ as _SERVICE_VERSION
 from kb.access import (
     CENTRAL_DATASET,
     SESSION_TRACES_DATASET,
@@ -516,14 +515,8 @@ async def lifespan(app: FastAPI) -> Any:
 
 
 # Single-source the service version so /.well-known/citadel.json and the CLI
-# never drift. Prefer installed package metadata; fall back to the in-source
-# kb.__version__ because the Railway node runs from source (not dist-installed),
-# where importlib.metadata raises and a hardcoded version would mislead.
-try:
-    _SERVICE_VERSION = _pkg_version("citadel-archive")
-except PackageNotFoundError:
-    from kb import __version__ as _SERVICE_VERSION
-
+# never drift. The Railway node runs from source, and editable environments can
+# retain stale distribution metadata after a version bump.
 app = FastAPI(
     title="Citadel Archive",
     version=_SERVICE_VERSION,
