@@ -36,7 +36,7 @@ export default function Login() {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || REJECTED);
       }
-      window.location.assign("/app");
+      window.location.assign("/next/app");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : REJECTED);
     } finally {

@@ -12,7 +12,13 @@ import {
 } from "@/components/app/app-shell";
 import { FIELD_INPUT } from "@/components/ui";
 import { api, errorMessage } from "@/lib/api";
-import { useSession } from "@/lib/dashboard";
+import {
+  SEARCH_SOURCE_OPTIONS,
+  searchScopeDatasets,
+  useSession,
+  type SearchScope,
+  type SearchSource,
+} from "@/lib/dashboard";
 
 type SectionKey = "central" | "session_traces" | "node";
 
@@ -87,6 +93,35 @@ type PreviewState = {
   error: string | null;
   document: SourceDocument | null;
 };
+
+type SourceFilter = "all" | SearchSource;
+
+type SearchRequest = {
+  query: string;
+  top_k: number;
+  dataset?: string;
+  source?: SearchSource;
+};
+
+const FILTER_BUTTON =
+  "cursor-pointer border px-3 py-1.5 text-[12.5px] font-medium transition-[background-color,border-color,color] duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
+
+function filterButtonClass(active: boolean): string {
+  return active
+    ? `${FILTER_BUTTON} border-accent bg-accent-soft text-accent-ink`
+    : `${FILTER_BUTTON} border-border-2 bg-surface text-ink-2 hover:border-accent hover:text-accent-ink`;
+}
+
+function buildSearchRequest(
+  query: string,
+  dataset: string | null,
+  source: SourceFilter,
+): SearchRequest {
+  const request: SearchRequest = { query, top_k: 10 };
+  if (dataset) request.dataset = dataset;
+  if (source !== "all") request.source = source;
+  return request;
+}
 
 const SECTION_ORDER: Array<{ key: SectionKey; label: string }> = [
   { key: "central", label: "Central" },
@@ -382,11 +417,26 @@ export default function Search() {
   const session = useSession();
   const [input, setInput] = useState("");
   const [query, setQuery] = useState<string | null>(null);
+  const [scope, setScope] = useState<SearchScope>("all");
+  const [source, setSource] = useState<SourceFilter>("all");
   const [response, setResponse] = useState<SearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
+
+  const scopeDatasets = searchScopeDatasets(session.data);
+  const scopeOptions: Array<{ value: SearchScope; label: string; dataset: string | null }> = [
+    { value: "all", label: "Everything", dataset: null },
+    ...(scopeDatasets.central
+      ? [{ value: "central" as const, label: "Central only", dataset: scopeDatasets.central }]
+      : []),
+    ...(scopeDatasets.node
+      ? [{ value: "node" as const, label: "My Node only", dataset: scopeDatasets.node }]
+      : []),
+  ];
+  const activeScope = scopeOptions.some((option) => option.value === scope) ? scope : "all";
+  const selectedDataset = scopeOptions.find((option) => option.value === activeScope)?.dataset ?? null;
 
   useEffect(() => {
     const nextQuery = new URLSearchParams(window.location.search).get("q")?.trim() ?? "";
@@ -410,7 +460,7 @@ export default function Search() {
 
     api<SearchResponse>("/search", {
       method: "POST",
-      body: JSON.stringify({ query, top_k: 10 }),
+      body: JSON.stringify(buildSearchRequest(query, selectedDataset, source)),
       signal: controller.signal,
     })
       .then((payload) => {
@@ -427,7 +477,7 @@ export default function Search() {
       active = false;
       controller.abort();
     };
-  }, [query, retry]);
+  }, [query, retry, selectedDataset, source]);
 
   async function togglePreview(endpoint: string, hide: boolean) {
     if (hide) {
@@ -501,6 +551,54 @@ export default function Search() {
           Search
         </button>
       </form>
+
+      <div className="mb-7 flex flex-wrap gap-x-8 gap-y-5">
+        <fieldset className="m-0 min-w-0 border-0 p-0">
+          <legend className="mb-2 text-[12px] font-semibold uppercase tracking-[.08em] text-ink-3">
+            Scope
+          </legend>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Search scope">
+            {scopeOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={activeScope === option.value}
+                className={filterButtonClass(activeScope === option.value)}
+                onClick={() => setScope(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+
+        <fieldset className="m-0 min-w-0 border-0 p-0">
+          <legend className="mb-2 text-[12px] font-semibold uppercase tracking-[.08em] text-ink-3">
+            Source
+          </legend>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Search source">
+            <button
+              type="button"
+              aria-pressed={source === "all"}
+              className={filterButtonClass(source === "all")}
+              onClick={() => setSource("all")}
+            >
+              All sources
+            </button>
+            {SEARCH_SOURCE_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={source === option.value}
+                className={filterButtonClass(source === option.value)}
+                onClick={() => setSource(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+      </div>
 
       <section className={PANEL} aria-live="polite" aria-busy={loading}>
         <div className={PANEL_HEAD}>

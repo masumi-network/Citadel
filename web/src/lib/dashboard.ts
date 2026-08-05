@@ -19,10 +19,56 @@ export const ROLE_ORDER: Record<Role, number> = { reader: 1, writer: 2, admin: 3
 
 export type Session = {
   role: Role;
+  default_dataset?: string | null;
+  search_datasets?: string[] | null;
   seat_slug?: string | null;
   node_label?: string | null;
   actor?: { name?: string | null } | null;
 };
+
+export type SearchScope = "all" | "central" | "node";
+
+export type SearchScopeDatasets = {
+  central: string | null;
+  node: string | null;
+};
+
+/* These are the source identities emitted by the current repository-content and
+ * Linear provenance paths and accepted by SearchBody.source. Keep the UI list
+ * narrower than arbitrary text so it only offers known source identities.
+ */
+export const SEARCH_SOURCE_OPTIONS = [
+  { value: "repo-content", label: "Repository content" },
+  { value: "linear-issue", label: "Linear issues" },
+] as const;
+
+export type SearchSource = (typeof SEARCH_SOURCE_OPTIONS)[number]["value"];
+
+const SESSION_TRACES_DATASET = "session-traces";
+
+/** Resolve only dataset IDs whose meaning is established by the session payload.
+ *
+ * A seat response orders its datasets as Node, Central (when allowed), then
+ * session traces. Central is intentionally left unavailable when the response
+ * does not identify a seat, because a lone default dataset is not proof that it
+ * is Central.
+ */
+export function searchScopeDatasets(session: Session | null): SearchScopeDatasets {
+  if (!session?.seat_slug) return { central: null, node: null };
+
+  const datasets = Array.isArray(session.search_datasets)
+    ? session.search_datasets.filter((dataset): dataset is string => Boolean(dataset?.trim()))
+    : [];
+  const defaultDataset = session.default_dataset?.trim() || null;
+  const node =
+    (defaultDataset && datasets.includes(defaultDataset) ? defaultDataset : null) ||
+    datasets.find((dataset) => dataset.startsWith("seat:")) ||
+    null;
+  const central =
+    datasets.find((dataset) => dataset !== node && dataset !== SESSION_TRACES_DATASET) || null;
+
+  return { central, node };
+}
 
 export function canUse(role: Role | null, minimum: Role): boolean {
   return role !== null && ROLE_ORDER[role] >= ROLE_ORDER[minimum];

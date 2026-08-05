@@ -3291,7 +3291,13 @@ async def create_admin_session(
 
 
 @app.post("/admin/logout")
-async def logout(response: Response) -> dict[str, bool]:
+async def logout(request: Request, response: Response) -> Any:
+    # Native form submissions are document navigations and need a login page,
+    # while fetch/API callers still consume the historical JSON response.
+    if "text/html" in request.headers.get("accept", "").lower():
+        redirect = RedirectResponse("/login", status_code=303)
+        redirect.delete_cookie(ADMIN_COOKIE)
+        return redirect
     response.delete_cookie(ADMIN_COOKIE)
     return {"ok": True}
 
