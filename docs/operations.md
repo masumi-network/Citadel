@@ -54,6 +54,11 @@ threshold to Cognee's high-volume task and retrieval loggers. The default
 flooding Railway's log ingestion. Temporarily set it to `INFO` or `DEBUG` for
 diagnosis, then restore `WARNING`.
 
+Public pages read `CITADEL_PUBLISHED_VERSION`, captured when the web process
+starts. Keep it at the last approved release while a candidate is being tested.
+Set it to `0.5.0` only after the owner approves the v0.5.0 release and the
+deployment is serving that release.
+
 Enable pgvector before production ingest:
 
 ```sql

@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -151,6 +152,15 @@ _LAST_CANARY: dict[str, Any] | None = None
 # over an empty graph were the #27 failure mode).
 _MIN_TRACKED_FOR_CORPUS = 10
 _INDEXED_FLOOR = 1
+_CORPUS_HEALTH_PROBE_LIMIT = 64
+try:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_CACHE_TTL_SECONDS", "5"))
+    )
+except ValueError:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = 5.0
+_CORPUS_HEALTH_CACHE: tuple[float, tuple[int, ...], dict[str, Any]] | None = None
+_CORPUS_HEALTH_LOCK = asyncio.Lock()
 
 # In-flight counts for the soft concurrency cap / 429 backpressure contract
 # (#50). Single-loop server → increment/decrement need no lock. Search and the
@@ -524,6 +534,15 @@ def _build_id_from_env(env: Mapping[str, str]) -> str | None:
 
 
 _BUILD_ID = _build_id_from_env(os.environ)
+
+
+def _public_release_version_from_env(env: Mapping[str, str]) -> str:
+    """Return the last explicitly published release shown on public pages."""
+    value = env.get("CITADEL_PUBLISHED_VERSION", "0.4.0").strip()
+    return value or "0.4.0"
+
+
+_PUBLIC_RELEASE_VERSION = _public_release_version_from_env(os.environ)
 
 
 app = FastAPI(
@@ -2639,7 +2658,7 @@ def document_endpoint_for_result(result_id: str) -> str | None:
     # hides that they are different ids for different things.
     if not result_id or result_id.startswith("chunk:"):
         return None
-    return f"/api/documents/{result_id}"
+    return f"/api/documents/{quote(result_id, safe=':._-')}"
 
 
 def result_content_sha256(result: dict[str, Any]) -> str:
@@ -4270,7 +4289,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
     return {
         "ok": True,
         "service": "Citadel Archive",
-        "version": app.version,
+        "version": _PUBLIC_RELEASE_VERSION,
         "build_id": _BUILD_ID,
         "healthy": True,
         "sources": sources,
@@ -4389,22 +4408,126 @@ async def get_skill(slug: str) -> FileResponse:
     return FileResponse(path, media_type="text/markdown; charset=utf-8", headers=headers)
 
 
-async def _corpus_health() -> dict[str, Any]:
-    """Data-plane volume gate: are tracked sources actually indexed? (#27)
+async def _corpus_health_impl() -> dict[str, Any]:
+    """Data-plane volume gate using exact relational projection measurements. (#27)
 
-    Fail-soft — any error returns ok=True with a ``degraded`` note so readiness
-    never flaps on a transient graph read; the real signal is "many sources
-    tracked but the graph is empty".
+    A failed measurement is a readiness failure, not an empty or healthy
+    corpus. The legacy graph-count fallback remains for local fakes and older
+    clients without ``corpus_health``.
     """
+    global _CORPUS_HEALTH_CACHE
+
+    citadel = get_citadel()
+    cache_key: tuple[int, ...] = (id(citadel),)
     try:
+        github_syncer = get_github_syncer()
+        repo_content_syncer = get_repo_content_syncer()
+        linear_syncer = get_linear_syncer()
+
+        def state_identity(name: str) -> int:
+            value = getattr(app.state, name, None)
+            return id(value) if value is not None else 0
+
+        cache_key = (
+            id(citadel),
+            state_identity("github_syncer"),
+            state_identity("repo_content_syncer"),
+            state_identity("linear_syncer"),
+        )
+        cached = _CORPUS_HEALTH_CACHE
+        if (
+            cached is not None
+            and cached[1] == cache_key
+            and _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0
+            and time.monotonic() - cached[0] < _CORPUS_HEALTH_CACHE_TTL_SECONDS
+        ):
+            return dict(cached[2])
+
         tracked = 0
-        github_status = await get_github_syncer().status()
+        github_status = await github_syncer.status()
         tracked += int(github_status.get("tracked_repositories") or 0)
-        repo_content_status = await get_repo_content_syncer().status()
+        repo_content_status = await repo_content_syncer.status()
         tracked += int(repo_content_status.get("tracked_files") or 0)
-        linear_status = await get_linear_syncer().status()
+        linear_status = await linear_syncer.status()
         tracked += int(linear_status.get("issue_count") or 0)
-        counts = await get_citadel()._graph_counts()
+
+        measured_read = getattr(getattr(citadel, "cognee", None), "corpus_health", None)
+        if callable(measured_read):
+            measured = await measured_read(limit=_CORPUS_HEALTH_PROBE_LIMIT)
+            if not isinstance(measured, dict):
+                raise RuntimeError("bounded corpus probe returned a non-object")
+            for field in (
+                "relational_documents",
+                "probe_limit",
+                "probe_documents",
+                "probe_chunked_documents",
+                "probe_graph_documents",
+                "probe_fully_indexed_documents",
+            ):
+                value = measured.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            for field in ("probe_complete", "probe_ok"):
+                if type(measured.get(field)) is not bool:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            if measured["probe_documents"] > measured["probe_limit"]:
+                raise RuntimeError("bounded corpus probe exceeded its page limit")
+            for field in ("probe_max_documents", "probe_pages"):
+                if field in measured:
+                    value = measured[field]
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            if "probe_max_documents" in measured and measured["probe_documents"] > measured[
+                "probe_max_documents"
+            ]:
+                raise RuntimeError("bounded corpus probe exceeded its hard cap")
+            if "probe_cap_exceeded" in measured:
+                if type(measured["probe_cap_exceeded"]) is not bool:
+                    raise RuntimeError(
+                        "bounded corpus probe returned invalid probe_cap_exceeded"
+                    )
+                if measured["probe_cap_exceeded"] and (
+                    measured["probe_complete"] or measured["probe_ok"]
+                ):
+                    raise RuntimeError("capped corpus probe cannot be complete")
+            if (
+                measured["probe_complete"]
+                and measured["probe_documents"] != measured["relational_documents"]
+            ):
+                raise RuntimeError(
+                    "complete bounded corpus probe does not cover the relational document total"
+                )
+
+            counts = await citadel._graph_counts()
+            indexed = int(counts.get("nodes") or 0)
+            edges = int(counts.get("edges") or 0)
+            result = {
+                **measured,
+                "ok": measured["probe_complete"] is True
+                and measured["probe_ok"] is True
+                and not (
+                    tracked >= _MIN_TRACKED_FOR_CORPUS
+                    and measured["relational_documents"] == 0
+                ),
+                "tracked_sources": tracked,
+                # Compatibility for MeshState: graph nodes are not relational
+                # document projections and are not used for readiness.
+                "indexed_docs": indexed,
+                "indexed_graph_nodes": indexed,
+                "indexed_edges": edges,
+                "measurement": "bounded_relational_projection_probe",
+            }
+            if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+                _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+            return result
+
+        # Preserve the old method-boundary fallback for local fakes and older
+        # clients that do not expose the bounded probe yet.
+        counts = await citadel._graph_counts()
         indexed = int(counts.get("nodes") or 0)
         # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
         # back in the same call for free. /api/mesh used to publish the in-memory
@@ -4412,21 +4535,33 @@ async def _corpus_health() -> dict[str, Any]:
         # so this is the real total that field needs.
         edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {
+        result = {
             "ok": ok,
             "tracked_sources": tracked,
             "indexed_docs": indexed,
             "indexed_edges": edges,
         }
-    except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
-        logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {
-            "ok": True,
+        if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+            _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
+        logger.warning("corpus health check degraded: %s", exc)
+        result = {
+            "ok": False,
             "tracked_sources": None,
             "indexed_docs": None,
             "indexed_edges": None,
             "degraded": str(exc),
         }
+        if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+            _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+        return result
+
+
+async def _corpus_health() -> dict[str, Any]:
+    """Serialize uncached corpus probes so concurrent readiness checks share work."""
+    async with _CORPUS_HEALTH_LOCK:
+        return await _corpus_health_impl()
 
 
 @app.get("/readyz")

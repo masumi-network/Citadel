@@ -147,7 +147,7 @@
   fetch("/api/state", { headers: { "Accept": "application/json" } })
     .then(function (r) { if (!r.ok) throw new Error("state " + r.status); return r.json(); })
     .then(function (d) {
-      var ver = vlabel(d.version) || "v0.5.0";
+      var ver = vlabel(d.version) || "v0.4.0";
       set("m-version", ver);
       var healthEl = document.getElementById("pill-health");
       var healthText = document.getElementById("pill-health-text");

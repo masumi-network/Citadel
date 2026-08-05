@@ -32,6 +32,27 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 10_000
+
+
+def _corpus_health_max_documents() -> int:
+    raw = os.getenv(
+        "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS",
+        str(DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        ) from exc
+    if value < 1:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        )
+    return value
+
+
 def _utc_datetime(value: datetime) -> datetime:
     """Treat a naive timestamp as UTC.
 
@@ -136,9 +157,9 @@ def assert_cognee_dataset_api() -> None:
     # The corpus census (corpus_page / corpus_totals / corpus_chunk_counts /
     # corpus_graph_presence) leans on more private surface than dataset
     # attribution does: specific Data/Dataset/DatasetData columns, the pgvector
-    # adapter's table reflection + session, and the graph adapter's batched
-    # node lookup. Pin each one so a cognee bump that moves any of them fails
-    # loudly at boot and in CI instead of quietly breaking the census.
+    # adapter's table reflection + session, and the graph adapter's raw query
+    # surface. Pin each one so a cognee bump that moves any of them fails loudly
+    # at boot and in CI instead of quietly breaking the census.
     from cognee.infrastructure.databases.graph.ladybug.adapter import LadybugAdapter
     from cognee.infrastructure.databases.vector import get_vector_engine  # noqa: F401
     from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
@@ -175,7 +196,7 @@ def assert_cognee_dataset_api() -> None:
     for adapter, method_name in (
         (PGVectorAdapter, "get_table"),
         (PGVectorAdapter, "get_async_session"),
-        (LadybugAdapter, "get_nodes"),
+        (LadybugAdapter, "query"),
     ):
         if not callable(getattr(adapter, method_name, None)):
             raise RuntimeError(
@@ -313,6 +334,9 @@ class CogneeGateway(Protocol):
         ...
 
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
+        ...
+
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
         ...
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
@@ -1052,6 +1076,128 @@ class CogneePublicClient:
             "by_dataset_default_owner": by_dataset_default_owner,
         }
 
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
+        """Walk relational rows and verify their vector and graph projections.
+
+        The graph can contain stale or unrelated nodes, so graph volume cannot
+        certify accepted relational documents. Walk the relational corpus with
+        keyset pagination and inspect each page's exact ids in both projections.
+        The hard document cap prevents readiness from doing unbounded work.
+        """
+        probe_limit = max(1, min(int(limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        empty_result = {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": 0,
+            "probe_pages": 0,
+            "probe_complete": False,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": 0,
+            "probe_graph_documents": 0,
+            "probe_fully_indexed_documents": 0,
+            "probe_ok": False,
+        }
+        if total_documents > max_documents:
+            return {**empty_result, "probe_cap_exceeded": True}
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        document_ids_seen: set[str] = set()
+        chunked_ids: set[str] = set()
+        graph_ids_seen: set[str] = set()
+        fully_indexed_ids: set[str] = set()
+        pages = 0
+
+        while len(document_ids_seen) < total_documents:
+            page_limit = min(
+                probe_limit,
+                max_documents - len(document_ids_seen),
+                total_documents - len(document_ids_seen),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=page_limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > page_limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            page_ids: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in document_ids_seen:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                document_ids_seen.add(document_id)
+                page_ids.append(document_id)
+            if len(document_ids_seen) > total_documents:
+                raise RuntimeError("corpus pages exceeded the reported document total")
+
+            chunk_counts = await self.corpus_chunk_counts(page_ids)
+            if chunk_counts is None:
+                raise RuntimeError("vector chunk measurement is unavailable")
+            graph_ids = await self.corpus_graph_presence(page_ids)
+            if graph_ids is None:
+                raise RuntimeError("graph presence measurement is unavailable")
+
+            graph_id_set = {str(document_id) for document_id in graph_ids}
+            page_chunked_ids = {
+                document_id
+                for document_id in page_ids
+                if int(chunk_counts.get(document_id, 0)) > 0
+            }
+            page_graph_ids = set(page_ids) & graph_id_set
+            chunked_ids.update(page_chunked_ids)
+            graph_ids_seen.update(page_graph_ids)
+            fully_indexed_ids.update(page_chunked_ids & page_graph_ids)
+            pages += 1
+
+            if len(document_ids_seen) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        probe_complete = len(document_ids_seen) == total_documents
+        return {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": len(document_ids_seen),
+            "probe_pages": pages,
+            "probe_complete": probe_complete,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": len(chunked_ids),
+            "probe_graph_documents": len(graph_ids_seen),
+            "probe_fully_indexed_documents": len(fully_indexed_ids),
+            "probe_ok": probe_complete
+            and (
+                total_documents == 0
+                or len(fully_indexed_ids) == len(document_ids_seen)
+            ),
+        }
+
     async def corpus_chunk_counts(
         self, document_ids: list[str]
     ) -> dict[str, int] | None:
@@ -1103,27 +1249,48 @@ class CogneePublicClient:
         return counts
 
     async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
-        """Which of these document ids exist as graph nodes; None when not measured.
+        """Which source documents have a graph projection; None when unmeasured.
 
-        A document graph node's id equals the relational ``Data.id``, so
-        presence here means the document was cognified, not merely accepted.
-        Uses the engine's batched ``get_nodes`` (one query per page) through
-        ``get_graph_engine()`` — never the graph file directly, which would
-        contend with the single writer — and passes str ids. An engine without
-        ``get_nodes`` returns None rather than pretending it looked.
+        Cognee's TextChunker gives DocumentChunk nodes their own ids. The
+        relational ``Data.id`` is copied into each chunk's ``document_id``
+        property, so probing graph node ids with Data ids is invalid. Query the
+        graph property instead, returning one distinct source id per page. An
+        engine without raw query support returns None rather than pretending it
+        measured presence.
         """
         if not document_ids:
             return set()
         engine = await self._graph_engine()
-        get_nodes = getattr(engine, "get_nodes", None)
-        if not callable(get_nodes):
+        query = getattr(engine, "query", None)
+        if not callable(query):
             return None
-        nodes = await get_nodes([str(document_id) for document_id in document_ids])
+
+        requested = {str(document_id) for document_id in document_ids}
+        query_text = """
+        MATCH (n:Node)
+        WITH CAST(json_extract(n.properties, '$.document_id') AS STRING) AS document_id_json
+        WHERE document_id_json IN $document_ids_json
+        RETURN DISTINCT document_id_json
+        """
+        rows = await query(
+            query_text,
+            {"document_ids_json": [json.dumps(document_id) for document_id in requested]},
+        )
         present: set[str] = set()
-        for node in nodes or []:
-            node_id = node.get("id") if isinstance(node, dict) else None
-            if node_id:
-                present.add(str(node_id))
+        for row in rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 1:
+                return None
+            value = row[0]
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            if not isinstance(value, str) or value not in requested:
+                return None
+            present.add(value)
         return present
 
     async def ensure_dataset(self, name: str) -> bool:

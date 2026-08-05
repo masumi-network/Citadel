@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -1553,3 +1554,228 @@ async def test_corpus_chunk_counts_says_not_measured_off_pgvector(
 
     assert await client.corpus_chunk_counts(["3b9c0d05-0000-0000-0000-000000000001"]) is None
     assert await client.corpus_chunk_counts([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    monkeypatch.delenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", raising=False)
+    pages = [
+        [
+            {"id": "doc-a", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": "doc-b", "created_at": "2026-01-02T00:00:00+00:00"},
+        ],
+        [{"id": "doc-c", "created_at": "2026-01-03T00:00:00+00:00"}],
+    ]
+    page_calls: list[tuple[str | None, str | None, int]] = []
+    chunk_calls: list[list[str]] = []
+    graph_calls: list[list[str]] = []
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 3}
+
+    async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
+        page_calls.append(
+            (kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"])
+        )
+        return pages[len(page_calls) - 1]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        chunk_calls.append(document_ids)
+        return {document_id: 2 for document_id in document_ids}
+
+    async def corpus_graph_presence(document_ids: list[str]) -> set[str]:
+        graph_calls.append(document_ids)
+        return set(document_ids) | {"stale-graph-node"}
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "corpus_graph_presence", corpus_graph_presence)
+
+    health = await client.corpus_health(limit=2)
+
+    assert page_calls == [
+        (None, None, 2),
+        ("2026-01-02T00:00:00+00:00", "doc-b", 1),
+    ]
+    assert chunk_calls == [["doc-a", "doc-b"], ["doc-c"]]
+    assert graph_calls == [["doc-a", "doc-b"], ["doc-c"]]
+    assert health == {
+        "relational_documents": 3,
+        "probe_limit": 2,
+        "probe_max_documents": 10_000,
+        "probe_documents": 3,
+        "probe_pages": 2,
+        "probe_complete": True,
+        "probe_cap_exceeded": False,
+        "probe_chunked_documents": 3,
+        "probe_graph_documents": 3,
+        "probe_fully_indexed_documents": 3,
+        "probe_ok": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_fails_closed_before_document_cap(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    monkeypatch.setenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", "2")
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 3}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        raise AssertionError("cap must be checked before page enumeration")
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+
+    health = await client.corpus_health()
+
+    assert health["relational_documents"] == 3
+    assert health["probe_max_documents"] == 2
+    assert health["probe_documents"] == 0
+    assert health["probe_cap_exceeded"] is True
+    assert health["probe_complete"] is False
+    assert health["probe_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_fails_closed_when_vector_measurement_is_unavailable(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 1}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [{"id": "doc-a"}]
+
+    async def corpus_chunk_counts(_: list[str]) -> None:
+        return None
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+
+    with pytest.raises(RuntimeError, match="vector chunk measurement is unavailable"):
+        await client.corpus_health()
+
+
+@pytest.mark.asyncio
+async def test_standard_cognee_document_graph_contains_relational_data_id() -> None:
+    from uuid import NAMESPACE_OID, uuid4, uuid5
+
+    from cognee.modules.chunking.models import DocumentChunk
+    from cognee.modules.data.processing.document_types import TextDocument
+    from cognee.modules.graph.utils import get_graph_from_model
+
+    data_id = uuid4()
+    document = TextDocument(
+        id=data_id,
+        name="document",
+        raw_data_location="document.txt",
+        external_metadata="{}",
+        mime_type="text/plain",
+    )
+    chunk = DocumentChunk(
+        id=uuid5(NAMESPACE_OID, f"{data_id}-0"),
+        text="document",
+        chunk_size=1,
+        chunk_index=0,
+        cut_type="sentence_end",
+        is_part_of=document,
+        contains=[],
+        document_id=str(data_id),
+        document_name="document",
+    )
+
+    nodes, edges = await get_graph_from_model(chunk)
+
+    assert str(data_id) in {str(node.id) for node in nodes}
+    assert any(str(source) == str(chunk.id) and str(target) == str(data_id) for source, target, *_ in edges)
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_empty_corpus_is_complete(monkeypatch: Any) -> None:
+    client = CogneePublicClient()
+    graph_calls = 0
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 0}
+
+    async def corpus_graph_presence(_: list[str]) -> set[str]:
+        nonlocal graph_calls
+        graph_calls += 1
+        return set()
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_graph_presence", corpus_graph_presence)
+
+    health = await client.corpus_health()
+
+    assert health == {
+        "relational_documents": 0,
+        "probe_limit": 64,
+        "probe_max_documents": 10_000,
+        "probe_documents": 0,
+        "probe_pages": 0,
+        "probe_complete": True,
+        "probe_cap_exceeded": False,
+        "probe_chunked_documents": 0,
+        "probe_graph_documents": 0,
+        "probe_fully_indexed_documents": 0,
+        "probe_ok": True,
+    }
+    assert graph_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_corpus_graph_presence_uses_source_document_property(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class GraphEngine:
+        async def query(self, query: str, params: dict[str, Any]) -> list[tuple[str]]:
+            calls.append((query, params))
+            return [(json.dumps("doc-a"),)]
+
+        async def get_nodes(self, _: list[str]) -> list[dict[str, Any]]:
+            raise AssertionError("source Data.id must not be used as graph node id")
+
+    async def graph_engine() -> GraphEngine:
+        return GraphEngine()
+
+    monkeypatch.setattr(client, "_graph_engine", graph_engine)
+
+    assert await client.corpus_graph_presence(["doc-a", "doc-b"]) == {"doc-a"}
+    assert len(calls) == 1
+    query, params = calls[0]
+    assert "json_extract(n.properties, '$.document_id')" in query
+    assert "RETURN DISTINCT document_id_json" in query
+    assert set(params["document_ids_json"]) == {json.dumps("doc-a"), json.dumps("doc-b")}
+
+
+@pytest.mark.asyncio
+async def test_corpus_graph_presence_without_query_is_unmeasured(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    class GraphEngine:
+        async def get_nodes(self, _: list[str]) -> list[dict[str, Any]]:
+            return [{"id": "doc-a"}]
+
+    async def graph_engine() -> GraphEngine:
+        return GraphEngine()
+
+    monkeypatch.setattr(client, "_graph_engine", graph_engine)
+
+    assert await client.corpus_graph_presence(["doc-a"]) is None

@@ -49,7 +49,7 @@ const SECTIONS: Section[] = [
    last published values, so a visitor who arrives while the node is unreachable
    reads something true and slightly old rather than a row of dashes. */
 const STAMPED = {
-  version: "v0.5.0",
+  version: "v0.4.0",
   mcpTools: 22,
 };
 

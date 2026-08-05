@@ -46,6 +46,9 @@ class FakeCitadel:
 
     documents: dict[str, dict[str, Any]] = {}
 
+    async def _graph_counts(self) -> dict[str, int]:
+        return {"nodes": 5, "edges": 7}
+
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         return self.documents.get(document_id)
 
@@ -77,7 +80,6 @@ class FakeCitadel:
                 else None
             ),
         }
-
 
 class FakeLinearSyncer:
     async def status(self) -> dict[str, Any]:
@@ -274,6 +276,20 @@ def test_healthz() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "service": "citadel"}
+
+
+def test_public_release_version_is_explicitly_separate_from_package_version() -> None:
+    assert server_module._public_release_version_from_env({}) == "0.4.0"
+    assert server_module._public_release_version_from_env(
+        {"CITADEL_PUBLISHED_VERSION": "0.5.0"}
+    ) == "0.5.0"
+    assert server_module._public_release_version_from_env(
+        {"CITADEL_PUBLISHED_VERSION": "  "}
+    ) == "0.4.0"
+    client = authed_client("test-reader")
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    assert response.json()["version"] == server_module._PUBLIC_RELEASE_VERSION
 
 
 def test_security_headers_are_applied_to_http_responses() -> None:
@@ -932,7 +948,8 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["tracked_sources"] == 1
+    # The fixture reports 3 GitHub repositories and 2 Linear issues.
+    assert mesh.json()["stats"]["tracked_sources"] == 5
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -2506,6 +2523,291 @@ def test_readyz_reports_503_when_data_plane_empty() -> None:
     assert body["corpus"]["tracked_sources"] == 50
 
 
+def test_readyz_reports_503_when_corpus_measurement_fails() -> None:
+    class BrokenGraphCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            raise RuntimeError("graph unavailable")
+
+    class HealthySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    client = authed_client("test-reader")
+    app.state.citadel = BrokenGraphCitadel()
+    app.state.github_syncer = HealthySyncer()
+    app.state.repo_content_syncer = HealthySyncer()
+    app.state.linear_syncer = HealthySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"] == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "graph unavailable",
+    }
+
+
+def test_readyz_does_not_use_graph_nodes_as_projection_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 2,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": False,
+            }
+
+    class GraphOnlyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = GraphOnlyCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    corpus = ready.json()["corpus"]
+    assert corpus["indexed_docs"] == 280
+    assert corpus["probe_fully_indexed_documents"] == 0
+    assert corpus["probe_ok"] is False
+
+
+def test_readyz_rejects_a_partial_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PartialCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 65,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 64,
+                "probe_pages": 1,
+                "probe_complete": False,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 64,
+                "probe_graph_documents": 64,
+                "probe_fully_indexed_documents": 64,
+                "probe_ok": True,
+            }
+
+    class PartialCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = PartialCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = PartialCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"]["probe_complete"] is False
+    assert ready.json()["corpus"]["probe_ok"] is True
+
+
+def test_readyz_rejects_inconsistent_complete_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InconsistentCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 100,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 0,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 0,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": True,
+            }
+
+    class InconsistentCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = InconsistentCorpus()
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = InconsistentCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"] == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "complete bounded corpus probe does not cover the relational document total",
+    }
+
+
+def test_corpus_health_cache_is_shared_by_readyz_and_mesh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 1,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 1,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 1,
+                "probe_graph_documents": 1,
+                "probe_fully_indexed_documents": 1,
+                "probe_ok": True,
+            }
+
+    class MeasuredCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MeasuredCitadel()
+
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/api/mesh").status_code == 200
+    assert calls == 1
+
+
+async def test_corpus_health_deduplicates_concurrent_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 1, "tracked_files": 0, "issue_count": 0}
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return {
+                "relational_documents": 1,
+                "probe_limit": limit,
+                "probe_max_documents": 10000,
+                "probe_documents": 1,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 1,
+                "probe_graph_documents": 1,
+                "probe_fully_indexed_documents": 1,
+                "probe_ok": True,
+            }
+
+    class MeasuredCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 1, "edges": 1}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    app.state.citadel = MeasuredCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    first, second = await asyncio.gather(
+        server_module._corpus_health(), server_module._corpus_health()
+    )
+
+    assert calls == 1
+    assert first == second
+
+
+def test_readyz_rejects_measured_empty_corpus_when_sources_are_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyMeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 0,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 0,
+                "probe_pages": 0,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 0,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": True,
+            }
+
+    class MeasuredEmptyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = EmptyMeasuredCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MeasuredEmptyCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"]["probe_ok"] is True
+    assert ready.json()["corpus"]["ok"] is False
+
+
 def test_readyz_ok_when_graph_populated() -> None:
     class PopulatedCitadel(FakeCitadel):
         async def _graph_counts(self) -> dict[str, int]:
@@ -2677,6 +2979,9 @@ def test_document_endpoint_for_result_covers_real_ids_only() -> None:
     assert document_endpoint_for_result("ghsync:abc") == "/api/documents/ghsync:abc"
     assert document_endpoint_for_result("doc_123") == "/api/documents/doc_123"
     assert document_endpoint_for_result(uuid) == f"/api/documents/{uuid}"
+    assert document_endpoint_for_result("../../api/access") == (
+        "/api/documents/..%2F..%2Fapi%2Faccess"
+    )
     assert document_endpoint_for_result("chunk:deadbeef") is None
     assert document_endpoint_for_result("") is None
 
