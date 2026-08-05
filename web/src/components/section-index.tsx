@@ -4,7 +4,7 @@ import { useVaultState, versionLabel } from "@/lib/vault-state";
 
 export type Section = { id: string; label: string };
 
-const FALLBACK_VERSION = "v0.4.0";
+const FALLBACK_VERSION = "v0.5.0";
 
 /* The topmost band currently in view owns the underline. Tracking the set of
    intersecting bands, rather than the last entry the callback handed us, keeps

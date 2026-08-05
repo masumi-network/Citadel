@@ -61,7 +61,7 @@ jobs:
         # --all-extras pulls in the `server` optional-dependency group
         # (fastapi, mcp, cognee, …); the test suite imports kb.server and the
         # MCP module, so a base-only sync fails collection with ModuleNotFound.
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Confirm the interpreter actually under test
         run: uv run python -c "import sys; print(sys.version)"
@@ -87,7 +87,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: pip-audit
         # PYSEC-2026-2447 is ignored pending an upstream fix. CVEs that already
@@ -97,6 +97,37 @@ jobs:
           uv run pip-audit --cache-dir .pip-audit-cache \
             --ignore-vuln PYSEC-2026-2447
 
+  web:
+    name: frontend export
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Typecheck Next app
+        run: npm run typecheck --workspace web
+
+      - name: Build committed frontend export
+        run: npm run build:web
+
+      - name: Require a reproducible committed export
+        shell: bash
+        run: |
+          if [[ -n "$(git status --porcelain -- kb/webui)" ]]; then
+            echo "::error::kb/webui is not reproducible from the committed source and lockfile."
+            git status --short -- kb/webui
+            git diff -- kb/webui
+            exit 1
+          fi
+
   gate:
     name: CI gate
     # The single required status check for `main`.
@@ -105,7 +136,7 @@ jobs:
     # renamed without an admin editing the branch ruleset. `if: always()` ensures
     # this job still runs — and fails — when a job it depends on fails.
     if: always()
-    needs: [test, audit]
+    needs: [test, audit, web]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required job succeeded
