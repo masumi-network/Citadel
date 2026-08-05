@@ -105,6 +105,15 @@ from kb.security_scan import (
     redact_secrets,
     scan_text_entries,
 )
+from kb.visibility import (
+    can_bypass_dataset_allowlist,
+    conflict_visible_to,
+    dataset_visible_to,
+    effective_scopes,
+    enforce_dataset_allowlist,
+    event_visible_to,
+    owner_visible_to,
+)
 from kb.self_improve import SelfImprovement
 from kb.service import Citadel
 from kb.skills import skill_catalog, skill_integrity, skill_path
@@ -1461,27 +1470,11 @@ def require_role(request: Request, minimum_role: str) -> AccessIdentity:
     return identity
 
 
-def effective_scopes(identity: AccessIdentity) -> tuple[str, ...]:
-    if identity.scopes:
-        return identity.scopes
-    if identity.source == "env":
-        return default_scopes(identity.role)
-    return ()
-
-
 def require_access(request: Request, minimum_role: str, scope: str) -> AccessIdentity:
     identity = require_role(request, minimum_role)
     if scope not in effective_scopes(identity):
         raise HTTPException(status_code=403, detail=f"Scope required: {scope}.")
     return identity
-
-
-def can_bypass_dataset_allowlist(identity: AccessIdentity) -> bool:
-    if identity.source == "env":
-        return True
-    if identity.role == "admin":
-        return True
-    return "access:manage" in effective_scopes(identity)
 
 
 def env_exclude_patterns() -> tuple[str, ...]:
@@ -1642,41 +1635,6 @@ def redact_pending_item(item: dict[str, Any]) -> dict[str, Any]:
             # "not scanned", which the UI must not show as a pass.
             logger.exception("Deferred secret scan failed for promotion item")
     return redacted
-
-
-def enforce_dataset_allowlist(identity: AccessIdentity, dataset: str) -> None:
-    if can_bypass_dataset_allowlist(identity):
-        return
-    if dataset == SESSION_TRACES_DATASET:
-        # Org-wide consultable prior work: readable by every authenticated caller;
-        # writes are gated by the share-session endpoint instead.
-        return
-    if dataset in identity.allowed_datasets:
-        return
-    # Seat nodes are private memory: the seat: namespace is default-deny even for
-    # callers that carry no allowlist at all. Without this, any legacy or non-seat
-    # token (whose allowed_datasets is empty) could read or write another seat's
-    # node by naming it explicitly. Non-seat datasets stay open for unscoped tokens
-    # to preserve backward compatibility.
-    if is_seat_dataset(dataset):
-        raise HTTPException(status_code=403, detail=f"Dataset not allowed: {dataset}.")
-    if not identity.allowed_datasets:
-        return
-    raise HTTPException(status_code=403, detail=f"Dataset not allowed: {dataset}.")
-
-
-def dataset_visible_to(identity: AccessIdentity, dataset: str) -> bool:
-    """Boolean twin of enforce_dataset_allowlist for read-side projections.
-
-    Used where a hidden dataset should silently disappear from a payload
-    (e.g. /api/mesh/graph attribution) instead of rejecting the request.
-    Delegates to enforce_dataset_allowlist so the two can never drift.
-    """
-    try:
-        enforce_dataset_allowlist(identity, dataset)
-    except HTTPException:
-        return False
-    return True
 
 
 def scope_override_active(
@@ -3378,8 +3336,9 @@ async def me_summary(request: Request) -> dict[str, Any]:
         # Scope the timeline page to this seat Node *before* the limit slice.
         # Filtering only after a mixed visible page (Central + shared traces)
         # can drop all Node activity when org traffic is busy.
-        def _node_visible(dataset: str | None) -> bool:
-            return dataset == node
+        def _node_visible(event: dict[str, Any]) -> bool:
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            return details.get("dataset") == node
 
         try:
             timeline = await get_mesh().timeline(limit=12, visible=_node_visible)
@@ -4490,11 +4449,7 @@ def scope_mesh_snapshot(
         if edge.get("source") not in dropped and edge.get("target") not in dropped
     ]
     kept_events = [
-        event
-        for event in snapshot.get("events", [])
-        if _mesh_dataset_visible(
-            identity, (event.get("details") or {}).get("dataset"), cache
-        )
+        event for event in snapshot.get("events", []) if event_visible_to(identity, event)
     ]
     return {
         **snapshot,
@@ -4536,14 +4491,11 @@ async def knowledge_events(
         raise HTTPException(status_code=422, detail="Timeline limit must be between 1 and 160.")
     # ADR-0009: the timeline carries Node content (event messages, dataset names,
     # and error operations/reasons), so scope it to the caller exactly as the two
-    # sibling projections do — /api/mesh via scope_mesh_snapshot and /events via
-    # _mesh_dataset_visible. This endpoint previously discarded the identity and
+    # sibling projections do, /api/mesh via scope_mesh_snapshot and /events via
+    # event_visible_to. This endpoint previously discarded the identity and
     # returned every seat's events to any reader token.
-    visible_cache: dict[str, bool] = {}
-    visible = (
-        None
-        if can_bypass_dataset_allowlist(identity)
-        else (lambda dataset: _mesh_dataset_visible(identity, dataset, visible_cache))
+    visible = None if can_bypass_dataset_allowlist(identity) else (
+        lambda event: event_visible_to(identity, event)
     )
     timeline = await get_mesh().timeline(
         after_id=after_id,
@@ -4632,7 +4584,9 @@ async def list_knowledge_conflicts(request: Request, status: str | None = None) 
     if status not in {None, "open", "resolved"}:
         raise HTTPException(status_code=422, detail="Unsupported conflict status filter.")
     store = get_conflict_store()
-    conflicts = store.list(status=status)
+    conflicts = [
+        conflict for conflict in store.list(status=status) if conflict_visible_to(actor, conflict)
+    ]
     get_access_store().record_event(
         action="conflicts.list",
         actor=actor,
@@ -4643,7 +4597,7 @@ async def list_knowledge_conflicts(request: Request, status: str | None = None) 
         "ok": True,
         "status": status or "all",
         "conflicts": jsonable_encoder(conflicts),
-        "open_count": store.open_count(),
+        "open_count": sum(1 for conflict in conflicts if conflict.get("status") == "open"),
     }
 
 
@@ -4654,8 +4608,27 @@ async def resolve_knowledge_conflict(
     request: Request,
 ) -> Any:
     actor = require_access(request, "writer", "kb:ingest")
+    store = get_conflict_store()
     try:
-        resolved = get_conflict_store().resolve(
+        conflict = store.get(conflict_id)
+    except KeyError as exc:
+        get_access_store().record_event(
+            action="conflicts.resolve",
+            actor=actor,
+            success=False,
+            detail={"conflict_id": conflict_id, "reason": "not_found"},
+        )
+        raise HTTPException(status_code=404, detail="Conflict not found.") from exc
+    if not conflict_visible_to(actor, conflict):
+        get_access_store().record_event(
+            action="conflicts.resolve",
+            actor=actor,
+            success=False,
+            detail={"conflict_id": conflict_id, "reason": "not_found"},
+        )
+        raise HTTPException(status_code=404, detail="Conflict not found.")
+    try:
+        resolved = store.resolve(
             conflict_id,
             resolution_note=body.resolution_note,
             resolved_by=actor.actor_id,
@@ -4750,7 +4723,7 @@ def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
 
 @app.get("/api/sources")
 async def sources(request: Request, type: str | None = None) -> Any:
-    require_access(request, "reader", "sources:read")
+    identity = require_access(request, "reader", "sources:read")
     sources_payload: list[dict[str, Any]] = []
     # When the evolve cycle last completed. Without it, a node that has not
     # evolved in a week looks identical to one that evolved five minutes ago,
@@ -4842,7 +4815,14 @@ async def sources(request: Request, type: str | None = None) -> Any:
         summary["linear_issues"] = linear_status.get("issue_count", 0)
 
     if type in {None, "obsidian_vault"}:
-        obsidian_status = get_obsidian_sync().source_status(source_type="obsidian_vault")
+        obsidian_status = get_obsidian_sync().source_status(
+            source_type="obsidian_vault",
+            visible_owner=lambda vault: owner_visible_to(
+                identity,
+                vault.get("owner_actor_id"),
+                vault.get("owner_seat_slug"),
+            ),
+        )
         # One vault-wide error: pushes are audited per sync, not per vault, so
         # the same last-failure applies to every vault entry rather than being
         # attributed to one of them arbitrarily.
@@ -4868,7 +4848,12 @@ async def run_github_sync(body: GitHubSyncBody, request: Request) -> Any:
         result = await get_github_syncer().run(force=body.force)
     except Exception as exc:  # pragma: no cover - depends on GitHub and runtime Cognee config.
         logger.error("GitHub sync run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="github_sync", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="github_sync",
+            error=str(exc),
+            dataset=citadel.config.github_sync_dataset,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     await mesh_state.record_github_sync(citadel.config, result)
     return jsonable_encoder(result)
@@ -4919,7 +4904,10 @@ async def _run_webhook_reingest(syncer: GitHubOrgSyncer) -> None:
             exc,
         )
         await get_mesh().record_error(
-            get_citadel().config, operation="github_sync", error=str(exc)
+            get_citadel().config,
+            operation="github_sync",
+            error=str(exc),
+            dataset=get_citadel().config.github_sync_dataset,
         )
 
 
@@ -5010,7 +4998,12 @@ async def run_linear_sync(body: LinearSyncBody, request: Request) -> Any:
         result = await get_linear_syncer().run(force=body.force)
     except Exception as exc:  # pragma: no cover - depends on Linear API and runtime Cognee config.
         logger.error("Linear sync run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="linear_sync", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="linear_sync",
+            error=str(exc),
+            dataset=citadel.config.linear_sync_dataset,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if not result.get("ok"):
         raise HTTPException(status_code=503, detail=result.get("reason", "Linear sync unavailable"))
@@ -5030,6 +5023,7 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             citadel.config,
             operation="repo_content_sync",
             error=str(exc),
+            dataset=citadel.config.repo_content_sync_dataset,
         )
         get_access_store().record_event(
             action="repo_content_sync.run",
@@ -5255,6 +5249,7 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
             obsidian_push_conflict_candidate(
                 sync_conflict,
                 vault_name=manifest["vault"].get("name"),
+                dataset=push_dataset,
             )
         )
         await mesh_state.record_conflict(citadel.config, conflict=conflict_record)
@@ -5679,7 +5674,12 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
         )
     except Exception as exc:  # pragma: no cover - depends on external sources and Cognee config.
         logger.error("Learning agent run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="learning_agent", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="learning_agent",
+            error=str(exc),
+            dataset=citadel.config.default_dataset,
+        )
         get_access_store().record_event(
             action="learning_agent.run",
             actor=actor,
@@ -5942,9 +5942,8 @@ async def events(request: Request) -> StreamingResponse:
     queue = mesh_state.subscribe()
     # ADR-0009: the SSE stream serves the same content-leaking projection as
     # /api/mesh, so scope the initial snapshot and every live event to the
-    # caller (bypass callers see all). Cache visibility across events.
+    # caller (bypass callers see all).
     bypass = can_bypass_dataset_allowlist(identity)
-    visible_cache: dict[str, bool] = {}
 
     async def stream() -> Any:
         try:
@@ -5956,9 +5955,7 @@ async def events(request: Request) -> StreamingResponse:
                 except TimeoutError:
                     yield ": ping\n\n"
                     continue
-                if not bypass and not _mesh_dataset_visible(
-                    identity, (event.get("details") or {}).get("dataset"), visible_cache
-                ):
+                if not bypass and not event_visible_to(identity, event):
                     continue
                 yield sse("mesh-event", event)
         finally:
@@ -6277,8 +6274,13 @@ async def recent_contributions(
         actions=CONTRIBUTION_ACTIONS,
         actor_id=actor_id,
         success=True,
-        limit=limit,
+        limit=100,
     )
+    events = [
+        event
+        for event in events
+        if event.get("success") and event_visible_to(actor, event)
+    ][:limit]
     return {
         "ok": True,
         "contributions": events,
@@ -6483,7 +6485,12 @@ async def knowledge(
                 top_k=limit,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error=str(exc),
+                dataset=search_datasets[0],
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset, _ in merged:
@@ -6545,7 +6552,12 @@ async def optimize_learning_agent(body: OptimizeBody, request: Request) -> Any:
             actor=actor,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="self_improve", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="self_improve",
+            error=str(exc),
+            dataset=citadel.config.default_dataset,
+        )
         get_access_store().record_event(
             action="learning_agent.optimize",
             actor=actor,
@@ -6598,7 +6610,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 top_k=fetch_k,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error=str(exc),
+                dataset=search_datasets[0],
+            )
             record_mcp_audit(
                 request,
                 actor=actor,
@@ -6614,7 +6631,10 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     if timed_out:
         await mesh_state.record_error(
-            citadel.config, operation="search", error="search budget exceeded"
+            citadel.config,
+            operation="search",
+            error="search budget exceeded",
+            dataset=search_datasets[0],
         )
 
     # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
@@ -6925,7 +6945,12 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
             )
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="feedback", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="feedback",
+            error=str(exc),
+            dataset=dataset,
+        )
         record_mcp_audit(
             request,
             actor=actor,
@@ -6986,7 +7011,12 @@ async def run_improve(
             session_ids=body.session_ids,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="improve",
+            error=str(exc),
+            dataset=dataset,
+        )
         if request:
             record_mcp_audit(
                 request,

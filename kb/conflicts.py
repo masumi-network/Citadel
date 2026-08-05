@@ -63,6 +63,7 @@ class ConflictRecord:
     summary: str
     side_a: ConflictSide
     side_b: ConflictSide
+    dataset: str | None = None
     status: str = OPEN
     resolution_note: str | None = None
     resolved_at: str | None = None
@@ -76,6 +77,7 @@ class ConflictCandidate:
     side_a: ConflictSide
     side_b: ConflictSide
     dedupe_key: str
+    dataset: str | None = None
 
 
 class KnowledgeConflictStore:
@@ -87,7 +89,10 @@ class KnowledgeConflictStore:
 
     def record(self, candidate: ConflictCandidate) -> dict[str, Any]:
         data = self._load()
-        conflict_id = stable_conflict_id(f"{candidate.kind}:{candidate.dedupe_key}")
+        dedupe_key = f"{candidate.kind}:{candidate.dedupe_key}"
+        if candidate.dataset:
+            dedupe_key = f"{candidate.dataset}:{dedupe_key}"
+        conflict_id = stable_conflict_id(dedupe_key)
         existing = data["conflicts"].get(conflict_id)
         if existing and existing.get("status") == OPEN:
             return existing
@@ -99,6 +104,7 @@ class KnowledgeConflictStore:
             summary=candidate.summary,
             side_a=candidate.side_a,
             side_b=candidate.side_b,
+            dataset=candidate.dataset,
         )
         data["conflicts"][conflict_id] = asdict(record)
         self._prune(data)
@@ -190,6 +196,7 @@ def obsidian_push_conflict_candidate(
     sync_conflict: dict[str, Any],
     *,
     vault_name: str | None = None,
+    dataset: str | None = None,
 ) -> ConflictCandidate:
     """Build a Knowledge Conflict candidate from an Obsidian push conflict."""
     path = str(sync_conflict.get("path") or "unknown note")
@@ -211,6 +218,7 @@ def obsidian_push_conflict_candidate(
             timestamp=sync_conflict.get("updated_at"),
         ),
         dedupe_key=str(sync_conflict.get("id") or f"{vault}:{path}"),
+        dataset=dataset,
     )
 
 
@@ -218,6 +226,7 @@ def detect_contribution_conflict(
     data: str,
     *,
     config: CitadelConfig,
+    dataset: str | None = None,
 ) -> ConflictCandidate | None:
     """Cheap ingest-time check: does a contribution's title match existing
     indexed content with a different content hash?
@@ -237,6 +246,7 @@ def detect_contribution_conflict(
         contribution_hash,
         data=data,
         config=config,
+        dataset=dataset,
     )
     if candidate:
         return candidate
@@ -245,6 +255,7 @@ def detect_contribution_conflict(
         contribution_hash,
         data=data,
         config=config,
+        dataset=dataset,
     )
 
 
@@ -262,6 +273,7 @@ def _github_digest_conflict(
     *,
     data: str,
     config: CitadelConfig,
+    dataset: str | None,
 ) -> ConflictCandidate | None:
     state = _load_state(Path(config.github_sync_state_path))
     digest = str(state.get("last_digest") or "").strip()
@@ -292,6 +304,7 @@ def _github_digest_conflict(
                 timestamp=state.get("last_digest_at") or state.get("last_checked_at"),
             ),
             dedupe_key=f"{org}:{section_title.casefold()}:{contribution_hash[:16]}",
+            dataset=dataset,
         )
     return None
 
@@ -302,6 +315,7 @@ def _obsidian_document_conflict(
     *,
     data: str,
     config: CitadelConfig,
+    dataset: str | None,
 ) -> ConflictCandidate | None:
     state = _load_state(Path(config.obsidian_sync_state_path))
     documents = state.get("documents")
@@ -337,5 +351,6 @@ def _obsidian_document_conflict(
                 timestamp=document.get("updated_at"),
             ),
             dedupe_key=f"{document.get('id')}:{contribution_hash[:16]}",
+            dataset=dataset,
         )
     return None

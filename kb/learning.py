@@ -136,7 +136,10 @@ class LearningProcess:
             except Exception as exc:
                 if self.mesh:
                     await self.mesh.record_error(
-                        self.config, operation=operation, error=str(exc)
+                        self.config,
+                        operation=operation,
+                        error=str(exc),
+                        dataset=target_dataset,
                     )
                 raise
             results.append(result)
@@ -164,7 +167,7 @@ class LearningProcess:
 
         conflict = None
         if detect_conflicts and accepted_any:
-            conflict = self._detect_conflict(data)
+            conflict = self._detect_conflict(data, dataset=target_dataset)
             if conflict and self.mesh:
                 await self.mesh.record_conflict(self.config, conflict=conflict)
 
@@ -218,16 +221,31 @@ class LearningProcess:
             inputs.append((_chunk_text(chunk), [*tags, *chunk.tags]))
         return inputs
 
-    async def record_failure(self, *, operation: str, error: str) -> None:
+    async def record_failure(
+        self,
+        *,
+        operation: str,
+        error: str,
+        dataset: str | None = None,
+    ) -> None:
         """Record a learning-related failure on the mesh projection."""
         if self.mesh:
-            await self.mesh.record_error(self.config, operation=operation, error=error)
+            await self.mesh.record_error(
+                self.config,
+                operation=operation,
+                error=error,
+                dataset=dataset,
+            )
 
-    def _detect_conflict(self, data: str) -> dict[str, Any] | None:
+    def _detect_conflict(self, data: str, *, dataset: str) -> dict[str, Any] | None:
         if not self.conflicts:
             return None
         try:
-            candidate = detect_contribution_conflict(data, config=self.config)
+            candidate = detect_contribution_conflict(
+                data,
+                config=self.config,
+                dataset=dataset,
+            )
         except Exception as exc:  # pragma: no cover - defensive; detection is best-effort.
             logger.warning(
                 "Knowledge conflict detection failed with %s; continuing",

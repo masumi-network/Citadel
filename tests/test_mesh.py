@@ -101,10 +101,11 @@ async def test_events_deque_is_bounded_at_160() -> None:
 async def test_error_details_are_clipped_to_280_characters() -> None:
     mesh = MeshState()
 
-    await mesh.record_error(CONFIG, operation="ingest", error="x" * 500)
+    await mesh.record_error(CONFIG, operation="ingest", error="x" * 500, dataset="notes")
     snapshot = await mesh.snapshot(CONFIG)
 
     assert len(snapshot["events"][0]["details"]["error"]) == 280
+    assert snapshot["events"][0]["details"]["dataset"] == "notes"
 
 
 async def test_subscribers_receive_published_events() -> None:

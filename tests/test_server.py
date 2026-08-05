@@ -19,7 +19,7 @@ import kb.server as server_module
 
 from kb.access import AccessIdentity, AccessStore, SESSION_TRACES_DATASET
 from kb.config import CitadelConfig
-from kb.conflicts import KnowledgeConflictStore
+from kb.conflicts import ConflictCandidate, ConflictSide, KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.mesh import MeshState
 from kb.models import FeedbackResult, IngestResult
@@ -1129,6 +1129,36 @@ def test_knowledge_events_scopes_timeline_to_the_caller(tmp_path: Any) -> None:
     assert {"masumi-network", "personal"} <= unscoped_datasets
 
 
+def test_knowledge_events_hide_other_seat_error_details(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post(
+        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
+    ).json()["token"]
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("PRIVATE_ERROR_MARKER")
+
+    monkeypatch.setattr(server_module, "_search_within_budget", fail)
+    api = TestClient(app, base_url="https://testserver")
+    alice_headers = {"Authorization": f"Bearer {alice_token}"}
+    bob_headers = {"Authorization": f"Bearer {bob_token}"}
+
+    failed_search = api.post(
+        "/search", json={"query": "private"}, headers=alice_headers
+    )
+    bob_events = api.get("/api/knowledge/events?limit=50", headers=bob_headers)
+
+    assert failed_search.status_code == 500
+    assert bob_events.status_code == 200
+    assert "PRIVATE_ERROR_MARKER" not in json.dumps(bob_events.json())
+
+
 def test_reader_access_can_view_and_search_but_not_mutate() -> None:
     client = authed_client("test-reader")
 
@@ -2172,12 +2202,18 @@ def test_obsidian_vault_is_not_readable_or_writable_by_another_actor(tmp_path: A
         },
         headers=intruder_headers,
     )
+    owner_sources = api.get("/api/sources?type=obsidian_vault", headers=owner_headers)
+    intruder_sources = api.get("/api/sources?type=obsidian_vault", headers=intruder_headers)
 
     assert owner_manifest.status_code == 200
     assert intruder_manifest.status_code == 404
     assert intruder_pull.status_code == 404
     assert intruder_document.status_code == 404
     assert intruder_push.status_code == 404
+    assert owner_sources.status_code == 200
+    assert [source["id"] for source in owner_sources.json()["sources"]] == [vault_id]
+    assert intruder_sources.status_code == 200
+    assert intruder_sources.json()["sources"] == []
     # The owner still has full access, and an admin/bypass token is unaffected.
     assert api.get(f"/api/documents/{document_id}", headers=owner_headers).status_code == 200
     assert admin.get(f"/api/obsidian/manifest?vault_id={vault_id}").status_code == 200
@@ -2794,6 +2830,51 @@ def test_knowledge_conflict_listing_and_resolution_are_role_gated(tmp_path: Any)
     assert "conflicts.resolve" in actions
 
 
+def test_knowledge_conflicts_are_scoped_to_the_calling_seat(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post(
+        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
+    ).json()["token"]
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.conflict_store = KnowledgeConflictStore(tmp_path / "conflicts.json")
+    conflict = app.state.conflict_store.record(
+        ConflictCandidate(
+            kind="seat_conflict",
+            summary="Alice private conflict",
+            side_a=ConflictSide(source="alice", excerpt="ALICE_PRIVATE_MARKER"),
+            side_b=ConflictSide(source="alice-old", excerpt="old private text"),
+            dedupe_key="alice-private",
+            dataset="seat:alice",
+        )
+    )
+    api = TestClient(app, base_url="https://testserver")
+    alice_headers = {"Authorization": f"Bearer {alice_token}"}
+    bob_headers = {"Authorization": f"Bearer {bob_token}"}
+
+    alice_list = api.get("/api/conflicts", headers=alice_headers)
+    bob_list = api.get("/api/conflicts", headers=bob_headers)
+    bob_resolve = api.post(
+        f"/api/conflicts/{conflict['id']}/resolve",
+        json={"resolution_note": "cross-seat attempt"},
+        headers=bob_headers,
+    )
+    alice_resolve = api.post(
+        f"/api/conflicts/{conflict['id']}/resolve",
+        json={"resolution_note": "kept Alice's newer note"},
+        headers=alice_headers,
+    )
+
+    assert alice_list.status_code == 200
+    assert alice_list.json()["conflicts"][0]["side_a"]["excerpt"] == "ALICE_PRIVATE_MARKER"
+    assert bob_list.status_code == 200
+    assert bob_list.json()["conflicts"] == []
+    assert bob_resolve.status_code == 404
+    assert alice_resolve.status_code == 200
+
+
 def test_knowledge_conflicts_require_authentication() -> None:
     client = TestClient(app, base_url="https://testserver")
 
@@ -3034,6 +3115,48 @@ def test_mesh_projection_hides_seat_content_from_plain_readers(tmp_path: Any) ->
     # Owner and admin both retain their own/all content.
     assert secret in json.dumps(alice_view)
     assert secret in json.dumps(admin_view)
+
+
+def test_mesh_projection_hides_private_obsidian_nodes_from_plain_readers(
+    tmp_path: Any,
+) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post(
+        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
+    ).json()["token"]
+    reader_token = admin.post(
+        "/api/access/tokens",
+        json={"name": "plain-reader", "role": "reader", "kind": "service_account"},
+    ).json()["token"]
+    mesh = server_module.get_mesh()
+    asyncio.run(
+        mesh.record_obsidian_sync(
+            server_module.get_citadel().config,
+            vault={"id": "vault-private", "name": "Private Vault"},
+            result={
+                "accepted": [
+                    {"path": "Secrets.md", "rev": 1, "content_hash": "hash"}
+                ],
+                "skipped": [],
+                "conflicts": [],
+            },
+            dataset="seat:alice",
+        )
+    )
+
+    api = TestClient(app, base_url="https://testserver")
+    reader_view = api.get(
+        "/api/mesh", headers={"Authorization": f"Bearer {reader_token}"}
+    ).json()
+    alice_view = api.get(
+        "/api/mesh", headers={"Authorization": f"Bearer {alice_token}"}
+    ).json()
+
+    reader_blob = json.dumps(reader_view)
+    assert "Secrets.md" not in reader_blob
+    assert "Private Vault" not in reader_blob
+    assert "Secrets.md" in json.dumps(alice_view)
 
 
 class IsolationDatasetGateway:
@@ -3711,6 +3834,57 @@ def test_recent_contributions_omits_rejected_writes(tmp_path: Any) -> None:
     assert recent.status_code == 200
     assert recent.json()["contributions"] == []
 
+def test_recent_contributions_hide_other_seat_nodes(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post(
+        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
+    ).json()["token"]
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    api = TestClient(app, base_url="https://testserver")
+    alice_headers = {"Authorization": f"Bearer {alice_token}"}
+    bob_headers = {"Authorization": f"Bearer {bob_token}"}
+    alice = app.state.access_store.authenticate_token(alice_token)
+    bob = app.state.access_store.authenticate_token(bob_token)
+    assert alice is not None
+    assert bob is not None
+    app.state.access_store.record_event(
+        action="contribute",
+        actor=alice.identity,
+        success=True,
+        dataset="seat:alice",
+        detail={"title": "Alice private"},
+    )
+    app.state.access_store.record_event(
+        action="contribute",
+        actor=bob.identity,
+        success=True,
+        dataset="seat:bob",
+        detail={"title": "Bob private"},
+    )
+    alice_recent = api.get("/api/contributions/recent", headers=alice_headers)
+    bob_recent = api.get("/api/contributions/recent", headers=bob_headers)
+
+    assert alice_recent.status_code == 200
+    assert bob_recent.status_code == 200
+    assert all(
+        event["dataset"] == "seat:alice"
+        for event in alice_recent.json()["contributions"]
+    )
+    assert all(
+        event["dataset"] == "seat:bob"
+        for event in bob_recent.json()["contributions"]
+    )
+    assert all(
+        "Bob private" not in str(event)
+        for event in alice_recent.json()["contributions"]
+    )
+    assert all(
+        "Alice private" not in str(event)
+        for event in bob_recent.json()["contributions"]
+    )
 
 def test_contribute_routes_through_learning_process_and_audits(tmp_path: Any) -> None:
     client = authed_client("test-writer")
