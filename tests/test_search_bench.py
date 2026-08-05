@@ -806,6 +806,40 @@ class TestRunTimestamp:
         assert stamped.tzinfo is not None
 
 
+class TestRunExitStatus:
+    def test_cmd_run_fails_when_every_search_attempt_errors(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps(
+                {"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.setattr(
+            sb,
+            "make_http_searcher",
+            lambda *args: lambda _query, _top_k: (None, 2.0, "connection refused"),
+        )
+        monkeypatch.setattr(
+            sb,
+            "build_fingerprint",
+            lambda *args: {
+                "content": {"sha256": "a" * 64, "files": 1},
+                "api": {"documents_tracked": 1, "node_version": "test"},
+                "harness_git_sha": "test",
+                "questions_sha256": "q" * 64,
+            },
+        )
+
+        exit_code = sb.main(
+            ["run", "--questions", str(questions_path), "--node-url", "https://node.example"]
+        )
+
+        assert exit_code == 1
+        assert "all 2 benchmark search attempts failed" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------
 # Empty file map must not fingerprint as a real corpus
 # --------------------------------------------------------------------------

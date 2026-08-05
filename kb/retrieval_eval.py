@@ -2030,6 +2030,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(f"\nwrote {args.out}")
+    attempts = len(questions) * max(1, args.repeats)
+    errors = (result.get("summary") or {}).get("latency", {}).get("errors", 0)
+    if attempts > 0 and errors >= attempts:
+        print(
+            f"ERROR: all {attempts} benchmark search attempts failed; "
+            "reported quality is transport-only",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
