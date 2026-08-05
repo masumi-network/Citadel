@@ -123,11 +123,17 @@ def _repo_content_sync_stage() -> int:
     return run_async(_repo_content_sync_stage_async())
 
 
-def _cognify_mode(*, verify: bool) -> int:
+def _cognify_mode(*, verify: bool, force: bool = False) -> int:
     from kb.service import Citadel
 
     dataset = os.getenv("CITADEL_COGNIFY_DATASET") or None
-    result = run_async(Citadel.from_env().cognify_dataset(dataset=dataset, verify=verify))
+    result = run_async(
+        Citadel.from_env().cognify_dataset(
+            dataset=dataset,
+            verify=verify,
+            force=force,
+        )
+    )
     logger.info(
         "Cognify finished: dataset=%s graph_before=%s graph_after=%s grew=%s verify=%s",
         result.get("dataset"),
@@ -136,6 +142,9 @@ def _cognify_mode(*, verify: bool) -> int:
         result.get("graph_grew"),
         (result.get("verification") or {}).get("ok") if verify else result.get("verify"),
     )
+    if result.get("ok") is False:
+        logger.error("Cognify failed: %s", result)
+        return 1
     if verify and not (result.get("verification") or {}).get("ok"):
         logger.error("Cognify verification failed: %s", result.get("verification"))
         return 1
@@ -207,6 +216,13 @@ def _cognify_via_api(url: str, *, force: bool) -> int:
         logger.error("Cognify API timed out after %ss: %s", _cognify_timeout(), exc)
         return 1
 
+    if not isinstance(result, dict):
+        logger.error("Cognify API returned an invalid result: %r", result)
+        return 1
+    if result.get("ok") is False:
+        logger.error("Cognify API reported failure: %s", result)
+        return 1
+
     logger.info(
         "Cognify (API) finished: graph_before=%s graph_after=%s grew=%s",
         result.get("graph_before"),
@@ -231,7 +247,10 @@ def _cognify_stage() -> int:
             "(e.g. http://citadel-archive.railway.internal:8080) to cognify via the web."
         )
         return 1
-    return _cognify_mode(verify=False)
+    return _cognify_mode(
+        verify=False,
+        force=_bool(os.getenv("CITADEL_COGNIFY_FORCE")),
+    )
 
 
 async def _promotion_stage_async() -> int:
@@ -624,7 +643,10 @@ def run(mode: str | None = None) -> int:
 
         return run_backup_mirror()
     if resolved_mode in {"cognify", "cognify-verify"}:
-        return _cognify_mode(verify=resolved_mode == "cognify-verify")
+        return _cognify_mode(
+            verify=resolved_mode == "cognify-verify",
+            force=_bool(os.getenv("CITADEL_COGNIFY_FORCE")),
+        )
     if resolved_mode in {"pipeline", "all", "cron"}:
         return run_pipeline()
     if resolved_mode == "evolve":

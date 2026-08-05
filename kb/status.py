@@ -67,6 +67,8 @@ MCP_AGENT_FALLBACK = (
 CODE_AUTH_REQUIRED = "AUTH_REQUIRED"
 CODE_SEARCH_UNAVAILABLE = "SEARCH_UNAVAILABLE"
 CODE_TIMEOUT = "TIMEOUT"
+CODE_READINESS_UNAVAILABLE = "READINESS_UNAVAILABLE"
+CODE_READINESS_PROTOCOL = "READINESS_PROTOCOL_ERROR"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -197,7 +199,20 @@ def check_node_health(base_url: str, *, timeout: float = _TIMEOUT) -> Check:
         return Check("node", ok=False, detail=_humanize_net_error(exc))
     latency = int((time.monotonic() - started) * 1000)
     ok = bool(data.get("ok"))
-    return Check("node", ok=ok, detail="healthy" if ok else "unhealthy", latency_ms=latency)
+    node_data = {
+        key: data[key]
+        for key in ("version", "build")
+        if key in data
+    }
+    detail = "healthy" if ok else "unhealthy"
+    version = node_data.get("version")
+    build = node_data.get("build")
+    commit_sha = build.get("commit_sha") if isinstance(build, dict) else None
+    if version:
+        detail += f" v{version}"
+    if commit_sha:
+        detail += f" ({str(commit_sha)[:12]})"
+    return Check("node", ok=ok, detail=detail, latency_ms=latency, data=node_data)
 
 
 def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> Check:
@@ -295,7 +310,9 @@ def check_search(
 def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> Check | None:
     """Data-plane corpus health from the Node's honest /readyz (#27).
 
-    Returns None (non-gating) when there is no token or /readyz is unreachable;
+    Tokenless status remains local-only and does not probe /readyz. Once a token
+    is present, a transport or protocol failure is a failed readiness check;
+    otherwise ``gather_status`` would treat a missing data-plane signal as green.
     /readyz answers 503 with a body when the corpus gate or canary is RED, so we
     parse the body off the HTTPError too.
     """
@@ -307,19 +324,78 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
         data = _request("GET", url, token=token, timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code != 503:
-            return None
+            return Check(
+                "corpus",
+                ok=False,
+                detail=_humanize_net_error(exc),
+                data={"code": CODE_READINESS_UNAVAILABLE},
+            )
         try:
             data = json.loads(exc.read().decode() or "{}")
-        except (ValueError, OSError):
-            return None
-    except Exception:
-        return None
+        except (UnicodeError, ValueError, OSError) as parse_exc:
+            return Check(
+                "corpus",
+                ok=False,
+                detail=f"invalid /readyz response: {parse_exc}",
+                data={"code": CODE_READINESS_PROTOCOL},
+            )
+    except Exception as exc:
+        return Check(
+            "corpus",
+            ok=False,
+            detail=_humanize_net_error(exc),
+            data={"code": CODE_READINESS_UNAVAILABLE},
+        )
     latency = int((time.monotonic() - started) * 1000)
-    corpus = data.get("corpus") or {}
+
+    if not isinstance(data, dict):
+        return Check(
+            "corpus",
+            ok=False,
+            detail="invalid /readyz response: expected an object",
+            latency_ms=latency,
+            data={"code": CODE_READINESS_PROTOCOL},
+        )
+    if not isinstance(data.get("ok"), bool):
+        return Check(
+            "corpus",
+            ok=False,
+            detail="invalid /readyz response: ok must be a boolean",
+            latency_ms=latency,
+            data={"code": CODE_READINESS_PROTOCOL},
+        )
+
+    corpus = data.get("corpus")
+    if not isinstance(corpus, dict) or not isinstance(corpus.get("ok"), bool):
+        return Check(
+            "corpus",
+            ok=False,
+            detail="invalid /readyz response: corpus.ok must be a boolean",
+            latency_ms=latency,
+            data={"code": CODE_READINESS_PROTOCOL},
+        )
+
     canary = data.get("canary")
+    if canary is not None and not isinstance(canary, dict):
+        return Check(
+            "corpus",
+            ok=False,
+            detail="invalid /readyz response: canary must be an object or null",
+            latency_ms=latency,
+            data={"code": CODE_READINESS_PROTOCOL, "canary": canary},
+        )
+    if canary is not None and not isinstance(canary.get("ok"), bool):
+        return Check(
+            "corpus",
+            ok=False,
+            detail="invalid /readyz response: canary.ok must be a boolean",
+            latency_ms=latency,
+            data={"code": CODE_READINESS_PROTOCOL, "canary": canary},
+        )
+
     indexed = corpus.get("indexed_docs")
     tracked = corpus.get("tracked_sources")
-    ok = bool(corpus.get("ok", True)) and (canary is None or bool(canary.get("ok", True)))
+    ok = data["ok"] and corpus["ok"] and (canary is None or canary["ok"])
     detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
     return Check("corpus", ok=ok, detail=detail, latency_ms=latency, data={"canary": canary})
 

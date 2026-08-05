@@ -191,9 +191,10 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
     assert result["commit_count"] == 1
     assert result["ingested"] is True
     assert result["improved"] is True
-    assert "masumi-network/agent" in citadel.ingest_calls[0]["data"]
-    assert "teach the archive about commits" in citadel.ingest_calls[0]["data"]
-    assert citadel.ingest_calls[0]["dataset"] == "masumi-network"
+    ingested_text = "\n".join(call["data"] for call in citadel.ingest_calls)
+    assert "masumi-network/agent" in ingested_text
+    assert "teach the archive about commits" in ingested_text
+    assert all(call["dataset"] == "masumi-network" for call in citadel.ingest_calls)
     assert citadel.improve_calls[0]["session_ids"] == ["masumi-github-daily"]
     state = json.loads(Path(config.github_sync_state_path).read_text(encoding="utf-8"))
     assert "teach the archive about commits" in state["last_digest"]
@@ -239,12 +240,14 @@ async def test_github_sync_can_skip_unchanged_ingest(tmp_path: Any) -> None:
     )
 
     await syncer.run()
+    first_ingest_count = len(citadel.ingest_calls)
     second = await syncer.run()
 
     assert second["changed_count"] == 0
     assert second["event_count"] == 0
     assert second["commit_count"] == 0
-    assert len(citadel.ingest_calls) == 1
+    assert first_ingest_count >= 1
+    assert len(citadel.ingest_calls) == first_ingest_count
 
 
 @pytest.mark.asyncio
@@ -497,6 +500,7 @@ async def test_corrupt_state_raises_instead_of_everything_changed(tmp_path: Any)
     citadel = FakeCitadel(config)
     syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
     await syncer.run()  # seed a real state file
+    first_ingest_count = len(citadel.ingest_calls)
     corrupt = '{"version": 1, "org": "masumi-network", "repos"'
     Path(config.github_sync_state_path).write_text(corrupt, encoding="utf-8")
 
@@ -505,7 +509,8 @@ async def test_corrupt_state_raises_instead_of_everything_changed(tmp_path: Any)
 
     # No digest was fabricated from the corrupt state, and the file was left
     # untouched as evidence.
-    assert len(citadel.ingest_calls) == 1
+    assert first_ingest_count >= 1
+    assert len(citadel.ingest_calls) == first_ingest_count
     assert Path(config.github_sync_state_path).read_text(encoding="utf-8") == corrupt
 
 

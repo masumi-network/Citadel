@@ -206,7 +206,12 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
         "open",
         _route(
             {
-                "/healthz": {"ok": True, "service": "citadel"},
+                "/healthz": {
+                    "ok": True,
+                    "service": "citadel",
+                    "version": "0.5.0",
+                    "build": {"commit_sha": "abc123456789"},
+                },
                 "/api/session": {
                     "ok": True,
                     "role": "writer",
@@ -216,6 +221,11 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
                     "actor": {"name": "Sarthi"},
                 },
                 "/search": {"results": [{"id": 1}]},
+                "/readyz": {
+                    "ok": True,
+                    "corpus": {"ok": True, "tracked_sources": 200, "indexed_docs": 280},
+                    "canary": None,
+                },
                 "/api/contributions/recent": {"contributions": [{"title": "feat: x", "created_at": "2026-06-27T10:00:00"}]},
             }
         ),
@@ -231,6 +241,13 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
     assert report.identity["seat_slug"] == "sarthi"
     names = {c.name: c.ok for c in report.checks}
     assert names["node"] and names["auth"] and names["search"]
+    node = next(check for check in report.checks if check.name == "node")
+    assert node.data == {
+        "version": "0.5.0",
+        "build": {"commit_sha": "abc123456789"},
+    }
+    assert "v0.5.0" in node.detail
+    assert "abc123456789" in node.detail
     assert report.recent[0]["title"] == "feat: x"
     readiness = report.readiness()
     assert readiness["authenticated"] is True
@@ -332,6 +349,65 @@ def test_check_corpus_ok_when_readyz_healthy(monkeypatch) -> None:
     check = status_mod.check_corpus("https://node.example", "ctdl_tok")
     assert check is not None and check.ok is True
     assert "280 indexed / 200 tracked" in check.detail
+
+
+def test_check_corpus_fails_closed_when_readyz_transport_fails(monkeypatch) -> None:
+    def fail_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(status_mod, "_request", fail_request)
+
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+
+    assert check is not None
+    assert check.ok is False
+    assert check.data["code"] == status_mod.CODE_READINESS_UNAVAILABLE
+    assert check.detail == "connection refused"
+
+
+def test_check_corpus_fails_closed_on_malformed_canary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        status_mod,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "corpus": {"ok": True, "tracked_sources": 200, "indexed_docs": 280},
+            "canary": [],
+        },
+    )
+
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+
+    assert check is not None
+    assert check.ok is False
+    assert check.data["code"] == status_mod.CODE_READINESS_PROTOCOL
+    assert "canary" in check.detail
+
+
+def test_gather_status_fails_closed_when_readyz_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
+        url = request.full_url
+        if "/healthz" in url:
+            return _FakeResp({"ok": True})
+        if "/api/session" in url:
+            return _FakeResp({"ok": True, "role": "writer", "seat_slug": "s"})
+        if "/readyz" in url:
+            raise OSError("readiness unavailable")
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(status_mod._OPENER, "open", fake_open)
+
+    report = gather_status(
+        "https://node.example",
+        "ctdl_tok",
+        repo=tmp_path,
+        config_path=tmp_path / "c.json",
+        with_recent=False,
+    )
+
+    assert report.healthy is False
+    corpus = next(check for check in report.checks if check.name == "corpus")
+    assert corpus.ok is False
 
 
 def test_gather_status_node_down(tmp_path: Path) -> None:
@@ -477,7 +553,7 @@ def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> No
     monkeypatch.setattr(
         status_mod._OPENER,
         "open",
-        _route({"/healthz": {"ok": True}, "/api/session": {"ok": True, "role": "writer", "seat_slug": "s"}, "/search": {"results": []}, "/api/contributions/recent": {"contributions": []}}),
+        _route({"/healthz": {"ok": True}, "/api/session": {"ok": True, "role": "writer", "seat_slug": "s"}, "/readyz": {"ok": True, "corpus": {"ok": True}, "canary": None}, "/search": {"results": []}, "/api/contributions/recent": {"contributions": []}}),
     )
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_tok")
     args = argparse.Namespace(

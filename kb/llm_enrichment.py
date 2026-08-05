@@ -24,6 +24,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
+from kb import chunk_window
 from kb.secure_http import open_secure
 
 from kb.retry import run_with_retries
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_LLM_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_THRESHOLD_CHARS = 4000
 DEFAULT_MAX_CHUNK_CHARS = 4000
+DEFAULT_DETERMINISTIC_CHUNK_CHARS = 1200
+DETERMINISTIC_CHUNK_CHARS_ENV = "CITADEL_DETERMINISTIC_CHUNK_CHARS"
+DETERMINISTIC_BPE_SAFETY_MARGIN_TOKENS = 32
 MAX_CHUNKS = 20
 MAX_TAGS_PER_CHUNK = 6
 MIN_TAGS_PER_CHUNK = 3
@@ -89,6 +93,42 @@ def enrichment_threshold_chars() -> int:
         "CITADEL_LLM_ENRICHMENT_THRESHOLD_CHARS",
         default=DEFAULT_THRESHOLD_CHARS,
     ))
+
+
+def deterministic_chunk_chars() -> int:
+    """Return the character backstop used by the lossless pre-ingest splitter.
+
+    The actual chunk boundary is chosen in Cognee's GPT-4o BPE units. This cap
+    prevents a tokenizer failure from producing an unbounded piece.
+    """
+    return max(
+        1,
+        _int_env(
+            DETERMINISTIC_CHUNK_CHARS_ENV,
+            default=DEFAULT_DETERMINISTIC_CHUNK_CHARS,
+        ),
+    )
+
+
+def deterministic_chunk_bpe_budget() -> int:
+    """Return the BPE budget the pre-ingest splitter must fit.
+
+    Leave room for small counter differences between Citadel's lossless replica
+    and the installed Cognee tokenizer path. Lower explicit values still take
+    effect through :func:`chunk_window.resolve_chunk_budget`.
+    """
+    safe_observed_budget = max(
+        1,
+        chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS
+        - DETERMINISTIC_BPE_SAFETY_MARGIN_TOKENS,
+    )
+    return max(
+        1,
+        min(
+            chunk_window.resolve_chunk_budget(),
+            safe_observed_budget,
+        ),
+    )
 
 
 def redacted_preview(text: str, *, length: int = LOG_PREVIEW_CHARS) -> str:
@@ -217,6 +257,14 @@ def paragraph_chunks(data: str, *, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> 
     current: list[str] = []
     current_len = 0
     for paragraph in paragraphs:
+        pieces = _split_oversized_paragraph(paragraph, max_chars=max_chars)
+        if len(pieces) > 1:
+            if current:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(pieces)
+            continue
         added = len(paragraph) + (2 if current else 0)
         if current and current_len + added > max_chars:
             chunks.append("\n\n".join(current))
@@ -227,6 +275,201 @@ def paragraph_chunks(data: str, *, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> 
     if current:
         chunks.append("\n\n".join(current))
     return chunks
+
+
+_SAFE_SPLIT_CHARS = ("\n", "\r", " ", "\t", ".", ",", ";", "!", "?", ")", "]", "}")
+
+
+def _split_oversized_paragraph(paragraph: str, *, max_chars: int) -> list[str]:
+    """Split one paragraph without silently dropping its bytes.
+
+    Cognee's paragraph fallback leaves a long table row, code block, or minified
+    line intact. Prefer a nearby structural boundary, then use a hard boundary
+    when the input has none. The whole source was security-scanned before this
+    function runs, so splitting never acts as a secret-scan bypass.
+    """
+    if len(paragraph) <= max_chars:
+        return [paragraph]
+
+    pieces: list[str] = []
+    start = 0
+    while start < len(paragraph):
+        limit = min(start + max_chars, len(paragraph))
+        if limit == len(paragraph):
+            cut = limit
+        else:
+            boundary = max(
+                (paragraph.rfind(char, start, limit) for char in _SAFE_SPLIT_CHARS),
+                default=-1,
+            )
+            cut = boundary + 1 if boundary > start else limit
+        pieces.append(paragraph[start:cut])
+        start = cut
+    return pieces
+
+
+def _count_bpe(text: str) -> int | None:
+    encoding = chunk_window._bpe_encoding()
+    if encoding is None:
+        return None
+    try:
+        # Cognee's chunk_by_sentence sums token counts for each segment from
+        # chunk_by_word. Counting the whole string would undercount merges at
+        # segment boundaries and let Cognee split the piece again downstream.
+        return sum(
+            len(encoding.encode(word))
+            for word in chunk_window.split_cognee_words(text)
+        )
+    except Exception:  # pragma: no cover - tokenizer failure is fail-soft.
+        return None
+
+
+def _largest_fitting_prefix(
+    text: str,
+    *,
+    prefix: str,
+    max_chars: int,
+    budget: int,
+) -> int:
+    """Find the largest exact character prefix that fits ``budget`` BPE tokens.
+
+    Walk Cognee's segments once. Only the segment that crosses the budget needs
+    a character search, which avoids retokenizing the whole candidate for every
+    binary-search probe.
+    """
+    upper = min(len(text), max_chars)
+    if upper <= 0:
+        return 0
+    encoding = chunk_window._bpe_encoding()
+    if encoding is None:
+        return upper
+
+    candidate = prefix + text[:upper]
+    prefix_length = len(prefix)
+    candidate_length = len(candidate)
+    consumed = 0
+    cursor = 0
+    for word in chunk_window._iter_cognee_words(candidate):
+        word_start = cursor
+        word_end = word_start + len(word)
+        cursor = word_end
+        word_tokens = len(encoding.encode(word))
+        if consumed + word_tokens <= budget:
+            consumed += word_tokens
+            if word_end > prefix_length:
+                fitting_end = min(word_end, candidate_length) - prefix_length
+            else:
+                fitting_end = 0
+            if fitting_end >= upper:
+                return upper
+            continue
+
+        if word_end <= prefix_length:
+            return 0
+
+        body_start = max(0, prefix_length - word_start)
+        body_end = min(len(word), candidate_length - word_start)
+        available = max(0, body_end - body_start)
+        low = 0
+        high = available
+        best = 0
+        while low <= high:
+            middle = (low + high) // 2
+            word_tokens = len(encoding.encode(word[: body_start + middle]))
+            if consumed + word_tokens <= budget:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return max(0, word_start + body_start + best - prefix_length)
+
+    return upper
+
+
+def _prefer_safe_boundary(text: str, *, start: int, end: int) -> int:
+    """Move a fitting cut left to a nearby boundary without dropping text."""
+    boundary = max(
+        (text.rfind(char, start, end) for char in _SAFE_SPLIT_CHARS),
+        default=-1,
+    )
+    return boundary + 1 if boundary > start else end
+
+
+def _lossless_chunks(
+    data: str,
+    *,
+    prefix: str = "",
+    max_chars: int,
+    bpe_budget: int,
+) -> list[str]:
+    """Split exact text while accounting for an optional repeated prefix."""
+    if not data:
+        return [prefix] if prefix else []
+    body_budget = max(1, max_chars - len(prefix))
+    chunks: list[str] = []
+    start = 0
+    while start < len(data):
+        fitting = _largest_fitting_prefix(
+            data[start:],
+            prefix=prefix,
+            max_chars=body_budget,
+            budget=bpe_budget,
+        )
+        cut = (
+            fitting
+            if start + fitting >= len(data)
+            else _prefer_safe_boundary(data, start=start, end=start + fitting)
+        )
+        if cut <= start:
+            cut = min(start + 1, len(data))
+        chunks.append(prefix + data[start:cut])
+        start = cut
+    return chunks
+
+
+def deterministic_source_chunks(
+    data: str,
+    *,
+    max_chars: int | None = None,
+) -> list[str]:
+    """Create lossless, BPE-bounded chunks for every ingest path.
+
+    Repo-content documents carry a sync header before ``---``. That header is
+    repeated on every piece so a later search can still resolve each piece to
+    its repository path and blob. Other inputs use the paragraph splitter
+    directly. The body text is sliced, never stripped or regrouped.
+    """
+    limit = deterministic_chunk_chars() if max_chars is None else max_chars
+    limit = max(1, limit)
+    bpe_budget = deterministic_chunk_bpe_budget()
+    marker = "\n---\n\n"
+    marker_index = data.find(marker)
+    header = data[:marker_index] if marker_index >= 0 else ""
+    is_repo_header = data.startswith("# ") and all(
+        f"\n{field}:" in header
+        for field in ("Repository", "Source", "Commit", "Blob")
+    )
+    if is_repo_header:
+        prefix_end = marker_index + len(marker)
+        prefix = data[:prefix_end]
+        body = data[prefix_end:]
+        if body.strip():
+            if len(prefix) >= limit:
+                raise ValueError(
+                    "repo content provenance header exceeds the deterministic "
+                    f"chunk limit ({len(prefix)} >= {limit} characters)"
+                )
+            return _lossless_chunks(
+                body,
+                prefix=prefix,
+                max_chars=limit,
+                bpe_budget=bpe_budget,
+            )
+    return _lossless_chunks(
+        data,
+        max_chars=limit,
+        bpe_budget=bpe_budget,
+    )
 
 
 def _clean_tags(value: Any) -> tuple[str, ...]:

@@ -657,8 +657,73 @@ async def test_ensure_dataset_makes_a_seat_resolvable_to_cognee(
     assert await client.ensure_dataset("seat:alice") is True
     resolved = await get_authorized_dataset_by_name("seat:alice", user, "read")
     assert resolved is not None and resolved.name == "seat:alice"
-
     assert await client.ensure_dataset("seat:alice") is False
+
+
+@pytest.mark.asyncio
+async def test_node_provenance_map_reads_only_valid_server_metadata(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    from cognee.infrastructure.databases.relational import create_db_and_tables
+    from cognee.infrastructure.databases.relational import get_relational_engine
+    from cognee.modules.data.models import Data
+    from cognee.modules.users.methods import get_default_user
+    from uuid import uuid4
+
+    await create_db_and_tables()
+    user = await get_default_user()
+    promoted_id = uuid4()
+    ignored_id = uuid4()
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(
+            Data(
+                id=promoted_id,
+                name="promoted",
+                content_hash="provenance-hash",
+                mime_type="text/plain",
+                owner_id=user.id,
+                tenant_id=user.tenant_id,
+                external_metadata={
+                    "citadel_provenance": {
+                        "kind": "promotion",
+                        "trust_tier": "unattested",
+                        "promoted_by": "operator-1",
+                        "promoted_at": "2026-08-05T10:00:00+00:00",
+                    }
+                },
+            )
+        )
+        session.add(
+            Data(
+                id=ignored_id,
+                name="untrusted",
+                content_hash="ignored-hash",
+                mime_type="text/plain",
+                owner_id=user.id,
+                tenant_id=user.tenant_id,
+                external_metadata={"citadel_provenance": {"kind": "forged"}},
+            )
+        )
+        await session.commit()
+
+    client = _real_cognee_client(monkeypatch)
+
+    assert await client.node_provenance_map() == {
+        str(promoted_id): {
+            "kind": "promotion",
+            "promoted_by": "operator-1",
+            "promoted_at": "2026-08-05T10:00:00+00:00",
+            "trust_tier": "unattested",
+        }
+    }
+    assert await client.document_provenance(str(promoted_id)) == {
+        "kind": "promotion",
+        "promoted_by": "operator-1",
+        "promoted_at": "2026-08-05T10:00:00+00:00",
+        "trust_tier": "unattested",
+    }
+    assert await client.document_provenance(str(ignored_id)) is None
 
 
 @pytest.mark.asyncio
@@ -992,12 +1057,24 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
         dataset_name="masumi-network",
         session_id="masumi-github-daily",
         tags=("github",),
+        provenance={
+            "kind": "promotion",
+            "promoted_by": "operator-1",
+            "promoted_at": "2026-08-05T10:00:00+00:00",
+        },
     )
     assert "session_id" not in captured["kwargs"]
     assert captured["kwargs"] == {"dataset_name": "masumi-network"}
     assert isinstance(captured["data"], DataItem)
     assert captured["data"].data == "real digest"
-    assert captured["data"].external_metadata == {"citadel_tags": ["github"]}
+    assert captured["data"].external_metadata == {
+        "citadel_tags": ["github"],
+        "citadel_provenance": {
+            "kind": "promotion",
+            "promoted_by": "operator-1",
+            "promoted_at": "2026-08-05T10:00:00+00:00",
+        },
+    }
     assert result == {"added": {"ok": True}, "cognify": "suppressed"}
 
 
@@ -1071,6 +1148,33 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(monkeypatch: 
     client.schedule_cognify([])
     await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == []
+
+
+@pytest.mark.asyncio
+async def test_list_dataset_names_returns_nonempty_owned_names(monkeypatch: Any) -> None:
+    async def run_startup_migrations() -> None:
+        return None
+
+    class Dataset:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    async def list_datasets() -> list[Dataset]:
+        return [Dataset("seat:sarthi"), Dataset(""), Dataset("seat:sarthi")]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_startup_migrations=run_startup_migrations,
+            datasets=SimpleNamespace(
+                list_datasets=list_datasets,
+            ),
+        ),
+    )
+    client = CogneePublicClient()
+
+    assert await client.list_dataset_names() == ["seat:sarthi"]
 
 
 @pytest.mark.asyncio
@@ -1553,3 +1657,121 @@ async def test_corpus_chunk_counts_says_not_measured_off_pgvector(
 
     assert await client.corpus_chunk_counts(["3b9c0d05-0000-0000-0000-000000000001"]) is None
     assert await client.corpus_chunk_counts([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_joins_bounded_row_projection_measurements(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    monkeypatch.delenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", raising=False)
+    calls: dict[str, Any] = {"pages": [], "chunk_ids": [], "graph_ids": []}
+    pages = [
+        [
+            {"id": "doc-a", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": "doc-b", "created_at": "2026-01-02T00:00:00+00:00"},
+        ],
+        [{"id": "doc-c", "created_at": "2026-01-03T00:00:00+00:00"}],
+    ]
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 3}
+
+    async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
+        calls["pages"].append(
+            (kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"])
+        )
+        return pages[len(calls["pages"]) - 1]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        calls["chunk_ids"].append(document_ids)
+        return {document_id: 2 for document_id in document_ids}
+
+    async def corpus_graph_presence(document_ids: list[str]) -> set[str]:
+        calls["graph_ids"].append(document_ids)
+        return set(document_ids) | {"stale-graph-node"}
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "corpus_graph_presence", corpus_graph_presence)
+
+    health = await client.corpus_health(limit=2)
+
+    assert calls == {
+        "pages": [
+            (None, None, 2),
+            ("2026-01-02T00:00:00+00:00", "doc-b", 1),
+        ],
+        "chunk_ids": [["doc-a", "doc-b"], ["doc-c"]],
+        "graph_ids": [["doc-a", "doc-b"], ["doc-c"]],
+    }
+    assert health == {
+        "relational_documents": 3,
+        "probe_limit": 2,
+        "probe_max_documents": 10_000,
+        "probe_documents": 3,
+        "probe_pages": 2,
+        "probe_complete": True,
+        "probe_cap_exceeded": False,
+        "probe_chunked_documents": 3,
+        "probe_graph_documents": 3,
+        "probe_fully_indexed_documents": 3,
+        "probe_ok": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_fails_closed_before_scanning_past_document_cap(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    monkeypatch.setenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", "2")
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 3}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        raise AssertionError("cap check must happen before page enumeration")
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+
+    health = await client.corpus_health()
+
+    assert health == {
+        "relational_documents": 3,
+        "probe_limit": 64,
+        "probe_max_documents": 2,
+        "probe_documents": 0,
+        "probe_pages": 0,
+        "probe_complete": False,
+        "probe_cap_exceeded": True,
+        "probe_chunked_documents": 0,
+        "probe_graph_documents": 0,
+        "probe_fully_indexed_documents": 0,
+        "probe_ok": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_fails_closed_when_vector_measurement_is_unavailable(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 1}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [{"id": "doc-a"}]
+
+    async def corpus_chunk_counts(_: list[str]) -> None:
+        return None
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+
+    with pytest.raises(RuntimeError, match="vector chunk measurement is unavailable"):
+        await client.corpus_health()

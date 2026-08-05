@@ -14,8 +14,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -32,6 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from kb import __version__ as _SERVICE_VERSION
 from kb.access import (
     CENTRAL_DATASET,
     SESSION_TRACES_DATASET,
@@ -51,6 +50,7 @@ from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPub
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
 from kb.cognee_client import assert_cognee_dataset_api
+from kb.cognee_client import drain_background_cognify_tasks
 from kb.config import CitadelConfig
 from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
@@ -105,6 +105,15 @@ from kb.security_scan import (
     redact_secrets,
     scan_text_entries,
 )
+from kb.visibility import (
+    can_bypass_dataset_allowlist,
+    conflict_visible_to,
+    dataset_visible_to,
+    effective_scopes,
+    enforce_dataset_allowlist,
+    event_visible_to,
+    owner_visible_to,
+)
 from kb.self_improve import SelfImprovement
 from kb.service import Citadel
 from kb.skills import skill_catalog, skill_integrity, skill_path
@@ -152,6 +161,14 @@ _LAST_CANARY: dict[str, Any] | None = None
 # over an empty graph were the #27 failure mode).
 _MIN_TRACKED_FOR_CORPUS = 10
 _INDEXED_FLOOR = 1
+_CORPUS_HEALTH_PROBE_LIMIT = 64
+try:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_CACHE_TTL_SECONDS", "5"))
+    )
+except ValueError:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = 5.0
+_CORPUS_HEALTH_CACHE: tuple[float, int, dict[str, Any]] | None = None
 
 # In-flight counts for the soft concurrency cap / 429 backpressure contract
 # (#50). Single-loop server → increment/decrement need no lock. Search and the
@@ -344,14 +361,19 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             "yes",
             "on",
         }
+        global _LAST_CANARY
         try:
             # verify=True runs the end-to-end ingest+cognify+search canary and
             # records its verdict for /readyz (#27).
             result = await get_citadel().cognify_dataset(force=force, verify=True)
-            global _LAST_CANARY
             verification = result.get("verification") or {}
+            canary_ok = (
+                result.get("ok") is True
+                and isinstance(verification, dict)
+                and verification.get("ok") is True
+            )
             _LAST_CANARY = {
-                "ok": bool(result.get("ok")),
+                "ok": canary_ok,
                 "search_hit": verification.get("search_hit"),
                 "graph_grew": result.get("graph_grew"),
                 "marker": verification.get("marker"),
@@ -364,7 +386,13 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            _LAST_CANARY = {
+                "ok": False,
+                "search_hit": False,
+                "graph_grew": False,
+                "error": type(exc).__name__,
+            }
             logger.exception("Evolve scheduler: cognify failed")
         finally:
             # Stamp the pass even when a stage failed. This records that the
@@ -505,6 +533,10 @@ async def lifespan(app: FastAPI) -> Any:
                 "Seat dataset backfill failed; seats created before provisioning "
                 "may still fail every search (#147)"
             )
+        try:
+            await schedule_startup_cognify_recovery(get_citadel())
+        except Exception:
+            logger.exception("Startup cognify recovery failed to schedule")
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
@@ -513,16 +545,31 @@ async def lifespan(app: FastAPI) -> Any:
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
             await _stop_evolve_scheduler(repo_stats_task)
+            await drain_background_cognify_tasks()
 
 
 # Single-source the service version so /.well-known/citadel.json and the CLI
-# never drift. Prefer installed package metadata; fall back to the in-source
-# kb.__version__ because the Railway node runs from source (not dist-installed),
-# where importlib.metadata raises and a hardcoded version would mislead.
-try:
-    _SERVICE_VERSION = _pkg_version("citadel-archive")
-except PackageNotFoundError:
-    from kb import __version__ as _SERVICE_VERSION
+# never drift. Installed metadata can lag in an editable checkout, so prefer
+# the package source value that is bundled into both source deployments and
+# wheels.
+
+
+def _build_identity() -> dict[str, str | None]:
+    """Expose deployment identity without exposing runtime configuration."""
+
+    def first_env(*names: str) -> str | None:
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return None
+
+    return {
+        "commit_sha": first_env("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT_SHA", "BUILD_SHA"),
+        "deployment_id": first_env("RAILWAY_DEPLOYMENT_ID", "RAILWAY_SNAPSHOT_ID"),
+        "branch": first_env("RAILWAY_GIT_BRANCH", "GIT_BRANCH"),
+    }
+
 
 app = FastAPI(
     title="Citadel Archive",
@@ -1461,27 +1508,11 @@ def require_role(request: Request, minimum_role: str) -> AccessIdentity:
     return identity
 
 
-def effective_scopes(identity: AccessIdentity) -> tuple[str, ...]:
-    if identity.scopes:
-        return identity.scopes
-    if identity.source == "env":
-        return default_scopes(identity.role)
-    return ()
-
-
 def require_access(request: Request, minimum_role: str, scope: str) -> AccessIdentity:
     identity = require_role(request, minimum_role)
     if scope not in effective_scopes(identity):
         raise HTTPException(status_code=403, detail=f"Scope required: {scope}.")
     return identity
-
-
-def can_bypass_dataset_allowlist(identity: AccessIdentity) -> bool:
-    if identity.source == "env":
-        return True
-    if identity.role == "admin":
-        return True
-    return "access:manage" in effective_scopes(identity)
 
 
 def env_exclude_patterns() -> tuple[str, ...]:
@@ -1642,41 +1673,6 @@ def redact_pending_item(item: dict[str, Any]) -> dict[str, Any]:
             # "not scanned", which the UI must not show as a pass.
             logger.exception("Deferred secret scan failed for promotion item")
     return redacted
-
-
-def enforce_dataset_allowlist(identity: AccessIdentity, dataset: str) -> None:
-    if can_bypass_dataset_allowlist(identity):
-        return
-    if dataset == SESSION_TRACES_DATASET:
-        # Org-wide consultable prior work: readable by every authenticated caller;
-        # writes are gated by the share-session endpoint instead.
-        return
-    if dataset in identity.allowed_datasets:
-        return
-    # Seat nodes are private memory: the seat: namespace is default-deny even for
-    # callers that carry no allowlist at all. Without this, any legacy or non-seat
-    # token (whose allowed_datasets is empty) could read or write another seat's
-    # node by naming it explicitly. Non-seat datasets stay open for unscoped tokens
-    # to preserve backward compatibility.
-    if is_seat_dataset(dataset):
-        raise HTTPException(status_code=403, detail=f"Dataset not allowed: {dataset}.")
-    if not identity.allowed_datasets:
-        return
-    raise HTTPException(status_code=403, detail=f"Dataset not allowed: {dataset}.")
-
-
-def dataset_visible_to(identity: AccessIdentity, dataset: str) -> bool:
-    """Boolean twin of enforce_dataset_allowlist for read-side projections.
-
-    Used where a hidden dataset should silently disappear from a payload
-    (e.g. /api/mesh/graph attribution) instead of rejecting the request.
-    Delegates to enforce_dataset_allowlist so the two can never drift.
-    """
-    try:
-        enforce_dataset_allowlist(identity, dataset)
-    except HTTPException:
-        return False
-    return True
 
 
 def scope_override_active(
@@ -2051,6 +2047,32 @@ async def search_across_datasets(
     if not per_dataset:
         return merged
 
+    # Cognee 1.2.2 drops vector distances at this boundary. When any candidate
+    # has an attested lexical match, use that signal across dataset boundaries;
+    # preserve dataset order for ties and for pages with no lexical match.
+    terms = query_terms(query)
+    if len(per_dataset) > 1 and terms:
+        ranked_candidates: list[tuple[float, int, int, str, Any]] = []
+        for dataset_index, (dataset, results) in enumerate(per_dataset):
+            for result_index, result in enumerate(results):
+                coverage = (
+                    hit_term_coverage(result, terms)[0]
+                    if isinstance(result, dict)
+                    else 0.0
+                )
+                ranked_candidates.append(
+                    (coverage, dataset_index, result_index, dataset, result)
+                )
+        if any(candidate[0] > 0.0 for candidate in ranked_candidates):
+            ranked_candidates.sort(
+                key=lambda candidate: (-candidate[0], candidate[1], candidate[2])
+            )
+            for _coverage, _dataset_index, _result_index, dataset, result in ranked_candidates:
+                take(dataset, [result], 1)
+                if len(merged) >= top_k:
+                    break
+            return merged
+
     reserve = max(1, top_k // 5) if len(per_dataset) > 1 else 0
     primary_dataset, primary_results = per_dataset[0]
     take(primary_dataset, primary_results, top_k - reserve)
@@ -2068,6 +2090,7 @@ async def execute_learning_writes(
     targets: list[WriteTarget],
     tags: list[str],
     session_id: str | None,
+    provenance: dict[str, Any] | None = None,
     operation: str,
     detect_conflicts: bool = True,
     run_improve: bool = False,
@@ -2076,11 +2099,16 @@ async def execute_learning_writes(
     outcomes: list[LearningOutcome] = []
     primary: LearningOutcome | None = None
     for target in targets:
+        # Promotion provenance attests the full Central write. The light seat
+        # mirror is source material and must not claim that promotion succeeded
+        # if the later Central write is rejected.
+        target_provenance = provenance if target.tier == "full" else None
         outcome = await learning.learn(
             data,
             dataset=target.dataset,
             tags=tags,
             session_id=session_id,
+            provenance=target_provenance,
             operation=operation,
             detect_conflicts=detect_conflicts and target.tier == "full",
             run_improve=run_improve and target.tier == "full",
@@ -2103,6 +2131,7 @@ async def retry_failed_learning_writes(
     outcomes: list[LearningOutcome],
     tags: list[str],
     session_id: str | None,
+    provenance: dict[str, Any] | None = None,
     operation: str,
     detect_conflicts: bool = True,
     run_improve: bool = False,
@@ -2123,6 +2152,7 @@ async def retry_failed_learning_writes(
             dataset=target.dataset,
             tags=tags,
             session_id=session_id,
+            provenance=provenance,
             operation=operation,
             detect_conflicts=detect_conflicts and target.tier == "full",
             run_improve=run_improve and target.tier == "full",
@@ -2530,6 +2560,46 @@ async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[s
             counts["failed"],
         )
     return counts
+
+
+async def schedule_startup_cognify_recovery(citadel: Citadel) -> list[str]:
+    """Queue incremental recovery for every durable dataset after boot.
+
+    ``cognee.add`` is durable before cognify, so a killed request or process can
+    leave rows that have never reached the searchable projection. Incremental
+    cognify is idempotent and only processes work Cognee still considers pending;
+    this sweep is therefore a recovery pass, not a forced rebuild.
+    """
+    if os.getenv("CITADEL_STARTUP_COGNIFY_RECOVERY", "true").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        logger.info("Startup cognify recovery disabled by CITADEL_STARTUP_COGNIFY_RECOVERY")
+        return []
+    client = getattr(citadel, "cognee", None)
+    list_names = getattr(client, "list_dataset_names", None)
+    schedule = getattr(client, "schedule_cognify", None)
+    if not callable(list_names) or not callable(schedule):
+        logger.warning("Startup cognify recovery unavailable: gateway lacks dataset enumeration")
+        return []
+    try:
+        datasets = await list_names()
+    except Exception:
+        logger.exception("Startup cognify recovery could not enumerate datasets")
+        return []
+    names = list(
+        dict.fromkeys(
+            name.strip()
+            for name in datasets
+            if isinstance(name, str) and name.strip()
+        )
+    )
+    if names:
+        schedule(names)
+        logger.info("Startup cognify recovery queued for %d dataset(s)", len(names))
+    return names
 
 
 def known_datasets(config: Any) -> list[str]:
@@ -3378,8 +3448,9 @@ async def me_summary(request: Request) -> dict[str, Any]:
         # Scope the timeline page to this seat Node *before* the limit slice.
         # Filtering only after a mixed visible page (Central + shared traces)
         # can drop all Node activity when org traffic is busy.
-        def _node_visible(dataset: str | None) -> bool:
-            return dataset == node
+        def _node_visible(event: dict[str, Any]) -> bool:
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            return details.get("dataset") == node
 
         try:
             timeline = await get_mesh().timeline(limit=12, visible=_node_visible)
@@ -4187,8 +4258,13 @@ async def revoke_access_token(token_id: str, request: Request) -> dict[str, Any]
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str | bool]:
-    return {"ok": True, "service": "citadel"}
+async def healthz() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "citadel",
+        "version": app.version,
+        "build": _build_identity(),
+    }
 
 
 @app.get("/api/state")
@@ -4269,6 +4345,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         "ok": True,
         "service": "Citadel Archive",
         "version": app.version,
+        "build": _build_identity(),
         "healthy": True,
         "sources": sources,
         "totals": {
@@ -4293,6 +4370,7 @@ async def citadel_discovery_manifest(request: Request, response: Response) -> di
             "name": "Citadel Archive",
             "kind": "organization_vault",
             "version": app.version,
+            "build": _build_identity(),
             "base_url": base,
         },
         "public_endpoints": {
@@ -4386,12 +4464,27 @@ async def get_skill(slug: str) -> FileResponse:
 
 
 async def _corpus_health() -> dict[str, Any]:
-    """Data-plane volume gate: are tracked sources actually indexed? (#27)
+    """Data-plane volume gate using a bounded relational projection probe. (#27)
 
-    Fail-soft — any error returns ok=True with a ``degraded`` note so readiness
-    never flaps on a transient graph read; the real signal is "many sources
-    tracked but the graph is empty".
+    A failed read is a readiness failure, not an empty or healthy corpus. The
+    liveness endpoint remains separate, so a transient graph read does not
+    make the process look dead while ``/readyz`` correctly withholds traffic.
+    The legacy graph node count remains in the response for mesh compatibility,
+    but it is not evidence that relational documents have vector chunks.
     """
+    global _CORPUS_HEALTH_CACHE
+
+    citadel = get_citadel()
+    cache_key = id(citadel)
+    cached = _CORPUS_HEALTH_CACHE
+    if (
+        cached is not None
+        and cached[1] == cache_key
+        and _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0
+        and time.monotonic() - cached[0] < _CORPUS_HEALTH_CACHE_TTL_SECONDS
+    ):
+        return dict(cached[2])
+
     try:
         tracked = 0
         github_status = await get_github_syncer().status()
@@ -4400,7 +4493,79 @@ async def _corpus_health() -> dict[str, Any]:
         tracked += int(repo_content_status.get("tracked_files") or 0)
         linear_status = await get_linear_syncer().status()
         tracked += int(linear_status.get("issue_count") or 0)
-        counts = await get_citadel()._graph_counts()
+
+        measured_read = getattr(getattr(citadel, "cognee", None), "corpus_health", None)
+        if callable(measured_read):
+            measured = await measured_read(limit=_CORPUS_HEALTH_PROBE_LIMIT)
+            if not isinstance(measured, dict):
+                raise RuntimeError("bounded corpus probe returned a non-object")
+            for field in (
+                "relational_documents",
+                "probe_limit",
+                "probe_documents",
+                "probe_chunked_documents",
+                "probe_graph_documents",
+                "probe_fully_indexed_documents",
+            ):
+                value = measured.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            for field in ("probe_complete", "probe_ok"):
+                if type(measured.get(field)) is not bool:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            if measured["probe_documents"] > measured["probe_limit"]:
+                raise RuntimeError("bounded corpus probe exceeded its limit")
+            for field in ("probe_max_documents", "probe_pages"):
+                if field in measured:
+                    value = measured[field]
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            if "probe_max_documents" in measured and measured["probe_documents"] > measured[
+                "probe_max_documents"
+            ]:
+                raise RuntimeError("bounded corpus probe exceeded its hard cap")
+            if "probe_cap_exceeded" in measured:
+                if type(measured["probe_cap_exceeded"]) is not bool:
+                    raise RuntimeError(
+                        "bounded corpus probe returned invalid probe_cap_exceeded"
+                    )
+                if measured["probe_cap_exceeded"] and (
+                    measured["probe_complete"] or measured["probe_ok"]
+                ):
+                    raise RuntimeError("capped corpus probe cannot be complete")
+
+            counts = await citadel._graph_counts()
+            indexed = int(counts.get("nodes") or 0)
+            edges = int(counts.get("edges") or 0)
+            # A measured client must prove the bounded page is the complete
+            # corpus before readiness can be green. The tracked-source floor
+            # remains part of the legacy fallback below.
+            ok = (
+                measured["probe_complete"] is True
+                and measured["probe_ok"] is True
+            )
+            result = {
+                **measured,
+                "ok": ok,
+                "tracked_sources": tracked,
+                # Compatibility for MeshState: this is a graph-node count, not
+                # a relational-document index count and not the readiness gate.
+                "indexed_docs": indexed,
+                "indexed_graph_nodes": indexed,
+                "indexed_edges": edges,
+                "measurement": "bounded_relational_projection_probe",
+            }
+            if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+                _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+            return result
+
+        # Preserve the old method-boundary fallback for local fakes and older
+        # clients that do not expose the bounded probe yet.
+        counts = await citadel._graph_counts()
         indexed = int(counts.get("nodes") or 0)
         # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
         # back in the same call for free. /api/mesh used to publish the in-memory
@@ -4414,15 +4579,18 @@ async def _corpus_health() -> dict[str, Any]:
             "indexed_docs": indexed,
             "indexed_edges": edges,
         }
-    except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
-        logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {
-            "ok": True,
+    except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
+        logger.warning("corpus health check degraded: %s", exc)
+        result = {
+            "ok": False,
             "tracked_sources": None,
             "indexed_docs": None,
             "indexed_edges": None,
             "degraded": str(exc),
         }
+        if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+            _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+        return result
 
 
 @app.get("/readyz")
@@ -4431,8 +4599,15 @@ async def readyz(request: Request) -> Any:
     config = get_citadel().config
     corpus = await _corpus_health()
     canary = _LAST_CANARY
-    # RED when the corpus gate trips or the last end-to-end canary failed.
-    ok = corpus["ok"] and (canary is None or bool(canary.get("ok", True)))
+    # A configured scheduler must prove one end-to-end pass before readiness is
+    # green. Local installs with scheduling disabled keep the corpus-only
+    # readiness contract, but a failed or malformed canary is always RED.
+    canary_ok = (
+        not config.evolve_scheduler_enabled
+        if canary is None
+        else isinstance(canary, dict) and canary.get("ok") is True
+    )
+    ok = corpus["ok"] and canary_ok
     payload = {
         "ok": ok,
         "service": "citadel",
@@ -4490,11 +4665,7 @@ def scope_mesh_snapshot(
         if edge.get("source") not in dropped and edge.get("target") not in dropped
     ]
     kept_events = [
-        event
-        for event in snapshot.get("events", [])
-        if _mesh_dataset_visible(
-            identity, (event.get("details") or {}).get("dataset"), cache
-        )
+        event for event in snapshot.get("events", []) if event_visible_to(identity, event)
     ]
     return {
         **snapshot,
@@ -4514,9 +4685,9 @@ async def mesh(request: Request) -> Any:
     # dashboard actually reads, was never updated to supply it. In production it
     # still returned `documents: 1, indexed_chunks: 1` against a real 17991
     # indexed, which is what makes a healthy vault look empty on login.
-    # `_corpus_health` is the same source /readyz and `citadel status` use, and
-    # is fail-soft: on a transient read error it returns None totals and
-    # `snapshot` falls back to the in-memory values rather than raising here.
+    # `_corpus_health` is the same source /readyz and `citadel status` use. On a
+    # transient read error it returns None totals, and `snapshot` falls back to
+    # the in-memory values rather than raising here.
     snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
     return jsonable_encoder(scope_mesh_snapshot(snapshot, identity))
 
@@ -4536,14 +4707,11 @@ async def knowledge_events(
         raise HTTPException(status_code=422, detail="Timeline limit must be between 1 and 160.")
     # ADR-0009: the timeline carries Node content (event messages, dataset names,
     # and error operations/reasons), so scope it to the caller exactly as the two
-    # sibling projections do — /api/mesh via scope_mesh_snapshot and /events via
-    # _mesh_dataset_visible. This endpoint previously discarded the identity and
+    # sibling projections do, /api/mesh via scope_mesh_snapshot and /events via
+    # event_visible_to. This endpoint previously discarded the identity and
     # returned every seat's events to any reader token.
-    visible_cache: dict[str, bool] = {}
-    visible = (
-        None
-        if can_bypass_dataset_allowlist(identity)
-        else (lambda dataset: _mesh_dataset_visible(identity, dataset, visible_cache))
+    visible = None if can_bypass_dataset_allowlist(identity) else (
+        lambda event: event_visible_to(identity, event)
     )
     timeline = await get_mesh().timeline(
         after_id=after_id,
@@ -4632,7 +4800,9 @@ async def list_knowledge_conflicts(request: Request, status: str | None = None) 
     if status not in {None, "open", "resolved"}:
         raise HTTPException(status_code=422, detail="Unsupported conflict status filter.")
     store = get_conflict_store()
-    conflicts = store.list(status=status)
+    conflicts = [
+        conflict for conflict in store.list(status=status) if conflict_visible_to(actor, conflict)
+    ]
     get_access_store().record_event(
         action="conflicts.list",
         actor=actor,
@@ -4643,7 +4813,7 @@ async def list_knowledge_conflicts(request: Request, status: str | None = None) 
         "ok": True,
         "status": status or "all",
         "conflicts": jsonable_encoder(conflicts),
-        "open_count": store.open_count(),
+        "open_count": sum(1 for conflict in conflicts if conflict.get("status") == "open"),
     }
 
 
@@ -4654,8 +4824,27 @@ async def resolve_knowledge_conflict(
     request: Request,
 ) -> Any:
     actor = require_access(request, "writer", "kb:ingest")
+    store = get_conflict_store()
     try:
-        resolved = get_conflict_store().resolve(
+        conflict = store.get(conflict_id)
+    except KeyError as exc:
+        get_access_store().record_event(
+            action="conflicts.resolve",
+            actor=actor,
+            success=False,
+            detail={"conflict_id": conflict_id, "reason": "not_found"},
+        )
+        raise HTTPException(status_code=404, detail="Conflict not found.") from exc
+    if not conflict_visible_to(actor, conflict):
+        get_access_store().record_event(
+            action="conflicts.resolve",
+            actor=actor,
+            success=False,
+            detail={"conflict_id": conflict_id, "reason": "not_found"},
+        )
+        raise HTTPException(status_code=404, detail="Conflict not found.")
+    try:
+        resolved = store.resolve(
             conflict_id,
             resolution_note=body.resolution_note,
             resolved_by=actor.actor_id,
@@ -4750,7 +4939,7 @@ def _last_source_error(source_type: str) -> tuple[str | None, str | None]:
 
 @app.get("/api/sources")
 async def sources(request: Request, type: str | None = None) -> Any:
-    require_access(request, "reader", "sources:read")
+    identity = require_access(request, "reader", "sources:read")
     sources_payload: list[dict[str, Any]] = []
     # When the evolve cycle last completed. Without it, a node that has not
     # evolved in a week looks identical to one that evolved five minutes ago,
@@ -4842,7 +5031,14 @@ async def sources(request: Request, type: str | None = None) -> Any:
         summary["linear_issues"] = linear_status.get("issue_count", 0)
 
     if type in {None, "obsidian_vault"}:
-        obsidian_status = get_obsidian_sync().source_status(source_type="obsidian_vault")
+        obsidian_status = get_obsidian_sync().source_status(
+            source_type="obsidian_vault",
+            visible_owner=lambda vault: owner_visible_to(
+                identity,
+                vault.get("owner_actor_id"),
+                vault.get("owner_seat_slug"),
+            ),
+        )
         # One vault-wide error: pushes are audited per sync, not per vault, so
         # the same last-failure applies to every vault entry rather than being
         # attributed to one of them arbitrarily.
@@ -4868,7 +5064,12 @@ async def run_github_sync(body: GitHubSyncBody, request: Request) -> Any:
         result = await get_github_syncer().run(force=body.force)
     except Exception as exc:  # pragma: no cover - depends on GitHub and runtime Cognee config.
         logger.error("GitHub sync run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="github_sync", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="github_sync",
+            error=str(exc),
+            dataset=citadel.config.github_sync_dataset,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     await mesh_state.record_github_sync(citadel.config, result)
     return jsonable_encoder(result)
@@ -4919,7 +5120,10 @@ async def _run_webhook_reingest(syncer: GitHubOrgSyncer) -> None:
             exc,
         )
         await get_mesh().record_error(
-            get_citadel().config, operation="github_sync", error=str(exc)
+            get_citadel().config,
+            operation="github_sync",
+            error=str(exc),
+            dataset=get_citadel().config.github_sync_dataset,
         )
 
 
@@ -5010,7 +5214,12 @@ async def run_linear_sync(body: LinearSyncBody, request: Request) -> Any:
         result = await get_linear_syncer().run(force=body.force)
     except Exception as exc:  # pragma: no cover - depends on Linear API and runtime Cognee config.
         logger.error("Linear sync run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="linear_sync", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="linear_sync",
+            error=str(exc),
+            dataset=citadel.config.linear_sync_dataset,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if not result.get("ok"):
         raise HTTPException(status_code=503, detail=result.get("reason", "Linear sync unavailable"))
@@ -5030,6 +5239,7 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             citadel.config,
             operation="repo_content_sync",
             error=str(exc),
+            dataset=citadel.config.repo_content_sync_dataset,
         )
         get_access_store().record_event(
             action="repo_content_sync.run",
@@ -5255,6 +5465,7 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
             obsidian_push_conflict_candidate(
                 sync_conflict,
                 vault_name=manifest["vault"].get("name"),
+                dataset=push_dataset,
             )
         )
         await mesh_state.record_conflict(citadel.config, conflict=conflict_record)
@@ -5679,7 +5890,12 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
         )
     except Exception as exc:  # pragma: no cover - depends on external sources and Cognee config.
         logger.error("Learning agent run failed: %s", exc.__class__.__name__)
-        await mesh_state.record_error(citadel.config, operation="learning_agent", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="learning_agent",
+            error=str(exc),
+            dataset=citadel.config.default_dataset,
+        )
         get_access_store().record_event(
             action="learning_agent.run",
             actor=actor,
@@ -5791,6 +6007,28 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        detail = {
+            "verify": body.verify,
+            "force": body.force,
+            "error": result.get("error") if isinstance(result, dict) else "invalid result",
+        }
+        get_access_store().record_event(
+            action="cognify.run",
+            actor=actor,
+            success=False,
+            dataset=dataset,
+            detail=detail,
+        )
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=dataset,
+            detail={"operation": "cognify.run", **detail},
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     verification = result.get("verification") or {}
     get_access_store().record_event(
@@ -5942,9 +6180,8 @@ async def events(request: Request) -> StreamingResponse:
     queue = mesh_state.subscribe()
     # ADR-0009: the SSE stream serves the same content-leaking projection as
     # /api/mesh, so scope the initial snapshot and every live event to the
-    # caller (bypass callers see all). Cache visibility across events.
+    # caller (bypass callers see all).
     bypass = can_bypass_dataset_allowlist(identity)
-    visible_cache: dict[str, bool] = {}
 
     async def stream() -> Any:
         try:
@@ -5956,9 +6193,7 @@ async def events(request: Request) -> StreamingResponse:
                 except TimeoutError:
                     yield ": ping\n\n"
                     continue
-                if not bypass and not _mesh_dataset_visible(
-                    identity, (event.get("details") or {}).get("dataset"), visible_cache
-                ):
+                if not bypass and not event_visible_to(identity, event):
                     continue
                 yield sse("mesh-event", event)
         finally:
@@ -6277,8 +6512,13 @@ async def recent_contributions(
         actions=CONTRIBUTION_ACTIONS,
         actor_id=actor_id,
         success=True,
-        limit=limit,
+        limit=100,
     )
+    events = [
+        event
+        for event in events
+        if event.get("success") and event_visible_to(actor, event)
+    ][:limit]
     return {
         "ok": True,
         "contributions": events,
@@ -6483,7 +6723,12 @@ async def knowledge(
                 top_k=limit,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error=str(exc),
+                dataset=search_datasets[0],
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset, _ in merged:
@@ -6545,7 +6790,12 @@ async def optimize_learning_agent(body: OptimizeBody, request: Request) -> Any:
             actor=actor,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="self_improve", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="self_improve",
+            error=str(exc),
+            dataset=citadel.config.default_dataset,
+        )
         get_access_store().record_event(
             action="learning_agent.optimize",
             actor=actor,
@@ -6598,7 +6848,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 top_k=fetch_k,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error=str(exc),
+                dataset=search_datasets[0],
+            )
             record_mcp_audit(
                 request,
                 actor=actor,
@@ -6614,7 +6869,10 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     if timed_out:
         await mesh_state.record_error(
-            citadel.config, operation="search", error="search budget exceeded"
+            citadel.config,
+            operation="search",
+            error="search budget exceeded",
+            dataset=search_datasets[0],
         )
 
     # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
@@ -6925,7 +7183,12 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
             )
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="feedback", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="feedback",
+            error=str(exc),
+            dataset=dataset,
+        )
         record_mcp_audit(
             request,
             actor=actor,
@@ -6986,7 +7249,12 @@ async def run_improve(
             session_ids=body.session_ids,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
+        await mesh_state.record_error(
+            citadel.config,
+            operation="improve",
+            error=str(exc),
+            dataset=dataset,
+        )
         if request:
             record_mcp_audit(
                 request,

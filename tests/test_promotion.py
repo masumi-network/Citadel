@@ -55,7 +55,15 @@ class FakeLearning:
     async def learn(self, data: str, **kwargs: Any) -> LearningOutcome:
         dataset = kwargs.get("dataset") or CENTRAL
         tags = tuple(kwargs.get("tags") or ())
-        self.calls.append({"data": data, "dataset": kwargs.get("dataset"), "tier": kwargs.get("tier"), "tags": kwargs.get("tags")})
+        self.calls.append(
+            {
+                "data": data,
+                "dataset": kwargs.get("dataset"),
+                "tier": kwargs.get("tier"),
+                "tags": kwargs.get("tags"),
+                "provenance": kwargs.get("provenance"),
+            }
+        )
         if self.central_reject_reason and dataset == CENTRAL:
             result = IngestResult(False, self.central_reject_reason, dataset, tags)
         else:
@@ -157,9 +165,13 @@ async def test_relevant_clean_item_is_promoted_to_central_with_audit(tmp_path: P
     assert result["promoted"] == 1
     # Promotion routed through the org-ready dual-write -> a real Central write.
     assert len(learning.central_writes) == 1
+    assert learning.calls[0]["provenance"] is None
     assert "org-ready" in learning.central_writes[0]["tags"]
     assert "promotion-agent" in learning.central_writes[0]["tags"]
     assert "promotion-seat:alice" in learning.central_writes[0]["tags"]
+    assert learning.central_writes[0]["provenance"]["kind"] == "promotion"
+    assert learning.central_writes[0]["provenance"]["promoted_by"] == "promotion-engine"
+    assert learning.central_writes[0]["provenance"]["source_dataset"] == SEAT
     promote_events = store.recent_audit_events(action="promotion.promote")
     assert len(promote_events) == 1
     assert promote_events[0]["success"] is True
@@ -730,5 +742,6 @@ async def test_approve_pending_surfaces_the_write_reason(
     assert result["promoted"] is False
     assert result["ok"] is False
     assert result["write_reason"] == "duplicate_in_process"
+    assert learning.central_writes[0]["provenance"]["promoted_by"] == "alice"
     # The item is consumed regardless, matching the contract on main.
     assert store.get_promotion_pending(item.id).status != "pending"

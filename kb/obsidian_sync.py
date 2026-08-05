@@ -6,7 +6,7 @@ from hashlib import sha1, sha256
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kb.access import AccessIdentity
 
@@ -138,16 +138,29 @@ class ObsidianSyncStore:
         self._save(data)
         return vault
 
-    def source_status(self, *, source_type: str | None = None) -> dict[str, Any]:
+    def source_status(
+        self,
+        *,
+        source_type: str | None = None,
+        visible_owner: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
         data = self._load()
         vaults = list(data.get("vaults", {}).values())
         if source_type and source_type != "obsidian_vault":
             vaults = []
-        documents = list(data.get("documents", {}).values())
+        if visible_owner is not None:
+            vaults = [vault for vault in vaults if visible_owner(vault)]
+        visible_vault_ids = {vault.get("id") for vault in vaults}
+        documents = [
+            document
+            for document in data.get("documents", {}).values()
+            if document.get("source_id") in visible_vault_ids
+        ]
         conflicts = [
             conflict
             for conflict in data.get("conflicts", {}).values()
             if conflict.get("status") == "open"
+            and conflict.get("source_id") in visible_vault_ids
         ]
         by_source: dict[str, dict[str, Any]] = {
             vault["id"]: {

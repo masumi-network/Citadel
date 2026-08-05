@@ -18,6 +18,8 @@ import logging
 import re
 from typing import Any, Callable
 
+from kb.document_provenance import TRUST_REFERENCE, TRUST_UNATTESTED
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_NODES = 200
@@ -150,6 +152,27 @@ def _raw_props_by_id(raw_nodes: list[Any]) -> dict[str, dict[str, Any]]:
         if isinstance(properties, dict):
             index[node_id] = properties
     return index
+
+
+def _graph_provenance(value: Any) -> dict[str, str]:
+    """Keep only server-written provenance fields supplied by the gateway."""
+    if not isinstance(value, dict) or value.get("kind") != "promotion":
+        return {}
+    promoted_by = value.get("promoted_by")
+    promoted_at = value.get("promoted_at")
+    if not isinstance(promoted_by, str) or not promoted_by.strip():
+        return {}
+    if not isinstance(promoted_at, str) or not promoted_at.strip():
+        return {}
+    result = {
+        "kind": "promotion",
+        "promoted_by": promoted_by.strip()[:200],
+        "promoted_at": promoted_at.strip()[:80],
+    }
+    trust_tier = value.get("trust_tier")
+    if trust_tier in {TRUST_REFERENCE, TRUST_UNATTESTED}:
+        result["trust_tier"] = trust_tier
+    return result
 
 
 def _basename_label(location: str) -> str:
@@ -328,6 +351,7 @@ def build_graph_payload(
     *,
     limit: int = DEFAULT_MAX_NODES,
     dataset_map: dict[str, list[str]] | None = None,
+    provenance_map: dict[str, dict[str, Any]] | None = None,
     presence: list[dict[str, Any]] | None = None,
     collapse_orphan_documents: bool = False,
 ) -> dict[str, Any]:
@@ -344,7 +368,13 @@ def build_graph_payload(
     of their document via ``is_part_of`` edges, and one synthetic hub node per
     dataset (``dataset:<name>``) is appended with ``belongs_to`` edges. Hubs are
     synthetic: they do not count against ``limit`` or into ``total_nodes``.
-    ``None``/``{}`` keeps the exact pre-attribution behavior.
+    ``None``/``{}`` keeps the pre-attribution dataset and hub behavior; content
+    nodes still carry their explicit ``trust_tier``.
+
+    ``provenance_map`` contains server-written document metadata keyed by graph
+    node id. Promotion fields are copied to the document and its
+    ``is_part_of`` chunks. Every content node carries an attested trust tier:
+    ``reference-only`` for Shared Session Traces, ``unattested`` otherwise.
 
     ``presence`` (``[{"dataset": name, "label": label, "documents": count?},
     ...]``) appends a universal hub per entry regardless of surviving content
@@ -365,6 +395,7 @@ def build_graph_payload(
     """
     limit = max(1, limit)
     dataset_map = dataset_map or {}
+    provenance_map = provenance_map or {}
     nodes: list[dict[str, Any]] = []
     kept_ids: set[str] = set()
     node_by_id: dict[str, dict[str, Any]] = {}
@@ -428,6 +459,41 @@ def build_graph_payload(
                     other["datasets"] = list(names)
                 if doc_id in internal_nodes:
                     doc_chunk_ids.setdefault(doc_id, []).append(other_id)
+
+    provenance_by_id: dict[str, dict[str, str]] = {}
+    for node_id in node_by_id:
+        provenance = _graph_provenance(provenance_map.get(node_id))
+        if provenance:
+            provenance_by_id[node_id] = provenance
+    if provenance_map:
+        # Document metadata is keyed by the TextDocument id. Propagate it only
+        # across is_part_of, never across entity relationships, so a promoted
+        # document does not falsely promote every entity it mentions.
+        for raw in raw_edges:
+            try:
+                source, target, relationship = str(raw[0]), str(raw[1]), str(raw[2])
+            except (TypeError, IndexError, KeyError):
+                continue
+            if relationship != "is_part_of":
+                continue
+            for owner_id, child_id in ((source, target), (target, source)):
+                owner_provenance = _graph_provenance(provenance_map.get(owner_id))
+                if owner_provenance and child_id in node_by_id:
+                    provenance_by_id.setdefault(child_id, owner_provenance)
+
+    for node in nodes:
+        names = node.get("datasets") or ([node["dataset"]] if node.get("dataset") else [])
+        provenance = provenance_by_id.get(node["id"])
+        node["trust_tier"] = (
+            provenance.get("trust_tier")
+            if provenance and provenance.get("trust_tier") in {TRUST_REFERENCE, TRUST_UNATTESTED}
+            else TRUST_REFERENCE
+            if TRUST_REFERENCE in names
+            else TRUST_UNATTESTED
+        )
+        if provenance:
+            node["promoted_by"] = provenance["promoted_by"]
+            node["promoted_at"] = provenance["promoted_at"]
 
     if doc_chunk_ids:
         # Derive readable document labels: pick the chunk with the smallest
@@ -713,6 +779,7 @@ class KnowledgeMesh:
         raw_nodes = list(raw_nodes)
         raw_edges = list(raw_edges)
         dataset_map: dict[str, list[str]] = {}
+        provenance_map: dict[str, dict[str, Any]] = {}
         node_dataset_map = getattr(self.gateway, "node_dataset_map", None)
         if callable(node_dataset_map):
             try:
@@ -724,6 +791,17 @@ class KnowledgeMesh:
                     exc.__class__.__name__,
                 )
                 dataset_map = {}
+        node_provenance_map = getattr(self.gateway, "node_provenance_map", None)
+        if callable(node_provenance_map):
+            try:
+                provenance_map = await node_provenance_map() or {}
+            except Exception as exc:
+                logger.warning(
+                    "Knowledge mesh provenance map read failed with %s; "
+                    "showing unattested nodes",
+                    exc.__class__.__name__,
+                )
+                provenance_map = {}
         if presence:
             # Fill presence document counts from the RAW map, before caller
             # scoping strips hidden names: contribution counts are presence
@@ -776,6 +854,7 @@ class KnowledgeMesh:
                 raw_edges,
                 limit=limit,
                 dataset_map=dataset_map,
+                provenance_map=provenance_map,
                 presence=presence,
                 collapse_orphan_documents=collapse_orphans,
             )

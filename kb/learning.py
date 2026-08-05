@@ -16,7 +16,12 @@ import logging
 from typing import Any, Literal
 
 from kb.conflicts import KnowledgeConflictStore, detect_contribution_conflict
-from kb.llm_enrichment import EnrichedChunk, EnrichmentOutcome, enrich_source_material
+from kb.llm_enrichment import (
+    EnrichedChunk,
+    EnrichmentOutcome,
+    deterministic_source_chunks,
+    enrich_source_material,
+)
 from kb.mesh import MeshState
 from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
 from kb.models import IngestResult
@@ -79,6 +84,7 @@ class LearningProcess:
         dataset: str | None = None,
         tags: list[str] | None = None,
         session_id: str | None = None,
+        provenance: dict[str, Any] | None = None,
         operation: str = "ingest",
         run_improve: bool = False,
         detect_conflicts: bool = True,
@@ -122,6 +128,7 @@ class LearningProcess:
             enrichment = self._enrich(data)
             effective_run_improve = run_improve
         chunk_inputs = self._chunk_inputs(data, list(tags or []), enrichment)
+        coalesce_cognify = len(chunk_inputs) > 1 and not defer_cognify
 
         results: list[IngestResult] = []
         for chunk_data, chunk_tags in chunk_inputs:
@@ -131,12 +138,16 @@ class LearningProcess:
                     dataset=dataset,
                     tags=chunk_tags,
                     session_id=session_id,
-                    defer_cognify=defer_cognify,
+                    provenance=provenance,
+                    defer_cognify=defer_cognify or coalesce_cognify,
                 )
             except Exception as exc:
                 if self.mesh:
                     await self.mesh.record_error(
-                        self.config, operation=operation, error=str(exc)
+                        self.config,
+                        operation=operation,
+                        error=str(exc),
+                        dataset=target_dataset,
                     )
                 raise
             results.append(result)
@@ -148,6 +159,11 @@ class LearningProcess:
                     dataset=target_dataset,
                     tags=list(chunk_tags),
                 )
+
+        if coalesce_cognify and any(result.accepted for result in results):
+            scheduler = getattr(getattr(self.citadel, "cognee", None), "schedule_cognify", None)
+            if callable(scheduler):
+                scheduler([target_dataset])
 
         if enrichment is not None and self.mesh:
             await self.mesh.record_enrichment(
@@ -164,7 +180,7 @@ class LearningProcess:
 
         conflict = None
         if detect_conflicts and accepted_any:
-            conflict = self._detect_conflict(data)
+            conflict = self._detect_conflict(data, dataset=target_dataset)
             if conflict and self.mesh:
                 await self.mesh.record_conflict(self.config, conflict=conflict)
 
@@ -212,22 +228,40 @@ class LearningProcess:
         enrichment: EnrichmentOutcome | None,
     ) -> list[tuple[str, list[str]]]:
         if enrichment is None or not enrichment.chunks:
-            return [(data, tags)]
+            chunks = deterministic_source_chunks(data)
+            return [(chunk, tags) for chunk in chunks] or [(data, tags)]
         inputs: list[tuple[str, list[str]]] = []
         for chunk in enrichment.chunks:
-            inputs.append((_chunk_text(chunk), [*tags, *chunk.tags]))
+            chunk_tags = [*tags, *chunk.tags]
+            for chunk_data in deterministic_source_chunks(_chunk_text(chunk)):
+                inputs.append((chunk_data, chunk_tags))
         return inputs
 
-    async def record_failure(self, *, operation: str, error: str) -> None:
+    async def record_failure(
+        self,
+        *,
+        operation: str,
+        error: str,
+        dataset: str | None = None,
+    ) -> None:
         """Record a learning-related failure on the mesh projection."""
         if self.mesh:
-            await self.mesh.record_error(self.config, operation=operation, error=error)
+            await self.mesh.record_error(
+                self.config,
+                operation=operation,
+                error=error,
+                dataset=dataset,
+            )
 
-    def _detect_conflict(self, data: str) -> dict[str, Any] | None:
+    def _detect_conflict(self, data: str, *, dataset: str) -> dict[str, Any] | None:
         if not self.conflicts:
             return None
         try:
-            candidate = detect_contribution_conflict(data, config=self.config)
+            candidate = detect_contribution_conflict(
+                data,
+                config=self.config,
+                dataset=dataset,
+            )
         except Exception as exc:  # pragma: no cover - defensive; detection is best-effort.
             logger.warning(
                 "Knowledge conflict detection failed with %s; continuing",

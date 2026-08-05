@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,20 @@ def test_recording_same_open_conflict_twice_is_deduplicated(tmp_path: Path) -> N
 
     assert first["id"] == second["id"]
     assert len(store.list()) == 1
+
+
+def test_scoped_conflicts_with_same_key_do_not_collide(tmp_path: Path) -> None:
+    store = KnowledgeConflictStore(tmp_path / "conflicts.json")
+
+    alice = store.record(
+        replace(candidate("same"), dataset="seat:alice")
+    )
+    bob = store.record(
+        replace(candidate("same"), dataset="seat:bob")
+    )
+
+    assert alice["id"] != bob["id"]
+    assert {item["dataset"] for item in store.list()} == {"seat:alice", "seat:bob"}
 
 
 def test_store_is_bounded_and_drops_resolved_records_first(tmp_path: Path) -> None:

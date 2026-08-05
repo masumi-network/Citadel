@@ -315,7 +315,7 @@ class MeshState:
     ) -> dict[str, Any]:
         """Return a bounded, newest-first event timeline for resume/backfill reads.
 
-        ``visible`` scopes events to the caller by ``details.dataset`` (ADR-0009).
+        ``visible`` scopes events to the caller by event details (ADR-0009).
         It runs BEFORE the limit slice so a caller still receives a full page of
         their own events rather than whatever survives filtering one page of
         everyone's. ``latest_event_id`` stays global on purpose: --watch resumes
@@ -337,7 +337,7 @@ class MeshState:
                 events = [
                     event
                     for event in events
-                    if visible((event.get("details") or {}).get("dataset"))
+                    if visible(event)
                 ]
             return {
                 "generated_at": utc_now(),
@@ -683,6 +683,7 @@ class MeshState:
                 "metadata": {
                     "source_type": "obsidian_vault",
                     "vault_id": vault.get("id"),
+                    "dataset": dataset or config.default_dataset,
                     "team_id": vault.get("team_id"),
                     "last_push_at": vault.get("last_push_at"),
                     "accepted": len(result.get("accepted", [])),
@@ -706,6 +707,7 @@ class MeshState:
                     "metadata": {
                         "source_type": "obsidian_vault",
                         "vault_id": vault.get("id"),
+                        "dataset": dataset or config.default_dataset,
                         "rev": document.get("rev"),
                         "content_hash": document.get("content_hash"),
                     },
@@ -788,10 +790,18 @@ class MeshState:
                     "kind": conflict.get("kind"),
                     "status": conflict.get("status"),
                     "summary": str(conflict.get("summary") or "")[:280],
+                    "dataset": conflict.get("dataset"),
                 },
             )
 
-    async def record_error(self, config: CitadelConfig, *, operation: str, error: str) -> None:
+    async def record_error(
+        self,
+        config: CitadelConfig,
+        *,
+        operation: str,
+        error: str,
+        dataset: str | None = None,
+    ) -> None:
         async with self._lock:
             self._ensure_base_graph(config)
             self.errors += 1
@@ -799,7 +809,11 @@ class MeshState:
             await self._record_event(
                 "error",
                 "Operation failed",
-                {"operation": operation, "error": redact_secrets(error[:280])},
+                {
+                    "operation": operation,
+                    "error": redact_secrets(error[:280]),
+                    "dataset": dataset,
+                },
             )
 
     def _ensure_base_graph(self, config: CitadelConfig) -> None:
@@ -862,14 +876,22 @@ class MeshState:
                 "id": "graph",
                 "name": "Graph mesh",
                 "status": "active",
-                "records": len([node for node in self.nodes.values() if node["type"] != "index"]),
+                "records": None,
+                "scope": "not_measured",
+                "description": (
+                    "Graph total is reported in stats.nodes; the reader path does not measure it here."
+                ),
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
                 "id": "vector",
                 "name": "Vector index",
                 "status": "active",
-                "records": self.documents,
+                "records": None,
+                "scope": "not_measured",
+                "description": (
+                    "Vector chunk total requires the admin corpus census; the reader path does not measure it."
+                ),
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
@@ -877,6 +899,8 @@ class MeshState:
                 "name": "Feedback memory",
                 "status": "active",
                 "records": self.feedback_items,
+                "scope": "since_restart",
+                "description": "Feedback events recorded since this process started.",
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
@@ -884,6 +908,8 @@ class MeshState:
                 "name": "Global context",
                 "status": "enabled" if config.build_global_context_index else "standby",
                 "records": self.upgrades,
+                "scope": "since_restart",
+                "description": "Upgrade events recorded since this process started.",
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
         ]

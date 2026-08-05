@@ -18,7 +18,6 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -851,11 +850,15 @@ async def _improve(args: argparse.Namespace) -> None:
 
 
 @_needs_server
-async def _cognify(args: argparse.Namespace) -> None:
+async def _cognify(args: argparse.Namespace) -> int:
     from kb.service import Citadel
 
     kb = Citadel.from_env()
-    result = await kb.cognify_dataset(dataset=args.dataset, verify=args.verify)
+    result = await kb.cognify_dataset(
+        dataset=args.dataset,
+        verify=args.verify,
+        force=args.force,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -2484,12 +2487,17 @@ async def _onboard(args: argparse.Namespace) -> int:
 
 
 def _cli_version() -> str:
+    # The source module is the canonical value in a checkout and is also
+    # bundled into wheels. Installed metadata can lag after an editable source
+    # change, which made the CLI report an older release than the server.
     try:
-        return _pkg_version("citadel-archive")
-    except PackageNotFoundError:
         from kb import __version__
 
         return __version__
+    except (ImportError, AttributeError):
+        from importlib.metadata import version
+
+        return version("citadel-archive")
 
 
 def _install_channel() -> tuple[str, str]:
@@ -3172,6 +3180,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cognify already-added data in a dataset (recover uncognified data)",
     )
     cognify.add_argument("--dataset")
+    cognify.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess data Cognee marks as already processed; this is not a source reindex",
+    )
     cognify.add_argument(
         "--verify",
         action="store_true",
