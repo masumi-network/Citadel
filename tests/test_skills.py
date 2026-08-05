@@ -5,6 +5,7 @@ import hashlib
 
 from fastapi.testclient import TestClient
 
+import kb.server as server_module
 from kb.server import app
 
 
@@ -42,8 +43,7 @@ def test_list_skills_uses_forwarded_public_url() -> None:
 
 
 def test_discovery_manifest_is_public_and_verifiable(monkeypatch) -> None:
-    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
-    monkeypatch.delenv("CITADEL_BUILD_ID", raising=False)
+    monkeypatch.setattr(server_module, "_BUILD_ID", None)
     client = TestClient(app, base_url="https://citadel.example")
     response = client.get("/.well-known/citadel.json")
 
@@ -84,8 +84,8 @@ def test_discovery_manifest_is_public_and_verifiable(monkeypatch) -> None:
     assert "test-writer" not in serialized
 
 
-def test_discovery_manifest_reports_runtime_build_id(monkeypatch) -> None:
-    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "a" * 40)
+def test_discovery_manifest_reports_captured_build_id(monkeypatch) -> None:
+    monkeypatch.setattr(server_module, "_BUILD_ID", "a" * 40)
     client = TestClient(app, base_url="https://citadel.example")
 
     first = client.get("/.well-known/citadel.json").json()
@@ -93,7 +93,7 @@ def test_discovery_manifest_reports_runtime_build_id(monkeypatch) -> None:
 
     monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "b" * 40)
     second = client.get("/.well-known/citadel.json").json()
-    assert second["service"]["build_id"] == "b" * 40
+    assert second["service"]["build_id"] == "a" * 40
 
 
 def test_discovery_manifest_uses_forwarded_public_url() -> None:
