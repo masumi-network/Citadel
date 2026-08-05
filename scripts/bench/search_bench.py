@@ -85,6 +85,78 @@ MIN_SHARED_SHINGLES = 3
 
 UNCONVERTED_KEY = "answer_spans_unconverted_reason"
 
+# --------------------------------------------------------------------------
+# Embedding-window pairs (v5)
+# --------------------------------------------------------------------------
+# A pair quotes ONE document twice: once from inside the first HEAD_WINDOW_CHARS
+# characters, once from at least TAIL_MIN_DEPTH through it. Both quotes are
+# verbatim and unique across every cached body, so exactly one document can
+# answer either. The pair is a controlled comparison: same document, same corpus,
+# same query shape, only the position of the quoted text changes.
+#
+# The control that makes a failing tail mean something: a tail quote qualifies
+# only when at least TAIL_MIN_NOVEL_TERMS of its distinctive terms are ABSENT
+# from the document head. Without that rule a tail could be answered by the head
+# embedding alone, and a pass would prove nothing about how much of the document
+# is reachable.
+#
+# These questions are scored in their own block and are EXCLUDED from
+# answer_recall_at_5 so the existing headline stays comparable with baselines
+# taken before v5.
+WINDOW_HEAD_CATEGORY = "window_head"
+WINDOW_TAIL_CATEGORY = "window_tail"
+WINDOW_CATEGORIES = frozenset({WINDOW_HEAD_CATEGORY, WINDOW_TAIL_CATEGORY})
+HEAD_WINDOW_CHARS = 2000
+TAIL_MIN_DEPTH = 0.40
+TAIL_MIN_NOVEL_TERMS = 3
+NOVEL_TERM_RE = re.compile(r"[a-z][a-z0-9]{3,}")
+NOVEL_TERM_STOPWORDS = frozenset(
+    "the a an and or of to in for is are be it this that with as on by from at "
+    "not you your we they if then than so but can will each any all when what "
+    "which who how why into out up down over under only same other more most "
+    "some such no nor too very just also its per".split()
+)
+
+
+def is_window_question(question: dict[str, Any]) -> bool:
+    """True for anything `summarize` will bucket as a window row.
+
+    Keyed on BOTH surfaces deliberately. `summarize` buckets on `window_role`
+    (score_question copies that field straight through), while the fixture
+    contract is declared as `category`. Keying lint on `category` alone left a
+    bypass: a question carrying `window_role` and no category was invisible to
+    `_lint_window_question` and still entered head/tail recall and the
+    `tail_recall_given_head_at_5` arithmetic with zero validation. Whatever
+    either surface treats as a window question has to satisfy the contract,
+    and the contract itself requires the two to agree.
+    """
+    if str(question.get("category", "")) in WINDOW_CATEGORIES:
+        return True
+    return question.get("window_role") in ("head", "tail")
+
+
+def distinctive_terms(text: str) -> set[str]:
+    """Lowercase content words used for the head/tail novelty control."""
+    return {
+        word
+        for word in NOVEL_TERM_RE.findall(text.lower())
+        if word not in NOVEL_TERM_STOPWORDS
+    }
+
+
+def questions_pin(questions: list[dict[str, Any]]) -> str:
+    """sha256 over the canonical question list.
+
+    The pin is what makes the set FROZEN. Any edit to any question changes it,
+    so re-freezing is a deliberate act (update the pin, bump the version) rather
+    than a silent drift that would make two runs answer different questions
+    while both called themselves the baseline.
+    """
+    canonical = json.dumps(
+        questions, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
 
 class BenchError(RuntimeError):
     """A configuration or honesty violation that must stop the run."""
@@ -339,6 +411,69 @@ def resolve_probe_patterns(
 # --------------------------------------------------------------------------
 
 
+def hit_term_coverage(hit: dict[str, Any]) -> float | None:
+    """The node's OWN reported share of query terms this hit matched.
+
+    Read rather than recomputed on purpose: ranking is the node's decision, so
+    the inversion metric has to be expressed in the node's own units. A number
+    the harness derived itself would only prove the harness and the node
+    disagree about tokenization.
+    """
+    citadel = hit.get("_citadel")
+    if not isinstance(citadel, dict):
+        return None
+    relevance = citadel.get("relevance")
+    if not isinstance(relevance, dict):
+        return None
+    coverage = relevance.get("term_coverage")
+    return float(coverage) if isinstance(coverage, (int, float)) else None
+
+
+def trust_observations(hits: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """(result_id, content_sha256, trust_tier) for every hit that carries all three.
+
+    Free byproduct of a run: the same chunk is served across many questions, so
+    disagreement between two observations of the SAME id at the SAME content
+    hash is per-request metadata instability, caught without a single extra
+    query.
+    """
+    out: list[tuple[str, str, str]] = []
+    for hit in hits:
+        citadel = hit.get("_citadel")
+        if not isinstance(citadel, dict):
+            continue
+        result_id = citadel.get("result_id") or hit.get("id")
+        sha = citadel.get("content_sha256")
+        tier = citadel.get("trust_tier")
+        if isinstance(result_id, str) and isinstance(sha, str) and isinstance(tier, str):
+            out.append((result_id, sha, tier))
+    return out
+
+
+def entry_matches_expected(
+    entry: dict[str, Any],
+    expected: list[str],
+    gt_shingles: dict[str, set[str]],
+) -> bool:
+    """Is this collapsed identity one of the question's expect_any documents?
+
+    Identity first (path+blob or Linear key), then the cached-body shingle
+    fallback for a later chunk that carries no sync header. One definition
+    shared by `doc_rank` and by the answer-slot provenance check, so the two
+    can never disagree about what "the expected document" means.
+    """
+    identity = entry["identity"]
+    if identity.kind in ("repo", "linear") and identity.source in expected:
+        return True
+    for repo_path in expected:
+        if repo_path not in gt_shingles:
+            continue
+        for body in entry["bodies"]:
+            if len(shingles(body) & gt_shingles[repo_path]) >= MIN_SHARED_SHINGLES:
+                return True
+    return False
+
+
 def score_question(
     question: dict[str, Any],
     hits: list[dict[str, Any]],
@@ -351,11 +486,24 @@ def score_question(
     collapsed = collapse_hits(hits)
 
     answer_rank: int | None = None
+    # Whether the document that supplied the span is one this question named.
+    # `answer_pass_at_5` deliberately does NOT gate on it: that metric asks
+    # whether the answer TEXT came back, `doc_recall_at_5` asks whether the
+    # named document did, and blending them is what a single recall number
+    # already does wrong. But span uniqueness is enforced by `lint` only across
+    # the ~49 files in the gitignored ground-truth cache, never across the
+    # corpus, so a second render of a file, an org digest, a session trace or
+    # any uncached document quoting the sentence would score the pass. Counting
+    # the fact makes that blind spot visible per run instead of assumed away.
+    answer_from_expected: bool | None = None
     if spans:
         for entry in collapsed:
             bodies = [normalize(body) for body in entry["bodies"]]
             if any(span in body for body in bodies for span in spans):
                 answer_rank = entry["effective_rank"]
+                answer_from_expected = entry_matches_expected(
+                    entry, expected, gt_shingles
+                )
                 break
 
     raw_page_pass = False
@@ -366,21 +514,53 @@ def score_question(
                 raw_page_pass = True
                 break
 
+    # ---- Ranking, measured separately from retrieval -----------------------
+    # Retrieval asks whether the answering document came back at all. Ranking
+    # asks whether the node put it in the right place. They are different
+    # questions and a single recall number silently blends them, so the answer
+    # slot is anchored to a BODY span match (header stripped) and then compared
+    # against the node's own term_coverage for everything served above it.
+    #
+    # An inversion is: some hit ranked ABOVE the one that verifiably contains
+    # the answer, while the node itself reports that hit matched a STRICTLY
+    # SMALLER share of the query terms.
+    #
+    # BLIND SPOT, stated where the number is produced. The answer SLOT is
+    # header-immune: it is bound to a body span match with the sync header
+    # stripped, so a hit whose only overlap is the path can never become the
+    # answer. `term_coverage` is NOT header-immune. The node computes it over
+    # a haystack that includes the hit's own path, source url, provenance and
+    # the sync header still sitting in the chunk text
+    # (`kb/search_format.py:_hit_text`), and every hit on a page carries a
+    # DIFFERENT path, so a filename can move either side of this comparison:
+    # a decoy whose path matches three query terms stops being an inversion,
+    # and an answer whose path matches becomes one. Both directions were
+    # executed against the node's own coverage function. The metric is
+    # therefore an honest statement about the node's published relevance
+    # signal disagreeing with the node's own ordering, and NOT a body-only
+    # measure of relevance. Do not quote it as one.
+    answer_slot: int | None = None
+    answer_coverage: float | None = None
+    outranked_by_coverage: float | None = None
+    outranked_by_slot: int | None = None
+    if spans:
+        for slot, hit in enumerate(hits, start=1):
+            body = normalize(split_header_body(hit_text(hit))[1])
+            if any(span in body for span in spans):
+                answer_slot = slot
+                answer_coverage = hit_term_coverage(hit)
+                break
+    if answer_slot is not None and answer_coverage is not None:
+        for slot, hit in enumerate(hits[: answer_slot - 1], start=1):
+            coverage = hit_term_coverage(hit)
+            if coverage is not None and coverage < answer_coverage:
+                outranked_by_coverage = coverage
+                outranked_by_slot = slot
+                break
+
     doc_rank: int | None = None
     for entry in collapsed:
-        identity = entry["identity"]
-        matched = identity.kind in ("repo", "linear") and identity.source in expected
-        if not matched:
-            for repo_path in expected:
-                if repo_path not in gt_shingles:
-                    continue
-                for body in entry["bodies"]:
-                    if len(shingles(body) & gt_shingles[repo_path]) >= MIN_SHARED_SHINGLES:
-                        matched = True
-                        break
-                if matched:
-                    break
-        if matched:
+        if entry_matches_expected(entry, expected, gt_shingles):
             doc_rank = entry["effective_rank"]
             break
 
@@ -451,7 +631,17 @@ def score_question(
         "has_spans": bool(spans),
         "answer_rank": answer_rank,
         "answer_pass_at_5": answer_rank is not None and answer_rank <= K_ANSWER,
+        "answer_from_expected_document": answer_from_expected,
         "raw_page_pass_at_5": raw_page_pass,
+        "expect_any": expected,
+        "window_role": question.get("window_role"),
+        "window_pair": question.get("window_pair"),
+        "depth_fraction": question.get("depth_fraction"),
+        "answer_slot": answer_slot,
+        "answer_term_coverage": answer_coverage,
+        "outranked_by_coverage": outranked_by_coverage,
+        "outranked_by_slot": outranked_by_slot,
+        "trust_observations": trust_observations(hits),
         "doc_rank": doc_rank,
         "doc_pass_at_5": doc_rank is not None and doc_rank <= K_ANSWER,
         "legacy_rank": legacy_rank(hits, expected, gt_shingles),
@@ -489,7 +679,25 @@ def attempt_outcome(row: dict[str, Any]) -> bool:
 def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, Any]:
     positives = [row for row in rows if row["expected_recall"] == 1]
     probes = [row for row in rows if row["expected_recall"] == 0]
-    span_rows = [row for row in positives if row["has_spans"]]
+    window_rows = [row for row in positives if row.get("window_role") in ("head", "tail")]
+    # Window pairs are deliberately kept out of the SPAN-scored headline. They
+    # were added in questions v5 and they fail by design against current
+    # behaviour; folding them in would move answer_recall_at_5 for a reason
+    # that has nothing to do with the node changing.
+    #
+    # Scope of that protection, stated exactly rather than as "the headline".
+    # `span_rows` is the only exclusion, so only the metrics computed from it
+    # are unmoved by v5: answer_recall_at_5, raw_page_recall_at_5, mrr_body,
+    # header_credit_rate. Every metric computed from `positives` or from `rows`
+    # DID move when the 36 window questions landed -- doc_recall_at_5,
+    # duplicate_blob_rate_at_10, distinct_files_at_10, the two
+    # distinct_source_ratio figures, hit_stability and rank_inversion_rate.
+    # None of those is comparable across the v5 boundary. `compare` is what
+    # enforces this: two runs answering different question sets differ in
+    # `questions_pin` and are refused outright.
+    span_rows = [
+        row for row in positives if row["has_spans"] and row.get("window_role") is None
+    ]
     if not probes:
         raise BenchError(
             "The blocked-probe/negatives list is empty (no expected_recall=0 "
@@ -538,6 +746,70 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
     )
     negative_hits = sum(1 for row in probes if row["doc_rank"] is not None)
 
+    # ---- Embedding window --------------------------------------------------
+    heads = [row for row in window_rows if row["window_role"] == "head"]
+    tails = [row for row in window_rows if row["window_role"] == "tail"]
+    head_by_pair = {row["window_pair"]: row for row in heads}
+    tail_by_pair = {row["window_pair"]: row for row in tails}
+    complete_pairs = sorted(set(head_by_pair) & set(tail_by_pair))
+    # Every published window rate is computed over COMPLETE pairs only, so the
+    # figure really is a within-document difference and never a comparison
+    # across two different document populations. The comment used to claim
+    # that while `head_recall`/`tail_recall` were taken over ALL head rows and
+    # ALL tail rows: one dangling side (a tail dropped, a head added without
+    # its tail) silently turned window_penalty into a cross-population
+    # difference, and the report still printed `pairs_complete` as its n.
+    # Restricting here keeps the rate, the penalty and the printed n consistent
+    # by construction. With every pair complete the numbers are identical, so
+    # this does not move a baseline taken while the set was whole.
+    paired_heads = [head_by_pair[pair] for pair in complete_pairs]
+    paired_tails = [tail_by_pair[pair] for pair in complete_pairs]
+    head_recall = rate(paired_heads, "answer_pass_at_5") if paired_heads else None
+    tail_recall = rate(paired_tails, "answer_pass_at_5") if paired_tails else None
+    head_only_pass = sum(
+        1
+        for pair in complete_pairs
+        if head_by_pair[pair]["answer_pass_at_5"] and not tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    both_pass = sum(
+        1
+        for pair in complete_pairs
+        if head_by_pair[pair]["answer_pass_at_5"] and tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    neither_pass = sum(
+        1
+        for pair in complete_pairs
+        if not head_by_pair[pair]["answer_pass_at_5"]
+        and not tail_by_pair[pair]["answer_pass_at_5"]
+    )
+    tail_only_pass = len(complete_pairs) - head_only_pass - both_pass - neither_pass
+
+    # ---- Ranking, separate from retrieval ----------------------------------
+    ranked = [
+        row
+        for row in positives
+        if row["answer_slot"] is not None and row["answer_term_coverage"] is not None
+    ]
+    inverted = [row for row in ranked if row["outranked_by_coverage"] is not None]
+    zero_coverage_inversions = sum(
+        1 for row in inverted if row["outranked_by_coverage"] == 0.0
+    )
+    # rank_inversion_rate blends two populations that answer_recall_at_5 keeps
+    # apart: real questions and the 36 verbatim-sentence window queries, whose
+    # exact-quote form is not how anyone searches. Report the split so a reader
+    # can see which set a movement came from instead of inferring it.
+    ranked_window = [row for row in ranked if row.get("window_role") is not None]
+    ranked_plain = [row for row in ranked if row.get("window_role") is None]
+    inverted_window = [row for row in ranked_window if row["outranked_by_coverage"] is not None]
+    inverted_plain = [row for row in ranked_plain if row["outranked_by_coverage"] is not None]
+
+    # ---- Per-request metadata stability ------------------------------------
+    tiers_seen: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        for result_id, sha, tier in row.get("trust_observations") or []:
+            tiers_seen.setdefault((result_id, sha), set()).add(tier)
+    unstable = {key: sorted(v) for key, v in tiers_seen.items() if len(v) > 1}
+
     return {
         "quality": {
             "answer_recall_at_5": round(rate(span_rows, "answer_pass_at_5"), 4),
@@ -546,6 +818,19 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             "mrr_body": round(mrr_body, 4),
             "header_credit_rate": round(header_credit / len(span_rows), 4),
             "negative_hit_rate": round(negative_hits / len(probes), 4),
+            # How many answer passes came off a document the question did NOT
+            # name. `lint` proves a span unique across the ~49 cached
+            # ground-truth files and cannot say anything about the corpus, so
+            # this is the run-time reading of that blind spot. Non-zero does
+            # not mean the pass was wrong; it means the pass was scored off
+            # text lint never checked for uniqueness, and those rows should be
+            # read before the recall figure is quoted.
+            "answers_from_unexpected_documents": sum(
+                1
+                for row in positives
+                if row["answer_pass_at_5"]
+                and row.get("answer_from_expected_document") is False
+            ),
         },
         "duplication": {
             "duplicate_blob_rate_at_10": (
@@ -568,6 +853,77 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             ),
             "hits_with_unresolvable_source": unresolvable_hits,
         },
+        "window": {
+            "head_recall_at_5": round(head_recall, 4) if head_recall is not None else None,
+            "tail_recall_at_5": round(tail_recall, 4) if tail_recall is not None else None,
+            # The figure that survives the obvious objection. A document whose
+            # HEAD quote also missed may simply not be in the index at all, and
+            # its tail miss says nothing about the window. Restricting to pairs
+            # whose head retrieved keeps only documents proven reachable.
+            #
+            # What it does NOT control for, stated beside the number: the pair
+            # holds the DOCUMENT constant and replaces the QUERY entirely. Head
+            # and tail are different sentences with different tokenisations
+            # facing different corpus competition, so a tail miss is positional
+            # OR lexical and this metric cannot separate the two. Measured on
+            # the 2026-08-04 set the confound runs the other way in aggregate
+            # (head queries averaged 7.1 extracted terms against the tails' 6.8
+            # and faced MORE cached-body competitors, 8.9 against 6.3), so it
+            # does not explain that day's 0 of 11 -- but "positional and
+            # nothing else" is a stronger claim than the design supports.
+            "tail_recall_given_head_at_5": (
+                round(both_pass / (both_pass + head_only_pass), 4)
+                if (both_pass + head_only_pass)
+                else None
+            ),
+            "pairs_head_reachable": both_pass + head_only_pass,
+            "window_penalty": (
+                round(head_recall - tail_recall, 4)
+                if head_recall is not None and tail_recall is not None
+                else None
+            ),
+            "pairs_complete": len(complete_pairs),
+            "pairs_head_only": head_only_pass,
+            "pairs_both": both_pass,
+            "pairs_neither": neither_pass,
+            "pairs_tail_only": tail_only_pass,
+            # Distinct expect_any DOCUMENTS, not distinct pair ids. Two pairs
+            # quoting one document used to report `documents: 2`, overstating
+            # how much of the corpus the window measurement covers -- the
+            # name-versus-what-it-attests failure this harness exists to catch.
+            "documents": len(
+                {doc for row in window_rows for doc in (row.get("expect_any") or [])}
+            ),
+        },
+        "ranking": {
+            "answers_ranked": len(ranked),
+            "rank_inversion_rate": (
+                round(len(inverted) / len(ranked), 4) if ranked else None
+            ),
+            "inversions_by_zero_coverage": zero_coverage_inversions,
+            "answer_worst_slot": max((row["answer_slot"] for row in ranked), default=None),
+            # The split behind the headline rate. `answer_recall_at_5` excludes
+            # window rows and this one does not, so the two denominators differ
+            # and the blended figure is dominated by whichever set is larger.
+            "answers_ranked_excluding_window": len(ranked_plain),
+            "rank_inversion_rate_excluding_window": (
+                round(len(inverted_plain) / len(ranked_plain), 4) if ranked_plain else None
+            ),
+            "answers_ranked_window_only": len(ranked_window),
+            "rank_inversion_rate_window_only": (
+                round(len(inverted_window) / len(ranked_window), 4)
+                if ranked_window
+                else None
+            ),
+        },
+        "metadata_stability": {
+            "chunks_observed": len(tiers_seen),
+            "chunks_with_unstable_trust_tier": len(unstable),
+            "unstable_examples": [
+                {"result_id": key[0], "content_sha256": key[1], "tiers": value}
+                for key, value in sorted(unstable.items())[:5]
+            ],
+        },
         "stability": {
             "hit_stability": round(statistics.fmean(stability), 4) if stability else None,
         },
@@ -577,6 +933,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             "questions_with_spans": len(span_rows),
             "questions_excluded_from_answer_recall": len(positives) - len(span_rows),
             "questions_blocked_probe": len(probes),
+            "questions_window": len(window_rows),
         },
     }
 
@@ -805,6 +1162,49 @@ def corpus_census(
     return result
 
 
+def ground_truth_fingerprint(cache_dir: Path | None = None) -> dict[str, Any]:
+    """sha256 over the cached ground-truth bodies the run scored against.
+
+    `ground_truth/` is gitignored and `fetch_ground_truth.py` pulls each file
+    from GitHub at HEAD with no ref, then skips anything already on disk. Two
+    machines therefore bake in whatever HEAD was on the day they first fetched.
+    The cache is not decoration: `load_ground_truth_shingles` feeds `doc_rank`'s
+    shingle fallback and `legacy_rank`, so it moves `doc_recall_at_5` and
+    `header_credit_rate`. Recording its hash is what lets `compare` say so.
+
+    Drift is not hypothetical: on 2026-08-05 a re-fetch of the w05 fixture's
+    document came back 5617 chars against the 5373 the fixture recorded, with
+    the quote at 4679 rather than 4435.
+    """
+    # Resolved at call time, not bound as a default, so the directory the run
+    # actually read is the one that gets hashed.
+    cache_dir = GROUND_TRUTH if cache_dir is None else cache_dir
+    if not cache_dir.exists():
+        return {
+            "sha256": None,
+            "files": 0,
+            "reason": (
+                f"ground-truth cache not found at {cache_dir}; runs are NOT "
+                "comparable on the bodies doc_rank fell back to"
+            ),
+        }
+    digests: dict[str, str] = {}
+    for path in sorted(cache_dir.iterdir()):
+        if path.is_file():
+            digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not digests:
+        return {
+            "sha256": None,
+            "files": 0,
+            "reason": (
+                f"ground-truth cache at {cache_dir} is empty; runs are NOT "
+                "comparable on the bodies doc_rank fell back to"
+            ),
+        }
+    canonical = json.dumps(digests, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"sha256": hashlib.sha256(canonical).hexdigest(), "files": len(digests)}
+
+
 def build_fingerprint(
     node_url: str,
     token: str,
@@ -829,7 +1229,14 @@ def build_fingerprint(
         "census": corpus_census(make_corpus_fetcher(node_url, token, timeout)),
         "content": content,
         "harness_git_sha": harness_git_sha(),
+        # Two different hashes on purpose. questions_sha256 is over the FILE
+        # bytes, so reformatting or a comment moves it. questions_pin is over
+        # the canonical question list, so it moves only when a question really
+        # changes. A run records both: the pin says which frozen set was
+        # answered, the file hash says whether the file was touched at all.
         "questions_sha256": hashlib.sha256(questions_path.read_bytes()).hexdigest(),
+        "questions_pin": questions_pin(load_questions(questions_path)),
+        "ground_truth": ground_truth_fingerprint(),
         "python_version": platform.python_version(),
     }
 
@@ -879,9 +1286,56 @@ def compare_fingerprints(
             f"({baseline_sha[:12]} -> {current_sha[:12]}). NOT COMPARABLE: any "
             "metric delta includes corpus movement, not just code."
         )
-    if current.get("questions_sha256") != baseline.get("questions_sha256"):
+    # The PIN is the authority on which frozen set was answered, not the file
+    # hash. `questions_pin` is over the canonical question list, so it moves
+    # when a question really changes; `questions_sha256` is over the file bytes,
+    # so reindenting the JSON or bumping `version` moves it while both runs
+    # answered exactly the same questions. Gating on the file hash withheld the
+    # whole delta in precisely the case the pin was introduced to fix. A run
+    # predating the pin has no pin, so the file hash still gates there: an
+    # artifact that cannot say which set it answered is not comparable on
+    # anybody's word.
+    current_pin = current.get("questions_pin")
+    baseline_pin = baseline.get("questions_pin")
+    if current_pin and baseline_pin:
+        if current_pin != baseline_pin:
+            comparable = False
+            verdicts.append(
+                "QUESTIONS CHANGED: frozen sets differ "
+                f"({str(baseline_pin)[:16]} -> {str(current_pin)[:16]}). NOT "
+                "COMPARABLE."
+            )
+        elif current.get("questions_sha256") != baseline.get("questions_sha256"):
+            verdicts.append(
+                "note: the questions FILE differs but questions_pin is "
+                f"identical ({str(current_pin)[:16]}); the two runs answered "
+                "the same frozen set and the delta stands"
+            )
+    elif current.get("questions_sha256") != baseline.get("questions_sha256"):
         comparable = False
-        verdicts.append("QUESTIONS CHANGED: golden sets differ. NOT COMPARABLE.")
+        verdicts.append(
+            "QUESTIONS CHANGED: golden sets differ and at least one run "
+            "predates questions_pin, so the file hash is all there is. NOT "
+            "COMPARABLE."
+        )
+    # The ground-truth cache is refetched from an unpinned upstream HEAD and
+    # feeds doc_rank's shingle fallback and legacy_rank. A note, not a gate:
+    # every run taken before this key existed would otherwise be refused.
+    current_gt = (current.get("ground_truth") or {}).get("sha256")
+    baseline_gt = (baseline.get("ground_truth") or {}).get("sha256")
+    if current_gt is None or baseline_gt is None:
+        verdicts.append(
+            "note: ground-truth cache fingerprint unavailable on at least one "
+            "run; doc_recall_at_5 and header_credit_rate are not attested to "
+            "have been scored against the same cached bodies"
+        )
+    elif current_gt != baseline_gt:
+        verdicts.append(
+            "note: ground-truth cache differs "
+            f"({baseline_gt[:12]} -> {current_gt[:12]}); doc_recall_at_5 and "
+            "header_credit_rate use it as a fallback and can move without the "
+            "node changing"
+        )
     if current.get("harness_git_sha") != baseline.get("harness_git_sha"):
         verdicts.append(
             "note: harness git sha differs "
@@ -1059,7 +1513,14 @@ def lint_questions(
                         f"{label}: appears in the first line of {repo_path} "
                         "(head-of-document credit, not an answer)"
                     )
-            if norm_span in normalize(question.get("question", "")):
+            # A window question IS its own quote: the query is the verbatim
+            # sentence, which is the strongest retrieval signal that exists. If
+            # that fails, retrieval failed. Every other question keeps the rule,
+            # because there the span appearing in the query would hand the
+            # scorer the answer.
+            if norm_span in normalize(question.get("question", "")) and not is_window_question(
+                question
+            ):
                 problems.append(f"{label}: appears in the question text")
             for other, body in cached_norm.items():
                 if other in expected:
@@ -1068,7 +1529,156 @@ def lint_questions(
                     problems.append(
                         f"{label}: not unique, also present in cached body {other}"
                     )
+
+        if is_window_question(question):
+            window_problems, window_notes = _lint_window_question(question, cached_raw)
+            problems.extend(window_problems)
+            notes.extend(window_notes)
+
+    problems.extend(_lint_freeze_pin(data))
     return problems, notes
+
+
+def _lint_window_question(
+    question: dict[str, Any], cached_raw: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """The contract that makes a window pair a controlled comparison.
+
+    Without these checks a failing tail is just a failing question. With them a
+    failing tail means: an exact, corpus-unique sentence, sitting past the depth
+    threshold, carrying terms of its own that the head does not have, did not
+    retrieve the one document that contains it.
+
+    Every threshold below is enforced on a MEASURED value, never on a declared
+    one. `source_offset_chars` and `depth_fraction` are claims a fixture author
+    writes; `body.find(quote)` is where the sentence actually sits. Trusting
+    the claim let a quote inside the head window ship declared as a deep tail,
+    which lands in `tail_recall_at_5` and in the `tail_recall_given_head_at_5`
+    denominator while every artifact says it tested the tail.
+
+    Returns (problems, notes).
+    """
+    qid = question.get("id", "?")
+    role = question.get("window_role")
+    problems: list[str] = []
+    notes: list[str] = []
+    if role not in ("head", "tail"):
+        return [f"{qid}: window question needs window_role of 'head' or 'tail'"], notes
+
+    expected_category = (
+        WINDOW_HEAD_CATEGORY if role == "head" else WINDOW_TAIL_CATEGORY
+    )
+    if str(question.get("category", "")) != expected_category:
+        problems.append(
+            f"{qid}: window_role {role!r} needs category {expected_category!r} "
+            f"(got {str(question.get('category', ''))!r}); lint and summarize "
+            "must agree about which questions are window questions"
+        )
+    if not question.get("window_pair"):
+        problems.append(f"{qid}: window question needs a window_pair id")
+
+    expected = list(question.get("expect_any") or [])
+    body = next((cached_raw[p] for p in expected if p in cached_raw), None)
+    if body is None:
+        problems.append(f"{qid}: no expect_any document is cached; cannot verify offset")
+        return problems, notes
+
+    declared = question.get("source_offset_chars")
+    if not isinstance(declared, int):
+        problems.append(f"{qid}: window question needs an integer source_offset_chars")
+        return problems, notes
+
+    quote = str(question.get("question", ""))
+    offset = body.find(quote.strip())
+    if offset < 0:
+        problems.append(f"{qid}: the quote is not present verbatim in the cached body")
+        return problems, notes
+
+    depth = offset / len(body) if body else 0.0
+    # A declared offset that disagrees with the measured one is a NOTE, not a
+    # problem: `ground_truth/` is refetched from an unpinned upstream HEAD, so
+    # ordinary whitespace drift moves it by a few characters and hard-failing
+    # would make lint unusable on any machine that fetched on a different day.
+    # The thresholds below never read the declared value, so a stale claim
+    # cannot change a verdict; it can only be out of date in the artifact.
+    if declared != offset:
+        notes.append(
+            f"NOTE: {qid} declares source_offset_chars {declared} but the quote "
+            f"sits at {offset} in the cached body (depth {depth:.4f}); the "
+            "cached ground truth has drifted from the fixture. Thresholds were "
+            "checked against the measured offset."
+        )
+    declared_depth = question.get("depth_fraction")
+    if isinstance(declared_depth, (int, float)) and abs(depth - declared_depth) > 0.005:
+        notes.append(
+            f"NOTE: {qid} declares depth_fraction {declared_depth} but the "
+            f"measured depth is {depth:.4f}"
+        )
+
+    if role == "head":
+        if offset >= HEAD_WINDOW_CHARS:
+            problems.append(
+                f"{qid}: head quote sits at offset {offset}, outside the first "
+                f"{HEAD_WINDOW_CHARS} characters; it is not a head control"
+            )
+    else:
+        if depth < TAIL_MIN_DEPTH:
+            problems.append(
+                f"{qid}: tail quote sits at depth {depth:.2f}, BELOW the "
+                f"{TAIL_MIN_DEPTH} threshold; too shallow to test the window"
+            )
+        novel = question.get("novel_terms_absent_from_head")
+        if not isinstance(novel, list) or len(novel) < TAIL_MIN_NOVEL_TERMS:
+            problems.append(
+                f"{qid}: tail quote needs at least {TAIL_MIN_NOVEL_TERMS} "
+                "novel_terms_absent_from_head; without them a pass could be the "
+                "head embedding answering the query"
+            )
+        else:
+            declared_novel = set(map(str, novel))
+            # A word the quote does not contain cannot make the quote novel.
+            # Without this, three arbitrary dictionary words absent from the
+            # head satisfy the control while saying nothing about this sentence.
+            not_in_quote = sorted(declared_novel - distinctive_terms(quote))
+            if not_in_quote:
+                problems.append(
+                    f"{qid}: terms declared novel are not terms of the quote "
+                    f"({', '.join(not_in_quote)}); a word the quote does not "
+                    "contain cannot make it novel"
+                )
+            head_terms = distinctive_terms(body[:HEAD_WINDOW_CHARS])
+            leaked = sorted(declared_novel & head_terms)
+            if leaked:
+                problems.append(
+                    f"{qid}: terms declared novel DO occur in the document head "
+                    f"({', '.join(leaked)}); the control is void"
+                )
+    return problems, notes
+
+
+def _lint_freeze_pin(data: dict[str, Any]) -> list[str]:
+    """The fixtures are frozen or they are not. This is what enforces it."""
+    frozen = data.get("frozen")
+    if not isinstance(frozen, dict):
+        return [
+            "questions file has no `frozen` block; without a pin the set can "
+            "drift between two runs that both call themselves the baseline"
+        ]
+    pinned = frozen.get("questions_sha256")
+    actual = questions_pin(list(data.get("questions") or []))
+    if not pinned:
+        return [
+            "frozen.questions_sha256 is missing; set it to the current pin "
+            f"({actual}) to freeze this set"
+        ]
+    if pinned != actual:
+        return [
+            "FROZEN SET CHANGED: frozen.questions_sha256 is "
+            f"{pinned} but the questions hash to {actual}. A baseline taken "
+            "before this edit answered different questions. Bump `version`, "
+            "update the pin deliberately, and re-take the baseline."
+        ]
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -1227,6 +1837,33 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print("\n--- duplication ---")
     for key, value in summary["duplication"].items():
         print(f"{key:>28}: {value}")
+    window = summary.get("window") or {}
+    if window.get("pairs_complete"):
+        print("\n--- embedding window (same document, head quote vs tail quote) ---")
+        for key, value in window.items():
+            print(f"{key:>28}: {value}")
+        print(
+            f"{'reads as':>28}: a tail miss is an exact, corpus-unique sentence "
+            "failing to retrieve the one document containing it"
+        )
+    ranking = summary.get("ranking") or {}
+    if ranking.get("answers_ranked"):
+        print("\n--- ranking (separate question from retrieval) ---")
+        for key, value in ranking.items():
+            print(f"{key:>28}: {value}")
+        print(
+            f"{'reads as':>28}: share of answers the node ranked BELOW a hit it "
+            "itself scored as matching fewer query terms"
+        )
+    meta = summary.get("metadata_stability") or {}
+    if meta.get("chunks_observed"):
+        print("\n--- per-request metadata stability ---")
+        print(f"{'chunks_observed':>28}: {meta['chunks_observed']}")
+        print(
+            f"{'unstable_trust_tier':>28}: "
+            f"{meta.get('chunks_with_unstable_trust_tier')} "
+            "(same chunk id + same content_sha256, different trust_tier)"
+        )
     print("\n--- stability ---")
     for key, value in summary["stability"].items():
         print(f"{key:>28}: {value}")
@@ -1273,6 +1910,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"{'node_version':>28}: {fingerprint['api'].get('node_version')}")
     print(f"{'harness_git_sha':>28}: {fingerprint['harness_git_sha']}")
     print(f"{'questions_sha256':>28}: {fingerprint['questions_sha256'][:16]}...")
+    print(f"{'questions_pin (frozen set)':>28}: {fingerprint.get('questions_pin', '')[:16]}...")
 
     census = fingerprint.get("census") or {}
     print("\n--- corpus census (/api/corpus) ---")
@@ -1408,6 +2046,42 @@ METRIC_DEFINITIONS: dict[str, str] = {
         "a pass that the body scorer refuses; phantom credit measured so it "
         "can never silently re-enter recall"
     ),
+    "head_recall_at_5": (
+        "share of window pairs where a verbatim quote taken from the first "
+        f"{HEAD_WINDOW_CHARS} characters of a document retrieves that document "
+        "into the top 5 distinct identities; the quote is the whole query, and "
+        "lint proves it unique across the CACHED ground-truth bodies only, "
+        "never across the corpus"
+    ),
+    "tail_recall_at_5": (
+        "the same measurement with the quote taken from at least "
+        f"{int(TAIL_MIN_DEPTH * 100)}% through the SAME document, and only "
+        f"where at least {TAIL_MIN_NOVEL_TERMS} of the quote's distinctive "
+        "terms are absent from that document's head, so a pass cannot be the "
+        "head embedding answering the query"
+    ),
+    "window_penalty": (
+        "head_recall_at_5 minus tail_recall_at_5 over the same documents: how "
+        "much of a document stops being reachable purely because the text sits "
+        "later in it. 0 means position does not matter"
+    ),
+    "tail_recall_given_head_at_5": (
+        "tail_recall_at_5 restricted to documents whose head quote DID "
+        "retrieve, so every document counted is one the index demonstrably "
+        "holds. This is the figure to quote: a document missing from both "
+        "sides may simply never have been indexed, and its tail miss is not "
+        "evidence about position"
+    ),
+    "rank_inversion_rate": (
+        "share of answers the node ranked BELOW a hit that the node ITSELF "
+        "reports matched a strictly smaller share of the query terms. The "
+        "answer slot is header-immune (a body span match, header stripped) but "
+        "the comparison reads _citadel.relevance.term_coverage, which the node "
+        "computes over a haystack including each hit's own path and sync "
+        "header, so a filename can move either side. Read it as the node's "
+        "published relevance disagreeing with the node's own ordering, NOT as "
+        "a body-only measure of relevance"
+    ),
 }
 
 # (summary section, metric key, sample-count source). The report refuses any
@@ -1419,6 +2093,11 @@ REPORT_METRICS: list[tuple[str, str, str]] = [
     ("quality", "negative_hit_rate", "probes"),
     ("duplication", "duplicate_blob_rate_at_10", "dup_rows"),
     ("quality", "header_credit_rate", "spans"),
+    ("window", "head_recall_at_5", "window_pairs"),
+    ("window", "tail_recall_at_5", "window_pairs"),
+    ("window", "tail_recall_given_head_at_5", "head_reachable"),
+    ("window", "window_penalty", "window_pairs"),
+    ("ranking", "rank_inversion_rate", "ranked"),
 ]
 
 
@@ -1430,6 +2109,12 @@ def _metric_sample_count(run: dict[str, Any], n_source: str) -> Any:
         return counts.get("questions_positive")
     if n_source == "probes":
         return counts.get("questions_blocked_probe")
+    if n_source == "window_pairs":
+        return ((run.get("summary") or {}).get("window") or {}).get("pairs_complete")
+    if n_source == "head_reachable":
+        return ((run.get("summary") or {}).get("window") or {}).get("pairs_head_reachable")
+    if n_source == "ranked":
+        return ((run.get("summary") or {}).get("ranking") or {}).get("answers_ranked")
     if n_source == "dup_rows":
         rows = run.get("rows")
         if not isinstance(rows, list):
@@ -1501,6 +2186,21 @@ def build_markdown_report(run: dict[str, Any]) -> str:
     short_sha = sha[:12] if sha not in ("", "unknown") else "unknown"
     node_version = (fingerprint.get("api") or {}).get("node_version")
 
+    # WHICH frozen set produced these numbers. Printed here because it is the
+    # only surface an operator reads before quoting a delta, and a table of
+    # metrics that cannot name its question set is exactly the artifact the pin
+    # exists to prevent.
+    pin = str(fingerprint.get("questions_pin") or "")
+    pin_line = (
+        f"Frozen question set `{pin[:16]}` (`questions_pin`)."
+        if pin
+        else (
+            "Frozen question set: NOT RECORDED. This run predates "
+            "`questions_pin`, so which questions produced these numbers is not "
+            "determinable from the artifact."
+        )
+    )
+
     lines = [
         "<!-- Generated by `scripts/bench/search_bench.py report`. "
         "Regenerate from a run JSON instead of hand-editing numbers. -->",
@@ -1516,6 +2216,8 @@ def build_markdown_report(run: dict[str, Any]) -> str:
             f"repeats {summary.get('repeats')}."
         ),
         "",
+        pin_line,
+        "",
         "| metric | value | date | commit | n | what it matches on |",
         "|---|---|---|---|---|---|",
     ]
@@ -1528,6 +2230,16 @@ def build_markdown_report(run: dict[str, Any]) -> str:
                 "the head-line-credit incident happened; add the definition "
                 "before reporting it."
             )
+        if section not in summary:
+            # A run taken before this metric existed did not measure it. Saying
+            # so is accurate; refusing the whole report would make every older
+            # baseline unreportable, and printing a bare "n/a" would blur "we
+            # measured nothing" into "we measured and got nothing".
+            lines.append(
+                f"| {key} | not measured in this run | {run_date} | "
+                f"`{short_sha}` | n/a | {definition} |"
+            )
+            continue
         section_values = summary.get(section) or {}
         if key not in section_values:
             raise BenchError(

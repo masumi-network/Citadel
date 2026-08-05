@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "created_at": "2026-07-31",
   "corpus": "repo_content sync of masumi-network/{sokosumi,Sokosumi-MCP,sokosumi-cli,sokosumi-docs}",
   "notes": [
@@ -16,7 +16,15 @@
     "Blocked-content probes p01-p05 are therefore PATTERN probes: expected_recall 0 plus blocked_pattern naming a rule in kb.security_scan.SECRET_PATTERNS. The harness imports the LIVE rule at run and lint time (a renamed or deleted rule fails loudly instead of matching nothing) and flags a hit when a served chunk's RAW text matches the rule - text every current ingest gate (kb/service.py _guard_content, kb/repo_content_sync.py sync scan, share/promotion scans) rejects at block_severity=high. A pattern-probe hit therefore means: content ingested before the scanner existed, ingested with scanning disabled, or a rule weakened after ingest. Report any hit as a security finding, not a metric.",
     "secret_assignment is deliberately NOT probe-eligible: its _is_credential_like carve-outs mean the bare regex over-matches legitimate documentation, so a probe keyed on it would cry leak on clean content.",
     "Out-of-corpus negative controls n01-n03 name real GitHub files verifiably outside the syncer's selection (wrong extension or prefix, or a repo absent from the tracked four with autojoin disabled in prod). A hit resolving to one of those identities means the corpus quietly widened (convert the control to a positive, exactly the b01-b04 lifecycle) or identity parsing broke. fetch_ground_truth.py never caches expect_any targets of expected_recall=0 questions, so no probe target can enter this public repo.",
-    "v4 verification status: probes carry a `verification` field recording exactly what was checked on 2026-08-02 and what was not. Three probes were confirmed against production with read-only searches (p01, p04 clean; p02 clean on served text with an undetermined truncated remainder); p03 and p05 are sound by construction but their production miss is unconfirmed; n01-n03 were confirmed offline against the syncer's own discovery and the live sources API, not by a search. Nothing here is a benchmark result - the harness has still never completed a run."
+    "v4 verification status: probes carry a `verification` field recording exactly what was checked on 2026-08-02 and what was not. Three probes were confirmed against production with read-only searches (p01, p04 clean; p02 clean on served text with an undetermined truncated remainder); p03 and p05 are sound by construction but their production miss is unconfirmed; n01-n03 were confirmed offline against the syncer's own discovery and the live sources API, not by a search. Nothing here is a benchmark result - the harness has still never completed a run.",
+    "v5 adds embedding-window pairs (window_head / window_tail). Each pair quotes ONE",
+    "document twice: once from inside the first 2000 characters, once from at least 40%",
+    "depth. A tail quote qualifies only when at least 3 of its distinctive terms are",
+    "ABSENT from the document head, so a passing tail cannot be explained by the head",
+    "embedding answering the query. Both quotes are verbatim and unique across every",
+    "cached body, so exactly one document can answer. These questions are scored in",
+    "their own block and are EXCLUDED from answer_recall_at_5, which keeps the existing",
+    "headline comparable with baselines taken before v5."
   ],
   "questions": [
     {
@@ -864,6 +872,741 @@
       "expected_recall": 0,
       "note": "Out-of-corpus control derived 2026-08-02: README.md is a root path the syncer selects, but masumi-network/masumi-payment-service is not one of the four tracked repo_content repos and autojoin is disabled in prod (confirmed via the sources API). The github digest source does track that repo, but digests never render a '# org/repo/path' first line, so no legitimate hit can resolve to this identity.",
       "verification": "2026-08-02 OBSERVED (offline): masumi-network/masumi-payment-service is not in the tracked repo_content repo list returned by the live sources API, and autojoin_enabled is false there. NOT confirmed by a live search."
+    },
+    {
+      "id": "w01h",
+      "question": "- Go to [app.sokosumi.com/connections](https://app.sokosumi.com/connections)",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/README.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Go to [app.sokosumi.com/connections](https://app.sokosumi.com/connections)"
+      ],
+      "window_pair": "w01",
+      "window_role": "head",
+      "doc_chars": 11419,
+      "source_offset_chars": 1189,
+      "depth_fraction": 0.1041
+    },
+    {
+      "id": "w01t",
+      "question": "/sokosumi:market Build a market analysis plan for this product.",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/README.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "/sokosumi:market Build a market analysis plan for this product."
+      ],
+      "window_pair": "w01",
+      "window_role": "tail",
+      "doc_chars": 11419,
+      "source_offset_chars": 6196,
+      "depth_fraction": 0.5426,
+      "novel_terms_absent_from_head": [
+        "analysis",
+        "build",
+        "market",
+        "plan",
+        "product"
+      ]
+    },
+    {
+      "id": "w02h",
+      "question": "- Manually: the user runs `/sokosumi:watch <task-or-job-id>` to arm or re-arm monitoring on any task or job.",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/watch/SKILL.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Manually: the user runs `/sokosumi:watch <task-or-job-id>` to arm or re-arm monitoring on any task or job."
+      ],
+      "window_pair": "w02",
+      "window_role": "head",
+      "doc_chars": 6588,
+      "source_offset_chars": 1183,
+      "depth_fraction": 0.1796
+    },
+    {
+      "id": "w02t",
+      "question": "- **Finished** (task `COMPLETED` or any finished status; job `completed`) or **failed/cancelled** (task `FAILED` or `CANCELED`; job `failed`) — go to Step 4.",
+      "expect_any": [
+        "masumi-network/Sokosumi-MCP/skills/watch/SKILL.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- **Finished** (task `COMPLETED` or any finished status; job `completed`) or **failed/cancelled** (task `FAILED` or `CANCELED`; job `failed`) — go to Step 4."
+      ],
+      "window_pair": "w02",
+      "window_role": "tail",
+      "doc_chars": 6588,
+      "source_offset_chars": 4785,
+      "depth_fraction": 0.7263,
+      "novel_terms_absent_from_head": [
+        "canceled",
+        "cancelled",
+        "completed",
+        "failed",
+        "finished"
+      ]
+    },
+    {
+      "id": "w03h",
+      "question": "**CRITICAL**: Do NOT perform any git operations unless explicitly requested by the user.",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/AGENTS.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "**CRITICAL**: Do NOT perform any git operations unless explicitly requested by the user."
+      ],
+      "window_pair": "w03",
+      "window_role": "head",
+      "doc_chars": 16910,
+      "source_offset_chars": 789,
+      "depth_fraction": 0.0467
+    },
+    {
+      "id": "w03t",
+      "question": "- [ ] Implement `magic-link.mjs` ← Currently working on this",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/AGENTS.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- [ ] Implement `magic-link.mjs` ← Currently working on this"
+      ],
+      "window_pair": "w03",
+      "window_role": "tail",
+      "doc_chars": 16910,
+      "source_offset_chars": 13445,
+      "depth_fraction": 0.7951,
+      "novel_terms_absent_from_head": [
+        "implement",
+        "link",
+        "magic"
+      ]
+    },
+    {
+      "id": "w04h",
+      "question": "npx skills add https://github.com/masumi-network/sokosumi-cli --skill watch",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/README.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "npx skills add https://github.com/masumi-network/sokosumi-cli --skill watch"
+      ],
+      "window_pair": "w04",
+      "window_role": "head",
+      "doc_chars": 9456,
+      "source_offset_chars": 1511,
+      "depth_fraction": 0.1598
+    },
+    {
+      "id": "w04t",
+      "question": "- direct API-key authentication plus the live sign-up, sign-in, and Connections URLs for humans who need to create a key",
+      "expect_any": [
+        "masumi-network/sokosumi-cli/README.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- direct API-key authentication plus the live sign-up, sign-in, and Connections URLs for humans who need to create a key"
+      ],
+      "window_pair": "w04",
+      "window_role": "tail",
+      "doc_chars": 9456,
+      "source_offset_chars": 7223,
+      "depth_fraction": 0.7639,
+      "novel_terms_absent_from_head": [
+        "connections",
+        "humans",
+        "live",
+        "need",
+        "sign",
+        "urls"
+      ]
+    },
+    {
+      "id": "w05h",
+      "question": "never write to the live production parent. Provision always forks a child",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/cloud-agent-database.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "never write to the live production parent. Provision always forks a child"
+      ],
+      "window_pair": "w05",
+      "window_role": "head",
+      "doc_chars": 5373,
+      "source_offset_chars": 1057,
+      "depth_fraction": 0.1967
+    },
+    {
+      "id": "w05t",
+      "question": "node scripts/cloud-agent-db/teardown.mjs --from-text \"$(gh pr view 123 --json body -q .body)\"",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/agents/cloud-agent-database.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "node scripts/cloud-agent-db/teardown.mjs --from-text \"$(gh pr view 123 --json body -q .body)\""
+      ],
+      "window_pair": "w05",
+      "window_role": "tail",
+      "doc_chars": 5373,
+      "source_offset_chars": 4435,
+      "depth_fraction": 0.8254,
+      "novel_terms_absent_from_head": [
+        "body",
+        "text",
+        "view"
+      ]
+    },
+    {
+      "id": "w06h",
+      "question": "- **How it's validated:** every coworker the API returns is parsed against the",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker-metadata.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- **How it's validated:** every coworker the API returns is parsed against the"
+      ],
+      "window_pair": "w06",
+      "window_role": "head",
+      "doc_chars": 13477,
+      "source_offset_chars": 583,
+      "depth_fraction": 0.0433
+    },
+    {
+      "id": "w06t",
+      "question": "\"prompt\": \"Run a competitive and market analysis for [COMPANY] ([WEBSITE]).\",",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker-metadata.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "\"prompt\": \"Run a competitive and market analysis for [COMPANY] ([WEBSITE]).\","
+      ],
+      "window_pair": "w06",
+      "window_role": "tail",
+      "doc_chars": 13477,
+      "source_offset_chars": 10053,
+      "depth_fraction": 0.7459,
+      "novel_terms_absent_from_head": [
+        "analysis",
+        "company",
+        "competitive",
+        "market",
+        "prompt",
+        "website"
+      ]
+    },
+    {
+      "id": "w07h",
+      "question": "pnpm bench:coworker-chat -- --scenario realistic --out /tmp/bench-report.json",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/benchmarks/README.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "pnpm bench:coworker-chat -- --scenario realistic --out /tmp/bench-report.json"
+      ],
+      "window_pair": "w07",
+      "window_role": "head",
+      "doc_chars": 5483,
+      "source_offset_chars": 498,
+      "depth_fraction": 0.0908
+    },
+    {
+      "id": "w07t",
+      "question": "- Output contains `Something went wrong while processing your task`",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/benchmarks/README.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Output contains `Something went wrong while processing your task`"
+      ],
+      "window_pair": "w07",
+      "window_role": "tail",
+      "doc_chars": 5483,
+      "source_offset_chars": 3610,
+      "depth_fraction": 0.6584,
+      "novel_terms_absent_from_head": [
+        "contains",
+        "output",
+        "processing",
+        "something",
+        "task",
+        "went",
+        "while",
+        "wrong"
+      ]
+    },
+    {
+      "id": "w08h",
+      "question": "- **Source of truth (OpenAPI shape):** `apps/core/src/schemas/task.schema.ts`",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- **Source of truth (OpenAPI shape):** `apps/core/src/schemas/task.schema.ts`"
+      ],
+      "window_pair": "w08",
+      "window_role": "head",
+      "doc_chars": 7905,
+      "source_offset_chars": 704,
+      "depth_fraction": 0.0891
+    },
+    {
+      "id": "w08t",
+      "question": "After human **approve**: task unparks to `grantResumeStatus` (null → `READY`).",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/coworker/vendor-workspace-grants-api.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "After human **approve**: task unparks to `grantResumeStatus` (null → `READY`)."
+      ],
+      "window_pair": "w08",
+      "window_role": "tail",
+      "doc_chars": 7905,
+      "source_offset_chars": 5538,
+      "depth_fraction": 0.7006,
+      "novel_terms_absent_from_head": [
+        "after",
+        "approve",
+        "human",
+        "unparks"
+      ]
+    },
+    {
+      "id": "w09h",
+      "question": "- `overrides.organizationId` is optional. When present, it is authoritative for",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/hermes-orchestrator-approve-overrides.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- `overrides.organizationId` is optional. When present, it is authoritative for"
+      ],
+      "window_pair": "w09",
+      "window_role": "head",
+      "doc_chars": 8250,
+      "source_offset_chars": 1001,
+      "depth_fraction": 0.1213
+    },
+    {
+      "id": "w09t",
+      "question": "job confirmation card. Both should show the same Personal default and",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/hermes-orchestrator-approve-overrides.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "job confirmation card. Both should show the same Personal default and"
+      ],
+      "window_pair": "w09",
+      "window_role": "tail",
+      "doc_chars": 8250,
+      "source_offset_chars": 6015,
+      "depth_fraction": 0.7291,
+      "novel_terms_absent_from_head": [
+        "both",
+        "card",
+        "default",
+        "show"
+      ]
+    },
+    {
+      "id": "w10h",
+      "question": "- **Per-user scope:** `orchestratorId` is never implied by the secret. Resolve",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/orchestrator/hermes-orchestrator-actor.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- **Per-user scope:** `orchestratorId` is never implied by the secret. Resolve"
+      ],
+      "window_pair": "w10",
+      "window_role": "head",
+      "doc_chars": 6930,
+      "source_offset_chars": 663,
+      "depth_fraction": 0.0957
+    },
+    {
+      "id": "w10t",
+      "question": "verified fresh provision path). Poll advances `lastPolledAt` so missing",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/orchestrator/hermes-orchestrator-actor.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "verified fresh provision path). Poll advances `lastPolledAt` so missing"
+      ],
+      "window_pair": "w10",
+      "window_role": "tail",
+      "doc_chars": 6930,
+      "source_offset_chars": 5712,
+      "depth_fraction": 0.8242,
+      "novel_terms_absent_from_head": [
+        "advances",
+        "fresh",
+        "lastpolledat",
+        "missing",
+        "verified"
+      ]
+    },
+    {
+      "id": "w11h",
+      "question": "- [ ] **Step 1: Write failing tests** — append to the existing test file (it already mocks `tx.user.findMany`; add `count`):",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-06-12-admin-user-overview.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- [ ] **Step 1: Write failing tests** — append to the existing test file (it already mocks `tx.user.findMany`; add `count`):"
+      ],
+      "window_pair": "w11",
+      "window_role": "head",
+      "doc_chars": 23564,
+      "source_offset_chars": 1242,
+      "depth_fraction": 0.0527
+    },
+    {
+      "id": "w11t",
+      "question": "const result = await coreClient.listAdminUserOverview(params);",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-06-12-admin-user-overview.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "const result = await coreClient.listAdminUserOverview(params);"
+      ],
+      "window_pair": "w11",
+      "window_role": "tail",
+      "doc_chars": 23564,
+      "source_offset_chars": 18150,
+      "depth_fraction": 0.7702,
+      "novel_terms_absent_from_head": [
+        "coreclient",
+        "listadminuseroverview",
+        "params"
+      ]
+    },
+    {
+      "id": "w12h",
+      "question": "- No auto-settle after top-up (requested status still dropped on pause)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-07-27-task-credit-pause-timeline-ux.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- No auto-settle after top-up (requested status still dropped on pause)"
+      ],
+      "window_pair": "w12",
+      "window_role": "head",
+      "doc_chars": 18343,
+      "source_offset_chars": 970,
+      "depth_fraction": 0.0529
+    },
+    {
+      "id": "w12t",
+      "question": "// expect \"tried to charge 3 credits\" (secondary or in body)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/plans/2026-07-27-task-credit-pause-timeline-ux.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "// expect \"tried to charge 3 credits\" (secondary or in body)"
+      ],
+      "window_pair": "w12",
+      "window_role": "tail",
+      "doc_chars": 18343,
+      "source_offset_chars": 12902,
+      "depth_fraction": 0.7034,
+      "novel_terms_absent_from_head": [
+        "body",
+        "secondary",
+        "tried"
+      ]
+    },
+    {
+      "id": "w13h",
+      "question": "and core preview deployments to disagree on the cookie name, which broke",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-03-24-better-auth-cookie-prefix-commit-ref-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "and core preview deployments to disagree on the cookie name, which broke"
+      ],
+      "window_pair": "w13",
+      "window_role": "head",
+      "doc_chars": 6000,
+      "source_offset_chars": 708,
+      "depth_fraction": 0.118
+    },
+    {
+      "id": "w13t",
+      "question": "[apps/web/src/lib/auth/__tests__/auth.test.ts](/Users/andreas/Developer/masumi-network/sokosumi-review/apps/web/src/lib/auth/__tests__/auth.test.ts)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-03-24-better-auth-cookie-prefix-commit-ref-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "[apps/web/src/lib/auth/__tests__/auth.test.ts](/Users/andreas/Developer/masumi-network/sokosumi-review/apps/web/src/lib/auth/__tests__/auth.test.ts)"
+      ],
+      "window_pair": "w13",
+      "window_role": "tail",
+      "doc_chars": 6000,
+      "source_offset_chars": 4138,
+      "depth_fraction": 0.6897,
+      "novel_terms_absent_from_head": [
+        "apps",
+        "test",
+        "tests"
+      ]
+    },
+    {
+      "id": "w14h",
+      "question": "Before this PR, the zero-margin decision was made **server-side only** in web via",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-18-zero-margin-pricing-core-authority-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "Before this PR, the zero-margin decision was made **server-side only** in web via"
+      ],
+      "window_pair": "w14",
+      "window_role": "head",
+      "doc_chars": 8479,
+      "source_offset_chars": 1081,
+      "depth_fraction": 0.1275
+    },
+    {
+      "id": "w14t",
+      "question": "10. **`apps/web/src/app/(app)/billing/page.tsx`** — delete `zeroMarginTopUpEnabled()`",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-18-zero-margin-pricing-core-authority-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "10. **`apps/web/src/app/(app)/billing/page.tsx`** — delete `zeroMarginTopUpEnabled()`"
+      ],
+      "window_pair": "w14",
+      "window_role": "tail",
+      "doc_chars": 8479,
+      "source_offset_chars": 6212,
+      "depth_fraction": 0.7326,
+      "novel_terms_absent_from_head": [
+        "apps",
+        "delete",
+        "page",
+        "zeromargintopupenabled"
+      ]
+    },
+    {
+      "id": "w15h",
+      "question": "- **Task naming** has no core equivalent. Web `actions/task/action.ts`",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-19-remove-openrouter-from-web-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- **Task naming** has no core equivalent. Web `actions/task/action.ts`"
+      ],
+      "window_pair": "w15",
+      "window_role": "head",
+      "doc_chars": 8786,
+      "source_offset_chars": 1100,
+      "depth_fraction": 0.1252
+    },
+    {
+      "id": "w15t",
+      "question": "- The LLM call runs **before** the DB transaction, so a slow or failing LLM",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-06-19-remove-openrouter-from-web-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- The LLM call runs **before** the DB transaction, so a slow or failing LLM"
+      ],
+      "window_pair": "w15",
+      "window_role": "tail",
+      "doc_chars": 8786,
+      "source_offset_chars": 6950,
+      "depth_fraction": 0.791,
+      "novel_terms_absent_from_head": [
+        "before",
+        "call",
+        "failing",
+        "runs",
+        "slow",
+        "transaction"
+      ]
+    },
+    {
+      "id": "w16h",
+      "question": "- Tie refresh to API access (forces RT on every API client; blocks identity+refresh)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-23-oauth-refresh-token-opt-in-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Tie refresh to API access (forces RT on every API client; blocks identity+refresh)"
+      ],
+      "window_pair": "w16",
+      "window_role": "head",
+      "doc_chars": 6817,
+      "source_offset_chars": 851,
+      "depth_fraction": 0.1248
+    },
+    {
+      "id": "w16t",
+      "question": "1. Remove `offline_access` from client scopes (**this is the real gate**)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-23-oauth-refresh-token-opt-in-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "1. Remove `offline_access` from client scopes (**this is the real gate**)"
+      ],
+      "window_pair": "w16",
+      "window_role": "tail",
+      "doc_chars": 6817,
+      "source_offset_chars": 4809,
+      "depth_fraction": 0.7054,
+      "novel_terms_absent_from_head": [
+        "gate",
+        "real",
+        "remove"
+      ]
+    },
+    {
+      "id": "w17h",
+      "question": "- `kind: \"channel\"` — create named channel (`name` / `slug`)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-27-chats-api-and-chat-room-schema-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- `kind: \"channel\"` — create named channel (`name` / `slug`)"
+      ],
+      "window_pair": "w17",
+      "window_role": "head",
+      "doc_chars": 6421,
+      "source_offset_chars": 1610,
+      "depth_fraction": 0.2507
+    },
+    {
+      "id": "w17t",
+      "question": "**`chat_room_read_state`** — UNIQUE `(roomId, userId)`, `lastReadAt`.",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-27-chats-api-and-chat-room-schema-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "**`chat_room_read_state`** — UNIQUE `(roomId, userId)`, `lastReadAt`."
+      ],
+      "window_pair": "w17",
+      "window_role": "tail",
+      "doc_chars": 6421,
+      "source_offset_chars": 4602,
+      "depth_fraction": 0.7167,
+      "novel_terms_absent_from_head": [
+        "lastreadat",
+        "state",
+        "unique",
+        "userid"
+      ]
+    },
+    {
+      "id": "w18h",
+      "question": "- Redirects from legacy `/chat/[bucket]/conversation/[id]` (404 or soft land on `/chat`; default **404**)",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
+      ],
+      "category": "window_head",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Redirects from legacy `/chat/[bucket]/conversation/[id]` (404 or soft land on `/chat`; default **404**)"
+      ],
+      "window_pair": "w18",
+      "window_role": "head",
+      "doc_chars": 8915,
+      "source_offset_chars": 985,
+      "depth_fraction": 0.1105
+    },
+    {
+      "id": "w18t",
+      "question": "- Core must reject `coworkerIds.length > 1` on `kind: \"direct\"` create (include in this cutover if not already shipped).",
+      "expect_any": [
+        "masumi-network/sokosumi/docs/superpowers/specs/2026-07-28-chat-rooms-cutover-deprecate-conversations-design.md"
+      ],
+      "category": "window_tail",
+      "expected_recall": 1,
+      "answer_spans": [
+        "- Core must reject `coworkerIds.length > 1` on `kind: \"direct\"` create (include in this cutover if not already shipped)."
+      ],
+      "window_pair": "w18",
+      "window_role": "tail",
+      "doc_chars": 8915,
+      "source_offset_chars": 7191,
+      "depth_fraction": 0.8066,
+      "novel_terms_absent_from_head": [
+        "core",
+        "coworkerids",
+        "include",
+        "length",
+        "must",
+        "reject",
+        "shipped"
+      ]
     }
-  ]
+  ],
+  "frozen": {
+    "frozen_at": "2026-08-04",
+    "policy": "Editing any question below changes what the baseline means. lint recomputes questions_sha256 over the canonical question list and fails when it differs from the pin, so a change is a deliberate re-freeze and a version bump, never a silent drift.",
+    "questions_sha256": "022b6b4f66c73af10ae99090d58ed0c1b89806718db222de0825a14c9cfb9838"
+  }
 }
