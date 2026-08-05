@@ -79,6 +79,51 @@ def test_bad_flag_choice_not_labeled_unknown_subcommand(capsys) -> None:
     assert "--score" in err
 
 
+def test_bench_defaults_to_run_and_preserves_arguments() -> None:
+    args = build_parser().parse_args(["bench", "run", "--repeats", "3"])
+    assert args.command == "bench"
+    assert args.bench_args == ["run", "--repeats", "3"]
+
+
+def test_bench_delegates_to_packaged_retrieval_eval(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_main(argv: list[str]) -> int:
+        calls.append(argv)
+        return 7
+
+    monkeypatch.setattr("kb.retrieval_eval.main", fake_main)
+    assert _run(["bench", "lint", "--questions", "questions.json"]) == 7
+    assert calls == [["lint", "--questions", "questions.json"]]
+
+
+def test_bench_help_reaches_nested_parser(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["citadel", "bench", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        kb.cli.main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "{run,lint,ci,compare,report}" in out
+
+
+def test_cognify_force_reaches_service(monkeypatch, capsys) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCitadel:
+        async def cognify_dataset(self, **kwargs: object) -> dict[str, bool]:
+            calls.append(kwargs)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        "kb.service.Citadel.from_env",
+        classmethod(lambda cls: FakeCitadel()),
+    )
+
+    assert _run(["cognify", "--dataset", "masumi-network", "--force"]) == 0
+    assert calls == [{"dataset": "masumi-network", "verify": False, "force": True}]
+    assert '"ok": true' in capsys.readouterr().out
+
+
 def test_setup_json_never_prompts_even_on_tty(tmp_path: Path, monkeypatch, capsys) -> None:
     # --json implies non-interactive: must not call input() even with a TTY.
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)

@@ -1,4 +1,4 @@
-"""Tests for the retrieval benchmark harness (scripts/bench/search_bench.py).
+"""Tests for the packaged retrieval benchmark harness.
 
 Fixtures mirror the REAL /search hit shape: repo-content hits carry a
 ``# org/repo/path`` first line plus a Repository/Source/Commit/Blob header
@@ -185,12 +185,14 @@ class TestDuplicationMetrics:
         assert row["duplicate_blob_rate_at_10"] == pytest.approx(0.8)
         assert row["distinct_files_at_10"] == 1
         assert row["answer_rank"] == 1
+        assert row["answer_pass_at_1"] is True
         assert row["answer_pass_at_5"] is True
         # One question, one pass: recall over [row] + probe must be 1.0, not
         # inflated by the 10 duplicate slots.
         probe = sb.score_question(question("p01", expect=["masumi-network/x/gone.md"], recall=0), [], {})
         summary = sb.summarize([row, probe], [])
         assert summary["quality"]["answer_recall_at_5"] == 1.0
+        assert summary["quality"]["answer_recall_at_1"] == 1.0
 
     def test_duplication_tax_raw_page_misses_collapsed_hits(self):
         # First 5 raw slots are one non-answering file; the answer sits at slot
@@ -201,6 +203,7 @@ class TestDuplicationMetrics:
         row = sb.score_question(question(spans=[span]), hits, {})
         assert row["raw_page_pass_at_5"] is False
         assert row["answer_rank"] == 2
+        assert row["answer_pass_at_1"] is False
         assert row["answer_pass_at_5"] is True
 
 
@@ -910,8 +913,10 @@ def make_run(
         "run_at": run_at,
         "summary": {
             "quality": {
+                "answer_recall_at_1": 0.6410,
                 "answer_recall_at_5": 0.8974,
                 "raw_page_recall_at_5": 0.7692,
+                "doc_recall_at_1": 0.7213,
                 "doc_recall_at_5": 0.9508,
                 "mrr_body": 0.7521,
                 "header_credit_rate": 0.0256,

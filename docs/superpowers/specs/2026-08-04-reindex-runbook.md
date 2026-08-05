@@ -239,7 +239,7 @@ Body model at `kb/server.py:987-990`, handler at `kb/server.py:5765-5771`, scope
 
 Three operational facts about that call:
 
-1. **The CLI cannot do this.** `citadel cognify` takes `--dataset` and `--verify` and no force flag (`kb/cli.py:3170-3180`), and `_cognify` calls `cognify_dataset(dataset=..., verify=args.verify)` with no `force` (`kb/cli.py:854-858`). **VERIFIED.** The HTTP endpoint is the only surface that can force.
+1. **The CLI can now do this.** `citadel cognify` accepts `--dataset`, `--verify`, and `--force`; `_cognify` passes all three to `cognify_dataset` (`kb/cli.py:853-863`, `kb/cli.py:3180-3194`). **VERIFIED.** `--force` reprocesses the whole selected dataset, so use the same backup, canary, and census controls as the HTTP path. The HTTP endpoint remains available for admin-scoped remote recovery.
 2. **The response's `ok` field proves nothing when `verify` is false.** `cognify_dataset` returns `"ok": True if verification is None else bool(verification["ok"])` (`kb/service.py:370`). **VERIFIED.** With `verify: false` it is unconditionally true. Read `graph_before` and `graph_after` in the same payload for a number that is at least a measurement, and read the census for one that is authoritative.
 3. **One request will not survive the window.** At the section 3.3 timings a single dataset's force cognify runs for hours, and a client timeout says nothing about whether the write succeeded. Issue #229 recorded that exact confusion and is closed, but the property remains: a timed-out client and a failed write look the same from the client.
 
@@ -314,6 +314,14 @@ chunk_count_after >= 2 x chunk_count_before,  for every document longer than abo
 ```
 
 with the expected ratio around 22 from section 1. Documents shorter than one chunk's worth of text legitimately stay at 1 and must be excluded from the check rather than counted as failures. This is why step 1 keeps every row: without the before-census there is no delta to compute.
+
+**First signal, the pre-storage chunk-budget validator.** Normal Citadel ingest
+replays the pinned Cognee chunker before `cognee.add` and rejects a final chunk
+whose reported additive size or exact joined text exceeds the configured BPE
+budget (`kb/chunk_window.py:validate_cognee_chunk_budget`). **VERIFIED** by the
+focused test that returns `chunk_budget_violation` without calling `remember`.
+This protects new writes only. Existing rows still require the census and
+controlled repair described below.
 
 **Second signal, the embed-window detector.** `install_embed_window_detector` wraps the fastembed engine's `embed_text` and logs each overflow (`kb/chunk_window.py:390`, log line at `:294-302`):
 

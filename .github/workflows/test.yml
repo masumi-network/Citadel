@@ -119,9 +119,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --dev
 
-      - name: Validate benchmark fixtures
+      - name: Run benchmark harness self-check
         run: >-
-          uv run python scripts/bench/search_bench.py lint
+          uv run citadel bench ci
           --questions scripts/bench/golden_questions_ci.json
           --ground-truth scripts/bench/ground_truth_ci
 

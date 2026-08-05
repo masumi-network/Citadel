@@ -1,4 +1,4 @@
-"""Chunk budget for the embedder, and overflow detection at the embed boundary (#227).
+"""Chunk budget validation before storage and overflow detection at the embed boundary (#227).
 
 The defect
 ----------
@@ -32,7 +32,8 @@ non-Latin text to sample.
 A second mechanism removes the last hope of an arithmetic answer.
 ``chunk_by_paragraph`` compares against the budget only when the accumulating
 chunk is non-empty (``cognee/tasks/chunks/chunk_by_paragraph.py:40``), so a
-single over-budget "word" is emitted verbatim no matter what the budget says.
+single over-budget "word" can be emitted verbatim when Cognee is called outside
+Citadel's ingest gate.
 Measured: one line of minified JS in ``kb/webui`` is 1,392 BPE tokens and comes
 out as one 1,710-wordpiece chunk at every budget from 512 down to 192 — at 192
 that is 7.2x the budget it supposedly obeys.
@@ -40,10 +41,13 @@ that is 7.2x the budget it supposedly obeys.
 What this module ships instead
 ------------------------------
 1. ``OBSERVED_CHUNK_BUDGET_TOKENS`` — an observation, not a bound. See its note.
-2. ``record_embed_batch`` — a detector at the embed boundary that measures the
+2. ``validate_cognee_chunk_budget`` — a pre-storage check that replays the pinned
+   Cognee chunker and rejects a final chunk whose reported or exact text size is
+   over the configured budget.
+3. ``record_embed_batch`` — a detector at the embed boundary that measures the
    chunk actually handed to the model, in the model's own units, and says so.
    Predicting an overflow is arithmetic; measuring one is evidence.
-3. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
+4. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
    cannot be chunked at all. It refuses and records. It never edits text.
 """
 
@@ -475,6 +479,134 @@ class UnchunkableSpan:
         if self.tokens_are_exact:
             return f"{self.tokens} BPE tokens"
         return f"at least {self.tokens} BPE tokens"
+
+
+@dataclass(frozen=True)
+class ChunkBudgetViolation:
+    """A final Cognee chunk that cannot be trusted to fit the configured budget."""
+
+    reason: str
+    chunk_index: int
+    configured_size: int
+    measured_tokens: int | None
+    char_length: int
+    fingerprint: str
+
+    def describe(self) -> str:
+        measured = (
+            "unmeasured" if self.measured_tokens is None else f"{self.measured_tokens} BPE tokens"
+        )
+        return (
+            f"{self.reason}: chunk {self.chunk_index}, reported "
+            f"{self.configured_size} BPE tokens, measured {measured}, "
+            f"{self.char_length} characters, {self.fingerprint}"
+        )
+
+
+class ChunkBudgetValidationError(RuntimeError):
+    """The final-chunk validator could not establish the budget invariant."""
+
+
+def _iter_cognee_final_chunks(
+    text: str, budget: int
+) -> Iterable[tuple[int, str, int]]:
+    """Mirror Cognee 1.2.x TextChunker output before its storage fan-out.
+
+    Cognee's paragraph chunker returns intermediate chunks, then TextChunker
+    joins several with spaces while carrying forward the summed ``chunk_size``.
+    The joined text is the value that reaches the vector and graph writers, so
+    validating only the intermediate iterator misses the exact failure mode.
+    """
+    try:
+        from cognee.tasks.chunks.chunk_by_paragraph import chunk_by_paragraph
+    except Exception as exc:  # pragma: no cover - dependency pin/import failure
+        raise ChunkBudgetValidationError(
+            "cannot import Cognee's pinned paragraph chunker"
+        ) from exc
+
+    paragraph_chunks: list[dict[str, Any]] = []
+    current_size = 0
+    chunk_index = 0
+    try:
+        chunks = chunk_by_paragraph(text, budget, batch_paragraphs=True)
+        for chunk_data in chunks:
+            chunk_text = chunk_data.get("text")
+            chunk_size = chunk_data.get("chunk_size")
+            if not isinstance(chunk_text, str) or not isinstance(chunk_size, int):
+                raise ChunkBudgetValidationError(
+                    "Cognee paragraph chunker returned an invalid chunk shape"
+                )
+            if current_size + chunk_size <= budget:
+                paragraph_chunks.append(chunk_data)
+                current_size += chunk_size
+                continue
+            if not paragraph_chunks:
+                yield chunk_index, chunk_text, chunk_size
+                current_size = 0
+            else:
+                yield (
+                    chunk_index,
+                    " ".join(item["text"] for item in paragraph_chunks),
+                    current_size,
+                )
+                paragraph_chunks = [chunk_data]
+                current_size = chunk_size
+            chunk_index += 1
+    except ChunkBudgetValidationError:
+        raise
+    except Exception as exc:  # pragma: no cover - dependency contract failure
+        raise ChunkBudgetValidationError("Cognee paragraph chunking failed") from exc
+
+    if paragraph_chunks:
+        yield (
+            chunk_index,
+            " ".join(item["text"] for item in paragraph_chunks),
+            current_size,
+        )
+
+
+def validate_cognee_chunk_budget(
+    text: str, *, budget: int | None = None
+) -> ChunkBudgetViolation | None:
+    """Validate final Cognee chunk text before any durable write begins.
+
+    ``chunk_size`` is Cognee's additive GPT-4o BPE accounting field. It can be
+    larger than an exact count of the joined text because tokenization merges
+    across word boundaries. The validator therefore enforces both values stay
+    within budget without requiring them to be equal.
+    """
+    limit = budget if budget is not None else resolve_chunk_budget()
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot prove final chunk size"
+        )
+    for chunk_index, chunk_text, configured_size in _iter_cognee_final_chunks(text, limit):
+        try:
+            measured_tokens = len(encoding.encode(chunk_text, disallowed_special=()))
+        except Exception as exc:  # pragma: no cover - tokenizer contract failure
+            raise ChunkBudgetValidationError(
+                "the gpt-4o tokenizer could not measure a final Cognee chunk"
+            ) from exc
+        if configured_size > limit:
+            return ChunkBudgetViolation(
+                reason="chunk_size_over_budget",
+                chunk_index=chunk_index,
+                configured_size=configured_size,
+                measured_tokens=measured_tokens,
+                char_length=len(chunk_text),
+                fingerprint=_fingerprint(chunk_text),
+            )
+        if measured_tokens > limit:
+            return ChunkBudgetViolation(
+                reason="chunk_over_budget",
+                chunk_index=chunk_index,
+                configured_size=configured_size,
+                measured_tokens=measured_tokens,
+                char_length=len(chunk_text),
+                fingerprint=_fingerprint(chunk_text),
+            )
+    return None
 
 
 def _iter_cognee_words(text: str) -> Iterable[str]:

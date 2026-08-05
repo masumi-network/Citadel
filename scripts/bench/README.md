@@ -13,21 +13,32 @@ export CITADEL_MCP_ACCESS_TOKEN=...          # a seat token with kb:search
 export GITHUB_TOKEN=...                      # only for refreshing ground truth
 
 python scripts/bench/fetch_ground_truth.py       # once, or when the corpus changes
-python scripts/bench/search_bench.py lint        # validate the golden set offline
-python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
-python scripts/bench/search_bench.py run --baseline scripts/bench/runs/latest.json   # later, for a delta
-python scripts/bench/search_bench.py compare run_a.json run_b.json
-python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+citadel bench lint                                # validate the golden set offline
+citadel bench run --out scripts/bench/runs/latest.json
+citadel bench run --baseline scripts/bench/runs/latest.json   # later, for a delta
+citadel bench compare run_a.json run_b.json
+citadel bench report scripts/bench/runs/latest.json --markdown
 ```
+
+`python scripts/bench/search_bench.py ...` remains a compatibility launcher for
+source checkouts. The implementation is packaged as `kb.retrieval_eval`.
 
 The merge gate uses a small tracked fixture set that is safe to validate in a
 clean checkout:
 
 ```bash
-python scripts/bench/search_bench.py lint \
+citadel bench lint \
+  --questions scripts/bench/golden_questions_ci.json \
+  --ground-truth scripts/bench/ground_truth_ci
+
+citadel bench ci \
   --questions scripts/bench/golden_questions_ci.json \
   --ground-truth scripts/bench/ground_truth_ci
 ```
+
+`ci` runs the tracked synthetic fixture through the same scoring path without a
+network token. It checks answer/doc top-1 and top-5 plus zero negative hits. It
+is a harness self-check, not evidence about the live node or its corpus.
 
 The full `golden_questions.json` set still uses the private, gitignored
 `ground_truth/` cache. Refresh that cache with `fetch_ground_truth.py` before a
@@ -339,8 +350,8 @@ zero; the zero count is then a floor.
 ## Publishing numbers: `report`
 
 ```bash
-python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
-python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown --out block.md
+citadel bench report scripts/bench/runs/latest.json --markdown
+citadel bench report scripts/bench/runs/latest.json --markdown --out block.md
 ```
 
 Turns a saved run JSON into a README-ready markdown block. Every table row
@@ -358,8 +369,8 @@ when the run has no content fingerprint. Regenerating the block is the whole
 loop:
 
 ```bash
-python scripts/bench/search_bench.py run --out scripts/bench/runs/latest.json
-python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
+citadel bench run --out scripts/bench/runs/latest.json
+citadel bench report scripts/bench/runs/latest.json --markdown
 ```
 
 ## Baselines

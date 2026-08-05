@@ -341,6 +341,57 @@ def test_newline_is_not_a_word_boundary() -> None:
     assert chunk_window.split_cognee_words("aaa\nbbb") == ["aaa\nbbb"]
 
 
+def test_final_cognee_chunk_validator_accepts_in_budget_text() -> None:
+    assert chunk_window.validate_cognee_chunk_budget(
+        "A short note with ordinary words.", budget=64
+    ) is None
+
+
+def test_final_cognee_chunk_validator_rejects_emitted_over_budget_chunk(
+    monkeypatch: Any,
+) -> None:
+    import importlib
+
+    module = importlib.import_module("cognee.tasks.chunks.chunk_by_paragraph")
+
+    def fake_chunker(text: str, max_chunk_size: int, batch_paragraphs: bool = True) -> Any:
+        yield {"text": text, "chunk_size": max_chunk_size + 1}
+
+    monkeypatch.setattr(module, "chunk_by_paragraph", fake_chunker)
+    violation = chunk_window.validate_cognee_chunk_budget("ordinary", budget=64)
+
+    assert violation is not None
+    assert violation.reason == "chunk_size_over_budget"
+    assert violation.configured_size == 65
+    assert violation.measured_tokens is not None
+    assert "ordinary" not in violation.describe()
+
+
+def test_ingest_rejects_final_chunk_before_remember(monkeypatch: Any) -> None:
+    import asyncio
+    import importlib
+
+    from kb.config import CitadelConfig
+    from kb.service import Citadel
+    from tests.test_service import FakeCognee
+
+    module = importlib.import_module("cognee.tasks.chunks.chunk_by_paragraph")
+
+    def fake_chunker(text: str, max_chunk_size: int, batch_paragraphs: bool = True) -> Any:
+        yield {"text": text, "chunk_size": max_chunk_size + 1}
+
+    monkeypatch.setattr(module, "chunk_by_paragraph", fake_chunker)
+    monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "64")
+    fake = FakeCognee()
+    citadel = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = asyncio.run(citadel.ingest("ordinary content"))
+
+    assert not result.accepted
+    assert result.reason == "chunk_budget_violation"
+    assert fake.remember_calls == []
+
+
 def test_ingest_refuses_content_cognee_cannot_chunk(monkeypatch: Any) -> None:
     """Refuse and record. One such document fails the whole dataset's pipeline run."""
     import asyncio

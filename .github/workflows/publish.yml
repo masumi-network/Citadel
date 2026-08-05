@@ -45,13 +45,16 @@ jobs:
           assert webui.joinpath("index.html").is_file()
           assert webui.joinpath("404.html").is_file()
           assert webui.joinpath("_next").is_dir()
+          assert files("kb").joinpath("retrieval_eval.py").is_file()
 
           sdist = next(Path("dist").glob("*.tar.gz"))
           with tarfile.open(sdist, "r:gz") as archive:
               names = set(archive.getnames())
           assert any(name.endswith("/kb/webui/index.html") for name in names)
-          print("release artifact webui payload verified")
+          assert any(name.endswith("/kb/retrieval_eval.py") for name in names)
+          print("release artifact webui and benchmark payload verified")
           PY
+          "$venv/bin/citadel" bench --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: dist

@@ -151,10 +151,9 @@ class Citadel:
 
         cognee breaks words on a single space and on sentence endings only, so one
         line of minified output is one word to it. A word over the budget either
-        raises ``ValueError`` out of ``chunk_by_sentence`` — which ``run_tasks``
-        escalates into a failure of the entire dataset's pipeline run, so one
-        document blocks every other document in that dataset from being indexed —
-        or is emitted verbatim as an over-budget chunk that the embedder truncates.
+        raises ``ValueError`` out of ``chunk_by_sentence`` or is emitted as an
+        over-budget chunk. The pre-storage validator below catches the latter
+        before ``cognee.add`` can create durable state.
 
         The choice here is refuse and record, not split. A splitter that edits
         content to make it fit has already corrupted two of this project's own
@@ -169,7 +168,25 @@ class Citadel:
             return None
         span = chunk_window.check_chunkable(data)
         if span is None:
-            return None
+            try:
+                violation = chunk_window.validate_cognee_chunk_budget(data)
+            except chunk_window.ChunkBudgetValidationError as exc:
+                logger.error(
+                    "Ingest refused for dataset %s: final chunk budget could not "
+                    "be verified (%s)",
+                    safe_log_value(dataset),
+                    safe_log_value(str(exc)),
+                )
+                return "chunk_budget_unmeasured"
+            if violation is None:
+                return None
+            logger.warning(
+                "Ingest refused for dataset %s: final Cognee chunk violates its "
+                "budget (%s)",
+                safe_log_value(dataset),
+                safe_log_value(violation.describe()),
+            )
+            return "chunk_budget_violation"
         # The dataset name arrives from the caller and is not constrained to a
         # charset anywhere on the way here, so it is escaped before it goes into a
         # line this project later reads back as evidence (CodeQL py/log-injection).

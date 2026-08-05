@@ -854,7 +854,11 @@ async def _cognify(args: argparse.Namespace) -> None:
     from kb.service import Citadel
 
     kb = Citadel.from_env()
-    result = await kb.cognify_dataset(dataset=args.dataset, verify=args.verify)
+    result = await kb.cognify_dataset(
+        dataset=args.dataset,
+        verify=args.verify,
+        force=args.force,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -904,6 +908,13 @@ async def _learn(args: argparse.Namespace) -> None:
     )
     _print_json(result)
     return _result_exit(result)
+
+
+async def _bench(args: argparse.Namespace) -> int:
+    """Run the packaged retrieval benchmark without server dependencies."""
+    from kb.retrieval_eval import main as retrieval_eval_main
+
+    return retrieval_eval_main(list(getattr(args, "bench_args", None) or ["run"]))
 
 
 def _parse_root_arg(raw: str) -> tuple[str, tuple[str, ...]]:
@@ -3176,6 +3187,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ingest a unique marker, cognify, and confirm it lands in the graph",
     )
+    cognify.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess the whole dataset when Cognee reports it already processed",
+    )
     cognify.set_defaults(handler=_cognify)
 
     sync_github = subcommands.add_parser(
@@ -3213,6 +3229,18 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("--hide-digest-preview", action="store_true")
     learn.set_defaults(handler=_learn)
 
+    bench = subcommands.add_parser(
+        "bench",
+        add_help=False,
+        help="Run the frozen retrieval benchmark (run, lint, compare, or report)",
+    )
+    bench.add_argument(
+        "bench_args",
+        nargs=argparse.REMAINDER,
+        help="Benchmark arguments; defaults to `run`",
+    )
+    bench.set_defaults(handler=_bench)
+
     return parser
 
 
@@ -3221,7 +3249,11 @@ def main() -> None:
 
     configure_logging()
     parser = build_parser()
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if getattr(args, "command", None) == "bench":
+        args.bench_args.extend(unknown)
+    elif unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     # One Ctrl-C guard around every dispatch path (first-run onboarding + handlers)
     # so quitting a prompt exits cleanly (130) instead of dumping a traceback.
     # SystemExit (carrying handler return codes) is a different type and propagates.
