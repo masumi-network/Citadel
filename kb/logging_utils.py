@@ -6,6 +6,19 @@ import re
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+COGNEE_LOG_LEVEL_ENV = "CITADEL_COGNEE_LOG_LEVEL"
+DEFAULT_COGNEE_LOG_LEVEL = "WARNING"
+
+# Cognee 1.2.x and its task/retriever helpers emit high-volume INFO records.
+# Keep the names explicit because some helpers log outside the ``cognee.*``
+# namespace. WARNING and above still pass through to the hosted log sink.
+COGNEE_LOGGER_NAMES = (
+    "cognee",
+    "cognee.shared.logging_utils",
+    "run_tasks_base",
+    "ChunksRetriever",
+    "OntologyAdapter",
+)
 
 # Everything left in C0/C1 once the three that have readable escapes are handled.
 # \x09 (tab) and \x0a (newline) are excluded from the range because the explicit
@@ -40,6 +53,26 @@ def safe_log_value(value: object, *, limit: int = DEFAULT_LOG_VALUE_LIMIT) -> st
 def resolve_log_level(value: str | None = None) -> str:
     level = (value or os.getenv("CITADEL_LOG_LEVEL") or "INFO").strip().upper()
     return level if level in VALID_LEVELS else "INFO"
+
+
+def resolve_cognee_log_level(value: str | None = None) -> str:
+    level = (
+        value or os.getenv(COGNEE_LOG_LEVEL_ENV) or DEFAULT_COGNEE_LOG_LEVEL
+    ).strip().upper()
+    return level if level in VALID_LEVELS else DEFAULT_COGNEE_LOG_LEVEL
+
+
+def configure_cognee_logging(level: str | None = None) -> None:
+    """Bound Cognee's noisy loggers without changing Citadel's root level.
+
+    Cognee installs its structlog handler during import, so this is called after
+    import and may safely run again for each client operation. An explicit
+    ``CITADEL_COGNEE_LOG_LEVEL`` can restore INFO or DEBUG for diagnosis.
+    """
+    resolved = resolve_cognee_log_level(level)
+    numeric_level = logging.getLevelNamesMapping()[resolved]
+    for name in COGNEE_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(numeric_level)
 
 
 def configure_logging(level: str | None = None) -> None:

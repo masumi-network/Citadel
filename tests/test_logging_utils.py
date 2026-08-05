@@ -3,8 +3,11 @@ import logging
 import pytest
 
 from kb.logging_utils import (
+    COGNEE_LOGGER_NAMES,
     VALID_LEVELS,
+    configure_cognee_logging,
     configure_logging,
+    resolve_cognee_log_level,
     resolve_log_level,
     safe_log_value,
 )
@@ -63,6 +66,49 @@ def test_configure_logging_is_idempotent_on_handlers(restore_root, monkeypatch):
     configure_logging("info")  # second call must not add another handler
     assert len(restore_root.handlers) == 1
     assert restore_root.level == logging.INFO
+
+
+@pytest.fixture
+def restore_cognee_loggers():
+    loggers = {name: logging.getLogger(name) for name in COGNEE_LOGGER_NAMES}
+    levels = {name: logger.level for name, logger in loggers.items()}
+    yield loggers
+    for name, level in levels.items():
+        loggers[name].setLevel(level)
+
+
+def test_resolve_cognee_defaults_to_warning(monkeypatch):
+    monkeypatch.delenv("CITADEL_COGNEE_LOG_LEVEL", raising=False)
+    assert resolve_cognee_log_level() == "WARNING"
+
+
+def test_resolve_cognee_reads_env_and_invalid_values_fail_closed(monkeypatch):
+    monkeypatch.setenv("CITADEL_COGNEE_LOG_LEVEL", "debug")
+    assert resolve_cognee_log_level() == "DEBUG"
+    assert resolve_cognee_log_level("verbose") == "WARNING"
+
+
+def test_configure_cognee_logging_scopes_threshold_to_named_loggers(
+    restore_cognee_loggers, monkeypatch
+):
+    monkeypatch.delenv("CITADEL_COGNEE_LOG_LEVEL", raising=False)
+    configure_cognee_logging()
+
+    assert all(
+        logger.level == logging.WARNING
+        for logger in restore_cognee_loggers.values()
+    )
+
+
+def test_configure_cognee_logging_allows_explicit_diagnostics(
+    restore_cognee_loggers, monkeypatch
+):
+    monkeypatch.delenv("CITADEL_COGNEE_LOG_LEVEL", raising=False)
+    configure_cognee_logging("debug")
+
+    assert all(
+        logger.level == logging.DEBUG for logger in restore_cognee_loggers.values()
+    )
 
 
 # --------------------------------------------------------------------------

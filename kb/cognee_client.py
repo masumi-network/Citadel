@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
+from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +485,10 @@ class CogneePublicClient:
         return attach(data)
 
     async def _ensure_cognee_ready(self, cognee: Any) -> None:
+        # Cognee configures structlog on import and emits high-volume INFO
+        # records during cognify/search. Apply Citadel's scoped threshold after
+        # that setup, without hiding Citadel's own INFO records.
+        configure_cognee_logging()
         if self._startup_migrations_done:
             return
         run_startup_migrations = getattr(cognee, "run_startup_migrations", None)

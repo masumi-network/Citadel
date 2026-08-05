@@ -48,6 +48,12 @@ SYSTEM_ROOT_DIRECTORY=/data/.cognee_system
 DATA_ROOT_DIRECTORY=/data/.data_storage
 ```
 
+Citadel keeps its own logs at `CITADEL_LOG_LEVEL` and applies a separate
+threshold to Cognee's high-volume task and retrieval loggers. The default
+`CITADEL_COGNEE_LOG_LEVEL=WARNING` preserves warnings and failures without
+flooding Railway's log ingestion. Temporarily set it to `INFO` or `DEBUG` for
+diagnosis, then restore `WARNING`.
+
 Enable pgvector before production ingest:
 
 ```sql
