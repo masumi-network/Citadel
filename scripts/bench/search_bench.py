@@ -32,6 +32,7 @@ Usage:
     python scripts/bench/search_bench.py run --repeats 3 --out scripts/bench/runs/latest.json
     python scripts/bench/search_bench.py run --baseline previous_run.json
     python scripts/bench/search_bench.py lint
+    python scripts/bench/search_bench.py lint --ground-truth scripts/bench/ground_truth_ci
     python scripts/bench/search_bench.py compare run_a.json run_b.json
     python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
 
@@ -1959,7 +1960,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    problems, notes = lint_questions(Path(args.questions), GROUND_TRUTH)
+    problems, notes = lint_questions(
+        Path(args.questions), Path(args.ground_truth)
+    )
     for note in notes:
         print(note)
     if problems:
@@ -2363,6 +2366,11 @@ def main(argv: list[str] | None = None) -> int:
 
     lint_parser = sub.add_parser("lint", help="validate every answer span")
     lint_parser.add_argument("--questions", default=str(DEFAULT_QUESTIONS))
+    lint_parser.add_argument(
+        "--ground-truth",
+        default=str(GROUND_TRUTH),
+        help="directory of cached source bodies used to validate spans",
+    )
     lint_parser.set_defaults(func=cmd_lint)
 
     compare_parser = sub.add_parser("compare", help="compare two saved runs")

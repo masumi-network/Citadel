@@ -575,6 +575,13 @@ class TestLint:
         problems, _ = sb.lint_questions(path, gt)
         assert problems == []
 
+    def test_cmd_lint_accepts_explicit_ground_truth_path(self, tmp_path, capsys):
+        path, gt = self._write_golden(tmp_path, [self._q()])
+        assert sb.main(
+            ["lint", "--questions", str(path), "--ground-truth", str(gt)]
+        ) == 0
+        assert "lint OK: 1 question(s)" in capsys.readouterr().out
+
     def test_span_absent_from_body_fails(self, tmp_path):
         path, gt = self._write_golden(
             tmp_path, [self._q(answer_spans=["this sentence exists nowhere at all"])]

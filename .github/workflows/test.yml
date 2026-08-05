@@ -112,13 +112,18 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: |
+          uv python install 3.12
+          uv python pin 3.12
 
       - name: Install dependencies
-        run: uv sync --locked --all-extras --dev
+        run: uv sync --locked --dev
 
       - name: Validate benchmark fixtures
-        run: uv run python scripts/bench/search_bench.py lint
+        run: >-
+          uv run python scripts/bench/search_bench.py lint
+          --questions scripts/bench/golden_questions_ci.json
+          --ground-truth scripts/bench/ground_truth_ci
 
   web:
     name: frontend export

@@ -20,6 +20,19 @@ python scripts/bench/search_bench.py compare run_a.json run_b.json
 python scripts/bench/search_bench.py report scripts/bench/runs/latest.json --markdown
 ```
 
+The merge gate uses a small tracked fixture set that is safe to validate in a
+clean checkout:
+
+```bash
+python scripts/bench/search_bench.py lint \
+  --questions scripts/bench/golden_questions_ci.json \
+  --ground-truth scripts/bench/ground_truth_ci
+```
+
+The full `golden_questions.json` set still uses the private, gitignored
+`ground_truth/` cache. Refresh that cache with `fetch_ground_truth.py` before a
+local retrieval benchmark or full lint run.
+
 Write run JSONs only under `scripts/bench/runs/`. That directory is
 gitignored; a bare `runs/` from the repo root is not the same place, and a
 run JSON enumerates every served hit identity, so it must never be committed

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "questions": [
+    {
+      "id": "ci-q01",
+      "question": "Which invariant does this fixture check?",
+      "expect_any": [
+        "citadel-ci/fixtures/retrieval.md"
+      ],
+      "category": "ci_fixture",
+      "expected_recall": 1,
+      "answer_spans": [
+        "This synthetic fixture verifies that tracked benchmark input can be validated in a clean checkout."
+      ]
+    },
+    {
+      "id": "ci-probe",
+      "question": "Where should a benchmark credential be stored?",
+      "expect_any": [],
+      "category": "ci_probe",
+      "expected_recall": 0,
+      "blocked_pattern": "citadel_access_token"
+    }
+  ],
+  "frozen": {
+    "frozen_at": "2026-08-05",
+    "policy": "Editing this CI fixture set requires an intentional pin update.",
+    "questions_sha256": "4a680caabf667c58e1d75cfdd816b5aa26f1f5d51e9d84fb39f1987475b88ab9"
+  }
+}
