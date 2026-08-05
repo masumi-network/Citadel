@@ -517,6 +517,15 @@ async def lifespan(app: FastAPI) -> Any:
 # Single-source the service version so /.well-known/citadel.json and the CLI
 # never drift. The Railway node runs from source, and editable environments can
 # retain stale distribution metadata after a version bump.
+def _runtime_build_id() -> str | None:
+    """Return deployment identity without guessing when the platform omits it."""
+    for name in ("RAILWAY_GIT_COMMIT_SHA", "CITADEL_BUILD_ID"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
 app = FastAPI(
     title="Citadel Archive",
     version=_SERVICE_VERSION,
@@ -4262,6 +4271,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         "ok": True,
         "service": "Citadel Archive",
         "version": app.version,
+        "build_id": _runtime_build_id(),
         "healthy": True,
         "sources": sources,
         "totals": {
@@ -4286,6 +4296,7 @@ async def citadel_discovery_manifest(request: Request, response: Response) -> di
             "name": "Citadel Archive",
             "kind": "organization_vault",
             "version": app.version,
+            "build_id": _runtime_build_id(),
             "base_url": base,
         },
         "public_endpoints": {
