@@ -80,9 +80,16 @@ def test_cognify_mode_runs_cognify_without_verify(monkeypatch: Any) -> None:
     calls: list[dict[str, Any]] = []
 
     class FakeCitadel:
-        async def cognify_dataset(self, *, dataset: Any, verify: bool) -> dict[str, Any]:
-            calls.append({"dataset": dataset, "verify": verify})
-            return {"ok": True, "dataset": dataset, "graph_grew": True, "verify": verify}
+        async def cognify_dataset(
+            self, *, dataset: Any, verify: bool, force: bool
+        ) -> dict[str, Any]:
+            calls.append({"dataset": dataset, "verify": verify, "force": force})
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "graph_grew": True,
+                "verify": verify,
+            }
 
     import kb.service as service
 
@@ -90,7 +97,26 @@ def test_cognify_mode_runs_cognify_without_verify(monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_COGNIFY_DATASET", raising=False)
 
     assert run_railway.run("cognify") == 0
-    assert calls == [{"dataset": None, "verify": False}]
+    assert calls == [{"dataset": None, "verify": False, "force": False}]
+
+
+def test_cognify_mode_passes_force_and_fails_on_top_level_false(monkeypatch: Any) -> None:
+    calls: list[bool] = []
+
+    class FakeCitadel:
+        async def cognify_dataset(
+            self, *, dataset: Any, verify: bool, force: bool
+        ) -> dict[str, Any]:
+            calls.append(force)
+            return {"ok": False, "dataset": dataset, "verify": verify, "force": force}
+
+    import kb.service as service
+
+    monkeypatch.setattr(service.Citadel, "from_env", classmethod(lambda cls: FakeCitadel()))
+    monkeypatch.setenv("CITADEL_COGNIFY_FORCE", "true")
+
+    assert run_railway.run("cognify") == 1
+    assert calls == [True]
 
 
 def test_cognify_stage_refuses_in_process_when_scheduler_enabled(monkeypatch: Any) -> None:
@@ -110,12 +136,15 @@ def test_cognify_stage_refuses_in_process_when_scheduler_enabled(monkeypatch: An
 
 def test_cognify_verify_mode_fails_when_verification_fails(monkeypatch: Any) -> None:
     class FakeCitadel:
-        async def cognify_dataset(self, *, dataset: Any, verify: bool) -> dict[str, Any]:
+        async def cognify_dataset(
+            self, *, dataset: Any, verify: bool, force: bool
+        ) -> dict[str, Any]:
             return {
                 "ok": True,
                 "dataset": dataset,
                 "graph_grew": False,
                 "verify": verify,
+                "force": force,
                 "verification": {"ok": False, "search_hit": False, "graph_grew": False},
             }
 
@@ -375,7 +404,7 @@ def test_cognify_stage_routes_to_api_when_target_url_set(monkeypatch: Any) -> No
         api_calls.append((url, force))
         return 0
 
-    def fail_mode(*, verify: bool) -> int:
+    def fail_mode(*, verify: bool, force: bool) -> int:
         raise AssertionError("cognify must go through the API, not asyncio.run")
 
     monkeypatch.setattr(run_railway, "_cognify_via_api", fake_api)
@@ -390,7 +419,7 @@ def test_cognify_stage_runs_in_process_without_target_url(monkeypatch: Any) -> N
 
     mode_calls: list[bool] = []
 
-    def fake_mode(*, verify: bool) -> int:
+    def fake_mode(*, verify: bool, force: bool) -> int:
         mode_calls.append(verify)
         return 0
 
@@ -434,6 +463,25 @@ def test_cognify_via_api_posts_to_endpoint(monkeypatch: Any) -> None:
 
 def test_cognify_via_api_fails_without_admin_key(monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
+    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
+
+
+def test_cognify_via_api_fails_when_response_reports_failure(monkeypatch: Any) -> None:
+    import urllib.request
+
+    class _FakeResp:
+        def __enter__(self) -> "_FakeResp":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": false, "error": "cognify failed"}'
+
+    monkeypatch.setenv("CITADEL_ADMIN_KEY", "admin-key")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: _FakeResp())
+
     assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
 
 

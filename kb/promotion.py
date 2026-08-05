@@ -27,6 +27,7 @@ from typing import Any
 
 from kb.access import AccessIdentity, AccessStore, is_seat_dataset, now_iso
 from kb.config import CitadelConfig
+from kb.document_provenance import promotion_provenance
 from kb.learning import LearningProcess
 from kb.llm_enrichment import (
     default_llm_model,
@@ -529,6 +530,8 @@ class PromotionEngine:
         seat_dataset: str,
         identity: AccessIdentity,
         proposal: ProposedPromotion,
+        *,
+        provenance_actor: AccessIdentity | None = None,
     ) -> str:
         """Promote one qualifying item via the org-ready dual-write path.
 
@@ -559,6 +562,14 @@ class PromotionEngine:
         if proposal.reference_status:
             promotion_tags.append(f"promotion-ref:{proposal.reference_status}")
 
+        provenance_identity = provenance_actor or identity
+        promoted_at = now_iso()
+        provenance = promotion_provenance(
+            promoted_by=provenance_identity.actor_id,
+            promoted_at=promoted_at,
+            source_dataset=seat_dataset,
+        )
+
         central = None
         try:
             targets = resolve_write_targets(
@@ -574,6 +585,7 @@ class PromotionEngine:
                 targets=targets,
                 tags=promotion_tags,
                 session_id=None,
+                provenance=provenance,
                 operation="promotion",
             )
         except SecretContentError as exc:
@@ -652,6 +664,8 @@ class PromotionEngine:
                 "tags": promotion_tags,
                 "reference_status": proposal.reference_status,
                 "capture_tags": list(proposal.capture_tags),
+                "promoted_by": provenance["promoted_by"],
+                "promoted_at": promoted_at,
             },
         )
         return "promoted"
@@ -832,7 +846,12 @@ class PromotionEngine:
             reference_status=item.reference_status,
         )
         identity = self._promotion_identity(item.seat_dataset)
-        outcome = await self._promote(item.seat_dataset, identity, proposal)
+        outcome = await self._promote(
+            item.seat_dataset,
+            identity,
+            proposal,
+            provenance_actor=actor,
+        )
         promoted = outcome == "promoted"
         decided = self.access_store.decide_promotion_pending(
             item_id,

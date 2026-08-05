@@ -197,7 +197,9 @@ async def test_rehydrate_seeds_graph_and_timestamp_not_counters() -> None:
     assert len(source_nodes) == 2
     assert {node["label"] for node in repo_nodes} == {"one", "two"}
     graph_index = next(index for index in snapshot["indexes"] if index["id"] == "graph")
-    assert graph_index["records"] > 0
+    assert graph_index["records"] is None
+    assert graph_index["scope"] == "not_measured"
+    assert snapshot["stats"]["nodes"] > 0
 
 
 async def test_rehydrate_baseline_then_live_ingest_does_not_double_count() -> None:
@@ -341,7 +343,7 @@ async def test_snapshot_reports_authoritative_corpus_totals() -> None:
 
 @pytest.mark.asyncio
 async def test_snapshot_falls_back_when_corpus_is_unavailable() -> None:
-    """_corpus_health fails soft and returns None counts; do not report None."""
+    """MeshState keeps local counts when corpus totals are unavailable."""
     config = CitadelConfig()
     mesh = MeshState()
     mesh.documents = 4

@@ -45,9 +45,24 @@ async def test_graph_maps_cognee_tuples_to_nodes_and_edges() -> None:
     assert graph["ok"] is True
     assert graph["fallback"] is False
     assert graph["nodes"] == [
-        {"id": "node-1", "label": "Citadel", "type": "Entity"},
-        {"id": "node-2", "label": "Cognee", "type": "Tool"},
-        {"id": "node-3", "label": "node-3", "type": "node"},
+        {
+            "id": "node-1",
+            "label": "Citadel",
+            "type": "Entity",
+            "trust_tier": "unattested",
+        },
+        {
+            "id": "node-2",
+            "label": "Cognee",
+            "type": "Tool",
+            "trust_tier": "unattested",
+        },
+        {
+            "id": "node-3",
+            "label": "node-3",
+            "type": "node",
+            "trust_tier": "unattested",
+        },
     ]
     assert {"source": "node-1", "target": "node-2", "relationship": "uses"} in graph["edges"]
     # Empty relationship names fall back to "related"; dangling edges are dropped.
@@ -139,15 +154,20 @@ class FakeDatasetGateway(FakeGraphGateway):
         *,
         dataset_map: dict[str, list[str]] | None = None,
         map_error: Exception | None = None,
+        provenance_map: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(nodes, edges)
         self.dataset_map = dataset_map or {}
         self.map_error = map_error
+        self.provenance_map = provenance_map or {}
 
     async def node_dataset_map(self) -> dict[str, list[str]]:
         if self.map_error:
             raise self.map_error
         return self.dataset_map
+
+    async def node_provenance_map(self) -> dict[str, dict[str, Any]]:
+        return self.provenance_map
 
 
 DOC_NODES = [
@@ -269,6 +289,51 @@ async def test_graph_attributes_datasets_through_gateway() -> None:
     doc = next(node for node in graph["nodes"] if node["id"] == "doc-1")
     assert doc["dataset"] == "seat:alice"
     assert any(node["id"] == "dataset:seat:alice" for node in graph["nodes"])
+
+
+def test_graph_projects_server_provenance_to_document_and_chunks() -> None:
+    payload = build_graph_payload(
+        DOC_NODES,
+        DOC_EDGES,
+        provenance_map={
+            "doc-1": {
+                "kind": "promotion",
+                "trust_tier": "unattested",
+                "promoted_by": "operator-1",
+                "promoted_at": "2026-08-05T10:00:00+00:00",
+            }
+        },
+    )
+
+    doc = next(node for node in payload["nodes"] if node["id"] == "doc-1")
+    chunk = next(node for node in payload["nodes"] if node["id"] == "chunk-1")
+    assert doc["trust_tier"] == "unattested"
+    assert doc["promoted_by"] == "operator-1"
+    assert doc["promoted_at"] == "2026-08-05T10:00:00+00:00"
+    assert chunk["promoted_by"] == "operator-1"
+    assert chunk["promoted_at"] == "2026-08-05T10:00:00+00:00"
+
+
+async def test_graph_reads_server_provenance_from_gateway() -> None:
+    mesh = KnowledgeMesh(
+        FakeDatasetGateway(
+            DOC_NODES,
+            DOC_EDGES,
+            provenance_map={
+                "doc-1": {
+                    "kind": "promotion",
+                    "promoted_by": "operator-1",
+                    "promoted_at": "2026-08-05T10:00:00+00:00",
+                }
+            },
+        )
+    )
+
+    graph = await mesh.graph()
+
+    doc = next(node for node in graph["nodes"] if node["id"] == "doc-1")
+    assert doc["promoted_by"] == "operator-1"
+    assert doc["trust_tier"] == "unattested"
 
 
 async def test_graph_dataset_map_failure_degrades_to_plain_graph() -> None:

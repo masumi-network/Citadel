@@ -27,6 +27,7 @@ def clean_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "CITADEL_LLM_ENRICHMENT_ENABLED",
         "CITADEL_LLM_ENRICHMENT_THRESHOLD_CHARS",
+        "CITADEL_DETERMINISTIC_CHUNK_CHARS",
         "CITADEL_LLM_MODEL",
         "OPENROUTER_API_KEY",
         "LLM_API_KEY",
@@ -48,11 +49,122 @@ LONG_MATERIAL = (
 def test_paragraph_chunks_split_on_blank_lines_and_respect_max_chars() -> None:
     chunks = paragraph_chunks(LONG_MATERIAL, max_chars=60)
 
-    assert len(chunks) == 2
+    assert len(chunks) == 3
     assert chunks[0].startswith("First paragraph")
     assert chunks[1].startswith("Second paragraph")
+    assert chunks[1] + chunks[2] == LONG_MATERIAL.split("\n\n", 1)[1]
+    assert all(len(chunk) <= 60 for chunk in chunks)
     # Small paragraphs are grouped back together under a large cap.
     assert paragraph_chunks(LONG_MATERIAL, max_chars=10_000) == [LONG_MATERIAL]
+
+
+def test_paragraph_chunks_split_oversized_paragraphs_without_dropping_text() -> None:
+    material = "row one\nrow two\n" + ("x" * 31)
+
+    chunks = paragraph_chunks(material, max_chars=12)
+
+    assert all(len(chunk) <= 12 for chunk in chunks)
+    assert "".join(chunks) == material
+
+
+def test_deterministic_source_chunks_preserve_whitespace_and_unicode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_CHUNK_BUDGET_TOKENS", "32")
+    data = "  α\n\n界界界\t" + ("emoji 🧭 " * 60) + "  "
+
+    chunks = llm_enrichment.deterministic_source_chunks(data, max_chars=1200)
+
+    assert "".join(chunks) == data
+    assert len(chunks) > 1
+    assert all(
+        llm_enrichment._count_bpe(chunk) <= 32
+        for chunk in chunks
+        if llm_enrichment._count_bpe(chunk) is not None
+    )
+
+
+def test_deterministic_source_chunks_repeat_repo_header() -> None:
+    prefix = (
+        "# org/repo/README.md\n\n"
+        "Repository: org/repo\n"
+        "Source: https://github.com/org/repo/blob/main/README.md\n"
+        "Commit: abc\n"
+        "Blob: def\n"
+        "\n---\n\n"
+    )
+    body = "first body line\nsecond body line\n" + ("z" * 40)
+
+    chunks = llm_enrichment.deterministic_source_chunks(
+        prefix + body,
+        max_chars=150,
+    )
+
+    assert len(chunks) > 1
+    assert all(chunk.startswith(prefix) for chunk in chunks)
+    assert "".join(chunk[len(prefix) :] for chunk in chunks) == body
+
+
+def test_repo_header_over_chunk_limit_fails_closed() -> None:
+    prefix = (
+        "# org/repo/README.md\n\n"
+        "Repository: org/repo\n"
+        "Source: https://github.com/org/repo/blob/main/README.md\n"
+        "Commit: abc\n"
+        "Blob: def\n"
+        "\n---\n\n"
+    )
+
+    with pytest.raises(ValueError, match="provenance header exceeds"):
+        llm_enrichment.deterministic_source_chunks(prefix + "body", max_chars=10)
+
+
+def test_deterministic_chunks_survive_cognee_paragraph_chunking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    from cognee.tasks.chunks import chunk_by_paragraph
+
+    chunk_by_sentence_module = importlib.import_module(
+        "cognee.tasks.chunks.chunk_by_sentence"
+    )
+
+    monkeypatch.setenv("CITADEL_CHUNK_BUDGET_TOKENS", "256")
+    encoding = llm_enrichment.chunk_window._bpe_encoding()
+    assert encoding is not None
+    monkeypatch.setattr(
+        chunk_by_sentence_module,
+        "get_word_size",
+        lambda text: len(encoding.encode(text)),
+    )
+
+    prefix = (
+        "# org/repo/notes.md\n\n"
+        "Repository: org/repo\n"
+        "Source: https://github.com/org/repo/blob/main/notes.md\n"
+        "Commit: abc\n"
+        "Blob: def\n"
+        "\n---\n\n"
+    )
+    data = prefix + ("semantic retrieval details " * 500)
+    chunks = llm_enrichment.deterministic_source_chunks(data)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        downstream = list(chunk_by_paragraph(chunk, max_chunk_size=256))
+        assert len(downstream) == 1
+        assert downstream[0]["text"] == chunk
+        assert downstream[0]["chunk_size"] <= 256
+
+
+def test_markdown_horizontal_rule_is_not_treated_as_repo_header() -> None:
+    data = "# Plain note\n\n---\n\n" + ("body " * 80)
+
+    chunks = llm_enrichment.deterministic_source_chunks(data, max_chars=40)
+
+    assert len(chunks) > 1
+    assert not any(chunk.startswith("# Plain note\n\n---\n\n# Plain note") for chunk in chunks)
 
 
 def test_disabled_enrichment_is_a_pure_passthrough() -> None:
@@ -206,6 +318,8 @@ class RecordingCitadel:
 
     def __init__(self) -> None:
         self.ingest_calls: list[dict[str, Any]] = []
+        self.cognify_calls: list[list[str]] = []
+        self.cognee = self
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})
@@ -213,6 +327,9 @@ class RecordingCitadel:
 
     async def improve(self, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True}
+
+    def schedule_cognify(self, datasets: list[str]) -> None:
+        self.cognify_calls.append(datasets)
 
 
 async def test_learning_process_ingests_enriched_chunks_with_merged_tags(
@@ -236,6 +353,7 @@ async def test_learning_process_ingests_enriched_chunks_with_merged_tags(
     snapshot = await mesh.snapshot(citadel.config)
 
     assert len(citadel.ingest_calls) == 2
+    assert citadel.cognify_calls == [["notes"]]
     assert citadel.ingest_calls[0]["data"] == "Summary: First part\n\nChunk one"
     assert citadel.ingest_calls[0]["tags"] == ["team", "alpha"]
     assert citadel.ingest_calls[1]["tags"] == ["team", "beta"]
@@ -263,6 +381,21 @@ async def test_learning_process_keeps_single_ingest_when_enrichment_disabled() -
     assert citadel.ingest_calls[0]["data"] == "Plain note"
     assert result.enrichment is None
     assert result.chunk_ingests == ()
+
+
+async def test_learning_process_bounds_long_plain_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_DETERMINISTIC_CHUNK_CHARS", "32")
+    citadel = RecordingCitadel()
+    learning = LearningProcess(citadel)
+
+    result = await learning.learn("line one\nline two\n" + ("z" * 80))
+
+    assert result.accepted_chunks > 1
+    assert len(citadel.ingest_calls) == result.accepted_chunks
+    assert all(len(call["data"]) <= 32 for call in citadel.ingest_calls)
+    assert citadel.cognify_calls == [["notes"]]
 
 
 async def test_learning_process_survives_enrichment_explosions(

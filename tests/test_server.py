@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import hmac
 import json
@@ -62,6 +63,9 @@ class FakeCitadel:
 
     async def improve(self, **kwargs: Any) -> dict[str, Any]:
         return {"dataset": kwargs["dataset"], "session_ids": kwargs["session_ids"]}
+
+    async def _graph_counts(self) -> dict[str, int]:
+        return {"nodes": 280, "edges": 514}
 
     async def cognify_dataset(self, *, dataset: Any = None, verify: bool = False, force: bool = False) -> dict[str, Any]:
         return {
@@ -273,7 +277,44 @@ def test_healthz() -> None:
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "service": "citadel"}
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["service"] == "citadel"
+    assert payload["version"] == app.version
+    assert set(payload["build"]) == {"commit_sha", "deployment_id", "branch"}
+
+
+def test_healthz_reports_railway_build_identity_without_secrets(monkeypatch: Any) -> None:
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "abc123")
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "deployment-7")
+    monkeypatch.setenv("RAILWAY_GIT_BRANCH", "release/v0.5.0")
+    monkeypatch.setenv("CITADEL_ACCESS_TOKEN", "must-not-appear")
+
+    payload = TestClient(app).get("/healthz").json()
+
+    assert payload["build"] == {
+        "commit_sha": "abc123",
+        "deployment_id": "deployment-7",
+        "branch": "release/v0.5.0",
+    }
+    assert "must-not-appear" not in json.dumps(payload)
+
+
+def test_startup_cognify_recovery_enumerates_and_queues_datasets() -> None:
+    scheduled: list[list[str]] = []
+
+    class RecoveryGateway:
+        async def list_dataset_names(self) -> list[str]:
+            return ["seat:sarthi", "masumi-network", "seat:sarthi", None]  # type: ignore[list-item]
+
+        def schedule_cognify(self, datasets: list[str]) -> None:
+            scheduled.append(datasets)
+
+    client = SimpleNamespace(cognee=RecoveryGateway())
+    names = asyncio.run(server_module.schedule_startup_cognify_recovery(client))
+
+    assert names == ["seat:sarthi", "masumi-network"]
+    assert scheduled == [["seat:sarthi", "masumi-network"]]
 
 
 def test_security_headers_are_applied_to_http_responses() -> None:
@@ -411,7 +452,8 @@ def test_landing_flow_bundle_is_committed_and_served() -> None:
     assert styles.status_code == 200
     # esbuild is configured with globalName CitadelFlow; landing.js calls
     # window.CitadelFlow.mount() once the script has loaded.
-    assert script.text.startswith("var CitadelFlow=")
+    # esbuild may emit a strict-mode directive before the global export.
+    assert "var CitadelFlow=" in script.text[:128]
     assert ".react-flow" in styles.text
 
 
@@ -900,6 +942,12 @@ def test_no_vendor_name_on_user_facing_surfaces() -> None:
 def test_api_uses_configured_citadel_service() -> None:
     client = authed_client()
 
+    class EmptyRepoContentSyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_files": 0}
+
+    app.state.repo_content_syncer = EmptyRepoContentSyncer()
+
     ready = client.get("/readyz")
     ingest = client.post("/ingest", json={"data": "A useful note", "tags": ["research"]})
     search = client.post("/search", json={"query": "useful", "top_k": 3})
@@ -932,7 +980,9 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["tracked_sources"] == 1
+    # Corpus health sums the configured source status counts: 3 GitHub repos,
+    # 0 repo-content files, and 2 Linear issues.
+    assert mesh.json()["stats"]["tracked_sources"] == 5
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -1029,6 +1079,22 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     assert verify.status_code == 200
     assert verify.json()["verify"] is True
     assert verify.json()["verification"]["ok"] is True
+
+
+def test_cognify_run_fails_when_service_reports_failure() -> None:
+    class FailedCognifyCitadel(FakeCitadel):
+        async def cognify_dataset(
+            self, *, dataset: Any = None, verify: bool = False, force: bool = False
+        ) -> dict[str, Any]:
+            return {"ok": False, "error": "graph unavailable", "dataset": dataset}
+
+    client = authed_client()
+    app.state.citadel = FailedCognifyCitadel()
+
+    response = client.post("/api/cognify/run", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"] == "graph unavailable"
 
 
 def test_cognify_run_requires_admin() -> None:
@@ -2560,6 +2626,239 @@ def test_readyz_ok_when_graph_populated() -> None:
     ready = client.get("/readyz")
     assert ready.status_code == 200
     assert ready.json()["corpus"]["ok"] is True
+
+
+def test_readyz_requires_a_canary_when_scheduler_is_enabled(monkeypatch: Any) -> None:
+    class ScheduledCitadel(FakeCitadel):
+        config = replace(FakeCitadel.config, evolve_scheduler_enabled=True)
+
+    monkeypatch.setattr(server_module, "_LAST_CANARY", None)
+    client = authed_client("test-reader")
+    app.state.citadel = ScheduledCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["canary"] is None
+
+
+def test_readyz_rejects_a_failed_canary(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        server_module,
+        "_LAST_CANARY",
+        {"ok": False, "search_hit": False, "graph_grew": False, "error": "RuntimeError"},
+    )
+    client = authed_client("test-reader")
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+
+
+def test_readyz_reports_503_when_corpus_read_fails() -> None:
+    class BrokenGraphCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            raise RuntimeError("graph unavailable")
+
+    class HealthySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    client = authed_client("test-reader")
+    app.state.citadel = BrokenGraphCitadel()
+    app.state.github_syncer = HealthySyncer()
+    app.state.repo_content_syncer = HealthySyncer()
+    app.state.linear_syncer = HealthySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"] == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "graph unavailable",
+    }
+
+
+def test_readyz_does_not_use_unrelated_graph_nodes_as_corpus_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_documents": 2,
+                "probe_complete": True,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": False,
+            }
+
+    class GraphOnlyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_LAST_CANARY", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = GraphOnlyCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    corpus = ready.json()["corpus"]
+    assert corpus["ok"] is False
+    assert corpus["indexed_docs"] == 280
+    assert corpus["indexed_graph_nodes"] == 280
+    assert corpus["relational_documents"] == 2
+    assert corpus["probe_chunked_documents"] == 0
+    assert corpus["probe_graph_documents"] == 2
+    assert corpus["probe_fully_indexed_documents"] == 0
+    assert corpus["probe_ok"] is False
+
+
+def test_readyz_rejects_a_healthy_but_partial_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PartialCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 65,
+                "probe_limit": 64,
+                "probe_documents": 64,
+                "probe_complete": False,
+                "probe_chunked_documents": 64,
+                "probe_graph_documents": 64,
+                "probe_fully_indexed_documents": 64,
+                "probe_ok": True,
+            }
+
+    class PartialCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = PartialCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_LAST_CANARY", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = PartialCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"]["probe_complete"] is False
+    assert ready.json()["corpus"]["probe_ok"] is True
+
+
+def test_readyz_rejects_a_capped_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CappedCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 10001,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 0,
+                "probe_pages": 0,
+                "probe_complete": False,
+                "probe_cap_exceeded": True,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 0,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": False,
+            }
+
+    class CappedCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = CappedCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_LAST_CANARY", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = CappedCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    corpus = ready.json()["corpus"]
+    assert corpus["ok"] is False
+    assert corpus["probe_cap_exceeded"] is True
+    assert corpus["probe_complete"] is False
+    assert corpus["probe_ok"] is False
+
+
+def test_corpus_health_cache_is_shared_by_readyz_and_mesh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 1,
+                "probe_limit": 64,
+                "probe_documents": 1,
+                "probe_complete": True,
+                "probe_chunked_documents": 1,
+                "probe_graph_documents": 1,
+                "probe_fully_indexed_documents": 1,
+                "probe_ok": True,
+            }
+
+    class MeasuredCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_LAST_CANARY", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MeasuredCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/api/mesh").status_code == 200
+    assert calls == 1
 
 
 def test_search_across_datasets_runs_concurrently() -> None:
@@ -6629,9 +6928,8 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
 ) -> None:
     """A degraded corpus read must not blank the dashboard or 500.
 
-    `_corpus_health` is fail-soft and returns None totals on a transient graph
-    error. The endpoint has to survive that, because the alternative is that one
-    slow Kuzu read takes the whole dashboard down.
+    The endpoint still survives a degraded corpus payload, because a transient
+    Kuzu read must not take the dashboard down.
     """
     client = authed_client()
 

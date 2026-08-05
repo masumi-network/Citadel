@@ -14,12 +14,41 @@ from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
+from kb.document_provenance import parse_document_provenance
 
 logger = logging.getLogger(__name__)
 
 # Strong refs to detached background cognify tasks so the loop does not GC them
 # mid-flight (and so they can be awaited/observed in tests).
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
+
+
+async def drain_background_cognify_tasks(timeout_seconds: float = 30.0) -> None:
+    """Give queued cognify work a bounded shutdown window.
+
+    A task that outlives the web process leaves its durable add behind without
+    its graph/vector projection. The next boot recovery still repairs it, but a
+    graceful shutdown should first let the current batch finish.
+    """
+    tasks = [task for task in _BACKGROUND_COGNIFY_TASKS if not task.done()]
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+    if pending:
+        logger.warning(
+            "Cancelling %d background cognify task(s) after %.1fs shutdown window; "
+            "startup recovery will retry their datasets",
+            len(pending),
+            max(0.0, timeout_seconds),
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    # Retrieve exceptions from tasks that finished during the wait so the
+    # shutdown path does not emit an unobserved-task warning.
+    for task in done:
+        if not task.cancelled():
+            task.exception()
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -29,6 +58,27 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 10_000
+
+
+def _corpus_health_max_documents() -> int:
+    raw = os.getenv(
+        "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS",
+        str(DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        ) from exc
+    if value < 1:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        )
+    return value
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -88,6 +138,9 @@ NODE_DATASET_MAP_TIMEOUT_SECONDS = _float_env(
 # attribution, never to an empty vault.
 NODE_DATASET_MAP_FAILURE_TTL_SECONDS = _float_env(
     "CITADEL_NODE_DATASET_MAP_FAILURE_TTL_SECONDS", 5.0
+)
+NODE_PROVENANCE_MAP_TIMEOUT_SECONDS = _float_env(
+    "CITADEL_NODE_PROVENANCE_MAP_TIMEOUT_SECONDS", 5.0
 )
 # The whole-graph Kuzu read is expensive (5,382 nodes / 33,859 edges, ~0.3s+)
 # and is now front-loaded on every dashboard open. TTL-cache the RAW read so N
@@ -266,6 +319,7 @@ class CogneeGateway(Protocol):
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        provenance: dict[str, Any] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
         ...
@@ -305,6 +359,15 @@ class CogneeGateway(Protocol):
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         ...
 
+    async def list_dataset_names(self) -> list[str]:
+        ...
+
+    async def node_provenance_map(self) -> dict[str, dict[str, str]]:
+        ...
+
+    async def document_provenance(self, document_id: str) -> dict[str, str] | None:
+        ...
+
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         ...
 
@@ -312,6 +375,9 @@ class CogneeGateway(Protocol):
         ...
 
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
+        ...
+
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
         ...
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
@@ -507,13 +573,16 @@ class CogneePublicClient:
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        provenance: dict[str, Any] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
-        metadata = {"citadel_tags": list(tags)} if tags else None
+        metadata: dict[str, Any] = {"citadel_tags": list(tags)} if tags else {}
+        if provenance:
+            metadata["citadel_provenance"] = dict(provenance)
         # Durable knowledge writes always go to cognee's permanent graph
         # (add+cognify), never its per-session cache. When a session_id was
         # supplied, cognee routed the write into the session cache, which (a)
@@ -523,7 +592,7 @@ class CogneePublicClient:
         # scaffolded "Session ID:/Question:/Answer:" blob every sync cycle.
         # session_id is still accepted (callers pass it as provenance) but no
         # longer diverts the write away from the durable path.
-        data = self._data_with_metadata(data, metadata)
+        data = self._data_with_metadata(data, metadata or None)
 
         # Add is a fast write to the relational + vector stores; it does NOT touch
         # the Kuzu graph (cognify is the graph write). Metadata rides in the
@@ -854,6 +923,87 @@ class CogneePublicClient:
                 mapping.setdefault(str(data_id), []).append(dataset_name)
         return mapping
 
+    async def node_provenance_map(self) -> dict[str, dict[str, str]]:
+        """Return server-written provenance keyed by graph document id.
+
+        Cognee graph nodes do not expose ``Data.external_metadata``. Read the
+        durable relational column separately and fail soft to an empty map so a
+        metadata outage cannot turn a working graph into a 500 response.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._read_node_provenance_map(),
+                timeout=NODE_PROVENANCE_MAP_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - provenance is display metadata
+            logger.warning(
+                "node provenance map read failed; graph will show unattested nodes",
+                exc_info=True,
+            )
+            return {}
+
+    async def _read_node_provenance_map(self) -> dict[str, dict[str, str]]:
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        mapping: dict[str, dict[str, str]] = {}
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Data.id, Data.external_metadata).where(Data.owner_id == user.id)
+            )
+            for data_id, external_metadata in rows.all():
+                provenance = parse_document_provenance(external_metadata)
+                if provenance:
+                    mapping[str(data_id)] = provenance
+        return mapping
+
+    async def document_provenance(self, document_id: str) -> dict[str, str] | None:
+        """Read one document's validated provenance for drill-down responses."""
+        try:
+            data_id = UUID(str(document_id))
+        except (TypeError, ValueError):
+            return None
+        try:
+            self._prepare_cognee_environment()
+            import cognee
+
+            await self._ensure_cognee_ready(cognee)
+            from cognee.infrastructure.databases.relational import get_relational_engine
+            from cognee.modules.data.models import Data
+            from cognee.modules.users.methods import get_default_user
+
+            from sqlalchemy import select
+
+            user = await get_default_user()
+            engine = get_relational_engine()
+            async with engine.get_async_session() as session:
+                row = (
+                    await session.execute(
+                        select(Data.external_metadata).where(
+                            Data.id == data_id,
+                            Data.owner_id == user.id,
+                        )
+                    )
+                ).scalar_one_or_none()
+            provenance = parse_document_provenance(row)
+            return provenance or None
+        except Exception:  # noqa: BLE001 - drill-down metadata is best effort
+            logger.warning(
+                "document provenance read failed for %s",
+                document_id,
+                exc_info=True,
+            )
+            return None
+
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
 
@@ -1047,6 +1197,131 @@ class CogneePublicClient:
             "by_dataset_default_owner": by_dataset_default_owner,
         }
 
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
+        """Run a bounded keyset walk over relational projection state.
+
+        ``graph_data()`` can contain stale or unrelated nodes, so its node count
+        cannot prove that accepted relational documents have vector chunks. Walk
+        every relational row in bounded pages and join the existing vector and
+        graph presence checks for those exact ids. Missing measurements raise so
+        callers cannot turn an unavailable store into a healthy result.
+
+        The walk stops before exceeding ``CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS``.
+        A cap hit is an explicit non-ready result, not a partial success.
+        """
+        probe_limit = max(1, min(int(limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        empty_result = {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": 0,
+            "probe_pages": 0,
+            "probe_complete": False,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": 0,
+            "probe_graph_documents": 0,
+            "probe_fully_indexed_documents": 0,
+            "probe_ok": False,
+        }
+        if total_documents > max_documents:
+            return {**empty_result, "probe_cap_exceeded": True}
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        document_ids_seen: set[str] = set()
+        chunked_ids: set[str] = set()
+        graph_ids_seen: set[str] = set()
+        fully_indexed_ids: set[str] = set()
+        pages = 0
+
+        while len(document_ids_seen) < total_documents:
+            page_limit = min(
+                probe_limit,
+                max_documents - len(document_ids_seen),
+                total_documents - len(document_ids_seen),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=page_limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > page_limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            page_ids: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in document_ids_seen:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                document_ids_seen.add(document_id)
+                page_ids.append(document_id)
+            if len(document_ids_seen) > total_documents:
+                raise RuntimeError("corpus pages exceeded the reported document total")
+
+            chunk_counts = await self.corpus_chunk_counts(page_ids)
+            if chunk_counts is None:
+                raise RuntimeError("vector chunk measurement is unavailable")
+            graph_ids = await self.corpus_graph_presence(page_ids)
+            if graph_ids is None:
+                raise RuntimeError("graph presence measurement is unavailable")
+
+            graph_id_set = {str(document_id) for document_id in graph_ids}
+            page_chunked_ids = {
+                document_id
+                for document_id in page_ids
+                if int(chunk_counts.get(document_id, 0)) > 0
+            }
+            page_graph_ids = set(page_ids) & graph_id_set
+            chunked_ids.update(page_chunked_ids)
+            graph_ids_seen.update(page_graph_ids)
+            fully_indexed_ids.update(page_chunked_ids & page_graph_ids)
+            pages += 1
+
+            if len(document_ids_seen) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        probe_complete = len(document_ids_seen) == total_documents
+
+        return {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": len(document_ids_seen),
+            "probe_pages": pages,
+            "probe_complete": probe_complete,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": len(chunked_ids),
+            "probe_graph_documents": len(graph_ids_seen),
+            "probe_fully_indexed_documents": len(fully_indexed_ids),
+            "probe_ok": probe_complete
+            and bool(document_ids_seen)
+            and len(fully_indexed_ids) == len(document_ids_seen),
+        }
+
     async def corpus_chunk_counts(
         self, document_ids: list[str]
     ) -> dict[str, int] | None:
@@ -1188,6 +1463,23 @@ class CogneePublicClient:
             return False
         return was_missing
 
+    async def list_dataset_names(self) -> list[str]:
+        """Return the durable dataset names owned by the current Cognee user."""
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee import datasets as cognee_datasets
+
+        rows = await cognee_datasets.list_datasets()
+        return sorted(
+            {
+                str(getattr(row, "name", "") or "").strip()
+                for row in rows
+                if str(getattr(row, "name", "") or "").strip()
+            }
+        )
+
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
         """Delete nodes by id from BOTH the graph and the chunk vector store (#15).
 
@@ -1317,8 +1609,22 @@ class CogneePublicClient:
         doc_id = str(document_id)
         document = await self._document_from_graph(doc_id, follow_parent=True)
         if document is not None:
+            return await self._attach_document_provenance(document)
+        document = await self._document_from_chunk_store(doc_id)
+        if document is None:
+            return None
+        return await self._attach_document_provenance(document)
+
+    async def _attach_document_provenance(self, document: dict[str, Any]) -> dict[str, Any]:
+        """Add validated promotion fields to a drill-down document response."""
+        provenance = await self.document_provenance(str(document.get("id") or ""))
+        if not provenance:
             return document
-        return await self._document_from_chunk_store(doc_id)
+        result = dict(document)
+        metadata = dict(result.get("metadata") or {})
+        metadata.update(provenance)
+        result["metadata"] = metadata
+        return result
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
         """Owner node ids for the ADR-0009 drill-down visibility rule — WITHOUT

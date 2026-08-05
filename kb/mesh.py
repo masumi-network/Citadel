@@ -876,14 +876,22 @@ class MeshState:
                 "id": "graph",
                 "name": "Graph mesh",
                 "status": "active",
-                "records": len([node for node in self.nodes.values() if node["type"] != "index"]),
+                "records": None,
+                "scope": "not_measured",
+                "description": (
+                    "Graph total is reported in stats.nodes; the reader path does not measure it here."
+                ),
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
                 "id": "vector",
                 "name": "Vector index",
                 "status": "active",
-                "records": self.documents,
+                "records": None,
+                "scope": "not_measured",
+                "description": (
+                    "Vector chunk total requires the admin corpus census; the reader path does not measure it."
+                ),
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
@@ -891,6 +899,8 @@ class MeshState:
                 "name": "Feedback memory",
                 "status": "active",
                 "records": self.feedback_items,
+                "scope": "since_restart",
+                "description": "Feedback events recorded since this process started.",
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
@@ -898,6 +908,8 @@ class MeshState:
                 "name": "Global context",
                 "status": "enabled" if config.build_global_context_index else "standby",
                 "records": self.upgrades,
+                "scope": "since_restart",
+                "description": "Upgrade events recorded since this process started.",
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
         ]

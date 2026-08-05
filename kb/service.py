@@ -72,6 +72,7 @@ class Citadel:
         dataset: str | None = None,
         tags: Iterable[str] | None = None,
         session_id: str | None = None,
+        provenance: dict[str, Any] | None = None,
         defer_cognify: bool = False,
     ) -> IngestResult:
         target_dataset = dataset or self.config.default_dataset
@@ -115,6 +116,7 @@ class Citadel:
                 dataset_name=target_dataset,
                 session_id=session_id,
                 tags=merged_tags,
+                provenance=provenance,
                 defer_cognify=defer_cognify,
             )
         except BaseException:

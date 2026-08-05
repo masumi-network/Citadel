@@ -873,7 +873,7 @@ function renderSnapshot(snapshot) {
       item.innerHTML = `
         <div>
           <div class="index-name">${escapeHtml(index.name)}</div>
-          <div class="index-meta">${escapeHtml(index.records)} records</div>
+          <div class="index-meta">${escapeHtml(formatIndexRecords(index))}</div>
         </div>
         <span class="status-chip status-${escapeHtml(index.status)}">${escapeHtml(index.status)}</span>
       `;
@@ -881,6 +881,12 @@ function renderSnapshot(snapshot) {
     });
   }
 
+}
+
+function formatIndexRecords(index) {
+  if (typeof index.records !== "number") return "Not measured";
+  if (index.scope === "since_restart") return `${index.records} records since restart`;
+  return `${index.records} records`;
 }
 
 function renderTimelineStats(snapshot) {
@@ -1358,7 +1364,7 @@ function renderDashboardIndexes(indexes = []) {
     item.innerHTML = `
       <div>
         <strong>${escapeHtml(index.name)}</strong>
-        <p>${escapeHtml(index.records)} records</p>
+        <p>${escapeHtml(formatIndexRecords(index))}</p>
       </div>
       <span class="status-chip status-${escapeHtml(index.status)}">${escapeHtml(index.status)}</span>
     `;
@@ -1391,7 +1397,8 @@ function renderKnowledgeIndexes(indexes = []) {
   if (!knowledgeIndexList) return;
   knowledgeIndexList.innerHTML = "";
   const recordCount = indexes.reduce((total, index) => total + Number(index.records || 0), 0);
-  if (knowledgeRecordCount) knowledgeRecordCount.textContent = String(recordCount);
+  const allRecordsMeasured = indexes.length > 0 && indexes.every((index) => typeof index.records === "number");
+  if (knowledgeRecordCount) knowledgeRecordCount.textContent = allRecordsMeasured ? String(recordCount) : "Not measured";
   if (!indexes.length) {
     knowledgeIndexList.append(emptyState("No index status", "The retrieval indexes have not reported yet."));
     return;
@@ -1404,7 +1411,7 @@ function renderKnowledgeIndexes(indexes = []) {
         <strong>${escapeHtml(index.name)}</strong>
         <p>${escapeHtml(index.description || "Knowledge retrieval index")}</p>
       </div>
-      <span class="status-chip status-${escapeHtml(index.status)}">${escapeHtml(index.records)} records</span>
+      <span class="status-chip status-${escapeHtml(index.status)}">${escapeHtml(formatIndexRecords(index))}</span>
     `;
     knowledgeIndexList.append(item);
   });
@@ -2485,6 +2492,7 @@ async function loadKnowledgeGraph(force = false) {
     return;
   }
   state.realGraphLoading = true;
+  meshAlert.hidden = true;
   updateGraphMeta("Loading Knowledge Mesh");
   try {
     const payload = await fetchMeshGraphWithBackoff();
@@ -2495,18 +2503,23 @@ async function loadKnowledgeGraph(force = false) {
       updateGraphMeta();
       updateRealGraphEmpty();
       renderGraphLegend();
+      meshAlert.hidden = true;
     }
   } catch (error) {
     if (error && error.status === 429) {
-      // Retries exhausted: soft, non-error status (no toast) so a login-burst
-      // 429 doesn't read as a failure. Next view switch / refresh retries.
+      // Retries exhausted: keep the failure local to the graph panel and leave
+      // the Retry control available instead of silently requiring a page refresh.
       if (state.graphMode === "knowledge") {
         updateGraphMeta("Knowledge Mesh is busy — refresh in a moment");
+        meshAlert.hidden = false;
+        meshAlertText.textContent = "Knowledge Mesh is busy. Retry in a moment.";
       }
     } else {
       showToast(`Could not load the Knowledge Mesh: ${error.message}`, "error");
       if (state.graphMode === "knowledge") {
         updateGraphMeta("Knowledge Mesh unavailable");
+        meshAlert.hidden = false;
+        meshAlertText.textContent = error.message || "Try refreshing the vault.";
       }
     }
   } finally {
@@ -4014,7 +4027,13 @@ document.getElementById("logoutButton").addEventListener("click", async () => {
   }
   window.location.assign("/login");
 });
-document.getElementById("meshRetryButton").addEventListener("click", () => loadMesh());
+document.getElementById("meshRetryButton").addEventListener("click", () => {
+  if (state.graphMode === "knowledge") {
+    loadKnowledgeGraph(true);
+  } else {
+    loadMesh();
+  }
+});
 document.getElementById("fitButton").addEventListener("click", () => {
   resetGraphView();
 });
