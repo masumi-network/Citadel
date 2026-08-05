@@ -99,6 +99,27 @@ jobs:
           uv run pip-audit --cache-dir .pip-audit-cache \
             --ignore-vuln PYSEC-2026-2447
 
+  benchmark:
+    name: benchmark fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.1"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Validate benchmark fixtures
+        run: uv run python scripts/bench/search_bench.py lint
+
   web:
     name: frontend export
     runs-on: ubuntu-latest
@@ -138,7 +159,7 @@ jobs:
     # renamed without an admin editing the branch ruleset. `if: always()` ensures
     # this job still runs — and fails — when a job it depends on fails.
     if: always()
-    needs: [test, audit, web]
+    needs: [test, audit, benchmark, web]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required job succeeded
