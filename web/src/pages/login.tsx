@@ -36,9 +36,10 @@ export default function Login() {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || REJECTED);
       }
-      // Keep the authenticated app on its verified canonical surface until the
-      // Next dashboard has graph, admin, and workflow parity.
-      window.location.assign("/app");
+      const session = await response.json().catch(() => ({}));
+      // Readers have parity on the Next read-only dashboard. Keep writers and
+      // admins on the legacy surface until privileged workflows are migrated.
+      window.location.assign(session.role === "reader" ? "/next/app" : "/app");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : REJECTED);
     } finally {

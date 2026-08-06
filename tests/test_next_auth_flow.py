@@ -11,7 +11,7 @@ def _client() -> TestClient:
     return TestClient(app, base_url="https://testserver")
 
 
-def test_next_login_sends_successful_sessions_to_verified_dashboard() -> None:
+def test_next_login_routes_readers_to_next_and_privileged_roles_to_legacy_app() -> None:
     source = (
         Path(server_module.__file__).resolve().parent.parent
         / "web"
@@ -20,8 +20,16 @@ def test_next_login_sends_successful_sessions_to_verified_dashboard() -> None:
         / "login.tsx"
     ).read_text(encoding="utf-8")
 
-    assert 'window.location.assign("/app")' in source
-    assert 'window.location.assign("/next/app")' not in source
+    assert 'session.role === "reader" ? "/next/app" : "/app"' in source
+    assert 'window.location.assign("/app")' not in source
+
+    compiled = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages").glob("login-*.js")
+    )
+    assert "reader" in compiled
+    assert '"/next/app"' in compiled
+    assert '"/app"' in compiled
 
 
 def test_browser_logout_redirects_to_login_and_deletes_cookie() -> None:

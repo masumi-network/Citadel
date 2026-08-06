@@ -259,6 +259,15 @@ def test_graph_view_is_a_real_next_dashboard_route() -> None:
     assert "Presence-only view. No content nodes are visible for this scope." in source
     assert "No content nodes are visible for this scope." in source
 
+    compiled = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob(
+            "graph-*.js"
+        )
+    )
+    assert "visible_nodes" in compiled
+    assert "Presence-only view. No content nodes are visible for this scope." in compiled
+
 
 def test_sources_view_is_read_only_and_uses_separate_health_endpoints() -> None:
     body = (server_module.WEBUI_DIR / "app" / "sources.html").read_text(encoding="utf-8")
