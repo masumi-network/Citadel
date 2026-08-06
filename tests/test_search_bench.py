@@ -585,6 +585,22 @@ class TestLint:
         ) == 0
         assert "lint OK: 1 question(s)" in capsys.readouterr().out
 
+    def test_cmd_ci_accepts_the_shipped_fixture(self, capsys):
+        assert sb.main(["ci"]) == 0
+        assert "ci benchmark OK:" in capsys.readouterr().out
+
+    def test_cmd_ci_rejects_failed_metrics(self, monkeypatch, capsys):
+        def empty_searcher(*_args, **_kwargs):
+            def searcher(*_search_args, **_search_kwargs):
+                return {"results": []}, 0.0, None
+
+            return searcher
+
+        monkeypatch.setattr(sb, "make_ci_searcher", empty_searcher)
+
+        assert sb.main(["ci"]) == 1
+        assert "CI BENCH FAILED:" in capsys.readouterr().err
+
     def test_span_absent_from_body_fails(self, tmp_path):
         path, gt = self._write_golden(
             tmp_path, [self._q(answer_spans=["this sentence exists nowhere at all"])]
