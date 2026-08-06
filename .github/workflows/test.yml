@@ -154,6 +154,32 @@ jobs:
             git status --short -- kb/webui
             git diff -- kb/webui
             exit 1
+
+  package-smoke:
+    name: package smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.1"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build wheel and sdist
+        run: uv build --wheel --sdist
+
+      - name: Install wheel and verify payloads
+        run: |
+          venv="$RUNNER_TEMP/citadel-wheel"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install --no-index --no-deps dist/*.whl
+          "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
+          "$venv/bin/citadel" bench --help >/dev/null
           fi
 
   gate:
@@ -164,7 +190,7 @@ jobs:
     # renamed without an admin editing the branch ruleset. `if: always()` ensures
     # this job still runs — and fails — when a job it depends on fails.
     if: always()
-    needs: [test, audit, benchmark, web]
+    needs: [test, audit, benchmark, web, package-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required job succeeded
