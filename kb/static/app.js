@@ -1060,11 +1060,13 @@ function relatedNodeForEvent(event) {
     if (vaultNode) return vaultNode;
   }
   if (details.org) {
-    const org = String(details.org).toLowerCase();
+    const org = String(details.org).trim().toLowerCase();
     const sourceNode = findGraphNode((node) => {
-      const label = String(node.label || "").toLowerCase();
-      const url = String(node.metadata?.url || "").toLowerCase();
-      return node.type === "source" && (label.includes(org) || url.includes(org));
+      const label = String(node.label || "").trim().toLowerCase();
+      return (
+        node.type === "source" &&
+        (label === `github / ${org}` || label === `repo content / ${org}`)
+      );
     });
     if (sourceNode) return sourceNode;
   }

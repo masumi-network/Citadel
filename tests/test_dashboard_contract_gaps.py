@@ -566,3 +566,49 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     assert "Not reported by this node yet" in app_js and "Unavailable" in app_js, (
         "a failed fetch and an absent field must render different reasons"
     )
+
+
+def test_event_graph_focus_matches_exact_source_identity() -> None:
+    """#126: an organization must not select a source by substring coincidence.
+
+    The legacy dashboard has no DOM test runner, but this resolver is pure once
+    its graph lookup and timeline envelope are supplied. Execute the extracted
+    function with an exact source label, a near-match label, and a URL-only
+    decoy so the regression exercises matching behavior, not only source text.
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parents[1] / "kb" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    resolver = re.search(
+        r"function relatedNodeForEvent\(event\) \{.*?\n\}\n\nfunction findGraphNode",
+        app_js,
+        re.S,
+    )
+    assert resolver, "relatedNodeForEvent moved"
+    resolver_source = resolver.group(0).split("\n\nfunction findGraphNode", 1)[0]
+
+    script = f"""
+{resolver_source}
+const nodes = [
+  {{ id: "near", type: "source", label: "GitHub / acme-docs" }},
+  {{ id: "url-only", type: "source", label: "Other source", metadata: {{ url: "https://acme.example" }} }},
+  {{ id: "exact", type: "source", label: "GitHub / acme" }},
+];
+function findGraphNode(predicate) {{ return nodes.find(predicate) || null; }}
+function timelineEnvelope(event) {{ return event.timeline || {{ dataset: null }}; }}
+const matched = relatedNodeForEvent({{ details: {{ org: " ACME " }} }});
+if (!matched || matched.id !== "exact") process.exit(1);
+if (relatedNodeForEvent({{ details: {{ org: "acme-docs" }} }}).id !== "near") process.exit(2);
+if (relatedNodeForEvent({{ details: {{ org: "acme.example" }} }}) !== null) process.exit(3);
+"""
+    result = subprocess.run(
+        ["node", "--input-type=commonjs", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
