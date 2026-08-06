@@ -3218,6 +3218,12 @@ def test_document_endpoint_for_result_covers_real_ids_only() -> None:
     assert document_endpoint_for_result("ghsync:abc") == "/api/documents/ghsync:abc"
     assert document_endpoint_for_result("doc_123") == "/api/documents/doc_123"
     assert document_endpoint_for_result(uuid) == f"/api/documents/{uuid}"
+    assert document_endpoint_for_result(
+        "chunk-uuid", document_id="document-uuid"
+    ) == "/api/documents/document-uuid"
+    assert document_endpoint_for_result(
+        "chunk:deadbeef", document_id="document-uuid"
+    ) == "/api/documents/document-uuid"
     assert document_endpoint_for_result("../../api/access") == (
         "/api/documents/..%2F..%2Fapi%2Faccess"
     )
@@ -3260,6 +3266,46 @@ def test_cognee_search_hit_drills_down_to_document() -> None:
 
     # An unknown cognee id still 404s cleanly.
     assert client.get("/api/documents/does-not-exist").status_code == 404
+
+
+def test_search_drilldown_prefers_parent_document_id_for_chunk_hit(
+    tmp_path: Any,
+) -> None:
+    class ParentDocumentSearchCitadel(DrilldownIsolationCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "chunk-b",
+                    "document_id": "doc-b",
+                    "text": "bob chunk text",
+                }
+            ]
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = ParentDocumentSearchCitadel()
+    app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
+    api = TestClient(app, base_url="https://testserver")
+    bob = {"Authorization": f"Bearer {bob_token}"}
+    try:
+        response = api.post("/search", json={"query": "bob", "top_k": 1}, headers=bob)
+        hit = response.json()["results"][0]
+        endpoint = hit["_citadel"]["document_endpoint"]
+        document = api.get(endpoint, headers=bob)
+    finally:
+        app.state.knowledge_mesh = None
+
+    assert response.status_code == 200
+    assert hit["_citadel"]["result_id"] == "chunk-b"
+    assert hit["document_id"] == "doc-b"
+    assert endpoint == "/api/documents/doc-b"
+    assert hit["_citadel"]["retrieval"]["document_drilldown_available"] is True
+    assert document.status_code == 200
+    assert document.json()["document"]["body"] == "bob text"
 
 
 def test_knowledge_conflict_listing_and_resolution_are_role_gated(tmp_path: Any) -> None:

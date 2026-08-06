@@ -2671,19 +2671,18 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     return {key: value for key, value in provenance.items() if value}
 
 
-def document_endpoint_for_result(result_id: str) -> str | None:
+def document_endpoint_for_result(
+    result_id: str, *, document_id: str | None = None
+) -> str | None:
     # Any real id is now drillable (#28): ghsync:/doc_ as before, plus native
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
-    # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
-    # no backing store, so they stay honestly non-drillable.
-    #
-    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
-    # its `document_id`. This still resolves because /api/documents walks
-    # chunk -> parent document, so a caller passing either id "works" — which
-    # hides that they are different ids for different things.
-    if not result_id or result_id.startswith("chunk:"):
+    # Prefer a hit's document-level id when present. A chunk-level id can be
+    # retrievable by search without being a resolvable graph node, while its
+    # parent document remains the canonical drilldown target.
+    drilldown_id = first_string(document_id, result_id)
+    if not drilldown_id or drilldown_id.startswith("chunk:"):
         return None
-    return f"/api/documents/{quote(result_id, safe=':._-')}"
+    return f"/api/documents/{quote(drilldown_id, safe=':._-')}"
 
 
 def result_content_sha256(result: dict[str, Any]) -> str:
@@ -2758,8 +2757,10 @@ def with_result_metadata(
 ) -> Any:
     """Attach a reserved Citadel provenance envelope to dict search results.
 
-    ``drilldown_predicate`` (when supplied) decides, per result id, whether
-    ``/api/documents`` would actually return 200 for THIS caller. The
+    ``drilldown_predicate`` (when supplied) decides, per document id, whether
+    ``/api/documents`` would actually return 200 for THIS caller. A hit's
+    ``document_id`` is preferred to its chunk-level ``id`` for that decision.
+    The
     ``document_drilldown_available`` hint and the ``document_endpoint`` URL are
     then emitted only when the drill-down is honestly reachable, so an agent
     that follows the hint never lands on an ADR-0009 404. Without a predicate
@@ -2783,13 +2784,17 @@ def with_result_metadata(
         result = {key: value for key, value in result.items() if key != SHARED_TRACE_MARKER}
     normalized = with_result_id(result)
     result_id = str(normalized["id"])
-    document_endpoint = document_endpoint_for_result(result_id)
+    document_id = first_string(normalized.get("document_id"))
+    drilldown_id = document_id or result_id
+    document_endpoint = document_endpoint_for_result(
+        result_id, document_id=document_id
+    )
     if not document_endpoint:
         drilldown_available = False
     elif drilldown_predicate is None:
         drilldown_available = True
     else:
-        drilldown_available = bool(drilldown_predicate(result_id))
+        drilldown_available = bool(drilldown_predicate(drilldown_id))
     metadata: dict[str, Any] = {
         "rank": index + 1,
         "dataset": dataset,
@@ -6947,8 +6952,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         # remaining ids deny — the safe under-promise, never a hung request.
         drilldown_deadline = drilldown_started + citadel.config.search_timeout_seconds
 
-        async def _resolve_drilldown(result_id: str) -> bool:
-            if result_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
+        async def _resolve_drilldown(drilldown_id: str) -> bool:
+            if drilldown_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
                 # github drill-down has no ADR-0009 scope gate and resolves via a
                 # different endpoint branch (github_section_document, not
                 # get_document); the endpoint returns 200 for any reader with a
@@ -6960,7 +6965,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             # docs/chunks fall out here.
             try:
                 owner_node_ids = await get_citadel().resolve_document_owner_ids(
-                    result_id
+                    drilldown_id
                 )
             except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
                 return False
@@ -6974,23 +6979,27 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 continue
             envelope = item["_citadel"]
             result_id = str(envelope.get("result_id") or "")
-            document_endpoint = document_endpoint_for_result(result_id)
+            document_id = first_string(item.get("document_id"))
+            drilldown_id = document_id or result_id
+            document_endpoint = document_endpoint_for_result(
+                result_id, document_id=document_id
+            )
             if not document_endpoint:
                 # Synthetic chunk:<hash> id with no backing store — honestly
                 # non-drillable, nothing to resolve.
                 continue
-            if result_id not in drilldown_hint:
+            if drilldown_id not in drilldown_hint:
                 remaining = drilldown_deadline - time.perf_counter()
                 if remaining <= 0:
-                    drilldown_hint[result_id] = False
+                    drilldown_hint[drilldown_id] = False
                 else:
                     try:
-                        drilldown_hint[result_id] = await asyncio.wait_for(
-                            _resolve_drilldown(result_id), timeout=remaining
+                        drilldown_hint[drilldown_id] = await asyncio.wait_for(
+                            _resolve_drilldown(drilldown_id), timeout=remaining
                         )
                     except asyncio.TimeoutError:
-                        drilldown_hint[result_id] = False
-            if drilldown_hint[result_id]:
+                        drilldown_hint[drilldown_id] = False
+            if drilldown_hint[drilldown_id]:
                 envelope["document_endpoint"] = document_endpoint
                 retrieval = envelope.get("retrieval")
                 if isinstance(retrieval, dict):
