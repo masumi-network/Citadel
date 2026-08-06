@@ -365,13 +365,13 @@ def test_healthz() -> None:
 
 
 def test_public_release_version_is_explicitly_separate_from_package_version() -> None:
-    assert server_module._public_release_version_from_env({}) == "0.4.0"
+    assert server_module._public_release_version_from_env({}) == "0.4.1"
     assert server_module._public_release_version_from_env(
-        {"CITADEL_PUBLISHED_VERSION": "0.5.0"}
-    ) == "0.5.0"
+        {"CITADEL_PUBLISHED_VERSION": "0.4.1"}
+    ) == "0.4.1"
     assert server_module._public_release_version_from_env(
         {"CITADEL_PUBLISHED_VERSION": "  "}
-    ) == "0.4.0"
+    ) == "0.4.1"
     client = authed_client("test-reader")
     response = client.get("/api/state")
     assert response.status_code == 200

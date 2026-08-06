@@ -49,11 +49,11 @@ const SECTIONS: Section[] = [
    last published values, so a visitor who arrives while the node is unreachable
    reads something true and slightly old rather than a row of dashes. */
 const STAMPED = {
-  version: "v0.4.0",
+  version: "v0.4.1",
   mcpTools: 22,
 };
 
-const AS_OF = "Releases are as of v0.4.0, 2026-07-22.";
+const AS_OF = "Releases are as of v0.4.1, 2026-08-06.";
 
 /* A closing footer that is itself a band is full-bleed, so it carries no top
    margin: the gap an in-column footer wants would show as a stripe of --ground
@@ -111,7 +111,7 @@ function useInfoTiles() {
     footNote: state
       ? `State-of-the-vault report · live tiles from /api/state${
           updatedAt ? ` (updated ${updatedAt})` : ""
-        } · window v0.2.0 → v0.4.0.`
+        } · window v0.2.0 → v0.4.1.`
       : null,
   };
 }
@@ -137,12 +137,12 @@ export default function Info() {
         </h1>
         <div className={META}>
           <span className={PILL}>Railway + PyPI</span>
-          <span className={PILL}>Window: v0.2.0 → v0.4.0</span>
+          <span className={PILL}>Window: v0.2.0 → v0.4.1</span>
         </div>
         <Tldr label="TL;DR: read this, skim the rest">
           <p className={TLDR_P}>
             This is the running node reporting on itself: what is deployed right now, what shipped
-            across v0.2.0 → v0.4.0, and what is being built next. If you are new to Citadel, the{" "}
+            across v0.2.0 → v0.4.1, and what is being built next. If you are new to Citadel, the{" "}
             <a href="/">home page</a> covers what it is, how it&apos;s built, and how to start; this
             page is the numbers.
           </p>
@@ -178,7 +178,7 @@ export default function Info() {
             }
             label={tiles.docsSub}
           />
-          <Metric accent value="10" label="releases shipped (v0.1.0 → v0.4.0)" />
+          <Metric accent value="11" label="releases shipped (v0.1.0 → v0.4.1)" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
           <Metric
             value={<span className="text-[19px]">~$55/mo</span>}
@@ -189,7 +189,7 @@ export default function Info() {
         <Verified>
           {tiles.stateUpdated ??
             (tiles.failed ? (
-              "Live data unavailable right now. Showing the last published repo figures, as of v0.4.0, 2026-07-22."
+              "Live data unavailable right now. Showing the last published repo figures, as of v0.4.1, 2026-08-06."
             ) : (
               <>
                 Live tiles pull from <code className={CODE}>/api/state</code>. MCP tools refresh on
@@ -324,7 +324,7 @@ export default function Info() {
       </Band>
 
       <Band tone="white" id="releases">
-        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.4.0" />
+        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.4.1" />
         <p className={LEDE}>
           Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.
         </p>
@@ -403,7 +403,7 @@ export default function Info() {
             {tiles.footNote ?? (
               <>
                 State-of-the-vault report · live tiles from <code className={CODE}>/api/state</code>{" "}
-                · window v0.2.0 → v0.4.0.
+                · window v0.2.0 → v0.4.1.
               </>
             )}
           </p>
@@ -421,7 +421,28 @@ function Releases() {
     <div className="relative pl-[30px]">
       <span className="absolute bottom-3 left-[5px] top-3 w-0.5 bg-[linear-gradient(var(--accent),var(--accent-ink))] opacity-35" />
 
-      <Release version="v0.4.0" date="2026-07-22 · latest" tip open
+      <Release version="v0.4.1" date="2026-08-06 · latest" tip open
+        title="Indexing repair, retrieval gates, and the Next migration boundary.">
+        <DeepLi>
+          <b className={DEEP_B}>Indexing repair safety</b>: zero-chunk and oversized-document
+          census and repair paths, journaled phases, rollback, source-backed recovery, and a
+          cross-process repair lease.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Retrieval verification</b>: chunk-budget enforcement, frozen
+          benchmark fixtures, literal-ranking checks, and failure gates for transport and trust.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Next migration groundwork</b>: reproducible static export, runtime
+          build identity, and functional search, sources, and graph previews behind <code className={CODE}>/next</code>.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Release controls</b>: package artifact checks, DCO and secret scanning,
+          stable CI aggregation, and operational diagnostics.
+        </DeepLi>
+      </Release>
+
+      <Release version="v0.4.0" date="2026-07-22"
         title="Shared team memory, the seat portal, and a real brand.">
         <DeepLi>
           <b className={DEEP_B}>Shared Session Traces v1</b>: explicit in-session share via MCP +{" "}

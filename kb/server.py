@@ -544,8 +544,8 @@ _BUILD_ID = _build_id_from_env(os.environ)
 
 def _public_release_version_from_env(env: Mapping[str, str]) -> str:
     """Return the last explicitly published release shown on public pages."""
-    value = env.get("CITADEL_PUBLISHED_VERSION", "0.4.0").strip()
-    return value or "0.4.0"
+    value = env.get("CITADEL_PUBLISHED_VERSION", "0.4.1").strip()
+    return value or "0.4.1"
 
 
 _PUBLIC_RELEASE_VERSION = _public_release_version_from_env(os.environ)

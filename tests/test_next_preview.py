@@ -350,7 +350,7 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     """
     body = _client().get("/next/info").text
 
-    assert "v0.4.0" in body
+    assert "v0.4.1" in body
     assert "~$55/mo" in body
     assert "269 ms" in body
     assert "commits on main" not in body
