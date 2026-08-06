@@ -31,6 +31,7 @@ import { canUse, type Role } from "@/lib/dashboard";
 const ENTRIES: Array<{ href: string; label: string; minRole?: Role }> = [
   { href: "/next/app", label: "Home" },
   { href: "/next/app/search", label: "Search" },
+  { href: "/next/app/sources", label: "Sources" },
   { href: "/next/app/graph", label: "Graph" },
   { href: "/next/app/review", label: "Review", minRole: "writer" },
   { href: "/next/app/admin", label: "Admin", minRole: "admin" },

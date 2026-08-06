@@ -119,24 +119,29 @@ export type Source = {
   id?: string;
   name?: string | null;
   source_type?: string;
+  status?: string;
+  url?: string | null;
+  last_checked_at?: string | null;
+  documents?: number | null;
   open_conflicts?: number;
+  last_error?: string | null;
+  last_error_at?: string | null;
   metadata?: { last_security_scan?: { blocked?: boolean; finding_count?: number; highest_severity?: string } };
 };
 
-/* A source in trouble, as far as the API can currently say.
- *
- * There is no `last_error` on `/api/sources` (contract map gap 8), so "failing"
- * is inferred from open conflicts and, for the GitHub source only, a blocked
- * security scan. A source that failed for any other reason is invisible here,
- * and no amount of client code fixes that. */
+/* A source in trouble, using only the fields the current API exposes. */
 export function failingSources(sources: Source[]): Source[] {
   return sources.filter(
     (source) =>
-      (source.open_conflicts ?? 0) > 0 || source.metadata?.last_security_scan?.blocked === true
+      source.status === "error" ||
+      Boolean(source.last_error) ||
+      (source.open_conflicts ?? 0) > 0 ||
+      source.metadata?.last_security_scan?.blocked === true
   );
 }
 
 export function failureReason(source: Source): string {
+  if (source.last_error) return source.last_error;
   const conflicts = source.open_conflicts ?? 0;
   if (source.metadata?.last_security_scan?.blocked) {
     const findings = source.metadata.last_security_scan.finding_count;

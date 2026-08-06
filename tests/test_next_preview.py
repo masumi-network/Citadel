@@ -156,6 +156,7 @@ def test_the_export_carries_no_inline_script_and_no_inline_style() -> None:
 APP_VIEWS = (
     "/next/app",
     "/next/app/search",
+    "/next/app/sources",
     "/next/app/graph",
     "/next/app/review",
     "/next/app/admin",
@@ -200,11 +201,11 @@ def test_dashboard_views_are_role_gated_at_the_route() -> None:
     the server.
     """
     expected = {
-        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 403,
+        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 403,
                         "/next/app/admin": 403},
-        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 200,
+        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
                         "/next/app/admin": 403},
-        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 200,
+        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
                        "/next/app/admin": 200},
     }
 
@@ -254,6 +255,24 @@ def test_graph_view_is_a_real_next_dashboard_route() -> None:
     assert "Knowledge graph" in body
     assert "/api/mesh/graph?limit=200" in source
     assert "Caller-scoped graph projection" in body
+
+
+def test_sources_view_is_read_only_and_uses_separate_health_endpoints() -> None:
+    body = (server_module.WEBUI_DIR / "app" / "sources.html").read_text(encoding="utf-8")
+    source = (
+        Path(server_module.__file__).resolve().parent.parent
+        / "web"
+        / "src"
+        / "pages"
+        / "app"
+        / "sources.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "Sources and index health" in body
+    assert 'useEndpoint<SourcesResponse>("/api/sources")' in source
+    assert 'useEndpoint<IndexesResponse>("/api/indexes")' in source
+    for mutation in ("/run", "/ingest", "/promote", "/sync/push", 'method: "POST"'):
+        assert mutation not in source, f"Sources view contains a mutation endpoint: {mutation!r}"
 
 
 def test_review_makes_no_claim_the_api_cannot_support() -> None:

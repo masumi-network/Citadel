@@ -3056,6 +3056,7 @@ async def next_preview() -> Response:
 WEBUI_APP_VIEWS: dict[str, str] = {
     "graph": "reader",
     "search": "reader",
+    "sources": "reader",
     "review": "writer",
     "admin": "admin",
 }
