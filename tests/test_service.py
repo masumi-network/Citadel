@@ -336,6 +336,83 @@ async def test_cognify_dataset_force_passes_incremental_loading_false() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconcile_zero_chunks_is_dry_run_by_default() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "zero_chunk_count": 2,
+                "unassigned_zero_chunk_count": 0,
+                "repair_datasets": ["notes"],
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents()
+
+    assert result["ok"] is True
+    assert result["reason"] == "repair_required"
+    assert result["repair_required"] is True
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_chunks_applies_and_rechecks() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "zero_chunk_count": 1,
+                    "unassigned_zero_chunk_count": 0,
+                    "repair_datasets": ["notes"],
+                },
+                {
+                    "ok": True,
+                    "zero_chunk_count": 0,
+                    "unassigned_zero_chunk_count": 0,
+                    "repair_datasets": [],
+                },
+            ]
+
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert result["after"]["zero_chunk_count"] == 0
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_chunks_refuses_unassigned_apply() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "zero_chunk_count": 1,
+                "unassigned_zero_chunk_count": 1,
+                "repair_datasets": [],
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents(apply=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "zero_chunk_documents_without_dataset"
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
 async def test_feedback_can_auto_improve() -> None:
     fake = FakeCognee()
     kb = Citadel(CitadelConfig(auto_improve=True), cognee=fake)

@@ -304,6 +304,17 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             openWorldHint=True,
         ),
     ),
+    "citadel_reconcile_corpus": ToolPolicy(
+        role="admin",
+        scope="sources:sync",
+        risk="admin_job",
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    ),
     "citadel_run_repo_content_sync": ToolPolicy(
         role="admin",
         scope="sources:sync",
@@ -1428,6 +1439,27 @@ def create_mcp_server(
                 "/api/learning-agent/run",
                 {"force": force, "dry_run": dry_run},
                 tool_name="citadel_run_learning_agent",
+            ),
+        )
+
+    @mcp.tool(annotations=TOOL_POLICIES["citadel_reconcile_corpus"].annotations)
+    async def citadel_reconcile_corpus(
+        ctx: Context,
+        dataset: str | None = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Audit or repair accepted documents with no vector chunks.
+
+        The default is a read-only census. Applying a repair requires admin
+        access and cognifies only datasets attached to affected documents.
+        """
+        return await _call_async(
+            "citadel_reconcile_corpus",
+            lambda: resolve_client(ctx).post(
+                "/api/corpus/reconcile",
+                {"dataset": dataset, "apply": apply, "force": force},
+                tool_name="citadel_reconcile_corpus",
             ),
         )
 

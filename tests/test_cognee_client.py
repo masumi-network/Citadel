@@ -538,6 +538,70 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     }
 
 
+@pytest.mark.asyncio
+async def test_zero_chunk_census_walks_pages_and_filters_datasets(monkeypatch: Any) -> None:
+    client = CogneePublicClient()
+    rows = [
+        {"id": "doc-a", "name": "a", "created_at": "2026-01-01T00:00:00+00:00", "datasets": ["alpha"]},
+        {"id": "doc-b", "name": "b", "created_at": "2026-01-02T00:00:00+00:00", "datasets": ["beta"]},
+        {"id": "doc-c", "name": "c", "created_at": "2026-01-03T00:00:00+00:00", "datasets": ["alpha", "beta"]},
+    ]
+    page_cursors: list[tuple[str | None, str | None, int]] = []
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 3}
+
+    async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
+        page_cursors.append(
+            (kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"])
+        )
+        return rows[:2] if kwargs["after_id"] is None else rows[2:]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        return {document_id: 0 for document_id in document_ids}
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+
+    report = await client.corpus_zero_chunk_documents(dataset="alpha", page_limit=2)
+
+    assert report["ok"] is True
+    assert report["documents_scanned"] == 3
+    assert report["pages"] == 2
+    assert report["zero_chunk_count"] == 2
+    assert [row["id"] for row in report["zero_chunk_documents"]] == ["doc-a", "doc-c"]
+    assert report["repair_datasets"] == ["alpha"]
+    assert report["unassigned_zero_chunk_count"] == 0
+    assert page_cursors == [
+        (None, None, 2),
+        ("2026-01-02T00:00:00+00:00", "doc-b", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_zero_chunk_census_fails_when_vectors_are_unavailable(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, Any]:
+        return {"documents": 1}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [{"id": "doc-a", "created_at": "2026-01-01T00:00:00+00:00"}]
+
+    async def corpus_chunk_counts(_: list[str]) -> None:
+        return None
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+
+    with pytest.raises(RuntimeError, match="vector chunk measurement is unavailable"):
+        await client.corpus_zero_chunk_documents()
+
+
 def test_auto_feedback_is_off_by_default_in_cognees_own_config(monkeypatch: Any) -> None:
     """cognee must actually agree the gate is off, not just see our env var (#50, #105).
 

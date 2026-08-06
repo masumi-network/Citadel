@@ -393,6 +393,111 @@ class Citadel:
             "verification": verification,
         }
 
+    async def reconcile_zero_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Audit and optionally repair accepted documents with no vector chunks.
+
+        The default is a read-only census. Applying a repair only cognifies the
+        datasets attached to the affected rows, then performs the same census
+        again. Rows without dataset membership are reported as unrepairable
+        instead of being guessed into the default dataset.
+        """
+        before = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
+        if before.get("ok") is not True:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": before.get("reason") or "census_failed",
+                "before": before,
+                "after": None,
+            }
+
+        zero_count = before.get("zero_chunk_count")
+        unassigned_count = before.get("unassigned_zero_chunk_count")
+        repair_datasets = before.get("repair_datasets")
+        if (
+            isinstance(zero_count, bool)
+            or not isinstance(zero_count, int)
+            or zero_count < 0
+            or isinstance(unassigned_count, bool)
+            or not isinstance(unassigned_count, int)
+            or unassigned_count < 0
+            or not isinstance(repair_datasets, list)
+            or any(not isinstance(item, str) or not item for item in repair_datasets)
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "census_returned_invalid_repair_metadata",
+                "before": before,
+                "after": None,
+            }
+
+        if zero_count == 0:
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "no_zero_chunk_documents",
+                "before": before,
+                "after": before if apply else None,
+            }
+
+        if not apply:
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "apply": False,
+                "force": force,
+                "reason": "repair_required",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        if unassigned_count or not repair_datasets:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "zero_chunk_documents_without_dataset",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        await self.cognee.cognify(datasets=repair_datasets, force=force)
+        after = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
+        after_zero_count = after.get("zero_chunk_count")
+        repaired = (
+            after.get("ok") is True
+            and isinstance(after_zero_count, int)
+            and not isinstance(after_zero_count, bool)
+            and after_zero_count == 0
+        )
+        return {
+            "ok": repaired,
+            "dataset": dataset,
+            "apply": True,
+            "force": force,
+            "reason": "repaired" if repaired else "zero_chunk_documents_remain",
+            "repair_required": not repaired,
+            "repair_datasets": repair_datasets,
+            "before": before,
+            "after": after,
+        }
+
     async def _delete_marker_node(self, marker: str) -> None:
         """Best-effort delete of a cognify verify-marker node (backprop, #15)."""
         try:

@@ -81,6 +81,28 @@ class FakeCitadel:
             ),
         }
 
+    async def reconcile_zero_chunk_documents(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_zero_chunk_documents",
+            "before": {
+                "ok": True,
+                "zero_chunk_count": 0,
+                "unassigned_zero_chunk_count": 0,
+                "repair_datasets": [],
+            },
+            "after": None,
+        }
+
 class FakeLinearSyncer:
     async def status(self) -> dict[str, Any]:
         return {
@@ -1068,6 +1090,51 @@ def test_cognify_run_requires_admin() -> None:
     response = client.post("/api/cognify/run", json={})
 
     assert response.status_code == 403
+
+
+def test_admin_can_audit_zero_chunk_reconciliation_and_writer_cannot() -> None:
+    admin = authed_client()
+
+    response = admin.post(
+        "/api/corpus/reconcile",
+        json={"dataset": "masumi-network"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "no_zero_chunk_documents"
+    assert response.json()["apply"] is False
+
+    writer = authed_client("test-writer")
+    assert writer.post("/api/corpus/reconcile", json={}).status_code == 403
+
+
+def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
+    class FailingReconcile(FakeCitadel):
+        async def reconcile_zero_chunk_documents(
+            self,
+            *,
+            dataset: Any = None,
+            apply: bool = False,
+            force: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "zero_chunk_documents_remain",
+            }
+
+    client = authed_client()
+    app.state.citadel = FailingReconcile()
+
+    response = client.post("/api/corpus/reconcile", json={"apply": True})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["result"]["reason"] == "zero_chunk_documents_remain"
+    events = app.state.access_store.snapshot()["audit_events"]
+    reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
+    assert reconcile_events[-1]["success"] is False
 
 
 def test_knowledge_events_api_returns_resumable_timeline() -> None:

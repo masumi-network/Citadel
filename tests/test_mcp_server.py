@@ -777,6 +777,7 @@ _ADMIN_TOOLS = {
     "citadel_improve",
     "citadel_backup_mirror_status",
     "citadel_run_learning_agent",
+    "citadel_reconcile_corpus",
     "citadel_run_repo_content_sync",
     "citadel_run_backup_mirror",
 }
@@ -1272,6 +1273,21 @@ def test_run_repo_content_sync_tool_posts_to_admin_endpoint() -> None:
 
     assert result["path"] == "/api/repo-content-sync/run"
     assert client.posts[-1]["payload"] == {"force": True, "dry_run": True}
+
+
+def test_reconcile_corpus_tool_defaults_to_read_only() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_reconcile_corpus", None, dataset="notes")
+
+    assert result["path"] == "/api/corpus/reconcile"
+    assert client.posts[-1]["payload"] == {
+        "dataset": "notes",
+        "apply": False,
+        "force": False,
+    }
+    assert client.posts[-1]["tool_name"] == "citadel_reconcile_corpus"
 
 
 def test_recent_contributions_tool_reads_audit_feed() -> None:

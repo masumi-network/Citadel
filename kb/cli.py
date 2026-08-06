@@ -864,6 +864,22 @@ async def _cognify(args: argparse.Namespace) -> None:
 
 
 @_needs_server
+async def _reindex(args: argparse.Namespace) -> int:
+    from kb.service import Citadel
+
+    if args.force and not args.apply:
+        raise ValueError("--force requires --apply")
+    kb = Citadel.from_env()
+    result = await kb.reconcile_zero_chunk_documents(
+        dataset=args.dataset,
+        apply=args.apply,
+        force=args.force,
+    )
+    _print_json(result)
+    return _result_exit(result)
+
+
+@_needs_server
 async def _sync_github(args: argparse.Namespace) -> None:
     from kb.github_sync import GitHubOrgSyncer
     from kb.service import Citadel
@@ -3193,6 +3209,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reprocess the whole dataset when Cognee reports it already processed",
     )
     cognify.set_defaults(handler=_cognify)
+
+    reindex = subcommands.add_parser(
+        "reindex",
+        help="Audit and optionally repair accepted documents with no vector chunks",
+    )
+    reindex.add_argument("--dataset")
+    reindex.add_argument(
+        "--apply",
+        action="store_true",
+        help="Run the repair after the census (default is read-only)",
+    )
+    reindex.add_argument(
+        "--force",
+        action="store_true",
+        help="Force dataset reprocessing; requires --apply",
+    )
+    reindex.set_defaults(handler=_reindex)
 
     sync_github = subcommands.add_parser(
         "sync-github",

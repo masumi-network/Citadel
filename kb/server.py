@@ -1017,6 +1017,12 @@ class CognifyRunBody(BaseModel):
     force: bool = False
 
 
+class CorpusReconcileBody(BaseModel):
+    dataset: str | None = None
+    apply: bool = False
+    force: bool = False
+
+
 class GraphCleanupBody(BaseModel):
     # Default to a non-destructive dry run: the caller must POST {"dry_run": false}
     # to actually delete, after reviewing the listed candidates (#15).
@@ -5988,6 +5994,77 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
             status_code=503,
             detail={
                 "message": "Cognify verification failed.",
+                "result": jsonable_encoder(result),
+            },
+        )
+    return jsonable_encoder(result)
+
+
+@app.post("/api/corpus/reconcile")
+async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
+    actor = require_access(request, "admin", "sources:sync")
+    citadel = get_citadel()
+    try:
+        result = await citadel.reconcile_zero_chunk_documents(
+            dataset=body.dataset,
+            apply=body.apply,
+            force=body.force,
+        )
+    except Exception as exc:  # pragma: no cover - depends on Cognee config.
+        logger.error("Corpus reconciliation failed: %s", exc.__class__.__name__)
+        get_access_store().record_event(
+            action="corpus.reconcile",
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "apply": body.apply,
+                "force": body.force,
+                "error": str(exc),
+            },
+        )
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "operation": "corpus.reconcile",
+                "apply": body.apply,
+                "force": body.force,
+                "error_type": exc.__class__.__name__,
+            },
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    result_ok = result.get("ok") is True
+    detail = {
+        "operation": "corpus.reconcile",
+        "apply": body.apply,
+        "force": body.force,
+        "ok": result_ok,
+        "reason": result.get("reason"),
+        "repair_required": result.get("repair_required"),
+    }
+    get_access_store().record_event(
+        action="corpus.reconcile",
+        actor=actor,
+        success=result_ok,
+        dataset=body.dataset,
+        detail=detail,
+    )
+    record_mcp_audit(
+        request,
+        actor=actor,
+        success=result_ok,
+        dataset=body.dataset,
+        detail=detail,
+    )
+    if not result_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Corpus reconciliation did not complete.",
                 "result": jsonable_encoder(result),
             },
         )
