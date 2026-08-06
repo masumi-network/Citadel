@@ -1699,6 +1699,74 @@ async def test_corpus_reconciliation_census_combines_zero_and_oversized_scans(
 
 
 @pytest.mark.asyncio
+async def test_corpus_reconciliation_census_scopes_oversized_totals_to_dataset(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 3}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "doc-notes-over",
+                "name": "Notes over",
+                "datasets": ["notes"],
+                "created_at": "1",
+            },
+            {
+                "id": "doc-other-over",
+                "name": "Other over",
+                "datasets": ["other"],
+                "created_at": "2",
+            },
+            {
+                "id": "doc-notes-ok",
+                "name": "Notes ok",
+                "datasets": ["notes"],
+                "created_at": "3",
+            },
+        ]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        return {document_id: 1 for document_id in document_ids}
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None, *, budget: int | None = None
+    ) -> dict[str, Any]:
+        assert document_ids is None
+        assert budget == 256
+        return {
+            "ok": False,
+            "scope": "full",
+            "violation_count": 3,
+            "violation_document_counts": {
+                "doc-notes-over": 1,
+                "doc-other-over": 2,
+            },
+            "missing_document_id_violation_count": 0,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_reconciliation_census(dataset="notes")
+
+    assert report["ok"] is True
+    assert report["oversized_document_count"] == 1
+    assert report["oversized_chunk_count"] == 1
+    assert report["oversized_document_ids"] == ["doc-notes-over"]
+    assert report["repair_document_ids"] == ["doc-notes-over"]
+    # The nested scan stays full-corpus evidence; the top-level repair totals
+    # are the requested dataset scope.
+    assert report["stored_chunk_budget"]["violation_count"] == 3
+
+
+@pytest.mark.asyncio
 async def test_graph_chunk_ids_use_source_document_property(monkeypatch: Any) -> None:
     client = CogneePublicClient()
     calls: list[tuple[str, dict[str, Any]]] = []

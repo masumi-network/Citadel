@@ -2065,6 +2065,11 @@ class CogneePublicClient:
         oversized_ids: set[str] = set()
         oversized_repair_ids: set[str] = set()
         oversized_documents: list[dict[str, Any]] = []
+        # ``stored_chunk_budget_check`` is intentionally a full-corpus scan.
+        # Keep the public census totals scoped to ``dataset`` so a violation in
+        # another dataset cannot turn a clean repair request into a false
+        # candidate.
+        oversized_chunk_count = 0
         oversized_unassigned = 0
         orphan_count = 0
         for raw_document_id, raw_count in violation_counts.items():
@@ -2074,6 +2079,7 @@ class CogneePublicClient:
                 orphan_count += 1
                 oversized_unassigned += 1
                 oversized_ids.add(document_id)
+                oversized_chunk_count += raw_count
                 if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
                     oversized_documents.append(
                         {
@@ -2096,6 +2102,7 @@ class CogneePublicClient:
             if dataset and dataset not in datasets:
                 continue
             oversized_ids.add(document_id)
+            oversized_chunk_count += raw_count
             if datasets:
                 oversized_repair_ids.add(document_id)
             else:
@@ -2135,7 +2142,7 @@ class CogneePublicClient:
             "zero_chunk_documents": zero_documents,
             "zero_chunk_documents_truncated": len(zero_ids) > len(zero_documents),
             "oversized_document_count": len(oversized_ids),
-            "oversized_chunk_count": violation_count,
+            "oversized_chunk_count": oversized_chunk_count,
             "oversized_document_ids": sorted(oversized_ids),
             "oversized_documents": oversized_documents,
             "oversized_documents_truncated": len(oversized_ids) > len(oversized_documents),
