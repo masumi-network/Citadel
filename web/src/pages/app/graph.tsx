@@ -15,11 +15,26 @@ import type { GraphPayload } from "@/components/app/knowledge-graph";
 
 const KnowledgeGraph = dynamic(() => import("@/components/app/knowledge-graph"), { ssr: false });
 
+type ScopedGraphPayload = GraphPayload & {
+  visible_nodes?: number;
+};
+
 export default function Graph() {
   const session = useSession();
-  const graph = useEndpoint<GraphPayload>("/api/mesh/graph?limit=200");
-  const nodeCount = graph.data?.nodes?.length ?? 0;
+  const graph = useEndpoint<ScopedGraphPayload>("/api/mesh/graph?limit=200");
+  const renderedNodeCount = graph.data?.nodes?.length ?? 0;
+  const hasScopedCount = typeof graph.data?.visible_nodes === "number";
+  const visibleNodeCount = hasScopedCount
+    ? graph.data?.visible_nodes ?? 0
+    : renderedNodeCount;
   const edgeCount = graph.data?.edges?.length ?? 0;
+  const hasPresenceHubs =
+    graph.data?.nodes?.some((node) =>
+      typeof node.type === "string" && node.type.toLowerCase().includes("dataset"),
+    ) ?? false;
+  const presenceOnly = hasScopedCount && visibleNodeCount === 0 && hasPresenceHubs;
+  const emptyScope = hasScopedCount && visibleNodeCount === 0 && !hasPresenceHubs;
+  const emptyGraph = !hasScopedCount && renderedNodeCount === 0;
 
   return (
     <AppShell
@@ -58,13 +73,22 @@ export default function Graph() {
             Graph data is temporarily unavailable. {graph.data.fallback_reason ?? "Try again later."}
           </p>
         ) : null}
-        {!graph.loading && !graph.error && !nodeCount ? <Empty>No graph nodes are visible yet.</Empty> : null}
+        {!graph.loading && !graph.error && presenceOnly ? (
+          <p className="border border-border-2 bg-surface-2 px-4 py-3 text-[13.5px] leading-[1.6] text-ink-2">
+            Presence-only view. No content nodes are visible for this scope.
+          </p>
+        ) : null}
+        {!graph.loading && !graph.error && (emptyScope || emptyGraph) ? (
+          <Empty>
+            {emptyScope ? "No content nodes are visible for this scope." : "No graph nodes are visible yet."}
+          </Empty>
+        ) : null}
         {graph.data?.note ? <p className="mt-3 text-[12.5px] text-ink-3">{graph.data.note}</p> : null}
-        {nodeCount ? (
+        {!graph.loading && !graph.error && (renderedNodeCount || hasScopedCount) ? (
           <dl className="mt-4 flex flex-wrap gap-x-6 gap-y-2 text-[12.5px] text-ink-2">
             <div>
               <dt className="font-medium text-ink-3">Visible nodes</dt>
-              <dd className="font-mono text-ink">{nodeCount}</dd>
+              <dd className="font-mono text-ink">{visibleNodeCount}</dd>
             </div>
             <div>
               <dt className="font-medium text-ink-3">Visible edges</dt>
@@ -80,7 +104,7 @@ export default function Graph() {
         ) : null}
       </section>
 
-      {graph.data && !graph.error && nodeCount ? <KnowledgeGraph payload={graph.data} /> : null}
+      {graph.data && !graph.error && renderedNodeCount ? <KnowledgeGraph payload={graph.data} /> : null}
     </AppShell>
   );
 }
