@@ -1300,6 +1300,156 @@ async def test_cognee_public_client_cognify_wraps_cognee_cognify(monkeypatch: An
 
 
 @pytest.mark.asyncio
+async def test_cognify_checks_only_source_ids_processed_by_this_pass(monkeypatch: Any) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    run = SimpleNamespace(
+        data_ingestion_info=[
+            {"data_id": "doc-a"},
+            {"data_id": "doc-a"},
+            {"data_id": "doc-b"},
+        ]
+    )
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        return {"dataset-id": run}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_startup_migrations=run_startup_migrations,
+            cognify=cognify,
+        ),
+    )
+    client = CogneePublicClient()
+    checked: list[list[str]] = []
+
+    async def stored_chunk_budget_check(*, document_ids: list[str]) -> dict[str, Any]:
+        checked.append(document_ids)
+        return {"ok": True, "violation_count": 0, "chunks_scanned": 2}
+
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    await client.cognify(datasets=["notes"])
+
+    assert checked == [["doc-a", "doc-b"]]
+
+
+@pytest.mark.asyncio
+async def test_cognify_fails_when_stored_chunk_check_is_red(monkeypatch: Any) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    run = SimpleNamespace(data_ingestion_info=[{"data_id": "doc-a"}])
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        return {"dataset-id": run}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_startup_migrations=run_startup_migrations,
+            cognify=cognify,
+        ),
+    )
+    client = CogneePublicClient()
+
+    async def stored_chunk_budget_check(*, document_ids: list[str]) -> dict[str, Any]:
+        assert document_ids == ["doc-a"]
+        return {"ok": False, "violation_count": 1, "chunks_scanned": 1}
+
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    with pytest.raises(RuntimeError, match="stored chunk budget check failed"):
+        await client.cognify(datasets=["notes"])
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_scans_exact_pgvector_payloads(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy import JSON, Column, MetaData, String, Table
+
+    metadata = MetaData()
+    table = Table(
+        "DocumentChunk_text",
+        metadata,
+        Column("id", String),
+        Column("payload", JSON),
+    )
+
+    class Result:
+        def all(self) -> list[tuple[str, dict[str, Any]]]:
+            return [
+                (
+                    "chunk-a",
+                    {
+                        "text": "ordinary words " * 20,
+                        "document_id": "doc-a",
+                        "chunk_index": 0,
+                        "chunk_size": 1,
+                    },
+                )
+            ]
+
+    class Session:
+        async def execute(self, _: Any) -> Result:
+            return Result()
+
+    class VectorEngine:
+        async def get_table(self, _: str) -> Table:
+            return table
+
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            yield Session()
+
+    def get_vector_engine() -> VectorEngine:
+        return VectorEngine()
+
+    class CollectionNotFoundError(Exception):
+        pass
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.vector",
+        SimpleNamespace(get_vector_engine=get_vector_engine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.vector.exceptions",
+        SimpleNamespace(CollectionNotFoundError=CollectionNotFoundError),
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    report = await client.stored_chunk_budget_check(["doc-a"], budget=8)
+
+    assert report is not None
+    assert report["ok"] is False
+    assert report["chunks_scanned"] == 1
+    assert report["violation_count"] == 1
+    assert report["violations"][0]["chunk_id"] == "chunk-a"
+
+
+@pytest.mark.asyncio
 async def test_recall_does_not_pass_only_context(monkeypatch: Any) -> None:
     # #50: cognee's only_context=True flips the CHUNKS result from the list-of-dicts
     # the callers rely on (result_provenance/_citadel envelope, dedup, drill-down) to

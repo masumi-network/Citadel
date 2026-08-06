@@ -47,7 +47,10 @@ What this module ships instead
 3. ``record_embed_batch`` — a detector at the embed boundary that measures the
    chunk actually handed to the model, in the model's own units, and says so.
    Predicting an overflow is arithmetic; measuring one is evidence.
-4. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
+4. ``check_stored_chunk_payload`` — a post-storage check for the exact payload
+   written to the vector store. It catches chunker drift instead of trusting a
+   replay of the input.
+5. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
    cannot be chunked at all. It refuses and records. It never edits text.
 """
 
@@ -505,6 +508,131 @@ class ChunkBudgetViolation:
 
 class ChunkBudgetValidationError(RuntimeError):
     """The final-chunk validator could not establish the budget invariant."""
+
+
+@dataclass(frozen=True)
+class StoredChunkBudgetViolation:
+    """A persisted vector payload that cannot be trusted to fit the budget.
+
+    The payload text is intentionally absent. A chunk id, lengths, and a digest
+    are enough to identify the bad row without copying user content into logs or
+    API responses.
+    """
+
+    reason: str
+    chunk_id: str
+    document_id: str | None
+    chunk_index: int | None
+    configured_size: int | None
+    measured_tokens: int | None
+    char_length: int
+    fingerprint: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "chunk_id": self.chunk_id,
+            "document_id": self.document_id,
+            "chunk_index": self.chunk_index,
+            "configured_size": self.configured_size,
+            "measured_tokens": self.measured_tokens,
+            "char_length": self.char_length,
+            "fingerprint": self.fingerprint,
+        }
+
+
+def measure_bpe_tokens(text: str) -> int:
+    """Count persisted text with the same GPT-4o encoding used by the chunk gate."""
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot measure stored chunk size"
+        )
+    try:
+        return len(encoding.encode(text, disallowed_special=()))
+    except Exception as exc:  # pragma: no cover - tokenizer contract failure
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer could not measure stored chunk size"
+        ) from exc
+
+
+def check_stored_chunk_payload(
+    payload: Any,
+    *,
+    chunk_id: str,
+    budget: int | None = None,
+) -> StoredChunkBudgetViolation | None:
+    """Check one exact vector payload after Cognee has written it.
+
+    A malformed ``DocumentChunk_text`` row is a failed measurement, not a clean
+    result. Returning a violation keeps the caller's aggregate check fail-closed.
+    """
+    limit = budget if budget is not None else resolve_chunk_budget()
+    if not isinstance(payload, dict):
+        return StoredChunkBudgetViolation(
+            reason="chunk_payload_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=None,
+            chunk_index=None,
+            configured_size=None,
+            measured_tokens=None,
+            char_length=0,
+            fingerprint="unavailable",
+        )
+
+    text = payload.get("text")
+    document_id = payload.get("document_id")
+    document_id = str(document_id) if document_id is not None else None
+    chunk_index = payload.get("chunk_index")
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = None
+    configured_size = payload.get("chunk_size")
+    if isinstance(configured_size, bool) or not isinstance(configured_size, int):
+        configured_size = None
+
+    if not isinstance(text, str):
+        return StoredChunkBudgetViolation(
+            reason="chunk_text_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=document_id,
+            chunk_index=chunk_index,
+            configured_size=configured_size,
+            measured_tokens=None,
+            char_length=0,
+            fingerprint="unavailable",
+        )
+
+    try:
+        measured_tokens = measure_bpe_tokens(text)
+    except ChunkBudgetValidationError:
+        return StoredChunkBudgetViolation(
+            reason="chunk_text_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=document_id,
+            chunk_index=chunk_index,
+            configured_size=configured_size,
+            measured_tokens=None,
+            char_length=len(text),
+            fingerprint=_fingerprint(text),
+        )
+
+    reason: str | None = None
+    if configured_size is not None and configured_size > limit:
+        reason = "chunk_size_over_budget"
+    elif measured_tokens > limit:
+        reason = "chunk_over_budget"
+    if reason is None:
+        return None
+    return StoredChunkBudgetViolation(
+        reason=reason,
+        chunk_id=str(chunk_id),
+        document_id=document_id,
+        chunk_index=chunk_index,
+        configured_size=configured_size,
+        measured_tokens=measured_tokens,
+        char_length=len(text),
+        fingerprint=_fingerprint(text),
+    )
 
 
 def _iter_cognee_final_chunks(

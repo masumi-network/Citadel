@@ -367,6 +367,56 @@ def test_final_cognee_chunk_validator_rejects_emitted_over_budget_chunk(
     assert "ordinary" not in violation.describe()
 
 
+def test_stored_chunk_check_measures_the_persisted_payload() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {
+            "text": "ordinary words " * 20,
+            "document_id": "doc-a",
+            "chunk_index": 3,
+            "chunk_size": 1,
+        },
+        chunk_id="chunk-a",
+        budget=8,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_over_budget"
+    assert violation.chunk_id == "chunk-a"
+    assert violation.document_id == "doc-a"
+    assert violation.chunk_index == 3
+    assert violation.measured_tokens is not None
+    assert "ordinary" not in str(violation.as_dict())
+
+
+def test_stored_chunk_check_rejects_a_bad_cognee_size_field() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {
+            "text": "short",
+            "document_id": "doc-a",
+            "chunk_index": 0,
+            "chunk_size": 65,
+        },
+        chunk_id="chunk-a",
+        budget=64,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_size_over_budget"
+    assert violation.measured_tokens is not None
+
+
+def test_stored_chunk_check_fails_closed_when_text_is_missing() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {"document_id": "doc-a", "chunk_index": 0},
+        chunk_id="chunk-a",
+        budget=64,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_text_unmeasured"
+    assert violation.measured_tokens is None
+
+
 def test_ingest_rejects_final_chunk_before_remember(monkeypatch: Any) -> None:
     import asyncio
     import importlib

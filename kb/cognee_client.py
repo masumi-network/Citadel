@@ -6,7 +6,7 @@ import contextvars
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from time import monotonic, perf_counter
 from typing import Any, Protocol
@@ -51,6 +51,35 @@ def _corpus_health_max_documents() -> int:
             "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
         )
     return value
+
+
+def _cognify_data_ids(result: Any) -> list[str]:
+    """Extract source ``Data.id`` values from a blocking cognify result.
+
+    Cognee returns one ``PipelineRunInfo`` per dataset. Its
+    ``data_ingestion_info`` entries are mappings containing ``data_id``. Keep the
+    parser tolerant of the single-result and list-shaped variants so the stored
+    chunk guard remains scoped to the pass that just ran.
+    """
+    if isinstance(result, Mapping):
+        runs = list(result.values())
+    elif isinstance(result, (list, tuple)):
+        runs = list(result)
+    else:
+        runs = [result]
+
+    data_ids: list[str] = []
+    for run in runs:
+        info = getattr(run, "data_ingestion_info", None)
+        if info is None and isinstance(run, Mapping):
+            info = run.get("data_ingestion_info")
+        if not isinstance(info, (list, tuple)):
+            continue
+        for item in info:
+            data_id = item.get("data_id") if isinstance(item, Mapping) else getattr(item, "data_id", None)
+            if data_id is not None:
+                data_ids.append(str(data_id))
+    return list(dict.fromkeys(data_ids))
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -554,8 +583,9 @@ class CogneePublicClient:
         # longer diverts the write away from the durable path.
         data = self._data_with_metadata(data, metadata)
 
-        # Add is a fast write to the relational + vector stores; it does NOT touch
-        # the Kuzu graph (cognify is the graph write). Metadata rides in the
+        # Add is a fast write to Cognee's relational/source stores; it does NOT
+        # create chunks, embeddings, or touch the Kuzu graph. Cognify is the
+        # chunk, vector, and graph write. Metadata rides in the
         # DataItem (external_metadata) via _data_with_metadata, never as an add()
         # keyword — cognee rejects external_metadata as a kwarg.
         added = await cognee.add(data, dataset_name=dataset_name)
@@ -610,9 +640,9 @@ class CogneePublicClient:
         except RuntimeError:
             # Silent here meant content was recorded as ingested and never
             # reached the graph, with nothing in the logs either way. cognee.add
-            # writes the relational and vector stores; ONLY cognify writes Kuzu.
-            # Skipping it makes a document that exists as a row and cannot be
-            # retrieved. Say so.
+            # writes the relational/source stores; ONLY cognify writes chunks,
+            # vectors, and Kuzu graph state. Skipping it makes a document that
+            # exists as a row and cannot be retrieved. Say so.
             logger.error(
                 "cognify NOT scheduled for %s: no running event loop. The data "
                 "is stored but will not be searchable until a cognify runs.",
@@ -1251,6 +1281,94 @@ class CogneePublicClient:
                 if document_id:
                     counts[str(document_id)] = int(total or 0)
         return counts
+
+    async def stored_chunk_budget_check(
+        self,
+        document_ids: list[str] | None = None,
+        *,
+        budget: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Measure exact persisted ``DocumentChunk_text`` payloads.
+
+        Cognee's public vector interface cannot enumerate a collection. Citadel's
+        production provider is pgvector, whose reflected table can be scanned
+        directly. Other providers return ``None`` because a similarity query is
+        not evidence of corpus-wide compliance.
+        """
+        self._prepare_cognee_environment()
+        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+            return None
+        limit = budget if budget is not None else chunk_window.resolve_chunk_budget()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.vector import get_vector_engine
+        from cognee.infrastructure.databases.vector.exceptions import (
+            CollectionNotFoundError,
+        )
+        from sqlalchemy import select
+
+        engine = get_vector_engine()
+        try:
+            table = await engine.get_table("DocumentChunk_text")
+        except CollectionNotFoundError:
+            return {
+                "ok": True,
+                "provider": "pgvector",
+                "collection": "DocumentChunk_text",
+                "collection_present": False,
+                "budget": limit,
+                "scope": "document_ids" if document_ids is not None else "full",
+                "chunks_scanned": 0,
+                "violation_count": 0,
+                "violations": [],
+            }
+
+        statement = select(table.c.id, table.c.payload)
+        wanted = [str(document_id) for document_id in document_ids or []]
+        if document_ids is not None and not wanted:
+            return {
+                "ok": True,
+                "provider": "pgvector",
+                "collection": "DocumentChunk_text",
+                "collection_present": True,
+                "budget": limit,
+                "scope": "document_ids",
+                "scope_document_count": 0,
+                "chunks_scanned": 0,
+                "violation_count": 0,
+                "violations": [],
+            }
+        if document_ids is not None:
+            payload_document_id = table.c.payload["document_id"].as_string()
+            statement = statement.where(payload_document_id.in_(wanted))
+
+        violations: list[dict[str, Any]] = []
+        chunks_scanned = 0
+        async with engine.get_async_session() as session:
+            rows = await session.execute(statement)
+            for row in rows.all():
+                chunks_scanned += 1
+                violation = chunk_window.check_stored_chunk_payload(
+                    row[1], chunk_id=str(row[0]), budget=limit
+                )
+                if violation is not None:
+                    violations.append(violation.as_dict())
+
+        return {
+            "ok": not violations,
+            "provider": "pgvector",
+            "collection": "DocumentChunk_text",
+            "collection_present": True,
+            "budget": limit,
+            "scope": "document_ids" if document_ids is not None else "full",
+            "scope_document_count": len(wanted) if document_ids is not None else None,
+            "chunks_scanned": chunks_scanned,
+            "violation_count": len(violations),
+            # Keep the failure response bounded. The count remains exact and
+            # each item contains an id/digest, never the stored text.
+            "violations": violations[:50],
+        }
 
     async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
         """Which source documents have a graph projection; None when unmeasured.
@@ -1938,6 +2056,28 @@ class CogneePublicClient:
                 datasets=datasets, incremental_loading=not force
             )
             self._invalidate_graph_data_cache()
+            processed_ids = _cognify_data_ids(result)
+            if processed_ids:
+                stored_check = await self.stored_chunk_budget_check(
+                    document_ids=processed_ids
+                )
+                if stored_check is None:
+                    logger.warning(
+                        "stored chunk budget was not measured after cognify: "
+                        "VECTOR_DB_PROVIDER is not pgvector"
+                    )
+                elif not stored_check["ok"]:
+                    logger.error(
+                        "stored chunk budget check failed after cognify: "
+                        "%d violation(s) across %d chunk(s)",
+                        stored_check["violation_count"],
+                        stored_check["chunks_scanned"],
+                    )
+                    raise RuntimeError(
+                        "stored chunk budget check failed: "
+                        f"{stored_check['violation_count']} violation(s) across "
+                        f"{stored_check['chunks_scanned']} persisted chunk(s)"
+                    )
             return result
 
     async def add_feedback(
