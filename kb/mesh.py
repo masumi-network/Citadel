@@ -262,7 +262,8 @@ class MeshState:
         """
         async with self._lock:
             self._ensure_base_graph(config)
-            indexes = self._indexes(config)
+            corpus = corpus or {}
+            indexes = self._indexes(config, corpus=corpus)
             since_restart = {
                 "started_at": self.started_at,
                 "documents": self.documents,
@@ -275,7 +276,6 @@ class MeshState:
                 "projection_nodes": len(self.nodes),
                 "projection_edges": len(self.edges),
             }
-            corpus = corpus or {}
             authoritative_nodes = corpus.get("indexed_docs")
             authoritative_docs = corpus.get("tracked_sources")
             authoritative_edges = corpus.get("indexed_edges")
@@ -856,20 +856,43 @@ class MeshState:
             "label": label,
         }
 
-    def _indexes(self, config: CitadelConfig) -> list[dict[str, Any]]:
+    def _indexes(
+        self,
+        config: CitadelConfig,
+        *,
+        corpus: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        corpus = corpus or {}
+        graph_records = len(
+            [node for node in self.nodes.values() if node["type"] != "index"]
+        )
+        authoritative_nodes = corpus.get("indexed_docs")
+        if isinstance(authoritative_nodes, int) and not isinstance(authoritative_nodes, bool):
+            graph_records = authoritative_nodes
+
+        vector_records = self.documents
+        probe_complete = corpus.get("probe_complete") is True
+        chunked_documents = corpus.get("probe_chunked_documents")
+        if (
+            probe_complete
+            and isinstance(chunked_documents, int)
+            and not isinstance(chunked_documents, bool)
+        ):
+            vector_records = chunked_documents
+
         return [
             {
                 "id": "graph",
                 "name": "Graph mesh",
                 "status": "active",
-                "records": len([node for node in self.nodes.values() if node["type"] != "index"]),
+                "records": graph_records,
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
                 "id": "vector",
                 "name": "Vector index",
                 "status": "active",
-                "records": self.documents,
+                "records": vector_records,
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {

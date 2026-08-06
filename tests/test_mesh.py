@@ -132,6 +132,25 @@ async def test_snapshot_contains_base_indexes() -> None:
     }
 
 
+async def test_snapshot_uses_authoritative_corpus_counts_for_indexes() -> None:
+    mesh = MeshState()
+
+    snapshot = await mesh.snapshot(
+        CONFIG,
+        corpus={
+            "indexed_docs": 33189,
+            "indexed_edges": 189046,
+            "tracked_sources": 330,
+            "probe_complete": True,
+            "probe_chunked_documents": 1975,
+        },
+    )
+
+    indexes = {index["id"]: index for index in snapshot["indexes"]}
+    assert indexes["graph"]["records"] == 33189
+    assert indexes["vector"]["records"] == 1975
+
+
 async def test_snapshot_always_includes_central_dataset_node() -> None:
     mesh = MeshState()
     config = CitadelConfig(
