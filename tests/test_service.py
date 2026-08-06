@@ -974,6 +974,105 @@ async def test_reconcile_corpus_reports_failure_phase_after_deletion(tmp_path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repair_method", ["combined", "oversized"])
+async def test_reconcile_stops_after_partial_delete_failure(
+    tmp_path, repair_method: str
+) -> None:
+    class PartialDeleteGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "zero_chunk_count": 0,
+                "zero_chunk_document_ids": [],
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_document_ids": ["doc-over"],
+                "zero_repair_document_ids": [],
+                "oversized_repair_document_ids": ["doc-over"],
+                "repair_document_ids": ["doc-over"],
+                "repair_document_datasets": {"doc-over": ["notes"]},
+                "repair_datasets": ["notes"],
+                "unassigned_zero_chunk_document_count": 0,
+                "unassigned_oversized_document_count": 0,
+                "orphan_oversized_document_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_documents_truncated": False,
+                "repair_document_ids": ["doc-over"],
+                "repair_datasets": ["notes"],
+                "unassigned_oversized_document_count": 0,
+                "orphan_oversized_document_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            return {
+                "ok": False,
+                "document_ids": document_ids,
+                "snapshot_token": "snap-1",
+                "reason": "repair_delete_failed",
+                "error_type": "RuntimeError",
+                "projections_preserved": True,
+            }
+
+        async def restore_document_chunks(self, _: dict[str, Any]) -> bool:
+            self.events.append("restore")
+            return True
+
+        async def cognify(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("cognify must not run after a failed delete")
+
+    fake = PartialDeleteGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    if repair_method == "combined":
+        result = await kb.reconcile_corpus(apply=True, force=True)
+    else:
+        result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_delete_failed"
+    assert result["repair_phase"] == "delete"
+    assert result["deleted"]["snapshot_token"] == "snap-1"
+    assert result["projections_preserved"] is True
+    assert fake.events == ["lock_enter", "census", "delete", "lock_exit"]
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[-1]["status"] == "failed"
+    assert journal[-1]["phase"] == "delete"
+    assert journal[-1]["reason"] == "repair_delete_failed"
+    assert journal[-1]["projections_preserved"] is True
+
+
+@pytest.mark.asyncio
 async def test_reconcile_corpus_restores_when_post_check_invariants_remain(tmp_path) -> None:
     class IncompleteRepairGateway(FakeCognee):
         def __init__(self) -> None:

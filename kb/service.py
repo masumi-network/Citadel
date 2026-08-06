@@ -854,6 +854,10 @@ class Citadel:
                 deleted = await self.cognee.delete_document_chunks(
                     sorted(oversized_repair_ids_set)
                 )
+            if isinstance(deleted, dict) and deleted.get("ok") is False:
+                raise RuntimeError(
+                    str(deleted.get("reason") or "repair_delete_failed")
+                )
             deleted_ids = (
                 deleted.get("document_ids", [])
                 if isinstance(deleted, dict)
@@ -931,9 +935,17 @@ class Citadel:
                 if isinstance(deleted, dict)
                 else []
             )
-            projections_preserved = False
-            if deleted is not None:
+            projections_preserved = (
+                isinstance(deleted, dict)
+                and deleted.get("projections_preserved") is True
+            )
+            if deleted is not None and not projections_preserved:
                 projections_preserved = await self._restore_repair_projections(deleted)
+            failure_reason = (
+                deleted.get("reason")
+                if isinstance(deleted, dict) and isinstance(deleted.get("reason"), str)
+                else "repair_failed"
+            )
             try:
                 self.repair_journal.append(
                     operation_id=repair_operation_id,
@@ -944,7 +956,7 @@ class Citadel:
                     repair_datasets=repair_datasets,
                     deleted_document_ids=deleted_ids,
                     error_type=exc.__class__.__name__,
-                    reason="repair_failed",
+                    reason=failure_reason,
                     projections_preserved=projections_preserved,
                 )
             except Exception:  # noqa: BLE001 - preserve the original failure
@@ -954,7 +966,7 @@ class Citadel:
                 "dataset": dataset,
                 "apply": True,
                 "force": force,
-                "reason": "repair_failed",
+                "reason": failure_reason,
                 "repair_phase": repair_phase,
                 "error_type": exc.__class__.__name__,
                 "repair_operation_id": repair_operation_id,
@@ -1401,6 +1413,10 @@ class Citadel:
                 repair_datasets=repair_datasets,
             )
             deleted = await self.cognee.delete_document_chunks(repair_ids)
+            if isinstance(deleted, dict) and deleted.get("ok") is False:
+                raise RuntimeError(
+                    str(deleted.get("reason") or "repair_delete_failed")
+                )
             self.repair_journal.append(
                 operation_id=repair_operation_id,
                 dataset=dataset,
@@ -1466,9 +1482,17 @@ class Citadel:
                 if isinstance(deleted, dict)
                 else []
             )
-            projections_preserved = False
-            if deleted is not None:
+            projections_preserved = (
+                isinstance(deleted, dict)
+                and deleted.get("projections_preserved") is True
+            )
+            if deleted is not None and not projections_preserved:
                 projections_preserved = await self._restore_repair_projections(deleted)
+            failure_reason = (
+                deleted.get("reason")
+                if isinstance(deleted, dict) and isinstance(deleted.get("reason"), str)
+                else "repair_failed"
+            )
             try:
                 self.repair_journal.append(
                     operation_id=repair_operation_id,
@@ -1479,7 +1503,7 @@ class Citadel:
                     repair_datasets=repair_datasets,
                     deleted_document_ids=deleted_ids,
                     error_type=exc.__class__.__name__,
-                    reason="repair_failed",
+                    reason=failure_reason,
                     projections_preserved=projections_preserved,
                 )
             except Exception:  # noqa: BLE001 - preserve original failure
@@ -1489,7 +1513,7 @@ class Citadel:
                 "dataset": dataset,
                 "apply": True,
                 "force": True,
-                "reason": "repair_failed",
+                "reason": failure_reason,
                 "repair_phase": repair_phase,
                 "error_type": exc.__class__.__name__,
                 "repair_operation_id": repair_operation_id,

@@ -436,7 +436,11 @@ async def test_delete_graph_nodes_clears_graph_and_vector(monkeypatch: Any) -> N
     async def run_startup_migrations() -> None:
         return None
 
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations),
+    )
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -1857,7 +1861,14 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
     ) -> dict[str, list[dict[str, Any]]]:
         del graph_engine, graph_ids
         return {
-            "nodes": [{"id": graph_id, "name": "chunk", "type": "DocumentChunk", "properties": "{}"}],
+            "nodes": [
+                {
+                    "id": graph_id,
+                    "name": "chunk",
+                    "type": "DocumentChunk",
+                    "properties": "{}",
+                }
+            ],
             "edges": [],
         }
 
@@ -1874,6 +1885,107 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
     assert result["snapshot_token"]
     assert "vector_rows" not in result
     assert "graph" not in result
+
+
+@pytest.mark.asyncio
+async def test_delete_document_chunks_reports_partial_delete_failure(
+    monkeypatch: Any,
+) -> None:
+    from uuid import UUID
+
+    captured: dict[str, Any] = {}
+    graph_id = "graph-node"
+    vector_id = "9dbe579d-eccb-51b6-9bba-13982cbaf69f"
+
+    class FakeGraphEngine:
+        async def delete_nodes(self, node_ids: list[str]) -> None:
+            captured["graph"] = list(node_ids)
+            raise RuntimeError("graph delete failed")
+
+    class FakeVectorEngine:
+        async def delete_data_points(self, collection: str, ids: list[UUID]) -> None:
+            captured["collection"] = collection
+            captured["vector"] = list(ids)
+
+    async def get_graph_engine() -> FakeGraphEngine:
+        return FakeGraphEngine()
+
+    def get_vector_engine() -> FakeVectorEngine:
+        return FakeVectorEngine()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.graph",
+        SimpleNamespace(get_graph_engine=get_graph_engine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.vector",
+        SimpleNamespace(get_vector_engine=get_vector_engine),
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    async def stored_ids(_: list[str]) -> list[str]:
+        return [vector_id]
+
+    async def graph_ids(_: list[str]) -> set[str]:
+        return {graph_id}
+
+    monkeypatch.setattr(client, "stored_chunk_ids_for_documents", stored_ids)
+    monkeypatch.setattr(client, "graph_chunk_ids_for_documents", graph_ids)
+
+    async def snapshot_vector_rows(
+        vector_engine: Any, vector_ids: list[UUID]
+    ) -> list[dict[str, Any]]:
+        del vector_engine, vector_ids
+        return [{"id": UUID(vector_id), "payload": {"text": "private"}, "vector": [0.1]}]
+
+    async def snapshot_graph_projection(
+        graph_engine: Any, graph_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        del graph_engine, graph_ids
+        return {
+            "nodes": [{"id": graph_id, "name": "chunk", "type": "DocumentChunk", "properties": "{}"}],
+            "edges": [],
+        }
+
+    monkeypatch.setattr(client, "_snapshot_vector_rows", snapshot_vector_rows)
+    monkeypatch.setattr(client, "_snapshot_graph_projection", snapshot_graph_projection)
+
+    async def restore_snapshot(*_: Any, **__: Any) -> bool:
+        captured["restore_attempted"] = True
+        return False
+
+    monkeypatch.setattr(client, "_restore_document_chunk_snapshot_locked", restore_snapshot)
+
+    result = await client.delete_document_chunks(["doc-a"])
+
+    assert result["ok"] is False
+    assert result["document_ids"] == ["doc-a"]
+    assert result["vector_chunk_count"] == 1
+    assert result["graph_node_count"] == 1
+    assert result["reason"] == "repair_delete_failed"
+    assert result["error_type"] == "RuntimeError"
+    assert result["projections_preserved"] is False
+    assert result["snapshot_token"]
+    assert captured["collection"] == "DocumentChunk_text"
+    assert captured["vector"] == [UUID(vector_id)]
+    assert captured["graph"] == [graph_id]
+    assert captured["restore_attempted"] is True
 
 
 @pytest.mark.asyncio

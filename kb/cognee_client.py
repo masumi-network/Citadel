@@ -2427,7 +2427,7 @@ class CogneePublicClient:
                 if graph_ids:
                     await graph_engine.delete_nodes(sorted(graph_ids))
                 self._invalidate_graph_data_cache()
-            except Exception:
+            except Exception as exc:
                 restored = False
                 try:
                     restored = await self._restore_document_chunk_snapshot_locked(
@@ -2440,7 +2440,16 @@ class CogneePublicClient:
                     logger.exception("repair snapshot restore failed after delete error")
                 if restored:
                     self._repair_snapshots.pop(snapshot_token, None)
-                raise
+                return {
+                    "ok": False,
+                    "document_ids": requested,
+                    "vector_chunk_count": len(vector_uuids),
+                    "graph_node_count": len(graph_ids),
+                    "snapshot_token": snapshot_token if not restored else None,
+                    "reason": "repair_delete_failed",
+                    "error_type": exc.__class__.__name__,
+                    "projections_preserved": restored,
+                }
         return {
             "document_ids": requested,
             "vector_chunk_count": len(vector_uuids),
