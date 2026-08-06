@@ -24,6 +24,7 @@ def verify(dist_dir: Path) -> None:
     tokenizer_dir = files("kb").joinpath("data", "tiktoken-cache")
     tokenizer_files = [path for path in tokenizer_dir.iterdir() if path.is_file()]
     assert len(tokenizer_files) == 1
+    assert tokenizer_files[0].name.endswith(".gz")
 
     with tarfile.open(sdists[0], "r:gz") as archive:
         names = set(archive.getnames())
@@ -31,7 +32,7 @@ def verify(dist_dir: Path) -> None:
     assert any(name.endswith("/kb/retrieval_eval.py") for name in names)
     tokenizer_prefix = "/kb/data/tiktoken-cache/"
     assert any(
-        tokenizer_prefix in name and not name.endswith("/") for name in names
+        tokenizer_prefix in name and name.endswith(".gz") for name in names
     )
     print("release artifact webui, benchmark, and tokenizer payload verified")
 

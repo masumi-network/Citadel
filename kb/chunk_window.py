@@ -56,6 +56,7 @@ What this module ships instead
 
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import re
@@ -768,6 +769,7 @@ _BPE_ENCODING_FAILED = False
 _TIKTOKEN_CACHE_FILENAME = "".join(
     ("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790")
 )
+_TIKTOKEN_CACHE_ARCHIVE = _TIKTOKEN_CACHE_FILENAME + ".gz"
 _TIKTOKEN_CACHE_SHA256 = "".join(
     (
         "446a9538",
@@ -803,12 +805,12 @@ def _seed_bundled_tiktoken_cache() -> None:
     global _BUNDLED_TIKTOKEN_CACHE_READY
     if "TIKTOKEN_CACHE_DIR" in os.environ:
         return
-    bundled = (
+    bundled_archive = (
         Path(__file__).with_name("data")
         / "tiktoken-cache"
-        / _TIKTOKEN_CACHE_FILENAME
+        / _TIKTOKEN_CACHE_ARCHIVE
     )
-    if not bundled.is_file():
+    if not bundled_archive.is_file():
         return
     configured = os.getenv("CITADEL_TIKTOKEN_CACHE_DIR")
     cache_dir = (
@@ -817,12 +819,13 @@ def _seed_bundled_tiktoken_cache() -> None:
         else Path(tempfile.gettempdir()) / "citadel-tiktoken-cache"
     )
     target = cache_dir / _TIKTOKEN_CACHE_FILENAME
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        if _file_sha256(bundled) != _TIKTOKEN_CACHE_SHA256:
-            raise OSError("bundled tokenizer hash mismatch")
         cache_dir.mkdir(parents=True, exist_ok=True)
         if not _valid_tiktoken_cache_file(target):
-            shutil.copyfile(bundled, target)
+            with gzip.open(bundled_archive, "rb") as source, temporary.open("wb") as dest:
+                shutil.copyfileobj(source, dest)
+            os.replace(temporary, target)
         if not _valid_tiktoken_cache_file(target):
             raise OSError("seeded tokenizer hash mismatch")
         os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
@@ -832,6 +835,13 @@ def _seed_bundled_tiktoken_cache() -> None:
             "Could not seed the bundled gpt-4o tokenizer cache; "
             "exact chunk measurement is unavailable"
         )
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove temporary gpt-4o tokenizer cache")
 
 
 _seed_bundled_tiktoken_cache()
