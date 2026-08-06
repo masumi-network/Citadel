@@ -103,6 +103,30 @@ class FakeCitadel:
             "after": None,
         }
 
+    async def reconcile_oversized_chunks(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_oversized_chunks",
+            "before": {
+                "ok": True,
+                "oversized_document_count": 0,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": [],
+                "repair_datasets": [],
+            },
+            "after": None,
+        }
+
 class FakeLinearSyncer:
     async def status(self) -> dict[str, Any]:
         return {
@@ -1106,6 +1130,19 @@ def test_admin_can_audit_zero_chunk_reconciliation_and_writer_cannot() -> None:
 
     writer = authed_client("test-writer")
     assert writer.post("/api/corpus/reconcile", json={}).status_code == 403
+
+
+def test_admin_can_audit_oversized_chunk_reconciliation() -> None:
+    client = authed_client()
+
+    response = client.post(
+        "/api/corpus/reconcile",
+        json={"oversized": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "no_oversized_chunks"
+    assert response.json()["apply"] is False
 
 
 def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:

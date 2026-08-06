@@ -1448,17 +1448,26 @@ def create_mcp_server(
         dataset: str | None = None,
         apply: bool = False,
         force: bool = False,
+        oversized: bool = False,
     ) -> dict[str, Any]:
-        """Audit or repair accepted documents with no vector chunks.
+        """Audit or repair accepted documents with missing or oversized chunks.
 
         The default is a read-only census. Applying a repair requires admin
-        access and cognifies only datasets attached to affected documents.
+        access and cognifies only datasets attached to affected documents. Set
+        ``oversized`` to rebuild persisted chunks that exceed the embed budget.
         """
+        payload: dict[str, Any] = {
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+        }
+        if oversized:
+            payload["oversized"] = True
         return await _call_async(
             "citadel_reconcile_corpus",
             lambda: resolve_client(ctx).post(
                 "/api/corpus/reconcile",
-                {"dataset": dataset, "apply": apply, "force": force},
+                payload,
                 tool_name="citadel_reconcile_corpus",
             ),
         )

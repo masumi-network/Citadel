@@ -1541,6 +1541,182 @@ async def test_stored_chunk_budget_check_scans_exact_pgvector_payloads(
     assert report["chunks_scanned"] == 1
     assert report["violation_count"] == 1
     assert report["violations"][0]["chunk_id"] == "chunk-a"
+    assert report["violation_document_counts"] == {"doc-a": 1}
+    assert report["violation_document_ids"] == ["doc-a"]
+    assert report["violations_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_corpus_oversized_chunk_documents_reports_repair_metadata(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    pages = [
+        [
+            {"id": "doc-a", "name": "A", "datasets": ["notes"], "created_at": "1"},
+            {"id": "doc-b", "name": "B", "datasets": ["other"], "created_at": "2"},
+        ]
+    ]
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 2}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return pages.pop(0)
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None, *, budget: int | None = None
+    ) -> dict[str, Any]:
+        assert document_ids is None
+        assert budget == 256
+        return {
+            "ok": False,
+            "violation_count": 3,
+            "violation_document_counts": {"doc-a": 3},
+            "missing_document_id_violation_count": 0,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_oversized_chunk_documents(dataset="notes")
+
+    assert report["ok"] is True
+    assert report["oversized_document_count"] == 1
+    assert report["oversized_chunk_count"] == 3
+    assert report["repair_document_ids"] == ["doc-a"]
+    assert report["repair_datasets"] == ["notes"]
+    assert report["unassigned_oversized_document_count"] == 0
+    assert report["census_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_corpus_oversized_chunk_documents_surfaces_orphan_violations(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 1}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [{"id": "doc-a", "datasets": ["notes"]}]
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None, *, budget: int | None = None
+    ) -> dict[str, Any]:
+        assert document_ids is None
+        assert budget == 256
+        return {
+            "ok": False,
+            "violation_count": 3,
+            "violation_document_counts": {"doc-a": 1, "ghost": 1},
+            "missing_document_id_violation_count": 1,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_oversized_chunk_documents()
+
+    assert report["oversized_document_count"] == 2
+    assert report["repair_document_ids"] == ["doc-a"]
+    assert report["unassigned_oversized_document_count"] == 1
+    assert report["orphan_oversized_document_count"] == 1
+    assert report["missing_document_id_violation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_graph_chunk_ids_use_source_document_property(monkeypatch: Any) -> None:
+    client = CogneePublicClient()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class GraphEngine:
+        async def query(self, query: str, params: dict[str, Any]) -> list[tuple[str, str, str]]:
+            calls.append((query, params))
+            return [("chunk-a", "DocumentChunk", json.dumps("doc-a"))]
+
+    async def graph_engine() -> GraphEngine:
+        return GraphEngine()
+
+    monkeypatch.setattr(client, "_graph_engine", graph_engine)
+
+    assert await client.graph_chunk_ids_for_documents(["doc-a"]) == {"chunk-a"}
+    assert "node_type = 'DocumentChunk'" in calls[0][0]
+    assert "RETURN node_id, node_type, document_id_json" in calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
+    monkeypatch: Any,
+) -> None:
+    from uuid import UUID
+
+    captured: dict[str, Any] = {}
+    graph_id = "graph-node"
+    vector_id = "9dbe579d-eccb-51b6-9bba-13982cbaf69f"
+
+    class FakeGraphEngine:
+        async def delete_nodes(self, node_ids: list[str]) -> None:
+            captured["graph"] = list(node_ids)
+
+    class FakeVectorEngine:
+        async def delete_data_points(self, collection: str, ids: list[UUID]) -> None:
+            captured["collection"] = collection
+            captured["vector"] = list(ids)
+
+    async def get_graph_engine() -> FakeGraphEngine:
+        return FakeGraphEngine()
+
+    def get_vector_engine() -> FakeVectorEngine:
+        return FakeVectorEngine()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.graph",
+        SimpleNamespace(get_graph_engine=get_graph_engine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.vector",
+        SimpleNamespace(get_vector_engine=get_vector_engine),
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    async def stored_ids(_: list[str]) -> list[str]:
+        return [vector_id]
+
+    async def graph_ids(_: list[str]) -> set[str]:
+        return {graph_id}
+
+    monkeypatch.setattr(client, "stored_chunk_ids_for_documents", stored_ids)
+    monkeypatch.setattr(client, "graph_chunk_ids_for_documents", graph_ids)
+
+    result = await client.delete_document_chunks(["doc-a"])
+
+    assert result["vector_chunk_count"] == 1
+    assert result["graph_node_count"] == 1
+    assert captured["graph"] == [graph_id]
+    assert captured["collection"] == "DocumentChunk_text"
+    assert captured["vector"] == [UUID(vector_id)]
 
 
 @pytest.mark.asyncio
@@ -2049,6 +2225,7 @@ async def test_corpus_graph_presence_uses_source_document_property(
     assert len(calls) == 1
     query, params = calls[0]
     assert "json_extract(n.properties, '$.document_id')" in query
+    assert "node_type = 'DocumentChunk'" in query
     assert "RETURN DISTINCT document_id_json" in query
     assert set(params["document_ids_json"]) == {json.dumps("doc-a"), json.dumps("doc-b")}
 

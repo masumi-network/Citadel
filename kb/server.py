@@ -1021,6 +1021,7 @@ class CorpusReconcileBody(BaseModel):
     dataset: str | None = None
     apply: bool = False
     force: bool = False
+    oversized: bool = False
 
 
 class GraphCleanupBody(BaseModel):
@@ -6005,11 +6006,18 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
     citadel = get_citadel()
     try:
-        result = await citadel.reconcile_zero_chunk_documents(
-            dataset=body.dataset,
-            apply=body.apply,
-            force=body.force,
-        )
+        if body.oversized:
+            result = await citadel.reconcile_oversized_chunks(
+                dataset=body.dataset,
+                apply=body.apply,
+                force=body.force,
+            )
+        else:
+            result = await citadel.reconcile_zero_chunk_documents(
+                dataset=body.dataset,
+                apply=body.apply,
+                force=body.force,
+            )
     except Exception as exc:  # pragma: no cover - depends on Cognee config.
         logger.error("Corpus reconciliation failed: %s", exc.__class__.__name__)
         get_access_store().record_event(
@@ -6020,6 +6028,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
             detail={
                 "apply": body.apply,
                 "force": body.force,
+                "oversized": body.oversized,
                 "error": str(exc),
             },
         )
@@ -6032,6 +6041,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
                 "operation": "corpus.reconcile",
                 "apply": body.apply,
                 "force": body.force,
+                "oversized": body.oversized,
                 "error_type": exc.__class__.__name__,
             },
         )
@@ -6042,6 +6052,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
         "operation": "corpus.reconcile",
         "apply": body.apply,
         "force": body.force,
+        "oversized": body.oversized,
         "ok": result_ok,
         "reason": result.get("reason"),
         "repair_required": result.get("repair_required"),

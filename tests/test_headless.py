@@ -147,6 +147,24 @@ def test_reindex_force_requires_apply(capsys) -> None:
     assert "--force requires --apply" in capsys.readouterr().err
 
 
+def test_reindex_oversized_reaches_oversized_service(monkeypatch, capsys) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCitadel:
+        async def reconcile_oversized_chunks(self, **kwargs: object) -> dict[str, bool]:
+            calls.append(kwargs)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        "kb.service.Citadel.from_env",
+        classmethod(lambda cls: FakeCitadel()),
+    )
+
+    assert _run(["reindex", "--oversized", "--apply", "--force"]) == 0
+    assert calls == [{"dataset": None, "apply": True, "force": True}]
+    assert '"ok": true' in capsys.readouterr().out
+
+
 def test_setup_json_never_prompts_even_on_tty(tmp_path: Path, monkeypatch, capsys) -> None:
     # --json implies non-interactive: must not call input() even with a TTY.
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)

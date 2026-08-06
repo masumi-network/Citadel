@@ -1290,6 +1290,21 @@ def test_reconcile_corpus_tool_defaults_to_read_only() -> None:
     assert client.posts[-1]["tool_name"] == "citadel_reconcile_corpus"
 
 
+def test_reconcile_corpus_tool_can_request_oversized_repair() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_reconcile_corpus", None, oversized=True)
+
+    assert result["path"] == "/api/corpus/reconcile"
+    assert client.posts[-1]["payload"] == {
+        "dataset": None,
+        "apply": False,
+        "force": False,
+        "oversized": True,
+    }
+
+
 def test_recent_contributions_tool_reads_audit_feed() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)

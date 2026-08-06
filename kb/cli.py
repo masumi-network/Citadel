@@ -870,11 +870,18 @@ async def _reindex(args: argparse.Namespace) -> int:
     if args.force and not args.apply:
         raise ValueError("--force requires --apply")
     kb = Citadel.from_env()
-    result = await kb.reconcile_zero_chunk_documents(
-        dataset=args.dataset,
-        apply=args.apply,
-        force=args.force,
-    )
+    if args.oversized:
+        result = await kb.reconcile_oversized_chunks(
+            dataset=args.dataset,
+            apply=args.apply,
+            force=args.force,
+        )
+    else:
+        result = await kb.reconcile_zero_chunk_documents(
+            dataset=args.dataset,
+            apply=args.apply,
+            force=args.force,
+        )
     _print_json(result)
     return _result_exit(result)
 
@@ -3212,9 +3219,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     reindex = subcommands.add_parser(
         "reindex",
-        help="Audit and optionally repair accepted documents with no vector chunks",
+        help="Audit and optionally repair accepted documents with missing or oversized chunks",
     )
     reindex.add_argument("--dataset")
+    reindex.add_argument(
+        "--oversized",
+        action="store_true",
+        help="Audit and repair persisted chunks over the embed budget",
+    )
     reindex.add_argument(
         "--apply",
         action="store_true",
