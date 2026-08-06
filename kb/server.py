@@ -31,7 +31,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from kb import __version__ as _SERVICE_VERSION
+from kb.build_identity import SERVICE_BUILD_IDENTITY, build_identity_from_env
 from kb import chunk_window
 from kb.access import (
     CENTRAL_DATASET,
@@ -540,25 +540,17 @@ async def lifespan(app: FastAPI) -> Any:
             await _stop_evolve_scheduler(repo_stats_task)
 
 
-# Single-source the service version so /.well-known/citadel.json and the CLI
-# never drift. The Railway node runs from source, and editable environments can
-# retain stale distribution metadata after a version bump.
+# Single-source the service version and captured deployment identity. The Railway
+# node runs from source, and editable environments can retain stale distribution
+# metadata after a version bump.
 def _build_id_from_env(env: Mapping[str, str]) -> str | None:
-    """Capture Railway's deployment identity without guessing when absent."""
-    value = env.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
-    return value or None
+    """Compatibility helper for callers that only need the source build ID."""
+    return build_identity_from_env(env).build_id
 
 
-_BUILD_ID = _build_id_from_env(os.environ)
-
-
-def _public_release_version_from_env(env: Mapping[str, str]) -> str:
-    """Return the last explicitly published release shown on public pages."""
-    value = env.get("CITADEL_PUBLISHED_VERSION", "0.4.1").strip()
-    return value or "0.4.1"
-
-
-_PUBLIC_RELEASE_VERSION = _public_release_version_from_env(os.environ)
+_SERVICE_VERSION = SERVICE_BUILD_IDENTITY.version
+_BUILD_ID = SERVICE_BUILD_IDENTITY.build_id
+_DEPLOYMENT_ID = SERVICE_BUILD_IDENTITY.deployment_id
 
 
 app = FastAPI(
@@ -4353,8 +4345,9 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
     return {
         "ok": True,
         "service": "Citadel Archive",
-        "version": _PUBLIC_RELEASE_VERSION,
+        "version": _SERVICE_VERSION,
         "build_id": _BUILD_ID,
+        "deployment_id": _DEPLOYMENT_ID,
         "healthy": True,
         "sources": sources,
         "totals": {
@@ -4380,6 +4373,7 @@ async def citadel_discovery_manifest(request: Request, response: Response) -> di
             "kind": "organization_vault",
             "version": app.version,
             "build_id": _BUILD_ID,
+            "deployment_id": _DEPLOYMENT_ID,
             "base_url": base,
         },
         "public_endpoints": {

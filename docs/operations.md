@@ -54,10 +54,15 @@ threshold to Cognee's high-volume task and retrieval loggers. The default
 flooding Railway's log ingestion. Temporarily set it to `INFO` or `DEBUG` for
 diagnosis, then restore `WARNING`.
 
-Public pages read `CITADEL_PUBLISHED_VERSION`, captured when the web process
-starts. Keep it at the last approved release while a candidate is being tested.
-Set it to `0.5.0` only after the owner approves the v0.5.0 release and the
-deployment is serving that release.
+Public service surfaces read the package version from `kb.__version__`, captured
+when the web process starts. `build_id` reports `RAILWAY_GIT_COMMIT_SHA` when
+Railway provides it, then `CITADEL_BUILD_ID` as a CI-provided fallback.
+`deployment_id` is reported separately from `RAILWAY_DEPLOYMENT_ID`,
+`RAILWAY_SNAPSHOT_ID`, or `CITADEL_DEPLOYMENT_ID`. A missing source identifier
+stays `null`; a release version or deployment ID must never be used as a commit
+substitute. Deploy from a Git-connected Railway commit, or set
+`CITADEL_BUILD_ID` to the exact `git rev-parse HEAD` value in the deployment
+environment.
 
 Enable pgvector before production ingest:
 

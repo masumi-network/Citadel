@@ -12,6 +12,7 @@ from urllib.error import HTTPError
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+from kb import __version__
 import kb.mcp_server as mcp_server
 from kb.mcp_server import (
     MAX_AUDIT_LIMIT,
@@ -102,6 +103,12 @@ def test_record_feedback_does_not_require_qa_id() -> None:
     assert "qa_id" in schema["properties"]
 
 
+def test_mcp_server_reports_the_citadel_package_version() -> None:
+    server = create_mcp_server(FakeHttpClient())
+
+    assert server._mcp_server.version == __version__
+
+
 def test_tools_list_session_resolved_in_process_not_via_self_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,7 +162,7 @@ def test_streamable_http_uses_json_response_not_sse() -> None:
 
     app = server.streamable_http_app()
 
-    async def _roundtrip() -> tuple[str, int]:
+    async def _roundtrip() -> tuple[str, int, str]:
         async with app.router.lifespan_context(app):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -177,6 +184,7 @@ def test_streamable_http_uses_json_response_not_sse() -> None:
                         },
                     },
                 )
+                init_version = init.json()["result"]["serverInfo"]["version"]
                 sid = init.headers.get("mcp-session-id")
                 if sid:
                     headers = {**headers, "mcp-session-id": sid}
@@ -188,12 +196,17 @@ def test_streamable_http_uses_json_response_not_sse() -> None:
                     headers=headers,
                     json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                 )
-                return resp.headers.get("content-type", ""), resp.text.count('"name"')
+                return (
+                    resp.headers.get("content-type", ""),
+                    resp.text.count('"name"'),
+                    init_version,
+                )
 
-    content_type, tool_names = asyncio.run(_roundtrip())
+    content_type, tool_names, init_version = asyncio.run(_roundtrip())
     assert content_type.startswith("application/json")
     assert "text/event-stream" not in content_type
     assert tool_names == len(TOOL_POLICIES)
+    assert init_version == __version__
 
 
 def test_registered_tools_include_safety_annotations() -> None:

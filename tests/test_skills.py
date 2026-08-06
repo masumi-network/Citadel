@@ -58,6 +58,7 @@ def test_discovery_manifest_is_public_and_verifiable(monkeypatch) -> None:
         "kind": "organization_vault",
         "version": _SERVICE_VERSION,
         "build_id": None,
+        "deployment_id": None,
         "base_url": "https://citadel.example",
     }
     assert payload["public_endpoints"]["discovery"] == (

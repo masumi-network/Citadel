@@ -364,18 +364,25 @@ def test_healthz() -> None:
     assert response.json() == {"ok": True, "service": "citadel"}
 
 
-def test_public_release_version_is_explicitly_separate_from_package_version() -> None:
-    assert server_module._public_release_version_from_env({}) == "0.4.1"
-    assert server_module._public_release_version_from_env(
-        {"CITADEL_PUBLISHED_VERSION": "0.4.1"}
-    ) == "0.4.1"
-    assert server_module._public_release_version_from_env(
-        {"CITADEL_PUBLISHED_VERSION": "  "}
-    ) == "0.4.1"
+def test_public_state_uses_the_package_source_version() -> None:
     client = authed_client("test-reader")
     response = client.get("/api/state")
     assert response.status_code == 200
-    assert response.json()["version"] == server_module._PUBLIC_RELEASE_VERSION
+    assert response.json()["version"] == server_module._SERVICE_VERSION
+
+
+def test_public_state_and_discovery_share_deployment_identity() -> None:
+    client = authed_client("test-reader")
+    state = client.get("/api/state").json()
+    discovery = client.get("/.well-known/citadel.json").json()
+
+    assert state["version"] == discovery["service"]["version"] == server_module._SERVICE_VERSION
+    assert state["build_id"] == discovery["service"]["build_id"] == server_module._BUILD_ID
+    assert (
+        state["deployment_id"]
+        == discovery["service"]["deployment_id"]
+        == server_module._DEPLOYMENT_ID
+    )
 
 
 def test_public_state_reports_the_captured_build_id(monkeypatch) -> None:

@@ -18,6 +18,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from kb.access import ROLE_ORDER
+from kb.build_identity import SERVICE_BUILD_IDENTITY
 from kb.capture_config import load_capture_config
 from kb.retry import run_with_retries
 from kb.security_scan import redact_secrets
@@ -974,6 +975,9 @@ def create_mcp_server(
         streamable_http_path="/",
         transport_security=_transport_security(),
     )
+    # FastMCP currently leaves the low-level protocol version unset, which
+    # otherwise makes MCP report the installed MCP library version.
+    mcp._mcp_server.version = SERVICE_BUILD_IDENTITY.version
 
     def resolve_client(ctx: Context | None) -> CitadelHttpClient:
         """Per-request Citadel client.
