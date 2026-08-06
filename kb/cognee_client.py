@@ -2225,6 +2225,7 @@ class CogneePublicClient:
                 try:
                     value = json.loads(value)
                 except json.JSONDecodeError:
+                    # Ladybug may return a plain string instead of JSON.
                     pass
             if not isinstance(value, str) or value not in requested:
                 return None

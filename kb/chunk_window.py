@@ -839,6 +839,7 @@ def _seed_bundled_tiktoken_cache() -> None:
         try:
             temporary.unlink()
         except FileNotFoundError:
+            # The atomic replacement already removed the temporary file.
             pass
         except OSError:
             logger.warning("Could not remove temporary gpt-4o tokenizer cache")
