@@ -3054,6 +3054,7 @@ async def next_preview() -> Response:
 # all, so the gate has to be the route: a seat that cannot open a view is served
 # the locked page instead, and the view's markup never leaves the server.
 WEBUI_APP_VIEWS: dict[str, str] = {
+    "graph": "reader",
     "search": "reader",
     "review": "writer",
     "admin": "admin",

@@ -329,3 +329,48 @@
 .flowcanvas .react-flow__edge-text { font-family: var(--font-sans); font-size: 9px; font-weight: 500; fill: var(--ink-3); }
 .flowcanvas .fedge.is-on .react-flow__edge-text { fill: var(--accent-ink); }
 .flowcanvas .react-flow__edge-textbg { fill: var(--surface); }
+
+/* --- authenticated Knowledge Mesh --------------------------------------- */
+.knowledgecanvas {
+  position: relative;
+  width: 100%;
+  height: min(70vh, 680px);
+  min-height: 460px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.knowledgecanvas .react-flow {
+  --xy-background-color: var(--surface);
+  --xy-background-pattern-color: var(--border);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--ink-2);
+  --xy-controls-button-color-hover: var(--accent-ink);
+  --xy-controls-button-border-color: var(--border);
+  --xy-attribution-background-color: transparent;
+}
+.knowledgecanvas .react-flow__handle { width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; background: none; opacity: 0; }
+.knowledgecanvas .react-flow__edge-path { stroke: var(--border-2); stroke-width: 1.25; }
+.knowledgecanvas .react-flow__edge-text { fill: var(--ink-3); font-size: 9px; }
+.knowledgecanvas .react-flow__edge-textbg { fill: var(--surface); }
+.knowledge-node {
+  width: 190px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border-2);
+  line-height: 1.3;
+}
+.knowledge-node-label { overflow-wrap: anywhere; font-size: 12.5px; font-weight: 600; }
+.knowledge-node-kind,
+.knowledge-node-meta { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-3); }
+.knowledge-node-dataset { border: 2px solid var(--ink-3); background: var(--surface-2); }
+.knowledge-node-document { border-color: var(--accent); background: var(--accent-soft); }
+.knowledge-node-entity { background: var(--surface-2); }
+@media (max-width: 620px) {
+  .knowledgecanvas { min-height: 420px; height: 60vh; }
+}

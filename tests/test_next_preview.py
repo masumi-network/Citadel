@@ -153,7 +153,13 @@ def test_the_export_carries_no_inline_script_and_no_inline_style() -> None:
         assert not re.search(r'\sstyle="', html), f"{page.name} carries a style attribute"
 
 
-APP_VIEWS = ("/next/app", "/next/app/search", "/next/app/review", "/next/app/admin")
+APP_VIEWS = (
+    "/next/app",
+    "/next/app/search",
+    "/next/app/graph",
+    "/next/app/review",
+    "/next/app/admin",
+)
 
 
 def _seated_client(access_key: str) -> TestClient:
@@ -232,6 +238,22 @@ def test_the_dashboard_view_set_is_closed() -> None:
 
     for path in ("/next/app/nope", "/next/app/locked", "/next/app/overview"):
         assert client.get(path, follow_redirects=False).status_code == 404, path
+
+
+def test_graph_view_is_a_real_next_dashboard_route() -> None:
+    body = (server_module.WEBUI_DIR / "app" / "graph.html").read_text(encoding="utf-8")
+    source = (
+        Path(server_module.__file__).resolve().parent.parent
+        / "web"
+        / "src"
+        / "pages"
+        / "app"
+        / "graph.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "Knowledge graph" in body
+    assert "/api/mesh/graph?limit=200" in source
+    assert "Caller-scoped graph projection" in body
 
 
 def test_review_makes_no_claim_the_api_cannot_support() -> None:
