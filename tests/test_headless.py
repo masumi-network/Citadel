@@ -103,7 +103,7 @@ def test_bench_help_reaches_nested_parser(monkeypatch, capsys) -> None:
         kb.cli.main()
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    assert "{run,lint,ci,compare,report}" in out
+    assert "{run,lint,ci,compare,enforce,report}" in out
 
 
 def test_cognify_force_reaches_service(monkeypatch, capsys) -> None:
