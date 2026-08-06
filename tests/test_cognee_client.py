@@ -148,6 +148,50 @@ async def test_cognify_raises_without_llm_key(monkeypatch: Any) -> None:
         await client.cognify(datasets=["notes"])
 
 
+@pytest.mark.asyncio
+async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> None:
+    """Graph counts after cognify must observe the completed write."""
+    client = CogneePublicClient()
+    reads = 0
+
+    async def read_graph() -> tuple[list[Any], list[Any]]:
+        nonlocal reads
+        reads += 1
+        return ([(f"node-{reads}", {})], [])
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {"datasets": ["notes"], "incremental_loading": True}
+        return {"ok": True}
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(client, "_read_graph_data", read_graph)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_startup_migrations=run_startup_migrations,
+            cognify=cognify,
+        ),
+    )
+
+    await client.graph_data()
+    await client.graph_data()
+    assert reads == 1
+
+    await client.cognify(datasets=["notes"])
+    await client.graph_data()
+
+    assert reads == 2
+
+
 class _FakeGraphEngine:
     """Minimal cognee graph engine over in-memory nodes/edges (#28 drill-down).
 
@@ -378,6 +422,7 @@ async def test_delete_graph_nodes_clears_graph_and_vector(monkeypatch: Any) -> N
 
     client = CogneePublicClient()
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    client._graph_data_cache = (0.0, ([], []))
 
     async def _ready(_cognee: Any) -> None:
         return None
@@ -390,6 +435,7 @@ async def test_delete_graph_nodes_clears_graph_and_vector(monkeypatch: Any) -> N
     assert captured["graph"] == [uuid_a, uuid_b]
     assert captured["collection"] == "DocumentChunk_text"
     assert captured["vector"] == [UUID(uuid_a), UUID(uuid_b)]
+    assert client._graph_data_cache is None
     assert await client.delete_graph_nodes([]) == 0  # no-op
 
 

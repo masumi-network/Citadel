@@ -774,6 +774,10 @@ class CogneePublicClient:
             self._graph_data_cache = (monotonic(), result)
             return result
 
+    def _invalidate_graph_data_cache(self) -> None:
+        """Drop the raw graph snapshot after a successful graph mutation."""
+        self._graph_data_cache = None
+
     async def _read_graph_data(self) -> tuple[list[Any], list[Any]]:
         self._prepare_cognee_environment()
         import cognee
@@ -1380,6 +1384,7 @@ class CogneePublicClient:
         async with self.writer_lock:
             await engine.delete_nodes(node_ids)
             await self._delete_vector_points(node_ids)
+            self._invalidate_graph_data_cache()
         return len(node_ids)
 
     async def _delete_vector_points(self, node_ids: list[str]) -> None:
@@ -1929,7 +1934,11 @@ class CogneePublicClient:
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
-            return await cognee.cognify(datasets=datasets, incremental_loading=not force)
+            result = await cognee.cognify(
+                datasets=datasets, incremental_loading=not force
+            )
+            self._invalidate_graph_data_cache()
+            return result
 
     async def add_feedback(
         self,
