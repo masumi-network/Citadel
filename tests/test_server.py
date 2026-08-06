@@ -1672,6 +1672,44 @@ def test_knowledge_mesh_canvas_is_reachable_from_the_knowledge_page() -> None:
         assert page.count(f'id="{element_id}"') == 1, element_id
 
 
+def test_graph_inspector_resolves_one_hop_document_neighbors() -> None:
+    """#186: entity inspection may fall through to readable graph neighbors.
+
+    The legacy dashboard is a hand-written browser script with no DOM test
+    runner. This static contract keeps the bounded client behavior explicit;
+    `node --check kb/static/app.js` remains the syntax check for the script.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    bearing = re.search(
+        r"function isDocumentBearingNode\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    candidates = re.search(
+        r"function documentCandidates\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    loader = re.search(
+        r"async function loadNodeDocument\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    assert bearing and candidates and loader
+
+    bearing_body = bearing.group(1)
+    assert 'type.includes("document")' in bearing_body
+    assert 'type.includes("chunk")' in bearing_body
+    assert 'type.includes("summary")' in bearing_body
+
+    candidate_body = candidates.group(1)
+    assert "add(node)" in candidate_body
+    assert "knowledgeNeighbors(node.id)" in candidate_body
+    assert "seen.has(id)" in candidate_body
+
+    loader_body = loader.group(1)
+    assert "documentCandidates(node)" in loader_body
+    assert "candidate.node.id" in loader_body
+    assert "state.selectedId !== node.id" in loader_body
+    assert "error?.status === 404" in loader_body
+    assert "/not found/i.test(message)" in loader_body
+
+
 def test_admin_can_create_and_use_role_based_access_token(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     client = authed_client()

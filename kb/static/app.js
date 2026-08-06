@@ -2168,6 +2168,37 @@ function knowledgeNeighbors(nodeId) {
   return result;
 }
 
+// Entity nodes do not carry readable text themselves, but their graph
+// neighbors may be the document-bearing records that do. Keep this check
+// separate from nodeKind: TextSummary is useful in the inspector even though
+// it is currently rendered as an entity in the legend.
+function isDocumentBearingNode(node) {
+  const type = String(node?.type || "").toLowerCase();
+  return (
+    type.includes("document") ||
+    type.includes("chunk") ||
+    type.includes("summary") ||
+    ["text", "pdf", "audio", "image"].includes(type)
+  );
+}
+
+function documentCandidates(node) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (candidate, relationship = null) => {
+    const id = candidate?.id;
+    if (!id || seen.has(id) || !isDocumentBearingNode(candidate)) return;
+    seen.add(id);
+    candidates.push({ node: candidate, relationship });
+  };
+
+  add(node);
+  for (const item of knowledgeNeighbors(node.id)) {
+    add(item.node, item.relationship);
+  }
+  return candidates;
+}
+
 // Centre the viewport on a rendered node by id, mirroring handleNodeClick.
 // Nodes hidden by the legend filter are not rendered, so those just skip.
 function focusGraphNode(nodeId) {
@@ -2178,35 +2209,49 @@ function focusGraphNode(nodeId) {
   }
 }
 
-// Fetch and render the stored document text for a knowledge-graph node into
-// the inspector panel. Most entity nodes have no stored document (404), which
-// is normal and rendered as a quiet note rather than an error.
+// Fetch and render stored document text for a knowledge-graph node into the
+// inspector panel. Entity nodes fall through to one-hop document-bearing
+// neighbors, while a 404 remains a quiet empty state.
 async function loadNodeDocument(node) {
   const container = document.createElement("div");
   container.className = "node-document";
   container.innerHTML = "<p>Loading document text…</p>";
   selectedNode.append(container);
-  try {
-    const data = await api(`/api/documents/${encodeURIComponent(node.id)}`);
+  const candidates = documentCandidates(node);
+  let firstError = null;
+
+  for (const candidate of candidates) {
     if (state.selectedId !== node.id) return;
-    const doc = data?.document;
-    if (!doc || !doc.body) {
-      container.innerHTML = "<p>No document text stored for this node.</p>";
+    try {
+      const data = await api(`/api/documents/${encodeURIComponent(candidate.node.id)}`);
+      if (state.selectedId !== node.id) return;
+      const doc = data?.document;
+      if (!doc || !doc.body) continue;
+      const title =
+        doc.title && doc.title !== candidate.node.label
+          ? `<strong>${escapeHtml(doc.title)}</strong>`
+          : "";
+      const source =
+        candidate.node.id !== node.id
+          ? `<p class="node-document-source">From ${escapeHtml(
+              candidate.relationship || "related"
+            )} · ${escapeHtml(candidate.node.label || candidate.node.id)}</p>`
+          : "";
+      container.innerHTML = `${source}${title}<pre>${escapeHtml(doc.body)}</pre>`;
       return;
+    } catch (error) {
+      if (state.selectedId !== node.id) return;
+      const message = String(error?.message || "Request failed");
+      if (error?.status === 404 || /not found/i.test(message)) continue;
+      firstError = message;
+      break;
     }
-    const title =
-      doc.title && doc.title !== node.label
-        ? `<strong>${escapeHtml(doc.title)}</strong>`
-        : "";
-    container.innerHTML = `${title}<pre>${escapeHtml(doc.body)}</pre>`;
-  } catch (error) {
-    if (state.selectedId !== node.id) return;
-    const message = String(error?.message || "Request failed");
-    if (/not found/i.test(message)) {
-      container.innerHTML = "<p>No document text stored for this node.</p>";
-    } else {
-      container.innerHTML = `<p>Could not load document text: ${escapeHtml(message)}</p>`;
-    }
+  }
+
+  if (firstError) {
+    container.innerHTML = `<p>Could not load document text: ${escapeHtml(firstError)}</p>`;
+  } else {
+    container.innerHTML = "<p>No document text stored for this node.</p>";
   }
 }
 
