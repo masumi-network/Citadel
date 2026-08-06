@@ -674,7 +674,7 @@ def test_an_uncovered_embedding_provider_is_announced_once_per_process(
 def test_a_tokenizer_that_cannot_load_is_not_retried_on_every_document(
     monkeypatch: Any,
 ) -> None:
-    """``_BPE_ENCODING_FAILED`` is written on one call and read on the next.
+    """An unavailable encoding is cached and read on the next call.
 
     ``check_chunkable`` runs per ingest. Retrying a failed import per document
     would mean an exception and a traceback per document.
@@ -693,7 +693,6 @@ def test_a_tokenizer_that_cannot_load_is_not_retried_on_every_document(
     stub.encoding_for_model = encoding_for_model  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tiktoken", stub)
     monkeypatch.setattr(chunk_window, "_BPE_ENCODING", None)
-    monkeypatch.setattr(chunk_window, "_BPE_ENCODING_FAILED", False)
 
     assert chunk_window._bpe_encoding() is None
     assert chunk_window._bpe_encoding() is None

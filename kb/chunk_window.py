@@ -765,7 +765,7 @@ def split_cognee_words(text: str) -> list[str]:
 
 
 _BPE_ENCODING: Any | None = None
-_BPE_ENCODING_FAILED = False
+_BPE_ENCODING_UNAVAILABLE = object()
 _TIKTOKEN_CACHE_FILENAME = "".join(
     ("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790")
 )
@@ -840,7 +840,7 @@ def _seed_bundled_tiktoken_cache() -> None:
             temporary.unlink()
         except FileNotFoundError:
             # The atomic replacement already removed the temporary file.
-            pass
+            logger.debug("Temporary gpt-4o tokenizer cache was already removed")
         except OSError:
             logger.warning("Could not remove temporary gpt-4o tokenizer cache")
 
@@ -850,8 +850,10 @@ _seed_bundled_tiktoken_cache()
 
 def _bpe_encoding() -> Any | None:
     """The same encoding cognee counts the budget in: tiktoken for gpt-4o."""
-    global _BPE_ENCODING, _BPE_ENCODING_FAILED
-    if _BPE_ENCODING is not None or _BPE_ENCODING_FAILED:
+    global _BPE_ENCODING
+    if _BPE_ENCODING is _BPE_ENCODING_UNAVAILABLE:
+        return None
+    if _BPE_ENCODING is not None:
         return _BPE_ENCODING
     cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
     if cache_dir is None:
@@ -859,7 +861,7 @@ def _bpe_encoding() -> Any | None:
     else:
         cache_available = _valid_tiktoken_cache_file(Path(cache_dir) / _TIKTOKEN_CACHE_FILENAME)
     if not cache_available:
-        _BPE_ENCODING_FAILED = True
+        _BPE_ENCODING = _BPE_ENCODING_UNAVAILABLE
         logger.error(
             "No valid gpt-4o tokenizer cache is available; "
             "exact chunk measurement is unavailable"
@@ -870,12 +872,12 @@ def _bpe_encoding() -> Any | None:
 
         _BPE_ENCODING = tiktoken.encoding_for_model("gpt-4o")
     except Exception:
-        _BPE_ENCODING_FAILED = True
+        _BPE_ENCODING = _BPE_ENCODING_UNAVAILABLE
         logger.exception(
             "Could not load the gpt-4o encoding; un-chunkable content will pass "
             "the ingest check unmeasured"
         )
-    return _BPE_ENCODING
+    return None if _BPE_ENCODING is _BPE_ENCODING_UNAVAILABLE else _BPE_ENCODING
 
 
 def require_bpe_encoding() -> Any:

@@ -4462,6 +4462,16 @@ async def get_skill(slug: str) -> FileResponse:
     return FileResponse(path, media_type="text/markdown; charset=utf-8", headers=headers)
 
 
+def _cache_corpus_health_result(
+    cache_key: tuple[int, ...], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Store a readiness result for the next request and return that entry."""
+    global _CORPUS_HEALTH_CACHE
+    _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+    assert _CORPUS_HEALTH_CACHE is not None
+    return _CORPUS_HEALTH_CACHE[2]
+
+
 async def _corpus_health_impl() -> dict[str, Any]:
     """Data-plane volume gate using exact relational projection measurements. (#27)
 
@@ -4576,7 +4586,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
                 "measurement": "bounded_relational_projection_probe",
             }
             if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-                _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+                return _cache_corpus_health_result(cache_key, result)
             return result
 
         # Preserve the old method-boundary fallback for local fakes and older
@@ -4596,7 +4606,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "indexed_edges": edges,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+            return _cache_corpus_health_result(cache_key, result)
         return result
     except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
         logger.warning("corpus health check degraded: %s", exc)
@@ -4608,7 +4618,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "degraded": str(exc),
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+            return _cache_corpus_health_result(cache_key, result)
         return result
 
 

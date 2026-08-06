@@ -330,10 +330,10 @@ class CogneeGateway(Protocol):
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
-        ...
+        raise NotImplementedError
 
     def schedule_cognify(self, datasets: list[str]) -> None:
-        ...
+        raise NotImplementedError
 
     async def recall(
         self,
@@ -343,7 +343,7 @@ class CogneeGateway(Protocol):
         session_id: str | None = None,
         top_k: int = 10,
     ) -> list[Any]:
-        ...
+        raise NotImplementedError
 
     async def add_feedback(
         self,
@@ -353,7 +353,7 @@ class CogneeGateway(Protocol):
         score: int | None,
         text: str | None,
     ) -> bool:
-        ...
+        raise NotImplementedError
 
     async def improve(
         self,
@@ -362,36 +362,36 @@ class CogneeGateway(Protocol):
         session_ids: list[str] | None = None,
         build_global_context_index: bool = False,
     ) -> Any:
-        ...
+        raise NotImplementedError
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
-        ...
+        raise NotImplementedError
 
     def maintenance(self) -> AsyncIterator[None]:
-        ...
+        raise NotImplementedError
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
-        ...
+        raise NotImplementedError
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
-        ...
+        raise NotImplementedError
 
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
-        ...
+        raise NotImplementedError
 
     async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
-        ...
+        raise NotImplementedError
 
     async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
-        ...
+        raise NotImplementedError
 
     async def source_manifest_for_documents(
         self, document_ids: list[str]
     ) -> dict[str, dict[str, Any]] | None:
-        ...
+        raise NotImplementedError
 
     async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
-        ...
+        raise NotImplementedError
 
     async def corpus_zero_chunk_documents(
         self,
@@ -399,7 +399,7 @@ class CogneeGateway(Protocol):
         dataset: str | None = None,
         page_limit: int = 200,
     ) -> dict[str, Any]:
-        ...
+        raise NotImplementedError
 
     async def corpus_oversized_chunk_documents(
         self,
@@ -407,7 +407,7 @@ class CogneeGateway(Protocol):
         dataset: str | None = None,
         page_limit: int = 200,
     ) -> dict[str, Any]:
-        ...
+        raise NotImplementedError
 
     async def corpus_reconciliation_census(
         self,
@@ -415,21 +415,21 @@ class CogneeGateway(Protocol):
         dataset: str | None = None,
         page_limit: int = 200,
     ) -> dict[str, Any]:
-        ...
+        raise NotImplementedError
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
-        ...
+        raise NotImplementedError
 
     async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
-        ...
+        raise NotImplementedError
 
     async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
-        ...
+        raise NotImplementedError
 
     async def discard_document_chunk_snapshot(
         self, deleted: Mapping[str, Any]
     ) -> bool:
-        ...
+        raise NotImplementedError
 
 
 class CogneePublicClient:
@@ -2322,11 +2322,12 @@ class CogneePublicClient:
             if isinstance(value, bytes):
                 value = value.decode("utf-8")
             if isinstance(value, str):
+                raw_value = value
                 try:
                     value = json.loads(value)
                 except json.JSONDecodeError:
                     # Ladybug may return a plain string instead of JSON.
-                    pass
+                    value = raw_value
             if not isinstance(value, str) or value not in requested:
                 return None
             node_ids.add(str(node_id))
