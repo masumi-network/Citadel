@@ -160,6 +160,15 @@ try:
     )
 except ValueError:
     _CORPUS_HEALTH_CACHE_TTL_SECONDS = 5.0
+# /api/mesh and /api/indexes already degrade to restart-scoped counters when
+# corpus measurement fails. Bound that dependency so a slow graph read follows
+# the existing response contract instead of holding the dashboard request open.
+try:
+    _CORPUS_HEALTH_TIMEOUT_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_TIMEOUT_SECONDS", "2"))
+    )
+except ValueError:
+    _CORPUS_HEALTH_TIMEOUT_SECONDS = 2.0
 _CORPUS_HEALTH_CACHE: tuple[float, tuple[int, ...], dict[str, Any]] | None = None
 _CORPUS_HEALTH_LOCK = asyncio.Lock()
 
@@ -4628,6 +4637,32 @@ async def _corpus_health() -> dict[str, Any]:
         return await _corpus_health_impl()
 
 
+async def _bounded_corpus_health() -> dict[str, Any]:
+    """Return corpus health within the dashboard read budget.
+
+    A zero timeout keeps the previous unbounded behavior for operators that need
+    the full measurement. The normal setting is finite. The degraded payload is
+    the same shape already returned by ``_corpus_health_impl`` on dependency
+    failure, so callers keep their existing uptime-counter fallback.
+    """
+    try:
+        if _CORPUS_HEALTH_TIMEOUT_SECONDS <= 0:
+            return await _corpus_health()
+        return await asyncio.wait_for(
+            _corpus_health(), timeout=_CORPUS_HEALTH_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        timeout = _CORPUS_HEALTH_TIMEOUT_SECONDS
+        logger.warning("bounded corpus health timed out after %.2fs", timeout)
+        return {
+            "ok": False,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": f"corpus health timed out after {timeout:g}s",
+        }
+
+
 @app.get("/readyz")
 async def readyz(request: Request) -> Any:
     require_access(request, "reader", "kb:read")
@@ -4720,7 +4755,9 @@ async def mesh(request: Request) -> Any:
     # `_corpus_health` is the same source /readyz and `citadel status` use, and
     # is fail-soft: on a transient read error it returns None totals and
     # `snapshot` falls back to the in-memory values rather than raising here.
-    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
+    snapshot = await get_mesh().snapshot(
+        citadel.config, corpus=await _bounded_corpus_health()
+    )
     return jsonable_encoder(scope_mesh_snapshot(snapshot, identity))
 
 
@@ -4886,7 +4923,9 @@ async def indexes(request: Request) -> Any:
     citadel = get_citadel()
     # Pass the authoritative corpus figures so the dashboard reports the vault's
     # real size rather than whatever has happened since the last deploy.
-    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
+    snapshot = await get_mesh().snapshot(
+        citadel.config, corpus=await _bounded_corpus_health()
+    )
     return jsonable_encoder({"indexes": snapshot["indexes"], "stats": snapshot["stats"]})
 
 

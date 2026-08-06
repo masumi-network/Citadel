@@ -7113,6 +7113,59 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     assert stats["edges"] is not None
 
 
+@pytest.mark.asyncio
+async def test_dashboard_corpus_health_is_bounded_and_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(30)
+            return {"nodes": 5, "edges": 7}
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    app.state.citadel = SlowCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    result = await asyncio.wait_for(server_module._bounded_corpus_health(), timeout=0.5)
+
+    assert result == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "corpus health timed out after 0.01s",
+    }
+
+
+def test_indexes_timeout_preserves_existing_response_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(30)
+            return {"nodes": 5, "edges": 7}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+
+    response = client.get("/api/indexes")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"indexes", "stats"}
+    assert isinstance(body["indexes"], list)
+    assert "since_restart" in body["stats"]
+
+
 def test_api_mesh_activity_counters_are_scoped_not_top_level(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
