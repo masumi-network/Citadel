@@ -23,6 +23,10 @@ class FakeCognee:
         self.edges: list[Any] = []
         self._pending: list[Any] = []
 
+    @asynccontextmanager
+    async def maintenance(self):
+        yield
+
     async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
         self.remember_calls.append({"data": data, **kwargs})
         # Cognee.add stores data, but it only enters the graph once cognify
@@ -369,6 +373,7 @@ async def test_reconcile_zero_chunks_applies_and_rechecks() -> None:
     class RepairGateway(FakeCognee):
         def __init__(self) -> None:
             super().__init__()
+            self.events: list[str] = []
             self.reports = [
                 {
                     "ok": True,
@@ -384,8 +389,21 @@ async def test_reconcile_zero_chunks_applies_and_rechecks() -> None:
                 },
             ]
 
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
         async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
             return self.reports.pop(0)
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            return await super().cognify(**kwargs)
 
     fake = RepairGateway()
     kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
@@ -396,6 +414,7 @@ async def test_reconcile_zero_chunks_applies_and_rechecks() -> None:
     assert result["reason"] == "repaired"
     assert result["after"]["zero_chunk_count"] == 0
     assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert fake.events == ["lock_enter", "census", "cognify", "census", "lock_exit"]
 
 
 @pytest.mark.asyncio

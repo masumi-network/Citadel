@@ -1121,6 +1121,37 @@ class Citadel:
             journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
             if journal_gate is not None:
                 return journal_gate
+            maintenance = getattr(self.cognee, "maintenance", None)
+            if not callable(maintenance):
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "maintenance_unavailable",
+                    "before": None,
+                    "after": None,
+                }
+            async with maintenance():
+                return await self._reconcile_zero_chunk_documents(
+                    dataset=dataset,
+                    apply=True,
+                    force=force,
+                )
+        return await self._reconcile_zero_chunk_documents(
+            dataset=dataset,
+            apply=False,
+            force=force,
+        )
+
+    async def _reconcile_zero_chunk_documents(
+        self,
+        *,
+        dataset: str | None,
+        apply: bool,
+        force: bool,
+    ) -> dict[str, Any]:
+        """Run the zero-chunk census inside the caller's maintenance boundary."""
         before = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
         if before.get("ok") is not True:
             return {
