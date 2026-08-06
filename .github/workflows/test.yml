@@ -154,6 +154,7 @@ jobs:
             git status --short -- kb/webui
             git diff -- kb/webui
             exit 1
+          fi
 
   package-smoke:
     name: package smoke
@@ -180,7 +181,6 @@ jobs:
           "$venv/bin/python" -m pip install --no-index --no-deps dist/*.whl
           "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
           "$venv/bin/citadel" bench --help >/dev/null
-          fi
 
   gate:
     name: CI gate
