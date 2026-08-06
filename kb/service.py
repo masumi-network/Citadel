@@ -962,10 +962,6 @@ class Citadel:
                 "after": None,
             }
         if apply:
-            if not recover:
-                journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
-                if journal_gate is not None:
-                    return journal_gate
             maintenance = getattr(self.cognee, "maintenance", None)
             if not callable(maintenance):
                 return {
@@ -980,6 +976,12 @@ class Citadel:
                 }
             try:
                 with self.repair_journal.lease():
+                    if not recover:
+                        journal_gate = self._repair_journal_gate(
+                            dataset=dataset, force=force
+                        )
+                        if journal_gate is not None:
+                            return journal_gate
                     async with maintenance():
                         recovery: dict[str, Any] | None = None
                         if recover:
@@ -1558,9 +1560,6 @@ class Citadel:
         instead of being guessed into the default dataset.
         """
         if apply:
-            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
-            if journal_gate is not None:
-                return journal_gate
             maintenance = getattr(self.cognee, "maintenance", None)
             if not callable(maintenance):
                 return {
@@ -1574,6 +1573,9 @@ class Citadel:
                 }
             try:
                 with self.repair_journal.lease():
+                    journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+                    if journal_gate is not None:
+                        return journal_gate
                     async with maintenance():
                         return await self._reconcile_zero_chunk_documents(
                             dataset=dataset,
@@ -1921,14 +1923,13 @@ class Citadel:
         apply: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
-        if apply:
-            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
-            if journal_gate is not None:
-                return journal_gate
         maintenance = getattr(self.cognee, "maintenance", None)
         if apply:
             try:
                 with self.repair_journal.lease():
+                    journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+                    if journal_gate is not None:
+                        return journal_gate
                     if callable(maintenance):
                         async with maintenance():
                             return await self._reconcile_oversized_chunks(

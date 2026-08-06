@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import pytest
 
@@ -228,3 +228,49 @@ async def test_repair_apply_fails_closed_on_interrupted_journal(
     assert result["ok"] is False
     assert result["reason"] == "repair_interrupted"
     assert result["pending_operations"][0]["operation_id"] == "crashed-operation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair_method", ["combined", "oversized", "zero"])
+async def test_repair_rechecks_journal_after_acquiring_lease(
+    repair_method: str,
+) -> None:
+    class InterleavingJournal:
+        def __init__(self) -> None:
+            self.lease_entered = False
+            self.checks: list[bool] = []
+
+        @contextmanager
+        def lease(self):
+            self.lease_entered = True
+            yield
+
+        def pending_operations(self) -> list[dict[str, str]]:
+            self.checks.append(self.lease_entered)
+            if not self.lease_entered:
+                return []
+            return [{"operation_id": "crashed-after-preflight"}]
+
+    class NoopCognee:
+        @asynccontextmanager
+        async def maintenance(self):
+            raise AssertionError("journal gate must run inside the lease")
+            yield
+
+    journal = InterleavingJournal()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=NoopCognee())
+    kb.repair_journal = journal  # type: ignore[assignment]
+
+    if repair_method == "combined":
+        result = await kb.reconcile_corpus(apply=True, force=True)
+    elif repair_method == "oversized":
+        result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+    else:
+        result = await kb.reconcile_zero_chunk_documents(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_interrupted"
+    assert result["pending_operations"] == [
+        {"operation_id": "crashed-after-preflight"}
+    ]
+    assert journal.checks == [True]
