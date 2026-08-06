@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 _REPAIR_PHASES = {
@@ -77,3 +77,57 @@ class RepairJournal:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    def pending_operations(self) -> list[dict[str, Any]]:
+        """Return operations whose latest record does not prove a terminal state.
+
+        A process can die after a phase-start or phase-complete record and before
+        the next phase is written. Treat every non-terminal latest phase as an
+        interrupted operation so a new process cannot start another destructive
+        repair on an unknown projection state.
+        """
+        if not self.path.exists():
+            return []
+
+        latest: dict[str, dict[str, Any]] = {}
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise RuntimeError("repair journal cannot be read") from exc
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"repair journal contains invalid JSON at line {line_number}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise RuntimeError(
+                    f"repair journal record at line {line_number} is not an object"
+                )
+            operation_id = record.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise RuntimeError(
+                    f"repair journal record at line {line_number} has no operation id"
+                )
+            latest[operation_id] = record
+
+        def is_terminal(record: dict[str, Any]) -> bool:
+            status = record.get("status")
+            if status == "failed":
+                # Preflight failures happen before destructive work. A later
+                # failure is terminal only when rollback was explicitly proven.
+                return record.get("phase") == "preflight" or (
+                    record.get("projections_preserved") is True
+                )
+            return record.get("phase") in {"completed", "post_index_check"} and (
+                status == "completed"
+            )
+
+        pending = [record for record in latest.values() if not is_terminal(record)]
+        return sorted(
+            pending,
+            key=lambda record: str(record.get("operation_id")),
+        )

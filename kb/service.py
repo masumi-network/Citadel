@@ -401,6 +401,41 @@ class Citadel:
             getattr(self.cognee, "restore_document_chunks", None)
         )
 
+    def _repair_journal_gate(
+        self,
+        *,
+        dataset: str | None,
+        force: bool,
+    ) -> dict[str, Any] | None:
+        """Fence destructive repair after a process dies between journal phases."""
+        try:
+            pending = self.repair_journal.pending_operations()
+        except Exception as exc:  # noqa: BLE001 - fail closed before mutation
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_journal_unavailable",
+                "error_type": exc.__class__.__name__,
+                "repair_required": True,
+                "before": None,
+                "after": None,
+            }
+        if not pending:
+            return None
+        return {
+            "ok": False,
+            "dataset": dataset,
+            "apply": True,
+            "force": force,
+            "reason": "repair_interrupted",
+            "repair_required": True,
+            "pending_operations": pending,
+            "before": None,
+            "after": None,
+        }
+
     async def _restore_repair_projections(
         self, deleted: dict[str, Any] | None
     ) -> bool:
@@ -535,6 +570,9 @@ class Citadel:
         post-census verifies the vector, graph, and chunk-budget invariants.
         """
         if apply:
+            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+            if journal_gate is not None:
+                return journal_gate
             maintenance = getattr(self.cognee, "maintenance", None)
             if not callable(maintenance):
                 return {
@@ -1079,6 +1117,10 @@ class Citadel:
         again. Rows without dataset membership are reported as unrepairable
         instead of being guessed into the default dataset.
         """
+        if apply:
+            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+            if journal_gate is not None:
+                return journal_gate
         before = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
         if before.get("ok") is not True:
             return {
@@ -1177,6 +1219,10 @@ class Citadel:
         apply: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
+        if apply:
+            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+            if journal_gate is not None:
+                return journal_gate
         maintenance = getattr(self.cognee, "maintenance", None)
         if apply and callable(maintenance):
             async with maintenance():
