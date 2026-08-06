@@ -5953,14 +5953,16 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     verification = result.get("verification") or {}
+    result_ok = result.get("ok", True) is True
     get_access_store().record_event(
         action="cognify.run",
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=dataset,
         detail={
             "verify": body.verify,
             "force": body.force,
+            "ok": result_ok,
             "graph_grew": result.get("graph_grew"),
             "graph_before": result.get("graph_before"),
             "graph_after": result.get("graph_after"),
@@ -5970,16 +5972,25 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=dataset,
         detail={
             "operation": "cognify.run",
             "verify": body.verify,
             "force": body.force,
+            "ok": result_ok,
             "graph_grew": result.get("graph_grew"),
             "verification_ok": verification.get("ok") if body.verify else None,
         },
     )
+    if not result_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Cognify verification failed.",
+                "result": jsonable_encoder(result),
+            },
+        )
     return jsonable_encoder(result)
 
 

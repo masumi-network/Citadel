@@ -1035,6 +1035,33 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     assert verify.json()["verification"]["ok"] is True
 
 
+def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
+    class FailingCognify(FakeCitadel):
+        async def cognify_dataset(
+            self, *, dataset: Any = None, verify: bool = False, force: bool = False
+        ) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "dataset": dataset or self.config.default_dataset,
+                "graph_before": {"nodes": 5, "edges": 7},
+                "graph_after": {"nodes": 5, "edges": 7},
+                "graph_grew": False,
+                "verify": verify,
+                "verification": {"search_hit": False, "ok": False},
+            }
+
+    client = authed_client()
+    app.state.citadel = FailingCognify()
+
+    response = client.post("/api/cognify/run", json={"verify": True})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["result"]["ok"] is False
+    events = app.state.access_store.snapshot()["audit_events"]
+    cognify_events = [event for event in events if event["action"] == "cognify.run"]
+    assert cognify_events[-1]["success"] is False
+
+
 def test_cognify_run_requires_admin() -> None:
     client = authed_client("test-writer")
 

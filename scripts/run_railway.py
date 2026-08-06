@@ -213,6 +213,9 @@ def _cognify_via_api(url: str, *, force: bool) -> int:
         result.get("graph_after"),
         result.get("graph_grew"),
     )
+    if result.get("ok") is False:
+        logger.error("Cognify API reported failure: %s", result.get("verification"))
+        return 1
     return 0
 
 
