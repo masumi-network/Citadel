@@ -6080,6 +6080,11 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
         "ok": result_ok,
         "reason": result.get("reason"),
         "repair_required": result.get("repair_required"),
+        "repair_operation_id": result.get("repair_operation_id"),
+        "repair_phase": result.get("repair_phase"),
+        "repair_journal_error": result.get("repair_journal_error"),
+        "post_repair_indexed": result.get("post_repair_indexed"),
+        "post_repair_stored_budget_ok": result.get("post_repair_stored_budget_ok"),
     }
     get_access_store().record_event(
         action="corpus.reconcile",

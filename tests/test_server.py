@@ -1183,6 +1183,11 @@ def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
                 "apply": apply,
                 "force": force,
                 "reason": "reconciliation_invariants_remain",
+                "repair_operation_id": "repair-op-123",
+                "repair_phase": "post_index_check",
+                "repair_journal_error": "OSError",
+                "post_repair_indexed": False,
+                "post_repair_stored_budget_ok": True,
             }
 
     client = authed_client()
@@ -1195,6 +1200,20 @@ def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
     events = app.state.access_store.snapshot()["audit_events"]
     reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
     assert reconcile_events[-1]["success"] is False
+    assert reconcile_events[-1]["detail"] == {
+        "operation": "corpus.reconcile",
+        "apply": True,
+        "force": False,
+        "oversized": False,
+        "ok": False,
+        "reason": "reconciliation_invariants_remain",
+        "repair_required": None,
+        "repair_operation_id": "repair-op-123",
+        "repair_phase": "post_index_check",
+        "repair_journal_error": "OSError",
+        "post_repair_indexed": False,
+        "post_repair_stored_budget_ok": True,
+    }
 
 
 def test_knowledge_events_api_returns_resumable_timeline() -> None:
