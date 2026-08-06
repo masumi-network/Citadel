@@ -4,6 +4,7 @@ import asyncio
 import copy
 import contextlib
 import contextvars
+from hashlib import md5
 import json
 import logging
 import os
@@ -382,6 +383,11 @@ class CogneeGateway(Protocol):
         ...
 
     async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
+        ...
+
+    async def source_manifest_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
         ...
 
     async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
@@ -1361,6 +1367,85 @@ class CogneePublicClient:
                     counts[str(document_id)] = int(total or 0)
         return counts
 
+    async def source_manifest_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Return content-free source fingerprints for recovery fencing.
+
+        The manifest deliberately excludes source text and storage locations. It
+        proves that the relational source row still describes the same bytes and
+        lets recovery refuse a changed source before a dataset-wide force
+        cognify. A missing row is absent from the result so callers can fail
+        closed instead of treating a deleted source as recoverable.
+        """
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            return {}
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.infrastructure.files.utils.open_data_file import open_data_file
+        from cognee.modules.data.models import Data
+
+        from sqlalchemy import select
+
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("source manifest requested a non-UUID document id") from exc
+
+        engine = get_relational_engine()
+        manifest: dict[str, dict[str, Any]] = {}
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(
+                    Data.id,
+                    Data.content_hash,
+                    Data.raw_content_hash,
+                    Data.data_size,
+                    Data.raw_data_location,
+                    Data.updated_at,
+                ).where(Data.id.in_(wanted_ids))
+            )
+            for row in rows.all():
+                raw_location = getattr(row, "raw_data_location", None)
+                stored_raw_hash = getattr(row, "raw_content_hash", None)
+                if not isinstance(raw_location, str) or not raw_location:
+                    raise RuntimeError("repair source location is unavailable")
+                if not isinstance(stored_raw_hash, str) or not stored_raw_hash:
+                    raise RuntimeError("repair source hash is unavailable")
+                digest = md5()
+                raw_size = 0
+                try:
+                    async with open_data_file(raw_location) as source_file:
+                        while True:
+                            chunk = source_file.read(digest.block_size)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            raw_size += len(chunk)
+                except Exception as exc:  # noqa: BLE001 - source must be readable
+                    raise RuntimeError("repair source is unreadable") from exc
+                if digest.hexdigest() != stored_raw_hash:
+                    raise RuntimeError("repair source fingerprint mismatch")
+                entry: dict[str, Any] = {}
+                for key in ("content_hash", "raw_content_hash"):
+                    value = getattr(row, key, None)
+                    if value is not None:
+                        entry[key] = str(value)
+                if row.data_size is not None:
+                    entry["data_size"] = int(row.data_size)
+                entry["raw_data_size"] = raw_size
+                entry["source_readable"] = True
+                updated_at = _isoformat_utc(row.updated_at)
+                if updated_at is not None:
+                    entry["updated_at"] = updated_at
+                if entry:
+                    manifest[str(row.id)] = entry
+        return manifest
+
     async def corpus_zero_chunk_documents(
         self,
         *,
@@ -1395,6 +1480,10 @@ class CogneePublicClient:
             "zero_chunk_count": 0,
             "zero_chunk_documents": [],
             "zero_chunk_documents_truncated": False,
+            "zero_chunk_document_ids": [],
+            "zero_repair_document_ids": [],
+            "repair_document_ids": [],
+            "repair_document_datasets": {},
             "repair_datasets": [],
             "unassigned_zero_chunk_count": 0,
             "census_complete": False,
@@ -1411,6 +1500,9 @@ class CogneePublicClient:
         after_id: str | None = None
         seen_ids: set[str] = set()
         zero_documents: list[dict[str, Any]] = []
+        zero_ids: set[str] = set()
+        zero_repair_ids: set[str] = set()
+        repair_document_datasets: dict[str, list[str]] = {}
         repair_datasets: set[str] = set()
         unassigned = 0
         zero_count = 0
@@ -1463,8 +1555,12 @@ class CogneePublicClient:
                 if dataset and dataset not in datasets:
                     continue
                 zero_count += 1
+                zero_ids.add(document_id)
                 if datasets:
-                    repair_datasets.update([dataset] if dataset else datasets)
+                    assigned_datasets = [dataset] if dataset else datasets
+                    zero_repair_ids.add(document_id)
+                    repair_datasets.update(assigned_datasets)
+                    repair_document_datasets[document_id] = assigned_datasets
                 else:
                     unassigned += 1
                 if len(zero_documents) < MAX_ZERO_CHUNK_REPORT_DOCUMENTS:
@@ -1495,8 +1591,12 @@ class CogneePublicClient:
             "documents_scanned": len(seen_ids),
             "pages": pages,
             "zero_chunk_count": zero_count,
+            "zero_chunk_document_ids": sorted(zero_ids),
+            "zero_repair_document_ids": sorted(zero_repair_ids),
             "zero_chunk_documents": zero_documents,
             "zero_chunk_documents_truncated": zero_count > len(zero_documents),
+            "repair_document_ids": sorted(zero_repair_ids),
+            "repair_document_datasets": dict(sorted(repair_document_datasets.items())),
             "repair_datasets": sorted(repair_datasets),
             "unassigned_zero_chunk_count": unassigned,
             "census_complete": complete,

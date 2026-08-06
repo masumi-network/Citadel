@@ -543,6 +543,72 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
 
 
 @pytest.mark.asyncio
+async def test_source_manifest_requires_readable_matching_raw_source(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    from contextlib import asynccontextmanager
+    from hashlib import md5
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee.infrastructure.databases.relational as relational_module
+    from cognee.modules.data.models import Data
+
+    raw_bytes = b"stored source text\n"
+    raw_path = tmp_path / "source.txt"
+    raw_path.write_bytes(raw_bytes)
+    document_id = uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add(
+            Data(
+                id=document_id,
+                name="source",
+                raw_data_location=str(raw_path),
+                content_hash="original-hash",
+                raw_content_hash=md5(raw_bytes).hexdigest(),
+                data_size=18,
+                updated_at=None,
+            )
+        )
+        await session.commit()
+
+    class _FakeRelEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    monkeypatch.setattr(
+        relational_module, "get_relational_engine", lambda: _FakeRelEngine()
+    )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    manifest = await client.source_manifest_for_documents([str(document_id)])
+
+    await engine.dispose()
+    assert manifest == {
+        str(document_id): {
+            "content_hash": "original-hash",
+            "data_size": 18,
+            "raw_content_hash": md5(raw_bytes).hexdigest(),
+            "raw_data_size": len(raw_bytes),
+            "source_readable": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_zero_chunk_census_walks_pages_and_filters_datasets(monkeypatch: Any) -> None:
     client = CogneePublicClient()
     rows = [

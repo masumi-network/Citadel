@@ -147,6 +147,29 @@ def test_reindex_force_requires_apply(capsys) -> None:
     assert "--force requires --apply" in capsys.readouterr().err
 
 
+def test_reindex_recover_passes_explicit_recovery_flag(monkeypatch, capsys) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCitadel:
+        async def reconcile_corpus(self, **kwargs: object) -> dict[str, bool]:
+            calls.append(kwargs)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        "kb.service.Citadel.from_env",
+        classmethod(lambda cls: FakeCitadel()),
+    )
+
+    assert _run(["reindex", "--apply", "--force", "--recover"]) == 0
+    assert calls == [{"dataset": None, "apply": True, "force": True, "recover": True}]
+    assert '"ok": true' in capsys.readouterr().out
+
+
+def test_reindex_recover_requires_apply(capsys) -> None:
+    assert _run(["reindex", "--recover"]) == 1
+    assert "--recover requires --apply" in capsys.readouterr().err
+
+
 def test_reindex_oversized_reaches_oversized_service(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 

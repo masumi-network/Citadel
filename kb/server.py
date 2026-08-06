@@ -1021,6 +1021,7 @@ class CorpusReconcileBody(BaseModel):
     dataset: str | None = None
     apply: bool = False
     force: bool = False
+    recover: bool = False
     # Compatibility switch. The default runs the combined zero/oversized census.
     oversized: bool = False
 
@@ -6032,6 +6033,11 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
     citadel = get_citadel()
     try:
+        if body.recover and body.oversized:
+            raise HTTPException(
+                status_code=422,
+                detail="repair recovery is supported only by the combined census",
+            )
         if body.oversized:
             result = await citadel.reconcile_oversized_chunks(
                 dataset=body.dataset,
@@ -6039,11 +6045,16 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
                 force=body.force,
             )
         else:
-            result = await citadel.reconcile_corpus(
-                dataset=body.dataset,
-                apply=body.apply,
-                force=body.force,
-            )
+            kwargs: dict[str, Any] = {
+                "dataset": body.dataset,
+                "apply": body.apply,
+                "force": body.force,
+            }
+            if body.recover:
+                kwargs["recover"] = True
+            result = await citadel.reconcile_corpus(**kwargs)
+    except HTTPException:
+        raise
     except Exception as exc:  # pragma: no cover - depends on Cognee config.
         logger.error("Corpus reconciliation failed: %s", exc.__class__.__name__)
         get_access_store().record_event(
@@ -6054,6 +6065,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
             detail={
                 "apply": body.apply,
                 "force": body.force,
+                "recover": body.recover,
                 "oversized": body.oversized,
                 "error": str(exc),
             },
@@ -6067,6 +6079,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
                 "operation": "corpus.reconcile",
                 "apply": body.apply,
                 "force": body.force,
+                "recover": body.recover,
                 "oversized": body.oversized,
                 "error_type": exc.__class__.__name__,
             },
@@ -6088,6 +6101,8 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
         "post_repair_indexed": result.get("post_repair_indexed"),
         "post_repair_stored_budget_ok": result.get("post_repair_stored_budget_ok"),
     }
+    if body.recover:
+        detail["recover"] = True
     get_access_store().record_event(
         action="corpus.reconcile",
         actor=actor,

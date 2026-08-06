@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 from kb.config import CitadelConfig
-from kb.repair_journal import RepairJournal
+from kb.repair_journal import RepairJournal, RepairJournalLeaseError
 from kb.service import Citadel
 
 
@@ -95,6 +95,19 @@ def test_pending_operations_does_not_return_missing_journal(tmp_path) -> None:
     assert RepairJournal(tmp_path / "missing.jsonl").pending_operations() == []
 
 
+def test_repair_lease_rejects_concurrent_holder_and_releases(tmp_path) -> None:
+    pytest.importorskip("fcntl")
+    journal = RepairJournal(tmp_path / "repair.jsonl")
+
+    with journal.lease():
+        with pytest.raises(RepairJournalLeaseError, match="lease is busy"):
+            with journal.lease():
+                pass
+
+    with journal.lease():
+        pass
+
+
 def test_pending_operations_keeps_journal_content_json_only(tmp_path) -> None:
     path = tmp_path / "repair.jsonl"
     journal = RepairJournal(path)
@@ -110,6 +123,66 @@ def test_pending_operations_keeps_journal_content_json_only(tmp_path) -> None:
     record = json.loads(path.read_text(encoding="utf-8"))
     assert "text" not in record
     assert journal.pending_operations()[0]["operation_id"] == "op"
+
+
+def test_pending_operations_carries_source_manifest_across_phases(tmp_path) -> None:
+    path = tmp_path / "repair.jsonl"
+    journal = RepairJournal(path)
+    manifest = {
+        "doc": {
+            "content_hash": "content-hash",
+            "raw_content_hash": "raw-hash",
+            "data_size": 42,
+            "updated_at": "2026-08-06T20:00:00+00:00",
+        }
+    }
+    journal.append(
+        operation_id="op",
+        dataset="notes",
+        phase="started",
+        status="started",
+        repair_document_ids=["doc"],
+        repair_datasets=["notes"],
+        source_manifest=manifest,
+    )
+    journal.append(
+        operation_id="op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc"],
+        repair_datasets=["notes"],
+    )
+
+    pending = journal.pending_operations()
+
+    assert pending[0]["phase"] == "delete"
+    assert pending[0]["source_manifest"] == manifest
+
+
+def test_recovery_phase_is_terminal_only_after_postcheck(tmp_path) -> None:
+    path = tmp_path / "repair.jsonl"
+    journal = RepairJournal(path)
+    fields = {
+        "operation_id": "op",
+        "dataset": "notes",
+        "repair_document_ids": ["doc"],
+        "repair_datasets": ["notes"],
+    }
+    journal.append(phase="recovery", status="started", **fields)
+    assert journal.pending_operations()[0]["operation_id"] == "op"
+
+    journal.append(phase="recovery", status="completed", **fields)
+    assert journal.pending_operations()[0]["operation_id"] == "op"
+
+    journal.append(
+        phase="recovery",
+        status="completed",
+        post_repair_census_ok=True,
+        post_repair_indexed=True,
+        **fields,
+    )
+    assert journal.pending_operations() == []
 
 
 @pytest.mark.asyncio

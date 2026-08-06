@@ -879,6 +879,12 @@ async def _reindex(args: argparse.Namespace) -> int:
 
     if args.force and not args.apply:
         raise ValueError("--force requires --apply")
+    if args.recover and not args.apply:
+        raise ValueError("--recover requires --apply")
+    if args.recover and not args.force:
+        raise ValueError("--recover requires --force")
+    if args.recover and args.oversized:
+        raise ValueError("--recover is supported only by combined reindex")
     kb = Citadel.from_env()
     if args.oversized:
         result = await kb.reconcile_oversized_chunks(
@@ -887,11 +893,14 @@ async def _reindex(args: argparse.Namespace) -> int:
             force=args.force,
         )
     else:
-        result = await kb.reconcile_corpus(
-            dataset=args.dataset,
-            apply=args.apply,
-            force=args.force,
-        )
+        kwargs: dict[str, Any] = {
+            "dataset": args.dataset,
+            "apply": args.apply,
+            "force": args.force,
+        }
+        if args.recover:
+            kwargs["recover"] = True
+        result = await kb.reconcile_corpus(**kwargs)
     _print_json(result)
     return _result_exit(result)
 
@@ -3246,6 +3255,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Force dataset reprocessing; requires --apply",
+    )
+    reindex.add_argument(
+        "--recover",
+        action="store_true",
+        help="Recover an interrupted repair from unchanged source rows; requires --apply --force",
     )
     reindex.set_defaults(handler=_reindex)
 

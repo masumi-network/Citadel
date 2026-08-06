@@ -1305,6 +1305,28 @@ def test_reconcile_corpus_tool_can_request_oversized_repair() -> None:
     }
 
 
+def test_reconcile_corpus_tool_can_request_interrupted_recovery() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(
+        server,
+        "citadel_reconcile_corpus",
+        None,
+        dataset="notes",
+        apply=True,
+        recover=True,
+    )
+
+    assert result["path"] == "/api/corpus/reconcile"
+    assert client.posts[-1]["payload"] == {
+        "dataset": "notes",
+        "apply": True,
+        "force": False,
+        "recover": True,
+    }
+
+
 def test_recent_contributions_tool_reads_audit_feed() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)

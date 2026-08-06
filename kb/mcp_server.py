@@ -1448,19 +1448,24 @@ def create_mcp_server(
         dataset: str | None = None,
         apply: bool = False,
         force: bool = False,
+        recover: bool = False,
         oversized: bool = False,
     ) -> dict[str, Any]:
         """Audit or repair accepted documents with missing or oversized chunks.
 
         The default is a combined read-only census. Applying a repair requires
         admin access and repairs the zero-chunk and over-budget union in one
-        pass. Set ``oversized`` for the legacy over-budget-only path.
+        pass. Set ``recover`` with ``apply`` and ``force`` to rebuild an
+        interrupted operation from unchanged source rows. Set ``oversized`` for the legacy
+        over-budget-only path; it does not support recovery.
         """
         payload: dict[str, Any] = {
             "dataset": dataset,
             "apply": apply,
             "force": force,
         }
+        if recover:
+            payload["recover"] = True
         if oversized:
             payload["oversized"] = True
         return await _call_async(

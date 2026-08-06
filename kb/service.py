@@ -14,7 +14,7 @@ from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
-from kb.repair_journal import RepairJournal
+from kb.repair_journal import RepairJournal, RepairJournalLeaseError
 from kb.security_scan import (
     SecretContentError,
     SecurityScanEntry,
@@ -459,6 +459,371 @@ class Citadel:
         except Exception:  # noqa: BLE001 - cleanup must not change repair result
             logger.warning("repair snapshot cleanup failed", exc_info=True)
 
+    async def _capture_repair_source_manifest(
+        self, document_ids: list[str]
+    ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, Any] | None]:
+        """Capture content-free source fingerprints before a destructive repair.
+
+        Older test gateways and non-Cognee adapters may not expose this optional
+        capability. The normal repair remains compatible with those adapters, but
+        interrupted recovery will refuse to proceed without the manifest.
+        """
+        capture = getattr(self.cognee, "source_manifest_for_documents", None)
+        if not callable(capture):
+            return None, None
+        try:
+            manifest = await capture(document_ids)
+        except Exception as exc:  # noqa: BLE001 - fail closed before mutation
+            return None, {
+                "reason": "repair_source_manifest_unavailable",
+                "error_type": exc.__class__.__name__,
+            }
+        if not isinstance(manifest, Mapping):
+            return None, {"reason": "repair_source_manifest_unavailable"}
+        normalized: dict[str, dict[str, Any]] = {}
+        for document_id, entry in manifest.items():
+            if not isinstance(document_id, str) or not document_id:
+                return None, {"reason": "repair_source_manifest_invalid"}
+            if not isinstance(entry, Mapping) or not entry:
+                return None, {"reason": "repair_source_manifest_invalid"}
+            normalized[document_id] = dict(entry)
+        expected_ids = set(document_ids)
+        if set(normalized) != expected_ids:
+            return None, {
+                "reason": "repair_source_manifest_incomplete",
+                "missing_document_ids": sorted(expected_ids - set(normalized)),
+            }
+        return normalized, None
+
+    async def _verify_repair_source_manifest(
+        self,
+        document_ids: list[str],
+        expected: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Refuse recovery when persisted source fingerprints no longer match."""
+        current, failure = await self._capture_repair_source_manifest(document_ids)
+        if failure is not None:
+            return {"ok": False, **failure}
+        if current is None:
+            return {"ok": False, "reason": "repair_recovery_manifest_unavailable"}
+        for document_id in document_ids:
+            expected_entry = expected.get(document_id)
+            current_entry = current.get(document_id)
+            if not isinstance(expected_entry, Mapping) or not isinstance(
+                current_entry, Mapping
+            ):
+                return {
+                    "ok": False,
+                    "reason": "repair_source_manifest_incomplete",
+                    "document_id": document_id,
+                }
+            for key, expected_value in expected_entry.items():
+                if current_entry.get(key) != expected_value:
+                    return {
+                        "ok": False,
+                        "reason": "repair_source_changed",
+                        "document_id": document_id,
+                        "field": key,
+                    }
+        return {"ok": True, "source_manifest": current}
+
+    async def _recover_interrupted_repairs(
+        self,
+        *,
+        dataset: str | None,
+        force: bool,
+    ) -> dict[str, Any]:
+        """Rebuild interrupted operations from unchanged durable source rows.
+
+        This is a source-backed rebuild, not an exact rollback. A journal record
+        becomes terminal only after the source fingerprint check, force cognify,
+        complete census, and targeted vector/graph checks all pass.
+        """
+        try:
+            pending = self.repair_journal.pending_operations()
+        except Exception as exc:  # noqa: BLE001 - fail closed before mutation
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_journal_unavailable",
+                "error_type": exc.__class__.__name__,
+                "repair_required": True,
+                "before": None,
+                "after": None,
+            }
+        if not pending:
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "no_interrupted_repairs",
+                "recovered_operations": [],
+                "before": None,
+                "after": None,
+            }
+
+        scoped = [
+            record
+            for record in pending
+            if dataset is None or record.get("dataset") == dataset
+        ]
+        if len(scoped) != len(pending):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_interrupted",
+                "repair_required": True,
+                "pending_operations": pending,
+                "before": None,
+                "after": None,
+            }
+
+        recovered: list[str] = []
+        for record in scoped:
+            operation_id = record.get("operation_id")
+            repair_ids = record.get("repair_document_ids")
+            repair_datasets = record.get("repair_datasets")
+            repair_mapping = record.get("repair_document_datasets")
+            source_manifest = record.get("source_manifest")
+            if (
+                not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(repair_ids, list)
+                or not repair_ids
+                or any(not isinstance(item, str) or not item for item in repair_ids)
+                or not isinstance(repair_datasets, list)
+                or not repair_datasets
+                or any(not isinstance(item, str) or not item for item in repair_datasets)
+                or not isinstance(repair_mapping, Mapping)
+                or set(repair_mapping) != set(repair_ids)
+                or any(
+                    not isinstance(datasets, list)
+                    or not datasets
+                    or any(not isinstance(item, str) or not item for item in datasets)
+                    or any(item not in repair_datasets for item in datasets)
+                    for datasets in repair_mapping.values()
+                )
+                or not isinstance(source_manifest, Mapping)
+                or not source_manifest
+            ):
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "repair_recovery_context_unavailable",
+                    "repair_required": True,
+                    "pending_operations": pending,
+                    "before": None,
+                    "after": None,
+                }
+
+            verification = await self._verify_repair_source_manifest(
+                repair_ids, source_manifest
+            )
+            if verification.get("ok") is not True:
+                reason = str(
+                    verification.get("reason") or "repair_recovery_manifest_unavailable"
+                )
+                try:
+                    self.repair_journal.append(
+                        operation_id=operation_id,
+                        dataset=record.get("dataset"),
+                        phase="recovery",
+                        status="failed",
+                        repair_document_ids=repair_ids,
+                        repair_datasets=repair_datasets,
+                        repair_document_datasets=repair_mapping,
+                        reason=reason,
+                        error_type=verification.get("error_type"),
+                        source_manifest=source_manifest,
+                        projections_preserved=False,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the recovery refusal
+                    logger.exception("repair journal failed during recovery refusal")
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": reason,
+                    "repair_required": True,
+                    "pending_operations": self.repair_journal.pending_operations(),
+                    "before": None,
+                    "after": None,
+                }
+
+            try:
+                self.repair_journal.append(
+                    operation_id=operation_id,
+                    dataset=record.get("dataset"),
+                    phase="recovery",
+                    status="started",
+                    repair_document_ids=repair_ids,
+                    repair_datasets=repair_datasets,
+                    repair_document_datasets=repair_mapping,
+                    source_manifest=source_manifest,
+                )
+                await self.cognee.cognify(datasets=repair_datasets, force=True)
+                after = await self.cognee.corpus_reconciliation_census(
+                    dataset=record.get("dataset")
+                )
+                post_counts = await self.cognee.corpus_chunk_counts(repair_ids)
+                post_graph_ids = await self.cognee.corpus_graph_presence(repair_ids)
+            except Exception as exc:  # noqa: BLE001 - keep operation pending
+                logger.exception("interrupted repair recovery failed")
+                try:
+                    self.repair_journal.append(
+                        operation_id=operation_id,
+                        dataset=record.get("dataset"),
+                        phase="recovery",
+                        status="failed",
+                        repair_document_ids=repair_ids,
+                        repair_datasets=repair_datasets,
+                        repair_document_datasets=repair_mapping,
+                        reason="repair_recovery_failed",
+                        error_type=exc.__class__.__name__,
+                        source_manifest=source_manifest,
+                        projections_preserved=False,
+                    )
+                except Exception:  # noqa: BLE001 - preserve original failure
+                    logger.exception("repair journal failed during recovery failure")
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "repair_recovery_failed",
+                    "error_type": exc.__class__.__name__,
+                    "repair_required": True,
+                    "pending_operations": self.repair_journal.pending_operations(),
+                    "before": None,
+                    "after": None,
+                }
+
+            post_counts_valid = isinstance(post_counts, dict) and all(
+                isinstance(post_counts.get(document_id), int)
+                and not isinstance(post_counts.get(document_id), bool)
+                and post_counts.get(document_id, 0) > 0
+                for document_id in repair_ids
+            )
+            post_graph_valid = post_graph_ids is not None and set(repair_ids).issubset(
+                {str(document_id) for document_id in post_graph_ids}
+            )
+            post_census_clean = (
+                isinstance(after, dict)
+                and after.get("ok") is True
+                and after.get("census_complete") is True
+                and after.get("cap_exceeded") is False
+                and after.get("zero_chunk_count") == 0
+                and after.get("oversized_document_count") == 0
+                and after.get("oversized_chunk_count") == 0
+                and after.get("unassigned_zero_chunk_document_count") == 0
+                and after.get("unassigned_oversized_document_count") == 0
+                and after.get("orphan_oversized_document_count") == 0
+                and after.get("missing_document_id_violation_count") == 0
+            )
+            recovered_ok = post_census_clean and post_counts_valid and post_graph_valid
+            if not recovered_ok:
+                try:
+                    repair_result = await self._reconcile_corpus(
+                        dataset=record.get("dataset"),
+                        apply=True,
+                        force=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retain the pending fence
+                    logger.exception("interrupted repair continuation failed")
+                    repair_result = {
+                        "ok": False,
+                        "reason": "repair_recovery_continuation_failed",
+                        "error_type": exc.__class__.__name__,
+                    }
+                repair_result_ok = repair_result.get("ok") is True
+                repair_result_indexed = repair_result.get("post_repair_indexed") is True
+                if repair_result_ok and (
+                    repair_result_indexed or (post_counts_valid and post_graph_valid)
+                ):
+                    self.repair_journal.append(
+                        operation_id=operation_id,
+                        dataset=record.get("dataset"),
+                        phase="recovery",
+                        status="completed",
+                        repair_document_ids=repair_ids,
+                        repair_datasets=repair_datasets,
+                        repair_document_datasets=repair_mapping,
+                        reason="source_backed_rebuild_then_repair",
+                        source_manifest=source_manifest,
+                        projections_preserved=False,
+                        post_repair_census_ok=True,
+                        post_repair_indexed=True,
+                    )
+                    recovered.append(operation_id)
+                    continue
+
+                reason = "repair_recovery_postcheck_failed"
+                try:
+                    self.repair_journal.append(
+                        operation_id=operation_id,
+                        dataset=record.get("dataset"),
+                        phase="recovery",
+                        status="failed",
+                        repair_document_ids=repair_ids,
+                        repair_datasets=repair_datasets,
+                        repair_document_datasets=repair_mapping,
+                        reason=reason,
+                        source_manifest=source_manifest,
+                        projections_preserved=False,
+                        post_repair_indexed=post_counts_valid and post_graph_valid,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the recovery refusal
+                    logger.exception("repair journal failed during recovery postcheck")
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": reason,
+                    "repair_required": True,
+                    "repair_operation_id": operation_id,
+                    "pending_operations": self.repair_journal.pending_operations(),
+                    "before": None,
+                    "after": after,
+                    "post_repair_chunk_counts": post_counts,
+                    "post_repair_graph_documents": sorted(post_graph_ids or set()),
+                }
+
+            self.repair_journal.append(
+                operation_id=operation_id,
+                dataset=record.get("dataset"),
+                phase="recovery",
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+                reason="source_backed_rebuild",
+                source_manifest=source_manifest,
+                projections_preserved=False,
+                post_repair_census_ok=True,
+                post_repair_indexed=True,
+            )
+            recovered.append(operation_id)
+
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": True,
+            "force": force,
+            "reason": "recovered_interrupted_repairs",
+            "recovered_operations": recovered,
+            "before": None,
+            "after": None,
+        }
+
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         """Resolve a cognee search-hit id to its document/chunk (#28)."""
         return await self.cognee.get_document(document_id)
@@ -561,6 +926,7 @@ class Citadel:
         dataset: str | None = None,
         apply: bool = False,
         force: bool = False,
+        recover: bool = False,
     ) -> dict[str, Any]:
         """Audit and optionally repair zero and over-budget projections together.
 
@@ -568,11 +934,38 @@ class Citadel:
         failure predicates. One census decides the union, one repair removes only
         stale oversized projections, one cognify rebuilds the union, and one
         post-census verifies the vector, graph, and chunk-budget invariants.
+        ``recover=True`` explicitly permits source-backed recovery of an
+        interrupted journal operation before the normal census runs.
         """
+        if recover and not apply:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": False,
+                "force": force,
+                "recover": True,
+                "reason": "repair_recovery_requires_apply",
+                "repair_required": True,
+                "before": None,
+                "after": None,
+            }
+        if recover and not force:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": False,
+                "recover": True,
+                "reason": "repair_recovery_requires_force",
+                "repair_required": True,
+                "before": None,
+                "after": None,
+            }
         if apply:
-            journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
-            if journal_gate is not None:
-                return journal_gate
+            if not recover:
+                journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
+                if journal_gate is not None:
+                    return journal_gate
             maintenance = getattr(self.cognee, "maintenance", None)
             if not callable(maintenance):
                 return {
@@ -580,16 +973,42 @@ class Citadel:
                     "dataset": dataset,
                     "apply": True,
                     "force": force,
+                    "recover": recover,
                     "reason": "maintenance_unavailable",
                     "before": None,
                     "after": None,
                 }
-            async with maintenance():
-                return await self._reconcile_corpus(
-                    dataset=dataset,
-                    apply=True,
-                    force=force,
-                )
+            try:
+                with self.repair_journal.lease():
+                    async with maintenance():
+                        recovery: dict[str, Any] | None = None
+                        if recover:
+                            recovery = await self._recover_interrupted_repairs(
+                                dataset=dataset,
+                                force=force,
+                            )
+                            if recovery.get("ok") is not True:
+                                return recovery
+                        result = await self._reconcile_corpus(
+                            dataset=dataset,
+                            apply=True,
+                            force=force,
+                        )
+                        if recovery is not None:
+                            result["recovery"] = recovery
+                        return result
+            except RepairJournalLeaseError:
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "recover": recover,
+                    "reason": "repair_journal_busy",
+                    "repair_required": True,
+                    "before": None,
+                    "after": None,
+                }
         return await self._reconcile_corpus(
             dataset=dataset,
             apply=False,
@@ -757,6 +1176,25 @@ class Citadel:
                 "after": None,
             }
 
+        source_manifest, source_manifest_failure = (
+            await self._capture_repair_source_manifest(repair_ids)
+        )
+        if source_manifest_failure is not None:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": source_manifest_failure["reason"],
+                "error_type": source_manifest_failure.get("error_type"),
+                "missing_document_ids": source_manifest_failure.get(
+                    "missing_document_ids", []
+                ),
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
         repair_operation_id = uuid4().hex
         try:
             self.repair_journal.append(
@@ -766,6 +1204,8 @@ class Citadel:
                 status="started",
                 repair_document_ids=repair_ids,
                 repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+                source_manifest=source_manifest,
             )
         except Exception as exc:  # noqa: BLE001 - refuse unjournaled mutation
             return {
@@ -1132,12 +1572,25 @@ class Citadel:
                     "before": None,
                     "after": None,
                 }
-            async with maintenance():
-                return await self._reconcile_zero_chunk_documents(
-                    dataset=dataset,
-                    apply=True,
-                    force=force,
-                )
+            try:
+                with self.repair_journal.lease():
+                    async with maintenance():
+                        return await self._reconcile_zero_chunk_documents(
+                            dataset=dataset,
+                            apply=True,
+                            force=force,
+                        )
+            except RepairJournalLeaseError:
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "repair_journal_busy",
+                    "repair_required": True,
+                    "before": None,
+                    "after": None,
+                }
         return await self._reconcile_zero_chunk_documents(
             dataset=dataset,
             apply=False,
@@ -1167,6 +1620,9 @@ class Citadel:
         zero_count = before.get("zero_chunk_count")
         unassigned_count = before.get("unassigned_zero_chunk_count")
         repair_datasets = before.get("repair_datasets")
+        zero_ids = before.get("zero_chunk_document_ids")
+        repair_ids = before.get("repair_document_ids")
+        repair_mapping = before.get("repair_document_datasets")
         if (
             isinstance(zero_count, bool)
             or not isinstance(zero_count, int)
@@ -1221,16 +1677,225 @@ class Citadel:
                 "before": before,
                 "after": None,
             }
+        if (
+            not isinstance(zero_ids, list)
+            or any(not isinstance(item, str) or not item for item in zero_ids)
+            or len(set(zero_ids)) != len(zero_ids)
+            or not isinstance(repair_ids, list)
+            or any(not isinstance(item, str) or not item for item in repair_ids)
+            or len(set(repair_ids)) != len(repair_ids)
+            or set(repair_ids) != set(zero_ids)
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "census_returned_invalid_repair_metadata",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+        if repair_mapping is None:
+            repair_mapping = {document_id: list(repair_datasets) for document_id in repair_ids}
+        if (
+            not isinstance(repair_mapping, Mapping)
+            or set(repair_mapping) != set(repair_ids)
+            or any(
+                not isinstance(datasets, list)
+                or not datasets
+                or any(not isinstance(item, str) or not item for item in datasets)
+                for datasets in repair_mapping.values()
+            )
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "census_returned_invalid_repair_metadata",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
 
-        await self.cognee.cognify(datasets=repair_datasets, force=force)
-        after = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
+        source_manifest, source_manifest_failure = (
+            await self._capture_repair_source_manifest(repair_ids)
+        )
+        if source_manifest_failure is not None:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": source_manifest_failure["reason"],
+                "error_type": source_manifest_failure.get("error_type"),
+                "missing_document_ids": source_manifest_failure.get(
+                    "missing_document_ids", []
+                ),
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        repair_operation_id = uuid4().hex
+        try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase="started",
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+                source_manifest=source_manifest,
+            )
+        except Exception as exc:  # noqa: BLE001 - refuse unjournaled mutation
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_journal_unavailable",
+                "error_type": exc.__class__.__name__,
+                "repair_operation_id": repair_operation_id,
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        repair_phase = "cognify"
+        try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+            )
+            await self.cognee.cognify(datasets=repair_datasets, force=force)
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+            )
+            repair_phase = "post_census"
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+            )
+            after = await self.cognee.corpus_zero_chunk_documents(dataset=dataset)
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+            )
+            repair_phase = "post_index_check"
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+            )
+            post_counts = await self.cognee.corpus_chunk_counts(repair_ids)
+            post_graph_ids = await self.cognee.corpus_graph_presence(repair_ids)
+        except Exception as exc:  # noqa: BLE001 - retain the restart fence
+            logger.exception("zero-chunk reconciliation failed during %s", repair_phase)
+            try:
+                self.repair_journal.append(
+                    operation_id=repair_operation_id,
+                    dataset=dataset,
+                    phase=repair_phase,
+                    status="failed",
+                    repair_document_ids=repair_ids,
+                    repair_datasets=repair_datasets,
+                    repair_document_datasets=repair_mapping,
+                    error_type=exc.__class__.__name__,
+                    reason="repair_failed",
+                    source_manifest=source_manifest,
+                    projections_preserved=False,
+                )
+            except Exception:  # noqa: BLE001 - preserve original failure
+                logger.exception("repair journal failed during zero-chunk failure")
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_failed",
+                "repair_phase": repair_phase,
+                "error_type": exc.__class__.__name__,
+                "repair_operation_id": repair_operation_id,
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
         after_zero_count = after.get("zero_chunk_count")
+        post_counts_valid = isinstance(post_counts, dict) and all(
+            isinstance(post_counts.get(document_id), int)
+            and not isinstance(post_counts.get(document_id), bool)
+            and post_counts.get(document_id, 0) > 0
+            for document_id in repair_ids
+        )
+        post_graph_valid = post_graph_ids is not None and set(repair_ids).issubset(
+            {str(document_id) for document_id in post_graph_ids}
+        )
         repaired = (
             after.get("ok") is True
             and isinstance(after_zero_count, int)
             and not isinstance(after_zero_count, bool)
             and after_zero_count == 0
+            and post_counts_valid
+            and post_graph_valid
         )
+        try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase="post_index_check",
+                status="completed" if repaired else "failed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                repair_document_datasets=repair_mapping,
+                reason="repaired" if repaired else "zero_chunk_documents_remain",
+                source_manifest=source_manifest,
+                post_repair_census_ok=after.get("ok") is True and after_zero_count == 0,
+                post_repair_indexed=post_counts_valid and post_graph_valid,
+                projections_preserved=False if repaired else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep failed result auditable
+            logger.exception("repair journal failed during zero-chunk postcheck")
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_journal_unavailable",
+                "error_type": exc.__class__.__name__,
+                "repair_operation_id": repair_operation_id,
+                "repair_required": True,
+                "before": before,
+                "after": after,
+            }
         return {
             "ok": repaired,
             "dataset": dataset,
@@ -1238,9 +1903,15 @@ class Citadel:
             "force": force,
             "reason": "repaired" if repaired else "zero_chunk_documents_remain",
             "repair_required": not repaired,
+            "repair_operation_id": repair_operation_id,
             "repair_datasets": repair_datasets,
+            "repair_document_ids": repair_ids,
             "before": before,
             "after": after,
+            "post_repair_chunk_counts": post_counts,
+            "post_repair_graph_documents": sorted(post_graph_ids or set()),
+            "post_repair_indexed": post_counts_valid and post_graph_valid,
+            "projections_preserved": False if repaired else None,
         }
 
     async def reconcile_oversized_chunks(
@@ -1255,13 +1926,32 @@ class Citadel:
             if journal_gate is not None:
                 return journal_gate
         maintenance = getattr(self.cognee, "maintenance", None)
-        if apply and callable(maintenance):
-            async with maintenance():
-                return await self._reconcile_oversized_chunks(
-                    dataset=dataset,
-                    apply=apply,
-                    force=force,
-                )
+        if apply:
+            try:
+                with self.repair_journal.lease():
+                    if callable(maintenance):
+                        async with maintenance():
+                            return await self._reconcile_oversized_chunks(
+                                dataset=dataset,
+                                apply=apply,
+                                force=force,
+                            )
+                    return await self._reconcile_oversized_chunks(
+                        dataset=dataset,
+                        apply=apply,
+                        force=force,
+                    )
+            except RepairJournalLeaseError:
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "repair_journal_busy",
+                    "repair_required": True,
+                    "before": None,
+                    "after": None,
+                }
         return await self._reconcile_oversized_chunks(
             dataset=dataset,
             apply=apply,
@@ -1388,6 +2078,24 @@ class Citadel:
             document_id: ([dataset] if dataset else list(repair_datasets))
             for document_id in repair_ids
         }
+        source_manifest, source_manifest_failure = (
+            await self._capture_repair_source_manifest(repair_ids)
+        )
+        if source_manifest_failure is not None:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": True,
+                "reason": source_manifest_failure["reason"],
+                "error_type": source_manifest_failure.get("error_type"),
+                "missing_document_ids": source_manifest_failure.get(
+                    "missing_document_ids", []
+                ),
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
         try:
             self.repair_journal.append(
                 operation_id=repair_operation_id,
@@ -1396,6 +2104,8 @@ class Citadel:
                 status="started",
                 repair_document_ids=repair_ids,
                 repair_datasets=repair_datasets,
+                repair_document_datasets=repair_document_datasets,
+                source_manifest=source_manifest,
             )
         except Exception as exc:  # noqa: BLE001 - refuse unjournaled mutation
             return {

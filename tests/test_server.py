@@ -109,6 +109,7 @@ class FakeCitadel:
         dataset: Any = None,
         apply: bool = False,
         force: bool = False,
+        recover: bool = False,
     ) -> dict[str, Any]:
         return {
             "ok": True,
@@ -1175,6 +1176,20 @@ def test_admin_can_audit_oversized_chunk_reconciliation() -> None:
     assert response.status_code == 200
     assert response.json()["reason"] == "no_oversized_chunks"
     assert response.json()["apply"] is False
+
+
+def test_admin_can_request_interrupted_recovery() -> None:
+    client = authed_client()
+
+    response = client.post(
+        "/api/corpus/reconcile",
+        json={"apply": True, "recover": True},
+    )
+
+    assert response.status_code == 200
+    events = app.state.access_store.snapshot()["audit_events"]
+    reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
+    assert reconcile_events[-1]["detail"]["recover"] is True
 
 
 def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
