@@ -14,6 +14,7 @@ from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
+from kb.repair_journal import RepairJournal
 from kb.security_scan import (
     SecretContentError,
     SecurityScanEntry,
@@ -48,6 +49,7 @@ class Citadel:
     ) -> None:
         self.config = config or CitadelConfig.from_env()
         self.cognee = cognee or CogneePublicClient()
+        self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,
             exclude_patterns=self.config.exclude_patterns,
@@ -609,26 +611,131 @@ class Citadel:
                 "after": None,
             }
 
+        repair_operation_id = uuid4().hex
+        try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase="started",
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
+        except Exception as exc:  # noqa: BLE001 - refuse unjournaled mutation
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_journal_unavailable",
+                "error_type": exc.__class__.__name__,
+                "repair_operation_id": repair_operation_id,
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
         oversized_repair_ids_set = set(oversized_repair_ids)
         deleted: dict[str, Any] | None = None
         repair_phase = "delete"
         try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             if oversized_repair_ids_set:
                 deleted = await self.cognee.delete_document_chunks(
                     sorted(oversized_repair_ids_set)
                 )
+            deleted_ids = (
+                deleted.get("document_ids", [])
+                if isinstance(deleted, dict)
+                else []
+            )
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                deleted_document_ids=deleted_ids,
+            )
             repair_phase = "cognify"
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             await self.cognee.cognify(
                 datasets=repair_datasets,
                 force=force or bool(oversized_repair_ids_set),
             )
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             repair_phase = "post_census"
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             after = await self.cognee.corpus_reconciliation_census(dataset=dataset)
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="completed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             repair_phase = "post_index_check"
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase=repair_phase,
+                status="started",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+            )
             post_counts = await self.cognee.corpus_chunk_counts(repair_ids)
             post_graph_ids = await self.cognee.corpus_graph_presence(repair_ids)
         except Exception as exc:  # noqa: BLE001 - return recoverable repair state
             logger.exception("corpus reconciliation failed during %s", repair_phase)
+            deleted_ids = (
+                deleted.get("document_ids", [])
+                if isinstance(deleted, dict)
+                else []
+            )
+            try:
+                self.repair_journal.append(
+                    operation_id=repair_operation_id,
+                    dataset=dataset,
+                    phase=repair_phase,
+                    status="failed",
+                    repair_document_ids=repair_ids,
+                    repair_datasets=repair_datasets,
+                    deleted_document_ids=deleted_ids,
+                    error_type=exc.__class__.__name__,
+                    reason="repair_failed",
+                )
+            except Exception:  # noqa: BLE001 - preserve the original failure
+                logger.exception("repair journal failed during repair failure handling")
             return {
                 "ok": False,
                 "dataset": dataset,
@@ -637,6 +744,7 @@ class Citadel:
                 "reason": "repair_failed",
                 "repair_phase": repair_phase,
                 "error_type": exc.__class__.__name__,
+                "repair_operation_id": repair_operation_id,
                 "repair_required": True,
                 "deleted": deleted,
                 "before": before,
@@ -677,12 +785,32 @@ class Citadel:
             and post_graph_valid
             and stored_budget_valid
         )
+        try:
+            self.repair_journal.append(
+                operation_id=repair_operation_id,
+                dataset=dataset,
+                phase="completed" if repaired else repair_phase,
+                status="completed" if repaired else "failed",
+                repair_document_ids=repair_ids,
+                repair_datasets=repair_datasets,
+                reason="repaired" if repaired else "reconciliation_invariants_remain",
+                post_repair_indexed=post_counts_valid and post_graph_valid,
+                post_repair_stored_budget_ok=stored_budget_valid,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep failed result auditable
+            logger.exception("repair journal failed during post-repair audit")
+            repaired = False
+            journal_error = exc.__class__.__name__
+        else:
+            journal_error = None
         return {
             "ok": repaired,
             "dataset": dataset,
             "apply": True,
             "force": force,
             "reason": "repaired" if repaired else "reconciliation_invariants_remain",
+            "repair_operation_id": repair_operation_id,
+            "repair_journal_error": journal_error,
             "repair_required": not repaired,
             "repair_datasets": repair_datasets,
             "repair_document_ids": repair_ids,

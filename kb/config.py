@@ -74,6 +74,12 @@ def _evolve_state_path(value: str | None) -> str:
     return str(Path(_state_root()) / "evolve_state.json")
 
 
+def _repair_journal_path(value: str | None) -> str:
+    if value:
+        return value
+    return str(Path(_state_root()) / "repair_journal.jsonl")
+
+
 def _repo_stats_state_path(value: str | None) -> str:
     if value:
         return value
@@ -240,6 +246,7 @@ class CitadelConfig:
     repo_content_sync_session: str = "masumi-repo-content"
     repo_content_sync_state_path: str = ".citadel/repo_content_sync_state.json"
     evolve_state_path: str = ".citadel/evolve_state.json"
+    repair_journal_path: str = ".citadel/repair_journal.jsonl"
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -445,6 +452,9 @@ class CitadelConfig:
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_STATE_PATH")
             ),
             evolve_state_path=_evolve_state_path(os.getenv("CITADEL_EVOLVE_STATE_PATH")),
+            repair_journal_path=_repair_journal_path(
+                os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
+            ),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
             ),

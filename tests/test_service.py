@@ -532,7 +532,7 @@ async def test_reconcile_oversized_chunks_deletes_rebuilds_and_rechecks() -> Non
 
 
 @pytest.mark.asyncio
-async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock() -> None:
+async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock(tmp_path) -> None:
     class RepairGateway(FakeCognee):
         def __init__(self) -> None:
             super().__init__()
@@ -623,7 +623,11 @@ async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock() -
             return set(document_ids)
 
     fake = RepairGateway()
-    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
 
     result = await kb.reconcile_corpus(apply=True, force=True)
 
@@ -643,6 +647,13 @@ async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock() -
         "graph",
         "lock_exit",
     ]
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[0]["phase"] == "started"
+    assert journal[0]["repair_document_ids"] == ["doc-over", "doc-zero"]
+    assert journal[-1]["status"] == "completed"
+    assert journal[-1]["post_repair_indexed"] is True
+    assert journal[-1]["post_repair_stored_budget_ok"] is True
+    assert all("text" not in event for event in journal)
 
 
 @pytest.mark.asyncio
@@ -681,7 +692,7 @@ async def test_reconcile_corpus_refuses_incomplete_census_before_mutation() -> N
 
 
 @pytest.mark.asyncio
-async def test_reconcile_corpus_reports_failure_phase_after_deletion() -> None:
+async def test_reconcile_corpus_reports_failure_phase_after_deletion(tmp_path) -> None:
     class FailingGateway(FakeCognee):
         def __init__(self) -> None:
             super().__init__()
@@ -733,7 +744,11 @@ async def test_reconcile_corpus_reports_failure_phase_after_deletion() -> None:
             raise RuntimeError("cognify failed")
 
     fake = FailingGateway()
-    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
 
     result = await kb.reconcile_corpus(apply=True, force=True)
 
@@ -744,6 +759,11 @@ async def test_reconcile_corpus_reports_failure_phase_after_deletion() -> None:
     assert result["deleted"] == {"document_ids": ["doc-over"]}
     assert result["repair_required"] is True
     assert fake.events == ["lock_enter", "census", "delete", "cognify", "lock_exit"]
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[-1]["status"] == "failed"
+    assert journal[-1]["phase"] == "cognify"
+    assert journal[-1]["error_type"] == "RuntimeError"
+    assert journal[-1]["deleted_document_ids"] == ["doc-over"]
 
 
 @pytest.mark.asyncio
