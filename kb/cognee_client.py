@@ -1344,6 +1344,7 @@ class CogneePublicClient:
             statement = statement.where(payload_document_id.in_(wanted))
 
         violations: list[dict[str, Any]] = []
+        violation_count = 0
         chunks_scanned = 0
         async with engine.get_async_session() as session:
             rows = await session.execute(statement)
@@ -1353,10 +1354,12 @@ class CogneePublicClient:
                     row[1], chunk_id=str(row[0]), budget=limit
                 )
                 if violation is not None:
-                    violations.append(violation.as_dict())
+                    violation_count += 1
+                    if len(violations) < 50:
+                        violations.append(violation.as_dict())
 
         return {
-            "ok": not violations,
+            "ok": violation_count == 0,
             "provider": "pgvector",
             "collection": "DocumentChunk_text",
             "collection_present": True,
@@ -1364,7 +1367,7 @@ class CogneePublicClient:
             "scope": "document_ids" if document_ids is not None else "full",
             "scope_document_count": len(wanted) if document_ids is not None else None,
             "chunks_scanned": chunks_scanned,
-            "violation_count": len(violations),
+            "violation_count": violation_count,
             # Keep the failure response bounded. The count remains exact and
             # each item contains an id/digest, never the stored text.
             "violations": violations[:50],
@@ -2056,29 +2059,31 @@ class CogneePublicClient:
                 datasets=datasets, incremental_loading=not force
             )
             self._invalidate_graph_data_cache()
-            processed_ids = _cognify_data_ids(result)
-            if processed_ids:
-                stored_check = await self.stored_chunk_budget_check(
-                    document_ids=processed_ids
+        # The graph writer lock protects Kuzu only. Run the vector payload census
+        # after releasing it so a slow SQL scan cannot block another cognify.
+        processed_ids = _cognify_data_ids(result)
+        if processed_ids:
+            stored_check = await self.stored_chunk_budget_check(
+                document_ids=processed_ids
+            )
+            if stored_check is None:
+                logger.warning(
+                    "stored chunk budget was not measured after cognify: "
+                    "VECTOR_DB_PROVIDER is not pgvector"
                 )
-                if stored_check is None:
-                    logger.warning(
-                        "stored chunk budget was not measured after cognify: "
-                        "VECTOR_DB_PROVIDER is not pgvector"
-                    )
-                elif not stored_check["ok"]:
-                    logger.error(
-                        "stored chunk budget check failed after cognify: "
-                        "%d violation(s) across %d chunk(s)",
-                        stored_check["violation_count"],
-                        stored_check["chunks_scanned"],
-                    )
-                    raise RuntimeError(
-                        "stored chunk budget check failed: "
-                        f"{stored_check['violation_count']} violation(s) across "
-                        f"{stored_check['chunks_scanned']} persisted chunk(s)"
-                    )
-            return result
+            elif not stored_check["ok"]:
+                logger.error(
+                    "stored chunk budget check failed after cognify: "
+                    "%d violation(s) across %d chunk(s)",
+                    stored_check["violation_count"],
+                    stored_check["chunks_scanned"],
+                )
+                raise RuntimeError(
+                    "stored chunk budget check failed: "
+                    f"{stored_check['violation_count']} violation(s) across "
+                    f"{stored_check['chunks_scanned']} persisted chunk(s)"
+                )
+        return result
 
     async def add_feedback(
         self,
