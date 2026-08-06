@@ -349,6 +349,16 @@ def test_docs_mode_ranks_within_a_class_by_term_coverage() -> None:
     assert ranked[0] is match, [r.get("id") for r in ranked]
 
 
+def test_single_literal_query_ranks_exact_match_above_unrelated_hit() -> None:
+    """A unique identifier must outrank a cross-dataset semantic neighbour."""
+    miss = {"id": "miss", "text": "Central note with unrelated prose"}
+    match = {"id": "hit", "text": "UAT marker quokka-beacon-8823"}
+
+    ranked = apply_query_ranking([miss, match], "quokka-beacon-8823")
+
+    assert ranked[0] is match
+
+
 def test_repo_filter_is_identity_not_body_substring() -> None:
     """repo="sokosumi-cli" returned a sokosumi-DOCS file that mentioned the CLI."""
     docs_file = normalize_search_hit(

@@ -2973,6 +2973,65 @@ def test_search_across_datasets_runs_concurrently() -> None:
     assert {d for d, _ in merged} == {"a", "b"}
 
 
+def test_single_literal_search_preserves_each_dataset_candidate() -> None:
+    """Literal identifiers must survive the cross-dataset merge (#106)."""
+    import asyncio as aio
+
+    from kb.server import search_across_datasets
+
+    class LiteralCitadel:
+        config = FakeCitadel.config
+
+        async def search(
+            self, query: str, *, dataset: str, session_id: Any, top_k: int
+        ) -> list[Any]:
+            if dataset == "central":
+                return [
+                    {"id": "central-1", "text": "unrelated central note"},
+                    {"id": "central-2", "text": "another central note"},
+                ][:top_k]
+            return [
+                {"id": "node-1", "text": "unrelated node note"},
+                {"id": "node-2", "text": "quokka-beacon-8823"},
+            ][:top_k]
+
+    merged = aio.run(
+        search_across_datasets(
+            LiteralCitadel(),
+            query="quokka-beacon-8823",
+            datasets=["central", "node"],
+            sessions={},
+            top_k=2,
+        )
+    )
+
+    assert [result[1]["id"] for result in merged] == [
+        "central-1",
+        "central-2",
+        "node-1",
+        "node-2",
+    ]
+
+
+def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any) -> None:
+    """The API ranks the exact token before unrelated returned hits (#106)."""
+    async def fake_search(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, Any]], bool]:
+        return [
+            ("central", {"id": "central", "text": "unrelated central note"}),
+            ("node", {"id": "node", "text": "quokka-beacon-8823"}),
+        ], False
+
+    monkeypatch.setattr(server_module, "_search_within_budget", fake_search)
+    response = authed_client().post(
+        "/search", json={"query": "quokka-beacon-8823", "top_k": 2}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["id"] == "node"
+    assert body["results"][0]["_citadel"]["rank"] == 1
+
+
 def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
     # #50: at capacity the Node returns a 429 + Retry-After backpressure contract.
     client = authed_client("test-reader")

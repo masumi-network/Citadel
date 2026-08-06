@@ -2050,6 +2050,7 @@ async def search_across_datasets(
     per_dataset: list[tuple[str, list[Any]]] = [
         (dataset, list(results)) for dataset, results in zip(datasets, results_per)
     ]
+    literal_query = len(query_terms(query)) == 1
 
     merged: list[tuple[str, Any]] = []
     seen: set[str] = set()
@@ -2065,9 +2066,11 @@ async def search_across_datasets(
         for result in results
     }
 
+    merge_limit = top_k * len(per_dataset) if literal_query else top_k
+
     def take(dataset: str, results: list[Any], budget: int) -> None:
         for result in results:
-            if budget <= 0 or len(merged) >= top_k:
+            if budget <= 0 or len(merged) >= merge_limit:
                 return
             key = search_result_dedup_key(result)
             if key in seen:
@@ -2083,6 +2086,14 @@ async def search_across_datasets(
             budget -= 1
 
     if not per_dataset:
+        return merged
+
+    if literal_query:
+        # Single-token searches are commonly exact identifiers. Preserve the
+        # candidate page from every dataset so response shaping can place an
+        # observable literal match above unrelated cross-dataset hits (#106).
+        for dataset, results in per_dataset:
+            take(dataset, results, top_k)
         return merged
 
     reserve = max(1, top_k // 5) if len(per_dataset) > 1 else 0
@@ -6897,7 +6908,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     ]
     cleaned_mode = body.cleaned_mode()
     docs_mode = is_docs_mode_query(body.query, mode=cleaned_mode)
-    if docs_mode or is_spec_mode_query(body.query):
+    if docs_mode or is_spec_mode_query(body.query) or len(query_terms(body.query)) == 1:
         normalized = apply_query_ranking(normalized, body.query, mode=cleaned_mode)
     candidates_fetched = len(normalized)
     if filters_active:
