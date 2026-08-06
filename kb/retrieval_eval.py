@@ -2039,6 +2039,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    metadata = (result.get("summary") or {}).get("metadata_stability") or {}
+    unstable = metadata.get("chunks_with_unstable_trust_tier", 0)
+    if isinstance(unstable, int) and unstable > 0:
+        examples = metadata.get("unstable_examples") or []
+        print(
+            "ERROR: benchmark found "
+            f"{unstable} chunk(s) with unstable trust_tier for the same "
+            "(result_id, content_sha256); see metadata_stability.unstable_examples "
+            f"{json.dumps(examples, sort_keys=True)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

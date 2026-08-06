@@ -839,6 +839,57 @@ class TestRunExitStatus:
         assert exit_code == 1
         assert "all 2 benchmark search attempts failed" in capsys.readouterr().err
 
+    def test_cmd_run_fails_when_trust_tier_is_unstable(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps({"questions": [question(spans=["answer"]), question("p01", recall=0)]}),
+            encoding="utf-8",
+        )
+        span = "the subsystem persists attempted charges with a null transaction id"
+        rows = [
+            sb.score_question(
+                question("q1", spans=[span]),
+                [scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="reference-only", sha="deadbeef")],
+                {},
+            ),
+            sb.score_question(
+                question("q2", spans=[span]),
+                [scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="unattested", sha="deadbeef")],
+                {},
+            ),
+            sb.score_question(
+                {"id": "p01", "question": "probe", "expect_any": [], "expected_recall": 0},
+                [],
+                {},
+            ),
+        ]
+        summary = sb.summarize(rows, [])
+        summary["latency"] = {"errors": 0, "p50_ms": 1.0, "p95_ms": 1.0, "mean_ms": 1.0, "samples": 3}
+        summary["repeats"] = 1
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.setattr(
+            sb,
+            "execute_benchmark",
+            lambda *args, **kwargs: {"run_at": "2026-08-06T00:00:00+00:00", "summary": summary, "rows": rows},
+        )
+        monkeypatch.setattr(
+            sb,
+            "build_fingerprint",
+            lambda *args: {
+                "content": {"sha256": "a" * 64, "files": 1},
+                "api": {"documents_tracked": 1, "node_version": "test"},
+                "harness_git_sha": "test",
+                "questions_sha256": "q" * 64,
+            },
+        )
+
+        exit_code = sb.main(
+            ["run", "--questions", str(questions_path), "--node-url", "https://node.example"]
+        )
+
+        assert exit_code == 1
+        assert "unstable trust_tier" in capsys.readouterr().err
+
 
 # --------------------------------------------------------------------------
 # Empty file map must not fingerprint as a real corpus
