@@ -368,11 +368,14 @@ async def _linear_sync_stage_async() -> int:
             )
             return 1
         logger.info(
-            "Linear sync stage finished: issues=%s written=%s skipped_unchanged=%s mirrored=%s",
+            "Linear sync stage finished: issues=%s written=%s skipped_unchanged=%s mirrored=%s members=%s auto_mapped=%s unresolved=%s",
             result.get("issue_count"),
             result.get("written_count"),
             result.get("skipped_unchanged"),
             result.get("mirrored_count"),
+            result.get("auto_map_members_fetched"),
+            result.get("auto_mapped_assignees"),
+            result.get("unresolved_assignee_count"),
         )
         return 0
 
@@ -655,9 +658,12 @@ def run(mode: str | None = None) -> int:
                 )
                 return 1
             logger.info(
-                "Linear sync finished: issues=%s mirrored=%s",
+                "Linear sync finished: issues=%s mirrored=%s members=%s auto_mapped=%s unresolved=%s",
                 result.get("issue_count"),
                 result.get("mirrored_count"),
+                result.get("auto_map_members_fetched"),
+                result.get("auto_mapped_assignees"),
+                result.get("unresolved_assignee_count"),
             )
             return 0
 
