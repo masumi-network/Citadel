@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import contextvars
 import json
 import logging
 import os
+import secrets
 from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import datetime, timezone
 from time import monotonic, perf_counter
@@ -35,6 +37,7 @@ def _float_env(name: str, default: float) -> float:
 DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 10_000
 MAX_ZERO_CHUNK_REPORT_DOCUMENTS = 1_000
 MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS = 1_000
+MAX_REPAIR_SNAPSHOTS = 32
 
 
 def _corpus_health_max_documents() -> int:
@@ -414,6 +417,14 @@ class CogneeGateway(Protocol):
     async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
         ...
 
+    async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
+        ...
+
+    async def discard_document_chunk_snapshot(
+        self, deleted: Mapping[str, Any]
+    ) -> bool:
+        ...
+
 
 class CogneePublicClient:
     def __init__(self) -> None:
@@ -444,6 +455,11 @@ class CogneePublicClient:
         # single-flight lock so a burst of dashboard opens shares one Kuzu read.
         self._graph_data_cache: tuple[float, tuple[list[Any], list[Any]]] | None = None
         self._graph_data_lock = asyncio.Lock()
+        # Repair snapshots stay process-local and are addressed by an opaque,
+        # single-use token returned from delete_document_chunks. Keeping the
+        # snapshot out of the result prevents payload/text from crossing the
+        # service boundary while preserving exact rollback data for the caller.
+        self._repair_snapshots: dict[str, dict[str, Any]] = {}
 
     def _copy_env_if_missing(self, target: str, *sources: str) -> None:
         if os.getenv(target):
@@ -2395,16 +2411,309 @@ class CogneePublicClient:
         graph_engine = await get_graph_engine()
         vector_engine = get_vector_engine()
         async with self.writer_lock:
-            if vector_uuids:
-                await vector_engine.delete_data_points("DocumentChunk_text", vector_uuids)
-            if graph_ids:
-                await graph_engine.delete_nodes(sorted(graph_ids))
-            self._invalidate_graph_data_cache()
+            snapshot = await self._snapshot_document_chunks(
+                document_ids=requested,
+                vector_engine=vector_engine,
+                graph_engine=graph_engine,
+                vector_ids=vector_uuids,
+                graph_ids=sorted(graph_ids),
+            )
+            snapshot_token = self._store_repair_snapshot(snapshot)
+            try:
+                if vector_uuids:
+                    await vector_engine.delete_data_points(
+                        "DocumentChunk_text", vector_uuids
+                    )
+                if graph_ids:
+                    await graph_engine.delete_nodes(sorted(graph_ids))
+                self._invalidate_graph_data_cache()
+            except Exception:
+                restored = False
+                try:
+                    restored = await self._restore_document_chunk_snapshot_locked(
+                        snapshot,
+                        document_ids=requested,
+                        vector_engine=vector_engine,
+                        graph_engine=graph_engine,
+                    )
+                except Exception:  # noqa: BLE001 - preserve original delete failure
+                    logger.exception("repair snapshot restore failed after delete error")
+                if restored:
+                    self._repair_snapshots.pop(snapshot_token, None)
+                raise
         return {
             "document_ids": requested,
             "vector_chunk_count": len(vector_uuids),
             "graph_node_count": len(graph_ids),
+            "snapshot_token": snapshot_token,
         }
+
+    def _store_repair_snapshot(self, snapshot: dict[str, Any]) -> str:
+        """Keep rollback data private and return only an opaque handle."""
+        if len(self._repair_snapshots) >= MAX_REPAIR_SNAPSHOTS:
+            raise RuntimeError("repair snapshot capacity exhausted")
+        token = secrets.token_urlsafe(24)
+        self._repair_snapshots[token] = snapshot
+        return token
+
+    @staticmethod
+    def _graph_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
+    @classmethod
+    def _graph_properties(cls, value: Any) -> str:
+        value = value.decode("utf-8") if isinstance(value, bytes) else value
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return "{}"
+        try:
+            return json.dumps(value, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("graph properties are not serializable") from exc
+
+    async def _snapshot_vector_rows(
+        self, vector_engine: Any, vector_ids: list[UUID]
+    ) -> list[dict[str, Any]]:
+        if not vector_ids:
+            return []
+        from sqlalchemy import select
+
+        try:
+            table = await vector_engine.get_table("DocumentChunk_text")
+            statement = select(table.c.id, table.c.payload, table.c.vector).where(
+                table.c.id.in_(vector_ids)
+            )
+        except Exception as exc:  # noqa: BLE001 - snapshot must be complete
+            raise RuntimeError("vector projection snapshot is unavailable") from exc
+
+        async with vector_engine.get_async_session() as session:
+            rows = (await session.execute(statement)).all()
+        expected = {str(vector_id) for vector_id in vector_ids}
+        actual = {str(row[0]) for row in rows if row[0] is not None}
+        if actual != expected:
+            raise RuntimeError(
+                "vector projection changed while preparing repair snapshot"
+            )
+        return [
+            {
+                "id": row[0],
+                "payload": copy.deepcopy(row[1]),
+                "vector": copy.deepcopy(row[2]),
+            }
+            for row in rows
+        ]
+
+    async def _snapshot_graph_projection(
+        self, graph_engine: Any, graph_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not graph_ids:
+            return {"nodes": [], "edges": []}
+        query = getattr(graph_engine, "query", None)
+        if not callable(query):
+            raise RuntimeError("graph projection snapshot is unavailable")
+
+        node_rows = await query(
+            """
+            MATCH (n:Node)
+            WHERE n.id IN $node_ids
+            RETURN n.id, n.name, n.type, n.properties
+            """,
+            {"node_ids": graph_ids},
+        )
+        nodes: list[dict[str, Any]] = []
+        for row in node_rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 4 or row[0] is None:
+                raise RuntimeError("graph node snapshot returned an invalid row")
+            nodes.append(
+                {
+                    "id": self._graph_text(row[0]),
+                    "name": self._graph_text(row[1]),
+                    "type": self._graph_text(row[2]),
+                    "properties": self._graph_properties(row[3]),
+                }
+            )
+        if {node["id"] for node in nodes} != set(graph_ids):
+            raise RuntimeError(
+                "graph projection changed while preparing repair snapshot"
+            )
+
+        edge_rows = await query(
+            """
+            MATCH (source:Node)-[r:EDGE]->(target:Node)
+            WHERE source.id IN $node_ids OR target.id IN $node_ids
+            RETURN source.id, target.id, r.relationship_name, r.properties
+            """,
+            {"node_ids": graph_ids},
+        )
+        edges: list[dict[str, Any]] = []
+        for row in edge_rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 4:
+                raise RuntimeError("graph edge snapshot returned an invalid row")
+            if row[0] is None or row[1] is None or row[2] is None:
+                raise RuntimeError("graph edge snapshot returned an incomplete row")
+            edges.append(
+                {
+                    "source": self._graph_text(row[0]),
+                    "target": self._graph_text(row[1]),
+                    "relationship": self._graph_text(row[2]),
+                    "properties": self._graph_properties(row[3]),
+                }
+            )
+        return {"nodes": nodes, "edges": edges}
+
+    async def _snapshot_document_chunks(
+        self,
+        *,
+        document_ids: list[str],
+        vector_engine: Any,
+        graph_engine: Any,
+        vector_ids: list[UUID],
+        graph_ids: list[str],
+    ) -> dict[str, Any]:
+        """Capture both projections before a destructive repair delete."""
+        return {
+            "document_ids": list(document_ids),
+            "vector_rows": await self._snapshot_vector_rows(vector_engine, vector_ids),
+            "graph": await self._snapshot_graph_projection(graph_engine, graph_ids),
+        }
+
+    async def _restore_vector_rows(
+        self, vector_engine: Any, rows: list[dict[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        from sqlalchemy.dialects.postgresql import insert
+
+        table = await vector_engine.get_table("DocumentChunk_text")
+        values = [
+            {
+                "id": row["id"],
+                "payload": copy.deepcopy(row["payload"]),
+                "vector": copy.deepcopy(row["vector"]),
+            }
+            for row in rows
+        ]
+        statement = insert(table).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[table.c.id],
+            set_={
+                "payload": statement.excluded.payload,
+                "vector": statement.excluded.vector,
+            },
+        )
+        async with vector_engine.get_async_session() as session:
+            await session.execute(statement)
+            await session.commit()
+
+    async def _restore_graph_projection(
+        self, graph_engine: Any, graph: Mapping[str, Any]
+    ) -> None:
+        query = getattr(graph_engine, "query", None)
+        if not callable(query):
+            raise RuntimeError("graph projection restore is unavailable")
+        nodes = list(graph.get("nodes") or [])
+        edges = list(graph.get("edges") or [])
+        if nodes:
+            await query(
+                """
+                UNWIND $nodes AS node
+                MERGE (n:Node {id: node.id})
+                ON CREATE SET
+                    n.name = node.name,
+                    n.type = node.type,
+                    n.properties = node.properties
+                ON MATCH SET
+                    n.name = node.name,
+                    n.type = node.type,
+                    n.properties = node.properties
+                """,
+                {"nodes": nodes},
+            )
+        if edges:
+            await query(
+                """
+                UNWIND $edges AS edge
+                MATCH (source:Node), (target:Node)
+                WHERE source.id = edge.source AND target.id = edge.target
+                MERGE (source)-[r:EDGE {
+                    relationship_name: edge.relationship
+                }]->(target)
+                ON CREATE SET r.properties = edge.properties
+                ON MATCH SET r.properties = edge.properties
+                """,
+                {"edges": edges},
+            )
+        checkpoint = getattr(graph_engine, "checkpoint", None)
+        if callable(checkpoint):
+            await checkpoint()
+
+    async def _restore_document_chunk_snapshot_locked(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        document_ids: list[str],
+        vector_engine: Any,
+        graph_engine: Any,
+    ) -> bool:
+        vector_ids = await self.stored_chunk_ids_for_documents(document_ids)
+        graph_ids = await self.graph_chunk_ids_for_documents(document_ids)
+        if vector_ids is None or graph_ids is None:
+            return False
+        current_vector_uuids: list[UUID] = []
+        for vector_id in vector_ids:
+            try:
+                current_vector_uuids.append(UUID(str(vector_id)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise RuntimeError("current vector projection has a non-UUID id") from exc
+        if current_vector_uuids:
+            await vector_engine.delete_data_points(
+                "DocumentChunk_text", current_vector_uuids
+            )
+        if graph_ids:
+            await graph_engine.delete_nodes(sorted(graph_ids))
+        await self._restore_vector_rows(vector_engine, list(snapshot.get("vector_rows") or []))
+        await self._restore_graph_projection(graph_engine, snapshot.get("graph") or {})
+        self._invalidate_graph_data_cache()
+        return True
+
+    async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
+        """Restore a private exact snapshot after a failed repair operation."""
+        token = deleted.get("snapshot_token")
+        document_ids = deleted.get("document_ids")
+        if not isinstance(token, str) or not isinstance(document_ids, list):
+            return False
+        snapshot = self._repair_snapshots.get(token)
+        if snapshot is None:
+            return False
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.graph import get_graph_engine
+        from cognee.infrastructure.databases.vector import get_vector_engine
+
+        async with self.writer_lock:
+            restored = await self._restore_document_chunk_snapshot_locked(
+                snapshot,
+                document_ids=[str(document_id) for document_id in document_ids],
+                vector_engine=get_vector_engine(),
+                graph_engine=await get_graph_engine(),
+            )
+        if restored:
+            self._repair_snapshots.pop(token, None)
+        return restored
+
+    async def discard_document_chunk_snapshot(self, deleted: Mapping[str, Any]) -> bool:
+        """Release a successful repair's private rollback snapshot."""
+        token = deleted.get("snapshot_token")
+        if not isinstance(token, str):
+            return False
+        return self._repair_snapshots.pop(token, None) is not None
 
     async def _delete_vector_points(self, node_ids: list[str]) -> None:
         """Drop the same ids from the chunk vector collection (best-effort, #15)."""

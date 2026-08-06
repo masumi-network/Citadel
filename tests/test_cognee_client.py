@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -1846,6 +1846,24 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
     monkeypatch.setattr(client, "stored_chunk_ids_for_documents", stored_ids)
     monkeypatch.setattr(client, "graph_chunk_ids_for_documents", graph_ids)
 
+    async def snapshot_vector_rows(
+        vector_engine: Any, vector_ids: list[UUID]
+    ) -> list[dict[str, Any]]:
+        del vector_engine, vector_ids
+        return [{"id": UUID(vector_id), "payload": {"text": "private"}, "vector": [0.1]}]
+
+    async def snapshot_graph_projection(
+        graph_engine: Any, graph_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        del graph_engine, graph_ids
+        return {
+            "nodes": [{"id": graph_id, "name": "chunk", "type": "DocumentChunk", "properties": "{}"}],
+            "edges": [],
+        }
+
+    monkeypatch.setattr(client, "_snapshot_vector_rows", snapshot_vector_rows)
+    monkeypatch.setattr(client, "_snapshot_graph_projection", snapshot_graph_projection)
+
     result = await client.delete_document_chunks(["doc-a"])
 
     assert result["vector_chunk_count"] == 1
@@ -1853,6 +1871,86 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
     assert captured["graph"] == [graph_id]
     assert captured["collection"] == "DocumentChunk_text"
     assert captured["vector"] == [UUID(vector_id)]
+    assert result["snapshot_token"]
+    assert "vector_rows" not in result
+    assert "graph" not in result
+
+
+@pytest.mark.asyncio
+async def test_restore_document_chunks_uses_private_snapshot_once(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeGraphEngine:
+        pass
+
+    class FakeVectorEngine:
+        pass
+
+    async def get_graph_engine() -> FakeGraphEngine:
+        return FakeGraphEngine()
+
+    def get_vector_engine() -> FakeVectorEngine:
+        return FakeVectorEngine()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.graph",
+        SimpleNamespace(get_graph_engine=get_graph_engine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.infrastructure.databases.vector",
+        SimpleNamespace(get_vector_engine=get_vector_engine),
+    )
+
+    client = CogneePublicClient()
+    client._repair_snapshots["opaque-token"] = {
+        "document_ids": ["doc-a"],
+        "vector_rows": [{"id": "chunk-a", "payload": {"text": "private"}, "vector": [0.1]}],
+        "graph": {"nodes": [], "edges": []},
+    }
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def _ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
+
+    async def current_vectors(_: list[str]) -> list[str]:
+        return []
+
+    async def current_graph(_: list[str]) -> set[str]:
+        return set()
+
+    monkeypatch.setattr(client, "stored_chunk_ids_for_documents", current_vectors)
+    monkeypatch.setattr(client, "graph_chunk_ids_for_documents", current_graph)
+
+    async def restore_vectors(_: Any, rows: list[dict[str, Any]]) -> None:
+        captured["vectors"] = rows
+
+    async def restore_graph(_: Any, graph: Mapping[str, Any]) -> None:
+        captured["graph"] = graph
+
+    monkeypatch.setattr(client, "_restore_vector_rows", restore_vectors)
+    monkeypatch.setattr(client, "_restore_graph_projection", restore_graph)
+
+    result = await client.restore_document_chunks(
+        {"document_ids": ["doc-a"], "snapshot_token": "opaque-token"}
+    )
+
+    assert result is True
+    assert captured["vectors"][0]["payload"]["text"] == "private"
+    assert "opaque-token" not in client._repair_snapshots
+    assert await client.restore_document_chunks(
+        {"document_ids": ["doc-a"], "snapshot_token": "opaque-token"}
+    ) is False
 
 
 @pytest.mark.asyncio

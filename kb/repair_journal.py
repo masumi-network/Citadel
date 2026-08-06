@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import Iterable
 
 
+_REPAIR_PHASES = {
+    "started",
+    "preflight",
+    "delete",
+    "cognify",
+    "post_census",
+    "post_index_check",
+    "completed",
+}
+_REPAIR_STATUSES = {"started", "completed", "failed"}
+
+
 class RepairJournal:
     """Append repair lifecycle events without persisting document content."""
 
@@ -29,7 +41,12 @@ class RepairJournal:
         reason: str | None = None,
         post_repair_indexed: bool | None = None,
         post_repair_stored_budget_ok: bool | None = None,
+        projections_preserved: bool | None = None,
     ) -> None:
+        if phase not in _REPAIR_PHASES:
+            raise ValueError(f"invalid repair journal phase: {phase}")
+        if status not in _REPAIR_STATUSES:
+            raise ValueError(f"invalid repair journal status: {status}")
         record: dict[str, object] = {
             "schema_version": 1,
             "recorded_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -51,6 +68,8 @@ class RepairJournal:
             record["post_repair_indexed"] = post_repair_indexed
         if post_repair_stored_budget_ok is not None:
             record["post_repair_stored_budget_ok"] = post_repair_stored_budget_ok
+        if projections_preserved is not None:
+            record["projections_preserved"] = projections_preserved
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
