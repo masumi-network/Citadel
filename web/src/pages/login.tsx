@@ -36,7 +36,9 @@ export default function Login() {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || REJECTED);
       }
-      window.location.assign("/next/app");
+      // Keep the authenticated app on its verified canonical surface until the
+      // Next dashboard has graph, admin, and workflow parity.
+      window.location.assign("/app");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : REJECTED);
     } finally {

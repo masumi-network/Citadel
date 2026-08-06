@@ -11,7 +11,7 @@ def _client() -> TestClient:
     return TestClient(app, base_url="https://testserver")
 
 
-def test_next_login_sends_successful_sessions_to_next_dashboard() -> None:
+def test_next_login_sends_successful_sessions_to_verified_dashboard() -> None:
     source = (
         Path(server_module.__file__).resolve().parent.parent
         / "web"
@@ -20,8 +20,8 @@ def test_next_login_sends_successful_sessions_to_next_dashboard() -> None:
         / "login.tsx"
     ).read_text(encoding="utf-8")
 
-    assert 'window.location.assign("/next/app")' in source
-    assert 'window.location.assign("/app")' not in source
+    assert 'window.location.assign("/app")' in source
+    assert 'window.location.assign("/next/app")' not in source
 
 
 def test_browser_logout_redirects_to_login_and_deletes_cookie() -> None:
