@@ -279,6 +279,13 @@ class MeshState:
             authoritative_nodes = corpus.get("indexed_docs")
             authoritative_docs = corpus.get("tracked_sources")
             authoritative_edges = corpus.get("indexed_edges")
+            corpus_degraded = bool(corpus.get("degraded"))
+
+            def corpus_total(value: Any, fallback: int) -> int | None:
+                if value is not None:
+                    return value
+                return None if corpus_degraded else fallback
+
             return {
                 "revision": self.revision,
                 "generated_at": utc_now(),
@@ -286,13 +293,13 @@ class MeshState:
                 "default_dataset": config.default_dataset,
                 "stats": {
                     "nodes": (
-                        authoritative_nodes if authoritative_nodes is not None else len(self.nodes)
+                        corpus_total(authoritative_nodes, len(self.nodes))
                     ),
                     "edges": (
-                        authoritative_edges if authoritative_edges is not None else len(self.edges)
+                        corpus_total(authoritative_edges, len(self.edges))
                     ),
                     "tracked_sources": (
-                        authoritative_docs if authoritative_docs is not None else self.documents
+                        corpus_total(authoritative_docs, self.documents)
                     ),
                     "last_indexed_at": self.last_indexed_at,
                     "latest_event_id": self.revision,
@@ -867,10 +874,18 @@ class MeshState:
             [node for node in self.nodes.values() if node["type"] != "index"]
         )
         authoritative_nodes = corpus.get("indexed_docs")
+        corpus_degraded = bool(corpus.get("degraded"))
+        graph_status = "active"
         if isinstance(authoritative_nodes, int) and not isinstance(authoritative_nodes, bool):
             graph_records = authoritative_nodes
+            if corpus_degraded:
+                graph_status = "stale"
+        elif corpus_degraded:
+            graph_records = None
+            graph_status = "warming"
 
         vector_records = self.documents
+        vector_status = "active"
         probe_complete = corpus.get("probe_complete") is True
         chunked_documents = corpus.get("probe_chunked_documents")
         if (
@@ -879,19 +894,24 @@ class MeshState:
             and not isinstance(chunked_documents, bool)
         ):
             vector_records = chunked_documents
+            if corpus_degraded:
+                vector_status = "stale"
+        elif corpus_degraded:
+            vector_records = None
+            vector_status = "warming"
 
         return [
             {
                 "id": "graph",
                 "name": "Graph mesh",
-                "status": "active",
+                "status": graph_status,
                 "records": graph_records,
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },
             {
                 "id": "vector",
                 "name": "Vector index",
-                "status": "active",
+                "status": vector_status,
                 "records": vector_records,
                 "updated_at": self.events[0]["created_at"] if self.events else None,
             },

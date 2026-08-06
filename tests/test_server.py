@@ -7121,14 +7121,14 @@ def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
     assert stats["since_restart"]["documents"] != 317
 
 
-def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
+def test_api_mesh_keeps_degraded_corpus_totals_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A degraded corpus read must not blank the dashboard or 500.
+    """A degraded corpus read must not present uptime counters as totals.
 
     `_corpus_health` is fail-soft and returns None totals on a transient graph
-    error. The endpoint has to survive that, because the alternative is that one
-    slow Kuzu read takes the whole dashboard down.
+    error. The endpoint stays available, but marks the corpus figures unknown
+    until an authoritative probe completes.
     """
     client = authed_client()
 
@@ -7146,9 +7146,14 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     response = client.get("/api/mesh")
 
     assert response.status_code == 200
-    stats = response.json()["stats"]
-    assert stats["tracked_sources"] is not None
-    assert stats["edges"] is not None
+    body = response.json()
+    stats = body["stats"]
+    assert stats["tracked_sources"] is None
+    assert stats["nodes"] is None
+    assert stats["edges"] is None
+    indexes = {index["id"]: index for index in body["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["vector"]["status"] == "warming"
 
 
 @pytest.mark.asyncio
@@ -7207,6 +7212,13 @@ def test_indexes_timeout_preserves_existing_response_shape(
     assert set(body) == {"indexes", "stats"}
     assert isinstance(body["indexes"], list)
     assert "since_restart" in body["stats"]
+    indexes = {index["id"]: index for index in body["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["graph"]["records"] is None
+    assert indexes["vector"]["status"] == "warming"
+    assert indexes["vector"]["records"] is None
+    assert body["stats"]["nodes"] is None
+    assert body["stats"]["tracked_sources"] is None
 
 
 def test_api_mesh_activity_counters_are_scoped_not_top_level(
