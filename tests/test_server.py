@@ -377,6 +377,15 @@ def test_public_release_version_is_explicitly_separate_from_package_version() ->
     assert response.json()["version"] == server_module._PUBLIC_RELEASE_VERSION
 
 
+def test_public_state_reports_the_captured_build_id(monkeypatch) -> None:
+    monkeypatch.setattr(server_module, "_BUILD_ID", "a" * 40)
+
+    response = authed_client("test-reader").get("/api/state")
+
+    assert response.status_code == 200
+    assert response.json()["build_id"] == "a" * 40
+
+
 def test_security_headers_are_applied_to_http_responses() -> None:
     client = TestClient(app, base_url="https://testserver")
 
