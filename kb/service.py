@@ -120,7 +120,21 @@ class Citadel:
         except BaseException:
             self._seen_ingest_keys.discard(ingest_key)
             raise
-        return IngestResult(True, "accepted", target_dataset, merged_tags, result)
+        # ``cognee.add`` confirms durable source storage, not chunks, vectors, or
+        # graph presence. Keep accepted=True for the write receipt, but make the
+        # indexing state explicit until a blocking cognify result exists.
+        reason = "accepted"
+        if isinstance(result, dict):
+            cognify_state = result.get("cognify")
+            if result.get("background_cognify") is True or cognify_state in {
+                "deferred",
+                "suppressed",
+                "queued_not_confirmed",
+            }:
+                reason = "queued_not_confirmed"
+            elif cognify_state == "not_scheduled":
+                reason = "not_scheduled"
+        return IngestResult(True, reason, target_dataset, merged_tags, result)
 
     def _guard_content(self, data: str, dataset: str) -> None:
         """Block storing content that carries a blocking-severity secret.
@@ -391,6 +405,291 @@ class Citadel:
             "graph_grew": graph_grew,
             "verify": verify,
             "verification": verification,
+        }
+
+    async def reconcile_corpus(
+        self,
+        *,
+        dataset: str | None = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Audit and optionally repair zero and over-budget projections together.
+
+        The combined path is the default because a document can satisfy both
+        failure predicates. One census decides the union, one repair removes only
+        stale oversized projections, one cognify rebuilds the union, and one
+        post-census verifies the vector, graph, and chunk-budget invariants.
+        """
+        if apply:
+            maintenance = getattr(self.cognee, "maintenance", None)
+            if not callable(maintenance):
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": "maintenance_unavailable",
+                    "before": None,
+                    "after": None,
+                }
+            async with maintenance():
+                return await self._reconcile_corpus(
+                    dataset=dataset,
+                    apply=True,
+                    force=force,
+                )
+        return await self._reconcile_corpus(
+            dataset=dataset,
+            apply=False,
+            force=force,
+        )
+
+    async def _reconcile_corpus(
+        self,
+        *,
+        dataset: str | None,
+        apply: bool,
+        force: bool,
+    ) -> dict[str, Any]:
+        before = await self.cognee.corpus_reconciliation_census(dataset=dataset)
+        if (
+            before.get("ok") is not True
+            or before.get("census_complete") is not True
+            or before.get("cap_exceeded") is not False
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": before.get("reason") or "census_failed",
+                "before": before,
+                "after": None,
+            }
+
+        zero_count = before.get("zero_chunk_count")
+        oversized_count = before.get("oversized_document_count")
+        oversized_chunk_count = before.get("oversized_chunk_count")
+        missing_count = before.get("missing_document_id_violation_count")
+        zero_unassigned = before.get("unassigned_zero_chunk_document_count")
+        oversized_unassigned = before.get("unassigned_oversized_document_count")
+        orphan_count = before.get("orphan_oversized_document_count")
+        zero_ids = before.get("zero_chunk_document_ids")
+        oversized_ids = before.get("oversized_document_ids")
+        zero_repair_ids = before.get("zero_repair_document_ids")
+        oversized_repair_ids = before.get("oversized_repair_document_ids")
+        repair_ids = before.get("repair_document_ids")
+        repair_datasets = before.get("repair_datasets")
+        repair_mapping = before.get("repair_document_datasets")
+
+        def valid_count(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+        def valid_ids(value: Any) -> bool:
+            return (
+                isinstance(value, list)
+                and all(isinstance(item, str) and item for item in value)
+                and len(set(value)) == len(value)
+            )
+
+        if (
+            not valid_count(zero_count)
+            or not valid_count(oversized_count)
+            or not valid_count(oversized_chunk_count)
+            or not valid_count(missing_count)
+            or not valid_count(zero_unassigned)
+            or not valid_count(oversized_unassigned)
+            or not valid_count(orphan_count)
+            or not valid_ids(zero_ids)
+            or not valid_ids(oversized_ids)
+            or not valid_ids(zero_repair_ids)
+            or not valid_ids(oversized_repair_ids)
+            or not valid_ids(repair_ids)
+            or not isinstance(repair_datasets, list)
+            or any(not isinstance(item, str) or not item for item in repair_datasets)
+            or len(set(repair_datasets)) != len(repair_datasets)
+            or not isinstance(repair_mapping, dict)
+            or set(repair_mapping) != set(repair_ids)
+            or set(repair_ids) != set(zero_repair_ids) | set(oversized_repair_ids)
+            or set(zero_repair_ids) - set(zero_ids)
+            or set(oversized_repair_ids) - set(oversized_ids)
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "census_returned_invalid_repair_metadata",
+                "before": before,
+                "after": None,
+            }
+
+        for document_id, datasets in repair_mapping.items():
+            if (
+                not isinstance(datasets, list)
+                or not datasets
+                or any(not isinstance(item, str) or not item for item in datasets)
+                or any(item not in repair_datasets for item in datasets)
+            ):
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": apply,
+                    "force": force,
+                    "reason": "census_returned_invalid_repair_metadata",
+                    "before": before,
+                    "after": None,
+                }
+
+        has_candidates = bool(
+            zero_count
+            or oversized_count
+            or oversized_chunk_count
+            or missing_count
+            or zero_unassigned
+            or oversized_unassigned
+            or orphan_count
+        )
+        if not has_candidates:
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "no_repair_required",
+                "before": before,
+                "after": before if apply else None,
+            }
+
+        if not apply:
+            return {
+                "ok": True,
+                "dataset": dataset,
+                "apply": False,
+                "force": force,
+                "reason": "repair_required",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        if oversized_count or oversized_chunk_count or missing_count:
+            if not force:
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": False,
+                    "reason": "combined_repair_requires_force",
+                    "repair_required": True,
+                    "before": before,
+                    "after": None,
+                }
+
+        if (
+            zero_unassigned
+            or oversized_unassigned
+            or orphan_count
+            or missing_count
+            or not repair_ids
+            or not repair_datasets
+        ):
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "reconciliation_candidates_not_fully_assigned",
+                "repair_required": True,
+                "before": before,
+                "after": None,
+            }
+
+        oversized_repair_ids_set = set(oversized_repair_ids)
+        deleted: dict[str, Any] | None = None
+        repair_phase = "delete"
+        try:
+            if oversized_repair_ids_set:
+                deleted = await self.cognee.delete_document_chunks(
+                    sorted(oversized_repair_ids_set)
+                )
+            repair_phase = "cognify"
+            await self.cognee.cognify(
+                datasets=repair_datasets,
+                force=force or bool(oversized_repair_ids_set),
+            )
+            repair_phase = "post_census"
+            after = await self.cognee.corpus_reconciliation_census(dataset=dataset)
+            repair_phase = "post_index_check"
+            post_counts = await self.cognee.corpus_chunk_counts(repair_ids)
+            post_graph_ids = await self.cognee.corpus_graph_presence(repair_ids)
+        except Exception as exc:  # noqa: BLE001 - return recoverable repair state
+            logger.exception("corpus reconciliation failed during %s", repair_phase)
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": True,
+                "force": force,
+                "reason": "repair_failed",
+                "repair_phase": repair_phase,
+                "error_type": exc.__class__.__name__,
+                "repair_required": True,
+                "deleted": deleted,
+                "before": before,
+                "after": None,
+            }
+
+        after_valid = isinstance(after, dict)
+        post_counts_valid = (
+            isinstance(post_counts, dict)
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in (post_counts.get(document_id) for document_id in repair_ids)
+            )
+        )
+        post_graph_valid = (
+            post_graph_ids is not None
+            and set(repair_ids).issubset({str(document_id) for document_id in post_graph_ids})
+        )
+        stored_budget = after.get("stored_chunk_budget") if isinstance(after, dict) else None
+        stored_budget_valid = (
+            isinstance(stored_budget, dict)
+            and stored_budget.get("ok") is True
+            and stored_budget.get("violation_count") == 0
+            and stored_budget.get("missing_document_id_violation_count", 0) == 0
+        )
+        repaired = (
+            after_valid
+            and after.get("ok") is True
+            and after.get("census_complete") is True
+            and after.get("cap_exceeded") is False
+            and after.get("zero_chunk_count") == 0
+            and after.get("oversized_document_count") == 0
+            and after.get("oversized_chunk_count") == 0
+            and after.get("missing_document_id_violation_count") == 0
+            and post_counts_valid
+            and post_graph_valid
+            and stored_budget_valid
+        )
+        return {
+            "ok": repaired,
+            "dataset": dataset,
+            "apply": True,
+            "force": force,
+            "reason": "repaired" if repaired else "reconciliation_invariants_remain",
+            "repair_required": not repaired,
+            "repair_datasets": repair_datasets,
+            "repair_document_ids": repair_ids,
+            "deleted": deleted,
+            "before": before,
+            "after": after,
+            "post_repair_chunk_counts": post_counts,
+            "post_repair_graph_documents": sorted(post_graph_ids or set()),
+            "post_repair_indexed": post_counts_valid and post_graph_valid,
+            "post_repair_stored_budget_ok": stored_budget_valid,
         }
 
     async def reconcile_zero_chunk_documents(

@@ -103,6 +103,29 @@ class FakeCitadel:
             "after": None,
         }
 
+    async def reconcile_corpus(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_repair_required",
+            "before": {
+                "ok": True,
+                "census_complete": True,
+                "zero_chunk_count": 0,
+                "oversized_document_count": 0,
+                "oversized_chunk_count": 0,
+            },
+            "after": None,
+        }
+
     async def reconcile_oversized_chunks(
         self,
         *,
@@ -1116,7 +1139,7 @@ def test_cognify_run_requires_admin() -> None:
     assert response.status_code == 403
 
 
-def test_admin_can_audit_zero_chunk_reconciliation_and_writer_cannot() -> None:
+def test_admin_can_audit_combined_reconciliation_and_writer_cannot() -> None:
     admin = authed_client()
 
     response = admin.post(
@@ -1125,7 +1148,7 @@ def test_admin_can_audit_zero_chunk_reconciliation_and_writer_cannot() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["reason"] == "no_zero_chunk_documents"
+    assert response.json()["reason"] == "no_repair_required"
     assert response.json()["apply"] is False
 
     writer = authed_client("test-writer")
@@ -1147,7 +1170,7 @@ def test_admin_can_audit_oversized_chunk_reconciliation() -> None:
 
 def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
     class FailingReconcile(FakeCitadel):
-        async def reconcile_zero_chunk_documents(
+        async def reconcile_corpus(
             self,
             *,
             dataset: Any = None,
@@ -1159,7 +1182,7 @@ def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
                 "dataset": dataset,
                 "apply": apply,
                 "force": force,
-                "reason": "zero_chunk_documents_remain",
+                "reason": "reconciliation_invariants_remain",
             }
 
     client = authed_client()
@@ -1168,7 +1191,7 @@ def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
     response = client.post("/api/corpus/reconcile", json={"apply": True})
 
     assert response.status_code == 503
-    assert response.json()["detail"]["result"]["reason"] == "zero_chunk_documents_remain"
+    assert response.json()["detail"]["result"]["reason"] == "reconciliation_invariants_remain"
     events = app.state.access_store.snapshot()["audit_events"]
     reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
     assert reconcile_events[-1]["success"] is False

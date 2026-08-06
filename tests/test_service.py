@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -528,6 +529,237 @@ async def test_reconcile_oversized_chunks_deletes_rebuilds_and_rechecks() -> Non
     assert fake.deleted == ["doc-a"]
     assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
     assert result["post_repair_indexed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-zero"],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 2,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": ["doc-zero"],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over", "doc-zero"],
+                    "repair_document_datasets": {
+                        "doc-over": ["notes"],
+                        "doc-zero": ["notes"],
+                    },
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 2,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+            self.deleted: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return self.reports.pop(0)
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            self.deleted.extend(document_ids)
+            return {"document_ids": document_ids}
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            self.events.append("counts")
+            return {document_id: 3 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            self.events.append("graph")
+            return set(document_ids)
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert fake.deleted == ["doc-over"]
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert result["post_repair_indexed"] is True
+    assert result["post_repair_stored_budget_ok"] is True
+    assert fake.events == [
+        "lock_enter",
+        "census",
+        "delete",
+        "cognify",
+        "census",
+        "counts",
+        "graph",
+        "lock_exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_incomplete_census_before_mutation() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": False,
+                "census_complete": False,
+                "cap_exceeded": False,
+                "reason": "incomplete_corpus_walk",
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "incomplete_corpus_walk"
+    assert fake.cognify_calls == []
+    assert fake.events == ["lock_enter", "census", "lock_exit"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_reports_failure_phase_after_deletion() -> None:
+    class FailingGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            if self.events.count("census") == 1:
+                return {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 1,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over"],
+                    "repair_document_datasets": {"doc-over": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                }
+            raise AssertionError("post-census must not run after cognify failure")
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            return {"document_ids": document_ids}
+
+        async def cognify(self, **_: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            raise RuntimeError("cognify failed")
+
+    fake = FailingGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_failed"
+    assert result["repair_phase"] == "cognify"
+    assert result["error_type"] == "RuntimeError"
+    assert result["deleted"] == {"document_ids": ["doc-over"]}
+    assert result["repair_required"] is True
+    assert fake.events == ["lock_enter", "census", "delete", "cognify", "lock_exit"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_reports_queued_not_confirmed_until_cognify_finishes() -> None:
+    class QueuedCognee(FakeCognee):
+        async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+            self.remember_calls.append({"data": data, **kwargs})
+            return {"added": {"ok": True}, "background_cognify": True}
+
+    fake = QueuedCognee()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.ingest("a queued note")
+
+    assert result.accepted is True
+    assert result.reason == "queued_not_confirmed"
 
 
 @pytest.mark.asyncio

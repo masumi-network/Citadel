@@ -887,7 +887,7 @@ async def _reindex(args: argparse.Namespace) -> int:
             force=args.force,
         )
     else:
-        result = await kb.reconcile_zero_chunk_documents(
+        result = await kb.reconcile_corpus(
             dataset=args.dataset,
             apply=args.apply,
             force=args.force,
@@ -3235,7 +3235,7 @@ def build_parser() -> argparse.ArgumentParser:
     reindex.add_argument(
         "--oversized",
         action="store_true",
-        help="Audit and repair persisted chunks over the embed budget",
+        help="Compatibility mode: audit and repair only over-budget chunks",
     )
     reindex.add_argument(
         "--apply",

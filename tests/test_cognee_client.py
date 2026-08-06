@@ -1631,6 +1631,64 @@ async def test_corpus_oversized_chunk_documents_surfaces_orphan_violations(
 
 
 @pytest.mark.asyncio
+async def test_corpus_reconciliation_census_combines_zero_and_oversized_scans(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    page_calls: list[dict[str, Any]] = []
+    chunk_calls: list[list[str]] = []
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 3}
+
+    async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
+        page_calls.append(kwargs)
+        return [
+            {"id": "doc-zero", "name": "Zero", "datasets": ["notes"], "created_at": "1"},
+            {"id": "doc-over", "name": "Over", "datasets": ["notes"], "created_at": "2"},
+            {"id": "doc-ok", "name": "OK", "datasets": ["notes"], "created_at": "3"},
+        ]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        chunk_calls.append(document_ids)
+        return {"doc-zero": 0, "doc-over": 2, "doc-ok": 1}
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None, *, budget: int | None = None
+    ) -> dict[str, Any]:
+        assert document_ids is None
+        assert budget == 256
+        return {
+            "ok": False,
+            "scope": "full",
+            "violation_count": 2,
+            "violation_document_counts": {"doc-over": 2},
+            "missing_document_id_violation_count": 0,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_reconciliation_census(dataset="notes")
+
+    assert report["ok"] is True
+    assert report["census_complete"] is True
+    assert report["zero_chunk_document_ids"] == ["doc-zero"]
+    assert report["oversized_document_ids"] == ["doc-over"]
+    assert report["repair_document_ids"] == ["doc-over", "doc-zero"]
+    assert report["repair_document_datasets"] == {
+        "doc-over": ["notes"],
+        "doc-zero": ["notes"],
+    }
+    assert report["stored_chunk_budget"]["violation_count"] == 2
+    assert len(page_calls) == 1
+    assert chunk_calls == [["doc-zero", "doc-over", "doc-ok"]]
+
+
+@pytest.mark.asyncio
 async def test_graph_chunk_ids_use_source_document_property(monkeypatch: Any) -> None:
     client = CogneePublicClient()
     calls: list[tuple[str, dict[str, Any]]] = []

@@ -124,11 +124,11 @@ def test_cognify_force_reaches_service(monkeypatch, capsys) -> None:
     assert '"ok": true' in capsys.readouterr().out
 
 
-def test_reindex_reaches_service_with_apply_and_force(monkeypatch, capsys) -> None:
+def test_reindex_defaults_to_combined_reconciliation(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCitadel:
-        async def reconcile_zero_chunk_documents(self, **kwargs: object) -> dict[str, bool]:
+        async def reconcile_corpus(self, **kwargs: object) -> dict[str, bool]:
             calls.append(kwargs)
             return {"ok": True}
 

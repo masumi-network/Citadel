@@ -1021,6 +1021,7 @@ class CorpusReconcileBody(BaseModel):
     dataset: str | None = None
     apply: bool = False
     force: bool = False
+    # Compatibility switch. The default runs the combined zero/oversized census.
     oversized: bool = False
 
 
@@ -6024,7 +6025,7 @@ async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
                 force=body.force,
             )
         else:
-            result = await citadel.reconcile_zero_chunk_documents(
+            result = await citadel.reconcile_corpus(
                 dataset=body.dataset,
                 apply=body.apply,
                 force=body.force,

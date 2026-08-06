@@ -1452,9 +1452,9 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Audit or repair accepted documents with missing or oversized chunks.
 
-        The default is a read-only census. Applying a repair requires admin
-        access and cognifies only datasets attached to affected documents. Set
-        ``oversized`` to rebuild persisted chunks that exceed the embed budget.
+        The default is a combined read-only census. Applying a repair requires
+        admin access and repairs the zero-chunk and over-budget union in one
+        pass. Set ``oversized`` for the legacy over-budget-only path.
         """
         payload: dict[str, Any] = {
             "dataset": dataset,

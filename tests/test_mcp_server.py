@@ -1275,7 +1275,7 @@ def test_run_repo_content_sync_tool_posts_to_admin_endpoint() -> None:
     assert client.posts[-1]["payload"] == {"force": True, "dry_run": True}
 
 
-def test_reconcile_corpus_tool_defaults_to_read_only() -> None:
+def test_reconcile_corpus_tool_defaults_to_combined_read_only_mode() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 

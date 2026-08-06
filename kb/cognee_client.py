@@ -362,6 +362,9 @@ class CogneeGateway(Protocol):
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         ...
 
+    def maintenance(self) -> AsyncIterator[None]:
+        ...
+
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         ...
 
@@ -389,6 +392,14 @@ class CogneeGateway(Protocol):
         ...
 
     async def corpus_oversized_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        ...
+
+    async def corpus_reconciliation_census(
         self,
         *,
         dataset: str | None = None,
@@ -1819,6 +1830,315 @@ class CogneePublicClient:
             "orphan_oversized_document_count": orphan_count,
             "missing_document_id_violation_count": missing_document_id_violation_count,
             "census_complete": complete,
+        }
+
+    async def corpus_reconciliation_census(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        """Run one complete census for zero and over-budget projections.
+
+        The walk is intentionally separate from the legacy single-population
+        helpers. A combined repair must make its decision from one snapshot:
+        accepted source rows are enumerated once, vector chunk counts identify
+        zero-chunk rows, and one unfiltered pgvector payload scan identifies
+        over-budget rows and malformed/orphan payloads.
+        """
+        probe_limit = max(1, min(int(page_limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        base: dict[str, Any] = {
+            "dataset": dataset,
+            "budget": chunk_window.resolve_chunk_budget(),
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "documents_scanned": 0,
+            "pages": 0,
+            "zero_chunk_count": 0,
+            "zero_chunk_document_ids": [],
+            "zero_chunk_documents": [],
+            "zero_chunk_documents_truncated": False,
+            "oversized_document_count": 0,
+            "oversized_chunk_count": 0,
+            "oversized_document_ids": [],
+            "oversized_documents": [],
+            "oversized_documents_truncated": False,
+            "zero_repair_document_ids": [],
+            "oversized_repair_document_ids": [],
+            "repair_document_ids": [],
+            "repair_document_datasets": {},
+            "repair_datasets": [],
+            "unassigned_zero_chunk_document_count": 0,
+            "unassigned_oversized_document_count": 0,
+            "orphan_oversized_document_count": 0,
+            "missing_document_id_violation_count": 0,
+            "stored_chunk_budget": None,
+            "census_complete": False,
+        }
+        if total_documents > max_documents:
+            return {
+                **base,
+                "ok": False,
+                "reason": "document_cap_exceeded",
+                "cap_exceeded": True,
+            }
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        seen_ids: set[str] = set()
+        corpus_rows_by_id: dict[str, dict[str, Any]] = {}
+        zero_ids: set[str] = set()
+        zero_repair_ids: set[str] = set()
+        zero_documents: list[dict[str, Any]] = []
+        zero_unassigned = 0
+        pages = 0
+
+        while len(seen_ids) < total_documents:
+            limit = min(
+                probe_limit,
+                max_documents - len(seen_ids),
+                total_documents - len(seen_ids),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            page_ids: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in seen_ids:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                seen_ids.add(document_id)
+                page_ids.append(document_id)
+                corpus_rows_by_id[document_id] = row
+
+            chunk_counts = await self.corpus_chunk_counts(page_ids)
+            if chunk_counts is None:
+                return {
+                    **base,
+                    "ok": False,
+                    "reason": "vector_measurement_unavailable",
+                    "cap_exceeded": False,
+                    "documents_scanned": len(seen_ids),
+                    "pages": pages,
+                    "census_complete": False,
+                }
+            for document_id, count in chunk_counts.items():
+                if (
+                    isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                    or document_id not in page_ids
+                ):
+                    raise RuntimeError("vector chunk measurement returned invalid counts")
+            for row in rows:
+                document_id = str(row["id"])
+                if int(chunk_counts.get(document_id, 0)) != 0:
+                    continue
+                row_datasets = row.get("datasets")
+                datasets = (
+                    sorted({str(value) for value in row_datasets if value})
+                    if isinstance(row_datasets, list)
+                    else []
+                )
+                if dataset and dataset not in datasets:
+                    continue
+                zero_ids.add(document_id)
+                if datasets:
+                    zero_repair_ids.add(document_id)
+                else:
+                    zero_unassigned += 1
+                if len(zero_documents) < MAX_ZERO_CHUNK_REPORT_DOCUMENTS:
+                    zero_documents.append(
+                        {
+                            "id": document_id,
+                            "name": row.get("name"),
+                            "datasets": datasets,
+                            "created_at": row.get("created_at"),
+                        }
+                    )
+            pages += 1
+
+            if len(seen_ids) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        complete = len(seen_ids) == total_documents
+        if not complete:
+            return {
+                **base,
+                "ok": False,
+                "reason": "incomplete_corpus_walk",
+                "cap_exceeded": False,
+                "documents_scanned": len(seen_ids),
+                "pages": pages,
+                "census_complete": False,
+            }
+
+        check = await self.stored_chunk_budget_check(None, budget=base["budget"])
+        if check is None:
+            return {
+                **base,
+                "ok": False,
+                "reason": "vector_measurement_unavailable",
+                "cap_exceeded": False,
+                "documents_scanned": len(seen_ids),
+                "pages": pages,
+                "zero_chunk_count": len(zero_ids),
+                "zero_chunk_document_ids": sorted(zero_ids),
+                "zero_chunk_documents": zero_documents,
+                "zero_chunk_documents_truncated": len(zero_ids) > len(zero_documents),
+                "census_complete": False,
+            }
+        violation_counts = check.get("violation_document_counts")
+        violation_count = check.get("violation_count")
+        missing_count = check.get("missing_document_id_violation_count", 0)
+        if (
+            check.get("scope") not in {None, "full"}
+            or not isinstance(violation_counts, dict)
+            or isinstance(violation_count, bool)
+            or not isinstance(violation_count, int)
+            or violation_count < 0
+            or isinstance(missing_count, bool)
+            or not isinstance(missing_count, int)
+            or missing_count < 0
+        ):
+            raise RuntimeError("stored chunk budget returned invalid census metadata")
+        grouped_violation_count = 0
+        for raw_document_id, raw_count in violation_counts.items():
+            if (
+                not raw_document_id
+                or isinstance(raw_count, bool)
+                or not isinstance(raw_count, int)
+                or raw_count < 1
+            ):
+                raise RuntimeError("stored chunk budget returned invalid violation count")
+            grouped_violation_count += raw_count
+        if grouped_violation_count + missing_count != violation_count:
+            raise RuntimeError("stored chunk budget violation totals do not reconcile")
+
+        oversized_ids: set[str] = set()
+        oversized_repair_ids: set[str] = set()
+        oversized_documents: list[dict[str, Any]] = []
+        oversized_unassigned = 0
+        orphan_count = 0
+        for raw_document_id, raw_count in violation_counts.items():
+            document_id = str(raw_document_id)
+            row = corpus_rows_by_id.get(document_id)
+            if row is None:
+                orphan_count += 1
+                oversized_unassigned += 1
+                oversized_ids.add(document_id)
+                if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                    oversized_documents.append(
+                        {
+                            "id": document_id,
+                            "name": None,
+                            "datasets": [],
+                            "created_at": None,
+                            "violation_count": raw_count,
+                            "unrepairable": True,
+                        }
+                    )
+                continue
+
+            row_datasets = row.get("datasets")
+            datasets = (
+                sorted({str(value) for value in row_datasets if value})
+                if isinstance(row_datasets, list)
+                else []
+            )
+            if dataset and dataset not in datasets:
+                continue
+            oversized_ids.add(document_id)
+            if datasets:
+                oversized_repair_ids.add(document_id)
+            else:
+                oversized_unassigned += 1
+            if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                oversized_documents.append(
+                    {
+                        "id": document_id,
+                        "name": row.get("name"),
+                        "datasets": datasets,
+                        "created_at": row.get("created_at"),
+                        "violation_count": raw_count,
+                    }
+                )
+
+        repair_ids = zero_repair_ids | oversized_repair_ids
+        repair_document_datasets: dict[str, list[str]] = {}
+        for document_id in sorted(repair_ids):
+            row = corpus_rows_by_id[document_id]
+            row_datasets = row.get("datasets")
+            datasets = (
+                sorted({str(value) for value in row_datasets if value})
+                if isinstance(row_datasets, list)
+                else []
+            )
+            repair_document_datasets[document_id] = [dataset] if dataset else datasets
+
+        return {
+            **base,
+            "ok": True,
+            "reason": None,
+            "cap_exceeded": False,
+            "documents_scanned": len(seen_ids),
+            "pages": pages,
+            "zero_chunk_count": len(zero_ids),
+            "zero_chunk_document_ids": sorted(zero_ids),
+            "zero_chunk_documents": zero_documents,
+            "zero_chunk_documents_truncated": len(zero_ids) > len(zero_documents),
+            "oversized_document_count": len(oversized_ids),
+            "oversized_chunk_count": violation_count,
+            "oversized_document_ids": sorted(oversized_ids),
+            "oversized_documents": oversized_documents,
+            "oversized_documents_truncated": len(oversized_ids) > len(oversized_documents),
+            "zero_repair_document_ids": sorted(zero_repair_ids),
+            "oversized_repair_document_ids": sorted(oversized_repair_ids),
+            "repair_document_ids": sorted(repair_ids),
+            "repair_document_datasets": repair_document_datasets,
+            "repair_datasets": sorted(
+                {
+                    name
+                    for names in repair_document_datasets.values()
+                    for name in names
+                }
+            ),
+            "unassigned_zero_chunk_document_count": zero_unassigned,
+            "unassigned_oversized_document_count": oversized_unassigned,
+            "orphan_oversized_document_count": orphan_count,
+            "missing_document_id_violation_count": missing_count,
+            "stored_chunk_budget": check,
+            "census_complete": True,
         }
 
     async def graph_chunk_ids_for_documents(
