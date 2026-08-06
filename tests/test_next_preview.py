@@ -1,11 +1,9 @@
-"""The Next.js preview at /next, and the promise that it changed nothing else.
+"""The Next.js export, its canonical public routes, and the safe fallback.
 
-The rebuilt frontend ships beside the hand-written site rather than instead of
-it, on a route of its own, so that the migration can be looked at in a browser
-before anything switches over. Two things have to hold while that is true: the
-preview is subject to the same strict Content-Security-Policy as everything
-else, and every page that was already live still serves exactly what it served
-before.
+The rebuilt frontend is checked in for self-hosted installs. The public routes
+serve it when present, while an unbuilt source checkout keeps the hand-written
+pages usable. The authenticated dashboard stays on its established route until
+its graph and admin flows have parity.
 """
 
 from __future__ import annotations
@@ -349,13 +347,28 @@ def test_next_assets_are_served_and_cached_as_immutable_content() -> None:
     assert "'unsafe-inline'" not in response.headers["content-security-policy"]
 
 
-def test_every_page_that_was_live_still_serves_what_it_served() -> None:
-    """Nothing switches over in this change, and this is what says so.
+def test_canonical_public_routes_serve_the_built_export() -> None:
+    """Built public pages are served byte-for-byte from the committed export."""
+    client = _client()
 
-    Each of these is compared against its source rather than spot-checked for a
-    phrase, because the failure worth catching is not "the page broke" but "the
-    page quietly became the new one".
-    """
+    for path, source in (
+        ("/", server_module.WEBUI_DIR / "index.html"),
+        ("/info", server_module.WEBUI_DIR / "info.html"),
+        ("/use-cases", server_module.WEBUI_DIR / "use-cases.html"),
+        ("/contact", server_module.WEBUI_DIR / "contact.html"),
+        ("/login", server_module.WEBUI_DIR / "login.html"),
+    ):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.content == source.read_bytes(), path
+        assert response.headers["content-type"].startswith("text/html"), path
+
+
+def test_public_routes_fall_back_to_hand_written_pages_without_an_export(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source checkout without `build:web` keeps every public route usable."""
+    monkeypatch.setattr(server_module, "WEBUI_DIR", tmp_path)
     client = _client()
     static = server_module.STATIC_DIR
 
@@ -367,12 +380,8 @@ def test_every_page_that_was_live_still_serves_what_it_served() -> None:
     ):
         response = client.get(path)
         assert response.status_code == 200, path
-        assert response.content == source.read_bytes(), f"{path} is no longer {source.name}"
+        assert response.content == source.read_bytes(), path
 
     login = client.get("/login")
     assert login.status_code == 200
     assert login.text == server_module.LOGIN_HTML
-
-    # The hand-written landing page still loads the committed esbuild bundle,
-    # not anything the Next app produced.
-    assert "/static/landing.js" in client.get("/").text

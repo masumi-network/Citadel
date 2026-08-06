@@ -269,6 +269,22 @@ def authed_client(access_key: str = "test-admin") -> TestClient:
     return client
 
 
+LEGACY_PUBLIC_SOURCES = {
+    "/": "landing.html",
+    "/info": "info.html",
+    "/use-cases": "use-cases.html",
+    "/contact": "contact.html",
+}
+
+
+def legacy_public_markup(path: str) -> str:
+    if path == "/login":
+        return server_module.LOGIN_HTML
+    return (server_module.STATIC_DIR / LEGACY_PUBLIC_SOURCES[path]).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_healthz() -> None:
     client = TestClient(app)
 
@@ -387,9 +403,7 @@ def test_landing_diagram_ships_as_markup_and_upgrades_to_the_bundle() -> None:
     JavaScript off, has to get a correct picture from the HTML alone, so the
     four-step spine ships visible and the React container ships empty.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
 
     # The plain diagram ships visible, and it is four steps, not the fourteen
     # element two-lane version it replaced.
@@ -478,15 +492,12 @@ def test_mcp_legacy_path_redirects_relative() -> None:
 
 
 def test_login_page_uses_static_script_for_csp() -> None:
-    client = TestClient(app, base_url="https://testserver")
+    page = legacy_public_markup("/login")
 
-    response = client.get("/login")
-
-    assert response.status_code == 200
-    assert '<script src="/static/login.js" type="module"></script>' in response.text
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert '<script src="/static/login.js" type="module"></script>' in page
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_login_page_uses_the_public_design_system() -> None:
@@ -495,9 +506,7 @@ def test_login_page_uses_the_public_design_system() -> None:
     A visitor arriving from /info must not be handed to a visibly different
     product at the door: same stylesheet, same nav, same theme toggle.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    page = client.get("/login").text
+    page = legacy_public_markup("/login")
 
     assert '<link rel="stylesheet" href="/static/info.css">' in page
     assert "/static/styles.css" not in page
@@ -505,22 +514,18 @@ def test_login_page_uses_the_public_design_system() -> None:
     assert 'id="themebtn"' in page
 
 def test_use_cases_page_is_public_and_csp_clean() -> None:
-    client = TestClient(app, base_url="https://testserver")
-
-    response = client.get("/use-cases")
-
-    assert response.status_code == 200
+    page = legacy_public_markup("/use-cases")
     # No token, no session — a coordinator or a curious engineer must be able
     # to open this. Team use cases lead; the partnering profile follows.
-    assert "Four things teams run it for" in response.text
-    assert "Draft work package" in response.text
+    assert "Four things teams run it for" in page
+    assert "Draft work package" in page
     # Reuses the /info stylesheet + script rather than shipping its own.
-    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
-    assert '<script src="/static/info.js" defer></script>' in response.text
+    assert '<link rel="stylesheet" href="/static/info.css">' in page
+    assert '<script src="/static/info.js" defer></script>' in page
     # Strict CSP: nothing inline.
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_partners_url_still_resolves() -> None:
@@ -539,19 +544,16 @@ def test_partners_url_still_resolves() -> None:
 
 def test_contact_page_is_public_and_csp_clean() -> None:
     """The contact form is its own page, not a section at the bottom of another."""
-    client = TestClient(app, base_url="https://testserver")
+    page = legacy_public_markup("/contact")
 
-    response = client.get("/contact")
-
-    assert response.status_code == 200
-    assert 'id="contactForm"' in response.text
-    assert '<script src="/static/contact.js" defer></script>' in response.text
+    assert 'id="contactForm"' in page
+    assert '<script src="/static/contact.js" defer></script>' in page
     # The form only lives here now — /use-cases points at it instead.
-    assert 'id="contactForm"' not in client.get("/use-cases").text
-    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert 'id="contactForm"' not in legacy_public_markup("/use-cases")
+    assert '<link rel="stylesheet" href="/static/info.css">' in page
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_public_pages_share_one_top_nav() -> None:
@@ -560,14 +562,9 @@ def test_public_pages_share_one_top_nav() -> None:
     The nav is what stops the public pages from being orphans reachable only by
     direct link.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     pages = {
-        "/": client.get("/").text,
-        "/info": client.get("/info").text,
-        "/use-cases": client.get("/use-cases").text,
-        "/contact": client.get("/contact").text,
-        "/login": client.get("/login").text,
+        path: legacy_public_markup(path)
+        for path in ("/", "/info", "/use-cases", "/contact", "/login")
     }
 
     for path, page in pages.items():
@@ -589,10 +586,8 @@ def test_public_pages_share_the_band_layout() -> None:
     rhythm and the sticky section index are what make the five pages one site,
     so they are pinned here rather than left to the next redesign to notice.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     for path in ("/info", "/use-cases", "/contact"):
-        page = client.get(path).text
+        page = legacy_public_markup(path)
 
         # The hero band carries the nav and the glow, exactly as / does.
         assert '<div class="band band-hero">' in page, path
@@ -678,11 +673,9 @@ def test_public_pages_avoid_info_report_element_ids() -> None:
     Each page keeps only the ids it genuinely wants hydrated: the health pill
     and the brand mark.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     report_only_ids = ("foot-note", "state-updated", "m-version", "m-docs", "m-docs-sub")
     for path in ("/use-cases", "/contact"):
-        page = client.get(path).text
+        page = legacy_public_markup(path)
         for element_id in report_only_ids:
             assert f'id="{element_id}"' not in page, (
                 f'{path} declares id="{element_id}", which info.js overwrites '
@@ -730,10 +723,8 @@ def test_each_public_page_owns_its_subject() -> None:
     two places and drifted. Home owns what-it-is and how-to-start; /info owns
     the live numbers and the roadmap.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
-    info = client.get("/info").text
+    home = legacy_public_markup("/")
+    info = legacy_public_markup("/info")
 
     # The pipeline diagram and the install commands live on / only.
     assert 'class="spine"' in home
@@ -752,11 +743,9 @@ def test_home_owns_install_and_the_diagram() -> None:
     test_each_public_page_owns_its_subject from the /info pair to every public
     page, so a future page cannot quietly grow a second copy of either.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
     others = {
-        path: client.get(path).text
+        path: legacy_public_markup(path)
         for path in ("/info", "/use-cases", "/contact", "/login")
     }
 
@@ -778,9 +767,7 @@ def test_home_hero_has_no_terminal_block() -> None:
     lede below the fold. The commands still ship, at the bottom of the page.
     This pins the decision so it cannot drift back in.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
     hero = home[home.index('<header class="hero">'):home.index("</header>")]
 
     assert "<pre" not in hero
@@ -1306,7 +1293,7 @@ def test_root_is_the_public_landing_page_for_everyone() -> None:
     for response in (anon, member):
         assert response.status_code == 200
         assert 'id="graphCanvas"' not in response.text
-        assert '<link rel="stylesheet" href="/static/info.css">' in response.text
+        assert "Citadel remembers your" in response.text
 
 
 def test_ui_shell_is_served_after_login() -> None:

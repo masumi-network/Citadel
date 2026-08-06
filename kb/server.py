@@ -2988,19 +2988,18 @@ async def audit_forwarded_mcp_call(request: Request, call_next: Any) -> Response
 
 
 @app.get("/", include_in_schema=False)
-async def landing_page() -> FileResponse:
-    # The root is the landing page for everyone, signed in or not. The app
-    # lives at /app, so one URL means one body: a member can read the landing
-    # page and send the link on without being bounced into the dashboard.
+async def landing_page() -> Response:
+    # The committed Next export is canonical when present. A source checkout
+    # without a build still has a usable legacy landing page.
+    if (WEBUI_DIR / "index.html").is_file():
+        return webui_page("index")
     return FileResponse(STATIC_DIR / "landing.html")
 
 
 @app.get("/next", include_in_schema=False)
 async def next_preview() -> Response:
-    # The Next.js rebuild of the public site, served alongside the hand-written
-    # pages rather than instead of them. /, /info, /use-cases, /contact and
-    # /login are untouched and stay the real site; these five routes are where
-    # the port is checked in a browser until it is good enough to take over.
+    # The Next.js rebuild of the public site is also available at /next while
+    # the canonical public routes use the same committed export.
     #
     # It sends the site's strict CSP, unchanged and by default: the export
     # carries no inline <script> and no inline <style>. That is the whole reason
@@ -3089,11 +3088,15 @@ async def ui(request: Request) -> Response:
         # The dashboard stays behind auth. Anonymous callers go to the sign-in
         # page rather than the landing page: they asked for the app by name.
         return RedirectResponse("/login", status_code=303)
+    # The Next dashboard remains a preview until graph and admin parity is
+    # verified. Keep the established shell as the authenticated app surface.
     return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/login", include_in_schema=False)
-async def login() -> HTMLResponse:
+async def login() -> Response:
+    if (WEBUI_DIR / "login.html").is_file():
+        return webui_page("login")
     return HTMLResponse(LOGIN_HTML)
 
 
@@ -3128,17 +3131,21 @@ async def robots_txt() -> Response:
 
 
 @app.get("/info", include_in_schema=False)
-async def info_page() -> FileResponse:
+async def info_page() -> Response:
     # Public "State of the Vault" report. Static shell; live tiles hydrate from
     # /api/state so the numbers stay current without redeploying the page.
+    if (WEBUI_DIR / "info.html").is_file():
+        return webui_page("info")
     return FileResponse(STATIC_DIR / "info.html")
 
 
 @app.get("/use-cases", include_in_schema=False)
-async def use_cases_page() -> FileResponse:
+async def use_cases_page() -> Response:
     # What teams run Citadel for, then the partnering profile for EU consortia.
-    # Shares info.css/info.js with /info; the live health pill hydrates from the
-    # same public /api/state.
+    # The Next export is canonical when built. The fallback shares info.css and
+    # info.js with /info; its live health pill hydrates from /api/state.
+    if (WEBUI_DIR / "use-cases.html").is_file():
+        return webui_page("use-cases")
     return FileResponse(STATIC_DIR / "use-cases.html")
 
 
@@ -3150,9 +3157,11 @@ async def partners_page() -> RedirectResponse:
 
 
 @app.get("/contact", include_in_schema=False)
-async def contact_page() -> FileResponse:
+async def contact_page() -> Response:
     # The form that POSTs to /contact below. Its own page rather than a section
     # at the bottom of another one, because it is a destination, not a footer.
+    if (WEBUI_DIR / "contact.html").is_file():
+        return webui_page("contact")
     return FileResponse(STATIC_DIR / "contact.html")
 
 
