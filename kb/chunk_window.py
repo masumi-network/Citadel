@@ -59,10 +59,13 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
@@ -762,6 +765,76 @@ def split_cognee_words(text: str) -> list[str]:
 
 _BPE_ENCODING: Any | None = None
 _BPE_ENCODING_FAILED = False
+_TIKTOKEN_CACHE_FILENAME = "".join(
+    ("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790")
+)
+_TIKTOKEN_CACHE_SHA256 = "".join(
+    (
+        "446a9538",
+        "cb6c348e",
+        "3516120d",
+        "7c08b09f",
+        "57c36495",
+        "e2acfffe",
+        "59a5bf8b",
+        "0cfb1a2d",
+    )
+)
+_BUNDLED_TIKTOKEN_CACHE_READY = False
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _valid_tiktoken_cache_file(path: Path) -> bool:
+    try:
+        return path.is_file() and _file_sha256(path) == _TIKTOKEN_CACHE_SHA256
+    except OSError:
+        return False
+
+
+def _seed_bundled_tiktoken_cache() -> None:
+    """Make the pinned GPT-4o vocabulary available without a network fetch."""
+    global _BUNDLED_TIKTOKEN_CACHE_READY
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        return
+    bundled = (
+        Path(__file__).with_name("data")
+        / "tiktoken-cache"
+        / _TIKTOKEN_CACHE_FILENAME
+    )
+    if not bundled.is_file():
+        return
+    configured = os.getenv("CITADEL_TIKTOKEN_CACHE_DIR")
+    cache_dir = (
+        Path(configured)
+        if configured
+        else Path(tempfile.gettempdir()) / "citadel-tiktoken-cache"
+    )
+    target = cache_dir / _TIKTOKEN_CACHE_FILENAME
+    try:
+        if _file_sha256(bundled) != _TIKTOKEN_CACHE_SHA256:
+            raise OSError("bundled tokenizer hash mismatch")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if not _valid_tiktoken_cache_file(target):
+            shutil.copyfile(bundled, target)
+        if not _valid_tiktoken_cache_file(target):
+            raise OSError("seeded tokenizer hash mismatch")
+        os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+        _BUNDLED_TIKTOKEN_CACHE_READY = True
+    except OSError:
+        logger.warning(
+            "Could not seed the bundled gpt-4o tokenizer cache; "
+            "exact chunk measurement is unavailable"
+        )
+
+
+_seed_bundled_tiktoken_cache()
 
 
 def _bpe_encoding() -> Any | None:
@@ -769,6 +842,18 @@ def _bpe_encoding() -> Any | None:
     global _BPE_ENCODING, _BPE_ENCODING_FAILED
     if _BPE_ENCODING is not None or _BPE_ENCODING_FAILED:
         return _BPE_ENCODING
+    cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
+    if cache_dir is None:
+        cache_available = _BUNDLED_TIKTOKEN_CACHE_READY
+    else:
+        cache_available = _valid_tiktoken_cache_file(Path(cache_dir) / _TIKTOKEN_CACHE_FILENAME)
+    if not cache_available:
+        _BPE_ENCODING_FAILED = True
+        logger.error(
+            "No valid gpt-4o tokenizer cache is available; "
+            "exact chunk measurement is unavailable"
+        )
+        return None
     try:
         import tiktoken
 
@@ -780,6 +865,16 @@ def _bpe_encoding() -> Any | None:
             "the ingest check unmeasured"
         )
     return _BPE_ENCODING
+
+
+def require_bpe_encoding() -> Any:
+    """Return the exact Cognee tokenizer or fail before a write can start."""
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot run a measured cognify"
+        )
+    return encoding
 
 
 @lru_cache(maxsize=1)

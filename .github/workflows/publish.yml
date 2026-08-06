@@ -46,13 +46,20 @@ jobs:
           assert webui.joinpath("404.html").is_file()
           assert webui.joinpath("_next").is_dir()
           assert files("kb").joinpath("retrieval_eval.py").is_file()
+          tokenizer_dir = files("kb").joinpath("data", "tiktoken-cache")
+          tokenizer_files = [path for path in tokenizer_dir.iterdir() if path.is_file()]
+          assert len(tokenizer_files) == 1
 
           sdist = next(Path("dist").glob("*.tar.gz"))
           with tarfile.open(sdist, "r:gz") as archive:
               names = set(archive.getnames())
           assert any(name.endswith("/kb/webui/index.html") for name in names)
           assert any(name.endswith("/kb/retrieval_eval.py") for name in names)
-          print("release artifact webui and benchmark payload verified")
+          tokenizer_dir = "/kb/data/tiktoken-cache/"
+          assert any(
+              tokenizer_dir in name and not name.endswith("/") for name in names
+          )
+          print("release artifact webui, benchmark, and tokenizer payload verified")
           PY
           "$venv/bin/citadel" bench --help >/dev/null
       - uses: actions/upload-artifact@v7

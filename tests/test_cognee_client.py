@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from kb import chunk_window
 from kb.cognee_client import CogneePublicClient
 
 
@@ -146,6 +147,35 @@ async def test_cognify_raises_without_llm_key(monkeypatch: Any) -> None:
 
     with pytest.raises(RuntimeError, match="LLM_API_KEY"):
         await client.cognify(datasets=["notes"])
+
+
+@pytest.mark.asyncio
+async def test_cognify_checks_tokenizer_before_backend_write(monkeypatch: Any) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    def unavailable() -> Any:
+        raise chunk_window.ChunkBudgetValidationError("tokenizer unavailable")
+
+    monkeypatch.setattr(
+        chunk_window,
+        "require_bpe_encoding",
+        unavailable,
+    )
+    called = False
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(cognify=cognify))
+
+    with pytest.raises(chunk_window.ChunkBudgetValidationError, match="tokenizer"):
+        await client.cognify(datasets=["notes"])
+
+    assert called is False
 
 
 @pytest.mark.asyncio

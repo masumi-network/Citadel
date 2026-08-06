@@ -66,6 +66,16 @@ def test_budget_is_an_integer_the_operator_can_lower() -> None:
     assert chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS > 0
 
 
+def test_bundled_gpt4o_tokenizer_is_available_without_network() -> None:
+    cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
+
+    assert cache_dir
+    assert (
+        Path(cache_dir) / chunk_window._TIKTOKEN_CACHE_FILENAME
+    ).is_file()
+    assert chunk_window.require_bpe_encoding().name == "o200k_base"
+
+
 def test_budget_env_override_wins(monkeypatch: Any) -> None:
     monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "192")
     assert chunk_window.resolve_chunk_budget() == 192

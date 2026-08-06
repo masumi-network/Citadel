@@ -1412,6 +1412,8 @@ class CogneePublicClient:
                 try:
                     value = json.loads(value)
                 except json.JSONDecodeError:
+                    # Ladybug may return a plain string instead of a JSON string;
+                    # keep it unchanged and let the membership check below validate it.
                     pass
             if not isinstance(value, str) or value not in requested:
                 return None
@@ -2049,6 +2051,10 @@ class CogneePublicClient:
                 "LLM_API_KEY (or OPENROUTER_API_KEY) is not set; cognify requires an "
                 "LLM key to extract the knowledge graph."
             )
+        # Load the exact GPT-4o vocabulary before Cognee starts a write. If the
+        # asset is missing, fail before a partial cognify can leave rows that the
+        # persisted-chunk audit cannot measure.
+        chunk_window.require_bpe_encoding()
         import cognee
 
         await self._ensure_cognee_ready(cognee)

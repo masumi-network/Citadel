@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from kb import __version__ as _SERVICE_VERSION
+from kb import chunk_window
 from kb.access import (
     CENTRAL_DATASET,
     SESSION_TRACES_DATASET,
@@ -475,6 +476,11 @@ async def lifespan(app: FastAPI) -> Any:
     # startup and not at kb.config import: the CLI imports that module too and
     # must not die because the server's environment is misconfigured.
     enforce_access_key_strength()
+    try:
+        chunk_window.require_bpe_encoding()
+    except chunk_window.ChunkBudgetValidationError as exc:
+        logger.critical("exact cognify tokenizer is unavailable; refusing startup")
+        raise RuntimeError("exact cognify tokenizer is unavailable") from exc
     async with mcp_server.session_manager.run():
         # Eagerly build the mesh and seed its in-memory activity counters from
         # persistent source state so a redeploy does not look like the graph reset.
