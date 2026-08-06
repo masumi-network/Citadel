@@ -2860,6 +2860,44 @@ def test_readyz_rejects_a_partial_corpus_probe(
     assert ready.json()["corpus"]["probe_ok"] is True
 
 
+def test_readyz_accepts_a_complete_multi_page_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MultiPageCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 65,
+                "probe_limit": 64,
+                "probe_max_documents": 10_000,
+                "probe_documents": 65,
+                "probe_pages": 2,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 65,
+                "probe_graph_documents": 65,
+                "probe_fully_indexed_documents": 65,
+                "probe_ok": True,
+            }
+
+    class MultiPageCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MultiPageCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 65, "edges": 64}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MultiPageCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 200
+    assert ready.json()["corpus"]["probe_documents"] == 65
+
+
 def test_readyz_rejects_inconsistent_complete_corpus_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

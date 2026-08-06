@@ -4544,8 +4544,6 @@ async def _corpus_health_impl() -> dict[str, Any]:
             for field in ("probe_complete", "probe_ok"):
                 if type(measured.get(field)) is not bool:
                     raise RuntimeError(f"bounded corpus probe returned invalid {field}")
-            if measured["probe_documents"] > measured["probe_limit"]:
-                raise RuntimeError("bounded corpus probe exceeded its page limit")
             for field in ("probe_max_documents", "probe_pages"):
                 if field in measured:
                     value = measured[field]
