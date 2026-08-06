@@ -7119,7 +7119,7 @@ async def test_dashboard_corpus_health_is_bounded_and_fail_soft(
 ) -> None:
     class SlowCitadel(FakeCitadel):
         async def _graph_counts(self) -> dict[str, int]:
-            await asyncio.sleep(30)
+            await asyncio.sleep(0.05)
             return {"nodes": 5, "edges": 7}
 
     class Syncer:
@@ -7128,6 +7128,7 @@ async def test_dashboard_corpus_health_is_bounded_and_fail_soft(
 
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
     app.state.citadel = SlowCitadel()
     app.state.github_syncer = Syncer()
     app.state.repo_content_syncer = Syncer()
@@ -7142,6 +7143,9 @@ async def test_dashboard_corpus_health_is_bounded_and_fail_soft(
         "indexed_edges": None,
         "degraded": "corpus health timed out after 0.01s",
     }
+    await asyncio.sleep(0.06)
+    assert server_module._CORPUS_HEALTH_CACHE is not None
+    assert server_module._CORPUS_HEALTH_CACHE[2]["indexed_docs"] == 5
 
 
 def test_indexes_timeout_preserves_existing_response_shape(
@@ -7154,6 +7158,7 @@ def test_indexes_timeout_preserves_existing_response_shape(
 
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
     client = authed_client("test-reader")
     app.state.citadel = SlowCitadel()
 

@@ -171,6 +171,7 @@ except ValueError:
     _CORPUS_HEALTH_TIMEOUT_SECONDS = 2.0
 _CORPUS_HEALTH_CACHE: tuple[float, tuple[int, ...], dict[str, Any]] | None = None
 _CORPUS_HEALTH_LOCK = asyncio.Lock()
+_CORPUS_HEALTH_TASK: asyncio.Task[dict[str, Any]] | None = None
 
 # In-flight counts for the soft concurrency cap / 429 backpressure contract
 # (#50). Single-loop server → increment/decrement need no lock. Search and the
@@ -4637,23 +4638,42 @@ async def _corpus_health() -> dict[str, Any]:
         return await _corpus_health_impl()
 
 
+def _corpus_health_task() -> asyncio.Task[dict[str, Any]]:
+    """Start one shared corpus probe that can outlive a dashboard request."""
+    global _CORPUS_HEALTH_TASK
+    task = _CORPUS_HEALTH_TASK
+    if task is None or task.done():
+        task = asyncio.create_task(_corpus_health())
+        _CORPUS_HEALTH_TASK = task
+    return task
+
+
 async def _bounded_corpus_health() -> dict[str, Any]:
     """Return corpus health within the dashboard read budget.
 
     A zero timeout keeps the previous unbounded behavior for operators that need
-    the full measurement. The normal setting is finite. The degraded payload is
-    the same shape already returned by ``_corpus_health_impl`` on dependency
-    failure, so callers keep their existing uptime-counter fallback.
+    the full measurement. The normal setting is finite. A timed-out probe is
+    shielded so it can finish and populate the shared cache after the request
+    returns; callers use the last cached result when one exists, otherwise the
+    existing uptime-counter fallback.
     """
     try:
         if _CORPUS_HEALTH_TIMEOUT_SECONDS <= 0:
             return await _corpus_health()
         return await asyncio.wait_for(
-            _corpus_health(), timeout=_CORPUS_HEALTH_TIMEOUT_SECONDS
+            asyncio.shield(_corpus_health_task()),
+            timeout=_CORPUS_HEALTH_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         timeout = _CORPUS_HEALTH_TIMEOUT_SECONDS
         logger.warning("bounded corpus health timed out after %.2fs", timeout)
+        cached = _CORPUS_HEALTH_CACHE
+        if cached is not None:
+            result = dict(cached[2])
+            result["degraded"] = (
+                f"corpus health timed out after {timeout:g}s; serving cached result"
+            )
+            return result
         return {
             "ok": False,
             "tracked_sources": None,
