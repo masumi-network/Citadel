@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -2146,6 +2147,242 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+# `compare` is descriptive. It prints deltas after checking fingerprints, but
+# it deliberately accepts incomplete run artifacts and does not define a
+# release verdict. `enforce` is the bounded v0.5 gate: both artifacts must
+# carry complete evidence, and the candidate must not regress the listed
+# retrieval or indexing measures.
+ENFORCE_METRICS = (
+    ("quality", "answer_recall_at_5"),
+    ("quality", "doc_recall_at_5"),
+    ("quality", "mrr_body"),
+    ("window", "tail_recall_given_head_at_5"),
+)
+
+
+def _finite_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _nonnegative_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _enforce_run_evidence(
+    run: dict[str, Any], label: str
+) -> tuple[list[str], dict[str, float], int | None]:
+    """Validate evidence required before accepting one saved benchmark run."""
+    failures: list[str] = []
+    metrics: dict[str, float] = {}
+    zero_chunks: int | None = None
+
+    fingerprint = run.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        failures.append(f"{label} fingerprint is missing")
+        fingerprint = {}
+
+    census = fingerprint.get("census")
+    if not isinstance(census, dict):
+        failures.append(f"{label} census is missing; corpus coverage is unmeasured")
+    else:
+        if census.get("error"):
+            failures.append(
+                f"{label} census failed: {census.get('error')}"
+            )
+        if census.get("truncated") is not False:
+            failures.append(f"{label} census is incomplete or truncated")
+        unmeasured = census.get("chunk_count_unmeasured")
+        if not _nonnegative_count(unmeasured):
+            failures.append(
+                f"{label} census chunk_count_unmeasured is missing or invalid"
+            )
+        elif unmeasured:
+            failures.append(
+                f"{label} census has {unmeasured} unmeasured document(s)"
+            )
+        documents_total = census.get("documents_total")
+        documents_walked = census.get("documents_walked")
+        if not _nonnegative_count(documents_total) or not _nonnegative_count(
+            documents_walked
+        ):
+            failures.append(
+                f"{label} census total/walked document counts are missing or invalid"
+            )
+        elif documents_total != documents_walked:
+            failures.append(
+                f"{label} census is incomplete: walked {documents_walked} of "
+                f"{documents_total} document(s)"
+            )
+        zero_value = census.get("chunk_count_zero")
+        if not _nonnegative_count(zero_value):
+            failures.append(
+                f"{label} census chunk_count_zero is missing or invalid"
+            )
+        else:
+            zero_chunks = zero_value
+
+    ground_truth = fingerprint.get("ground_truth")
+    ground_truth_sha = (
+        ground_truth.get("sha256") if isinstance(ground_truth, dict) else None
+    )
+    if not isinstance(ground_truth_sha, str) or not ground_truth_sha:
+        failures.append(f"{label} ground-truth fingerprint is missing")
+
+    summary = run.get("summary")
+    if not isinstance(summary, dict):
+        failures.append(f"{label} summary is missing")
+        summary = {}
+
+    latency = summary.get("latency")
+    errors = latency.get("errors") if isinstance(latency, dict) else None
+    if not _nonnegative_count(errors):
+        failures.append(f"{label} search error count is missing or invalid")
+    elif errors:
+        failures.append(f"{label} contains {errors} search error(s)")
+
+    quality = summary.get("quality")
+    if not isinstance(quality, dict):
+        failures.append(f"{label} quality metrics are missing")
+        quality = {}
+    window = summary.get("window")
+    if not isinstance(window, dict):
+        failures.append(f"{label} window metrics are missing")
+        window = {}
+    sections = {"quality": quality, "window": window}
+    for section, key in ENFORCE_METRICS:
+        value = sections[section].get(key)
+        if not _finite_number(value) or not 0.0 <= float(value) <= 1.0:
+            failures.append(f"{label} {key} is missing or invalid: {value!r}")
+        else:
+            metrics[key] = float(value)
+
+    negative_hit_rate = quality.get("negative_hit_rate")
+    if not _finite_number(negative_hit_rate) or not 0.0 <= float(
+        negative_hit_rate
+    ) <= 1.0:
+        failures.append(
+            f"{label} negative_hit_rate is missing or invalid: {negative_hit_rate!r}"
+        )
+    elif negative_hit_rate:
+        failures.append(
+            f"{label} contains negative hits: negative_hit_rate={negative_hit_rate}"
+        )
+
+    metadata = summary.get("metadata_stability")
+    unstable = metadata.get("chunks_with_unstable_trust_tier") if isinstance(
+        metadata, dict
+    ) else None
+    if not _nonnegative_count(unstable):
+        failures.append(
+            f"{label} unstable trust count is missing or invalid"
+        )
+    elif unstable:
+        failures.append(
+            f"{label} contains unstable trust metadata on {unstable} chunk(s)"
+        )
+
+    return failures, metrics, zero_chunks
+
+
+def enforce_acceptance(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[bool, list[str], list[str]]:
+    """Return ``(comparable, fingerprint_verdicts, gate_failures)``.
+
+    This function only reads the two already-produced JSON objects. It does
+    not contact a node, run a search, alter the vault, or write an artifact.
+    ``baseline`` is the first positional run and ``candidate`` is the second.
+    """
+    baseline_fingerprint = baseline.get("fingerprint")
+    candidate_fingerprint = candidate.get("fingerprint")
+    baseline_fingerprint = (
+        baseline_fingerprint if isinstance(baseline_fingerprint, dict) else {}
+    )
+    candidate_fingerprint = (
+        candidate_fingerprint if isinstance(candidate_fingerprint, dict) else {}
+    )
+    comparable, verdicts = compare_fingerprints(
+        candidate_fingerprint, baseline_fingerprint
+    )
+    failures: list[str] = []
+    if not comparable:
+        failures.append("fingerprints are not comparable")
+
+    baseline_failures, baseline_metrics, baseline_zero = _enforce_run_evidence(
+        baseline, "baseline"
+    )
+    candidate_failures, candidate_metrics, candidate_zero = _enforce_run_evidence(
+        candidate, "candidate"
+    )
+    failures.extend(baseline_failures)
+    failures.extend(candidate_failures)
+
+    if comparable:
+        for _section, key in ENFORCE_METRICS:
+            previous = baseline_metrics.get(key)
+            current = candidate_metrics.get(key)
+            if previous is None or current is None:
+                continue
+            if current < previous:
+                failures.append(
+                    f"candidate {key} regressed: {previous:g} -> {current:g}"
+                )
+        if baseline_zero is not None and candidate_zero is not None:
+            if candidate_zero > baseline_zero:
+                failures.append(
+                    "candidate chunk_count_zero regressed: "
+                    f"{baseline_zero} -> {candidate_zero}"
+                )
+        if candidate_zero != 0:
+            failures.append(
+                f"candidate chunk_count_zero must be 0, got {candidate_zero}"
+            )
+        candidate_tail = candidate_metrics.get("tail_recall_given_head_at_5")
+        if candidate_tail != 1.0:
+            failures.append(
+                "candidate tail_recall_given_head_at_5 must be 1.0, "
+                f"got {candidate_tail}"
+            )
+
+        baseline_gt = (baseline_fingerprint.get("ground_truth") or {}).get("sha256")
+        candidate_gt = (candidate_fingerprint.get("ground_truth") or {}).get("sha256")
+        if baseline_gt != candidate_gt:
+            failures.append(
+                "ground-truth fingerprints differ; benchmark scores are not comparable"
+            )
+
+    return comparable, verdicts, failures
+
+
+def cmd_enforce(args: argparse.Namespace) -> int:
+    """Enforce the bounded, read-only v0.5 acceptance gate."""
+    try:
+        baseline = json.loads(Path(args.run_a).read_text(encoding="utf-8"))
+        candidate = json.loads(Path(args.run_b).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ENFORCE FAILED: unable to read run JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(baseline, dict) or not isinstance(candidate, dict):
+        print("ENFORCE FAILED: run JSON root must be an object", file=sys.stderr)
+        return 2
+
+    _comparable, verdicts, failures = enforce_acceptance(baseline, candidate)
+    for verdict in verdicts:
+        print(verdict)
+    if failures:
+        print("ENFORCE FAILED:", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+    print("ENFORCE PASSED: v0.5 benchmark acceptance gate")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Markdown report
 # --------------------------------------------------------------------------
@@ -2541,6 +2778,14 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser.add_argument("run_a")
     compare_parser.add_argument("run_b")
     compare_parser.set_defaults(func=cmd_compare)
+
+    enforce_parser = sub.add_parser(
+        "enforce",
+        help="enforce the bounded v0.5 gate (run_a baseline, run_b candidate)",
+    )
+    enforce_parser.add_argument("run_a", help="baseline run JSON")
+    enforce_parser.add_argument("run_b", help="candidate run JSON")
+    enforce_parser.set_defaults(func=cmd_enforce)
 
     report_parser = sub.add_parser(
         "report", help="emit a README-ready markdown block from a saved run"

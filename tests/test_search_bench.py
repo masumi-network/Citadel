@@ -1066,6 +1066,143 @@ def make_run(
     return run
 
 
+def make_enforce_run():
+    run = make_run()
+    run["fingerprint"]["census"]["chunk_count_zero"] = 0
+    run["fingerprint"]["ground_truth"] = {"sha256": "g" * 64}
+    run["summary"]["window"] = {
+        "tail_recall_given_head_at_5": 1.0,
+    }
+    run["summary"]["metadata_stability"] = {
+        "chunks_observed": 10,
+        "chunks_with_unstable_trust_tier": 0,
+        "unstable_examples": [],
+    }
+    return run
+
+
+class TestEnforce:
+    def test_enforce_accepts_compatible_healthy_runs(self, tmp_path, capsys):
+        baseline_path = tmp_path / "baseline.json"
+        candidate_path = tmp_path / "candidate.json"
+        baseline_path.write_text(json.dumps(make_enforce_run()), encoding="utf-8")
+        candidate_path.write_text(json.dumps(make_enforce_run()), encoding="utf-8")
+
+        assert sb.main(["enforce", str(baseline_path), str(candidate_path)]) == 0
+        output = capsys.readouterr()
+        assert "COMPARABLE" in output.out
+        assert "ENFORCE PASSED" in output.out
+        assert output.err == ""
+
+    def test_enforce_rejects_non_comparable_fingerprints(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["content"]["sha256"] = "0" * 64
+
+        comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert comparable is False
+        assert "fingerprints are not comparable" in failures
+
+    @pytest.mark.parametrize(
+        ("field", "value", "needle"),
+        [
+            ("truncated", True, "incomplete or truncated"),
+            ("chunk_count_unmeasured", 1, "unmeasured"),
+            ("documents_walked", 2866, "incomplete"),
+            ("error", "HTTP 403", "census failed"),
+        ],
+    )
+    def test_enforce_rejects_incomplete_or_unmeasured_census(
+        self, field, value, needle
+    ):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"][field] = value
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any(needle in failure for failure in failures), failures
+
+    def test_enforce_rejects_search_errors(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["latency"]["errors"] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("search error" in failure for failure in failures), failures
+
+    def test_enforce_rejects_negative_hits(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["quality"]["negative_hit_rate"] = 0.01
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("negative hits" in failure for failure in failures), failures
+
+    def test_enforce_rejects_unstable_trust(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["metadata_stability"][
+            "chunks_with_unstable_trust_tier"
+        ] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("unstable trust" in failure for failure in failures), failures
+
+    @pytest.mark.parametrize(
+        ("section", "metric"),
+        [
+            ("quality", "answer_recall_at_5"),
+            ("quality", "doc_recall_at_5"),
+            ("quality", "mrr_body"),
+            ("window", "tail_recall_given_head_at_5"),
+        ],
+    )
+    def test_enforce_rejects_retrieval_regression(self, section, metric):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"][section][metric] = (
+            baseline["summary"][section][metric] - 0.01
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any(metric in failure and "regressed" in failure for failure in failures)
+
+    def test_enforce_rejects_chunk_count_zero_regression(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"]["chunk_count_zero"] += 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("chunk_count_zero regressed" in failure for failure in failures)
+
+    def test_enforce_requires_clean_candidate_indexing_window(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"]["chunk_count_zero"] = 1
+        candidate["summary"]["window"]["tail_recall_given_head_at_5"] = 0.99
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("must be 0" in failure for failure in failures)
+        assert any("must be 1.0" in failure for failure in failures)
+
+    def test_enforce_requires_matching_ground_truth_cache(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["ground_truth"]["sha256"] = "h" * 64
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("ground-truth fingerprints differ" in failure for failure in failures)
+
+
 class TestReportNamesItsFrozenSet:
     """The runbook told an operator to confirm the pin before reading any
     delta, and named `report` as a surface that prints it. It did not. There
