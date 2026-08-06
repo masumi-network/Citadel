@@ -970,7 +970,7 @@ def shape_search_payload(
         exclude_ambient = True
     if apply_spec_ranking is None:
         apply_spec_ranking = is_spec_mode_query(query) and not docs_mode
-    if docs_mode or extract_hex_needles(query) or apply_spec_ranking:
+    if docs_mode or extract_hex_needles(query) or apply_spec_ranking or len(query_terms(query)) == 1:
         ordered = apply_query_ranking(raw_results, query, mode=mode)
     else:
         ordered = list(raw_results)

@@ -582,7 +582,13 @@ async def _search(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("search", as_json=getattr(args, "json", False))
-    from kb.search_format import apply_query_ranking, is_docs_mode_query, is_spec_mode_query, shape_search_payload
+    from kb.search_format import (
+        apply_query_ranking,
+        is_docs_mode_query,
+        is_spec_mode_query,
+        query_terms,
+        shape_search_payload,
+    )
     from kb.status import search_node
 
     top_k = getattr(args, "top_k", None)
@@ -658,7 +664,11 @@ async def _search(args: argparse.Namespace) -> int:
     display = dict(raw)
     if filters_on:
         display = {**display, "results": shaped["results"], "sections": None}
-    elif is_docs_mode_query(args.query, mode=shape_kw.get("mode")) or is_spec_mode_query(args.query):
+    elif (
+        is_docs_mode_query(args.query, mode=shape_kw.get("mode"))
+        or is_spec_mode_query(args.query)
+        or len(query_terms(args.query)) == 1
+    ):
         ranked = apply_query_ranking(
             list(raw.get("results") or []), args.query, mode=shape_kw.get("mode")
         )

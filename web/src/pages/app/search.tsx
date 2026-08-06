@@ -208,12 +208,19 @@ function safeExternalUrl(value: string | null | undefined): string | null {
   }
 }
 
-function resultGroups(response: SearchResponse): Array<{
+function isSingleLiteralQuery(query: string | null): boolean {
+  return Boolean(query?.trim() && query.trim().split(/\s+/).filter(Boolean).length === 1);
+}
+
+function resultGroups(response: SearchResponse, query: string | null): Array<{
   key: string;
   label: string;
   hits: SearchHit[];
 }> {
   const results = Array.isArray(response.results) ? response.results : [];
+  if (isSingleLiteralQuery(query)) {
+    return [{ key: "ranked", label: "Results", hits: results }];
+  }
   const groups: Array<{ key: string; label: string; hits: SearchHit[] }> = [];
   const placed = new Set<string>();
 
@@ -508,7 +515,7 @@ export default function Search() {
 
   const role = session.data?.role ?? null;
   const hits = response && Array.isArray(response.results) ? response.results : [];
-  const groups = response ? resultGroups(response) : [];
+  const groups = response ? resultGroups(response, query) : [];
   const incomplete = response?.timed_out === true || response?.truncated === true;
   const notices = response
     ? [response.note, ...(response.warnings ?? [])].filter((item): item is string => Boolean(item))

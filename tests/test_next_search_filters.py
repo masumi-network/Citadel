@@ -70,3 +70,10 @@ def test_filter_controls_preserve_query_url_and_static_csp_navigation() -> None:
     assert "next/link" not in SEARCH
     assert "history.pushState" not in SEARCH
     assert "window.location.assign" not in SEARCH
+
+
+def test_single_literal_queries_render_flat_ranked_results() -> None:
+    assert "function isSingleLiteralQuery(query: string | null)" in SEARCH
+    assert "if (isSingleLiteralQuery(query))" in SEARCH
+    assert 'return [{ key: "ranked", label: "Results", hits: results }];' in SEARCH
+    assert "resultGroups(response, query)" in SEARCH

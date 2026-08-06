@@ -1576,8 +1576,9 @@ def test_search_view_groups_central_before_node() -> None:
 
     assert web == cli_sections, (web, cli_sections)
     assert web.index("central") < web.index("node")
-    # And the results panel says so on the page itself.
-    assert "Central first, then your Node" in authed_client().get("/app").text
+    assert "isSingleLiteralQuery(query)" in app_js
+    assert "renderSearchResults(returned, response, query)" in app_js
+    assert "Search results" in authed_client().get("/app").text
 
 
 def test_review_is_the_only_place_with_approve_and_reject() -> None:

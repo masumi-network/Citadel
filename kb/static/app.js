@@ -4567,7 +4567,7 @@ document.getElementById("searchForm").addEventListener("submit", async (event) =
     });
     const returned = response.results || [];
     setSearchStatus(returned.length ? `${returned.length} result${returned.length === 1 ? "" : "s"}` : "No results", returned.length ? "status-enabled" : "status-standby");
-    renderSearchResults(returned, response);
+    renderSearchResults(returned, response, query);
     await loadMesh(false);
   } catch (err) {
 
@@ -4655,10 +4655,9 @@ document.getElementById("upgradeButton").addEventListener("click", async (event)
   }
 });
 
-// Central first, then shared traces, then Node — the same order and the same
-// labels as `_render_search` in kb/cli.py, so the web and the CLI teach one
-// mental model. The server does the splitting (`sections` on the /search
-// payload); this only renders it.
+// Grouped searches use Central, shared traces, then Node, matching the CLI.
+// Single-token searches stay flat so the server's cross-dataset ranking remains
+// visible. The server does the splitting (`sections` on the /search payload).
 const SEARCH_SECTION_ORDER = ["central", "session_traces", "node"];
 const SEARCH_SECTION_LABELS = {
   central: "Central",
@@ -4759,11 +4758,22 @@ function searchResultCard(result, index) {
   return item;
 }
 
-function renderSearchResults(results, response = {}) {
+function isSingleLiteralQuery(query) {
+  return String(query || "").trim().split(/\s+/).filter(Boolean).length === 1;
+}
+
+function renderSearchResults(results, response = {}, query = "") {
   const container = document.getElementById("searchResults");
   container.innerHTML = "";
   if (!results.length) {
     container.append(searchEmptyState(response));
+    return;
+  }
+
+  if (isSingleLiteralQuery(query)) {
+    results.slice(0, 10).forEach((result, index) => {
+      container.append(searchResultCard(result, index));
+    });
     return;
   }
 
