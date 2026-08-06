@@ -9,9 +9,37 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+  checks: read
+
 jobs:
+  release-guard:
+    name: Release guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch origin main --depth=1
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/main"
+      - name: Require a successful CI gate for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          successful_gates="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "CI gate" and .conclusion == "success")] | length')"
+          test "$successful_gates" -ge 1
+
   build:
     name: Build sdist + wheel
+    needs: release-guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +73,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [release-guard, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
