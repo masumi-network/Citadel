@@ -2115,6 +2115,7 @@ async def execute_learning_writes(
     tags: list[str],
     session_id: str | None,
     operation: str,
+    attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
@@ -2122,17 +2123,19 @@ async def execute_learning_writes(
     outcomes: list[LearningOutcome] = []
     primary: LearningOutcome | None = None
     for target in targets:
-        outcome = await learning.learn(
-            data,
-            dataset=target.dataset,
-            tags=tags,
-            session_id=session_id,
-            operation=operation,
-            detect_conflicts=detect_conflicts and target.tier == "full",
-            run_improve=run_improve and target.tier == "full",
-            tier=target.tier,
-            defer_cognify=defer_cognify,
-        )
+        learn_kwargs: dict[str, Any] = {
+            "dataset": target.dataset,
+            "tags": tags,
+            "session_id": session_id,
+            "operation": operation,
+            "detect_conflicts": detect_conflicts and target.tier == "full",
+            "run_improve": run_improve and target.tier == "full",
+            "tier": target.tier,
+            "defer_cognify": defer_cognify,
+        }
+        if attestation is not None:
+            learn_kwargs["attestation"] = attestation
+        outcome = await learning.learn(data, **learn_kwargs)
         outcomes.append(outcome)
         if primary is None or target.tier == "full":
             primary = outcome
@@ -2150,6 +2153,7 @@ async def retry_failed_learning_writes(
     tags: list[str],
     session_id: str | None,
     operation: str,
+    attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
@@ -2164,17 +2168,19 @@ async def retry_failed_learning_writes(
             operation,
             target.dataset,
         )
-        updated[index] = await learning.learn(
-            data,
-            dataset=target.dataset,
-            tags=tags,
-            session_id=session_id,
-            operation=operation,
-            detect_conflicts=detect_conflicts and target.tier == "full",
-            run_improve=run_improve and target.tier == "full",
-            tier=target.tier,
-            defer_cognify=defer_cognify,
-        )
+        learn_kwargs: dict[str, Any] = {
+            "dataset": target.dataset,
+            "tags": tags,
+            "session_id": session_id,
+            "operation": operation,
+            "detect_conflicts": detect_conflicts and target.tier == "full",
+            "run_improve": run_improve and target.tier == "full",
+            "tier": target.tier,
+            "defer_cognify": defer_cognify,
+        }
+        if attestation is not None:
+            learn_kwargs["attestation"] = attestation
+        updated[index] = await learning.learn(data, **learn_kwargs)
     return updated
 
 
@@ -5717,6 +5723,7 @@ async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
             body.dataset,
             dry_run=body.dry_run,
             max_items=body.max_items,
+            actor=actor,
         )
     except SecretContentError as exc:
         get_access_store().record_event(

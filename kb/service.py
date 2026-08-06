@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from hashlib import sha256
 import logging
 import re
@@ -72,6 +72,7 @@ class Citadel:
         dataset: str | None = None,
         tags: Iterable[str] | None = None,
         session_id: str | None = None,
+        attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> IngestResult:
         target_dataset = dataset or self.config.default_dataset
@@ -110,13 +111,15 @@ class Citadel:
         # (repo_content_sync) could never recover the file.
         self._seen_ingest_keys.add(ingest_key)
         try:
-            result = await self.cognee.remember(
-                data,
-                dataset_name=target_dataset,
-                session_id=session_id,
-                tags=merged_tags,
-                defer_cognify=defer_cognify,
-            )
+            remember_kwargs: dict[str, Any] = {
+                "dataset_name": target_dataset,
+                "session_id": session_id,
+                "tags": merged_tags,
+                "defer_cognify": defer_cognify,
+            }
+            if attestation is not None:
+                remember_kwargs["attestation"] = attestation
+            result = await self.cognee.remember(data, **remember_kwargs)
         except BaseException:
             self._seen_ingest_keys.discard(ingest_key)
             raise

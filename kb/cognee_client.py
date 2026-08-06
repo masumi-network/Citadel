@@ -323,6 +323,7 @@ class CogneeGateway(Protocol):
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
         ...
@@ -611,13 +612,29 @@ class CogneePublicClient:
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
-        metadata = {"citadel_tags": list(tags)} if tags else None
+        metadata: dict[str, Any] = {}
+        if tags:
+            metadata["citadel_tags"] = list(tags)
+        if attestation:
+            promoted_by = attestation.get("promoted_by")
+            promoted_at = attestation.get("promoted_at")
+            if (
+                isinstance(promoted_by, str)
+                and promoted_by.strip()
+                and isinstance(promoted_at, str)
+                and promoted_at.strip()
+            ):
+                metadata["citadel_attestation"] = {
+                    "promoted_by": promoted_by.strip(),
+                    "promoted_at": promoted_at.strip(),
+                }
         # Durable knowledge writes always go to cognee's permanent graph
         # (add+cognify), never its per-session cache. When a session_id was
         # supplied, cognee routed the write into the session cache, which (a)
@@ -627,7 +644,7 @@ class CogneePublicClient:
         # scaffolded "Session ID:/Question:/Answer:" blob every sync cycle.
         # session_id is still accepted (callers pass it as provenance) but no
         # longer diverts the write away from the durable path.
-        data = self._data_with_metadata(data, metadata)
+        data = self._data_with_metadata(data, metadata or None)
 
         # Add is a fast write to Cognee's relational/source stores; it does NOT
         # create chunks, embeddings, or touch the Kuzu graph. Cognify is the

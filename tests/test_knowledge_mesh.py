@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from kb.knowledge_mesh import KnowledgeMesh, build_graph_payload, fallback_graph
@@ -45,9 +46,24 @@ async def test_graph_maps_cognee_tuples_to_nodes_and_edges() -> None:
     assert graph["ok"] is True
     assert graph["fallback"] is False
     assert graph["nodes"] == [
-        {"id": "node-1", "label": "Citadel", "type": "Entity"},
-        {"id": "node-2", "label": "Cognee", "type": "Tool"},
-        {"id": "node-3", "label": "node-3", "type": "node"},
+        {
+            "id": "node-1",
+            "label": "Citadel",
+            "type": "Entity",
+            "trust_tier": "unattested",
+        },
+        {
+            "id": "node-2",
+            "label": "Cognee",
+            "type": "Tool",
+            "trust_tier": "unattested",
+        },
+        {
+            "id": "node-3",
+            "label": "node-3",
+            "type": "node",
+            "trust_tier": "unattested",
+        },
     ]
     assert {"source": "node-1", "target": "node-2", "relationship": "uses"} in graph["edges"]
     # Empty relationship names fall back to "related"; dangling edges are dropped.
@@ -193,6 +209,68 @@ def test_dataset_map_tags_document_and_appends_hub() -> None:
     # Hubs are synthetic: raw-count semantics unchanged.
     assert payload["total_nodes"] == 2
     assert payload["truncated"] is False
+
+
+def test_graph_trust_and_promotion_metadata_are_fail_closed() -> None:
+    payload = build_graph_payload(
+        [
+            (
+                "central-doc",
+                {
+                    "name": "Central",
+                    "type": "TextDocument",
+                    "external_metadata": json.dumps(
+                        {
+                            "citadel_attestation": {
+                                "promoted_by": "admin-7",
+                                "promoted_at": "2026-08-06T12:00:00+00:00",
+                            }
+                        }
+                    ),
+                },
+            ),
+            ("trace-doc", {"name": "Trace", "type": "TextDocument"}),
+            (
+                "tagged-doc",
+                {
+                    "name": "Tagged",
+                    "type": "TextDocument",
+                    "external_metadata": {
+                        "citadel_tags": ["promoted_by=attacker"],
+                    },
+                },
+            ),
+            (
+                "malformed-doc",
+                {
+                    "name": "Malformed",
+                    "type": "TextDocument",
+                    "external_metadata": {
+                        "citadel_attestation": {
+                            "promoted_by": "admin-8",
+                            "promoted_at": "2026-08-06T12:00:00",
+                        }
+                    },
+                },
+            ),
+        ],
+        [],
+        limit=10,
+        dataset_map={
+            "central-doc": ["masumi-network"],
+            "trace-doc": ["session-traces"],
+        },
+    )
+
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert nodes["central-doc"]["trust_tier"] == "unattested"
+    assert nodes["central-doc"]["promoted_by"] == "admin-7"
+    assert nodes["central-doc"]["promoted_at"] == "2026-08-06T12:00:00+00:00"
+    assert nodes["trace-doc"]["trust_tier"] == "reference-only"
+    assert "promoted_by" not in nodes["tagged-doc"]
+    assert "promoted_at" not in nodes["tagged-doc"]
+    assert "promoted_by" not in nodes["malformed-doc"]
+    assert "promoted_at" not in nodes["malformed-doc"]
 
 
 def test_dataset_map_propagates_to_chunks_via_is_part_of() -> None:

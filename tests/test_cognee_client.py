@@ -1133,12 +1133,22 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
         dataset_name="masumi-network",
         session_id="masumi-github-daily",
         tags=("github",),
+        attestation={
+            "promoted_by": "admin-7",
+            "promoted_at": "2026-08-06T12:00:00+00:00",
+        },
     )
     assert "session_id" not in captured["kwargs"]
     assert captured["kwargs"] == {"dataset_name": "masumi-network"}
     assert isinstance(captured["data"], DataItem)
     assert captured["data"].data == "real digest"
-    assert captured["data"].external_metadata == {"citadel_tags": ["github"]}
+    assert captured["data"].external_metadata == {
+        "citadel_tags": ["github"],
+        "citadel_attestation": {
+            "promoted_by": "admin-7",
+            "promoted_at": "2026-08-06T12:00:00+00:00",
+        },
+    }
     assert result == {"added": {"ok": True}, "cognify": "suppressed"}
 
 
