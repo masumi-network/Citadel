@@ -6274,7 +6274,9 @@ class ShareCitadel(FakeCitadel):
         self.ingest_calls: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled = []
-        self.cognee.schedule_cognify = lambda datasets: self.cognee.scheduled.append(list(datasets))
+        self.cognee.schedule_cognify = (
+            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})
@@ -6290,7 +6292,9 @@ class CrossSeatTraceCitadel(FakeCitadel):
         self.traces: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = lambda datasets: self.cognee.scheduled.append(list(datasets))
+        self.cognee.schedule_cognify = (
+            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})
@@ -6339,6 +6343,42 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
     datasets = [call["dataset"] for call in app.state.citadel.ingest_calls]
     assert datasets == ["seat:alice", SESSION_TRACES_DATASET]
     assert app.state.citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+
+
+def test_share_session_surfaces_rejected_durable_queue(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
+    ).json()["token"]
+    citadel = ShareCitadel()
+    citadel.cognee.schedule_cognify = lambda datasets: False
+    app.state.citadel = citadel
+    client = TestClient(app, base_url="https://testserver")
+    root = str(tmp_path)
+    register_seat_capture_roots(admin, "alice", [root])
+
+    response = client.post(
+        "/api/share-session",
+        json={"data": "Task: queue failure", "cwd": root, "capture_roots": [root]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["accepted"] is True
+    assert payload["cognify"] == "not_scheduled"
+    assert payload["message"] == (
+        "Shared Session Trace accepted, but indexing was not scheduled."
+    )
+    events = app.state.access_store.snapshot()["audit_events"]
+    successful = [
+        event
+        for event in events
+        if event["action"] == "share_session" and event["success"]
+    ]
+    assert successful[-1]["detail"]["cognify"] == "not_scheduled"
 
 
 def test_share_session_trace_visible_to_other_seat(tmp_path: Any) -> None:
@@ -6526,7 +6566,9 @@ class PartialSessionTraceWriteCitadel(FakeCitadel):
         self.ingest_calls: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = lambda datasets: self.cognee.scheduled.append(list(datasets))
+        self.cognee.schedule_cognify = (
+            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})
@@ -6544,7 +6586,9 @@ class FlakySessionTraceWriteCitadel(FakeCitadel):
         self.session_traces_attempts = 0
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = lambda datasets: self.cognee.scheduled.append(list(datasets))
+        self.cognee.schedule_cognify = (
+            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})

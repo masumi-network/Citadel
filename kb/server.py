@@ -6581,8 +6581,12 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         for target, item in zip(write_targets, all_outcomes, strict=True)
         if item.ingest.accepted
     ]
+    cognify_queued = False
     if cognify_datasets:
-        citadel.cognee.schedule_cognify(list(dict.fromkeys(cognify_datasets)))
+        cognify_queued = citadel.cognee.schedule_cognify(
+            list(dict.fromkeys(cognify_datasets))
+        )
+    cognify_state = "deferred" if cognify_queued else "not_scheduled"
 
     record_mcp_audit(
         request,
@@ -6594,6 +6598,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "accepted": outcome.ingest.accepted,
             "write_targets": [target.dataset for target in write_targets],
             "has_tool_errors": body.has_tool_errors,
+            "cognify": cognify_state,
         },
     )
     get_access_store().record_event(
@@ -6604,6 +6609,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         detail={
             "write_targets": [target.dataset for target in write_targets],
             "author_seat": actor.seat_slug,
+            "cognify": cognify_state,
         },
     )
     return jsonable_encoder(
@@ -6612,8 +6618,12 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "accepted": outcome.ingest.accepted,
             "dataset": SESSION_TRACES_DATASET,
             "write_targets": [target.dataset for target in write_targets],
-            "cognify": "deferred",
-            "message": "Shared Session Trace accepted; searchable after coalesced cognify.",
+            "cognify": cognify_state,
+            "message": (
+                "Shared Session Trace accepted; searchable after coalesced cognify."
+                if cognify_queued
+                else "Shared Session Trace accepted, but indexing was not scheduled."
+            ),
         }
     )
 

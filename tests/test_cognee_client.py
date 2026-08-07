@@ -1457,6 +1457,323 @@ async def test_long_cognify_renews_queue_lease(monkeypatch: Any, tmp_path: Any) 
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_failure_wins_same_turn_cognify_completion(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    queue = CognifyRetryQueue(tmp_path / "queue.json")
+    queue.enqueue(["central"])
+    lease = queue.claim()
+    assert lease is not None
+    client = CogneePublicClient(retry_queue=queue)
+
+    async def cognify(*, datasets: list[str], force: bool = False) -> dict[str, Any]:
+        return {"ok": True}
+
+    async def fail_heartbeat(lease: Any) -> None:
+        raise OSError("queue volume unavailable")
+
+    monkeypatch.setattr(client, "cognify", cognify)
+    monkeypatch.setattr(client, "_renew_cognify_lease", fail_heartbeat)
+
+    with pytest.raises(OSError, match="queue volume unavailable"):
+        await client._cognify_with_lease(lease)
+
+
+@pytest.mark.asyncio
+async def test_failed_lease_renewal_cancels_cognify_before_retry(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(
+        path,
+        lease_seconds=1,
+        backoff_seconds=30,
+        max_backoff_seconds=30,
+    )
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        started.set()
+        try:
+            await blocked.wait()
+        finally:
+            cancelled.set()
+        return {"ok": True}
+
+    def fail_renewal(lease: Any) -> None:
+        raise OSError("queue volume unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    monkeypatch.setattr(queue, "renew", fail_renewal)
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+    task = client._cognify_queue_task
+    assert task is not None
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(cancelled.wait(), timeout=2)
+    await asyncio.wait_for(asyncio.shield(task), timeout=2)
+
+    jobs = queue.snapshot()
+    assert len(jobs) == 1
+    assert jobs[0].leased is False
+    assert jobs[0].last_error == "OSError: queue volume unavailable"
+    assert client._cognify_queue_retry_handle is not None
+    await client.stop_cognify_queue()
+
+
+@pytest.mark.asyncio
+async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    first_queue = CognifyRetryQueue(
+        path,
+        lease_seconds=0.05,
+        backoff_seconds=0.01,
+        max_backoff_seconds=0.05,
+    )
+    second_queue = CognifyRetryQueue(
+        path,
+        lease_seconds=0.05,
+        backoff_seconds=0.01,
+        max_backoff_seconds=0.05,
+    )
+    first_queue.enqueue(["central"])
+    first_client = CogneePublicClient(retry_queue=first_queue)
+    second_client = CogneePublicClient(retry_queue=second_queue)
+    first_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    replacement_started = asyncio.Event()
+    active_cognify = 0
+    max_active_cognify = 0
+
+    async def first_cognify(*, datasets: list[str], force: bool = False) -> None:
+        nonlocal active_cognify, max_active_cognify
+        active_cognify += 1
+        max_active_cognify = max(max_active_cognify, active_cognify)
+        first_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise
+        finally:
+            active_cognify -= 1
+
+    async def fail_heartbeat(lease: Any) -> None:
+        await first_started.wait()
+        raise OSError("queue volume unavailable")
+
+    async def replacement_cognify(*, datasets: list[str], force: bool = False) -> None:
+        nonlocal active_cognify, max_active_cognify
+        active_cognify += 1
+        max_active_cognify = max(max_active_cognify, active_cognify)
+        replacement_started.set()
+        active_cognify -= 1
+
+    monkeypatch.setattr(first_client, "cognify", first_cognify)
+    monkeypatch.setattr(first_client, "_renew_cognify_lease", fail_heartbeat)
+    monkeypatch.setattr(
+        first_client,
+        "_schedule_cognify_retry",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(second_client, "cognify", replacement_cognify)
+
+    first_client.resume_cognify_queue()
+    first_task = first_client._cognify_queue_task
+    assert first_task is not None
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    await asyncio.sleep(0.08)
+
+    second_client.resume_cognify_queue()
+    contending_task = second_client._cognify_queue_task
+    assert contending_task is not None
+    await asyncio.wait_for(asyncio.shield(contending_task), timeout=1)
+
+    assert replacement_started.is_set() is False
+    pending = second_queue.snapshot()
+    assert len(pending) == 1
+    assert pending[0].attempt == 1
+    assert max_active_cognify == 1
+
+    release_cleanup.set()
+    await asyncio.wait_for(asyncio.shield(first_task), timeout=1)
+    second_client._cancel_cognify_retry()
+    second_client.resume_cognify_queue()
+    replacement_task = second_client._cognify_queue_task
+    assert replacement_task is not None
+    await asyncio.wait_for(replacement_started.wait(), timeout=1)
+    await asyncio.wait_for(asyncio.shield(replacement_task), timeout=1)
+
+    assert max_active_cognify == 1
+    assert second_queue.snapshot() == ()
+    await first_client.stop_cognify_queue()
+    await second_client.stop_cognify_queue()
+
+
+@pytest.mark.asyncio
+async def test_execution_lock_contention_uses_bounded_poll(tmp_path: Any) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    owner_queue = CognifyRetryQueue(path, lease_seconds=300)
+    contender_queue = CognifyRetryQueue(path, lease_seconds=300)
+    owner_queue.enqueue(["central"])
+    owner_guard = owner_queue.try_acquire_execution()
+    assert owner_guard is not None
+    lease = owner_queue.claim()
+    assert lease is not None
+    contender = CogneePublicClient(retry_queue=contender_queue)
+
+    contender.resume_cognify_queue()
+    task = contender._cognify_queue_task
+    assert task is not None
+    await asyncio.wait_for(asyncio.shield(task), timeout=1)
+
+    handle = contender._cognify_queue_retry_handle
+    assert handle is not None
+    remaining = handle.when() - asyncio.get_running_loop().time()
+    assert 0 < remaining <= 1.0
+    assert contender_queue.snapshot()[0].attempt == 1
+
+    await contender.stop_cognify_queue()
+    owner_guard.release()
+@pytest.mark.asyncio
+async def test_failed_acknowledgement_retries_without_external_activity(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(
+        path,
+        lease_seconds=0.05,
+        backoff_seconds=0.01,
+        max_backoff_seconds=0.05,
+    )
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    cognify_calls: list[list[str]] = []
+    acknowledgement_calls = 0
+    wakeup_calls = 0
+    retried = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        cognify_calls.append(list(datasets))
+        if len(cognify_calls) == 2:
+            retried.set()
+        return {"ok": True}
+
+    acknowledge = queue.acknowledge
+    next_wakeup_delay = queue.next_wakeup_delay
+
+    def fail_first_acknowledgement(lease: Any) -> None:
+        nonlocal acknowledgement_calls
+        acknowledgement_calls += 1
+        if acknowledgement_calls == 1:
+            raise OSError("queue volume unavailable")
+        acknowledge(lease)
+
+    def fail_first_wakeup_read() -> float | None:
+        nonlocal wakeup_calls
+        wakeup_calls += 1
+        if wakeup_calls == 1:
+            raise OSError("queue volume unavailable")
+        return next_wakeup_delay()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    monkeypatch.setattr(queue, "acknowledge", fail_first_acknowledgement)
+    monkeypatch.setattr(queue, "next_wakeup_delay", fail_first_wakeup_read)
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+
+    await asyncio.wait_for(retried.wait(), timeout=1)
+
+    async def wait_for_queue_empty() -> None:
+        while queue.snapshot():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_queue_empty(), timeout=1)
+
+    assert cognify_calls == [["central"], ["central"]]
+    assert acknowledgement_calls == 2
+    assert wakeup_calls >= 2
+    assert queue.snapshot() == ()
+    await client.stop_cognify_queue()
+
+
+@pytest.mark.asyncio
+async def test_child_cognify_cancellation_retries_without_external_activity(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(
+        path,
+        backoff_seconds=0.01,
+        max_backoff_seconds=0.05,
+    )
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    cognify_calls: list[list[str]] = []
+    retried = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        cognify_calls.append(list(datasets))
+        if len(cognify_calls) == 1:
+            raise asyncio.CancelledError
+        retried.set()
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+
+    await asyncio.wait_for(retried.wait(), timeout=1)
+
+    async def wait_for_queue_empty() -> None:
+        while queue.snapshot():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_queue_empty(), timeout=1)
+
+    assert cognify_calls == [["central"], ["central"]]
+    assert queue.snapshot() == ()
+    await client.stop_cognify_queue()
+
+
+@pytest.mark.asyncio
 async def test_stop_cognify_queue_reschedules_cancelled_work(
     monkeypatch: Any, tmp_path: Any
 ) -> None:

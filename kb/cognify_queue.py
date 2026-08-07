@@ -32,6 +32,37 @@ DEFAULT_BACKOFF_SECONDS = 5.0
 DEFAULT_MAX_BACKOFF_SECONDS = 3600.0
 MAX_ERROR_LENGTH = 512
 
+_EXECUTION_HANDLES_LOCK = threading.Lock()
+_EXECUTION_HANDLES: dict[int, Any] = {}
+
+
+def _before_fork() -> None:
+    _EXECUTION_HANDLES_LOCK.acquire()
+
+
+def _after_fork_parent() -> None:
+    _EXECUTION_HANDLES_LOCK.release()
+
+
+def _after_fork_child() -> None:
+    try:
+        for handle in _EXECUTION_HANDLES.values():
+            try:
+                handle.close()
+            except OSError:
+                pass
+        _EXECUTION_HANDLES.clear()
+    finally:
+        _EXECUTION_HANDLES_LOCK.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_parent,
+        after_in_child=_after_fork_child,
+    )
+
 _RECORD_FIELDS = frozenset(
     {
         "job_id",
@@ -66,6 +97,34 @@ class CognifyQueueStateError(CognifyQueueError):
 
 class CognifyLeaseError(CognifyQueueError):
     """A lease is unknown, stale, or does not match its queue record."""
+
+
+@dataclass(slots=True)
+class CognifyExecutionGuard:
+    """Owned cross-process execution lock for one queue drain."""
+
+    _handle: Any
+    _released: bool = False
+
+    def release(self) -> None:
+        """Release the execution lock and close its owned descriptor once."""
+        if self._released:
+            return
+        self._released = True
+        with _EXECUTION_HANDLES_LOCK:
+            if self._handle.closed:
+                return
+            _EXECUTION_HANDLES.pop(self._handle.fileno(), None)
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._handle.close()
+
+    def __enter__(self) -> CognifyExecutionGuard:
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.release()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +236,7 @@ class CognifyRetryQueue:
         max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
         clock: Clock | None = None,
     ) -> None:
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve(strict=False)
         self.lease_seconds = self._positive_duration(lease_seconds, "lease_seconds")
         self.backoff_seconds = self._positive_duration(backoff_seconds, "backoff_seconds")
         self.max_backoff_seconds = self._positive_duration(
@@ -189,6 +248,35 @@ class CognifyRetryQueue:
         self._thread_lock = threading.RLock()
         self._lock_depth = 0
         self._lock_file: Any | None = None
+
+    def try_acquire_execution(self) -> CognifyExecutionGuard | None:
+        """Acquire queue-wide execution ownership without waiting.
+
+        This lock is separate from the short state-mutation lock. Callers must
+        acquire it before claiming work and retain it until active cognify work
+        and its child-task cleanup have stopped.
+        """
+        lock_path = self.path.with_suffix(f"{self.path.suffix}.execute.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with _EXECUTION_HANDLES_LOCK:
+            descriptor = os.open(lock_path, flags, 0o600)
+            try:
+                handle = os.fdopen(descriptor, "a+")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                return None
+            except BaseException:
+                handle.close()
+                raise
+            _EXECUTION_HANDLES[handle.fileno()] = handle
+        return CognifyExecutionGuard(handle)
 
     @staticmethod
     def _positive_duration(value: float, field_name: str) -> float:
@@ -662,6 +750,7 @@ class CognifyRetryQueue:
 
 
 __all__ = [
+    "CognifyExecutionGuard",
     "CognifyJob",
     "CognifyLease",
     "CognifyLeaseError",

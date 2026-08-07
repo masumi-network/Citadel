@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,40 @@ def _at(value: str) -> datetime:
 def _enqueue_from_process(path: str, datasets: tuple[str, ...], start: object) -> None:
     start.wait()
     CognifyRetryQueue(path).enqueue(datasets, now=T0)
+
+
+def _hold_execution_guard(path: str, acquired: object, exit_now: object) -> None:
+    guard = CognifyRetryQueue(path).try_acquire_execution()
+    if guard is None:
+        raise RuntimeError("execution guard was already held")
+    acquired.set()
+    exit_now.wait()
+    os._exit(0)
+
+
+def _check_forked_child_closes_guard(path: str) -> None:
+    queue = CognifyRetryQueue(path)
+    guard = queue.try_acquire_execution()
+    assert guard is not None
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        os.write(write_fd, b"closed" if guard._handle.closed else b"open")
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    inherited_state = os.read(read_fd, 16)
+    os.close(read_fd)
+    _, child_status = os.waitpid(child_pid, 0)
+    assert inherited_state == b"closed"
+    assert os.waitstatus_to_exitcode(child_status) == 0
+    assert CognifyRetryQueue(path).try_acquire_execution() is None
+    guard.release()
+    recovered = CognifyRetryQueue(path).try_acquire_execution()
+    assert recovered is not None
+    recovered.release()
 
 
 def test_enqueue_is_content_free_and_merges_duplicate_dataset_sets(tmp_path: Path) -> None:
@@ -253,3 +288,55 @@ def test_cross_process_enqueue_does_not_lose_updates(tmp_path: Path) -> None:
     jobs = CognifyRetryQueue(path).snapshot()
     assert len(jobs) == 1
     assert jobs[0].datasets == ("central", "seat:alice")
+
+
+def test_execution_guard_blocks_other_process_without_claiming_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(path)
+    queue.enqueue(("central",), now=T0)
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    exit_now = context.Event()
+    process = context.Process(
+        target=_hold_execution_guard,
+        args=(str(path), acquired, exit_now),
+    )
+    process.start()
+    assert acquired.wait(timeout=10)
+
+    assert queue.try_acquire_execution() is None
+    pending = queue.snapshot()
+    assert len(pending) == 1
+    assert pending[0].attempt == 0
+    assert pending[0].leased is False
+
+    exit_now.set()
+    process.join(timeout=10)
+    assert process.exitcode == 0
+
+    recovered = queue.try_acquire_execution()
+    assert recovered is not None
+    recovered.release()
+    recovered.release()
+
+
+def test_forked_child_does_not_inherit_execution_guard(tmp_path: Path) -> None:
+    path = tmp_path / "queue.json"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_check_forked_child_closes_guard, args=(str(path),))
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 0
+
+
+def test_execution_guard_refuses_symlink_lock_file(tmp_path: Path) -> None:
+    path = tmp_path / "queue.json"
+    lock_path = tmp_path / "queue.json.execute.lock"
+    target = tmp_path / "other.lock"
+    target.touch()
+    lock_path.symlink_to(target)
+
+    with pytest.raises(OSError):
+        CognifyRetryQueue(path).try_acquire_execution()
