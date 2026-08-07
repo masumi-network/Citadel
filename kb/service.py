@@ -139,6 +139,8 @@ class Citadel:
                 reason = "queued_not_confirmed"
             elif cognify_state == "not_scheduled":
                 reason = "not_scheduled"
+            elif result.get("background_cognify") is False:
+                reason = "not_scheduled"
         return IngestResult(True, reason, target_dataset, merged_tags, result)
 
     def _guard_content(self, data: str, dataset: str) -> None:

@@ -148,7 +148,9 @@ async def test_linear_sync_ingests_central_and_mirror(
     # (Central + mirrors) instead of one-per-issue — capture it here.
     scheduled: list[list[str]] = []
     monkeypatch.setattr(
-        citadel.cognee, "schedule_cognify", lambda datasets: scheduled.append(list(datasets))
+        citadel.cognee,
+        "schedule_cognify",
+        lambda datasets: scheduled.append(list(datasets)) or True,
     )
 
     syncer = LinearSyncer(
@@ -196,7 +198,7 @@ async def test_linear_sync_writes_each_issue_to_central(
         return Outcome()
 
     monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
-    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: True)
     syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues))
 
     result = await syncer.run(force=True)
@@ -255,7 +257,7 @@ async def test_linear_sync_auto_maps_assignee_by_member_email(
         return Outcome()
 
     monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
-    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: True)
     syncer = LinearSyncer(
         citadel, client=FakeLinearClient(issues, users=members), access_store=store
     )
@@ -294,7 +296,9 @@ async def test_linear_sync_defers_coalesced_cognify_when_inline_suppressed(
     monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
     scheduled: list[list[str]] = []
     monkeypatch.setattr(
-        citadel.cognee, "schedule_cognify", lambda datasets: scheduled.append(list(datasets))
+        citadel.cognee,
+        "schedule_cognify",
+        lambda datasets: scheduled.append(list(datasets)) or True,
     )
     syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues))
 
@@ -337,7 +341,9 @@ async def test_linear_sync_awaits_coalesced_cognify_when_requested(
 
     monkeypatch.setattr(citadel.cognee, "cognify", fake_cognify)
     monkeypatch.setattr(
-        citadel.cognee, "schedule_cognify", lambda datasets: scheduled.append(list(datasets))
+        citadel.cognee,
+        "schedule_cognify",
+        lambda datasets: scheduled.append(list(datasets)) or True,
     )
     syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues))
 
@@ -366,6 +372,26 @@ async def test_linear_sync_reports_queued_not_confirmed_on_background_cognify(
     assert scheduled  # the background cognify was requested...
     # ...and the report claims no more than the request:
     assert result["central_ingested"] == "queued_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_reports_not_scheduled_when_retry_queue_rejects(
+    tmp_path: Any, sample_issues: list[dict[str, Any]], monkeypatch: Any
+) -> None:
+    syncer, ingests, scheduled = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+
+    def reject_schedule(datasets: Any) -> bool:
+        scheduled.append(list(datasets))
+        return False
+
+    monkeypatch.setattr(syncer.citadel.cognee, "schedule_cognify", reject_schedule)
+
+    result = await syncer.run(force=True)
+
+    assert result["ok"] is True
+    assert ingests
+    assert scheduled
+    assert result["central_ingested"] == "not_scheduled"
 
 
 @pytest.mark.asyncio
@@ -513,7 +539,7 @@ async def test_member_fetch_failure_is_carried_not_a_neutral_zero(
         return Outcome()
 
     monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
-    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: True)
 
     class MemberFetchFails(FakeLinearClient):
         def fetch_users(self, *, max_users: int = 250) -> list[dict[str, Any]]:
@@ -572,7 +598,7 @@ async def test_linear_sync_counts_unresolved_assignee_without_name_guessing(
         return Outcome()
 
     monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
-    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: True)
     syncer = LinearSyncer(
         citadel,
         client=FakeLinearClient(issues, users=[]),
@@ -635,7 +661,9 @@ def _incremental_syncer(
     _capture_learn(monkeypatch, ingests)
     scheduled: list[list[str]] = []
     monkeypatch.setattr(
-        citadel.cognee, "schedule_cognify", lambda datasets: scheduled.append(list(datasets))
+        citadel.cognee,
+        "schedule_cognify",
+        lambda datasets: scheduled.append(list(datasets)) or True,
     )
     syncer = LinearSyncer(
         citadel, client=FakeLinearClient(sample_issues), access_store=store
@@ -839,8 +867,9 @@ class FakeCogneeForScanTest:
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
         return {"cognified": True}
 
-    def schedule_cognify(self, datasets: Any) -> None:
+    def schedule_cognify(self, datasets: Any) -> bool:
         self.scheduled_datasets.append(list(datasets))
+        return True
 
 
 @pytest.mark.asyncio

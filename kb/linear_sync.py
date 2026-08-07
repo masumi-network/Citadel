@@ -666,8 +666,8 @@ class LinearSyncer:
             else:
                 # On-demand endpoint / evolve: background it so the request returns
                 # without waiting on the graph write.
-                self.citadel.cognee.schedule_cognify(cognify_datasets)
-                cognify_observed = "queued_not_confirmed"
+                queued = self.citadel.cognee.schedule_cognify(cognify_datasets)
+                cognify_observed = "queued_not_confirmed" if queued else "not_scheduled"
         elif touched_datasets:
             # Evolve Phase-1 subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY): add-only
             # by design; the web cognifies in Phase 2 as the sole Kuzu writer.
@@ -770,6 +770,7 @@ class LinearSyncer:
             #   "cognify_failed"        awaited coalesced cognify raised
             #   "queued_not_confirmed"  background cognify scheduled; outcome
             #                           not observed by this pass
+            #   "not_scheduled"        durable background queue rejected the work
             #   "suppressed"            add-only mode; evolve Phase 2 cognifies
             #   None                    no accepted Central write this pass
             "central_ingested": (
