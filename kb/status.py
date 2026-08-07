@@ -359,8 +359,35 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
     indexed = corpus.get("indexed_docs")
     tracked = corpus.get("tracked_sources")
     ok = bool(corpus.get("ok", True)) and (canary is None or bool(canary.get("ok", True)))
-    detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
-    return Check("corpus", ok=ok, detail=detail, latency_ms=latency, data={"canary": canary})
+    probe_documents = corpus.get("probe_documents")
+    relational_documents = corpus.get("relational_documents")
+    fully_indexed = corpus.get("probe_fully_indexed_documents")
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in (
+        probe_documents,
+        relational_documents,
+        fully_indexed,
+    )):
+        if corpus.get("probe_complete") is False:
+            probe_state = "incomplete"
+        elif corpus.get("probe_ok") is False:
+            probe_state = "failed"
+        else:
+            probe_state = "complete"
+        detail = (
+            f"corpus probe {probe_state}: {fully_indexed}/{probe_documents} sampled "
+            f"documents fully indexed ({probe_documents}/{relational_documents} sampled)"
+        )
+    elif corpus.get("degraded"):
+        detail = f"corpus probe unavailable: {corpus['degraded']}"
+    else:
+        detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
+    return Check(
+        "corpus",
+        ok=ok,
+        detail=detail,
+        latency_ms=latency,
+        data={"canary": canary, "corpus": dict(corpus)},
+    )
 
 
 def search_node(
@@ -930,12 +957,12 @@ def render_verdict(report: StatusReport, *, color: bool = False) -> str:
                 )
             )
         elif corpus_fail is not None:
-            # The Node is up, but the data plane is broken (sources tracked, graph
-            # empty, or the cognify canary failed) — the exact #27 failure mode.
+            # The Node is up, but its readiness gate is RED. Search availability
+            # is a separate check and must not be inferred from this gate.
             lines.append(
                 paint(
-                    f"Data plane broken — {corpus_fail.detail}. The Node is up but search "
-                    "returns nothing; ingested data is not being indexed.",
+                    f"Data plane not ready: {corpus_fail.detail}. The Node is up; "
+                    "search availability is reported separately.",
                     "red",
                     enable=color,
                 )
