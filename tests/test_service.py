@@ -1006,6 +1006,13 @@ async def test_reconcile_corpus_recovers_interrupted_source_backed_repair(tmp_pa
         ) -> dict[str, dict[str, Any]]:
             return {document_id: manifest[document_id] for document_id in document_ids}
 
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            # Scoped repair journals its target dataset; a shared document may
+            # also remain attached to another dataset without being drift.
+            return {document_id: ["notes", "other"] for document_id in document_ids}
+
         async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
             return self.reports.pop(0)
 
@@ -1093,6 +1100,11 @@ async def test_reconcile_corpus_continues_normal_repair_after_recovery_postcheck
         ) -> dict[str, dict[str, Any]]:
             return {document_id: manifest[document_id] for document_id in document_ids}
 
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["notes"] for document_id in document_ids}
+
         async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
             return self.reports.pop(0)
 
@@ -1168,6 +1180,11 @@ async def test_reconcile_corpus_refuses_recovery_when_source_changed(tmp_path) -
         ) -> dict[str, dict[str, Any]]:
             return {document_id: {"content_hash": "after"} for document_id in document_ids}
 
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["notes"] for document_id in document_ids}
+
     fake = ChangedSourceGateway()
     kb = Citadel(
         CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
@@ -1180,6 +1197,51 @@ async def test_reconcile_corpus_refuses_recovery_when_source_changed(tmp_path) -
     assert result["reason"] == "repair_source_changed"
     assert fake.cognify_calls == []
     assert result["pending_operations"][0]["operation_id"] == "changed-op"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_recovery_when_dataset_membership_changed(
+    tmp_path,
+) -> None:
+    manifest = {"doc-a": {"content_hash": "same"}}
+    journal_path = tmp_path / "repair.jsonl"
+    RepairJournal(journal_path).append(
+        operation_id="membership-drift-op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+        repair_document_datasets={"doc-a": ["notes"]},
+        source_manifest=manifest,
+    )
+
+    class ChangedMembershipGateway(FakeCognee):
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: manifest[document_id] for document_id in document_ids}
+
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["other"] for document_id in document_ids}
+
+    fake = ChangedMembershipGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_dataset_membership_changed"
+    assert fake.cognify_calls == []
+    assert result["pending_operations"][0]["operation_id"] == "membership-drift-op"
+    assert result["pending_operations"][0]["reason"] == (
+        "repair_dataset_membership_changed"
+    )
 
 
 @pytest.mark.asyncio

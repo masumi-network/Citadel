@@ -390,6 +390,11 @@ class CogneeGateway(Protocol):
     ) -> dict[str, dict[str, Any]] | None:
         raise NotImplementedError
 
+    async def dataset_membership_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, list[str]]:
+        raise NotImplementedError
+
     async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
         raise NotImplementedError
 
@@ -1445,6 +1450,53 @@ class CogneePublicClient:
                 if entry:
                     manifest[str(row.id)] = entry
         return manifest
+
+    async def dataset_membership_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, list[str]]:
+        """Return the current relational dataset membership for each source id.
+
+        Recovery uses this as a strict fence, so unlike ``node_dataset_map`` this
+        read is unscoped, uncached, and does not degrade to stale or empty data.
+        The census records the same unscoped DatasetData membership.
+        """
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            return {}
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+
+        from sqlalchemy import select
+
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "dataset membership requested a non-UUID document id"
+            ) from exc
+
+        engine = get_relational_engine()
+        names_by_id: dict[str, set[str]] = {document_id: set() for document_id in wanted}
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(DatasetData.data_id, Dataset.name)
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .where(DatasetData.data_id.in_(wanted_ids))
+            )
+            for data_id, dataset_name in rows.all():
+                if data_id is None or not isinstance(dataset_name, str) or not dataset_name:
+                    raise RuntimeError("dataset membership returned an invalid row")
+                document_id = str(data_id)
+                if document_id not in names_by_id:
+                    raise RuntimeError("dataset membership returned an unexpected document")
+                names_by_id[document_id].add(dataset_name)
+        return {
+            document_id: sorted(names_by_id[document_id]) for document_id in wanted
+        }
 
     async def corpus_zero_chunk_documents(
         self,

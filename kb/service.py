@@ -527,6 +527,56 @@ class Citadel:
                     }
         return {"ok": True, "source_manifest": current}
 
+    async def _verify_repair_dataset_membership(
+        self,
+        document_ids: list[str],
+        expected: Mapping[str, list[str]],
+    ) -> dict[str, Any]:
+        """Refuse recovery when live dataset membership differs from the journal."""
+        lookup = getattr(self.cognee, "dataset_membership_for_documents", None)
+        if not callable(lookup):
+            return {"ok": False, "reason": "repair_dataset_membership_unavailable"}
+        try:
+            current = await lookup(document_ids)
+        except Exception as exc:  # noqa: BLE001 - fail closed before cognify
+            return {
+                "ok": False,
+                "reason": "repair_dataset_membership_unavailable",
+                "error_type": exc.__class__.__name__,
+            }
+        if not isinstance(current, Mapping):
+            return {"ok": False, "reason": "repair_dataset_membership_unavailable"}
+
+        def normalize(mapping: Mapping[str, Any]) -> dict[str, list[str]] | None:
+            if set(mapping) != set(document_ids):
+                return None
+            normalized: dict[str, list[str]] = {}
+            for document_id in document_ids:
+                values = mapping.get(document_id)
+                if not isinstance(values, (list, tuple, set)):
+                    return None
+                if any(not isinstance(value, str) or not value for value in values):
+                    return None
+                normalized[document_id] = sorted(set(values))
+            return normalized
+
+        expected_normalized = normalize(expected)
+        current_normalized = normalize(current)
+        if expected_normalized is None or current_normalized is None:
+            return {"ok": False, "reason": "repair_dataset_membership_unavailable"}
+        for document_id in document_ids:
+            expected_datasets = set(expected_normalized[document_id])
+            current_datasets = set(current_normalized[document_id])
+            # A scoped repair journals only its target datasets. Other live
+            # memberships must not turn an unchanged target into a false drift.
+            if not expected_datasets.issubset(current_datasets):
+                return {
+                    "ok": False,
+                    "reason": "repair_dataset_membership_changed",
+                    "document_id": document_id,
+                }
+        return {"ok": True}
+
     async def _recover_interrupted_repairs(
         self,
         *,
@@ -652,6 +702,44 @@ class Citadel:
                     "apply": True,
                     "force": force,
                     "reason": reason,
+                    "repair_required": True,
+                    "pending_operations": self.repair_journal.pending_operations(),
+                    "before": None,
+                    "after": None,
+                }
+
+            membership_verification = await self._verify_repair_dataset_membership(
+                repair_ids, repair_mapping
+            )
+            if membership_verification.get("ok") is not True:
+                reason = str(
+                    membership_verification.get("reason")
+                    or "repair_dataset_membership_unavailable"
+                )
+                try:
+                    self.repair_journal.append(
+                        operation_id=operation_id,
+                        dataset=record.get("dataset"),
+                        phase="recovery",
+                        status="failed",
+                        repair_document_ids=repair_ids,
+                        repair_datasets=repair_datasets,
+                        repair_document_datasets=repair_mapping,
+                        reason=reason,
+                        error_type=membership_verification.get("error_type"),
+                        source_manifest=source_manifest,
+                        projections_preserved=False,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the recovery refusal
+                    logger.exception("repair journal failed during membership refusal")
+                return {
+                    "ok": False,
+                    "dataset": dataset,
+                    "apply": True,
+                    "force": force,
+                    "reason": reason,
+                    "error_type": membership_verification.get("error_type"),
+                    "document_id": membership_verification.get("document_id"),
                     "repair_required": True,
                     "pending_operations": self.repair_journal.pending_operations(),
                     "before": None,

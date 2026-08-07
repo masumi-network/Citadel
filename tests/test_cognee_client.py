@@ -534,11 +534,19 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     monkeypatch.setattr(client, "_ensure_cognee_ready", _ready)
 
     mapping = await client._read_node_dataset_map()
+    membership = await client.dataset_membership_for_documents(
+        [str(mirrored_id), str(doc_id), str(foreign_id)]
+    )
     await engine.dispose()
 
     assert mapping == {
         str(doc_id): ["seat:alice"],
         str(mirrored_id): ["seat:alice", "seat:bob"],
+    }
+    assert membership == {
+        str(doc_id): ["seat:alice"],
+        str(mirrored_id): ["seat:alice", "seat:bob"],
+        str(foreign_id): ["seat:carol"],
     }
 
 
