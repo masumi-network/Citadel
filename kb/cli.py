@@ -2081,8 +2081,13 @@ async def _doctor(args: argparse.Namespace) -> int:
     # unresolved so doctor exits nonzero.
     corpus = checks.get("corpus")
     if node and node.ok and auth and auth.ok and corpus and not corpus.ok:
-        issues.append({"problem": f"data plane broken ({corpus.detail}) — Node up but retrieval is empty",
-                       "fix": "check the evolve scheduler / cognify; run `citadel cognify --verify`"})
+        issues.append({
+            "problem": f"data plane not ready ({corpus.detail}); Node and auth are healthy",
+            "fix": (
+                "inspect the corpus probe in `citadel status --json`; "
+                "check the evolve scheduler / cognify; run `citadel cognify --verify`"
+            ),
+        })
 
     mcp_node = _mcp_node_url(repo / ".mcp.json")
     if mcp_node and cap_node and mcp_node.rstrip("/") != cap_node.rstrip("/"):

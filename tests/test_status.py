@@ -359,6 +359,52 @@ def test_check_corpus_ok_when_readyz_healthy(monkeypatch) -> None:
     assert "280 indexed / 200 tracked" in check.detail
 
 
+def test_check_corpus_reports_bounded_probe_and_preserves_payload(monkeypatch) -> None:
+    body = {
+        "ok": False,
+        "corpus": {
+            "ok": False,
+            "tracked_sources": 330,
+            "indexed_docs": 33788,
+            "relational_documents": 2867,
+            "probe_documents": 64,
+            "probe_complete": False,
+            "probe_ok": False,
+            "probe_fully_indexed_documents": 0,
+        },
+        "canary": None,
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+
+    assert check is not None and check.ok is False
+    assert check.detail == (
+        "corpus probe incomplete: 0/64 sampled documents fully indexed (64/2867 sampled)"
+    )
+    assert check.data["corpus"]["relational_documents"] == 2867
+
+
+def test_render_verdict_does_not_infer_empty_search_from_corpus_failure() -> None:
+    report = StatusReport(
+        node_url="https://node.example",
+        healthy=False,
+        identity={},
+        checks=[
+            Check("node", ok=True, detail="healthy"),
+            Check("auth", ok=True, detail="valid"),
+            Check("corpus", ok=False, detail="corpus probe incomplete: 0/64 sampled"),
+        ],
+        recent=[],
+    )
+
+    out = status_mod.render_verdict(report)
+
+    assert "Data plane not ready" in out
+    assert "search availability is reported separately" in out
+    assert "search returns nothing" not in out
+
+
 def test_gather_status_node_down(tmp_path: Path) -> None:
     import kb.status as s
 
