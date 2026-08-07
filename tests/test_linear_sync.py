@@ -263,6 +263,8 @@ async def test_linear_sync_auto_maps_assignee_by_member_email(
     result = await syncer.run(force=True)
     assert result["ok"] is True
     assert result["auto_mapped_assignees"] == 1
+    assert result["auto_map_members_fetched"] == 1
+    assert result["unresolved_assignee_count"] == 0
     assert result["mirrored_count"] == 1
     assert seat_dataset("john") in result["mirrors"]
 
@@ -533,6 +535,58 @@ async def test_member_fetch_failure_is_carried_not_a_neutral_zero(
 
     state = _json.loads(Path(config.linear_sync_state_path).read_text(encoding="utf-8"))
     assert "403" in state["auto_map_error"]
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_counts_unresolved_assignee_without_name_guessing(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "s.json"),
+        access_store_path=str(tmp_path / "a.json"),
+    )
+    citadel = Citadel(config)
+    store = AccessStore(config.access_store_path)
+    store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
+    issues = [
+        {
+            "id": "issue-unmatched",
+            "identifier": "ENG-99",
+            "title": "Unmatched assignee",
+            "description": "d",
+            "url": "u",
+            "priority": 1,
+            "updatedAt": "2026-06-25T10:00:00Z",
+            "state": {"name": "Todo", "type": "backlog"},
+            "team": {"key": "ENG", "name": "Eng"},
+            "assignee": {"id": "linear-user-unknown", "name": "Unknown", "email": None},
+        }
+    ]
+
+    async def fake_learn(self: Any, data: str, **_: Any) -> Any:
+        class Outcome:
+            class ingest:
+                accepted = True
+
+        return Outcome()
+
+    monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: None)
+    syncer = LinearSyncer(
+        citadel,
+        client=FakeLinearClient(issues, users=[]),
+        access_store=store,
+    )
+
+    result = await syncer.run(force=True)
+
+    assert result["mirrored_count"] == 0
+    assert result["auto_map_members_fetched"] == 0
+    assert result["auto_mapped_assignees"] == 0
+    assert result["unresolved_assignee_count"] == 1
+    status = await syncer.status()
+    assert status["unresolved_assignee_count"] == 1
 
 
 # --- #90: force must observably differ from an unforced (incremental) run ----

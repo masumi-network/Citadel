@@ -542,11 +542,14 @@ def apply_query_ranking(
     *,
     mode: str | None = None,
 ) -> list[Any]:
-    """Re-order hits for spec, docs/token, and/or hex asset-ID queries."""
+    """Re-order hits for docs/spec queries and single-token literal searches."""
+    terms = query_terms(query)
+    literal_query = len(terms) == 1
     if not (
         extract_hex_needles(query)
         or is_docs_mode_query(query, mode=mode)
         or is_spec_mode_query(query)
+        or literal_query
     ):
         return list(results)
     dict_hits = [item for item in results if isinstance(item, dict)]
@@ -556,8 +559,6 @@ def apply_query_ranking(
     # `canonical-docs`) sorted into exactly its input order and mode=docs was
     # indistinguishable from not passing it. Coverage can only reorder WITHIN a
     # class — it never lifts an issue above documentation.
-    terms = query_terms(query)
-
     def rank_key(item: dict[str, Any]) -> tuple[float, float]:
         coverage, _matched = hit_term_coverage(item, terms)
         return query_rank_score(item, query, mode=mode), coverage
@@ -969,7 +970,7 @@ def shape_search_payload(
         exclude_ambient = True
     if apply_spec_ranking is None:
         apply_spec_ranking = is_spec_mode_query(query) and not docs_mode
-    if docs_mode or extract_hex_needles(query) or apply_spec_ranking:
+    if docs_mode or extract_hex_needles(query) or apply_spec_ranking or len(query_terms(query)) == 1:
         ordered = apply_query_ranking(raw_results, query, mode=mode)
     else:
         ordered = list(raw_results)

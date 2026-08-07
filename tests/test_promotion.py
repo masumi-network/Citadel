@@ -55,7 +55,15 @@ class FakeLearning:
     async def learn(self, data: str, **kwargs: Any) -> LearningOutcome:
         dataset = kwargs.get("dataset") or CENTRAL
         tags = tuple(kwargs.get("tags") or ())
-        self.calls.append({"data": data, "dataset": kwargs.get("dataset"), "tier": kwargs.get("tier"), "tags": kwargs.get("tags")})
+        self.calls.append(
+            {
+                "data": data,
+                "dataset": kwargs.get("dataset"),
+                "tier": kwargs.get("tier"),
+                "tags": kwargs.get("tags"),
+                "attestation": kwargs.get("attestation"),
+            }
+        )
         if self.central_reject_reason and dataset == CENTRAL:
             result = IngestResult(False, self.central_reject_reason, dataset, tags)
         else:
@@ -165,6 +173,32 @@ async def test_relevant_clean_item_is_promoted_to_central_with_audit(tmp_path: P
     assert promote_events[0]["success"] is True
     assert promote_events[0]["dataset"] == CENTRAL
     assert promote_events[0]["detail"]["seat"] == SEAT
+
+
+async def test_auto_promotion_attests_the_request_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, learning, _store = _engine(
+        tmp_path,
+        [_org_note()],
+        _github_state(tmp_path),
+    )
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+    actor = AccessIdentity(
+        role="admin",
+        actor_id="admin-7",
+        actor_kind="user",
+        actor_name="Release Admin",
+        source="token",
+        default_dataset=CENTRAL,
+    )
+
+    result = await engine.run(SEAT, dry_run=False, actor=actor)
+
+    assert result["promoted"] == 1
+    attestation = learning.central_writes[0]["attestation"]
+    assert attestation["promoted_by"] == "admin-7"
+    assert attestation["promoted_at"].endswith("+00:00")
 
 
 async def test_sensitive_item_is_not_promoted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -732,3 +766,39 @@ async def test_approve_pending_surfaces_the_write_reason(
     assert result["write_reason"] == "duplicate_in_process"
     # The item is consumed regardless, matching the contract on main.
     assert store.get_promotion_pending(item.id).status != "pending"
+
+
+async def test_approved_promotion_attests_the_approver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = (
+        "# Capture summary: side project\n"
+        "- Remote: `https://github.com/other-org/new-app.git`\n"
+        "- Capture Root Tags: org-work\n"
+    )
+    state_path = tmp_path / "github-state.json"
+    state_path.write_text(
+        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
+    )
+    config = _config(github_sync_state_path=str(state_path))
+    engine, learning, store = _engine(tmp_path, [summary], config)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.95)
+
+    queued = await engine.run(SEAT, dry_run=False)
+    assert queued["queued"] == 1
+    item = store.list_promotion_pending(seat_slug="alice")[0]
+    actor = AccessIdentity(
+        role="admin",
+        actor_id="admin-9",
+        actor_kind="user",
+        actor_name="Approver",
+        source="token",
+        default_dataset=CENTRAL,
+    )
+
+    result = await engine.approve_pending(item.id, actor)
+
+    assert result["promoted"] is True
+    attestation = learning.central_writes[0]["attestation"]
+    assert attestation["promoted_by"] == "admin-9"
+    assert attestation["promoted_at"].endswith("+00:00")

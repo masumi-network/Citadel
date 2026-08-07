@@ -1,4 +1,4 @@
-"""Tests for the retrieval benchmark harness (scripts/bench/search_bench.py).
+"""Tests for the packaged retrieval benchmark harness.
 
 Fixtures mirror the REAL /search hit shape: repo-content hits carry a
 ``# org/repo/path`` first line plus a Repository/Source/Commit/Blob header
@@ -185,12 +185,14 @@ class TestDuplicationMetrics:
         assert row["duplicate_blob_rate_at_10"] == pytest.approx(0.8)
         assert row["distinct_files_at_10"] == 1
         assert row["answer_rank"] == 1
+        assert row["answer_pass_at_1"] is True
         assert row["answer_pass_at_5"] is True
         # One question, one pass: recall over [row] + probe must be 1.0, not
         # inflated by the 10 duplicate slots.
         probe = sb.score_question(question("p01", expect=["masumi-network/x/gone.md"], recall=0), [], {})
         summary = sb.summarize([row, probe], [])
         assert summary["quality"]["answer_recall_at_5"] == 1.0
+        assert summary["quality"]["answer_recall_at_1"] == 1.0
 
     def test_duplication_tax_raw_page_misses_collapsed_hits(self):
         # First 5 raw slots are one non-answering file; the answer sits at slot
@@ -201,6 +203,7 @@ class TestDuplicationMetrics:
         row = sb.score_question(question(spans=[span]), hits, {})
         assert row["raw_page_pass_at_5"] is False
         assert row["answer_rank"] == 2
+        assert row["answer_pass_at_1"] is False
         assert row["answer_pass_at_5"] is True
 
 
@@ -575,6 +578,29 @@ class TestLint:
         problems, _ = sb.lint_questions(path, gt)
         assert problems == []
 
+    def test_cmd_lint_accepts_explicit_ground_truth_path(self, tmp_path, capsys):
+        path, gt = self._write_golden(tmp_path, [self._q()])
+        assert sb.main(
+            ["lint", "--questions", str(path), "--ground-truth", str(gt)]
+        ) == 0
+        assert "lint OK: 1 question(s)" in capsys.readouterr().out
+
+    def test_cmd_ci_accepts_the_shipped_fixture(self, capsys):
+        assert sb.main(["ci"]) == 0
+        assert "ci benchmark OK:" in capsys.readouterr().out
+
+    def test_cmd_ci_rejects_failed_metrics(self, monkeypatch, capsys):
+        def empty_searcher(*_args, **_kwargs):
+            def searcher(*_search_args, **_search_kwargs):
+                return {"results": []}, 0.0, None
+
+            return searcher
+
+        monkeypatch.setattr(sb, "make_ci_searcher", empty_searcher)
+
+        assert sb.main(["ci"]) == 1
+        assert "CI BENCH FAILED:" in capsys.readouterr().err
+
     def test_span_absent_from_body_fails(self, tmp_path):
         path, gt = self._write_golden(
             tmp_path, [self._q(answer_spans=["this sentence exists nowhere at all"])]
@@ -796,6 +822,91 @@ class TestRunTimestamp:
         assert stamped.tzinfo is not None
 
 
+class TestRunExitStatus:
+    def test_cmd_run_fails_when_every_search_attempt_errors(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps(
+                {"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.setattr(
+            sb,
+            "make_http_searcher",
+            lambda *args: lambda _query, _top_k: (None, 2.0, "connection refused"),
+        )
+        monkeypatch.setattr(
+            sb,
+            "build_fingerprint",
+            lambda *args: {
+                "content": {"sha256": "a" * 64, "files": 1},
+                "api": {"documents_tracked": 1, "node_version": "test"},
+                "harness_git_sha": "test",
+                "questions_sha256": "q" * 64,
+            },
+        )
+
+        exit_code = sb.main(
+            ["run", "--questions", str(questions_path), "--node-url", "https://node.example"]
+        )
+
+        assert exit_code == 1
+        assert "all 2 benchmark search attempts failed" in capsys.readouterr().err
+
+    def test_cmd_run_fails_when_trust_tier_is_unstable(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps({"questions": [question(spans=["answer"]), question("p01", recall=0)]}),
+            encoding="utf-8",
+        )
+        span = "the subsystem persists attempted charges with a null transaction id"
+        rows = [
+            sb.score_question(
+                question("q1", spans=[span]),
+                [scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="reference-only", sha="deadbeef")],
+                {},
+            ),
+            sb.score_question(
+                question("q2", spans=[span]),
+                [scored_hit(PATH_DOC, BLOB_A, span, 1.0, tier="unattested", sha="deadbeef")],
+                {},
+            ),
+            sb.score_question(
+                {"id": "p01", "question": "probe", "expect_any": [], "expected_recall": 0},
+                [],
+                {},
+            ),
+        ]
+        summary = sb.summarize(rows, [])
+        summary["latency"] = {"errors": 0, "p50_ms": 1.0, "p95_ms": 1.0, "mean_ms": 1.0, "samples": 3}
+        summary["repeats"] = 1
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.setattr(
+            sb,
+            "execute_benchmark",
+            lambda *args, **kwargs: {"run_at": "2026-08-06T00:00:00+00:00", "summary": summary, "rows": rows},
+        )
+        monkeypatch.setattr(
+            sb,
+            "build_fingerprint",
+            lambda *args: {
+                "content": {"sha256": "a" * 64, "files": 1},
+                "api": {"documents_tracked": 1, "node_version": "test"},
+                "harness_git_sha": "test",
+                "questions_sha256": "q" * 64,
+            },
+        )
+
+        exit_code = sb.main(
+            ["run", "--questions", str(questions_path), "--node-url", "https://node.example"]
+        )
+
+        assert exit_code == 1
+        assert "unstable trust_tier" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------
 # Empty file map must not fingerprint as a real corpus
 # --------------------------------------------------------------------------
@@ -903,8 +1014,10 @@ def make_run(
         "run_at": run_at,
         "summary": {
             "quality": {
+                "answer_recall_at_1": 0.6410,
                 "answer_recall_at_5": 0.8974,
                 "raw_page_recall_at_5": 0.7692,
+                "doc_recall_at_1": 0.7213,
                 "doc_recall_at_5": 0.9508,
                 "mrr_body": 0.7521,
                 "header_credit_rate": 0.0256,
@@ -951,6 +1064,143 @@ def make_run(
     if census is not None:
         run["fingerprint"]["census"] = census
     return run
+
+
+def make_enforce_run():
+    run = make_run()
+    run["fingerprint"]["census"]["chunk_count_zero"] = 0
+    run["fingerprint"]["ground_truth"] = {"sha256": "g" * 64}
+    run["summary"]["window"] = {
+        "tail_recall_given_head_at_5": 1.0,
+    }
+    run["summary"]["metadata_stability"] = {
+        "chunks_observed": 10,
+        "chunks_with_unstable_trust_tier": 0,
+        "unstable_examples": [],
+    }
+    return run
+
+
+class TestEnforce:
+    def test_enforce_accepts_compatible_healthy_runs(self, tmp_path, capsys):
+        baseline_path = tmp_path / "baseline.json"
+        candidate_path = tmp_path / "candidate.json"
+        baseline_path.write_text(json.dumps(make_enforce_run()), encoding="utf-8")
+        candidate_path.write_text(json.dumps(make_enforce_run()), encoding="utf-8")
+
+        assert sb.main(["enforce", str(baseline_path), str(candidate_path)]) == 0
+        output = capsys.readouterr()
+        assert "COMPARABLE" in output.out
+        assert "ENFORCE PASSED" in output.out
+        assert output.err == ""
+
+    def test_enforce_rejects_non_comparable_fingerprints(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["content"]["sha256"] = "0" * 64
+
+        comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert comparable is False
+        assert "fingerprints are not comparable" in failures
+
+    @pytest.mark.parametrize(
+        ("field", "value", "needle"),
+        [
+            ("truncated", True, "incomplete or truncated"),
+            ("chunk_count_unmeasured", 1, "unmeasured"),
+            ("documents_walked", 2866, "incomplete"),
+            ("error", "HTTP 403", "census failed"),
+        ],
+    )
+    def test_enforce_rejects_incomplete_or_unmeasured_census(
+        self, field, value, needle
+    ):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"][field] = value
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any(needle in failure for failure in failures), failures
+
+    def test_enforce_rejects_search_errors(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["latency"]["errors"] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("search error" in failure for failure in failures), failures
+
+    def test_enforce_rejects_negative_hits(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["quality"]["negative_hit_rate"] = 0.01
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("negative hits" in failure for failure in failures), failures
+
+    def test_enforce_rejects_unstable_trust(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"]["metadata_stability"][
+            "chunks_with_unstable_trust_tier"
+        ] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("unstable trust" in failure for failure in failures), failures
+
+    @pytest.mark.parametrize(
+        ("section", "metric"),
+        [
+            ("quality", "answer_recall_at_5"),
+            ("quality", "doc_recall_at_5"),
+            ("quality", "mrr_body"),
+            ("window", "tail_recall_given_head_at_5"),
+        ],
+    )
+    def test_enforce_rejects_retrieval_regression(self, section, metric):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["summary"][section][metric] = (
+            baseline["summary"][section][metric] - 0.01
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any(metric in failure and "regressed" in failure for failure in failures)
+
+    def test_enforce_rejects_chunk_count_zero_regression(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"]["chunk_count_zero"] += 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("chunk_count_zero regressed" in failure for failure in failures)
+
+    def test_enforce_requires_clean_candidate_indexing_window(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"]["chunk_count_zero"] = 1
+        candidate["summary"]["window"]["tail_recall_given_head_at_5"] = 0.99
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("must be 0" in failure for failure in failures)
+        assert any("must be 1.0" in failure for failure in failures)
+
+    def test_enforce_requires_matching_ground_truth_cache(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["ground_truth"]["sha256"] = "h" * 64
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("ground-truth fingerprints differ" in failure for failure in failures)
 
 
 class TestReportNamesItsFrozenSet:

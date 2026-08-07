@@ -30,6 +30,11 @@ const nextConfig: NextConfig = {
   // next/image's default loader wants a server to resize on. There is none.
   images: { unoptimized: true },
 
+  // The export is committed into the Python package. Next otherwise generates
+  // a new build ID for every run, which changes the tracked asset path even
+  // when the source and lockfile are unchanged.
+  generateBuildId: async () => "citadel-static",
+
   reactStrictMode: true,
 
   // One URL per page, no trailing slash, matching every existing route.

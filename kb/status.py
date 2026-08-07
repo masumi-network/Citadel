@@ -66,6 +66,7 @@ MCP_AGENT_FALLBACK = (
 # Structured codes for agent readiness / error payloads (CLI JSON + check data).
 CODE_AUTH_REQUIRED = "AUTH_REQUIRED"
 CODE_SEARCH_UNAVAILABLE = "SEARCH_UNAVAILABLE"
+CODE_SEARCH_NO_LEXICAL_MATCH = "SEARCH_NO_LEXICAL_MATCH"
 CODE_TIMEOUT = "TIMEOUT"
 
 
@@ -283,10 +284,48 @@ def check_search(
     search_data: dict[str, Any] = {"count": count}
     if count <= 0:
         search_data["code"] = CODE_SEARCH_UNAVAILABLE
+    else:
+        # A non-empty nearest-neighbour page can still contain zero relevant
+        # hits.  The search endpoint already reports lexical overlap at the
+        # response and hit levels; use it when present so status cannot call an
+        # unrelated page healthy (#release-search-proof).
+        relevance = data.get("relevance")
+        max_coverage: float | None = None
+        if isinstance(relevance, dict):
+            candidate = relevance.get("max_term_coverage")
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                max_coverage = float(candidate)
+            elif relevance.get("no_lexical_match") is True:
+                max_coverage = 0.0
+        if max_coverage is None:
+            coverages = []
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                envelope = result.get("_citadel")
+                hit_relevance = envelope.get("relevance") if isinstance(envelope, dict) else None
+                if not isinstance(hit_relevance, dict):
+                    hit_relevance = result.get("relevance")
+                if not isinstance(hit_relevance, dict):
+                    continue
+                candidate = hit_relevance.get("term_coverage")
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                    coverages.append(float(candidate))
+            if coverages:
+                max_coverage = max(coverages)
+        if max_coverage is not None:
+            search_data["max_term_coverage"] = max_coverage
+            search_data["lexical_match"] = max_coverage > 0
+            if max_coverage <= 0:
+                search_data["code"] = CODE_SEARCH_NO_LEXICAL_MATCH
     return Check(
         "search",
-        ok=count > 0,
-        detail=f"{count} result(s)",
+        ok=count > 0 and search_data.get("lexical_match", True),
+        detail=(
+            f"{count} result(s); no lexical match"
+            if search_data.get("lexical_match") is False
+            else f"{count} result(s)"
+        ),
         latency_ms=latency,
         data=search_data,
     )

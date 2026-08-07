@@ -325,6 +325,10 @@ class LinearSyncer:
             "last_attempt_at": state.get("last_attempt_at"),
             "issue_count": len(issues),
             "mirror_count": mirror_count,
+            "auto_map_members_fetched": state.get("auto_map_members_fetched", 0),
+            "auto_mapped_assignees": state.get("auto_mapped_assignees", 0),
+            "unresolved_assignee_count": state.get("unresolved_assignee_count", 0),
+            "auto_map_error": state.get("auto_map_error"),
             "state_path": str(self.state_path),
         }
 
@@ -391,7 +395,9 @@ class LinearSyncer:
         # the id is matched instead. Explicit config map entries always win.
         user_map = dict(self.config.linear_user_map)
         auto_mapped = 0
+        auto_map_members_fetched = 0
         auto_map_error: str | None = None
+        members: list[dict[str, Any]] = []
         if self.access_store:
             email_to_slug = {
                 email: dataset.removeprefix(SEAT_DATASET_PREFIX)
@@ -400,7 +406,6 @@ class LinearSyncer:
             try:
                 members = await asyncio.to_thread(self._client().fetch_users)
             except LinearAPIError as exc:
-                members = []
                 # Carry the failure into the payload and persisted state so a
                 # 0 auto-map count is not misread as "the key cannot read
                 # member emails" when the fetch itself failed (#148).
@@ -409,6 +414,7 @@ class LinearSyncer:
                     "Linear member fetch failed; mirrors fall back to assignee email/config map: %s",
                     exc,
                 )
+            auto_map_members_fetched = len(members)
             for member in members:
                 member_id = member.get("id")
                 member_email = (member.get("email") or "").strip().lower()
@@ -508,6 +514,7 @@ class LinearSyncer:
         skipped_unchanged = 0
         mirrors: dict[str, list[str]] = {}
         written_mirror_datasets: list[str] = []
+        unresolved_assignee_count = 0
         # Tracked independently of central_outcome (the workspace digest's own
         # result): the digest and each issue's Central note are separate
         # learning.learn() calls, so the digest can be blocked while an
@@ -567,6 +574,8 @@ class LinearSyncer:
                 skipped_unchanged += 1
 
             if not mirror_dataset:
+                if issue.assignee_id:
+                    unresolved_assignee_count += 1
                 continue
 
             if central_blocked:
@@ -721,6 +730,9 @@ class LinearSyncer:
             "last_error": None,  # clear any prior failure on a successful sync
             "last_attempt_at": utc_now(),
             "auto_map_error": auto_map_error,
+            "auto_map_members_fetched": auto_map_members_fetched,
+            "auto_mapped_assignees": auto_mapped,
+            "unresolved_assignee_count": unresolved_assignee_count,
             # Scanner-blocked issues are excluded here, not just from Central/
             # mirror writes: issues_for_scope() reads this list directly, so a
             # blocked issue's title/description landing here would re-serve
@@ -745,7 +757,9 @@ class LinearSyncer:
             # set CITADEL_LINEAR_USER_MAP" when auto_map_error is None; a failed
             # member fetch also leaves this at 0 (#148).
             "auto_mapped_assignees": auto_mapped,
+            "auto_map_members_fetched": auto_map_members_fetched,
             "auto_map_error": auto_map_error,
+            "unresolved_assignee_count": unresolved_assignee_count,
             # Fate of this pass's Central writes as OBSERVED, never assumed.
             # This used to report cognee.add() acceptance as True, but add()
             # only QUEUES the graph write (cognify never runs synchronously),

@@ -57,6 +57,13 @@ TERMINAL_INGEST_REJECTIONS = frozenset(
     {"empty", "excluded_path", "too_short", "unchunkable_content"}
 )
 
+# ``accepted=True`` confirms source storage, not necessarily the projection.
+# These reasons mean the caller only requested cognification, so the state
+# entry must remain retryable until a later pass observes completion.
+PROJECTION_PENDING_INGEST_REASONS = frozenset(
+    {"queued_not_confirmed", "not_scheduled"}
+)
+
 # One lock per state file, NOT per syncer instance. ``get_repo_content_syncer``
 # in kb.server builds a fresh ``RepoContentSyncer`` on every call (app.state
 # .repo_content_syncer is never assigned anywhere), and ``LearningAgent``
@@ -963,19 +970,40 @@ class RepoContentSyncer:
                         run_improve=False,
                         detect_conflicts=False,
                     )
-                    if any(result.accepted for result in outcome.all_ingests):
+                    ingest_results = tuple(outcome.all_ingests)
+                    accepted_results = tuple(
+                        result for result in ingest_results if result.accepted
+                    )
+                    pending_reasons = sorted(
+                        {
+                            result.reason
+                            for result in ingest_results
+                            if result.reason in PROJECTION_PENDING_INGEST_REASONS
+                        }
+                    )
+                    if accepted_results:
                         ingested_files += 1
                         repo_result["ingested"] += 1
-                        tracked[key] = {
+                        tracked_entry: dict[str, Any] = {
                             "sha": file.sha,
                             "content_hash": file.content_hash,
                             "last_ingested_at": checked_at,
+                        }
+                        if pending_reasons:
+                            # ``accepted`` is a durable source receipt, while
+                            # these reasons only confirm that projection was
+                            # requested. Keep the source checkpoint, but omit
+                            # cognee ids so the next pass cannot call it
+                            # unchanged before indexing is confirmed.
+                            tracked_entry["projection_status"] = "pending"
+                            tracked_entry["projection_reason"] = "+".join(pending_reasons)
+                        else:
                             # What cognee actually assigned. Stored so a later
                             # run can check its own claim against the index; a
                             # state file holding only sha and content_hash can
                             # never verify what it asserted.
-                            "cognee_data_ids": _cognee_data_ids(outcome),
-                        }
+                            tracked_entry["cognee_data_ids"] = _cognee_data_ids(outcome)
+                        tracked[key] = tracked_entry
                         # Checkpoint immediately. State used to be written only
                         # after every repo finished, so a run killed part-way
                         # ingested files into cognee and recorded none of them,

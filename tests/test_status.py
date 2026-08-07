@@ -303,6 +303,31 @@ def test_check_search_empty_list_is_zero(monkeypatch) -> None:
     assert "0 result(s)" in check.detail
 
 
+def test_check_search_rejects_non_lexical_page(monkeypatch) -> None:
+    payload = {
+        "results": [{"id": "nearest", "_citadel": {"relevance": {"term_coverage": 0.0}}}],
+        "relevance": {"max_term_coverage": 0.0, "no_lexical_match": True},
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/search": payload}))
+    check = status_mod.check_search("https://node.example", "ctdl_tok")
+    assert check.ok is False
+    assert check.data["lexical_match"] is False
+    assert check.data["code"] == status_mod.CODE_SEARCH_NO_LEXICAL_MATCH
+    assert "no lexical match" in check.detail
+
+
+def test_check_search_accepts_lexical_page(monkeypatch) -> None:
+    payload = {
+        "results": [{"id": "match", "_citadel": {"relevance": {"term_coverage": 1.0}}}],
+        "relevance": {"max_term_coverage": 1.0, "no_lexical_match": False},
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/search": payload}))
+    check = status_mod.check_search("https://node.example", "ctdl_tok")
+    assert check.ok is True
+    assert check.data["lexical_match"] is True
+    assert check.data["max_term_coverage"] == 1.0
+
+
 def test_check_corpus_red_when_readyz_503(monkeypatch) -> None:
     # #27: /readyz answers 503 + body when the corpus gate trips; check_corpus
     # parses the body and reports RED.

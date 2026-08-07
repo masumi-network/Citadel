@@ -1,11 +1,9 @@
-"""The Next.js preview at /next, and the promise that it changed nothing else.
+"""The Next.js export, its canonical public routes, and the safe fallback.
 
-The rebuilt frontend ships beside the hand-written site rather than instead of
-it, on a route of its own, so that the migration can be looked at in a browser
-before anything switches over. Two things have to hold while that is true: the
-preview is subject to the same strict Content-Security-Policy as everything
-else, and every page that was already live still serves exactly what it served
-before.
+The rebuilt frontend is checked in for self-hosted installs. The public routes
+serve it when present, while an unbuilt source checkout keeps the hand-written
+pages usable. The authenticated dashboard stays on its established route until
+its graph and admin flows have parity.
 """
 
 from __future__ import annotations
@@ -155,7 +153,14 @@ def test_the_export_carries_no_inline_script_and_no_inline_style() -> None:
         assert not re.search(r'\sstyle="', html), f"{page.name} carries a style attribute"
 
 
-APP_VIEWS = ("/next/app", "/next/app/search", "/next/app/review", "/next/app/admin")
+APP_VIEWS = (
+    "/next/app",
+    "/next/app/search",
+    "/next/app/sources",
+    "/next/app/graph",
+    "/next/app/review",
+    "/next/app/admin",
+)
 
 
 def _seated_client(access_key: str) -> TestClient:
@@ -196,11 +201,11 @@ def test_dashboard_views_are_role_gated_at_the_route() -> None:
     the server.
     """
     expected = {
-        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 403,
+        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 403,
                         "/next/app/admin": 403},
-        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 200,
+        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
                         "/next/app/admin": 403},
-        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/review": 200,
+        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
                        "/next/app/admin": 200},
     }
 
@@ -234,6 +239,52 @@ def test_the_dashboard_view_set_is_closed() -> None:
 
     for path in ("/next/app/nope", "/next/app/locked", "/next/app/overview"):
         assert client.get(path, follow_redirects=False).status_code == 404, path
+
+
+def test_graph_view_is_a_real_next_dashboard_route() -> None:
+    body = (server_module.WEBUI_DIR / "app" / "graph.html").read_text(encoding="utf-8")
+    source = (
+        Path(server_module.__file__).resolve().parent.parent
+        / "web"
+        / "src"
+        / "pages"
+        / "app"
+        / "graph.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "Knowledge graph" in body
+    assert "/api/mesh/graph?limit=200" in source
+    assert "Caller-scoped graph projection" in body
+    assert "visible_nodes" in source
+    assert "Presence-only view. No content nodes are visible for this scope." in source
+    assert "No content nodes are visible for this scope." in source
+
+    compiled = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob(
+            "graph-*.js"
+        )
+    )
+    assert "visible_nodes" in compiled
+    assert "Presence-only view. No content nodes are visible for this scope." in compiled
+
+
+def test_sources_view_is_read_only_and_uses_separate_health_endpoints() -> None:
+    body = (server_module.WEBUI_DIR / "app" / "sources.html").read_text(encoding="utf-8")
+    source = (
+        Path(server_module.__file__).resolve().parent.parent
+        / "web"
+        / "src"
+        / "pages"
+        / "app"
+        / "sources.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "Sources and index health" in body
+    assert 'useEndpoint<SourcesResponse>("/api/sources")' in source
+    assert 'useEndpoint<IndexesResponse>("/api/indexes")' in source
+    for mutation in ("/run", "/ingest", "/promote", "/sync/push", 'method: "POST"'):
+        assert mutation not in source, f"Sources view contains a mutation endpoint: {mutation!r}"
 
 
 def test_review_makes_no_claim_the_api_cannot_support() -> None:
@@ -311,7 +362,7 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     """
     body = _client().get("/next/info").text
 
-    assert "v0.4.0" in body
+    assert "v0.4.1" in body
     assert "~$55/mo" in body
     assert "269 ms" in body
     assert "commits on main" not in body
@@ -349,13 +400,28 @@ def test_next_assets_are_served_and_cached_as_immutable_content() -> None:
     assert "'unsafe-inline'" not in response.headers["content-security-policy"]
 
 
-def test_every_page_that_was_live_still_serves_what_it_served() -> None:
-    """Nothing switches over in this change, and this is what says so.
+def test_canonical_public_routes_serve_the_built_export() -> None:
+    """Built public pages are served byte-for-byte from the committed export."""
+    client = _client()
 
-    Each of these is compared against its source rather than spot-checked for a
-    phrase, because the failure worth catching is not "the page broke" but "the
-    page quietly became the new one".
-    """
+    for path, source in (
+        ("/", server_module.WEBUI_DIR / "index.html"),
+        ("/info", server_module.WEBUI_DIR / "info.html"),
+        ("/use-cases", server_module.WEBUI_DIR / "use-cases.html"),
+        ("/contact", server_module.WEBUI_DIR / "contact.html"),
+        ("/login", server_module.WEBUI_DIR / "login.html"),
+    ):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.content == source.read_bytes(), path
+        assert response.headers["content-type"].startswith("text/html"), path
+
+
+def test_public_routes_fall_back_to_hand_written_pages_without_an_export(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source checkout without `build:web` keeps every public route usable."""
+    monkeypatch.setattr(server_module, "WEBUI_DIR", tmp_path)
     client = _client()
     static = server_module.STATIC_DIR
 
@@ -367,12 +433,8 @@ def test_every_page_that_was_live_still_serves_what_it_served() -> None:
     ):
         response = client.get(path)
         assert response.status_code == 200, path
-        assert response.content == source.read_bytes(), f"{path} is no longer {source.name}"
+        assert response.content == source.read_bytes(), path
 
     login = client.get("/login")
     assert login.status_code == 200
     assert login.text == server_module.LOGIN_HTML
-
-    # The hand-written landing page still loads the committed esbuild bundle,
-    # not anything the Next app produced.
-    assert "/static/landing.js" in client.get("/").text

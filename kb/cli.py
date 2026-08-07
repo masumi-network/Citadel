@@ -18,7 +18,6 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -583,7 +582,13 @@ async def _search(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("search", as_json=getattr(args, "json", False))
-    from kb.search_format import apply_query_ranking, is_docs_mode_query, is_spec_mode_query, shape_search_payload
+    from kb.search_format import (
+        apply_query_ranking,
+        is_docs_mode_query,
+        is_spec_mode_query,
+        query_terms,
+        shape_search_payload,
+    )
     from kb.status import search_node
 
     top_k = getattr(args, "top_k", None)
@@ -659,7 +664,11 @@ async def _search(args: argparse.Namespace) -> int:
     display = dict(raw)
     if filters_on:
         display = {**display, "results": shaped["results"], "sections": None}
-    elif is_docs_mode_query(args.query, mode=shape_kw.get("mode")) or is_spec_mode_query(args.query):
+    elif (
+        is_docs_mode_query(args.query, mode=shape_kw.get("mode"))
+        or is_spec_mode_query(args.query)
+        or len(query_terms(args.query)) == 1
+    ):
         ranked = apply_query_ranking(
             list(raw.get("results") or []), args.query, mode=shape_kw.get("mode")
         )
@@ -855,7 +864,43 @@ async def _cognify(args: argparse.Namespace) -> None:
     from kb.service import Citadel
 
     kb = Citadel.from_env()
-    result = await kb.cognify_dataset(dataset=args.dataset, verify=args.verify)
+    result = await kb.cognify_dataset(
+        dataset=args.dataset,
+        verify=args.verify,
+        force=args.force,
+    )
+    _print_json(result)
+    return _result_exit(result)
+
+
+@_needs_server
+async def _reindex(args: argparse.Namespace) -> int:
+    from kb.service import Citadel
+
+    if args.force and not args.apply:
+        raise ValueError("--force requires --apply")
+    if args.recover and not args.apply:
+        raise ValueError("--recover requires --apply")
+    if args.recover and not args.force:
+        raise ValueError("--recover requires --force")
+    if args.recover and args.oversized:
+        raise ValueError("--recover is supported only by combined reindex")
+    kb = Citadel.from_env()
+    if args.oversized:
+        result = await kb.reconcile_oversized_chunks(
+            dataset=args.dataset,
+            apply=args.apply,
+            force=args.force,
+        )
+    else:
+        kwargs: dict[str, Any] = {
+            "dataset": args.dataset,
+            "apply": args.apply,
+            "force": args.force,
+        }
+        if args.recover:
+            kwargs["recover"] = True
+        result = await kb.reconcile_corpus(**kwargs)
     _print_json(result)
     return _result_exit(result)
 
@@ -905,6 +950,13 @@ async def _learn(args: argparse.Namespace) -> None:
     )
     _print_json(result)
     return _result_exit(result)
+
+
+async def _bench(args: argparse.Namespace) -> int:
+    """Run the packaged retrieval benchmark without server dependencies."""
+    from kb.retrieval_eval import main as retrieval_eval_main
+
+    return retrieval_eval_main(list(getattr(args, "bench_args", None) or ["run"]))
 
 
 def _parse_root_arg(raw: str) -> tuple[str, tuple[str, ...]]:
@@ -2484,12 +2536,12 @@ async def _onboard(args: argparse.Namespace) -> int:
 
 
 def _cli_version() -> str:
-    try:
-        return _pkg_version("citadel-archive")
-    except PackageNotFoundError:
-        from kb import __version__
+    # Source is authoritative. Editable environments can retain stale
+    # distribution metadata after a version bump, while the CLI is running
+    # directly from this source tree.
+    from kb import __version__
 
-        return __version__
+    return __version__
 
 
 def _install_channel() -> tuple[str, str]:
@@ -3177,7 +3229,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ingest a unique marker, cognify, and confirm it lands in the graph",
     )
+    cognify.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess the whole dataset when Cognee reports it already processed",
+    )
     cognify.set_defaults(handler=_cognify)
+
+    reindex = subcommands.add_parser(
+        "reindex",
+        help="Audit and optionally repair accepted documents with missing or oversized chunks",
+    )
+    reindex.add_argument("--dataset")
+    reindex.add_argument(
+        "--oversized",
+        action="store_true",
+        help="Compatibility mode: audit and repair only over-budget chunks",
+    )
+    reindex.add_argument(
+        "--apply",
+        action="store_true",
+        help="Run the repair after the census (default is read-only)",
+    )
+    reindex.add_argument(
+        "--force",
+        action="store_true",
+        help="Force dataset reprocessing; requires --apply",
+    )
+    reindex.add_argument(
+        "--recover",
+        action="store_true",
+        help="Recover an interrupted repair from unchanged source rows; requires --apply --force",
+    )
+    reindex.set_defaults(handler=_reindex)
 
     sync_github = subcommands.add_parser(
         "sync-github",
@@ -3214,6 +3298,18 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("--hide-digest-preview", action="store_true")
     learn.set_defaults(handler=_learn)
 
+    bench = subcommands.add_parser(
+        "bench",
+        add_help=False,
+        help="Run the frozen retrieval benchmark (run, lint, compare, or report)",
+    )
+    bench.add_argument(
+        "bench_args",
+        nargs=argparse.REMAINDER,
+        help="Benchmark arguments; defaults to `run`",
+    )
+    bench.set_defaults(handler=_bench)
+
     return parser
 
 
@@ -3222,7 +3318,11 @@ def main() -> None:
 
     configure_logging()
     parser = build_parser()
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if getattr(args, "command", None) == "bench":
+        args.bench_args.extend(unknown)
+    elif unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     # One Ctrl-C guard around every dispatch path (first-run onboarding + handlers)
     # so quitting a prompt exits cleanly (130) instead of dumping a traceback.
     # SystemExit (carrying handler return codes) is a different type and propagates.

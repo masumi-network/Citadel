@@ -46,6 +46,9 @@ class FakeCitadel:
 
     documents: dict[str, dict[str, Any]] = {}
 
+    async def _graph_counts(self) -> dict[str, int]:
+        return {"nodes": 5, "edges": 7}
+
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         return self.documents.get(document_id)
 
@@ -78,6 +81,75 @@ class FakeCitadel:
             ),
         }
 
+    async def reconcile_zero_chunk_documents(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_zero_chunk_documents",
+            "before": {
+                "ok": True,
+                "zero_chunk_count": 0,
+                "unassigned_zero_chunk_count": 0,
+                "repair_datasets": [],
+            },
+            "after": None,
+        }
+
+    async def reconcile_corpus(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+        recover: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_repair_required",
+            "before": {
+                "ok": True,
+                "census_complete": True,
+                "zero_chunk_count": 0,
+                "oversized_document_count": 0,
+                "oversized_chunk_count": 0,
+            },
+            "after": None,
+        }
+
+    async def reconcile_oversized_chunks(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+            "reason": "no_oversized_chunks",
+            "before": {
+                "ok": True,
+                "oversized_document_count": 0,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": [],
+                "repair_datasets": [],
+            },
+            "after": None,
+        }
 
 class FakeLinearSyncer:
     async def status(self) -> dict[str, Any]:
@@ -267,6 +339,22 @@ def authed_client(access_key: str = "test-admin") -> TestClient:
     return client
 
 
+LEGACY_PUBLIC_SOURCES = {
+    "/": "landing.html",
+    "/info": "info.html",
+    "/use-cases": "use-cases.html",
+    "/contact": "contact.html",
+}
+
+
+def legacy_public_markup(path: str) -> str:
+    if path == "/login":
+        return server_module.LOGIN_HTML
+    return (server_module.STATIC_DIR / LEGACY_PUBLIC_SOURCES[path]).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_healthz() -> None:
     client = TestClient(app)
 
@@ -274,6 +362,36 @@ def test_healthz() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "service": "citadel"}
+
+
+def test_public_state_uses_the_package_source_version() -> None:
+    client = authed_client("test-reader")
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    assert response.json()["version"] == server_module._SERVICE_VERSION
+
+
+def test_public_state_and_discovery_share_deployment_identity() -> None:
+    client = authed_client("test-reader")
+    state = client.get("/api/state").json()
+    discovery = client.get("/.well-known/citadel.json").json()
+
+    assert state["version"] == discovery["service"]["version"] == server_module._SERVICE_VERSION
+    assert state["build_id"] == discovery["service"]["build_id"] == server_module._BUILD_ID
+    assert (
+        state["deployment_id"]
+        == discovery["service"]["deployment_id"]
+        == server_module._DEPLOYMENT_ID
+    )
+
+
+def test_public_state_reports_the_captured_build_id(monkeypatch) -> None:
+    monkeypatch.setattr(server_module, "_BUILD_ID", "a" * 40)
+
+    response = authed_client("test-reader").get("/api/state")
+
+    assert response.status_code == 200
+    assert response.json()["build_id"] == "a" * 40
 
 
 def test_security_headers_are_applied_to_http_responses() -> None:
@@ -371,9 +489,7 @@ def test_landing_diagram_ships_as_markup_and_upgrades_to_the_bundle() -> None:
     JavaScript off, has to get a correct picture from the HTML alone, so the
     four-step spine ships visible and the React container ships empty.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
 
     # The plain diagram ships visible, and it is four steps, not the fourteen
     # element two-lane version it replaced.
@@ -409,9 +525,9 @@ def test_landing_flow_bundle_is_committed_and_served() -> None:
 
     assert script.status_code == 200
     assert styles.status_code == 200
-    # esbuild is configured with globalName CitadelFlow; landing.js calls
-    # window.CitadelFlow.mount() once the script has loaded.
-    assert script.text.startswith("var CitadelFlow=")
+    # esbuild may prepend a strict-mode directive, but globalName must expose
+    # CitadelFlow; landing.js calls window.CitadelFlow.mount() after loading.
+    assert script.text.startswith(("var CitadelFlow=", '"use strict";var CitadelFlow='))
     assert ".react-flow" in styles.text
 
 
@@ -462,15 +578,12 @@ def test_mcp_legacy_path_redirects_relative() -> None:
 
 
 def test_login_page_uses_static_script_for_csp() -> None:
-    client = TestClient(app, base_url="https://testserver")
+    page = legacy_public_markup("/login")
 
-    response = client.get("/login")
-
-    assert response.status_code == 200
-    assert '<script src="/static/login.js" type="module"></script>' in response.text
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert '<script src="/static/login.js" type="module"></script>' in page
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_login_page_uses_the_public_design_system() -> None:
@@ -479,9 +592,7 @@ def test_login_page_uses_the_public_design_system() -> None:
     A visitor arriving from /info must not be handed to a visibly different
     product at the door: same stylesheet, same nav, same theme toggle.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    page = client.get("/login").text
+    page = legacy_public_markup("/login")
 
     assert '<link rel="stylesheet" href="/static/info.css">' in page
     assert "/static/styles.css" not in page
@@ -489,22 +600,18 @@ def test_login_page_uses_the_public_design_system() -> None:
     assert 'id="themebtn"' in page
 
 def test_use_cases_page_is_public_and_csp_clean() -> None:
-    client = TestClient(app, base_url="https://testserver")
-
-    response = client.get("/use-cases")
-
-    assert response.status_code == 200
+    page = legacy_public_markup("/use-cases")
     # No token, no session — a coordinator or a curious engineer must be able
     # to open this. Team use cases lead; the partnering profile follows.
-    assert "Four things teams run it for" in response.text
-    assert "Draft work package" in response.text
+    assert "Four things teams run it for" in page
+    assert "Draft work package" in page
     # Reuses the /info stylesheet + script rather than shipping its own.
-    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
-    assert '<script src="/static/info.js" defer></script>' in response.text
+    assert '<link rel="stylesheet" href="/static/info.css">' in page
+    assert '<script src="/static/info.js" defer></script>' in page
     # Strict CSP: nothing inline.
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_partners_url_still_resolves() -> None:
@@ -523,19 +630,16 @@ def test_partners_url_still_resolves() -> None:
 
 def test_contact_page_is_public_and_csp_clean() -> None:
     """The contact form is its own page, not a section at the bottom of another."""
-    client = TestClient(app, base_url="https://testserver")
+    page = legacy_public_markup("/contact")
 
-    response = client.get("/contact")
-
-    assert response.status_code == 200
-    assert 'id="contactForm"' in response.text
-    assert '<script src="/static/contact.js" defer></script>' in response.text
+    assert 'id="contactForm"' in page
+    assert '<script src="/static/contact.js" defer></script>' in page
     # The form only lives here now — /use-cases points at it instead.
-    assert 'id="contactForm"' not in client.get("/use-cases").text
-    assert '<link rel="stylesheet" href="/static/info.css">' in response.text
-    assert "<script>\n" not in response.text
-    assert "<style>" not in response.text
-    assert 'style="' not in response.text
+    assert 'id="contactForm"' not in legacy_public_markup("/use-cases")
+    assert '<link rel="stylesheet" href="/static/info.css">' in page
+    assert "<script>\n" not in page
+    assert "<style>" not in page
+    assert 'style="' not in page
 
 
 def test_public_pages_share_one_top_nav() -> None:
@@ -544,14 +648,9 @@ def test_public_pages_share_one_top_nav() -> None:
     The nav is what stops the public pages from being orphans reachable only by
     direct link.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     pages = {
-        "/": client.get("/").text,
-        "/info": client.get("/info").text,
-        "/use-cases": client.get("/use-cases").text,
-        "/contact": client.get("/contact").text,
-        "/login": client.get("/login").text,
+        path: legacy_public_markup(path)
+        for path in ("/", "/info", "/use-cases", "/contact", "/login")
     }
 
     for path, page in pages.items():
@@ -573,10 +672,8 @@ def test_public_pages_share_the_band_layout() -> None:
     rhythm and the sticky section index are what make the five pages one site,
     so they are pinned here rather than left to the next redesign to notice.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     for path in ("/info", "/use-cases", "/contact"):
-        page = client.get(path).text
+        page = legacy_public_markup(path)
 
         # The hero band carries the nav and the glow, exactly as / does.
         assert '<div class="band band-hero">' in page, path
@@ -662,11 +759,9 @@ def test_public_pages_avoid_info_report_element_ids() -> None:
     Each page keeps only the ids it genuinely wants hydrated: the health pill
     and the brand mark.
     """
-    client = TestClient(app, base_url="https://testserver")
-
     report_only_ids = ("foot-note", "state-updated", "m-version", "m-docs", "m-docs-sub")
     for path in ("/use-cases", "/contact"):
-        page = client.get(path).text
+        page = legacy_public_markup(path)
         for element_id in report_only_ids:
             assert f'id="{element_id}"' not in page, (
                 f'{path} declares id="{element_id}", which info.js overwrites '
@@ -714,10 +809,8 @@ def test_each_public_page_owns_its_subject() -> None:
     two places and drifted. Home owns what-it-is and how-to-start; /info owns
     the live numbers and the roadmap.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
-    info = client.get("/info").text
+    home = legacy_public_markup("/")
+    info = legacy_public_markup("/info")
 
     # The pipeline diagram and the install commands live on / only.
     assert 'class="spine"' in home
@@ -736,11 +829,9 @@ def test_home_owns_install_and_the_diagram() -> None:
     test_each_public_page_owns_its_subject from the /info pair to every public
     page, so a future page cannot quietly grow a second copy of either.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
     others = {
-        path: client.get(path).text
+        path: legacy_public_markup(path)
         for path in ("/info", "/use-cases", "/contact", "/login")
     }
 
@@ -762,9 +853,7 @@ def test_home_hero_has_no_terminal_block() -> None:
     lede below the fold. The commands still ship, at the bottom of the page.
     This pins the decision so it cannot drift back in.
     """
-    client = TestClient(app, base_url="https://testserver")
-
-    home = client.get("/").text
+    home = legacy_public_markup("/")
     hero = home[home.index('<header class="hero">'):home.index("</header>")]
 
     assert "<pre" not in hero
@@ -932,7 +1021,8 @@ def test_api_uses_configured_citadel_service() -> None:
         "document_drilldown_available": False,
     }
     assert mesh.status_code == 200
-    assert mesh.json()["stats"]["tracked_sources"] == 1
+    # The fixture reports 3 GitHub repositories and 2 Linear issues.
+    assert mesh.json()["stats"]["tracked_sources"] == 5
     assert indexes.status_code == 200
     assert len(indexes.json()["indexes"]) == 4
     assert sync_status.status_code == 200
@@ -1031,12 +1121,130 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     assert verify.json()["verification"]["ok"] is True
 
 
+def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
+    class FailingCognify(FakeCitadel):
+        async def cognify_dataset(
+            self, *, dataset: Any = None, verify: bool = False, force: bool = False
+        ) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "dataset": dataset or self.config.default_dataset,
+                "graph_before": {"nodes": 5, "edges": 7},
+                "graph_after": {"nodes": 5, "edges": 7},
+                "graph_grew": False,
+                "verify": verify,
+                "verification": {"search_hit": False, "ok": False},
+            }
+
+    client = authed_client()
+    app.state.citadel = FailingCognify()
+
+    response = client.post("/api/cognify/run", json={"verify": True})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["result"]["ok"] is False
+    events = app.state.access_store.snapshot()["audit_events"]
+    cognify_events = [event for event in events if event["action"] == "cognify.run"]
+    assert cognify_events[-1]["success"] is False
+
+
 def test_cognify_run_requires_admin() -> None:
     client = authed_client("test-writer")
 
     response = client.post("/api/cognify/run", json={})
 
     assert response.status_code == 403
+
+
+def test_admin_can_audit_combined_reconciliation_and_writer_cannot() -> None:
+    admin = authed_client()
+
+    response = admin.post(
+        "/api/corpus/reconcile",
+        json={"dataset": "masumi-network"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "no_repair_required"
+    assert response.json()["apply"] is False
+
+    writer = authed_client("test-writer")
+    assert writer.post("/api/corpus/reconcile", json={}).status_code == 403
+
+
+def test_admin_can_audit_oversized_chunk_reconciliation() -> None:
+    client = authed_client()
+
+    response = client.post(
+        "/api/corpus/reconcile",
+        json={"oversized": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "no_oversized_chunks"
+    assert response.json()["apply"] is False
+
+
+def test_admin_can_request_interrupted_recovery() -> None:
+    client = authed_client()
+
+    response = client.post(
+        "/api/corpus/reconcile",
+        json={"apply": True, "recover": True},
+    )
+
+    assert response.status_code == 200
+    events = app.state.access_store.snapshot()["audit_events"]
+    reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
+    assert reconcile_events[-1]["detail"]["recover"] is True
+
+
+def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
+    class FailingReconcile(FakeCitadel):
+        async def reconcile_corpus(
+            self,
+            *,
+            dataset: Any = None,
+            apply: bool = False,
+            force: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "reason": "reconciliation_invariants_remain",
+                "repair_operation_id": "repair-op-123",
+                "repair_phase": "post_index_check",
+                "repair_journal_error": "OSError",
+                "post_repair_indexed": False,
+                "post_repair_stored_budget_ok": True,
+            }
+
+    client = authed_client()
+    app.state.citadel = FailingReconcile()
+
+    response = client.post("/api/corpus/reconcile", json={"apply": True})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["result"]["reason"] == "reconciliation_invariants_remain"
+    events = app.state.access_store.snapshot()["audit_events"]
+    reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
+    assert reconcile_events[-1]["success"] is False
+    assert reconcile_events[-1]["detail"] == {
+        "operation": "corpus.reconcile",
+        "apply": True,
+        "force": False,
+        "oversized": False,
+        "ok": False,
+        "reason": "reconciliation_invariants_remain",
+        "repair_required": None,
+        "repair_operation_id": "repair-op-123",
+        "repair_phase": "post_index_check",
+        "repair_journal_error": "OSError",
+        "post_repair_indexed": False,
+        "post_repair_stored_budget_ok": True,
+    }
 
 
 def test_knowledge_events_api_returns_resumable_timeline() -> None:
@@ -1289,7 +1497,7 @@ def test_root_is_the_public_landing_page_for_everyone() -> None:
     for response in (anon, member):
         assert response.status_code == 200
         assert 'id="graphCanvas"' not in response.text
-        assert '<link rel="stylesheet" href="/static/info.css">' in response.text
+        assert "Citadel remembers your" in response.text
 
 
 def test_ui_shell_is_served_after_login() -> None:
@@ -1441,8 +1649,9 @@ def test_search_view_groups_central_before_node() -> None:
 
     assert web == cli_sections, (web, cli_sections)
     assert web.index("central") < web.index("node")
-    # And the results panel says so on the page itself.
-    assert "Central first, then your Node" in authed_client().get("/app").text
+    assert "isSingleLiteralQuery(query)" in app_js
+    assert "renderSearchResults(returned, response, query)" in app_js
+    assert "Search results" in authed_client().get("/app").text
 
 
 def test_review_is_the_only_place_with_approve_and_reject() -> None:
@@ -1535,6 +1744,44 @@ def test_knowledge_mesh_canvas_is_reachable_from_the_knowledge_page() -> None:
         "graphMeta",
     ):
         assert page.count(f'id="{element_id}"') == 1, element_id
+
+
+def test_graph_inspector_resolves_one_hop_document_neighbors() -> None:
+    """#186: entity inspection may fall through to readable graph neighbors.
+
+    The legacy dashboard is a hand-written browser script with no DOM test
+    runner. This static contract keeps the bounded client behavior explicit;
+    `node --check kb/static/app.js` remains the syntax check for the script.
+    """
+    app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    bearing = re.search(
+        r"function isDocumentBearingNode\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    candidates = re.search(
+        r"function documentCandidates\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    loader = re.search(
+        r"async function loadNodeDocument\(node\) \{(.*?)\n\}", app_js, re.S
+    )
+    assert bearing and candidates and loader
+
+    bearing_body = bearing.group(1)
+    assert 'type.includes("document")' in bearing_body
+    assert 'type.includes("chunk")' in bearing_body
+    assert 'type.includes("summary")' in bearing_body
+
+    candidate_body = candidates.group(1)
+    assert "add(node)" in candidate_body
+    assert "knowledgeNeighbors(node.id)" in candidate_body
+    assert "seen.has(id)" in candidate_body
+
+    loader_body = loader.group(1)
+    assert "documentCandidates(node)" in loader_body
+    assert "candidate.node.id" in loader_body
+    assert "state.selectedId !== node.id" in loader_body
+    assert "error?.status === 404" in loader_body
+    assert "/not found/i.test(message)" in loader_body
 
 
 def test_admin_can_create_and_use_role_based_access_token(tmp_path: Any) -> None:
@@ -2506,6 +2753,329 @@ def test_readyz_reports_503_when_data_plane_empty() -> None:
     assert body["corpus"]["tracked_sources"] == 50
 
 
+def test_readyz_reports_503_when_corpus_measurement_fails() -> None:
+    class BrokenGraphCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            raise RuntimeError("graph unavailable")
+
+    class HealthySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    client = authed_client("test-reader")
+    app.state.citadel = BrokenGraphCitadel()
+    app.state.github_syncer = HealthySyncer()
+    app.state.repo_content_syncer = HealthySyncer()
+    app.state.linear_syncer = HealthySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"] == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "graph unavailable",
+    }
+
+
+def test_readyz_does_not_use_graph_nodes_as_projection_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 2,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": False,
+            }
+
+    class GraphOnlyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = GraphOnlyCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    corpus = ready.json()["corpus"]
+    assert corpus["indexed_docs"] == 280
+    assert corpus["probe_fully_indexed_documents"] == 0
+    assert corpus["probe_ok"] is False
+
+
+def test_readyz_rejects_a_partial_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PartialCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 65,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 64,
+                "probe_pages": 1,
+                "probe_complete": False,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 64,
+                "probe_graph_documents": 64,
+                "probe_fully_indexed_documents": 64,
+                "probe_ok": True,
+            }
+
+    class PartialCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = PartialCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = PartialCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"]["probe_complete"] is False
+    assert ready.json()["corpus"]["probe_ok"] is True
+
+
+def test_readyz_accepts_a_complete_multi_page_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MultiPageCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 65,
+                "probe_limit": 64,
+                "probe_max_documents": 10_000,
+                "probe_documents": 65,
+                "probe_pages": 2,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 65,
+                "probe_graph_documents": 65,
+                "probe_fully_indexed_documents": 65,
+                "probe_ok": True,
+            }
+
+    class MultiPageCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MultiPageCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 65, "edges": 64}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MultiPageCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 200
+    assert ready.json()["corpus"]["probe_documents"] == 65
+
+
+def test_readyz_rejects_inconsistent_complete_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InconsistentCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 100,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 0,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 0,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": True,
+            }
+
+    class InconsistentCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = InconsistentCorpus()
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = InconsistentCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"] == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "complete bounded corpus probe does not cover the relational document total",
+    }
+
+
+def test_corpus_health_cache_is_shared_by_readyz_and_mesh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 1,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 1,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 1,
+                "probe_graph_documents": 1,
+                "probe_fully_indexed_documents": 1,
+                "probe_ok": True,
+            }
+
+    class MeasuredCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 280, "edges": 514}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MeasuredCitadel()
+
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/api/mesh").status_code == 200
+    assert calls == 1
+
+
+async def test_corpus_health_deduplicates_concurrent_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 1, "tracked_files": 0, "issue_count": 0}
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return {
+                "relational_documents": 1,
+                "probe_limit": limit,
+                "probe_max_documents": 10000,
+                "probe_documents": 1,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 1,
+                "probe_graph_documents": 1,
+                "probe_fully_indexed_documents": 1,
+                "probe_ok": True,
+            }
+
+    class MeasuredCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 1, "edges": 1}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    app.state.citadel = MeasuredCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    first, second = await asyncio.gather(
+        server_module._corpus_health(), server_module._corpus_health()
+    )
+
+    assert calls == 1
+    assert first == second
+
+
+def test_readyz_rejects_measured_empty_corpus_when_sources_are_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyMeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 0,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 0,
+                "probe_pages": 0,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 0,
+                "probe_graph_documents": 0,
+                "probe_fully_indexed_documents": 0,
+                "probe_ok": True,
+            }
+
+    class MeasuredEmptyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = EmptyMeasuredCorpus()
+
+    class BusySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    client = authed_client("test-reader")
+    app.state.citadel = MeasuredEmptyCitadel()
+    app.state.github_syncer = BusySyncer()
+    app.state.repo_content_syncer = BusySyncer()
+    app.state.linear_syncer = BusySyncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"]["probe_ok"] is True
+    assert ready.json()["corpus"]["ok"] is False
+
+
 def test_readyz_ok_when_graph_populated() -> None:
     class PopulatedCitadel(FakeCitadel):
         async def _graph_counts(self) -> dict[str, int]:
@@ -2551,6 +3121,65 @@ def test_search_across_datasets_runs_concurrently() -> None:
     # Concurrent: both datasets start before either finishes.
     assert order[0][0] == "start" and order[1][0] == "start"
     assert {d for d, _ in merged} == {"a", "b"}
+
+
+def test_single_literal_search_preserves_each_dataset_candidate() -> None:
+    """Literal identifiers must survive the cross-dataset merge (#106)."""
+    import asyncio as aio
+
+    from kb.server import search_across_datasets
+
+    class LiteralCitadel:
+        config = FakeCitadel.config
+
+        async def search(
+            self, query: str, *, dataset: str, session_id: Any, top_k: int
+        ) -> list[Any]:
+            if dataset == "central":
+                return [
+                    {"id": "central-1", "text": "unrelated central note"},
+                    {"id": "central-2", "text": "another central note"},
+                ][:top_k]
+            return [
+                {"id": "node-1", "text": "unrelated node note"},
+                {"id": "node-2", "text": "quokka-beacon-8823"},
+            ][:top_k]
+
+    merged = aio.run(
+        search_across_datasets(
+            LiteralCitadel(),
+            query="quokka-beacon-8823",
+            datasets=["central", "node"],
+            sessions={},
+            top_k=2,
+        )
+    )
+
+    assert [result[1]["id"] for result in merged] == [
+        "central-1",
+        "central-2",
+        "node-1",
+        "node-2",
+    ]
+
+
+def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any) -> None:
+    """The API ranks the exact token before unrelated returned hits (#106)."""
+    async def fake_search(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, Any]], bool]:
+        return [
+            ("central", {"id": "central", "text": "unrelated central note"}),
+            ("node", {"id": "node", "text": "quokka-beacon-8823"}),
+        ], False
+
+    monkeypatch.setattr(server_module, "_search_within_budget", fake_search)
+    response = authed_client().post(
+        "/search", json={"query": "quokka-beacon-8823", "top_k": 2}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["id"] == "node"
+    assert body["results"][0]["_citadel"]["rank"] == 1
 
 
 def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
@@ -2677,6 +3306,15 @@ def test_document_endpoint_for_result_covers_real_ids_only() -> None:
     assert document_endpoint_for_result("ghsync:abc") == "/api/documents/ghsync:abc"
     assert document_endpoint_for_result("doc_123") == "/api/documents/doc_123"
     assert document_endpoint_for_result(uuid) == f"/api/documents/{uuid}"
+    assert document_endpoint_for_result(
+        "chunk-uuid", document_id="document-uuid"
+    ) == "/api/documents/document-uuid"
+    assert document_endpoint_for_result(
+        "chunk:deadbeef", document_id="document-uuid"
+    ) == "/api/documents/document-uuid"
+    assert document_endpoint_for_result("../../api/access") == (
+        "/api/documents/..%2F..%2Fapi%2Faccess"
+    )
     assert document_endpoint_for_result("chunk:deadbeef") is None
     assert document_endpoint_for_result("") is None
 
@@ -2716,6 +3354,46 @@ def test_cognee_search_hit_drills_down_to_document() -> None:
 
     # An unknown cognee id still 404s cleanly.
     assert client.get("/api/documents/does-not-exist").status_code == 404
+
+
+def test_search_drilldown_prefers_parent_document_id_for_chunk_hit(
+    tmp_path: Any,
+) -> None:
+    class ParentDocumentSearchCitadel(DrilldownIsolationCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "chunk-b",
+                    "document_id": "doc-b",
+                    "text": "bob chunk text",
+                }
+            ]
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = ParentDocumentSearchCitadel()
+    app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
+    api = TestClient(app, base_url="https://testserver")
+    bob = {"Authorization": f"Bearer {bob_token}"}
+    try:
+        response = api.post("/search", json={"query": "bob", "top_k": 1}, headers=bob)
+        hit = response.json()["results"][0]
+        endpoint = hit["_citadel"]["document_endpoint"]
+        document = api.get(endpoint, headers=bob)
+    finally:
+        app.state.knowledge_mesh = None
+
+    assert response.status_code == 200
+    assert hit["_citadel"]["result_id"] == "chunk-b"
+    assert hit["document_id"] == "doc-b"
+    assert endpoint == "/api/documents/doc-b"
+    assert hit["_citadel"]["retrieval"]["document_drilldown_available"] is True
+    assert document.status_code == 200
+    assert document.json()["document"]["body"] == "bob text"
 
 
 def test_knowledge_conflict_listing_and_resolution_are_role_gated(tmp_path: Any) -> None:
@@ -6450,14 +7128,14 @@ def test_api_mesh_reports_authoritative_corpus_totals_not_uptime_counters(
     assert stats["since_restart"]["documents"] != 317
 
 
-def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
+def test_api_mesh_keeps_degraded_corpus_totals_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A degraded corpus read must not blank the dashboard or 500.
+    """A degraded corpus read must not present uptime counters as totals.
 
     `_corpus_health` is fail-soft and returns None totals on a transient graph
-    error. The endpoint has to survive that, because the alternative is that one
-    slow Kuzu read takes the whole dashboard down.
+    error. The endpoint stays available, but marks the corpus figures unknown
+    until an authoritative probe completes.
     """
     client = authed_client()
 
@@ -6475,9 +7153,79 @@ def test_api_mesh_falls_back_to_uptime_counters_when_corpus_read_fails(
     response = client.get("/api/mesh")
 
     assert response.status_code == 200
-    stats = response.json()["stats"]
-    assert stats["tracked_sources"] is not None
-    assert stats["edges"] is not None
+    body = response.json()
+    stats = body["stats"]
+    assert stats["tracked_sources"] is None
+    assert stats["nodes"] is None
+    assert stats["edges"] is None
+    indexes = {index["id"]: index for index in body["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["vector"]["status"] == "warming"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_corpus_health_is_bounded_and_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(0.05)
+            return {"nodes": 5, "edges": 7}
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    app.state.citadel = SlowCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    result = await asyncio.wait_for(server_module._bounded_corpus_health(), timeout=0.5)
+
+    assert result == {
+        "ok": False,
+        "tracked_sources": None,
+        "indexed_docs": None,
+        "indexed_edges": None,
+        "degraded": "corpus health timed out after 0.01s",
+    }
+    await asyncio.sleep(0.06)
+    assert server_module._CORPUS_HEALTH_CACHE is not None
+    assert server_module._CORPUS_HEALTH_CACHE[2]["indexed_docs"] == 5
+
+
+def test_indexes_timeout_preserves_existing_response_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(30)
+            return {"nodes": 5, "edges": 7}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+
+    response = client.get("/api/indexes")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"indexes", "stats"}
+    assert isinstance(body["indexes"], list)
+    assert "since_restart" in body["stats"]
+    indexes = {index["id"]: index for index in body["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["graph"]["records"] is None
+    assert indexes["vector"]["status"] == "warming"
+    assert indexes["vector"]["records"] is None
+    assert body["stats"]["nodes"] is None
+    assert body["stats"]["tracked_sources"] is None
 
 
 def test_api_mesh_activity_counters_are_scoped_not_top_level(

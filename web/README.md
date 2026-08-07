@@ -1,32 +1,35 @@
-# web/ — the Citadel frontend
+# web/ - the Citadel frontend
 
 Next.js, TypeScript and Tailwind, statically exported into `kb/webui/` so that
 FastAPI serves it as plain files. The decision and its reasoning are in
 [`docs/adr/0014-nextjs-frontend-static-export.md`](../docs/adr/0014-nextjs-frontend-static-export.md).
 
-Today this holds the five public pages, served as previews:
+When the committed export exists, FastAPI serves these pages on the canonical
+public routes. A source checkout without `kb/webui/` uses the legacy files as a
+fallback. The `/next/*` routes remain explicit preview aliases.
 
-| preview | ports | still served by |
+| route | page | source |
 | --- | --- | --- |
-| `/next` | the landing page | `kb/static/landing.html` |
-| `/next/info` | State of the Vault | `kb/static/info.html` |
-| `/next/use-cases` | use cases and partnering | `kb/static/use-cases.html` |
-| `/next/contact` | the enquiry form | `kb/static/contact.html` |
-| `/next/login` | seat access | `LOGIN_HTML` in `kb/server.py` |
+| `/` | the landing page | `web/src/pages/index.tsx` |
+| `/info` | State of the Vault | `web/src/pages/info.tsx` |
+| `/use-cases` | use cases and partnering | `web/src/pages/use-cases.tsx` |
+| `/contact` | the enquiry form | `web/src/pages/contact.tsx` |
+| `/login` | seat access | `web/src/pages/login.tsx` |
 
-…and the first slice of the dashboard, behind the same session `/app` requires:
+The Next dashboard slices are behind the same session gate as `/app`:
 
-| preview | ports | minimum role |
+| preview | page | minimum role |
 | --- | --- | --- |
 | `/next/app` | Home | reader |
-| `/next/app/search` | placeholder, not built | reader |
+| `/next/app/search` | search | reader |
+| `/next/app/sources` | sources | reader |
+| `/next/app/graph` | graph | reader |
 | `/next/app/review` | the promotion queue | writer |
-| `/next/app/admin` | placeholder, not built | admin |
+| `/next/app/admin` | placeholder | admin |
 
-Every existing route still serves what it served before; nothing has switched
-over. `/login` is the one worth switching first: it is generated from a Python
-string literal, which is why it is the page that keeps drifting from the other
-four.
+`/app` still serves the legacy authenticated dashboard. The Next dashboard is
+preview-only until browser interaction, API parity, and operator sign-off are
+complete. The public route switch does not switch the authenticated dashboard.
 
 ## The dashboard's gates
 
@@ -140,7 +143,7 @@ web/
   src/lib/api.ts            the authed fetch helper; a 401 anywhere goes to /login
   src/lib/dashboard.ts      the endpoint shapes each view reads, and nothing more
   src/styles/globals.css    the design tokens, as a Tailwind theme
-  flow/index.jsx            NOT part of this app — see below
+  flow/index.jsx            NOT part of this app. See below.
 ```
 
 Anything used by more than one page belongs in `ui.tsx`. Five hand-written HTML
@@ -157,7 +160,7 @@ uses.
 ## Theme
 
 Light is the default for everyone. Dark is an explicit choice, stored under the
-`citadel-info-theme` localStorage key — the same key the hand-written pages use,
-so the choice survives crossing between `/next` and `/info` — and applied as
+`citadel-info-theme` localStorage key, the same key the hand-written pages use,
+so the choice survives crossing between `/next` and `/info`, and applied as
 `data-theme="dark"` on `<html>`. `prefers-color-scheme` is deliberately not
 consulted.

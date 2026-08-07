@@ -14,9 +14,8 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -32,6 +31,8 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from kb.build_identity import SERVICE_BUILD_IDENTITY, build_identity_from_env
+from kb import chunk_window
 from kb.access import (
     CENTRAL_DATASET,
     SESSION_TRACES_DATASET,
@@ -152,6 +153,25 @@ _LAST_CANARY: dict[str, Any] | None = None
 # over an empty graph were the #27 failure mode).
 _MIN_TRACKED_FOR_CORPUS = 10
 _INDEXED_FLOOR = 1
+_CORPUS_HEALTH_PROBE_LIMIT = 64
+try:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_CACHE_TTL_SECONDS", "5"))
+    )
+except ValueError:
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = 5.0
+# /api/mesh and /api/indexes already degrade to restart-scoped counters when
+# corpus measurement fails. Bound that dependency so a slow graph read follows
+# the existing response contract instead of holding the dashboard request open.
+try:
+    _CORPUS_HEALTH_TIMEOUT_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_TIMEOUT_SECONDS", "2"))
+    )
+except ValueError:
+    _CORPUS_HEALTH_TIMEOUT_SECONDS = 2.0
+_CORPUS_HEALTH_CACHE: tuple[float, tuple[int, ...], dict[str, Any]] | None = None
+_CORPUS_HEALTH_LOCK = asyncio.Lock()
+_CORPUS_HEALTH_TASK: asyncio.Task[dict[str, Any]] | None = None
 
 # In-flight counts for the soft concurrency cap / 429 backpressure contract
 # (#50). Single-loop server → increment/decrement need no lock. Search and the
@@ -466,6 +486,11 @@ async def lifespan(app: FastAPI) -> Any:
     # startup and not at kb.config import: the CLI imports that module too and
     # must not die because the server's environment is misconfigured.
     enforce_access_key_strength()
+    try:
+        chunk_window.require_bpe_encoding()
+    except chunk_window.ChunkBudgetValidationError as exc:
+        logger.critical("exact cognify tokenizer is unavailable; refusing startup")
+        raise RuntimeError("exact cognify tokenizer is unavailable") from exc
     async with mcp_server.session_manager.run():
         # Eagerly build the mesh and seed its in-memory activity counters from
         # persistent source state so a redeploy does not look like the graph reset.
@@ -515,14 +540,18 @@ async def lifespan(app: FastAPI) -> Any:
             await _stop_evolve_scheduler(repo_stats_task)
 
 
-# Single-source the service version so /.well-known/citadel.json and the CLI
-# never drift. Prefer installed package metadata; fall back to the in-source
-# kb.__version__ because the Railway node runs from source (not dist-installed),
-# where importlib.metadata raises and a hardcoded version would mislead.
-try:
-    _SERVICE_VERSION = _pkg_version("citadel-archive")
-except PackageNotFoundError:
-    from kb import __version__ as _SERVICE_VERSION
+# Single-source the service version and captured deployment identity. The Railway
+# node runs from source, and editable environments can retain stale distribution
+# metadata after a version bump.
+def _build_id_from_env(env: Mapping[str, str]) -> str | None:
+    """Compatibility helper for callers that only need the source build ID."""
+    return build_identity_from_env(env).build_id
+
+
+_SERVICE_VERSION = SERVICE_BUILD_IDENTITY.version
+_BUILD_ID = SERVICE_BUILD_IDENTITY.build_id
+_DEPLOYMENT_ID = SERVICE_BUILD_IDENTITY.deployment_id
+
 
 app = FastAPI(
     title="Citadel Archive",
@@ -988,6 +1017,15 @@ class CognifyRunBody(BaseModel):
     dataset: str | None = None
     verify: bool = False
     force: bool = False
+
+
+class CorpusReconcileBody(BaseModel):
+    dataset: str | None = None
+    apply: bool = False
+    force: bool = False
+    recover: bool = False
+    # Compatibility switch. The default runs the combined zero/oversized census.
+    oversized: bool = False
 
 
 class GraphCleanupBody(BaseModel):
@@ -2016,6 +2054,7 @@ async def search_across_datasets(
     per_dataset: list[tuple[str, list[Any]]] = [
         (dataset, list(results)) for dataset, results in zip(datasets, results_per)
     ]
+    literal_query = len(query_terms(query)) == 1
 
     merged: list[tuple[str, Any]] = []
     seen: set[str] = set()
@@ -2031,9 +2070,11 @@ async def search_across_datasets(
         for result in results
     }
 
+    merge_limit = top_k * len(per_dataset) if literal_query else top_k
+
     def take(dataset: str, results: list[Any], budget: int) -> None:
         for result in results:
-            if budget <= 0 or len(merged) >= top_k:
+            if budget <= 0 or len(merged) >= merge_limit:
                 return
             key = search_result_dedup_key(result)
             if key in seen:
@@ -2049,6 +2090,14 @@ async def search_across_datasets(
             budget -= 1
 
     if not per_dataset:
+        return merged
+
+    if literal_query:
+        # Single-token searches are commonly exact identifiers. Preserve the
+        # candidate page from every dataset so response shaping can place an
+        # observable literal match above unrelated cross-dataset hits (#106).
+        for dataset, results in per_dataset:
+            take(dataset, results, top_k)
         return merged
 
     reserve = max(1, top_k // 5) if len(per_dataset) > 1 else 0
@@ -2069,6 +2118,7 @@ async def execute_learning_writes(
     tags: list[str],
     session_id: str | None,
     operation: str,
+    attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
@@ -2076,17 +2126,19 @@ async def execute_learning_writes(
     outcomes: list[LearningOutcome] = []
     primary: LearningOutcome | None = None
     for target in targets:
-        outcome = await learning.learn(
-            data,
-            dataset=target.dataset,
-            tags=tags,
-            session_id=session_id,
-            operation=operation,
-            detect_conflicts=detect_conflicts and target.tier == "full",
-            run_improve=run_improve and target.tier == "full",
-            tier=target.tier,
-            defer_cognify=defer_cognify,
-        )
+        learn_kwargs: dict[str, Any] = {
+            "dataset": target.dataset,
+            "tags": tags,
+            "session_id": session_id,
+            "operation": operation,
+            "detect_conflicts": detect_conflicts and target.tier == "full",
+            "run_improve": run_improve and target.tier == "full",
+            "tier": target.tier,
+            "defer_cognify": defer_cognify,
+        }
+        if attestation is not None:
+            learn_kwargs["attestation"] = attestation
+        outcome = await learning.learn(data, **learn_kwargs)
         outcomes.append(outcome)
         if primary is None or target.tier == "full":
             primary = outcome
@@ -2104,6 +2156,7 @@ async def retry_failed_learning_writes(
     tags: list[str],
     session_id: str | None,
     operation: str,
+    attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
@@ -2118,17 +2171,19 @@ async def retry_failed_learning_writes(
             operation,
             target.dataset,
         )
-        updated[index] = await learning.learn(
-            data,
-            dataset=target.dataset,
-            tags=tags,
-            session_id=session_id,
-            operation=operation,
-            detect_conflicts=detect_conflicts and target.tier == "full",
-            run_improve=run_improve and target.tier == "full",
-            tier=target.tier,
-            defer_cognify=defer_cognify,
-        )
+        learn_kwargs: dict[str, Any] = {
+            "dataset": target.dataset,
+            "tags": tags,
+            "session_id": session_id,
+            "operation": operation,
+            "detect_conflicts": detect_conflicts and target.tier == "full",
+            "run_improve": run_improve and target.tier == "full",
+            "tier": target.tier,
+            "defer_cognify": defer_cognify,
+        }
+        if attestation is not None:
+            learn_kwargs["attestation"] = attestation
+        updated[index] = await learning.learn(data, **learn_kwargs)
     return updated
 
 
@@ -2625,19 +2680,18 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     return {key: value for key, value in provenance.items() if value}
 
 
-def document_endpoint_for_result(result_id: str) -> str | None:
+def document_endpoint_for_result(
+    result_id: str, *, document_id: str | None = None
+) -> str | None:
     # Any real id is now drillable (#28): ghsync:/doc_ as before, plus native
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
-    # Only synthetic content-hash ids (chunk:<sha>, given to id-less results) have
-    # no backing store, so they stay honestly non-drillable.
-    #
-    # `result_id` here is the hit's chunk-level `id` (see with_result_id), not
-    # its `document_id`. This still resolves because /api/documents walks
-    # chunk -> parent document, so a caller passing either id "works" — which
-    # hides that they are different ids for different things.
-    if not result_id or result_id.startswith("chunk:"):
+    # Prefer a hit's document-level id when present. A chunk-level id can be
+    # retrievable by search without being a resolvable graph node, while its
+    # parent document remains the canonical drilldown target.
+    drilldown_id = first_string(document_id, result_id)
+    if not drilldown_id or drilldown_id.startswith("chunk:"):
         return None
-    return f"/api/documents/{result_id}"
+    return f"/api/documents/{quote(drilldown_id, safe=':._-')}"
 
 
 def result_content_sha256(result: dict[str, Any]) -> str:
@@ -2712,8 +2766,10 @@ def with_result_metadata(
 ) -> Any:
     """Attach a reserved Citadel provenance envelope to dict search results.
 
-    ``drilldown_predicate`` (when supplied) decides, per result id, whether
-    ``/api/documents`` would actually return 200 for THIS caller. The
+    ``drilldown_predicate`` (when supplied) decides, per document id, whether
+    ``/api/documents`` would actually return 200 for THIS caller. A hit's
+    ``document_id`` is preferred to its chunk-level ``id`` for that decision.
+    The
     ``document_drilldown_available`` hint and the ``document_endpoint`` URL are
     then emitted only when the drill-down is honestly reachable, so an agent
     that follows the hint never lands on an ADR-0009 404. Without a predicate
@@ -2737,13 +2793,17 @@ def with_result_metadata(
         result = {key: value for key, value in result.items() if key != SHARED_TRACE_MARKER}
     normalized = with_result_id(result)
     result_id = str(normalized["id"])
-    document_endpoint = document_endpoint_for_result(result_id)
+    document_id = first_string(normalized.get("document_id"))
+    drilldown_id = document_id or result_id
+    document_endpoint = document_endpoint_for_result(
+        result_id, document_id=document_id
+    )
     if not document_endpoint:
         drilldown_available = False
     elif drilldown_predicate is None:
         drilldown_available = True
     else:
-        drilldown_available = bool(drilldown_predicate(result_id))
+        drilldown_available = bool(drilldown_predicate(drilldown_id))
     metadata: dict[str, Any] = {
         "rank": index + 1,
         "dataset": dataset,
@@ -2967,19 +3027,18 @@ async def audit_forwarded_mcp_call(request: Request, call_next: Any) -> Response
 
 
 @app.get("/", include_in_schema=False)
-async def landing_page() -> FileResponse:
-    # The root is the landing page for everyone, signed in or not. The app
-    # lives at /app, so one URL means one body: a member can read the landing
-    # page and send the link on without being bounced into the dashboard.
+async def landing_page() -> Response:
+    # The committed Next export is canonical when present. A source checkout
+    # without a build still has a usable legacy landing page.
+    if (WEBUI_DIR / "index.html").is_file():
+        return webui_page("index")
     return FileResponse(STATIC_DIR / "landing.html")
 
 
 @app.get("/next", include_in_schema=False)
 async def next_preview() -> Response:
-    # The Next.js rebuild of the public site, served alongside the hand-written
-    # pages rather than instead of them. /, /info, /use-cases, /contact and
-    # /login are untouched and stay the real site; these five routes are where
-    # the port is checked in a browser until it is good enough to take over.
+    # The Next.js rebuild of the public site is also available at /next while
+    # the canonical public routes use the same committed export.
     #
     # It sends the site's strict CSP, unchanged and by default: the export
     # carries no inline <script> and no inline <style>. That is the whole reason
@@ -2998,7 +3057,9 @@ async def next_preview() -> Response:
 # all, so the gate has to be the route: a seat that cannot open a view is served
 # the locked page instead, and the view's markup never leaves the server.
 WEBUI_APP_VIEWS: dict[str, str] = {
+    "graph": "reader",
     "search": "reader",
+    "sources": "reader",
     "review": "writer",
     "admin": "admin",
 }
@@ -3068,11 +3129,15 @@ async def ui(request: Request) -> Response:
         # The dashboard stays behind auth. Anonymous callers go to the sign-in
         # page rather than the landing page: they asked for the app by name.
         return RedirectResponse("/login", status_code=303)
+    # The Next dashboard remains a preview until graph and admin parity is
+    # verified. Keep the established shell as the authenticated app surface.
     return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/login", include_in_schema=False)
-async def login() -> HTMLResponse:
+async def login() -> Response:
+    if (WEBUI_DIR / "login.html").is_file():
+        return webui_page("login")
     return HTMLResponse(LOGIN_HTML)
 
 
@@ -3107,17 +3172,21 @@ async def robots_txt() -> Response:
 
 
 @app.get("/info", include_in_schema=False)
-async def info_page() -> FileResponse:
+async def info_page() -> Response:
     # Public "State of the Vault" report. Static shell; live tiles hydrate from
     # /api/state so the numbers stay current without redeploying the page.
+    if (WEBUI_DIR / "info.html").is_file():
+        return webui_page("info")
     return FileResponse(STATIC_DIR / "info.html")
 
 
 @app.get("/use-cases", include_in_schema=False)
-async def use_cases_page() -> FileResponse:
+async def use_cases_page() -> Response:
     # What teams run Citadel for, then the partnering profile for EU consortia.
-    # Shares info.css/info.js with /info; the live health pill hydrates from the
-    # same public /api/state.
+    # The Next export is canonical when built. The fallback shares info.css and
+    # info.js with /info; its live health pill hydrates from /api/state.
+    if (WEBUI_DIR / "use-cases.html").is_file():
+        return webui_page("use-cases")
     return FileResponse(STATIC_DIR / "use-cases.html")
 
 
@@ -3129,9 +3198,11 @@ async def partners_page() -> RedirectResponse:
 
 
 @app.get("/contact", include_in_schema=False)
-async def contact_page() -> FileResponse:
+async def contact_page() -> Response:
     # The form that POSTs to /contact below. Its own page rather than a section
     # at the bottom of another one, because it is a destination, not a footer.
+    if (WEBUI_DIR / "contact.html").is_file():
+        return webui_page("contact")
     return FileResponse(STATIC_DIR / "contact.html")
 
 
@@ -3270,7 +3341,13 @@ async def create_admin_session(
 
 
 @app.post("/admin/logout")
-async def logout(response: Response) -> dict[str, bool]:
+async def logout(request: Request, response: Response) -> Any:
+    # Native form submissions are document navigations and need a login page,
+    # while fetch/API callers still consume the historical JSON response.
+    if "text/html" in request.headers.get("accept", "").lower():
+        redirect = RedirectResponse("/login", status_code=303)
+        redirect.delete_cookie(ADMIN_COOKIE)
+        return redirect
     response.delete_cookie(ADMIN_COOKIE)
     return {"ok": True}
 
@@ -4268,7 +4345,9 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
     return {
         "ok": True,
         "service": "Citadel Archive",
-        "version": app.version,
+        "version": _SERVICE_VERSION,
+        "build_id": _BUILD_ID,
+        "deployment_id": _DEPLOYMENT_ID,
         "healthy": True,
         "sources": sources,
         "totals": {
@@ -4293,6 +4372,8 @@ async def citadel_discovery_manifest(request: Request, response: Response) -> di
             "name": "Citadel Archive",
             "kind": "organization_vault",
             "version": app.version,
+            "build_id": _BUILD_ID,
+            "deployment_id": _DEPLOYMENT_ID,
             "base_url": base,
         },
         "public_endpoints": {
@@ -4385,22 +4466,134 @@ async def get_skill(slug: str) -> FileResponse:
     return FileResponse(path, media_type="text/markdown; charset=utf-8", headers=headers)
 
 
-async def _corpus_health() -> dict[str, Any]:
-    """Data-plane volume gate: are tracked sources actually indexed? (#27)
+def _cache_corpus_health_result(
+    cache_key: tuple[int, ...], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Store a readiness result for the next request and return that entry."""
+    global _CORPUS_HEALTH_CACHE
+    _CORPUS_HEALTH_CACHE = (time.monotonic(), cache_key, result)
+    assert _CORPUS_HEALTH_CACHE is not None
+    return _CORPUS_HEALTH_CACHE[2]
 
-    Fail-soft — any error returns ok=True with a ``degraded`` note so readiness
-    never flaps on a transient graph read; the real signal is "many sources
-    tracked but the graph is empty".
+
+async def _corpus_health_impl() -> dict[str, Any]:
+    """Data-plane volume gate using exact relational projection measurements. (#27)
+
+    A failed measurement is a readiness failure, not an empty or healthy
+    corpus. The legacy graph-count fallback remains for local fakes and older
+    clients without ``corpus_health``.
     """
+    global _CORPUS_HEALTH_CACHE
+
+    citadel = get_citadel()
+    cache_key: tuple[int, ...] = (id(citadel),)
     try:
+        github_syncer = get_github_syncer()
+        repo_content_syncer = get_repo_content_syncer()
+        linear_syncer = get_linear_syncer()
+
+        def state_identity(name: str) -> int:
+            value = getattr(app.state, name, None)
+            return id(value) if value is not None else 0
+
+        cache_key = (
+            id(citadel),
+            state_identity("github_syncer"),
+            state_identity("repo_content_syncer"),
+            state_identity("linear_syncer"),
+        )
+        cached = _CORPUS_HEALTH_CACHE
+        if (
+            cached is not None
+            and cached[1] == cache_key
+            and _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0
+            and time.monotonic() - cached[0] < _CORPUS_HEALTH_CACHE_TTL_SECONDS
+        ):
+            return dict(cached[2])
+
         tracked = 0
-        github_status = await get_github_syncer().status()
+        github_status = await github_syncer.status()
         tracked += int(github_status.get("tracked_repositories") or 0)
-        repo_content_status = await get_repo_content_syncer().status()
+        repo_content_status = await repo_content_syncer.status()
         tracked += int(repo_content_status.get("tracked_files") or 0)
-        linear_status = await get_linear_syncer().status()
+        linear_status = await linear_syncer.status()
         tracked += int(linear_status.get("issue_count") or 0)
-        counts = await get_citadel()._graph_counts()
+
+        measured_read = getattr(getattr(citadel, "cognee", None), "corpus_health", None)
+        if callable(measured_read):
+            measured = await measured_read(limit=_CORPUS_HEALTH_PROBE_LIMIT)
+            if not isinstance(measured, dict):
+                raise RuntimeError("bounded corpus probe returned a non-object")
+            for field in (
+                "relational_documents",
+                "probe_limit",
+                "probe_documents",
+                "probe_chunked_documents",
+                "probe_graph_documents",
+                "probe_fully_indexed_documents",
+            ):
+                value = measured.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            for field in ("probe_complete", "probe_ok"):
+                if type(measured.get(field)) is not bool:
+                    raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            for field in ("probe_max_documents", "probe_pages"):
+                if field in measured:
+                    value = measured[field]
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise RuntimeError(f"bounded corpus probe returned invalid {field}")
+            if "probe_max_documents" in measured and measured["probe_documents"] > measured[
+                "probe_max_documents"
+            ]:
+                raise RuntimeError("bounded corpus probe exceeded its hard cap")
+            if "probe_cap_exceeded" in measured:
+                if type(measured["probe_cap_exceeded"]) is not bool:
+                    raise RuntimeError(
+                        "bounded corpus probe returned invalid probe_cap_exceeded"
+                    )
+                if measured["probe_cap_exceeded"] and (
+                    measured["probe_complete"] or measured["probe_ok"]
+                ):
+                    raise RuntimeError("capped corpus probe cannot be complete")
+            if (
+                measured["probe_complete"]
+                and measured["probe_documents"] != measured["relational_documents"]
+            ):
+                raise RuntimeError(
+                    "complete bounded corpus probe does not cover the relational document total"
+                )
+
+            counts = await citadel._graph_counts()
+            indexed = int(counts.get("nodes") or 0)
+            edges = int(counts.get("edges") or 0)
+            result = {
+                **measured,
+                "ok": measured["probe_complete"] is True
+                and measured["probe_ok"] is True
+                and not (
+                    tracked >= _MIN_TRACKED_FOR_CORPUS
+                    and measured["relational_documents"] == 0
+                ),
+                "tracked_sources": tracked,
+                # Compatibility for MeshState: graph nodes are not relational
+                # document projections and are not used for readiness.
+                "indexed_docs": indexed,
+                "indexed_graph_nodes": indexed,
+                "indexed_edges": edges,
+                "measurement": "bounded_relational_projection_probe",
+            }
+            if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+                return _cache_corpus_health_result(cache_key, result)
+            return result
+
+        # Preserve the old method-boundary fallback for local fakes and older
+        # clients that do not expose the bounded probe yet.
+        counts = await citadel._graph_counts()
         indexed = int(counts.get("nodes") or 0)
         # `_graph_counts` already reads the whole graph for `nodes`; `edges` comes
         # back in the same call for free. /api/mesh used to publish the in-memory
@@ -4408,20 +4601,77 @@ async def _corpus_health() -> dict[str, Any]:
         # so this is the real total that field needs.
         edges = int(counts.get("edges") or 0)
         ok = not (tracked >= _MIN_TRACKED_FOR_CORPUS and indexed < _INDEXED_FLOOR)
-        return {
+        result = {
             "ok": ok,
             "tracked_sources": tracked,
             "indexed_docs": indexed,
             "indexed_edges": edges,
         }
-    except Exception as exc:  # noqa: BLE001 - readiness must not flap on a transient read
-        logger.warning("corpus health check degraded (fail-soft to ok): %s", exc)
-        return {
-            "ok": True,
+        if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+            return _cache_corpus_health_result(cache_key, result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
+        logger.warning("corpus health check degraded: %s", exc)
+        result = {
+            "ok": False,
             "tracked_sources": None,
             "indexed_docs": None,
             "indexed_edges": None,
             "degraded": str(exc),
+        }
+        if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
+            return _cache_corpus_health_result(cache_key, result)
+        return result
+
+
+async def _corpus_health() -> dict[str, Any]:
+    """Serialize uncached corpus probes so concurrent readiness checks share work."""
+    async with _CORPUS_HEALTH_LOCK:
+        return await _corpus_health_impl()
+
+
+def _corpus_health_task() -> asyncio.Task[dict[str, Any]]:
+    """Start one shared corpus probe that can outlive a dashboard request."""
+    global _CORPUS_HEALTH_TASK
+    task = _CORPUS_HEALTH_TASK
+    if task is None or task.done():
+        task = asyncio.create_task(_corpus_health())
+        _CORPUS_HEALTH_TASK = task
+    return task
+
+
+async def _bounded_corpus_health() -> dict[str, Any]:
+    """Return corpus health within the dashboard read budget.
+
+    A zero timeout keeps the previous unbounded behavior for operators that need
+    the full measurement. The normal setting is finite. A timed-out probe is
+    shielded so it can finish and populate the shared cache after the request
+    returns; callers use the last cached result when one exists, otherwise the
+    existing uptime-counter fallback.
+    """
+    try:
+        if _CORPUS_HEALTH_TIMEOUT_SECONDS <= 0:
+            return await _corpus_health()
+        return await asyncio.wait_for(
+            asyncio.shield(_corpus_health_task()),
+            timeout=_CORPUS_HEALTH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        timeout = _CORPUS_HEALTH_TIMEOUT_SECONDS
+        logger.warning("bounded corpus health timed out after %.2fs", timeout)
+        cached = _CORPUS_HEALTH_CACHE
+        if cached is not None:
+            result = dict(cached[2])
+            result["degraded"] = (
+                f"corpus health timed out after {timeout:g}s; serving cached result"
+            )
+            return result
+        return {
+            "ok": False,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": f"corpus health timed out after {timeout:g}s",
         }
 
 
@@ -4517,7 +4767,9 @@ async def mesh(request: Request) -> Any:
     # `_corpus_health` is the same source /readyz and `citadel status` use, and
     # is fail-soft: on a transient read error it returns None totals and
     # `snapshot` falls back to the in-memory values rather than raising here.
-    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
+    snapshot = await get_mesh().snapshot(
+        citadel.config, corpus=await _bounded_corpus_health()
+    )
     return jsonable_encoder(scope_mesh_snapshot(snapshot, identity))
 
 
@@ -4683,7 +4935,9 @@ async def indexes(request: Request) -> Any:
     citadel = get_citadel()
     # Pass the authoritative corpus figures so the dashboard reports the vault's
     # real size rather than whatever has happened since the last deploy.
-    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _corpus_health())
+    snapshot = await get_mesh().snapshot(
+        citadel.config, corpus=await _bounded_corpus_health()
+    )
     return jsonable_encoder({"indexes": snapshot["indexes"], "stats": snapshot["stats"]})
 
 
@@ -5533,6 +5787,7 @@ async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
             body.dataset,
             dry_run=body.dry_run,
             max_items=body.max_items,
+            actor=actor,
         )
     except SecretContentError as exc:
         get_access_store().record_event(
@@ -5793,14 +6048,16 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     verification = result.get("verification") or {}
+    result_ok = result.get("ok", True) is True
     get_access_store().record_event(
         action="cognify.run",
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=dataset,
         detail={
             "verify": body.verify,
             "force": body.force,
+            "ok": result_ok,
             "graph_grew": result.get("graph_grew"),
             "graph_before": result.get("graph_before"),
             "graph_after": result.get("graph_after"),
@@ -5810,16 +6067,125 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=dataset,
         detail={
             "operation": "cognify.run",
             "verify": body.verify,
             "force": body.force,
+            "ok": result_ok,
             "graph_grew": result.get("graph_grew"),
             "verification_ok": verification.get("ok") if body.verify else None,
         },
     )
+    if not result_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Cognify verification failed.",
+                "result": jsonable_encoder(result),
+            },
+        )
+    return jsonable_encoder(result)
+
+
+@app.post("/api/corpus/reconcile")
+async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
+    actor = require_access(request, "admin", "sources:sync")
+    citadel = get_citadel()
+    try:
+        if body.recover and body.oversized:
+            raise HTTPException(
+                status_code=422,
+                detail="repair recovery is supported only by the combined census",
+            )
+        if body.oversized:
+            result = await citadel.reconcile_oversized_chunks(
+                dataset=body.dataset,
+                apply=body.apply,
+                force=body.force,
+            )
+        else:
+            kwargs: dict[str, Any] = {
+                "dataset": body.dataset,
+                "apply": body.apply,
+                "force": body.force,
+            }
+            if body.recover:
+                kwargs["recover"] = True
+            result = await citadel.reconcile_corpus(**kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - depends on Cognee config.
+        logger.error("Corpus reconciliation failed: %s", exc.__class__.__name__)
+        get_access_store().record_event(
+            action="corpus.reconcile",
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "apply": body.apply,
+                "force": body.force,
+                "recover": body.recover,
+                "oversized": body.oversized,
+                "error": str(exc),
+            },
+        )
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "operation": "corpus.reconcile",
+                "apply": body.apply,
+                "force": body.force,
+                "recover": body.recover,
+                "oversized": body.oversized,
+                "error_type": exc.__class__.__name__,
+            },
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    result_ok = result.get("ok") is True
+    detail = {
+        "operation": "corpus.reconcile",
+        "apply": body.apply,
+        "force": body.force,
+        "oversized": body.oversized,
+        "ok": result_ok,
+        "reason": result.get("reason"),
+        "repair_required": result.get("repair_required"),
+        "repair_operation_id": result.get("repair_operation_id"),
+        "repair_phase": result.get("repair_phase"),
+        "repair_journal_error": result.get("repair_journal_error"),
+        "post_repair_indexed": result.get("post_repair_indexed"),
+        "post_repair_stored_budget_ok": result.get("post_repair_stored_budget_ok"),
+    }
+    if body.recover:
+        detail["recover"] = True
+    get_access_store().record_event(
+        action="corpus.reconcile",
+        actor=actor,
+        success=result_ok,
+        dataset=body.dataset,
+        detail=detail,
+    )
+    record_mcp_audit(
+        request,
+        actor=actor,
+        success=result_ok,
+        dataset=body.dataset,
+        detail=detail,
+    )
+    if not result_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Corpus reconciliation did not complete.",
+                "result": jsonable_encoder(result),
+            },
+        )
     return jsonable_encoder(result)
 
 
@@ -6638,7 +7004,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     ]
     cleaned_mode = body.cleaned_mode()
     docs_mode = is_docs_mode_query(body.query, mode=cleaned_mode)
-    if docs_mode or is_spec_mode_query(body.query):
+    if docs_mode or is_spec_mode_query(body.query) or len(query_terms(body.query)) == 1:
         normalized = apply_query_ranking(normalized, body.query, mode=cleaned_mode)
     candidates_fetched = len(normalized)
     if filters_active:
@@ -6676,8 +7042,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         # remaining ids deny — the safe under-promise, never a hung request.
         drilldown_deadline = drilldown_started + citadel.config.search_timeout_seconds
 
-        async def _resolve_drilldown(result_id: str) -> bool:
-            if result_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
+        async def _resolve_drilldown(drilldown_id: str) -> bool:
+            if drilldown_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
                 # github drill-down has no ADR-0009 scope gate and resolves via a
                 # different endpoint branch (github_section_document, not
                 # get_document); the endpoint returns 200 for any reader with a
@@ -6689,7 +7055,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             # docs/chunks fall out here.
             try:
                 owner_node_ids = await get_citadel().resolve_document_owner_ids(
-                    result_id
+                    drilldown_id
                 )
             except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
                 return False
@@ -6703,23 +7069,27 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 continue
             envelope = item["_citadel"]
             result_id = str(envelope.get("result_id") or "")
-            document_endpoint = document_endpoint_for_result(result_id)
+            document_id = first_string(item.get("document_id"))
+            drilldown_id = document_id or result_id
+            document_endpoint = document_endpoint_for_result(
+                result_id, document_id=document_id
+            )
             if not document_endpoint:
                 # Synthetic chunk:<hash> id with no backing store — honestly
                 # non-drillable, nothing to resolve.
                 continue
-            if result_id not in drilldown_hint:
+            if drilldown_id not in drilldown_hint:
                 remaining = drilldown_deadline - time.perf_counter()
                 if remaining <= 0:
-                    drilldown_hint[result_id] = False
+                    drilldown_hint[drilldown_id] = False
                 else:
                     try:
-                        drilldown_hint[result_id] = await asyncio.wait_for(
-                            _resolve_drilldown(result_id), timeout=remaining
+                        drilldown_hint[drilldown_id] = await asyncio.wait_for(
+                            _resolve_drilldown(drilldown_id), timeout=remaining
                         )
                     except asyncio.TimeoutError:
-                        drilldown_hint[result_id] = False
-            if drilldown_hint[result_id]:
+                        drilldown_hint[drilldown_id] = False
+            if drilldown_hint[drilldown_id]:
                 envelope["document_endpoint"] = document_endpoint
                 retrieval = envelope.get("retrieval")
                 if isinstance(retrieval, dict):

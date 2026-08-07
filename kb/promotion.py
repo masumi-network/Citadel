@@ -529,6 +529,8 @@ class PromotionEngine:
         seat_dataset: str,
         identity: AccessIdentity,
         proposal: ProposedPromotion,
+        *,
+        attested_by: AccessIdentity | None = None,
     ) -> str:
         """Promote one qualifying item via the org-ready dual-write path.
 
@@ -558,6 +560,14 @@ class PromotionEngine:
         ]
         if proposal.reference_status:
             promotion_tags.append(f"promotion-ref:{proposal.reference_status}")
+        attestation_identity = attested_by or identity
+        attestation = {
+            "promoted_by": (
+                attestation_identity.actor_id.strip()
+                or attestation_identity.actor_name.strip()
+            ),
+            "promoted_at": now_iso(),
+        }
 
         central = None
         try:
@@ -575,6 +585,7 @@ class PromotionEngine:
                 tags=promotion_tags,
                 session_id=None,
                 operation="promotion",
+                attestation=attestation,
             )
         except SecretContentError as exc:
             self.access_store.record_event(
@@ -662,6 +673,7 @@ class PromotionEngine:
         *,
         dry_run: bool = True,
         max_items: int | None = None,
+        actor: AccessIdentity | None = None,
     ) -> dict[str, Any]:
         """Enumerate, decide, and (when ``dry_run=False``) promote.
 
@@ -708,7 +720,12 @@ class PromotionEngine:
                 if proposal.decision != "promote":
                     settled.append(proposal)
                     continue
-                outcome = await self._promote(seat_dataset, identity, proposal)
+                outcome = await self._promote(
+                    seat_dataset,
+                    identity,
+                    proposal,
+                    attested_by=actor,
+                )
                 if outcome == "promoted":
                     promoted += 1
                     settled.append(
@@ -832,7 +849,12 @@ class PromotionEngine:
             reference_status=item.reference_status,
         )
         identity = self._promotion_identity(item.seat_dataset)
-        outcome = await self._promote(item.seat_dataset, identity, proposal)
+        outcome = await self._promote(
+            item.seat_dataset,
+            identity,
+            proposal,
+            attested_by=actor,
+        )
         promoted = outcome == "promoted"
         decided = self.access_store.decide_promotion_pending(
             item_id,

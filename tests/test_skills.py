@@ -5,6 +5,7 @@ import hashlib
 
 from fastapi.testclient import TestClient
 
+import kb.server as server_module
 from kb.server import app
 
 
@@ -41,7 +42,8 @@ def test_list_skills_uses_forwarded_public_url() -> None:
     assert connect["url"] == "https://citadel-archive-production.up.railway.app/skills/connect"
 
 
-def test_discovery_manifest_is_public_and_verifiable() -> None:
+def test_discovery_manifest_is_public_and_verifiable(monkeypatch) -> None:
+    monkeypatch.setattr(server_module, "_BUILD_ID", None)
     client = TestClient(app, base_url="https://citadel.example")
     response = client.get("/.well-known/citadel.json")
 
@@ -55,6 +57,8 @@ def test_discovery_manifest_is_public_and_verifiable() -> None:
         "name": "Citadel Archive",
         "kind": "organization_vault",
         "version": _SERVICE_VERSION,
+        "build_id": None,
+        "deployment_id": None,
         "base_url": "https://citadel.example",
     }
     assert payload["public_endpoints"]["discovery"] == (
@@ -79,6 +83,18 @@ def test_discovery_manifest_is_public_and_verifiable() -> None:
     assert "test-admin" not in serialized
     assert "test-reader" not in serialized
     assert "test-writer" not in serialized
+
+
+def test_discovery_manifest_reports_captured_build_id(monkeypatch) -> None:
+    monkeypatch.setattr(server_module, "_BUILD_ID", "a" * 40)
+    client = TestClient(app, base_url="https://citadel.example")
+
+    first = client.get("/.well-known/citadel.json").json()
+    assert first["service"]["build_id"] == "a" * 40
+
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "b" * 40)
+    second = client.get("/.well-known/citadel.json").json()
+    assert second["service"]["build_id"] == "a" * 40
 
 
 def test_discovery_manifest_uses_forwarded_public_url() -> None:

@@ -48,6 +48,22 @@ SYSTEM_ROOT_DIRECTORY=/data/.cognee_system
 DATA_ROOT_DIRECTORY=/data/.data_storage
 ```
 
+Citadel keeps its own logs at `CITADEL_LOG_LEVEL` and applies a separate
+threshold to Cognee's high-volume task and retrieval loggers. The default
+`CITADEL_COGNEE_LOG_LEVEL=WARNING` preserves warnings and failures without
+flooding Railway's log ingestion. Temporarily set it to `INFO` or `DEBUG` for
+diagnosis, then restore `WARNING`.
+
+Public service surfaces read the package version from `kb.__version__`, captured
+when the web process starts. `build_id` reports `RAILWAY_GIT_COMMIT_SHA` when
+Railway provides it, then `CITADEL_BUILD_ID` as a CI-provided fallback.
+`deployment_id` is reported separately from `RAILWAY_DEPLOYMENT_ID`,
+`RAILWAY_SNAPSHOT_ID`, or `CITADEL_DEPLOYMENT_ID`. A missing source identifier
+stays `null`; a release version or deployment ID must never be used as a commit
+substitute. Deploy from a Git-connected Railway commit, or set
+`CITADEL_BUILD_ID` to the exact `git rev-parse HEAD` value in the deployment
+environment.
+
 Enable pgvector before production ingest:
 
 ```sql

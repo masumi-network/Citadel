@@ -19,10 +19,56 @@ export const ROLE_ORDER: Record<Role, number> = { reader: 1, writer: 2, admin: 3
 
 export type Session = {
   role: Role;
+  default_dataset?: string | null;
+  search_datasets?: string[] | null;
   seat_slug?: string | null;
   node_label?: string | null;
   actor?: { name?: string | null } | null;
 };
+
+export type SearchScope = "all" | "central" | "node";
+
+export type SearchScopeDatasets = {
+  central: string | null;
+  node: string | null;
+};
+
+/* These are the source identities emitted by the current repository-content and
+ * Linear provenance paths and accepted by SearchBody.source. Keep the UI list
+ * narrower than arbitrary text so it only offers known source identities.
+ */
+export const SEARCH_SOURCE_OPTIONS = [
+  { value: "repo-content", label: "Repository content" },
+  { value: "linear-issue", label: "Linear issues" },
+] as const;
+
+export type SearchSource = (typeof SEARCH_SOURCE_OPTIONS)[number]["value"];
+
+const SESSION_TRACES_DATASET = "session-traces";
+
+/** Resolve only dataset IDs whose meaning is established by the session payload.
+ *
+ * A seat response orders its datasets as Node, Central (when allowed), then
+ * session traces. Central is intentionally left unavailable when the response
+ * does not identify a seat, because a lone default dataset is not proof that it
+ * is Central.
+ */
+export function searchScopeDatasets(session: Session | null): SearchScopeDatasets {
+  if (!session?.seat_slug) return { central: null, node: null };
+
+  const datasets = Array.isArray(session.search_datasets)
+    ? session.search_datasets.filter((dataset): dataset is string => Boolean(dataset?.trim()))
+    : [];
+  const defaultDataset = session.default_dataset?.trim() || null;
+  const node =
+    (defaultDataset && datasets.includes(defaultDataset) ? defaultDataset : null) ||
+    datasets.find((dataset) => dataset.startsWith("seat:")) ||
+    null;
+  const central =
+    datasets.find((dataset) => dataset !== node && dataset !== SESSION_TRACES_DATASET) || null;
+
+  return { central, node };
+}
 
 export function canUse(role: Role | null, minimum: Role): boolean {
   return role !== null && ROLE_ORDER[role] >= ROLE_ORDER[minimum];
@@ -73,24 +119,29 @@ export type Source = {
   id?: string;
   name?: string | null;
   source_type?: string;
+  status?: string;
+  url?: string | null;
+  last_checked_at?: string | null;
+  documents?: number | null;
   open_conflicts?: number;
+  last_error?: string | null;
+  last_error_at?: string | null;
   metadata?: { last_security_scan?: { blocked?: boolean; finding_count?: number; highest_severity?: string } };
 };
 
-/* A source in trouble, as far as the API can currently say.
- *
- * There is no `last_error` on `/api/sources` (contract map gap 8), so "failing"
- * is inferred from open conflicts and, for the GitHub source only, a blocked
- * security scan. A source that failed for any other reason is invisible here,
- * and no amount of client code fixes that. */
+/* A source in trouble, using only the fields the current API exposes. */
 export function failingSources(sources: Source[]): Source[] {
   return sources.filter(
     (source) =>
-      (source.open_conflicts ?? 0) > 0 || source.metadata?.last_security_scan?.blocked === true
+      source.status === "error" ||
+      Boolean(source.last_error) ||
+      (source.open_conflicts ?? 0) > 0 ||
+      source.metadata?.last_security_scan?.blocked === true
   );
 }
 
 export function failureReason(source: Source): string {
+  if (source.last_error) return source.last_error;
   const conflicts = source.open_conflicts ?? 0;
   if (source.metadata?.last_security_scan?.blocked) {
     const findings = source.metadata.last_security_scan.finding_count;

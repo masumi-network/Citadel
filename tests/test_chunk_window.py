@@ -66,6 +66,16 @@ def test_budget_is_an_integer_the_operator_can_lower() -> None:
     assert chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS > 0
 
 
+def test_bundled_gpt4o_tokenizer_is_available_without_network() -> None:
+    cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
+
+    assert cache_dir
+    assert (
+        Path(cache_dir) / chunk_window._TIKTOKEN_CACHE_FILENAME
+    ).is_file()
+    assert chunk_window.require_bpe_encoding().name == "o200k_base"
+
+
 def test_budget_env_override_wins(monkeypatch: Any) -> None:
     monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "192")
     assert chunk_window.resolve_chunk_budget() == 192
@@ -341,6 +351,107 @@ def test_newline_is_not_a_word_boundary() -> None:
     assert chunk_window.split_cognee_words("aaa\nbbb") == ["aaa\nbbb"]
 
 
+def test_final_cognee_chunk_validator_accepts_in_budget_text() -> None:
+    assert chunk_window.validate_cognee_chunk_budget(
+        "A short note with ordinary words.", budget=64
+    ) is None
+
+
+def test_final_cognee_chunk_validator_rejects_emitted_over_budget_chunk(
+    monkeypatch: Any,
+) -> None:
+    import importlib
+
+    module = importlib.import_module("cognee.tasks.chunks.chunk_by_paragraph")
+
+    def fake_chunker(text: str, max_chunk_size: int, batch_paragraphs: bool = True) -> Any:
+        yield {"text": text, "chunk_size": max_chunk_size + 1}
+
+    monkeypatch.setattr(module, "chunk_by_paragraph", fake_chunker)
+    violation = chunk_window.validate_cognee_chunk_budget("ordinary", budget=64)
+
+    assert violation is not None
+    assert violation.reason == "chunk_size_over_budget"
+    assert violation.configured_size == 65
+    assert violation.measured_tokens is not None
+    assert "ordinary" not in violation.describe()
+
+
+def test_stored_chunk_check_measures_the_persisted_payload() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {
+            "text": "ordinary words " * 20,
+            "document_id": "doc-a",
+            "chunk_index": 3,
+            "chunk_size": 1,
+        },
+        chunk_id="chunk-a",
+        budget=8,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_over_budget"
+    assert violation.chunk_id == "chunk-a"
+    assert violation.document_id == "doc-a"
+    assert violation.chunk_index == 3
+    assert violation.measured_tokens is not None
+    assert "ordinary" not in str(violation.as_dict())
+
+
+def test_stored_chunk_check_rejects_a_bad_cognee_size_field() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {
+            "text": "short",
+            "document_id": "doc-a",
+            "chunk_index": 0,
+            "chunk_size": 65,
+        },
+        chunk_id="chunk-a",
+        budget=64,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_size_over_budget"
+    assert violation.measured_tokens is not None
+
+
+def test_stored_chunk_check_fails_closed_when_text_is_missing() -> None:
+    violation = chunk_window.check_stored_chunk_payload(
+        {"document_id": "doc-a", "chunk_index": 0},
+        chunk_id="chunk-a",
+        budget=64,
+    )
+
+    assert violation is not None
+    assert violation.reason == "chunk_text_unmeasured"
+    assert violation.measured_tokens is None
+
+
+def test_ingest_rejects_final_chunk_before_remember(monkeypatch: Any) -> None:
+    import asyncio
+    import importlib
+
+    from kb.config import CitadelConfig
+    from kb.service import Citadel
+    from tests.test_service import FakeCognee
+
+    module = importlib.import_module("cognee.tasks.chunks.chunk_by_paragraph")
+
+    def fake_chunker(text: str, max_chunk_size: int, batch_paragraphs: bool = True) -> Any:
+        yield {"text": text, "chunk_size": max_chunk_size + 1}
+
+    monkeypatch.setattr(module, "chunk_by_paragraph", fake_chunker)
+    monkeypatch.setenv(chunk_window.CHUNK_BUDGET_ENV, "64")
+    fake = FakeCognee()
+    citadel = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = asyncio.run(citadel.ingest("ordinary content"))
+
+    assert not result.accepted
+    assert result.reason == "chunk_budget_violation"
+    assert fake.remember_calls == []
+
+
 def test_ingest_refuses_content_cognee_cannot_chunk(monkeypatch: Any) -> None:
     """Refuse and record. One such document fails the whole dataset's pipeline run."""
     import asyncio
@@ -563,7 +674,7 @@ def test_an_uncovered_embedding_provider_is_announced_once_per_process(
 def test_a_tokenizer_that_cannot_load_is_not_retried_on_every_document(
     monkeypatch: Any,
 ) -> None:
-    """``_BPE_ENCODING_FAILED`` is written on one call and read on the next.
+    """An unavailable encoding is cached and read on the next call.
 
     ``check_chunkable`` runs per ingest. Retrying a failed import per document
     would mean an exception and a traceback per document.
@@ -582,7 +693,6 @@ def test_a_tokenizer_that_cannot_load_is_not_retried_on_every_document(
     stub.encoding_for_model = encoding_for_model  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tiktoken", stub)
     monkeypatch.setattr(chunk_window, "_BPE_ENCODING", None)
-    monkeypatch.setattr(chunk_window, "_BPE_ENCODING_FAILED", False)
 
     assert chunk_window._bpe_encoding() is None
     assert chunk_window._bpe_encoding() is None

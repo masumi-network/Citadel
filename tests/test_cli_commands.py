@@ -300,7 +300,7 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     }
     monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
     args = argparse.Namespace(
-        query="kuzu", top_k=10, json=False, node_url="https://node.example",
+        query="kuzu lock", top_k=10, json=False, node_url="https://node.example",
         local=False, dataset=None, session=None,
         type=None, repo=None, path=None, canonical_only=False,
         exclude_ambient=False,
@@ -314,6 +314,24 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     assert "trust: reference-only" in out
     assert "author: alice" in out
     assert "fixed the kuzu lock" in out
+
+
+def test_search_human_literal_query_flattens_ranked_results(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    central = {"text": "unrelated central note", "_citadel": {"dataset": "masumi-network"}}
+    exact = {"text": "quokka-beacon-8823", "_citadel": {"dataset": "seat:alice"}}
+    payload = {
+        "results": [central, exact],
+        "sections": {"central": [central], "session_traces": [], "node": [exact]},
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
+
+    rc = asyncio.run(_search(_search_args(query="quokka-beacon-8823", json=False)))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.index("quokka-beacon-8823") < out.index("unrelated central note")
+    assert "Central\n" not in out
 
 
 def test_search_no_token_exits_one(monkeypatch, capsys) -> None:

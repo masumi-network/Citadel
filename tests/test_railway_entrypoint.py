@@ -432,6 +432,25 @@ def test_cognify_via_api_posts_to_endpoint(monkeypatch: Any) -> None:
     assert captured["auth"] == "Bearer test-admin-key"
 
 
+def test_cognify_via_api_fails_when_response_reports_failure(monkeypatch: Any) -> None:
+    import urllib.request
+
+    class _FakeResp:
+        def __enter__(self) -> "_FakeResp":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": false, "verification": {"ok": false}}'
+
+    monkeypatch.setenv("CITADEL_ADMIN_KEY", "test-admin-key")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: _FakeResp())
+
+    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
+
+
 def test_cognify_via_api_fails_without_admin_key(monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
     assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1

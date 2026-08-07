@@ -37,9 +37,10 @@ class FakeCitadel:
 
 
 class FakeLearningProcess:
-    def __init__(self) -> None:
+    def __init__(self, *, reasons: list[str] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.improve_calls: list[dict[str, Any]] = []
+        self.reasons = list(reasons or [])
 
     async def improve_once(self, **kwargs: Any) -> Any:
         self.improve_calls.append(kwargs)
@@ -73,9 +74,11 @@ class FakeLearningProcess:
             "background_cognify": True,
         }
 
+        reason = self.reasons.pop(0) if self.reasons else "accepted"
+
         class Outcome:
             ingest = IngestResult(
-                True, "accepted", kwargs.get("dataset", "x"), (), cognee_result
+                True, reason, kwargs.get("dataset", "x"), (), cognee_result
             )
             chunk_ingests = ()
             improve = {"ok": True} if kwargs.get("run_improve") else None
@@ -882,6 +885,56 @@ async def test_state_is_checkpointed_per_file_so_a_killed_run_resumes(
     assert result["files_ingested"] == 1
     assert result["files_skipped_by_reason"].get("unchanged") == 1
     assert len(resumed_learning.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_reason", ["queued_not_confirmed", "not_scheduled"])
+async def test_pending_projection_checkpoint_is_retried_before_unchanged(
+    tmp_path: Path, pending_reason: str
+) -> None:
+    """A source receipt without confirmed projection must stay retryable."""
+    state_path = tmp_path / "state.json"
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        # Keep this regression focused on one source file.
+        repo_content_sync_tree_prefixes=("missing/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+    learning = FakeLearningProcess(reasons=[pending_reason, "accepted"])
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    first = await syncer.run()
+
+    assert first["files_ingested"] == 1
+    pending_entry = json.loads(state_path.read_text(encoding="utf-8"))["files"][
+        "masumi-network/sokosumi-cli/README.md"
+    ]
+    assert pending_entry["projection_status"] == "pending"
+    assert pending_entry["projection_reason"] == pending_reason
+    assert "cognee_data_ids" not in pending_entry
+
+    second = await syncer.run()
+
+    assert second["files_ingested"] == 1
+    assert second["files_skipped_by_reason"] == {}
+    assert len(learning.calls) == 2
+    completed_entry = json.loads(state_path.read_text(encoding="utf-8"))["files"][
+        "masumi-network/sokosumi-cli/README.md"
+    ]
+    assert completed_entry["cognee_data_ids"]
+    assert "projection_status" not in completed_entry
 
 
 @pytest.mark.asyncio

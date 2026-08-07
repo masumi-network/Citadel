@@ -132,6 +132,25 @@ async def test_snapshot_contains_base_indexes() -> None:
     }
 
 
+async def test_snapshot_uses_authoritative_corpus_counts_for_indexes() -> None:
+    mesh = MeshState()
+
+    snapshot = await mesh.snapshot(
+        CONFIG,
+        corpus={
+            "indexed_docs": 33189,
+            "indexed_edges": 189046,
+            "tracked_sources": 330,
+            "probe_complete": True,
+            "probe_chunked_documents": 1975,
+        },
+    )
+
+    indexes = {index["id"]: index for index in snapshot["indexes"]}
+    assert indexes["graph"]["records"] == 33189
+    assert indexes["vector"]["records"] == 1975
+
+
 async def test_snapshot_always_includes_central_dataset_node() -> None:
     mesh = MeshState()
     config = CitadelConfig(
@@ -339,17 +358,37 @@ async def test_snapshot_reports_authoritative_corpus_totals() -> None:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_falls_back_when_corpus_is_unavailable() -> None:
-    """_corpus_health fails soft and returns None counts; do not report None."""
+async def test_snapshot_marks_corpus_totals_unknown_when_degraded() -> None:
+    """A timed-out health probe must not present process counters as totals."""
     config = CitadelConfig()
     mesh = MeshState()
     mesh.documents = 4
 
     snapshot = await mesh.snapshot(
-        config, corpus={"ok": True, "tracked_sources": None, "indexed_docs": None}
+        config,
+        corpus={
+            "ok": False,
+            "tracked_sources": None,
+            "indexed_docs": None,
+            "indexed_edges": None,
+            "degraded": "corpus health timed out",
+        },
     )
 
-    assert snapshot["stats"]["tracked_sources"] == 4
+    assert snapshot["stats"]["tracked_sources"] is None
+    assert snapshot["stats"]["nodes"] is None
+    assert snapshot["stats"]["edges"] is None
+    indexes = {index["id"]: index for index in snapshot["indexes"]}
+    assert indexes["graph"] == {
+        "id": "graph",
+        "name": "Graph mesh",
+        "status": "warming",
+        "records": None,
+        "updated_at": None,
+    }
+    assert indexes["vector"]["status"] == "warming"
+    assert indexes["vector"]["records"] is None
+    assert snapshot["stats"]["since_restart"]["documents"] == 4
 
 
 @pytest.mark.asyncio

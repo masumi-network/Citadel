@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 
 from kb.config import CitadelConfig
 from kb.models import FeedbackRequest
+from kb.repair_journal import RepairJournal
 from kb.security_scan import SecretContentError
 from kb.service import MAX_SEARCH_TOP_K, Citadel
 import kb.service as service
@@ -21,6 +23,10 @@ class FakeCognee:
         self.nodes: list[Any] = []
         self.edges: list[Any] = []
         self._pending: list[Any] = []
+
+    @asynccontextmanager
+    async def maintenance(self):
+        yield
 
     async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
         self.remember_calls.append({"data": data, **kwargs})
@@ -40,6 +46,12 @@ class FakeCognee:
         self.improve_calls.append(kwargs)
         return {"improved": True}
 
+    async def get_document(self, document_id: str) -> dict[str, Any]:
+        return {"id": document_id, "body": "A repairable document."}
+
+    async def restore_document_chunks(self, deleted: dict[str, Any]) -> bool:
+        return True
+
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
         self.cognify_calls.append(kwargs)
         # Cognify turns added-but-uncognified data into graph nodes.
@@ -49,6 +61,12 @@ class FakeCognee:
 
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
         return list(self.nodes), list(self.edges)
+
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+        return {document_id: 1 for document_id in document_ids}
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+        return set(document_ids)
 
 
 class EmptyCognee(FakeCognee):
@@ -333,6 +351,1543 @@ async def test_cognify_dataset_force_passes_incremental_loading_false() -> None:
     await kb.cognify_dataset(force=True)
 
     assert fake.cognify_calls == [{"datasets": ["masumi-network"], "force": True}]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_chunks_is_dry_run_by_default() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "zero_chunk_count": 2,
+                "unassigned_zero_chunk_count": 0,
+                "repair_datasets": ["notes"],
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents()
+
+    assert result["ok"] is True
+    assert result["reason"] == "repair_required"
+    assert result["repair_required"] is True
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_chunks_applies_and_rechecks() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+            self.reports = [
+                {
+                    "ok": True,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-zero"],
+                    "repair_document_ids": ["doc-zero"],
+                    "repair_document_datasets": {"doc-zero": ["notes"]},
+                    "unassigned_zero_chunk_count": 0,
+                    "repair_datasets": ["notes"],
+                },
+                {
+                    "ok": True,
+                    "zero_chunk_count": 0,
+                    "unassigned_zero_chunk_count": 0,
+                    "repair_datasets": [],
+                },
+            ]
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return self.reports.pop(0)
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            return await super().cognify(**kwargs)
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert result["after"]["zero_chunk_count"] == 0
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert fake.events == ["lock_enter", "census", "cognify", "census", "lock_exit"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_chunks_refuses_unassigned_apply() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_zero_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "zero_chunk_count": 1,
+                "unassigned_zero_chunk_count": 1,
+                "repair_datasets": [],
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_zero_chunk_documents(apply=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "zero_chunk_documents_without_dataset"
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oversized_chunks_is_dry_run_by_default() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "missing_document_id_violation_count": 0,
+                "orphan_oversized_document_count": 0,
+                "oversized_document_count": 1,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": ["doc-a"],
+                "repair_datasets": ["notes"],
+            }
+
+        async def delete_document_chunks(self, _: list[str]) -> dict[str, Any]:
+            raise AssertionError("dry run must not delete old chunks")
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_oversized_chunks()
+
+    assert result["ok"] is True
+    assert result["reason"] == "oversized_chunks_repair_required"
+    assert result["repair_required"] is True
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oversized_chunks_requires_force_on_apply() -> None:
+    class RepairGateway(FakeCognee):
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "missing_document_id_violation_count": 0,
+                "orphan_oversized_document_count": 0,
+                "oversized_document_count": 1,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": ["doc-a"],
+                "repair_datasets": ["notes"],
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_oversized_chunks(apply=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "oversized_chunks_repair_requires_force"
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oversized_chunks_deletes_rebuilds_and_rechecks(tmp_path) -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "missing_document_id_violation_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 2,
+                    "oversized_documents_truncated": True,
+                    "unassigned_oversized_document_count": 0,
+                    "repair_document_ids": ["doc-a"],
+                    "repair_datasets": ["notes"],
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "missing_document_id_violation_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_documents_truncated": False,
+                    "unassigned_oversized_document_count": 0,
+                    "repair_document_ids": [],
+                    "repair_datasets": [],
+                },
+            ]
+            self.deleted: list[str] = []
+
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.deleted.extend(document_ids)
+            return {"document_ids": document_ids, "vector_chunk_count": 2, "graph_node_count": 2}
+
+        async def corpus_chunk_counts(self, _: list[str]) -> dict[str, int]:
+            return {"doc-a": 4}
+
+        async def corpus_graph_presence(self, _: list[str]) -> set[str]:
+            return {"doc-a"}
+
+    fake = RepairGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert fake.deleted == ["doc-a"]
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert result["post_repair_indexed"] is True
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert [event["phase"] for event in journal] == [
+        "started",
+        "preflight",
+        "preflight",
+        "delete",
+        "delete",
+        "cognify",
+        "cognify",
+        "post_census",
+        "post_census",
+        "post_index_check",
+        "post_index_check",
+    ]
+    assert journal[-1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oversized_chunks_preflights_before_delete() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted = False
+
+        async def get_document(self, document_id: str) -> dict[str, Any]:
+            return {"id": document_id, "body": "x" * 100_000}
+
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "missing_document_id_violation_count": 0,
+                "orphan_oversized_document_count": 0,
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": ["doc-a"],
+                "repair_datasets": ["notes"],
+            }
+
+        async def delete_document_chunks(self, _: list[str]) -> dict[str, Any]:
+            self.deleted = True
+            raise AssertionError("invalid source must be rejected before delete")
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_preflight_failed"
+    assert result["preflight"]["reason"] == "unchunkable_content"
+    assert fake.deleted is False
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_oversized_chunks_fails_closed_without_restore_capability() -> None:
+    class NoRollbackGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_document_chunks = None
+
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "missing_document_id_violation_count": 0,
+                "orphan_oversized_document_count": 0,
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_documents_truncated": False,
+                "unassigned_oversized_document_count": 0,
+                "repair_document_ids": ["doc-a"],
+                "repair_datasets": ["notes"],
+            }
+
+        async def delete_document_chunks(self, _: list[str]) -> dict[str, Any]:
+            raise AssertionError("restore capability must be checked before delete")
+
+    fake = NoRollbackGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_rollback_unavailable"
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock(tmp_path) -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-zero"],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 2,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": ["doc-zero"],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over", "doc-zero"],
+                    "repair_document_datasets": {
+                        "doc-over": ["notes"],
+                        "doc-zero": ["notes"],
+                    },
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 2,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+            self.deleted: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return self.reports.pop(0)
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            self.deleted.extend(document_ids)
+            return {"document_ids": document_ids}
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            self.events.append("counts")
+            return {document_id: 3 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            self.events.append("graph")
+            return set(document_ids)
+
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {
+                document_id: {"content_hash": f"hash-{document_id}"}
+                for document_id in document_ids
+            }
+
+    fake = RepairGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert fake.deleted == ["doc-over"]
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert result["post_repair_indexed"] is True
+    assert result["post_repair_stored_budget_ok"] is True
+    assert fake.events == [
+        "lock_enter",
+        "census",
+        "delete",
+        "cognify",
+        "census",
+        "counts",
+        "graph",
+        "lock_exit",
+    ]
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[0]["phase"] == "started"
+    assert journal[0]["repair_document_ids"] == ["doc-over", "doc-zero"]
+    assert journal[0]["source_manifest"] == {
+        "doc-over": {"content_hash": "hash-doc-over"},
+        "doc-zero": {"content_hash": "hash-doc-zero"},
+    }
+    assert journal[-1]["status"] == "completed"
+    assert journal[-1]["post_repair_indexed"] is True
+    assert journal[-1]["post_repair_stored_budget_ok"] is True
+    assert all("text" not in event for event in journal)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_apply_when_source_manifest_fails(tmp_path) -> None:
+    class UnreadableSourceGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "zero_chunk_count": 1,
+                "zero_chunk_document_ids": ["doc-zero"],
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_document_ids": ["doc-over"],
+                "zero_repair_document_ids": ["doc-zero"],
+                "oversized_repair_document_ids": ["doc-over"],
+                "repair_document_ids": ["doc-over", "doc-zero"],
+                "repair_document_datasets": {
+                    "doc-over": ["notes"],
+                    "doc-zero": ["notes"],
+                },
+                "repair_datasets": ["notes"],
+                "unassigned_zero_chunk_document_count": 0,
+                "unassigned_oversized_document_count": 0,
+                "orphan_oversized_document_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def source_manifest_for_documents(
+            self, _: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            raise RuntimeError("source unavailable")
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.deleted.extend(document_ids)
+            return {"document_ids": document_ids}
+
+    fake = UnreadableSourceGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_source_manifest_unavailable"
+    assert fake.deleted == []
+    assert fake.cognify_calls == []
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_keeps_repair_datasets_and_ids_separate(tmp_path) -> None:
+    class MultiDatasetGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted: list[str] = []
+            self.census_calls: list[dict[str, Any]] = []
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 2,
+                    "zero_chunk_document_ids": ["doc-notes-zero", "doc-other-zero"],
+                    "oversized_document_count": 2,
+                    "oversized_chunk_count": 2,
+                    "oversized_document_ids": ["doc-notes-over", "doc-other-over"],
+                    "zero_repair_document_ids": ["doc-notes-zero", "doc-other-zero"],
+                    "oversized_repair_document_ids": ["doc-notes-over", "doc-other-over"],
+                    "repair_document_ids": [
+                        "doc-notes-over",
+                        "doc-notes-zero",
+                        "doc-other-over",
+                        "doc-other-zero",
+                    ],
+                    "repair_document_datasets": {
+                        "doc-notes-over": ["notes"],
+                        "doc-notes-zero": ["notes"],
+                        "doc-other-over": ["other"],
+                        "doc-other-zero": ["other"],
+                    },
+                    "repair_datasets": ["notes", "other"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 2,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def corpus_reconciliation_census(self, **kwargs: Any) -> dict[str, Any]:
+            self.census_calls.append(kwargs)
+            return self.reports.pop(0)
+
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: {"content_hash": document_id} for document_id in document_ids}
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.deleted.extend(document_ids)
+            return {"document_ids": document_ids}
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 2 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+    fake = MultiDatasetGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(tmp_path / "repair.jsonl")),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is True
+    assert fake.deleted == ["doc-notes-over", "doc-other-over"]
+    assert fake.cognify_calls == [{"datasets": ["notes", "other"], "force": True}]
+    assert fake.census_calls == [{"dataset": None}, {"dataset": None}]
+    assert result["repair_document_ids"] == [
+        "doc-notes-over",
+        "doc-notes-zero",
+        "doc-other-over",
+        "doc-other-zero",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_recovers_interrupted_source_backed_repair(tmp_path) -> None:
+    manifest = {"doc-a": {"content_hash": "hash-a", "data_size": 12}}
+    clean = {
+        "ok": True,
+        "census_complete": True,
+        "cap_exceeded": False,
+        "zero_chunk_count": 0,
+        "oversized_document_count": 0,
+        "oversized_chunk_count": 0,
+        "unassigned_zero_chunk_document_count": 0,
+        "unassigned_oversized_document_count": 0,
+        "orphan_oversized_document_count": 0,
+        "missing_document_id_violation_count": 0,
+        "zero_chunk_document_ids": [],
+        "oversized_document_ids": [],
+        "zero_repair_document_ids": [],
+        "oversized_repair_document_ids": [],
+        "repair_document_ids": [],
+        "repair_document_datasets": {},
+        "repair_datasets": [],
+    }
+
+    class RecoveryGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [dict(clean), dict(clean)]
+
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: manifest[document_id] for document_id in document_ids}
+
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            # Scoped repair journals its target dataset; a shared document may
+            # also remain attached to another dataset without being drift.
+            return {document_id: ["notes", "other"] for document_id in document_ids}
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 2 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+    journal_path = tmp_path / "repair.jsonl"
+    journal = RepairJournal(journal_path)
+    journal.append(
+        operation_id="interrupted-op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+        repair_document_datasets={"doc-a": ["notes"]},
+        source_manifest=manifest,
+    )
+    fake = RecoveryGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "no_repair_required"
+    assert result["recovery"]["reason"] == "recovered_interrupted_repairs"
+    assert result["recovery"]["recovered_operations"] == ["interrupted-op"]
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": True}]
+    assert RepairJournal(journal_path).pending_operations() == []
+    records = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert [record["phase"] for record in records[-2:]] == ["recovery", "recovery"]
+    assert records[-1]["status"] == "completed"
+    assert records[-1]["reason"] == "source_backed_rebuild"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_continues_normal_repair_after_recovery_postcheck(tmp_path) -> None:
+    manifest = {"doc-a": {"content_hash": "hash-a", "data_size": 12}}
+
+    def census(*, oversized: bool) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "census_complete": True,
+            "cap_exceeded": False,
+            "zero_chunk_count": 0,
+            "oversized_document_count": 1 if oversized else 0,
+            "oversized_chunk_count": 1 if oversized else 0,
+            "unassigned_zero_chunk_document_count": 0,
+            "unassigned_oversized_document_count": 0,
+            "orphan_oversized_document_count": 0,
+            "missing_document_id_violation_count": 0,
+            "zero_chunk_document_ids": [],
+            "oversized_document_ids": ["doc-a"] if oversized else [],
+            "zero_repair_document_ids": [],
+            "oversized_repair_document_ids": ["doc-a"] if oversized else [],
+            "repair_document_ids": ["doc-a"] if oversized else [],
+            "repair_document_datasets": {"doc-a": ["notes"]} if oversized else {},
+            "repair_datasets": ["notes"] if oversized else [],
+            "stored_chunk_budget": {
+                "ok": True,
+                "violation_count": 0,
+                "missing_document_id_violation_count": 0,
+            },
+            "budget": 1000,
+        }
+
+    class RecoveryContinuationGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                census(oversized=True),
+                census(oversized=True),
+                census(oversized=False),
+                census(oversized=False),
+            ]
+
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: manifest[document_id] for document_id in document_ids}
+
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["notes"] for document_id in document_ids}
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            return {"document_ids": document_ids}
+
+        async def stored_chunk_budget_check(
+            self, document_ids: list[str], *, budget: int | None = None
+        ) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "document_ids": document_ids,
+                "budget": budget,
+                "violation_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+    journal_path = tmp_path / "repair.jsonl"
+    RepairJournal(journal_path).append(
+        operation_id="interrupted-op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+        repair_document_datasets={"doc-a": ["notes"]},
+        source_manifest=manifest,
+    )
+    fake = RecoveryContinuationGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "no_repair_required"
+    assert result["recovery"]["recovered_operations"] == ["interrupted-op"]
+    assert fake.cognify_calls == [
+        {"datasets": ["notes"], "force": True},
+        {"datasets": ["notes"], "force": True},
+    ]
+    assert RepairJournal(journal_path).pending_operations() == []
+    records = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    recovery_terminal = [
+        record
+        for record in records
+        if record["operation_id"] == "interrupted-op" and record["status"] == "completed"
+    ]
+    assert recovery_terminal[-1]["reason"] == "source_backed_rebuild_then_repair"
+    assert recovery_terminal[-1]["post_repair_indexed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_recovery_when_source_changed(tmp_path) -> None:
+    journal_path = tmp_path / "repair.jsonl"
+    expected = {"doc-a": {"content_hash": "before"}}
+    RepairJournal(journal_path).append(
+        operation_id="changed-op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+        repair_document_datasets={"doc-a": ["notes"]},
+        source_manifest=expected,
+    )
+
+    class ChangedSourceGateway(FakeCognee):
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: {"content_hash": "after"} for document_id in document_ids}
+
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["notes"] for document_id in document_ids}
+
+    fake = ChangedSourceGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_source_changed"
+    assert fake.cognify_calls == []
+    assert result["pending_operations"][0]["operation_id"] == "changed-op"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_recovery_when_dataset_membership_changed(
+    tmp_path,
+) -> None:
+    manifest = {"doc-a": {"content_hash": "same"}}
+    journal_path = tmp_path / "repair.jsonl"
+    RepairJournal(journal_path).append(
+        operation_id="membership-drift-op",
+        dataset="notes",
+        phase="delete",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+        repair_document_datasets={"doc-a": ["notes"]},
+        source_manifest=manifest,
+    )
+
+    class ChangedMembershipGateway(FakeCognee):
+        async def source_manifest_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, dict[str, Any]]:
+            return {document_id: manifest[document_id] for document_id in document_ids}
+
+        async def dataset_membership_for_documents(
+            self, document_ids: list[str]
+        ) -> dict[str, list[str]]:
+            return {document_id: ["other"] for document_id in document_ids}
+
+    fake = ChangedMembershipGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_dataset_membership_changed"
+    assert fake.cognify_calls == []
+    assert result["pending_operations"][0]["operation_id"] == "membership-drift-op"
+    assert result["pending_operations"][0]["reason"] == (
+        "repair_dataset_membership_changed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_recovery_without_source_manifest(tmp_path) -> None:
+    journal_path = tmp_path / "repair.jsonl"
+    RepairJournal(journal_path).append(
+        operation_id="legacy-op",
+        dataset="notes",
+        phase="cognify",
+        status="started",
+        repair_document_ids=["doc-a"],
+        repair_datasets=["notes"],
+    )
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True, recover=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_recovery_context_unavailable"
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_recovery_requires_apply() -> None:
+    result = await Citadel(CitadelConfig(default_dataset="notes"), cognee=FakeCognee()).reconcile_corpus(
+        recover=True
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_recovery_requires_apply"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_recovery_requires_force() -> None:
+    result = await Citadel(CitadelConfig(default_dataset="notes"), cognee=FakeCognee()).reconcile_corpus(
+        apply=True, recover=True
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_recovery_requires_force"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_allows_zero_chunk_repair_without_projection_body() -> None:
+    class ZeroChunkGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-zero"],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": ["doc-zero"],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": ["doc-zero"],
+                    "repair_document_datasets": {"doc-zero": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+            self.restore_document_chunks = None
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def get_document(self, _: str) -> None:
+            return None
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 1 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+        async def delete_document_chunks(self, _: list[str]) -> dict[str, Any]:
+            raise AssertionError("zero-chunk repair must not delete projections")
+
+    fake = ZeroChunkGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(apply=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert fake.cognify_calls == [{"datasets": ["notes"], "force": False}]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_refuses_incomplete_census_before_mutation() -> None:
+    class RepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": False,
+                "census_complete": False,
+                "cap_exceeded": False,
+                "reason": "incomplete_corpus_walk",
+            }
+
+    fake = RepairGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "incomplete_corpus_walk"
+    assert fake.cognify_calls == []
+    assert fake.events == ["lock_enter", "census", "lock_exit"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_reports_failure_phase_after_deletion(tmp_path) -> None:
+    class FailingGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+            self.projections = {"doc-over": "old projection"}
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            if self.events.count("census") == 1:
+                return {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 1,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over"],
+                    "repair_document_datasets": {"doc-over": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                }
+            raise AssertionError("post-census must not run after cognify failure")
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            self.projections.clear()
+            return {"document_ids": document_ids}
+
+        async def restore_document_chunks(self, deleted: dict[str, Any]) -> bool:
+            self.events.append("restore")
+            self.projections["doc-over"] = "old projection"
+            return True
+
+        async def cognify(self, **_: Any) -> dict[str, Any]:
+            self.events.append("cognify")
+            raise RuntimeError("cognify failed")
+
+    fake = FailingGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_failed"
+    assert result["repair_phase"] == "cognify"
+    assert result["error_type"] == "RuntimeError"
+    assert result["deleted"] == {"document_ids": ["doc-over"]}
+    assert result["repair_required"] is True
+    assert fake.events == [
+        "lock_enter",
+        "census",
+        "delete",
+        "cognify",
+        "restore",
+        "lock_exit",
+    ]
+    assert fake.projections == {"doc-over": "old projection"}
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[-1]["status"] == "failed"
+    assert journal[-1]["phase"] == "cognify"
+    assert journal[-1]["error_type"] == "RuntimeError"
+    assert journal[-1]["deleted_document_ids"] == ["doc-over"]
+    assert journal[-1]["projections_preserved"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair_method", ["combined", "oversized"])
+async def test_reconcile_stops_after_partial_delete_failure(
+    tmp_path, repair_method: str
+) -> None:
+    class PartialDeleteGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[str] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            self.events.append("lock_enter")
+            try:
+                yield
+            finally:
+                self.events.append("lock_exit")
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "zero_chunk_count": 0,
+                "zero_chunk_document_ids": [],
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_document_ids": ["doc-over"],
+                "zero_repair_document_ids": [],
+                "oversized_repair_document_ids": ["doc-over"],
+                "repair_document_ids": ["doc-over"],
+                "repair_document_datasets": {"doc-over": ["notes"]},
+                "repair_datasets": ["notes"],
+                "unassigned_zero_chunk_document_count": 0,
+                "unassigned_oversized_document_count": 0,
+                "orphan_oversized_document_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def corpus_oversized_chunk_documents(self, **_: Any) -> dict[str, Any]:
+            self.events.append("census")
+            return {
+                "ok": True,
+                "census_complete": True,
+                "cap_exceeded": False,
+                "oversized_document_count": 1,
+                "oversized_chunk_count": 1,
+                "oversized_documents_truncated": False,
+                "repair_document_ids": ["doc-over"],
+                "repair_datasets": ["notes"],
+                "unassigned_oversized_document_count": 0,
+                "orphan_oversized_document_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            self.events.append("delete")
+            return {
+                "ok": False,
+                "document_ids": document_ids,
+                "snapshot_token": "snap-1",
+                "reason": "repair_delete_failed",
+                "error_type": "RuntimeError",
+                "projections_preserved": True,
+            }
+
+        async def restore_document_chunks(self, _: dict[str, Any]) -> bool:
+            self.events.append("restore")
+            return True
+
+        async def cognify(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("cognify must not run after a failed delete")
+
+    fake = PartialDeleteGateway()
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=fake,
+    )
+
+    if repair_method == "combined":
+        result = await kb.reconcile_corpus(apply=True, force=True)
+    else:
+        result = await kb.reconcile_oversized_chunks(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "repair_delete_failed"
+    assert result["repair_phase"] == "delete"
+    assert result["deleted"]["snapshot_token"] == "snap-1"
+    assert result["projections_preserved"] is True
+    assert fake.events == ["lock_enter", "census", "delete", "lock_exit"]
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert journal[-1]["status"] == "failed"
+    assert journal[-1]["phase"] == "delete"
+    assert journal[-1]["reason"] == "repair_delete_failed"
+    assert journal[-1]["projections_preserved"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_restores_when_post_check_invariants_remain(tmp_path) -> None:
+    class IncompleteRepairGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 1,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over"],
+                    "repair_document_datasets": {"doc-over": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 1,
+                    "oversized_chunk_count": 1,
+                    "oversized_document_ids": ["doc-over"],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": ["doc-over"],
+                    "repair_document_ids": ["doc-over"],
+                    "repair_document_datasets": {"doc-over": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+            self.restored: list[dict[str, Any]] = []
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+            return {"document_ids": document_ids, "snapshot_token": "snap-1"}
+
+        async def restore_document_chunks(self, deleted: dict[str, Any]) -> bool:
+            self.restored.append(deleted)
+            return True
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 1 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+    fake = IncompleteRepairGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(tmp_path / "repair.jsonl")),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "reconciliation_invariants_remain"
+    assert result["projections_preserved"] is True
+    assert fake.restored == [{"document_ids": ["doc-over"], "snapshot_token": "snap-1"}]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_rejects_remaining_global_invariants(tmp_path) -> None:
+    class IncompleteGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-zero"],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": ["doc-zero"],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": ["doc-zero"],
+                    "repair_document_datasets": {"doc-zero": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 1,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": True,
+                        "violation_count": 0,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 1 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+    fake = IncompleteGateway()
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(tmp_path / "repair.jsonl")),
+        cognee=fake,
+    )
+
+    result = await kb.reconcile_corpus(apply=True, force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "reconciliation_invariants_remain"
+    assert result["post_repair_indexed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_corpus_scopes_post_budget_to_requested_dataset() -> None:
+    class ScopedGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 1,
+                    "zero_chunk_document_ids": ["doc-notes"],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": ["doc-notes"],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": ["doc-notes"],
+                    "repair_document_datasets": {"doc-notes": ["notes"]},
+                    "repair_datasets": ["notes"],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "census_complete": True,
+                    "cap_exceeded": False,
+                    "zero_chunk_count": 0,
+                    "zero_chunk_document_ids": [],
+                    "oversized_document_count": 0,
+                    "oversized_chunk_count": 0,
+                    "oversized_document_ids": [],
+                    "zero_repair_document_ids": [],
+                    "oversized_repair_document_ids": [],
+                    "repair_document_ids": [],
+                    "repair_document_datasets": {},
+                    "repair_datasets": [],
+                    "unassigned_zero_chunk_document_count": 0,
+                    "unassigned_oversized_document_count": 0,
+                    "orphan_oversized_document_count": 0,
+                    "missing_document_id_violation_count": 0,
+                    "stored_chunk_budget": {
+                        "ok": False,
+                        "violation_count": 1,
+                        "missing_document_id_violation_count": 0,
+                    },
+                },
+            ]
+
+        @asynccontextmanager
+        async def maintenance(self):
+            yield
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+        async def stored_chunk_budget_check(
+            self, document_ids: list[str], **_: Any
+        ) -> dict[str, Any]:
+            assert document_ids == ["doc-notes"]
+            return {
+                "ok": True,
+                "scope": "document_ids",
+                "violation_count": 0,
+                "missing_document_id_violation_count": 0,
+            }
+
+        async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+            self.cognify_calls.append(kwargs)
+            return {"ok": True}
+
+        async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+            return {document_id: 1 for document_id in document_ids}
+
+        async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+            return set(document_ids)
+
+    fake = ScopedGateway()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.reconcile_corpus(dataset="notes", apply=True, force=True)
+
+    assert result["ok"] is True
+    assert result["reason"] == "repaired"
+    assert result["post_repair_stored_budget_ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_ingest_reports_queued_not_confirmed_until_cognify_finishes() -> None:
+    class QueuedCognee(FakeCognee):
+        async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+            self.remember_calls.append({"data": data, **kwargs})
+            return {"added": {"ok": True}, "background_cognify": True}
+
+    fake = QueuedCognee()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.ingest("a queued note")
+
+    assert result.accepted is True
+    assert result.reason == "queued_not_confirmed"
 
 
 @pytest.mark.asyncio

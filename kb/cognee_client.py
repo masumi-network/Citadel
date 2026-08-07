@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import contextvars
+from hashlib import md5
 import json
 import logging
 import os
-from collections.abc import Iterator
+import secrets
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import datetime, timezone
 from time import monotonic, perf_counter
 from typing import Any, Protocol
@@ -14,6 +17,7 @@ from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
+from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,59 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 10_000
+MAX_ZERO_CHUNK_REPORT_DOCUMENTS = 1_000
+MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS = 1_000
+MAX_REPAIR_SNAPSHOTS = 32
+
+
+def _corpus_health_max_documents() -> int:
+    raw = os.getenv(
+        "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS",
+        str(DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        ) from exc
+    if value < 1:
+        raise RuntimeError(
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+        )
+    return value
+
+
+def _cognify_data_ids(result: Any) -> list[str]:
+    """Extract source ``Data.id`` values from a blocking cognify result.
+
+    Cognee returns one ``PipelineRunInfo`` per dataset. Its
+    ``data_ingestion_info`` entries are mappings containing ``data_id``. Keep the
+    parser tolerant of the single-result and list-shaped variants so the stored
+    chunk guard remains scoped to the pass that just ran.
+    """
+    if isinstance(result, Mapping):
+        runs = list(result.values())
+    elif isinstance(result, (list, tuple)):
+        runs = list(result)
+    else:
+        runs = [result]
+
+    data_ids: list[str] = []
+    for run in runs:
+        info = getattr(run, "data_ingestion_info", None)
+        if info is None and isinstance(run, Mapping):
+            info = run.get("data_ingestion_info")
+        if not isinstance(info, (list, tuple)):
+            continue
+        for item in info:
+            data_id = item.get("data_id") if isinstance(item, Mapping) else getattr(item, "data_id", None)
+            if data_id is not None:
+                data_ids.append(str(data_id))
+    return list(dict.fromkeys(data_ids))
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -135,9 +192,9 @@ def assert_cognee_dataset_api() -> None:
     # The corpus census (corpus_page / corpus_totals / corpus_chunk_counts /
     # corpus_graph_presence) leans on more private surface than dataset
     # attribution does: specific Data/Dataset/DatasetData columns, the pgvector
-    # adapter's table reflection + session, and the graph adapter's batched
-    # node lookup. Pin each one so a cognee bump that moves any of them fails
-    # loudly at boot and in CI instead of quietly breaking the census.
+    # adapter's table reflection + session, and the graph adapter's raw query
+    # surface. Pin each one so a cognee bump that moves any of them fails loudly
+    # at boot and in CI instead of quietly breaking the census.
     from cognee.infrastructure.databases.graph.ladybug.adapter import LadybugAdapter
     from cognee.infrastructure.databases.vector import get_vector_engine  # noqa: F401
     from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
@@ -174,7 +231,8 @@ def assert_cognee_dataset_api() -> None:
     for adapter, method_name in (
         (PGVectorAdapter, "get_table"),
         (PGVectorAdapter, "get_async_session"),
-        (LadybugAdapter, "get_nodes"),
+        (PGVectorAdapter, "delete_data_points"),
+        (LadybugAdapter, "query"),
     ):
         if not callable(getattr(adapter, method_name, None)):
             raise RuntimeError(
@@ -185,6 +243,9 @@ def assert_cognee_dataset_api() -> None:
 
 _SUPPRESS_INLINE_COGNIFY: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "citadel_suppress_inline_cognify", default=False
+)
+_COGNEE_MAINTENANCE_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "citadel_cognee_maintenance_held", default=False
 )
 
 
@@ -266,12 +327,13 @@ class CogneeGateway(Protocol):
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
-        ...
+        raise NotImplementedError
 
     def schedule_cognify(self, datasets: list[str]) -> None:
-        ...
+        raise NotImplementedError
 
     async def recall(
         self,
@@ -281,7 +343,7 @@ class CogneeGateway(Protocol):
         session_id: str | None = None,
         top_k: int = 10,
     ) -> list[Any]:
-        ...
+        raise NotImplementedError
 
     async def add_feedback(
         self,
@@ -291,7 +353,7 @@ class CogneeGateway(Protocol):
         score: int | None,
         text: str | None,
     ) -> bool:
-        ...
+        raise NotImplementedError
 
     async def improve(
         self,
@@ -300,22 +362,82 @@ class CogneeGateway(Protocol):
         session_ids: list[str] | None = None,
         build_global_context_index: bool = False,
     ) -> Any:
-        ...
+        raise NotImplementedError
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
-        ...
+        raise NotImplementedError
+
+    async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
+        raise NotImplementedError
+
+    def maintenance(self) -> AsyncIterator[None]:
+        raise NotImplementedError
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
-        ...
+        raise NotImplementedError
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
-        ...
+        raise NotImplementedError
 
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
-        ...
+        raise NotImplementedError
+
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
+        raise NotImplementedError
+
+    async def source_manifest_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        raise NotImplementedError
+
+    async def dataset_membership_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, list[str]]:
+        raise NotImplementedError
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+        raise NotImplementedError
+
+    async def corpus_zero_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def corpus_oversized_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def corpus_reconciliation_census(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
 
     async def delete_graph_nodes(self, node_ids: list[str]) -> int:
-        ...
+        raise NotImplementedError
+
+    async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
+        raise NotImplementedError
+
+    async def discard_document_chunk_snapshot(
+        self, deleted: Mapping[str, Any]
+    ) -> bool:
+        raise NotImplementedError
 
 
 class CogneePublicClient:
@@ -329,6 +451,10 @@ class CogneePublicClient:
         # Phase-1 subprocess so the web never cognifies while the subprocess owns
         # the on-disk Kuzu lock.
         self.writer_lock = asyncio.Lock()
+        # Serializes corpus repair with every regular cognify call in this
+        # process. The repair context keeps this lock across census, deletion,
+        # rebuild, and post-repair verification.
+        self.maintenance_lock = asyncio.Lock()
         # node→dataset attribution cache: (monotonic_ts, mapping, ok). ``ok``
         # distinguishes a fresh successful read (full TTL) from a cached
         # failure (short failure TTL), and the last successful mapping is kept
@@ -343,6 +469,11 @@ class CogneePublicClient:
         # single-flight lock so a burst of dashboard opens shares one Kuzu read.
         self._graph_data_cache: tuple[float, tuple[list[Any], list[Any]]] | None = None
         self._graph_data_lock = asyncio.Lock()
+        # Repair snapshots stay process-local and are addressed by an opaque,
+        # single-use token returned from delete_document_chunks. Keeping the
+        # snapshot out of the result prevents payload/text from crossing the
+        # service boundary while preserving exact rollback data for the caller.
+        self._repair_snapshots: dict[str, dict[str, Any]] = {}
 
     def _copy_env_if_missing(self, target: str, *sources: str) -> None:
         if os.getenv(target):
@@ -484,6 +615,10 @@ class CogneePublicClient:
         return attach(data)
 
     async def _ensure_cognee_ready(self, cognee: Any) -> None:
+        # Cognee configures structlog on import and emits high-volume INFO
+        # records during cognify/search. Apply Citadel's scoped threshold after
+        # that setup, without hiding Citadel's own INFO records.
+        configure_cognee_logging()
         if self._startup_migrations_done:
             return
         run_startup_migrations = getattr(cognee, "run_startup_migrations", None)
@@ -507,13 +642,29 @@ class CogneePublicClient:
         dataset_name: str,
         session_id: str | None = None,
         tags: tuple[str, ...] = (),
+        attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
     ) -> Any:
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
-        metadata = {"citadel_tags": list(tags)} if tags else None
+        metadata: dict[str, Any] = {}
+        if tags:
+            metadata["citadel_tags"] = list(tags)
+        if attestation:
+            promoted_by = attestation.get("promoted_by")
+            promoted_at = attestation.get("promoted_at")
+            if (
+                isinstance(promoted_by, str)
+                and promoted_by.strip()
+                and isinstance(promoted_at, str)
+                and promoted_at.strip()
+            ):
+                metadata["citadel_attestation"] = {
+                    "promoted_by": promoted_by.strip(),
+                    "promoted_at": promoted_at.strip(),
+                }
         # Durable knowledge writes always go to cognee's permanent graph
         # (add+cognify), never its per-session cache. When a session_id was
         # supplied, cognee routed the write into the session cache, which (a)
@@ -523,10 +674,11 @@ class CogneePublicClient:
         # scaffolded "Session ID:/Question:/Answer:" blob every sync cycle.
         # session_id is still accepted (callers pass it as provenance) but no
         # longer diverts the write away from the durable path.
-        data = self._data_with_metadata(data, metadata)
+        data = self._data_with_metadata(data, metadata or None)
 
-        # Add is a fast write to the relational + vector stores; it does NOT touch
-        # the Kuzu graph (cognify is the graph write). Metadata rides in the
+        # Add is a fast write to Cognee's relational/source stores; it does NOT
+        # create chunks, embeddings, or touch the Kuzu graph. Cognify is the
+        # chunk, vector, and graph write. Metadata rides in the
         # DataItem (external_metadata) via _data_with_metadata, never as an add()
         # keyword — cognee rejects external_metadata as a kwarg.
         added = await cognee.add(data, dataset_name=dataset_name)
@@ -581,9 +733,9 @@ class CogneePublicClient:
         except RuntimeError:
             # Silent here meant content was recorded as ingested and never
             # reached the graph, with nothing in the logs either way. cognee.add
-            # writes the relational and vector stores; ONLY cognify writes Kuzu.
-            # Skipping it makes a document that exists as a row and cannot be
-            # retrieved. Say so.
+            # writes the relational/source stores; ONLY cognify writes chunks,
+            # vectors, and Kuzu graph state. Skipping it makes a document that
+            # exists as a row and cannot be retrieved. Say so.
             logger.error(
                 "cognify NOT scheduled for %s: no running event loop. The data "
                 "is stored but will not be searchable until a cognify runs.",
@@ -745,6 +897,10 @@ class CogneePublicClient:
             self._graph_data_cache = (monotonic(), result)
             return result
 
+    def _invalidate_graph_data_cache(self) -> None:
+        """Drop the raw graph snapshot after a successful graph mutation."""
+        self._graph_data_cache = None
+
     async def _read_graph_data(self) -> tuple[list[Any], list[Any]]:
         self._prepare_cognee_environment()
         import cognee
@@ -853,6 +1009,47 @@ class CogneePublicClient:
             for data_id, dataset_name in rows.all():
                 mapping.setdefault(str(data_id), []).append(dataset_name)
         return mapping
+
+    async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
+        """Return source ids in the authorized datasets, without graph access.
+
+        Forced cognify must verify the receipt against the same dataset scope
+        Cognee resolves for the current user. Querying DatasetData through
+        Cognee's authorized dataset ids avoids treating another owner's
+        same-named dataset as part of the rebuild.
+        """
+        wanted = list(dict.fromkeys(str(dataset) for dataset in datasets if str(dataset)))
+        if not wanted:
+            return []
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            dataset_rows = await session.execute(
+                select(Dataset.id).where(
+                    Dataset.owner_id == user.id,
+                    Dataset.tenant_id == user.tenant_id,
+                    Dataset.name.in_(wanted),
+                )
+            )
+            dataset_ids = [dataset_id for (dataset_id,) in dataset_rows.all()]
+            if not dataset_ids:
+                return []
+            rows = await session.execute(
+                select(DatasetData.data_id).where(
+                    DatasetData.dataset_id.in_(dataset_ids)
+                )
+            )
+        return sorted({str(data_id) for (data_id,) in rows.all() if data_id is not None})
 
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
@@ -1047,6 +1244,131 @@ class CogneePublicClient:
             "by_dataset_default_owner": by_dataset_default_owner,
         }
 
+    async def corpus_health(self, *, limit: int = 64) -> dict[str, Any]:
+        """Walk relational rows and verify their vector and graph projections.
+
+        The graph can contain stale or unrelated nodes, so graph volume cannot
+        certify accepted relational documents. Walk the relational corpus with
+        keyset pagination and inspect each page's exact ids in both projections.
+        The hard document cap prevents readiness from doing unbounded work.
+        """
+        probe_limit = max(1, min(int(limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        empty_result = {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": 0,
+            "probe_pages": 0,
+            "probe_complete": False,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": 0,
+            "probe_graph_documents": 0,
+            "probe_fully_indexed_documents": 0,
+            "probe_ok": False,
+        }
+        if total_documents > max_documents:
+            return {**empty_result, "probe_cap_exceeded": True}
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        document_ids_seen: set[str] = set()
+        document_ids: list[str] = []
+        pages = 0
+
+        while len(document_ids_seen) < total_documents:
+            page_limit = min(
+                probe_limit,
+                max_documents - len(document_ids_seen),
+                total_documents - len(document_ids_seen),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=page_limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > page_limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in document_ids_seen:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                document_ids_seen.add(document_id)
+                document_ids.append(document_id)
+            if len(document_ids_seen) > total_documents:
+                raise RuntimeError("corpus pages exceeded the reported document total")
+            pages += 1
+
+            if len(document_ids_seen) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        probe_complete = len(document_ids_seen) == total_documents
+        chunked_ids: set[str] = set()
+        graph_ids_seen: set[str] = set()
+        fully_indexed_ids: set[str] = set()
+        if document_ids:
+            # Both projection methods scan their backing store. Running them
+            # once after the relational walk avoids repeating a full graph scan
+            # for every source page while preserving the same complete-corpus
+            # and fail-closed checks.
+            chunk_counts = await self.corpus_chunk_counts(document_ids)
+            if chunk_counts is None:
+                raise RuntimeError("vector chunk measurement is unavailable")
+            graph_ids = await self.corpus_graph_presence(document_ids)
+            if graph_ids is None:
+                raise RuntimeError("graph presence measurement is unavailable")
+            chunked_ids = {
+                document_id
+                for document_id in document_ids
+                if int(chunk_counts.get(document_id, 0)) > 0
+            }
+            graph_ids_seen = set(document_ids) & {
+                str(document_id) for document_id in graph_ids
+            }
+            fully_indexed_ids = chunked_ids & graph_ids_seen
+
+        return {
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "probe_documents": len(document_ids_seen),
+            "probe_pages": pages,
+            "probe_complete": probe_complete,
+            "probe_cap_exceeded": False,
+            "probe_chunked_documents": len(chunked_ids),
+            "probe_graph_documents": len(graph_ids_seen),
+            "probe_fully_indexed_documents": len(fully_indexed_ids),
+            "probe_ok": probe_complete
+            and (
+                total_documents == 0
+                or len(fully_indexed_ids) == len(document_ids_seen)
+            ),
+        }
+
     async def corpus_chunk_counts(
         self, document_ids: list[str]
     ) -> dict[str, int] | None:
@@ -1097,28 +1419,1066 @@ class CogneePublicClient:
                     counts[str(document_id)] = int(total or 0)
         return counts
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
-        """Which of these document ids exist as graph nodes; None when not measured.
+    async def source_manifest_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Return content-free source fingerprints for recovery fencing.
 
-        A document graph node's id equals the relational ``Data.id``, so
-        presence here means the document was cognified, not merely accepted.
-        Uses the engine's batched ``get_nodes`` (one query per page) through
-        ``get_graph_engine()`` — never the graph file directly, which would
-        contend with the single writer — and passes str ids. An engine without
-        ``get_nodes`` returns None rather than pretending it looked.
+        The manifest deliberately excludes source text and storage locations. It
+        proves that the relational source row still describes the same bytes and
+        lets recovery refuse a changed source before a dataset-wide force
+        cognify. A missing row is absent from the result so callers can fail
+        closed instead of treating a deleted source as recoverable.
+        """
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            return {}
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.infrastructure.files.utils.open_data_file import open_data_file
+        from cognee.modules.data.models import Data
+
+        from sqlalchemy import select
+
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("source manifest requested a non-UUID document id") from exc
+
+        engine = get_relational_engine()
+        manifest: dict[str, dict[str, Any]] = {}
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(
+                    Data.id,
+                    Data.content_hash,
+                    Data.raw_content_hash,
+                    Data.data_size,
+                    Data.raw_data_location,
+                    Data.updated_at,
+                ).where(Data.id.in_(wanted_ids))
+            )
+            for row in rows.all():
+                raw_location = getattr(row, "raw_data_location", None)
+                stored_raw_hash = getattr(row, "raw_content_hash", None)
+                if not isinstance(raw_location, str) or not raw_location:
+                    raise RuntimeError("repair source location is unavailable")
+                if not isinstance(stored_raw_hash, str) or not stored_raw_hash:
+                    raise RuntimeError("repair source hash is unavailable")
+                digest = md5()
+                raw_size = 0
+                try:
+                    async with open_data_file(raw_location) as source_file:
+                        while True:
+                            chunk = source_file.read(digest.block_size)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            raw_size += len(chunk)
+                except Exception as exc:  # noqa: BLE001 - source must be readable
+                    raise RuntimeError("repair source is unreadable") from exc
+                if digest.hexdigest() != stored_raw_hash:
+                    raise RuntimeError("repair source fingerprint mismatch")
+                entry: dict[str, Any] = {}
+                for key in ("content_hash", "raw_content_hash"):
+                    value = getattr(row, key, None)
+                    if value is not None:
+                        entry[key] = str(value)
+                if row.data_size is not None:
+                    entry["data_size"] = int(row.data_size)
+                entry["raw_data_size"] = raw_size
+                entry["source_readable"] = True
+                updated_at = _isoformat_utc(row.updated_at)
+                if updated_at is not None:
+                    entry["updated_at"] = updated_at
+                if entry:
+                    manifest[str(row.id)] = entry
+        return manifest
+
+    async def dataset_membership_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, list[str]]:
+        """Return the current relational dataset membership for each source id.
+
+        Recovery uses this as a strict fence, so unlike ``node_dataset_map`` this
+        read is unscoped, uncached, and does not degrade to stale or empty data.
+        The census records the same unscoped DatasetData membership.
+        """
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            return {}
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+
+        from sqlalchemy import select
+
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "dataset membership requested a non-UUID document id"
+            ) from exc
+
+        engine = get_relational_engine()
+        names_by_id: dict[str, set[str]] = {document_id: set() for document_id in wanted}
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(DatasetData.data_id, Dataset.name)
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .where(DatasetData.data_id.in_(wanted_ids))
+            )
+            for data_id, dataset_name in rows.all():
+                if data_id is None or not isinstance(dataset_name, str) or not dataset_name:
+                    raise RuntimeError("dataset membership returned an invalid row")
+                document_id = str(data_id)
+                if document_id not in names_by_id:
+                    raise RuntimeError("dataset membership returned an unexpected document")
+                names_by_id[document_id].add(dataset_name)
+        return {
+            document_id: sorted(names_by_id[document_id]) for document_id in wanted
+        }
+
+    async def corpus_zero_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        """Enumerate accepted documents with no measured vector chunks.
+
+        ``corpus_chunk_counts`` returns an empty mapping for a real missing row
+        and ``None`` when the provider cannot measure chunks. The distinction is
+        preserved here because a repair must never treat an unavailable vector
+        store as evidence that documents need reindexing.
+        """
+        probe_limit = max(1, min(int(page_limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        base: dict[str, Any] = {
+            "dataset": dataset,
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "documents_scanned": 0,
+            "pages": 0,
+            "zero_chunk_count": 0,
+            "zero_chunk_documents": [],
+            "zero_chunk_documents_truncated": False,
+            "zero_chunk_document_ids": [],
+            "zero_repair_document_ids": [],
+            "repair_document_ids": [],
+            "repair_document_datasets": {},
+            "repair_datasets": [],
+            "unassigned_zero_chunk_count": 0,
+            "census_complete": False,
+        }
+        if total_documents > max_documents:
+            return {
+                **base,
+                "ok": False,
+                "reason": "document_cap_exceeded",
+                "cap_exceeded": True,
+            }
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        seen_ids: set[str] = set()
+        zero_documents: list[dict[str, Any]] = []
+        zero_ids: set[str] = set()
+        zero_repair_ids: set[str] = set()
+        repair_document_datasets: dict[str, list[str]] = {}
+        repair_datasets: set[str] = set()
+        unassigned = 0
+        zero_count = 0
+        pages = 0
+
+        while len(seen_ids) < total_documents:
+            limit = min(
+                probe_limit,
+                max_documents - len(seen_ids),
+                total_documents - len(seen_ids),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            page_ids: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in seen_ids:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                seen_ids.add(document_id)
+                page_ids.append(document_id)
+
+            chunk_counts = await self.corpus_chunk_counts(page_ids)
+            if chunk_counts is None:
+                raise RuntimeError("vector chunk measurement is unavailable")
+            for row in rows:
+                document_id = str(row["id"])
+                if int(chunk_counts.get(document_id, 0)) != 0:
+                    continue
+                row_datasets = row.get("datasets")
+                datasets = (
+                    sorted({str(value) for value in row_datasets if value})
+                    if isinstance(row_datasets, list)
+                    else []
+                )
+                if dataset and dataset not in datasets:
+                    continue
+                zero_count += 1
+                zero_ids.add(document_id)
+                if datasets:
+                    assigned_datasets = [dataset] if dataset else datasets
+                    zero_repair_ids.add(document_id)
+                    repair_datasets.update(assigned_datasets)
+                    repair_document_datasets[document_id] = assigned_datasets
+                else:
+                    unassigned += 1
+                if len(zero_documents) < MAX_ZERO_CHUNK_REPORT_DOCUMENTS:
+                    zero_documents.append(
+                        {
+                            "id": document_id,
+                            "name": row.get("name"),
+                            "datasets": datasets,
+                            "created_at": row.get("created_at"),
+                        }
+                    )
+            pages += 1
+
+            if len(seen_ids) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        complete = len(seen_ids) == total_documents
+        return {
+            **base,
+            "ok": complete,
+            "reason": None if complete else "incomplete_corpus_walk",
+            "cap_exceeded": False,
+            "documents_scanned": len(seen_ids),
+            "pages": pages,
+            "zero_chunk_count": zero_count,
+            "zero_chunk_document_ids": sorted(zero_ids),
+            "zero_repair_document_ids": sorted(zero_repair_ids),
+            "zero_chunk_documents": zero_documents,
+            "zero_chunk_documents_truncated": zero_count > len(zero_documents),
+            "repair_document_ids": sorted(zero_repair_ids),
+            "repair_document_datasets": dict(sorted(repair_document_datasets.items())),
+            "repair_datasets": sorted(repair_datasets),
+            "unassigned_zero_chunk_count": unassigned,
+            "census_complete": complete,
+        }
+
+    async def stored_chunk_budget_check(
+        self,
+        document_ids: list[str] | None = None,
+        *,
+        budget: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Measure exact persisted ``DocumentChunk_text`` payloads.
+
+        Cognee's public vector interface cannot enumerate a collection. Citadel's
+        production provider is pgvector, whose reflected table can be scanned
+        directly. Other providers return ``None`` because a similarity query is
+        not evidence of corpus-wide compliance.
+        """
+        self._prepare_cognee_environment()
+        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+            return None
+        limit = budget if budget is not None else chunk_window.resolve_chunk_budget()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.vector import get_vector_engine
+        from cognee.infrastructure.databases.vector.exceptions import (
+            CollectionNotFoundError,
+        )
+        from sqlalchemy import select
+
+        engine = get_vector_engine()
+        try:
+            table = await engine.get_table("DocumentChunk_text")
+        except CollectionNotFoundError:
+            return {
+                "ok": True,
+                "provider": "pgvector",
+                "collection": "DocumentChunk_text",
+                "collection_present": False,
+                "budget": limit,
+                "scope": "document_ids" if document_ids is not None else "full",
+                "chunks_scanned": 0,
+                "violation_count": 0,
+                "violations": [],
+                "violation_document_counts": {},
+                "violation_document_ids": [],
+                "missing_document_id_violation_count": 0,
+                "violations_truncated": False,
+            }
+
+        statement = select(table.c.id, table.c.payload)
+        wanted = [str(document_id) for document_id in document_ids or []]
+        if document_ids is not None and not wanted:
+            return {
+                "ok": True,
+                "provider": "pgvector",
+                "collection": "DocumentChunk_text",
+                "collection_present": True,
+                "budget": limit,
+                "scope": "document_ids",
+                "scope_document_count": 0,
+                "chunks_scanned": 0,
+                "violation_count": 0,
+                "violations": [],
+                "violation_document_counts": {},
+                "violation_document_ids": [],
+                "missing_document_id_violation_count": 0,
+                "violations_truncated": False,
+            }
+        if document_ids is not None:
+            payload_document_id = table.c.payload["document_id"].as_string()
+            statement = statement.where(payload_document_id.in_(wanted))
+
+        violations: list[dict[str, Any]] = []
+        violation_count = 0
+        chunks_scanned = 0
+        violation_document_counts: dict[str, int] = {}
+        missing_document_id_violation_count = 0
+        async with engine.get_async_session() as session:
+            rows = await session.execute(statement)
+            for row in rows.all():
+                chunks_scanned += 1
+                violation = chunk_window.check_stored_chunk_payload(
+                    row[1], chunk_id=str(row[0]), budget=limit
+                )
+                if violation is not None:
+                    violation_count += 1
+                    if violation.document_id is None:
+                        missing_document_id_violation_count += 1
+                    else:
+                        violation_document_counts[violation.document_id] = (
+                            violation_document_counts.get(violation.document_id, 0) + 1
+                        )
+                    if len(violations) < 50:
+                        violations.append(violation.as_dict())
+
+        return {
+            "ok": violation_count == 0,
+            "provider": "pgvector",
+            "collection": "DocumentChunk_text",
+            "collection_present": True,
+            "budget": limit,
+            "scope": "document_ids" if document_ids is not None else "full",
+            "scope_document_count": len(wanted) if document_ids is not None else None,
+            "chunks_scanned": chunks_scanned,
+            "violation_count": violation_count,
+            # Keep the failure response bounded. The count remains exact and
+            # each item contains an id/digest, never the stored text.
+            "violations": violations[:50],
+            "violation_document_counts": dict(sorted(violation_document_counts.items())),
+            "violation_document_ids": sorted(violation_document_counts),
+            "missing_document_id_violation_count": missing_document_id_violation_count,
+            "violations_truncated": violation_count > len(violations),
+        }
+
+    async def stored_chunk_ids_for_documents(
+        self, document_ids: list[str]
+    ) -> list[str] | None:
+        """Return every persisted chunk id for ``document_ids``.
+
+        A repair must delete the complete old projection before Cognee rebuilds
+        it. Similarity search cannot enumerate that projection, so non-pgvector
+        providers are explicitly unmeasured and refuse repair.
+        """
+        if not document_ids:
+            return []
+        self._prepare_cognee_environment()
+        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+            return None
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.vector import get_vector_engine
+        from cognee.infrastructure.databases.vector.exceptions import (
+            CollectionNotFoundError,
+        )
+        from sqlalchemy import select
+
+        engine = get_vector_engine()
+        try:
+            table = await engine.get_table("DocumentChunk_text")
+        except CollectionNotFoundError:
+            return []
+
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        payload_document_id = table.c.payload["document_id"].as_string()
+        statement = select(table.c.id).where(payload_document_id.in_(wanted))
+        async with engine.get_async_session() as session:
+            rows = await session.execute(statement)
+            return [str(row[0]) for row in rows.all() if row[0] is not None]
+
+    async def corpus_oversized_chunk_documents(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        """Enumerate accepted documents with persisted over-budget chunks.
+
+        The relational corpus is walked to map accepted source ids. A complete
+        unfiltered vector scan then checks exact stored payloads, so malformed
+        and orphan rows cannot disappear behind a page filter.
+        """
+        probe_limit = max(1, min(int(page_limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        base: dict[str, Any] = {
+            "dataset": dataset,
+            "budget": chunk_window.resolve_chunk_budget(),
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "documents_scanned": 0,
+            "pages": 0,
+            "oversized_document_count": 0,
+            "oversized_chunk_count": 0,
+            "oversized_documents": [],
+            "oversized_documents_truncated": False,
+            "repair_document_ids": [],
+            "repair_datasets": [],
+            "unassigned_oversized_document_count": 0,
+            "orphan_oversized_document_count": 0,
+            "missing_document_id_violation_count": 0,
+            "census_complete": False,
+        }
+        if total_documents > max_documents:
+            return {
+                **base,
+                "ok": False,
+                "reason": "document_cap_exceeded",
+                "cap_exceeded": True,
+            }
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        seen_ids: set[str] = set()
+        corpus_rows_by_id: dict[str, dict[str, Any]] = {}
+        pages = 0
+
+        while len(seen_ids) < total_documents:
+            limit = min(
+                probe_limit,
+                max_documents - len(seen_ids),
+                total_documents - len(seen_ids),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in seen_ids:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                seen_ids.add(document_id)
+                corpus_rows_by_id[document_id] = row
+
+            pages += 1
+            if len(seen_ids) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        complete = len(seen_ids) == total_documents
+        if not complete:
+            return {
+                **base,
+                "ok": False,
+                "reason": "incomplete_corpus_walk",
+                "cap_exceeded": False,
+                "documents_scanned": len(seen_ids),
+                "pages": pages,
+                "census_complete": False,
+            }
+
+        # Run the persisted scan without a document-id filter. A scoped query
+        # cannot see malformed/orphan payloads, which must block an apply rather
+        # than disappear behind an apparently clean accepted-document census.
+        check = await self.stored_chunk_budget_check(None, budget=base["budget"])
+        if check is None:
+            raise RuntimeError("stored chunk budget measurement is unavailable")
+        violation_counts = check.get("violation_document_counts")
+        if not isinstance(violation_counts, dict):
+            raise RuntimeError("stored chunk budget returned invalid document counts")
+        violation_count = check.get("violation_count")
+        missing_document_id_violation_count = check.get(
+            "missing_document_id_violation_count", 0
+        )
+        if (
+            isinstance(violation_count, bool)
+            or not isinstance(violation_count, int)
+            or violation_count < 0
+            or isinstance(missing_document_id_violation_count, bool)
+            or not isinstance(missing_document_id_violation_count, int)
+            or missing_document_id_violation_count < 0
+        ):
+            raise RuntimeError("stored chunk budget returned invalid violation totals")
+        grouped_violation_count = sum(
+            int(value) for value in violation_counts.values()
+        )
+        if grouped_violation_count + missing_document_id_violation_count != violation_count:
+            raise RuntimeError("stored chunk budget violation totals do not reconcile")
+
+        oversized_ids: set[str] = set()
+        repair_ids: set[str] = set()
+        oversized_chunk_count = 0
+        oversized_documents: list[dict[str, Any]] = []
+        repair_datasets: set[str] = set()
+        unassigned = 0
+        orphan_count = 0
+        for raw_document_id, raw_chunk_count in violation_counts.items():
+            document_id = str(raw_document_id)
+            if (
+                isinstance(raw_chunk_count, bool)
+                or not isinstance(raw_chunk_count, int)
+                or raw_chunk_count < 1
+            ):
+                raise RuntimeError("stored chunk budget returned invalid violation count")
+            row = corpus_rows_by_id.get(document_id)
+            if row is None:
+                # This is an oversized persisted projection with no accepted
+                # relational source. Keep it visible and refuse repair.
+                orphan_count += 1
+                oversized_ids.add(document_id)
+                oversized_chunk_count += raw_chunk_count
+                if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                    oversized_documents.append(
+                        {
+                            "id": document_id,
+                            "name": None,
+                            "datasets": [],
+                            "created_at": None,
+                            "violation_count": raw_chunk_count,
+                            "unrepairable": True,
+                        }
+                    )
+                continue
+
+            row_datasets = row.get("datasets")
+            datasets = (
+                sorted({str(value) for value in row_datasets if value})
+                if isinstance(row_datasets, list)
+                else []
+            )
+            if dataset and dataset not in datasets:
+                continue
+            oversized_ids.add(document_id)
+            oversized_chunk_count += raw_chunk_count
+            if datasets:
+                repair_ids.add(document_id)
+                repair_datasets.update([dataset] if dataset else datasets)
+            else:
+                unassigned += 1
+            if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                oversized_documents.append(
+                    {
+                        "id": document_id,
+                        "name": row.get("name"),
+                        "datasets": datasets,
+                        "created_at": row.get("created_at"),
+                        "violation_count": raw_chunk_count,
+                    }
+                )
+
+        return {
+            **base,
+            "ok": complete,
+            "reason": None if complete else "incomplete_corpus_walk",
+            "cap_exceeded": False,
+            "documents_scanned": len(seen_ids),
+            "pages": pages,
+            "oversized_document_count": len(oversized_ids),
+            "oversized_chunk_count": oversized_chunk_count,
+            "oversized_documents": oversized_documents,
+            "oversized_documents_truncated": len(oversized_ids)
+            > len(oversized_documents),
+            "repair_document_ids": sorted(repair_ids),
+            "repair_datasets": sorted(repair_datasets),
+            "unassigned_oversized_document_count": unassigned + orphan_count,
+            "orphan_oversized_document_count": orphan_count,
+            "missing_document_id_violation_count": missing_document_id_violation_count,
+            "census_complete": complete,
+        }
+
+    async def corpus_reconciliation_census(
+        self,
+        *,
+        dataset: str | None = None,
+        page_limit: int = 200,
+    ) -> dict[str, Any]:
+        """Run one complete census for zero and over-budget projections.
+
+        The walk is intentionally separate from the legacy single-population
+        helpers. A combined repair must make its decision from one snapshot:
+        accepted source rows are enumerated once, vector chunk counts identify
+        zero-chunk rows, and one unfiltered pgvector payload scan identifies
+        over-budget rows and malformed/orphan payloads.
+        """
+        probe_limit = max(1, min(int(page_limit), 256))
+        max_documents = _corpus_health_max_documents()
+        totals = await self.corpus_totals()
+        total_documents = totals.get("documents")
+        if (
+            isinstance(total_documents, bool)
+            or not isinstance(total_documents, int)
+            or total_documents < 0
+        ):
+            raise RuntimeError("corpus totals returned an invalid document count")
+
+        base: dict[str, Any] = {
+            "dataset": dataset,
+            "budget": chunk_window.resolve_chunk_budget(),
+            "relational_documents": total_documents,
+            "probe_limit": probe_limit,
+            "probe_max_documents": max_documents,
+            "documents_scanned": 0,
+            "pages": 0,
+            "zero_chunk_count": 0,
+            "zero_chunk_document_ids": [],
+            "zero_chunk_documents": [],
+            "zero_chunk_documents_truncated": False,
+            "oversized_document_count": 0,
+            "oversized_chunk_count": 0,
+            "oversized_document_ids": [],
+            "oversized_documents": [],
+            "oversized_documents_truncated": False,
+            "zero_repair_document_ids": [],
+            "oversized_repair_document_ids": [],
+            "repair_document_ids": [],
+            "repair_document_datasets": {},
+            "repair_datasets": [],
+            "unassigned_zero_chunk_document_count": 0,
+            "unassigned_oversized_document_count": 0,
+            "orphan_oversized_document_count": 0,
+            "missing_document_id_violation_count": 0,
+            "stored_chunk_budget": None,
+            "census_complete": False,
+        }
+        if total_documents > max_documents:
+            return {
+                **base,
+                "ok": False,
+                "reason": "document_cap_exceeded",
+                "cap_exceeded": True,
+            }
+
+        after_created_at: str | None = None
+        after_id: str | None = None
+        seen_ids: set[str] = set()
+        corpus_rows_by_id: dict[str, dict[str, Any]] = {}
+        zero_ids: set[str] = set()
+        zero_repair_ids: set[str] = set()
+        zero_documents: list[dict[str, Any]] = []
+        zero_unassigned = 0
+        pages = 0
+
+        while len(seen_ids) < total_documents:
+            limit = min(
+                probe_limit,
+                max_documents - len(seen_ids),
+                total_documents - len(seen_ids),
+            )
+            rows = list(
+                await self.corpus_page(
+                    after_created_at=after_created_at,
+                    after_id=after_id,
+                    limit=limit,
+                )
+                or []
+            )
+            if not rows:
+                break
+            if len(rows) > limit:
+                raise RuntimeError("corpus page exceeded its requested limit")
+
+            page_ids: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    raise RuntimeError("corpus page returned a row without an id")
+                document_id = str(row["id"])
+                if document_id in seen_ids:
+                    raise RuntimeError(
+                        f"corpus page returned duplicate document {document_id}"
+                    )
+                seen_ids.add(document_id)
+                page_ids.append(document_id)
+                corpus_rows_by_id[document_id] = row
+
+            chunk_counts = await self.corpus_chunk_counts(page_ids)
+            if chunk_counts is None:
+                return {
+                    **base,
+                    "ok": False,
+                    "reason": "vector_measurement_unavailable",
+                    "cap_exceeded": False,
+                    "documents_scanned": len(seen_ids),
+                    "pages": pages,
+                    "census_complete": False,
+                }
+            for document_id, count in chunk_counts.items():
+                if (
+                    isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                    or document_id not in page_ids
+                ):
+                    raise RuntimeError("vector chunk measurement returned invalid counts")
+            for row in rows:
+                document_id = str(row["id"])
+                if int(chunk_counts.get(document_id, 0)) != 0:
+                    continue
+                row_datasets = row.get("datasets")
+                datasets = (
+                    sorted({str(value) for value in row_datasets if value})
+                    if isinstance(row_datasets, list)
+                    else []
+                )
+                if dataset and dataset not in datasets:
+                    continue
+                zero_ids.add(document_id)
+                if datasets:
+                    zero_repair_ids.add(document_id)
+                else:
+                    zero_unassigned += 1
+                if len(zero_documents) < MAX_ZERO_CHUNK_REPORT_DOCUMENTS:
+                    zero_documents.append(
+                        {
+                            "id": document_id,
+                            "name": row.get("name"),
+                            "datasets": datasets,
+                            "created_at": row.get("created_at"),
+                        }
+                    )
+            pages += 1
+
+            if len(seen_ids) >= total_documents:
+                break
+            last_row = rows[-1]
+            if not last_row.get("created_at") or not last_row.get("id"):
+                raise RuntimeError("corpus page cannot form a keyset cursor")
+            after_created_at = str(last_row["created_at"])
+            after_id = str(last_row["id"])
+
+        complete = len(seen_ids) == total_documents
+        if not complete:
+            return {
+                **base,
+                "ok": False,
+                "reason": "incomplete_corpus_walk",
+                "cap_exceeded": False,
+                "documents_scanned": len(seen_ids),
+                "pages": pages,
+                "census_complete": False,
+            }
+
+        check = await self.stored_chunk_budget_check(None, budget=base["budget"])
+        if check is None:
+            return {
+                **base,
+                "ok": False,
+                "reason": "vector_measurement_unavailable",
+                "cap_exceeded": False,
+                "documents_scanned": len(seen_ids),
+                "pages": pages,
+                "zero_chunk_count": len(zero_ids),
+                "zero_chunk_document_ids": sorted(zero_ids),
+                "zero_chunk_documents": zero_documents,
+                "zero_chunk_documents_truncated": len(zero_ids) > len(zero_documents),
+                "census_complete": False,
+            }
+        violation_counts = check.get("violation_document_counts")
+        violation_count = check.get("violation_count")
+        missing_count = check.get("missing_document_id_violation_count", 0)
+        if (
+            check.get("scope") not in {None, "full"}
+            or not isinstance(violation_counts, dict)
+            or isinstance(violation_count, bool)
+            or not isinstance(violation_count, int)
+            or violation_count < 0
+            or isinstance(missing_count, bool)
+            or not isinstance(missing_count, int)
+            or missing_count < 0
+        ):
+            raise RuntimeError("stored chunk budget returned invalid census metadata")
+        grouped_violation_count = 0
+        for raw_document_id, raw_count in violation_counts.items():
+            if (
+                not raw_document_id
+                or isinstance(raw_count, bool)
+                or not isinstance(raw_count, int)
+                or raw_count < 1
+            ):
+                raise RuntimeError("stored chunk budget returned invalid violation count")
+            grouped_violation_count += raw_count
+        if grouped_violation_count + missing_count != violation_count:
+            raise RuntimeError("stored chunk budget violation totals do not reconcile")
+
+        oversized_ids: set[str] = set()
+        oversized_repair_ids: set[str] = set()
+        oversized_documents: list[dict[str, Any]] = []
+        # ``stored_chunk_budget_check`` is intentionally a full-corpus scan.
+        # Keep the public census totals scoped to ``dataset`` so a violation in
+        # another dataset cannot turn a clean repair request into a false
+        # candidate.
+        oversized_chunk_count = 0
+        oversized_unassigned = 0
+        orphan_count = 0
+        for raw_document_id, raw_count in violation_counts.items():
+            document_id = str(raw_document_id)
+            row = corpus_rows_by_id.get(document_id)
+            if row is None:
+                orphan_count += 1
+                oversized_unassigned += 1
+                oversized_ids.add(document_id)
+                oversized_chunk_count += raw_count
+                if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                    oversized_documents.append(
+                        {
+                            "id": document_id,
+                            "name": None,
+                            "datasets": [],
+                            "created_at": None,
+                            "violation_count": raw_count,
+                            "unrepairable": True,
+                        }
+                    )
+                continue
+
+            row_datasets = row.get("datasets")
+            datasets = (
+                sorted({str(value) for value in row_datasets if value})
+                if isinstance(row_datasets, list)
+                else []
+            )
+            if dataset and dataset not in datasets:
+                continue
+            oversized_ids.add(document_id)
+            oversized_chunk_count += raw_count
+            if datasets:
+                oversized_repair_ids.add(document_id)
+            else:
+                oversized_unassigned += 1
+            if len(oversized_documents) < MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS:
+                oversized_documents.append(
+                    {
+                        "id": document_id,
+                        "name": row.get("name"),
+                        "datasets": datasets,
+                        "created_at": row.get("created_at"),
+                        "violation_count": raw_count,
+                    }
+                )
+
+        repair_ids = zero_repair_ids | oversized_repair_ids
+        repair_document_datasets: dict[str, list[str]] = {}
+        for document_id in sorted(repair_ids):
+            row = corpus_rows_by_id[document_id]
+            row_datasets = row.get("datasets")
+            datasets = (
+                sorted({str(value) for value in row_datasets if value})
+                if isinstance(row_datasets, list)
+                else []
+            )
+            repair_document_datasets[document_id] = [dataset] if dataset else datasets
+
+        return {
+            **base,
+            "ok": True,
+            "reason": None,
+            "cap_exceeded": False,
+            "documents_scanned": len(seen_ids),
+            "pages": pages,
+            "zero_chunk_count": len(zero_ids),
+            "zero_chunk_document_ids": sorted(zero_ids),
+            "zero_chunk_documents": zero_documents,
+            "zero_chunk_documents_truncated": len(zero_ids) > len(zero_documents),
+            "oversized_document_count": len(oversized_ids),
+            "oversized_chunk_count": oversized_chunk_count,
+            "oversized_document_ids": sorted(oversized_ids),
+            "oversized_documents": oversized_documents,
+            "oversized_documents_truncated": len(oversized_ids) > len(oversized_documents),
+            "zero_repair_document_ids": sorted(zero_repair_ids),
+            "oversized_repair_document_ids": sorted(oversized_repair_ids),
+            "repair_document_ids": sorted(repair_ids),
+            "repair_document_datasets": repair_document_datasets,
+            "repair_datasets": sorted(
+                {
+                    name
+                    for names in repair_document_datasets.values()
+                    for name in names
+                }
+            ),
+            "unassigned_zero_chunk_document_count": zero_unassigned,
+            "unassigned_oversized_document_count": oversized_unassigned,
+            "orphan_oversized_document_count": orphan_count,
+            "missing_document_id_violation_count": missing_count,
+            "stored_chunk_budget": check,
+            "census_complete": True,
+        }
+
+    async def graph_chunk_ids_for_documents(
+        self, document_ids: list[str]
+    ) -> set[str] | None:
+        """Return graph node ids for ``DocumentChunk`` properties by source id."""
+        if not document_ids:
+            return set()
+        engine = await self._graph_engine()
+        query = getattr(engine, "query", None)
+        if not callable(query):
+            return None
+
+        requested = {str(document_id) for document_id in document_ids}
+        query_text = """
+        MATCH (n:Node)
+        WITH n.id AS node_id,
+             n.type AS node_type,
+             CAST(json_extract(n.properties, '$.document_id') AS STRING) AS document_id_json
+        WHERE node_type = 'DocumentChunk'
+          AND document_id_json IN $document_ids_json
+        RETURN node_id, node_type, document_id_json
+        """
+        rows = await query(
+            query_text,
+            {"document_ids_json": [json.dumps(document_id) for document_id in requested]},
+        )
+        node_ids: set[str] = set()
+        for row in rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 3:
+                return None
+            node_id, node_type, value = row
+            if isinstance(node_id, bytes):
+                node_id = node_id.decode("utf-8")
+            if node_id is None:
+                return None
+            if isinstance(node_type, bytes):
+                node_type = node_type.decode("utf-8")
+            if node_type != "DocumentChunk":
+                return None
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            if isinstance(value, str):
+                raw_value = value
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    # Ladybug may return a plain string instead of JSON.
+                    value = raw_value
+            if not isinstance(value, str) or value not in requested:
+                return None
+            node_ids.add(str(node_id))
+        return node_ids
+
+    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+        """Which source documents have a graph projection; None when unmeasured.
+
+        Cognee's TextChunker gives DocumentChunk nodes their own ids. The
+        relational ``Data.id`` is copied into each chunk's ``document_id``
+        property, so probing graph node ids with Data ids is invalid. Query the
+        graph property instead, returning one distinct source id per page. An
+        engine without raw query support returns None rather than pretending it
+        measured presence.
         """
         if not document_ids:
             return set()
         engine = await self._graph_engine()
-        get_nodes = getattr(engine, "get_nodes", None)
-        if not callable(get_nodes):
+        query = getattr(engine, "query", None)
+        if not callable(query):
             return None
-        nodes = await get_nodes([str(document_id) for document_id in document_ids])
+
+        requested = {str(document_id) for document_id in document_ids}
+        query_text = """
+        MATCH (n:Node)
+        WITH n.type AS node_type,
+             CAST(json_extract(n.properties, '$.document_id') AS STRING) AS document_id_json
+        WHERE node_type = 'DocumentChunk'
+          AND document_id_json IN $document_ids_json
+        RETURN DISTINCT document_id_json
+        """
+        rows = await query(
+            query_text,
+            {"document_ids_json": [json.dumps(document_id) for document_id in requested]},
+        )
         present: set[str] = set()
-        for node in nodes or []:
-            node_id = node.get("id") if isinstance(node, dict) else None
-            if node_id:
-                present.add(str(node_id))
+        for row in rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 1:
+                return None
+            value = row[0]
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    # Ladybug may return a plain string instead of a JSON string;
+                    # keep it unchanged and let the membership check below validate it.
+                    pass
+            if not isinstance(value, str) or value not in requested:
+                return None
+            present.add(value)
         return present
 
     async def ensure_dataset(self, name: str) -> bool:
@@ -1208,7 +2568,362 @@ class CogneePublicClient:
         async with self.writer_lock:
             await engine.delete_nodes(node_ids)
             await self._delete_vector_points(node_ids)
+            self._invalidate_graph_data_cache()
         return len(node_ids)
+
+    async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
+        """Delete every old vector and graph chunk for source documents.
+
+        Vector and graph ids are collected independently. Cognee 1.2.2 uses
+        content-derived ids for some first chunks, so assuming both stores share
+        the same id can leave a searchable stale row behind.
+        """
+        requested = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not requested:
+            return {
+                "document_ids": [],
+                "vector_chunk_count": 0,
+                "graph_node_count": 0,
+            }
+
+        vector_ids = await self.stored_chunk_ids_for_documents(requested)
+        if vector_ids is None:
+            raise RuntimeError("stored chunk deletion is unavailable outside pgvector")
+        graph_ids = await self.graph_chunk_ids_for_documents(requested)
+        if graph_ids is None:
+            raise RuntimeError("graph chunk deletion is unavailable")
+
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.graph import get_graph_engine
+        from cognee.infrastructure.databases.vector import get_vector_engine
+
+        vector_uuids: list[UUID] = []
+        for vector_id in vector_ids:
+            try:
+                vector_uuids.append(UUID(str(vector_id)))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise RuntimeError(
+                    "stored chunk collection returned a non-UUID row id"
+                ) from exc
+
+        graph_engine = await get_graph_engine()
+        vector_engine = get_vector_engine()
+        async with self.writer_lock:
+            snapshot = await self._snapshot_document_chunks(
+                document_ids=requested,
+                vector_engine=vector_engine,
+                graph_engine=graph_engine,
+                vector_ids=vector_uuids,
+                graph_ids=sorted(graph_ids),
+            )
+            snapshot_token = self._store_repair_snapshot(snapshot)
+            try:
+                if vector_uuids:
+                    await vector_engine.delete_data_points(
+                        "DocumentChunk_text", vector_uuids
+                    )
+                if graph_ids:
+                    await graph_engine.delete_nodes(sorted(graph_ids))
+                self._invalidate_graph_data_cache()
+            except Exception as exc:
+                restored = False
+                try:
+                    restored = await self._restore_document_chunk_snapshot_locked(
+                        snapshot,
+                        document_ids=requested,
+                        vector_engine=vector_engine,
+                        graph_engine=graph_engine,
+                    )
+                except Exception:  # noqa: BLE001 - preserve original delete failure
+                    logger.exception("repair snapshot restore failed after delete error")
+                if restored:
+                    self._repair_snapshots.pop(snapshot_token, None)
+                return {
+                    "ok": False,
+                    "document_ids": requested,
+                    "vector_chunk_count": len(vector_uuids),
+                    "graph_node_count": len(graph_ids),
+                    "snapshot_token": snapshot_token if not restored else None,
+                    "reason": "repair_delete_failed",
+                    "error_type": exc.__class__.__name__,
+                    "projections_preserved": restored,
+                }
+        return {
+            "document_ids": requested,
+            "vector_chunk_count": len(vector_uuids),
+            "graph_node_count": len(graph_ids),
+            "snapshot_token": snapshot_token,
+        }
+
+    def _store_repair_snapshot(self, snapshot: dict[str, Any]) -> str:
+        """Keep rollback data private and return only an opaque handle."""
+        if len(self._repair_snapshots) >= MAX_REPAIR_SNAPSHOTS:
+            raise RuntimeError("repair snapshot capacity exhausted")
+        token = secrets.token_urlsafe(24)
+        self._repair_snapshots[token] = snapshot
+        return token
+
+    @staticmethod
+    def _graph_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
+    @classmethod
+    def _graph_properties(cls, value: Any) -> str:
+        value = value.decode("utf-8") if isinstance(value, bytes) else value
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return "{}"
+        try:
+            return json.dumps(value, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("graph properties are not serializable") from exc
+
+    async def _snapshot_vector_rows(
+        self, vector_engine: Any, vector_ids: list[UUID]
+    ) -> list[dict[str, Any]]:
+        if not vector_ids:
+            return []
+        from sqlalchemy import select
+
+        try:
+            table = await vector_engine.get_table("DocumentChunk_text")
+            statement = select(table.c.id, table.c.payload, table.c.vector).where(
+                table.c.id.in_(vector_ids)
+            )
+        except Exception as exc:  # noqa: BLE001 - snapshot must be complete
+            raise RuntimeError("vector projection snapshot is unavailable") from exc
+
+        async with vector_engine.get_async_session() as session:
+            rows = (await session.execute(statement)).all()
+        expected = {str(vector_id) for vector_id in vector_ids}
+        actual = {str(row[0]) for row in rows if row[0] is not None}
+        if actual != expected:
+            raise RuntimeError(
+                "vector projection changed while preparing repair snapshot"
+            )
+        return [
+            {
+                "id": row[0],
+                "payload": copy.deepcopy(row[1]),
+                "vector": copy.deepcopy(row[2]),
+            }
+            for row in rows
+        ]
+
+    async def _snapshot_graph_projection(
+        self, graph_engine: Any, graph_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not graph_ids:
+            return {"nodes": [], "edges": []}
+        query = getattr(graph_engine, "query", None)
+        if not callable(query):
+            raise RuntimeError("graph projection snapshot is unavailable")
+
+        node_rows = await query(
+            """
+            MATCH (n:Node)
+            WHERE n.id IN $node_ids
+            RETURN n.id, n.name, n.type, n.properties
+            """,
+            {"node_ids": graph_ids},
+        )
+        nodes: list[dict[str, Any]] = []
+        for row in node_rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 4 or row[0] is None:
+                raise RuntimeError("graph node snapshot returned an invalid row")
+            nodes.append(
+                {
+                    "id": self._graph_text(row[0]),
+                    "name": self._graph_text(row[1]),
+                    "type": self._graph_text(row[2]),
+                    "properties": self._graph_properties(row[3]),
+                }
+            )
+        if {node["id"] for node in nodes} != set(graph_ids):
+            raise RuntimeError(
+                "graph projection changed while preparing repair snapshot"
+            )
+
+        edge_rows = await query(
+            """
+            MATCH (source:Node)-[r:EDGE]->(target:Node)
+            WHERE source.id IN $node_ids OR target.id IN $node_ids
+            RETURN source.id, target.id, r.relationship_name, r.properties
+            """,
+            {"node_ids": graph_ids},
+        )
+        edges: list[dict[str, Any]] = []
+        for row in edge_rows or []:
+            if not isinstance(row, (tuple, list)) or len(row) != 4:
+                raise RuntimeError("graph edge snapshot returned an invalid row")
+            if row[0] is None or row[1] is None or row[2] is None:
+                raise RuntimeError("graph edge snapshot returned an incomplete row")
+            edges.append(
+                {
+                    "source": self._graph_text(row[0]),
+                    "target": self._graph_text(row[1]),
+                    "relationship": self._graph_text(row[2]),
+                    "properties": self._graph_properties(row[3]),
+                }
+            )
+        return {"nodes": nodes, "edges": edges}
+
+    async def _snapshot_document_chunks(
+        self,
+        *,
+        document_ids: list[str],
+        vector_engine: Any,
+        graph_engine: Any,
+        vector_ids: list[UUID],
+        graph_ids: list[str],
+    ) -> dict[str, Any]:
+        """Capture both projections before a destructive repair delete."""
+        return {
+            "document_ids": list(document_ids),
+            "vector_rows": await self._snapshot_vector_rows(vector_engine, vector_ids),
+            "graph": await self._snapshot_graph_projection(graph_engine, graph_ids),
+        }
+
+    async def _restore_vector_rows(
+        self, vector_engine: Any, rows: list[dict[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        from sqlalchemy.dialects.postgresql import insert
+
+        table = await vector_engine.get_table("DocumentChunk_text")
+        values = [
+            {
+                "id": row["id"],
+                "payload": copy.deepcopy(row["payload"]),
+                "vector": copy.deepcopy(row["vector"]),
+            }
+            for row in rows
+        ]
+        statement = insert(table).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[table.c.id],
+            set_={
+                "payload": statement.excluded.payload,
+                "vector": statement.excluded.vector,
+            },
+        )
+        async with vector_engine.get_async_session() as session:
+            await session.execute(statement)
+            await session.commit()
+
+    async def _restore_graph_projection(
+        self, graph_engine: Any, graph: Mapping[str, Any]
+    ) -> None:
+        query = getattr(graph_engine, "query", None)
+        if not callable(query):
+            raise RuntimeError("graph projection restore is unavailable")
+        nodes = list(graph.get("nodes") or [])
+        edges = list(graph.get("edges") or [])
+        if nodes:
+            await query(
+                """
+                UNWIND $nodes AS node
+                MERGE (n:Node {id: node.id})
+                ON CREATE SET
+                    n.name = node.name,
+                    n.type = node.type,
+                    n.properties = node.properties
+                ON MATCH SET
+                    n.name = node.name,
+                    n.type = node.type,
+                    n.properties = node.properties
+                """,
+                {"nodes": nodes},
+            )
+        if edges:
+            await query(
+                """
+                UNWIND $edges AS edge
+                MATCH (source:Node), (target:Node)
+                WHERE source.id = edge.source AND target.id = edge.target
+                MERGE (source)-[r:EDGE {
+                    relationship_name: edge.relationship
+                }]->(target)
+                ON CREATE SET r.properties = edge.properties
+                ON MATCH SET r.properties = edge.properties
+                """,
+                {"edges": edges},
+            )
+        checkpoint = getattr(graph_engine, "checkpoint", None)
+        if callable(checkpoint):
+            await checkpoint()
+
+    async def _restore_document_chunk_snapshot_locked(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        document_ids: list[str],
+        vector_engine: Any,
+        graph_engine: Any,
+    ) -> bool:
+        vector_ids = await self.stored_chunk_ids_for_documents(document_ids)
+        graph_ids = await self.graph_chunk_ids_for_documents(document_ids)
+        if vector_ids is None or graph_ids is None:
+            return False
+        current_vector_uuids: list[UUID] = []
+        for vector_id in vector_ids:
+            try:
+                current_vector_uuids.append(UUID(str(vector_id)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise RuntimeError("current vector projection has a non-UUID id") from exc
+        if current_vector_uuids:
+            await vector_engine.delete_data_points(
+                "DocumentChunk_text", current_vector_uuids
+            )
+        if graph_ids:
+            await graph_engine.delete_nodes(sorted(graph_ids))
+        await self._restore_vector_rows(vector_engine, list(snapshot.get("vector_rows") or []))
+        await self._restore_graph_projection(graph_engine, snapshot.get("graph") or {})
+        self._invalidate_graph_data_cache()
+        return True
+
+    async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
+        """Restore a private exact snapshot after a failed repair operation."""
+        token = deleted.get("snapshot_token")
+        document_ids = deleted.get("document_ids")
+        if not isinstance(token, str) or not isinstance(document_ids, list):
+            return False
+        snapshot = self._repair_snapshots.get(token)
+        if snapshot is None:
+            return False
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.graph import get_graph_engine
+        from cognee.infrastructure.databases.vector import get_vector_engine
+
+        async with self.writer_lock:
+            restored = await self._restore_document_chunk_snapshot_locked(
+                snapshot,
+                document_ids=[str(document_id) for document_id in document_ids],
+                vector_engine=get_vector_engine(),
+                graph_engine=await get_graph_engine(),
+            )
+        if restored:
+            self._repair_snapshots.pop(token, None)
+        return restored
+
+    async def discard_document_chunk_snapshot(self, deleted: Mapping[str, Any]) -> bool:
+        """Release a successful repair's private rollback snapshot."""
+        token = deleted.get("snapshot_token")
+        if not isinstance(token, str):
+            return False
+        return self._repair_snapshots.pop(token, None) is not None
 
     async def _delete_vector_points(self, node_ids: list[str]) -> None:
         """Drop the same ids from the chunk vector collection (best-effort, #15)."""
@@ -1731,7 +3446,26 @@ class CogneePublicClient:
             )
             return None
 
+    @contextlib.asynccontextmanager
+    async def maintenance(self) -> AsyncIterator[None]:
+        """Hold the process-wide maintenance lock across a repair operation."""
+        async with self.maintenance_lock:
+            token = _COGNEE_MAINTENANCE_HELD.set(True)
+            try:
+                yield
+            finally:
+                _COGNEE_MAINTENANCE_HELD.reset(token)
+
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
+        """Cognify under the maintenance lock unless a repair already holds it."""
+        if _COGNEE_MAINTENANCE_HELD.get():
+            return await self._cognify_unlocked(datasets=datasets, force=force)
+        async with self.maintenance():
+            return await self._cognify_unlocked(datasets=datasets, force=force)
+
+    async def _cognify_unlocked(
+        self, *, datasets: list[str], force: bool = False
+    ) -> Any:
         """Cognify already-added data in ``datasets``.
 
         ``cognee.cognify`` defaults to ``incremental_loading=True``, so this only
@@ -1751,13 +3485,53 @@ class CogneePublicClient:
                 "LLM_API_KEY (or OPENROUTER_API_KEY) is not set; cognify requires an "
                 "LLM key to extract the knowledge graph."
             )
+        # Load the exact GPT-4o vocabulary before Cognee starts a write. If the
+        # asset is missing, fail before a partial cognify can leave rows that the
+        # persisted-chunk audit cannot measure.
+        chunk_window.require_bpe_encoding()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
+        expected_ids = await self.dataset_document_ids(datasets) if force else []
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
-            return await cognee.cognify(datasets=datasets, incremental_loading=not force)
+            result = await cognee.cognify(
+                datasets=datasets, incremental_loading=not force
+            )
+            self._invalidate_graph_data_cache()
+        # The graph writer lock protects Kuzu only. Run the vector payload census
+        # after releasing it so a slow SQL scan cannot block another cognify.
+        processed_ids = _cognify_data_ids(result)
+        if force:
+            missing_ids = sorted(set(expected_ids) - set(processed_ids))
+            if missing_ids:
+                raise RuntimeError(
+                    "forced cognify receipt omitted "
+                    f"{len(missing_ids)} expected source id(s)"
+                )
+        if processed_ids:
+            stored_check = await self.stored_chunk_budget_check(
+                document_ids=processed_ids
+            )
+            if stored_check is None:
+                logger.warning(
+                    "stored chunk budget was not measured after cognify: "
+                    "VECTOR_DB_PROVIDER is not pgvector"
+                )
+            elif not stored_check["ok"]:
+                logger.error(
+                    "stored chunk budget check failed after cognify: "
+                    "%d violation(s) across %d chunk(s)",
+                    stored_check["violation_count"],
+                    stored_check["chunks_scanned"],
+                )
+                raise RuntimeError(
+                    "stored chunk budget check failed: "
+                    f"{stored_check['violation_count']} violation(s) across "
+                    f"{stored_check['chunks_scanned']} persisted chunk(s)"
+                )
+        return result
 
     async def add_feedback(
         self,

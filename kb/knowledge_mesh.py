@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import re
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,8 @@ _CHUNK_LABEL_MAX = 64
 # Seat datasets are namespaced "seat:<slug>" (kb.access.SEAT_DATASET_PREFIX);
 # inlined so this module keeps zero kb imports.
 _SEAT_PREFIX = "seat:"
+_SESSION_TRACES_DATASET = "session-traces"
+_ATTESTATION_METADATA_KEY = "citadel_attestation"
 
 # YAML frontmatter closing fences are searched within this many leading lines.
 _FRONTMATTER_SCAN_LINES = 30
@@ -137,6 +142,55 @@ def _node_type(properties: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()[:80]
     return "node"
+
+
+def _trust_tier(datasets: list[str] | tuple[str, ...] | None) -> str:
+    """Derive graph trust from dataset attribution, never from content."""
+    if datasets and _SESSION_TRACES_DATASET in datasets:
+        return "reference-only"
+    return "unattested"
+
+
+def _external_metadata(value: Any) -> Mapping[str, Any] | None:
+    """Decode Cognee external metadata; malformed values are untrusted."""
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
+def _promotion_metadata(properties: dict[str, Any]) -> dict[str, str]:
+    """Return only a complete, reserved, timezone-aware promotion attestation."""
+    metadata = _external_metadata(properties.get("external_metadata"))
+    if metadata is None:
+        return {}
+    attestation = metadata.get(_ATTESTATION_METADATA_KEY)
+    if not isinstance(attestation, Mapping):
+        return {}
+    promoted_by = attestation.get("promoted_by")
+    promoted_at = attestation.get("promoted_at")
+    if (
+        not isinstance(promoted_by, str)
+        or not promoted_by.strip()
+        or not isinstance(promoted_at, str)
+        or not promoted_at.strip()
+    ):
+        return {}
+    try:
+        timestamp = datetime.fromisoformat(promoted_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return {}
+    if timestamp.tzinfo is None:
+        return {}
+    return {
+        "promoted_by": promoted_by.strip(),
+        "promoted_at": promoted_at.strip(),
+    }
 
 
 def _raw_props_by_id(raw_nodes: list[Any]) -> dict[str, dict[str, Any]]:
@@ -342,9 +396,16 @@ def build_graph_payload(
     document nodes to their cognee datasets (per-seat ``seat:<slug>`` datasets):
     mapped nodes gain ``dataset``/``datasets`` keys, chunks inherit the dataset
     of their document via ``is_part_of`` edges, and one synthetic hub node per
-    dataset (``dataset:<name>``) is appended with ``belongs_to`` edges. Hubs are
-    synthetic: they do not count against ``limit`` or into ``total_nodes``.
-    ``None``/``{}`` keeps the exact pre-attribution behavior.
+    dataset (``dataset:<name>``) is appended with ``belongs_to`` edges. Raw
+    nodes always expose ``trust_tier`` derived from their dataset attribution;
+    ``session-traces`` is ``reference-only`` and every other case is
+    ``unattested``. Hubs are synthetic: they do not count against ``limit`` or
+    into ``total_nodes``.
+
+    Raw nodes expose ``promoted_by``/``promoted_at`` only when Cognee carries a
+    complete, timezone-aware attestation in the reserved
+    ``external_metadata.citadel_attestation`` field. User tags and node text
+    are never inspected for these fields. Malformed metadata is ignored.
 
     ``presence`` (``[{"dataset": name, "label": label, "documents": count?},
     ...]``) appends a universal hub per entry regardless of surviving content
@@ -383,11 +444,14 @@ def build_graph_payload(
             "id": node_key,
             "label": _node_label(node_key, properties),
             "type": _node_type(properties),
+            "trust_tier": _trust_tier(dataset_map.get(node_key)),
         }
         names = dataset_map.get(node_key)
         if names:
             node["dataset"] = names[0]
             node["datasets"] = list(names)
+            node["trust_tier"] = _trust_tier(names)
+        node.update(_promotion_metadata(properties))
         nodes.append(node)
         node_by_id[node_key] = node
         if len(nodes) >= limit:
@@ -426,6 +490,7 @@ def build_graph_payload(
                 if names and other is not None and "dataset" not in other:
                     other["dataset"] = names[0]
                     other["datasets"] = list(names)
+                    other["trust_tier"] = _trust_tier(names)
                 if doc_id in internal_nodes:
                     doc_chunk_ids.setdefault(doc_id, []).append(other_id)
 

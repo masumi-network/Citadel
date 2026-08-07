@@ -18,6 +18,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from kb.access import ROLE_ORDER
+from kb.build_identity import SERVICE_BUILD_IDENTITY
 from kb.capture_config import load_capture_config
 from kb.retry import run_with_retries
 from kb.security_scan import redact_secrets
@@ -302,6 +303,17 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             destructiveHint=False,
             idempotentHint=False,
             openWorldHint=True,
+        ),
+    ),
+    "citadel_reconcile_corpus": ToolPolicy(
+        role="admin",
+        scope="sources:sync",
+        risk="admin_job",
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
         ),
     ),
     "citadel_run_repo_content_sync": ToolPolicy(
@@ -963,6 +975,9 @@ def create_mcp_server(
         streamable_http_path="/",
         transport_security=_transport_security(),
     )
+    # FastMCP currently leaves the low-level protocol version unset, which
+    # otherwise makes MCP report the installed MCP library version.
+    mcp._mcp_server.version = SERVICE_BUILD_IDENTITY.version
 
     def resolve_client(ctx: Context | None) -> CitadelHttpClient:
         """Per-request Citadel client.
@@ -1428,6 +1443,41 @@ def create_mcp_server(
                 "/api/learning-agent/run",
                 {"force": force, "dry_run": dry_run},
                 tool_name="citadel_run_learning_agent",
+            ),
+        )
+
+    @mcp.tool(annotations=TOOL_POLICIES["citadel_reconcile_corpus"].annotations)
+    async def citadel_reconcile_corpus(
+        ctx: Context,
+        dataset: str | None = None,
+        apply: bool = False,
+        force: bool = False,
+        recover: bool = False,
+        oversized: bool = False,
+    ) -> dict[str, Any]:
+        """Audit or repair accepted documents with missing or oversized chunks.
+
+        The default is a combined read-only census. Applying a repair requires
+        admin access and repairs the zero-chunk and over-budget union in one
+        pass. Set ``recover`` with ``apply`` and ``force`` to rebuild an
+        interrupted operation from unchanged source rows. Set ``oversized`` for the legacy
+        over-budget-only path; it does not support recovery.
+        """
+        payload: dict[str, Any] = {
+            "dataset": dataset,
+            "apply": apply,
+            "force": force,
+        }
+        if recover:
+            payload["recover"] = True
+        if oversized:
+            payload["oversized"] = True
+        return await _call_async(
+            "citadel_reconcile_corpus",
+            lambda: resolve_client(ctx).post(
+                "/api/corpus/reconcile",
+                payload,
+                tool_name="citadel_reconcile_corpus",
             ),
         )
 

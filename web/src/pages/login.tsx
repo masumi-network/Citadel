@@ -36,7 +36,10 @@ export default function Login() {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || REJECTED);
       }
-      window.location.assign("/app");
+      const session = await response.json().catch(() => ({}));
+      // Readers have parity on the Next read-only dashboard. Keep writers and
+      // admins on the legacy surface until privileged workflows are migrated.
+      window.location.assign(session.role === "reader" ? "/next/app" : "/app");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : REJECTED);
     } finally {

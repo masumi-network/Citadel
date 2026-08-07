@@ -1,4 +1,4 @@
-"""Chunk budget for the embedder, and overflow detection at the embed boundary (#227).
+"""Chunk budget validation before storage and overflow detection at the embed boundary (#227).
 
 The defect
 ----------
@@ -32,7 +32,8 @@ non-Latin text to sample.
 A second mechanism removes the last hope of an arithmetic answer.
 ``chunk_by_paragraph`` compares against the budget only when the accumulating
 chunk is non-empty (``cognee/tasks/chunks/chunk_by_paragraph.py:40``), so a
-single over-budget "word" is emitted verbatim no matter what the budget says.
+single over-budget "word" can be emitted verbatim when Cognee is called outside
+Citadel's ingest gate.
 Measured: one line of minified JS in ``kb/webui`` is 1,392 BPE tokens and comes
 out as one 1,710-wordpiece chunk at every budget from 512 down to 192 — at 192
 that is 7.2x the budget it supposedly obeys.
@@ -40,22 +41,32 @@ that is 7.2x the budget it supposedly obeys.
 What this module ships instead
 ------------------------------
 1. ``OBSERVED_CHUNK_BUDGET_TOKENS`` — an observation, not a bound. See its note.
-2. ``record_embed_batch`` — a detector at the embed boundary that measures the
+2. ``validate_cognee_chunk_budget`` — a pre-storage check that replays the pinned
+   Cognee chunker and rejects a final chunk whose reported or exact text size is
+   over the configured budget.
+3. ``record_embed_batch`` — a detector at the embed boundary that measures the
    chunk actually handed to the model, in the model's own units, and says so.
    Predicting an overflow is arithmetic; measuring one is evidence.
-3. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
+4. ``check_stored_chunk_payload`` — a post-storage check for the exact payload
+   written to the vector store. It catches chunker drift instead of trusting a
+   replay of the input.
+5. ``check_chunkable`` — a verdict for the ingest chokepoint on content that
    cannot be chunked at all. It refuses and records. It never edits text.
 """
 
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
@@ -477,6 +488,259 @@ class UnchunkableSpan:
         return f"at least {self.tokens} BPE tokens"
 
 
+@dataclass(frozen=True)
+class ChunkBudgetViolation:
+    """A final Cognee chunk that cannot be trusted to fit the configured budget."""
+
+    reason: str
+    chunk_index: int
+    configured_size: int
+    measured_tokens: int | None
+    char_length: int
+    fingerprint: str
+
+    def describe(self) -> str:
+        measured = (
+            "unmeasured" if self.measured_tokens is None else f"{self.measured_tokens} BPE tokens"
+        )
+        return (
+            f"{self.reason}: chunk {self.chunk_index}, reported "
+            f"{self.configured_size} BPE tokens, measured {measured}, "
+            f"{self.char_length} characters, {self.fingerprint}"
+        )
+
+
+class ChunkBudgetValidationError(RuntimeError):
+    """The final-chunk validator could not establish the budget invariant."""
+
+
+@dataclass(frozen=True)
+class StoredChunkBudgetViolation:
+    """A persisted vector payload that cannot be trusted to fit the budget.
+
+    The payload text is intentionally absent. A chunk id, lengths, and a digest
+    are enough to identify the bad row without copying user content into logs or
+    API responses.
+    """
+
+    reason: str
+    chunk_id: str
+    document_id: str | None
+    chunk_index: int | None
+    configured_size: int | None
+    measured_tokens: int | None
+    char_length: int
+    fingerprint: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "chunk_id": self.chunk_id,
+            "document_id": self.document_id,
+            "chunk_index": self.chunk_index,
+            "configured_size": self.configured_size,
+            "measured_tokens": self.measured_tokens,
+            "char_length": self.char_length,
+            "fingerprint": self.fingerprint,
+        }
+
+
+def measure_bpe_tokens(text: str) -> int:
+    """Count persisted text with the same GPT-4o encoding used by the chunk gate."""
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot measure stored chunk size"
+        )
+    try:
+        return len(encoding.encode(text, disallowed_special=()))
+    except Exception as exc:  # pragma: no cover - tokenizer contract failure
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer could not measure stored chunk size"
+        ) from exc
+
+
+def check_stored_chunk_payload(
+    payload: Any,
+    *,
+    chunk_id: str,
+    budget: int | None = None,
+) -> StoredChunkBudgetViolation | None:
+    """Check one exact vector payload after Cognee has written it.
+
+    A malformed ``DocumentChunk_text`` row is a failed measurement, not a clean
+    result. Returning a violation keeps the caller's aggregate check fail-closed.
+    """
+    limit = budget if budget is not None else resolve_chunk_budget()
+    if not isinstance(payload, dict):
+        return StoredChunkBudgetViolation(
+            reason="chunk_payload_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=None,
+            chunk_index=None,
+            configured_size=None,
+            measured_tokens=None,
+            char_length=0,
+            fingerprint="unavailable",
+        )
+
+    text = payload.get("text")
+    document_id = payload.get("document_id")
+    document_id = str(document_id) if document_id is not None else None
+    chunk_index = payload.get("chunk_index")
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = None
+    configured_size = payload.get("chunk_size")
+    if isinstance(configured_size, bool) or not isinstance(configured_size, int):
+        configured_size = None
+
+    if not isinstance(text, str):
+        return StoredChunkBudgetViolation(
+            reason="chunk_text_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=document_id,
+            chunk_index=chunk_index,
+            configured_size=configured_size,
+            measured_tokens=None,
+            char_length=0,
+            fingerprint="unavailable",
+        )
+
+    try:
+        measured_tokens = measure_bpe_tokens(text)
+    except ChunkBudgetValidationError:
+        return StoredChunkBudgetViolation(
+            reason="chunk_text_unmeasured",
+            chunk_id=str(chunk_id),
+            document_id=document_id,
+            chunk_index=chunk_index,
+            configured_size=configured_size,
+            measured_tokens=None,
+            char_length=len(text),
+            fingerprint=_fingerprint(text),
+        )
+
+    reason: str | None = None
+    if configured_size is not None and configured_size > limit:
+        reason = "chunk_size_over_budget"
+    elif measured_tokens > limit:
+        reason = "chunk_over_budget"
+    if reason is None:
+        return None
+    return StoredChunkBudgetViolation(
+        reason=reason,
+        chunk_id=str(chunk_id),
+        document_id=document_id,
+        chunk_index=chunk_index,
+        configured_size=configured_size,
+        measured_tokens=measured_tokens,
+        char_length=len(text),
+        fingerprint=_fingerprint(text),
+    )
+
+
+def _iter_cognee_final_chunks(
+    text: str, budget: int
+) -> Iterable[tuple[int, str, int]]:
+    """Mirror Cognee 1.2.x TextChunker output before its storage fan-out.
+
+    Cognee's paragraph chunker returns intermediate chunks, then TextChunker
+    joins several with spaces while carrying forward the summed ``chunk_size``.
+    The joined text is the value that reaches the vector and graph writers, so
+    validating only the intermediate iterator misses the exact failure mode.
+    """
+    try:
+        from cognee.tasks.chunks.chunk_by_paragraph import chunk_by_paragraph
+    except Exception as exc:  # pragma: no cover - dependency pin/import failure
+        raise ChunkBudgetValidationError(
+            "cannot import Cognee's pinned paragraph chunker"
+        ) from exc
+
+    paragraph_chunks: list[dict[str, Any]] = []
+    current_size = 0
+    chunk_index = 0
+    try:
+        chunks = chunk_by_paragraph(text, budget, batch_paragraphs=True)
+        for chunk_data in chunks:
+            chunk_text = chunk_data.get("text")
+            chunk_size = chunk_data.get("chunk_size")
+            if not isinstance(chunk_text, str) or not isinstance(chunk_size, int):
+                raise ChunkBudgetValidationError(
+                    "Cognee paragraph chunker returned an invalid chunk shape"
+                )
+            if current_size + chunk_size <= budget:
+                paragraph_chunks.append(chunk_data)
+                current_size += chunk_size
+                continue
+            if not paragraph_chunks:
+                yield chunk_index, chunk_text, chunk_size
+                current_size = 0
+            else:
+                yield (
+                    chunk_index,
+                    " ".join(item["text"] for item in paragraph_chunks),
+                    current_size,
+                )
+                paragraph_chunks = [chunk_data]
+                current_size = chunk_size
+            chunk_index += 1
+    except ChunkBudgetValidationError:
+        raise
+    except Exception as exc:  # pragma: no cover - dependency contract failure
+        raise ChunkBudgetValidationError("Cognee paragraph chunking failed") from exc
+
+    if paragraph_chunks:
+        yield (
+            chunk_index,
+            " ".join(item["text"] for item in paragraph_chunks),
+            current_size,
+        )
+
+
+def validate_cognee_chunk_budget(
+    text: str, *, budget: int | None = None
+) -> ChunkBudgetViolation | None:
+    """Validate final Cognee chunk text before any durable write begins.
+
+    ``chunk_size`` is Cognee's additive GPT-4o BPE accounting field. It can be
+    larger than an exact count of the joined text because tokenization merges
+    across word boundaries. The validator therefore enforces both values stay
+    within budget without requiring them to be equal.
+    """
+    limit = budget if budget is not None else resolve_chunk_budget()
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot prove final chunk size"
+        )
+    for chunk_index, chunk_text, configured_size in _iter_cognee_final_chunks(text, limit):
+        try:
+            measured_tokens = len(encoding.encode(chunk_text, disallowed_special=()))
+        except Exception as exc:  # pragma: no cover - tokenizer contract failure
+            raise ChunkBudgetValidationError(
+                "the gpt-4o tokenizer could not measure a final Cognee chunk"
+            ) from exc
+        if configured_size > limit:
+            return ChunkBudgetViolation(
+                reason="chunk_size_over_budget",
+                chunk_index=chunk_index,
+                configured_size=configured_size,
+                measured_tokens=measured_tokens,
+                char_length=len(chunk_text),
+                fingerprint=_fingerprint(chunk_text),
+            )
+        if measured_tokens > limit:
+            return ChunkBudgetViolation(
+                reason="chunk_over_budget",
+                chunk_index=chunk_index,
+                configured_size=configured_size,
+                measured_tokens=measured_tokens,
+                char_length=len(chunk_text),
+                fingerprint=_fingerprint(chunk_text),
+            )
+    return None
+
+
 def _iter_cognee_words(text: str) -> Iterable[str]:
     """Yield segments exactly where cognee's ``chunk_by_word`` segments.
 
@@ -501,25 +765,129 @@ def split_cognee_words(text: str) -> list[str]:
 
 
 _BPE_ENCODING: Any | None = None
-_BPE_ENCODING_FAILED = False
+_BPE_ENCODING_UNAVAILABLE = object()
+_TIKTOKEN_CACHE_FILENAME = "".join(
+    ("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790")
+)
+_TIKTOKEN_CACHE_ARCHIVE = _TIKTOKEN_CACHE_FILENAME + ".gz"
+_TIKTOKEN_CACHE_SHA256 = "".join(
+    (
+        "446a9538",
+        "cb6c348e",
+        "3516120d",
+        "7c08b09f",
+        "57c36495",
+        "e2acfffe",
+        "59a5bf8b",
+        "0cfb1a2d",
+    )
+)
+_BUNDLED_TIKTOKEN_CACHE_READY = False
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _valid_tiktoken_cache_file(path: Path) -> bool:
+    try:
+        return path.is_file() and _file_sha256(path) == _TIKTOKEN_CACHE_SHA256
+    except OSError:
+        return False
+
+
+def _seed_bundled_tiktoken_cache() -> None:
+    """Make the pinned GPT-4o vocabulary available without a network fetch."""
+    global _BUNDLED_TIKTOKEN_CACHE_READY
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        return
+    bundled_archive = (
+        Path(__file__).with_name("data")
+        / "tiktoken-cache"
+        / _TIKTOKEN_CACHE_ARCHIVE
+    )
+    if not bundled_archive.is_file():
+        return
+    configured = os.getenv("CITADEL_TIKTOKEN_CACHE_DIR")
+    cache_dir = (
+        Path(configured)
+        if configured
+        else Path(tempfile.gettempdir()) / "citadel-tiktoken-cache"
+    )
+    target = cache_dir / _TIKTOKEN_CACHE_FILENAME
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if not _valid_tiktoken_cache_file(target):
+            with gzip.open(bundled_archive, "rb") as source, temporary.open("wb") as dest:
+                shutil.copyfileobj(source, dest)
+            os.replace(temporary, target)
+        if not _valid_tiktoken_cache_file(target):
+            raise OSError("seeded tokenizer hash mismatch")
+        os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+        _BUNDLED_TIKTOKEN_CACHE_READY = True
+    except OSError:
+        logger.warning(
+            "Could not seed the bundled gpt-4o tokenizer cache; "
+            "exact chunk measurement is unavailable"
+        )
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            # The atomic replacement already removed the temporary file.
+            logger.debug("Temporary gpt-4o tokenizer cache was already removed")
+        except OSError:
+            logger.warning("Could not remove temporary gpt-4o tokenizer cache")
+
+
+_seed_bundled_tiktoken_cache()
 
 
 def _bpe_encoding() -> Any | None:
     """The same encoding cognee counts the budget in: tiktoken for gpt-4o."""
-    global _BPE_ENCODING, _BPE_ENCODING_FAILED
-    if _BPE_ENCODING is not None or _BPE_ENCODING_FAILED:
+    global _BPE_ENCODING
+    if _BPE_ENCODING is _BPE_ENCODING_UNAVAILABLE:
+        return None
+    if _BPE_ENCODING is not None:
         return _BPE_ENCODING
+    cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
+    if cache_dir is None:
+        cache_available = _BUNDLED_TIKTOKEN_CACHE_READY
+    else:
+        cache_available = _valid_tiktoken_cache_file(Path(cache_dir) / _TIKTOKEN_CACHE_FILENAME)
+    if not cache_available:
+        _BPE_ENCODING = _BPE_ENCODING_UNAVAILABLE
+        logger.error(
+            "No valid gpt-4o tokenizer cache is available; "
+            "exact chunk measurement is unavailable"
+        )
+        return None
     try:
         import tiktoken
 
         _BPE_ENCODING = tiktoken.encoding_for_model("gpt-4o")
     except Exception:
-        _BPE_ENCODING_FAILED = True
+        _BPE_ENCODING = _BPE_ENCODING_UNAVAILABLE
         logger.exception(
             "Could not load the gpt-4o encoding; un-chunkable content will pass "
             "the ingest check unmeasured"
         )
-    return _BPE_ENCODING
+    return None if _BPE_ENCODING is _BPE_ENCODING_UNAVAILABLE else _BPE_ENCODING
+
+
+def require_bpe_encoding() -> Any:
+    """Return the exact Cognee tokenizer or fail before a write can start."""
+    encoding = _bpe_encoding()
+    if encoding is None:
+        raise ChunkBudgetValidationError(
+            "the gpt-4o tokenizer is unavailable; cannot run a measured cognify"
+        )
+    return encoding
 
 
 @lru_cache(maxsize=1)

@@ -12,6 +12,7 @@ Obsidian sync feed it source material instead of repeating the orchestration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 import logging
 from typing import Any, Literal
 
@@ -79,6 +80,7 @@ class LearningProcess:
         dataset: str | None = None,
         tags: list[str] | None = None,
         session_id: str | None = None,
+        attestation: Mapping[str, str] | None = None,
         operation: str = "ingest",
         run_improve: bool = False,
         detect_conflicts: bool = True,
@@ -126,13 +128,15 @@ class LearningProcess:
         results: list[IngestResult] = []
         for chunk_data, chunk_tags in chunk_inputs:
             try:
-                result = await self.citadel.ingest(
-                    chunk_data,
-                    dataset=dataset,
-                    tags=chunk_tags,
-                    session_id=session_id,
-                    defer_cognify=defer_cognify,
-                )
+                ingest_kwargs: dict[str, Any] = {
+                    "dataset": dataset,
+                    "tags": chunk_tags,
+                    "session_id": session_id,
+                    "defer_cognify": defer_cognify,
+                }
+                if attestation is not None:
+                    ingest_kwargs["attestation"] = attestation
+                result = await self.citadel.ingest(chunk_data, **ingest_kwargs)
             except Exception as exc:
                 if self.mesh:
                     await self.mesh.record_error(

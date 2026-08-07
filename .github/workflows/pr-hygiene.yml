@@ -20,6 +20,10 @@ on:
     # Do not add a checkout step to this workflow.
     types: [opened, edited, reopened, synchronize, labeled, unlabeled]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: read
