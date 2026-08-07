@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
-from kb.cognify_queue import CognifyRetryQueue
+from kb.cognify_queue import CognifyLease, CognifyRetryQueue
 from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
@@ -456,6 +456,7 @@ class CogneePublicClient:
             configured_queue_path or DEFAULT_COGNIFY_QUEUE_PATH
         )
         self._cognify_queue_task: asyncio.Task[Any] | None = None
+        self._cognify_queue_retry_handle: asyncio.TimerHandle | None = None
         # Serializes graph writes within this process — Kuzu is a single-writer
         # embedded DB, so two overlapping cognify calls (an inline ingest cognify,
         # the evolve scheduler, /api/cognify/run) must not collide (#47). One client
@@ -749,6 +750,7 @@ class CogneePublicClient:
                 wanted,
             )
             return False
+        self._cancel_cognify_retry()
         self._start_cognify_queue_drain()
         return True
 
@@ -786,6 +788,48 @@ class CogneePublicClient:
 
         task.add_done_callback(_finished)
 
+    def _cancel_cognify_retry(self) -> None:
+        handle = self._cognify_queue_retry_handle
+        if handle is not None:
+            handle.cancel()
+            self._cognify_queue_retry_handle = None
+
+    def _schedule_cognify_retry(self) -> None:
+        try:
+            delay = self.cognify_queue.next_wakeup_delay()
+        except Exception:  # noqa: BLE001 - queue corruption must be visible
+            logger.exception("cognify retry wakeup scheduling failed")
+            return
+        if delay is None:
+            return
+        self._cancel_cognify_retry()
+        loop = asyncio.get_running_loop()
+
+        def _wake() -> None:
+            self._cognify_queue_retry_handle = None
+            self._start_cognify_queue_drain()
+
+        self._cognify_queue_retry_handle = loop.call_later(delay, _wake)
+
+    async def _cognify_with_lease(self, lease: CognifyLease) -> Any:
+        heartbeat = asyncio.create_task(self._renew_cognify_lease(lease))
+        try:
+            return await self.cognify(datasets=list(lease.datasets))
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _renew_cognify_lease(self, lease: CognifyLease) -> None:
+        interval = min(max(self.cognify_queue.lease_seconds / 3, 0.1), 30.0)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                self.cognify_queue.renew(lease)
+            except Exception:  # noqa: BLE001 - expiry is handled by acknowledgement
+                logger.exception("cognify retry lease renewal failed for %s", lease.job_id)
+                return
+
     async def _drain_cognify_queue(self) -> None:
         while True:
             try:
@@ -794,10 +838,15 @@ class CogneePublicClient:
                 logger.exception("cognify retry queue claim failed")
                 return
             if lease is None:
+                self._schedule_cognify_retry()
                 return
             try:
-                await self.cognify(datasets=list(lease.datasets))
+                await self._cognify_with_lease(lease)
             except asyncio.CancelledError:
+                try:
+                    self.cognify_queue.reschedule(lease, error="cognify worker cancelled")
+                except Exception:  # noqa: BLE001 - preserve cancellation semantics
+                    logger.exception("cognify retry cancellation reschedule failed")
                 raise
             except Exception as exc:  # noqa: BLE001 - retry after the lease expires
                 try:
@@ -811,6 +860,7 @@ class CogneePublicClient:
                     "background cognify failed for datasets %s; retry persisted",
                     lease.datasets,
                 )
+                self._schedule_cognify_retry()
                 return
             try:
                 self.cognify_queue.acknowledge(lease)
@@ -823,7 +873,8 @@ class CogneePublicClient:
             logger.info("background cognify finished for datasets %s", lease.datasets)
 
     async def stop_cognify_queue(self) -> None:
-        """Cancel the local drain; an active lease remains recoverable."""
+        """Cancel the local drain and return active work to the retry queue."""
+        self._cancel_cognify_retry()
         task = self._cognify_queue_task
         if task is None:
             return

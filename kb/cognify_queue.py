@@ -346,6 +346,34 @@ class CognifyRetryQueue:
                 self._save(state)
             return leases
 
+    def renew(
+        self,
+        lease: CognifyLease,
+        *,
+        now: datetime | None = None,
+        lease_seconds: float | None = None,
+    ) -> CognifyLease:
+        """Extend one active lease without changing its dataset snapshot."""
+        duration = (
+            self.lease_seconds
+            if lease_seconds is None
+            else self._positive_duration(lease_seconds, "lease_seconds")
+        )
+        current = self._resolve_now(now)
+        renewed_until = _timestamp(current + timedelta(seconds=duration))
+        with self._exclusive():
+            state = self._load()
+            record = self._leased_record(state, lease, current)
+            record.update({"leased_until": renewed_until, "updated_at": _timestamp(current)})
+            self._save(state)
+            return CognifyLease(
+                job_id=record["job_id"],
+                lease_id=record["lease_id"],
+                datasets=tuple(record["lease_datasets"]),
+                attempt=record["attempt"],
+                leased_until=renewed_until,
+            )
+
     def acknowledge(self, lease: CognifyLease, *, now: datetime | None = None) -> None:
         """Acknowledge one lease without losing datasets enqueued mid-lease."""
         current = self._resolve_now(now)
@@ -411,6 +439,18 @@ class CognifyRetryQueue:
             if count:
                 self._save(state)
             return count
+
+    def next_wakeup_delay(self, *, now: datetime | None = None) -> float | None:
+        """Return seconds until the next queued job can be claimed."""
+        current = self._resolve_now(now)
+        with self._exclusive():
+            state = self._load()
+            delays: list[float] = []
+            for record in state["jobs"].values():
+                field_name = "available_at" if record["lease_id"] is None else "leased_until"
+                timestamp = _parse_timestamp(record[field_name], field_name=field_name)
+                delays.append(max(0.0, (timestamp - current).total_seconds()))
+            return min(delays) if delays else None
 
     def snapshot(self) -> tuple[CognifyJob, ...]:
         """Return all records without changing their lease state."""

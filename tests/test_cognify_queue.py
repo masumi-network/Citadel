@@ -61,6 +61,23 @@ def test_claim_and_acknowledge_remove_completed_work(tmp_path: Path) -> None:
     assert queue.snapshot() == ()
 
 
+def test_renew_extends_lease_and_delays_reclaim(tmp_path: Path) -> None:
+    queue = CognifyRetryQueue(tmp_path / "queue.json", lease_seconds=10)
+    queue.enqueue(("central",), now=T0)
+    lease = queue.claim(now=T0)
+    assert lease is not None
+
+    renewed = queue.renew(lease, now=T0 + timedelta(seconds=5))
+
+    assert _at(renewed.leased_until) == T0 + timedelta(seconds=15)
+    assert queue.claim(now=T0 + timedelta(seconds=12)) is None
+    assert queue.next_wakeup_delay(now=T0 + timedelta(seconds=12)) == pytest.approx(3)
+
+    reclaimed = queue.claim(now=T0 + timedelta(seconds=16))
+    assert reclaimed is not None
+    assert reclaimed.attempt == 2
+
+
 def test_enqueue_during_lease_survives_acknowledgement(tmp_path: Path) -> None:
     queue = CognifyRetryQueue(tmp_path / "queue.json", lease_seconds=30)
     queue.enqueue(("central",), now=T0)

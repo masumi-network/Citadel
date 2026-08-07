@@ -1381,6 +1381,119 @@ async def test_failed_background_cognify_is_rescheduled(
 
 
 @pytest.mark.asyncio
+async def test_failed_background_cognify_retries_without_new_ingest(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(path, backoff_seconds=0.01, max_backoff_seconds=0.05)
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    calls: list[list[str]] = []
+    retried = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        calls.append(list(datasets))
+        if len(calls) == 1:
+            raise RuntimeError("temporary failure")
+        retried.set()
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+
+    await asyncio.wait_for(retried.wait(), timeout=1)
+
+    async def wait_for_queue_empty() -> None:
+        while queue.snapshot():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_queue_empty(), timeout=1)
+
+    assert calls == [["central"], ["central"]]
+    assert queue.snapshot() == ()
+    await client.stop_cognify_queue()
+
+
+@pytest.mark.asyncio
+async def test_long_cognify_renews_queue_lease(monkeypatch: Any, tmp_path: Any) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(path, lease_seconds=0.3)
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    started = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        started.set()
+        await asyncio.sleep(0.5)
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+    task = client._cognify_queue_task
+    assert task is not None
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(asyncio.shield(task), timeout=1)
+
+    assert queue.snapshot() == ()
+
+
+@pytest.mark.asyncio
+async def test_stop_cognify_queue_reschedules_cancelled_work(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    path = tmp_path / "queue.json"
+    queue = CognifyRetryQueue(path, lease_seconds=30, backoff_seconds=0.01)
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        started.set()
+        await blocked.wait()
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient(retry_queue=queue)
+    client.schedule_cognify(["central"])
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await client.stop_cognify_queue()
+
+    jobs = queue.snapshot()
+    assert len(jobs) == 1
+    assert jobs[0].leased is False
+    assert jobs[0].last_error == "cognify worker cancelled"
+
+
+@pytest.mark.asyncio
 async def test_resume_cognify_queue_drains_pending_work(
     monkeypatch: Any, tmp_path: Any
 ) -> None:

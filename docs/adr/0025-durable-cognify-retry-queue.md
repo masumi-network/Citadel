@@ -24,8 +24,11 @@ Each record contains only dataset names and retry metadata. Queue mutations use
 a sidecar file lock, atomic replacement, and an fsynced file and directory.
 Workers claim leases before cognifying. Successful work is acknowledged;
 failures are returned with bounded exponential backoff; expired leases become
-available again. The web lifespan starts a drain on boot, so work queued by a
-previous process can resume.
+available again. A failed job schedules a wakeup in the live process, so it can
+retry without a new ingest or a process restart. Long-running cognify work
+renews its lease; shutdown cancellation returns active work to the queue. The
+web lifespan starts a drain on boot, so work queued by a previous process can
+resume.
 
 The queue does not replace the in-process graph writer lock. It controls durable
 ownership of deferred work; the existing writer lock still serializes graph
@@ -46,6 +49,9 @@ writes within a process.
 - Queue corruption or an unavailable queue fails closed and logs an explicit
   error. It is not interpreted as an empty queue.
 - The queue stores no document bodies, IDs, or user content.
+- A live worker keeps retry timing and lease ownership durable across failures;
+  the lease heartbeat prevents a long cognify from being reclaimed by another
+  worker while it is still running.
 - A production repair and post-repair census are still required for historical
   zero-chunk documents. This decision does not close that operational part of
   #228.
@@ -53,6 +59,8 @@ writes within a process.
 ## Verification
 
 - [VERIFIED] Queue tests cover atomic writes, cross-process enqueue, leases,
-  backoff, stale-lease recovery, acknowledgement, and malformed state.
-- [VERIFIED] Client tests cover no-loop persistence, failure rescheduling,
-  startup drain, and truthful failure reporting.
+  lease renewal, backoff, stale-lease recovery, acknowledgement, and malformed
+  state.
+- [VERIFIED] Client tests cover no-loop persistence, live failure retry,
+  lease renewal during long cognify, cancellation rescheduling, startup drain,
+  and truthful failure reporting.
