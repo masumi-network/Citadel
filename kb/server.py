@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
+from inspect import isawaitable
 import json
 import logging
 import os
@@ -480,6 +481,20 @@ async def _stop_evolve_scheduler(task: "asyncio.Task[Any] | None") -> None:
         pass
 
 
+def _start_cognify_queue() -> None:
+    resume = getattr(getattr(get_citadel(), "cognee", None), "resume_cognify_queue", None)
+    if callable(resume):
+        resume()
+
+
+async def _stop_cognify_queue() -> None:
+    stop = getattr(getattr(get_citadel(), "cognee", None), "stop_cognify_queue", None)
+    if callable(stop):
+        result = stop()
+        if isawaitable(result):
+            await result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     # Refuse to serve with a guessable env access key (M4). Deliberately at
@@ -530,11 +545,13 @@ async def lifespan(app: FastAPI) -> Any:
                 "Seat dataset backfill failed; seats created before provisioning "
                 "may still fail every search (#147)"
             )
+        _start_cognify_queue()
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
             yield
         finally:
+            await _stop_cognify_queue()
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
             await _stop_evolve_scheduler(repo_stats_task)

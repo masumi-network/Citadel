@@ -659,6 +659,7 @@ class LinearSyncer:
                     await self.citadel.cognee.cognify(datasets=cognify_datasets)
                 except Exception:  # noqa: BLE001 - writes succeeded; cognify is a follow-on
                     logger.exception("Linear sync coalesced cognify failed")
+                    self.citadel.cognee.schedule_cognify(cognify_datasets)
                     cognify_observed = "cognify_failed"
                 else:
                     cognify_observed = "cognified"

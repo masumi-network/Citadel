@@ -4755,6 +4755,24 @@ def test_backfill_seat_datasets_is_wired_into_boot() -> None:
     assert "backfill_seat_datasets" in source, "boot no longer backfills seat datasets"
 
 
+def test_start_cognify_queue_resumes_due_work(monkeypatch: Any) -> None:
+    from kb import server
+
+    calls: list[str] = []
+
+    class FakeCognee:
+        def resume_cognify_queue(self) -> None:
+            calls.append("resume")
+
+    class FakeCitadel:
+        cognee = FakeCognee()
+
+    monkeypatch.setattr(server, "get_citadel", lambda: FakeCitadel())
+    server._start_cognify_queue()
+
+    assert calls == ["resume"]
+
+
 async def test_backfill_seat_datasets_is_a_noop_without_a_cognee_client(tmp_path: Any) -> None:
     """Boot must not break where the client has no ensure_dataset to call."""
     from kb.server import backfill_seat_datasets

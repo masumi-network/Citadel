@@ -48,7 +48,7 @@ class Citadel:
         cognee: CogneeGateway | None = None,
     ) -> None:
         self.config = config or CitadelConfig.from_env()
-        self.cognee = cognee or CogneePublicClient()
+        self.cognee = cognee or CogneePublicClient(queue_path=self.config.cognify_queue_path)
         self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,

@@ -179,6 +179,7 @@ CITADEL_WRITER_KEYS=<32+ char random>
 CITADEL_ADMIN_KEY=<32+ char random>
 CITADEL_ACCESS_STORE_PATH=/data/.citadel/access.json
 CITADEL_AUDIT_MAX_EVENTS=1000
+CITADEL_COGNIFY_QUEUE_PATH=/data/.citadel/cognify_queue.json
 ```
 
 Prefer minted tokens (Access page, or `POST /api/access/tokens`) over env keys

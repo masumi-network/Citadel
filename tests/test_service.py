@@ -74,6 +74,22 @@ class EmptyCognee(FakeCognee):
         return []
 
 
+def test_default_cognee_client_receives_configured_retry_queue_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class ConstructedClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(service, "CogneePublicClient", ConstructedClient)
+    path = tmp_path / "cognify-queue.json"
+    Citadel(CitadelConfig(cognify_queue_path=str(path)))
+
+    assert captured == {"queue_path": str(path)}
+
+
 @pytest.mark.asyncio
 async def test_ingest_applies_tags_and_dataset() -> None:
     fake = FakeCognee()

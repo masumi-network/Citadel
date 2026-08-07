@@ -11,12 +11,14 @@ import os
 import secrets
 from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
+from kb.cognify_queue import CognifyRetryQueue
 from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Strong refs to detached background cognify tasks so the loop does not GC them
 # mid-flight (and so they can be awaited/observed in tests).
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
+DEFAULT_COGNIFY_QUEUE_PATH = Path(".citadel/cognify_queue.json")
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -332,7 +335,7 @@ class CogneeGateway(Protocol):
     ) -> Any:
         raise NotImplementedError
 
-    def schedule_cognify(self, datasets: list[str]) -> None:
+    def schedule_cognify(self, datasets: list[str]) -> bool:
         raise NotImplementedError
 
     async def recall(
@@ -441,8 +444,18 @@ class CogneeGateway(Protocol):
 
 
 class CogneePublicClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        queue_path: str | Path | None = None,
+        retry_queue: CognifyRetryQueue | None = None,
+    ) -> None:
         self._startup_migrations_done = False
+        configured_queue_path = queue_path or os.getenv("CITADEL_COGNIFY_QUEUE_PATH")
+        self.cognify_queue = retry_queue or CognifyRetryQueue(
+            configured_queue_path or DEFAULT_COGNIFY_QUEUE_PATH
+        )
+        self._cognify_queue_task: asyncio.Task[Any] | None = None
         # Serializes graph writes within this process — Kuzu is a single-writer
         # embedded DB, so two overlapping cognify calls (an inline ingest cognify,
         # the evolve scheduler, /api/cognify/run) must not collide (#47). One client
@@ -704,30 +717,46 @@ class CogneePublicClient:
             # writer lock and starve the request (#46/#52). Add-only here; the caller
             # calls schedule_cognify() once when the batch is done.
             return {"added": added, "cognify": "deferred"}
-        self._schedule_background_cognify(dataset_name)
-        return {"added": added, "background_cognify": True}
+        queued = self._schedule_background_cognify(dataset_name)
+        return {"added": added, "background_cognify": queued}
 
-    def _schedule_background_cognify(self, dataset_name: str) -> None:
+    def _schedule_background_cognify(self, dataset_name: str) -> bool:
         """Schedule a tracked, writer-lock-guarded cognify so ingest stays fast.
 
         Replaces cognee's fire-and-forget run_in_background cognify with one that
         acquires our writer lock (via cognify()) — serializing the Kuzu write and
         surfacing failures instead of swallowing them (#47/#56).
         """
-        self.schedule_cognify([dataset_name])
+        return self.schedule_cognify([dataset_name])
 
-    def schedule_cognify(self, datasets: list[str]) -> None:
+    def schedule_cognify(self, datasets: list[str]) -> bool:
         """Schedule ONE tracked, writer-lock-guarded background cognify.
 
         Lets a bulk writer (the Linear resync) coalesce a single cognify over every
         dataset it touched instead of one-per-write, so the request is not starved by
         a storm of per-issue cognifies (#46/#52). The single cognify still serializes
         on the writer lock (single Kuzu writer, #47) and logs — never crashes — on
-        failure. No-op with no running loop (sync caller) or no datasets.
+        failure. Returns whether the durable queue accepted the work.
         """
         wanted = list(dict.fromkeys(datasets))  # de-dup, preserve order
         if not wanted:
-            return
+            return False
+        try:
+            self.cognify_queue.enqueue(wanted)
+        except Exception:  # noqa: BLE001 - a corrupt queue must be visible and fail closed
+            logger.exception(
+                "cognify NOT queued for datasets %s: durable retry state is unavailable",
+                wanted,
+            )
+            return False
+        self._start_cognify_queue_drain()
+        return True
+
+    def resume_cognify_queue(self) -> None:
+        """Resume due cognify work after a process restart."""
+        self._start_cognify_queue_drain()
+
+    def _start_cognify_queue_drain(self) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -737,28 +766,73 @@ class CogneePublicClient:
             # vectors, and Kuzu graph state. Skipping it makes a document that
             # exists as a row and cannot be retrieved. Say so.
             logger.error(
-                "cognify NOT scheduled for %s: no running event loop. The data "
-                "is stored but will not be searchable until a cognify runs.",
-                wanted,
+                "cognify retry drain not started: no running event loop; "
+                "durable work will resume on the next server startup"
             )
             return
 
-        async def _run() -> None:
-            try:
-                await self.cognify(datasets=wanted)
-            except Exception:  # noqa: BLE001 - background task: log, never crash the loop
-                logger.exception("background cognify for datasets %s failed", wanted)
-            else:
-                # Log SUCCESS too. Previously only failures were logged, so a
-                # cognify that never ran — because the process exited before this
-                # detached task was scheduled — was indistinguishable in the logs
-                # from one that completed. That is how a whole repository stayed
-                # missing from the index while every surface reported it synced.
-                logger.info("background cognify finished for datasets %s", wanted)
+        existing = self._cognify_queue_task
+        if existing is not None and not existing.done():
+            return
 
-        task = loop.create_task(_run())
+        task = loop.create_task(self._drain_cognify_queue())
+        self._cognify_queue_task = task
         _BACKGROUND_COGNIFY_TASKS.add(task)
-        task.add_done_callback(_BACKGROUND_COGNIFY_TASKS.discard)
+
+        def _finished(done: asyncio.Task[Any]) -> None:
+            _BACKGROUND_COGNIFY_TASKS.discard(done)
+            if self._cognify_queue_task is done:
+                self._cognify_queue_task = None
+
+        task.add_done_callback(_finished)
+
+    async def _drain_cognify_queue(self) -> None:
+        while True:
+            try:
+                lease = self.cognify_queue.claim()
+            except Exception:  # noqa: BLE001 - queue corruption must be visible
+                logger.exception("cognify retry queue claim failed")
+                return
+            if lease is None:
+                return
+            try:
+                await self.cognify(datasets=list(lease.datasets))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry after the lease expires
+                try:
+                    self.cognify_queue.reschedule(
+                        lease,
+                        error=f"{exc.__class__.__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001 - preserve the original failure
+                    logger.exception("cognify retry reschedule failed")
+                logger.exception(
+                    "background cognify failed for datasets %s; retry persisted",
+                    lease.datasets,
+                )
+                return
+            try:
+                self.cognify_queue.acknowledge(lease)
+            except Exception:  # noqa: BLE001 - expired lease will be recovered
+                logger.exception(
+                    "cognify retry acknowledgement failed for datasets %s",
+                    lease.datasets,
+                )
+                return
+            logger.info("background cognify finished for datasets %s", lease.datasets)
+
+    async def stop_cognify_queue(self) -> None:
+        """Cancel the local drain; an active lease remains recoverable."""
+        task = self._cognify_queue_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if self._cognify_queue_task is task:
+            self._cognify_queue_task = None
 
     async def recall(
         self,

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import pytest
 
 from kb import chunk_window
+from kb.cognify_queue import CognifyRetryQueue
 from kb.cognee_client import CogneePublicClient
 
 
@@ -1256,7 +1257,9 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_remember_schedules_lock_guarded_background_cognify(monkeypatch: Any) -> None:
+async def test_remember_schedules_lock_guarded_background_cognify(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
     # #47: outside the suppress flag, remember adds then schedules OUR background
     # cognify (lock-guarded), not cognee's fire-and-forget run_in_background.
     import asyncio
@@ -1265,6 +1268,7 @@ async def test_remember_schedules_lock_guarded_background_cognify(monkeypatch: A
 
     monkeypatch.delenv("CITADEL_SUPPRESS_INLINE_COGNIFY", raising=False)
     monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
     cognified: list[Any] = []
 
     async def run_startup_migrations() -> None:
@@ -1292,7 +1296,9 @@ async def test_remember_schedules_lock_guarded_background_cognify(monkeypatch: A
 
 
 @pytest.mark.asyncio
-async def test_schedule_cognify_runs_one_cognify_over_all_datasets(monkeypatch: Any) -> None:
+async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
     # #46/#52: the coalesced cognify is ONE background task over every dataset the
     # bulk write touched (de-duplicated), not one-per-write.
     import asyncio
@@ -1300,6 +1306,7 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(monkeypatch: 
     import kb.cognee_client as cc
 
     monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
     cognified: list[list[str]] = []
 
     async def run_startup_migrations() -> None:
@@ -1325,6 +1332,111 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(monkeypatch: 
     client.schedule_cognify([])
     await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == []
+
+
+def test_schedule_cognify_persists_without_a_running_loop(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    path = tmp_path / "queue.json"
+    monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
+
+    CogneePublicClient().schedule_cognify(["central"])
+
+    jobs = CognifyRetryQueue(path).snapshot()
+    assert len(jobs) == 1
+    assert jobs[0].datasets == ("central",)
+
+
+@pytest.mark.asyncio
+async def test_failed_background_cognify_is_rescheduled(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    import kb.cognee_client as cc
+
+    path = tmp_path / "queue.json"
+    monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
+    monkeypatch.setenv("LLM_API_KEY", "k")
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        raise RuntimeError("node unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient()
+    client.schedule_cognify(["central"])
+    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+
+    jobs = CognifyRetryQueue(path).snapshot()
+    assert len(jobs) == 1
+    assert jobs[0].leased is False
+    assert jobs[0].last_error == "RuntimeError: node unavailable"
+
+
+@pytest.mark.asyncio
+async def test_resume_cognify_queue_drains_pending_work(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import asyncio
+
+    import kb.cognee_client as cc
+
+    path = tmp_path / "queue.json"
+    CognifyRetryQueue(path).enqueue(["central"])
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    cognified: list[list[str]] = []
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+        cognified.append(list(datasets))
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient(queue_path=path)
+    client.resume_cognify_queue()
+    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+
+    assert cognified == [["central"]]
+    assert CognifyRetryQueue(path).snapshot() == ()
+
+
+@pytest.mark.asyncio
+async def test_remember_reports_false_when_durable_queue_cannot_accept_work(
+    monkeypatch: Any,
+) -> None:
+    class BrokenQueue:
+        def enqueue(self, datasets: list[str]) -> None:
+            raise OSError("queue volume unavailable")
+
+    async def add(data: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_startup_migrations=run_startup_migrations, add=add),
+    )
+    result = await CogneePublicClient(retry_queue=BrokenQueue()).remember(
+        "note", dataset_name="central"
+    )
+
+    assert result == {"added": {"ok": True}, "background_cognify": False}
 
 
 @pytest.mark.asyncio
