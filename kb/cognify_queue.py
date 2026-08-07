@@ -50,6 +50,7 @@ def _after_fork_child() -> None:
             try:
                 handle.close()
             except OSError:
+                # Child cleanup is best-effort; continue closing other handles.
                 pass
         _EXECUTION_HANDLES.clear()
     finally:
@@ -269,14 +270,15 @@ class CognifyRetryQueue:
                 raise
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                guard = CognifyExecutionGuard(handle)
+                _EXECUTION_HANDLES[handle.fileno()] = handle
             except BlockingIOError:
                 handle.close()
                 return None
             except BaseException:
                 handle.close()
                 raise
-            _EXECUTION_HANDLES[handle.fileno()] = handle
-        return CognifyExecutionGuard(handle)
+        return guard
 
     @staticmethod
     def _positive_duration(value: float, field_name: str) -> float:
@@ -301,7 +303,7 @@ class CognifyRetryQueue:
         current_text = _timestamp(current)
         with self._exclusive():
             state = self._load()
-            changed = self._recover_stale_in_state(state, current)
+            self._recover_stale_in_state(state, current)
             jobs = state["jobs"]
             unleased = [record for record in jobs.values() if record["lease_id"] is None]
             leased_overlaps = [
@@ -331,7 +333,6 @@ class CognifyRetryQueue:
                 for job_id in remove_ids:
                     jobs.pop(job_id, None)
                 target["updated_at"] = current_text
-                changed = True
                 result = self._job_from_record(target)
             elif unleased:
                 target = min(unleased, key=self._record_order)
@@ -350,7 +351,6 @@ class CognifyRetryQueue:
                         "updated_at": current_text,
                     }
                 )
-                changed = True
                 result = self._job_from_record(target)
             else:
                 job_id = f"cognify_{uuid4().hex}"
@@ -367,11 +367,9 @@ class CognifyRetryQueue:
                     "last_error": None,
                 }
                 jobs[job_id] = record
-                changed = True
                 result = self._job_from_record(record)
 
-            if changed:
-                self._save(state)
+            self._save(state)
             return result
 
     def claim(self, *, now: datetime | None = None, lease_seconds: float | None = None) -> CognifyLease | None:

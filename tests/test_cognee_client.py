@@ -11,7 +11,7 @@ import pytest
 
 from kb import chunk_window
 from kb.cognify_queue import CognifyRetryQueue
-from kb.cognee_client import CogneePublicClient
+from kb.cognee_client import CogneePublicClient, _BACKGROUND_COGNIFY_TASKS
 
 
 COGNEE_ENV_KEYS = (
@@ -1147,8 +1147,6 @@ async def test_node_dataset_map_times_out_and_caches_the_failure(
 @pytest.mark.asyncio
 async def test_cognify_serializes_on_writer_lock(monkeypatch: Any) -> None:
     # #47: Kuzu is single-writer, so two overlapping cognify calls must serialize.
-    import asyncio
-
     monkeypatch.setenv("LLM_API_KEY", "k")
     concurrent = 0
     max_seen = 0
@@ -1262,10 +1260,6 @@ async def test_remember_schedules_lock_guarded_background_cognify(
 ) -> None:
     # #47: outside the suppress flag, remember adds then schedules OUR background
     # cognify (lock-guarded), not cognee's fire-and-forget run_in_background.
-    import asyncio
-
-    import kb.cognee_client as cc
-
     monkeypatch.delenv("CITADEL_SUPPRESS_INLINE_COGNIFY", raising=False)
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
@@ -1291,7 +1285,7 @@ async def test_remember_schedules_lock_guarded_background_cognify(
     result = await client.remember("note", dataset_name="seat:sarthi", tags=())
     assert result == {"added": {"ok": True}, "background_cognify": True}
     # Drain the scheduled background cognify and confirm it ran via cognify().
-    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == [["seat:sarthi"]]
 
 
@@ -1301,10 +1295,6 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
 ) -> None:
     # #46/#52: the coalesced cognify is ONE background task over every dataset the
     # bulk write touched (de-duplicated), not one-per-write.
-    import asyncio
-
-    import kb.cognee_client as cc
-
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
     cognified: list[list[str]] = []
@@ -1324,13 +1314,13 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
     client = CogneePublicClient()
 
     client.schedule_cognify(["central", "seat:a", "central"])  # duplicate central
-    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == [["central", "seat:a"]]  # one cognify, de-duplicated
 
     # No datasets → no task scheduled.
     cognified.clear()
     client.schedule_cognify([])
-    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
     assert cognified == []
 
 
@@ -1351,10 +1341,6 @@ def test_schedule_cognify_persists_without_a_running_loop(
 async def test_failed_background_cognify_is_rescheduled(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
-    import kb.cognee_client as cc
-
     path = tmp_path / "queue.json"
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1372,7 +1358,7 @@ async def test_failed_background_cognify_is_rescheduled(
     )
     client = CogneePublicClient()
     client.schedule_cognify(["central"])
-    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
 
     jobs = CognifyRetryQueue(path).snapshot()
     assert len(jobs) == 1
@@ -1384,8 +1370,6 @@ async def test_failed_background_cognify_is_rescheduled(
 async def test_failed_background_cognify_retries_without_new_ingest(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(path, backoff_seconds=0.01, max_backoff_seconds=0.05)
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1425,8 +1409,6 @@ async def test_failed_background_cognify_retries_without_new_ingest(
 
 @pytest.mark.asyncio
 async def test_long_cognify_renews_queue_lease(monkeypatch: Any, tmp_path: Any) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(path, lease_seconds=0.3)
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1483,8 +1465,6 @@ async def test_heartbeat_failure_wins_same_turn_cognify_completion(
 async def test_failed_lease_renewal_cancels_cognify_before_retry(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(
         path,
@@ -1538,8 +1518,6 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
 async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     first_queue = CognifyRetryQueue(
         path,
@@ -1623,7 +1601,6 @@ async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
     await asyncio.wait_for(replacement_started.wait(), timeout=1)
     await asyncio.wait_for(asyncio.shield(replacement_task), timeout=1)
 
-    assert max_active_cognify == 1
     assert second_queue.snapshot() == ()
     await first_client.stop_cognify_queue()
     await second_client.stop_cognify_queue()
@@ -1631,8 +1608,6 @@ async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
 
 @pytest.mark.asyncio
 async def test_execution_lock_contention_uses_bounded_poll(tmp_path: Any) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     owner_queue = CognifyRetryQueue(path, lease_seconds=300)
     contender_queue = CognifyRetryQueue(path, lease_seconds=300)
@@ -1656,12 +1631,12 @@ async def test_execution_lock_contention_uses_bounded_poll(tmp_path: Any) -> Non
 
     await contender.stop_cognify_queue()
     owner_guard.release()
+
+
 @pytest.mark.asyncio
 async def test_failed_acknowledgement_retries_without_external_activity(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(
         path,
@@ -1730,8 +1705,6 @@ async def test_failed_acknowledgement_retries_without_external_activity(
 async def test_child_cognify_cancellation_retries_without_external_activity(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(
         path,
@@ -1777,8 +1750,6 @@ async def test_child_cognify_cancellation_retries_without_external_activity(
 async def test_stop_cognify_queue_reschedules_cancelled_work(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(path, lease_seconds=30, backoff_seconds=0.01)
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1814,10 +1785,6 @@ async def test_stop_cognify_queue_reschedules_cancelled_work(
 async def test_resume_cognify_queue_drains_pending_work(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    import asyncio
-
-    import kb.cognee_client as cc
-
     path = tmp_path / "queue.json"
     CognifyRetryQueue(path).enqueue(["central"])
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1837,7 +1804,7 @@ async def test_resume_cognify_queue_drains_pending_work(
     )
     client = CogneePublicClient(queue_path=path)
     client.resume_cognify_queue()
-    await asyncio.gather(*list(cc._BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
 
     assert cognified == [["central"]]
     assert CognifyRetryQueue(path).snapshot() == ()

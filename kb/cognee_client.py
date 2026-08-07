@@ -834,7 +834,7 @@ class CogneePublicClient:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if heartbeat in done:
-                await heartbeat
+                heartbeat.result()
                 raise RuntimeError(
                     f"cognify retry lease heartbeat stopped for {lease.job_id}"
                 )
@@ -940,7 +940,7 @@ class CogneePublicClient:
         if not task.done():
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            _ = await task
         if self._cognify_queue_task is task:
             self._cognify_queue_task = None
 

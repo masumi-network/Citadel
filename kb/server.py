@@ -492,7 +492,7 @@ async def _stop_cognify_queue() -> None:
     if callable(stop):
         result = stop()
         if isawaitable(result):
-            await result
+            _ = await result
 
 
 @asynccontextmanager
