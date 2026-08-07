@@ -1238,9 +1238,7 @@ class CogneePublicClient:
         after_created_at: str | None = None
         after_id: str | None = None
         document_ids_seen: set[str] = set()
-        chunked_ids: set[str] = set()
-        graph_ids_seen: set[str] = set()
-        fully_indexed_ids: set[str] = set()
+        document_ids: list[str] = []
         pages = 0
 
         while len(document_ids_seen) < total_documents:
@@ -1262,7 +1260,6 @@ class CogneePublicClient:
             if len(rows) > page_limit:
                 raise RuntimeError("corpus page exceeded its requested limit")
 
-            page_ids: list[str] = []
             for row in rows:
                 if not isinstance(row, dict) or not row.get("id"):
                     raise RuntimeError("corpus page returned a row without an id")
@@ -1272,27 +1269,9 @@ class CogneePublicClient:
                         f"corpus page returned duplicate document {document_id}"
                     )
                 document_ids_seen.add(document_id)
-                page_ids.append(document_id)
+                document_ids.append(document_id)
             if len(document_ids_seen) > total_documents:
                 raise RuntimeError("corpus pages exceeded the reported document total")
-
-            chunk_counts = await self.corpus_chunk_counts(page_ids)
-            if chunk_counts is None:
-                raise RuntimeError("vector chunk measurement is unavailable")
-            graph_ids = await self.corpus_graph_presence(page_ids)
-            if graph_ids is None:
-                raise RuntimeError("graph presence measurement is unavailable")
-
-            graph_id_set = {str(document_id) for document_id in graph_ids}
-            page_chunked_ids = {
-                document_id
-                for document_id in page_ids
-                if int(chunk_counts.get(document_id, 0)) > 0
-            }
-            page_graph_ids = set(page_ids) & graph_id_set
-            chunked_ids.update(page_chunked_ids)
-            graph_ids_seen.update(page_graph_ids)
-            fully_indexed_ids.update(page_chunked_ids & page_graph_ids)
             pages += 1
 
             if len(document_ids_seen) >= total_documents:
@@ -1304,6 +1283,30 @@ class CogneePublicClient:
             after_id = str(last_row["id"])
 
         probe_complete = len(document_ids_seen) == total_documents
+        chunked_ids: set[str] = set()
+        graph_ids_seen: set[str] = set()
+        fully_indexed_ids: set[str] = set()
+        if document_ids:
+            # Both projection methods scan their backing store. Running them
+            # once after the relational walk avoids repeating a full graph scan
+            # for every source page while preserving the same complete-corpus
+            # and fail-closed checks.
+            chunk_counts = await self.corpus_chunk_counts(document_ids)
+            if chunk_counts is None:
+                raise RuntimeError("vector chunk measurement is unavailable")
+            graph_ids = await self.corpus_graph_presence(document_ids)
+            if graph_ids is None:
+                raise RuntimeError("graph presence measurement is unavailable")
+            chunked_ids = {
+                document_id
+                for document_id in document_ids
+                if int(chunk_counts.get(document_id, 0)) > 0
+            }
+            graph_ids_seen = set(document_ids) & {
+                str(document_id) for document_id in graph_ids
+            }
+            fully_indexed_ids = chunked_ids & graph_ids_seen
+
         return {
             "relational_documents": total_documents,
             "probe_limit": probe_limit,

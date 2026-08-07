@@ -2487,8 +2487,8 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
         (None, None, 2),
         ("2026-01-02T00:00:00+00:00", "doc-b", 1),
     ]
-    assert chunk_calls == [["doc-a", "doc-b"], ["doc-c"]]
-    assert graph_calls == [["doc-a", "doc-b"], ["doc-c"]]
+    assert chunk_calls == [["doc-a", "doc-b", "doc-c"]]
+    assert graph_calls == [["doc-a", "doc-b", "doc-c"]]
     assert health == {
         "relational_documents": 3,
         "probe_limit": 2,
