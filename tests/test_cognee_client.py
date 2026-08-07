@@ -492,6 +492,8 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
 
     user_id = uuid4()
     other_user = uuid4()
+    tenant_id = uuid4()
+    foreign_tenant_id = uuid4()
     ds_alice, ds_bob, ds_foreign = uuid4(), uuid4(), uuid4()
     doc_id, mirrored_id, foreign_id = uuid4(), uuid4(), uuid4()
 
@@ -501,10 +503,31 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
         await conn.run_sync(DatasetData.__table__.create)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
-        session.add(Dataset(id=ds_alice, name="seat:alice", owner_id=user_id))
-        session.add(Dataset(id=ds_bob, name="seat:bob", owner_id=user_id))
+        session.add(
+            Dataset(
+                id=ds_alice,
+                name="seat:alice",
+                owner_id=user_id,
+                tenant_id=tenant_id,
+            )
+        )
+        session.add(
+            Dataset(
+                id=ds_bob,
+                name="seat:bob",
+                owner_id=user_id,
+                tenant_id=tenant_id,
+            )
+        )
         # A dataset owned by a different user must NOT leak into the map.
-        session.add(Dataset(id=ds_foreign, name="seat:carol", owner_id=other_user))
+        session.add(
+            Dataset(
+                id=ds_foreign,
+                name="seat:carol",
+                owner_id=other_user,
+                tenant_id=foreign_tenant_id,
+            )
+        )
         session.add(DatasetData(dataset_id=ds_alice, data_id=doc_id))
         session.add(DatasetData(dataset_id=ds_alice, data_id=mirrored_id))
         session.add(DatasetData(dataset_id=ds_bob, data_id=mirrored_id))
@@ -518,7 +541,7 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
                 yield session
 
     async def get_default_user() -> Any:
-        return SimpleNamespace(id=user_id)
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
 
     monkeypatch.setattr(
         relational_module, "get_relational_engine", lambda: _FakeRelEngine()
@@ -537,6 +560,7 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     membership = await client.dataset_membership_for_documents(
         [str(mirrored_id), str(doc_id), str(foreign_id)]
     )
+    forced_scope = await client.dataset_document_ids(["seat:alice", "seat:bob", "seat:carol"])
     await engine.dispose()
 
     assert mapping == {
@@ -548,6 +572,7 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
         str(mirrored_id): ["seat:alice", "seat:bob"],
         str(foreign_id): ["seat:carol"],
     }
+    assert forced_scope == sorted([str(doc_id), str(mirrored_id)])
 
 
 @pytest.mark.asyncio
@@ -1518,6 +1543,45 @@ async def test_cognify_checks_only_source_ids_processed_by_this_pass(monkeypatch
     await client.cognify(datasets=["notes"])
 
     assert checked == [["doc-a", "doc-b"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {},
+        {"dataset-id": SimpleNamespace(data_ingestion_info=[{"data_id": "doc-a"}])},
+    ],
+    ids=["empty", "partial"],
+)
+async def test_forced_cognify_rejects_empty_or_partial_receipt(
+    monkeypatch: Any, receipt: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+
+    async def run_startup_migrations() -> None:
+        return None
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        return receipt
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_startup_migrations=run_startup_migrations,
+            cognify=cognify,
+        ),
+    )
+    client = CogneePublicClient()
+
+    async def dataset_document_ids(_: list[str]) -> list[str]:
+        return ["doc-a", "doc-b"]
+
+    monkeypatch.setattr(client, "dataset_document_ids", dataset_document_ids)
+
+    with pytest.raises(RuntimeError, match="receipt omitted [12] expected source id"):
+        await client.cognify(datasets=["notes"], force=True)
 
 
 @pytest.mark.asyncio

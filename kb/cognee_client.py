@@ -367,6 +367,9 @@ class CogneeGateway(Protocol):
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         raise NotImplementedError
 
+    async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
+        raise NotImplementedError
+
     def maintenance(self) -> AsyncIterator[None]:
         raise NotImplementedError
 
@@ -1006,6 +1009,47 @@ class CogneePublicClient:
             for data_id, dataset_name in rows.all():
                 mapping.setdefault(str(data_id), []).append(dataset_name)
         return mapping
+
+    async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
+        """Return source ids in the authorized datasets, without graph access.
+
+        Forced cognify must verify the receipt against the same dataset scope
+        Cognee resolves for the current user. Querying DatasetData through
+        Cognee's authorized dataset ids avoids treating another owner's
+        same-named dataset as part of the rebuild.
+        """
+        wanted = list(dict.fromkeys(str(dataset) for dataset in datasets if str(dataset)))
+        if not wanted:
+            return []
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            dataset_rows = await session.execute(
+                select(Dataset.id).where(
+                    Dataset.owner_id == user.id,
+                    Dataset.tenant_id == user.tenant_id,
+                    Dataset.name.in_(wanted),
+                )
+            )
+            dataset_ids = [dataset_id for (dataset_id,) in dataset_rows.all()]
+            if not dataset_ids:
+                return []
+            rows = await session.execute(
+                select(DatasetData.data_id).where(
+                    DatasetData.dataset_id.in_(dataset_ids)
+                )
+            )
+        return sorted({str(data_id) for (data_id,) in rows.all() if data_id is not None})
 
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
@@ -3448,6 +3492,7 @@ class CogneePublicClient:
         import cognee
 
         await self._ensure_cognee_ready(cognee)
+        expected_ids = await self.dataset_document_ids(datasets) if force else []
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
@@ -3458,6 +3503,13 @@ class CogneePublicClient:
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
         processed_ids = _cognify_data_ids(result)
+        if force:
+            missing_ids = sorted(set(expected_ids) - set(processed_ids))
+            if missing_ids:
+                raise RuntimeError(
+                    "forced cognify receipt omitted "
+                    f"{len(missing_ids)} expected source id(s)"
+                )
         if processed_ids:
             stored_check = await self.stored_chunk_budget_check(
                 document_ids=processed_ids
