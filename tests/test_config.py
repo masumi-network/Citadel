@@ -33,6 +33,19 @@ def test_from_env_env_vars_still_override(monkeypatch) -> None:
     assert config.default_dataset == "explicit-dataset"
 
 
+def test_cognify_queue_path_defaults_to_state_root_and_honors_override(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(tmp_path / "state"))
+    monkeypatch.delenv("CITADEL_COGNIFY_QUEUE_PATH", raising=False)
+    config = CitadelConfig.from_env(env_file=None)
+    assert config.cognify_queue_path == str(tmp_path / "state" / "cognify_queue.json")
+
+    explicit = tmp_path / "explicit-queue.json"
+    monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(explicit))
+    assert CitadelConfig.from_env(env_file=None).cognify_queue_path == str(explicit)
+
+
 def test_repo_content_autojoin_env(monkeypatch) -> None:
     monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_ENABLED", "true")
     monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_MARKERS", "AGENTS.md, SKILL.md")

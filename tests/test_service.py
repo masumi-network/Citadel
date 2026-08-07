@@ -74,6 +74,22 @@ class EmptyCognee(FakeCognee):
         return []
 
 
+def test_default_cognee_client_receives_configured_retry_queue_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class ConstructedClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(service, "CogneePublicClient", ConstructedClient)
+    path = tmp_path / "cognify-queue.json"
+    Citadel(CitadelConfig(cognify_queue_path=str(path)))
+
+    assert captured == {"queue_path": str(path)}
+
+
 @pytest.mark.asyncio
 async def test_ingest_applies_tags_and_dataset() -> None:
     fake = FakeCognee()
@@ -1888,6 +1904,22 @@ async def test_ingest_reports_queued_not_confirmed_until_cognify_finishes() -> N
 
     assert result.accepted is True
     assert result.reason == "queued_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_ingest_reports_not_scheduled_when_retry_queue_rejects() -> None:
+    class RejectedQueueCognee(FakeCognee):
+        async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+            self.remember_calls.append({"data": data, **kwargs})
+            return {"added": {"ok": True}, "background_cognify": False}
+
+    fake = RejectedQueueCognee()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.ingest("a note whose retry was rejected")
+
+    assert result.accepted is True
+    assert result.reason == "not_scheduled"
 
 
 @pytest.mark.asyncio

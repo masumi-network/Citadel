@@ -80,6 +80,12 @@ def _repair_journal_path(value: str | None) -> str:
     return str(Path(_state_root()) / "repair_journal.jsonl")
 
 
+def _cognify_queue_path(value: str | None) -> str:
+    if value:
+        return value
+    return str(Path(_state_root()) / "cognify_queue.json")
+
+
 def _repo_stats_state_path(value: str | None) -> str:
     if value:
         return value
@@ -247,6 +253,7 @@ class CitadelConfig:
     repo_content_sync_state_path: str = ".citadel/repo_content_sync_state.json"
     evolve_state_path: str = ".citadel/evolve_state.json"
     repair_journal_path: str = ".citadel/repair_journal.jsonl"
+    cognify_queue_path: str = ".citadel/cognify_queue.json"
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -455,6 +462,7 @@ class CitadelConfig:
             repair_journal_path=_repair_journal_path(
                 os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
             ),
+            cognify_queue_path=_cognify_queue_path(os.getenv("CITADEL_COGNIFY_QUEUE_PATH")),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
             ),

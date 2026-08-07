@@ -31,6 +31,7 @@ Number 0008 was never used.
 | [0021](0021-retrieval-interface-owns-ranking-and-provenance.md) | Citadel defines the retrieval interface; the engine is one implementation behind it. Not yet implemented. |
 | [0022](0022-evidence-is-retained-and-attested-at-capture.md) | Evidence is retained and fingerprinted at capture, not recomputed at read. Not yet implemented. |
 | [0023](0023-control-plane-outside-the-application.md) | One organization, one instance. The control plane is a separate system. Not yet implemented. |
+| [0025](0025-durable-cognify-retry-queue.md) | Deferred cognify work is persisted as a dataset-level retry queue and resumed on web startup. |
 
 The four newest records come from the design session written up in
 [`../superpowers/specs/2026-08-03-citadel-substrate-design.md`](../superpowers/specs/2026-08-03-citadel-substrate-design.md).

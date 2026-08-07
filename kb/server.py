@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
+from inspect import isawaitable
 import json
 import logging
 import os
@@ -480,6 +481,20 @@ async def _stop_evolve_scheduler(task: "asyncio.Task[Any] | None") -> None:
         pass
 
 
+def _start_cognify_queue() -> None:
+    resume = getattr(getattr(get_citadel(), "cognee", None), "resume_cognify_queue", None)
+    if callable(resume):
+        resume()
+
+
+async def _stop_cognify_queue() -> None:
+    stop = getattr(getattr(get_citadel(), "cognee", None), "stop_cognify_queue", None)
+    if callable(stop):
+        result = stop()
+        if isawaitable(result):
+            _ = await result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     # Refuse to serve with a guessable env access key (M4). Deliberately at
@@ -530,11 +545,13 @@ async def lifespan(app: FastAPI) -> Any:
                 "Seat dataset backfill failed; seats created before provisioning "
                 "may still fail every search (#147)"
             )
+        _start_cognify_queue()
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
             yield
         finally:
+            await _stop_cognify_queue()
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
             await _stop_evolve_scheduler(repo_stats_task)
@@ -6564,8 +6581,12 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         for target, item in zip(write_targets, all_outcomes, strict=True)
         if item.ingest.accepted
     ]
+    cognify_queued = False
     if cognify_datasets:
-        citadel.cognee.schedule_cognify(list(dict.fromkeys(cognify_datasets)))
+        cognify_queued = citadel.cognee.schedule_cognify(
+            list(dict.fromkeys(cognify_datasets))
+        )
+    cognify_state = "deferred" if cognify_queued else "not_scheduled"
 
     record_mcp_audit(
         request,
@@ -6577,6 +6598,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "accepted": outcome.ingest.accepted,
             "write_targets": [target.dataset for target in write_targets],
             "has_tool_errors": body.has_tool_errors,
+            "cognify": cognify_state,
         },
     )
     get_access_store().record_event(
@@ -6587,6 +6609,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         detail={
             "write_targets": [target.dataset for target in write_targets],
             "author_seat": actor.seat_slug,
+            "cognify": cognify_state,
         },
     )
     return jsonable_encoder(
@@ -6595,8 +6618,12 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "accepted": outcome.ingest.accepted,
             "dataset": SESSION_TRACES_DATASET,
             "write_targets": [target.dataset for target in write_targets],
-            "cognify": "deferred",
-            "message": "Shared Session Trace accepted; searchable after coalesced cognify.",
+            "cognify": cognify_state,
+            "message": (
+                "Shared Session Trace accepted; searchable after coalesced cognify."
+                if cognify_queued
+                else "Shared Session Trace accepted, but indexing was not scheduled."
+            ),
         }
     )
 
