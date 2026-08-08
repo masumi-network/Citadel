@@ -216,7 +216,8 @@ def test_detector_reports_when_it_could_not_measure() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_caches(
+@pytest.mark.asyncio
+async def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_caches(
     monkeypatch: Any,
 ) -> None:
     """Clearing ``get_embedding_config`` alone does NOT change the chunk budget.
@@ -244,7 +245,7 @@ def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_
     chunk_window._clear_cognee_budget_caches()
     try:
         # A cognee operation runs BEFORE the guard, warming every cache at 8191.
-        warm = get_max_chunk_tokens()
+        warm = await get_max_chunk_tokens()
         assert warm > chunk_window.OBSERVED_CHUNK_BUDGET_TOKENS, (
             f"expected the un-clamped default to be larger than the budget, got {warm}"
         )
@@ -254,7 +255,7 @@ def test_clamp_reaches_get_max_chunk_tokens_after_a_cognee_operation_warmed_the_
 
         assert applied == 256
         assert os.environ[chunk_window.COGNEE_BUDGET_ENV] == "256"
-        assert get_max_chunk_tokens() == 256, (
+        assert await get_max_chunk_tokens() == 256, (
             "the clamp did not reach the real chunk budget: a warm create_vector_engine "
             "entry is still serving an embedding engine built at the old budget"
         )

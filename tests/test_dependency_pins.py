@@ -8,10 +8,16 @@ Keep both install paths on the same specifier so neither can drift alone.
 
 from __future__ import annotations
 
+from importlib import metadata
 from pathlib import Path
 import tomllib
 
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+COGNEE_VERSION = "1.4.1"
+CRYPTOGRAPHY_VERSION = "50.0.0"
 
 
 def _cognee_requirement(lines: list[str]) -> str:
@@ -22,6 +28,14 @@ def _cognee_requirement(lines: list[str]) -> str:
     raise AssertionError("no cognee requirement found")
 
 
+def _requirement(lines: list[str], package: str) -> str:
+    for line in lines:
+        stripped = line.strip().rstrip(",").strip('"')
+        if stripped.startswith(package):
+            return stripped
+    raise AssertionError(f"no {package} requirement found")
+
+
 def test_cognee_pin_matches_between_pyproject_and_requirements() -> None:
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     server_deps = pyproject["project"]["optional-dependencies"]["server"]
@@ -30,3 +44,51 @@ def test_cognee_pin_matches_between_pyproject_and_requirements() -> None:
         (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
     )
     assert pyproject_pin == requirements_pin
+    assert pyproject_pin == f"cognee[fastembed]=={COGNEE_VERSION}"
+
+
+def test_server_install_does_not_depend_on_the_community_qdrant_package() -> None:
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    server_deps = [str(item) for item in pyproject["project"]["optional-dependencies"]["server"]]
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+
+    assert not any("cognee-community-vector-adapter-qdrant" in item for item in server_deps)
+    assert not any("cognee-community-vector-adapter-qdrant" in item for item in requirements)
+
+
+def test_qdrant_client_pin_matches_between_pyproject_and_requirements() -> None:
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    server_deps = [str(item) for item in pyproject["project"]["optional-dependencies"]["server"]]
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+
+    pyproject_pin = _requirement(server_deps, "qdrant-client")
+    requirements_pin = _requirement(requirements, "qdrant-client")
+
+    assert pyproject_pin == requirements_pin == "qdrant-client==1.19.0"
+
+
+def test_project_supports_python_3_12() -> None:
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    supported = SpecifierSet(str(pyproject["project"]["requires-python"]))
+
+    assert supported.contains("3.12", prereleases=True)
+
+
+def test_installed_cognee_141_metadata_accepts_secure_cryptography() -> None:
+    cognee = metadata.distribution("cognee")
+    cryptography_requirements = [
+        Requirement(item)
+        for item in (cognee.requires or [])
+        if Requirement(item).name == "cryptography"
+    ]
+
+    assert cognee.version == COGNEE_VERSION
+    assert metadata.version("cryptography") == CRYPTOGRAPHY_VERSION
+    assert cryptography_requirements, "Cognee metadata has no cryptography requirement"
+    assert all(
+        requirement.specifier.contains(CRYPTOGRAPHY_VERSION, prereleases=True)
+        for requirement in cryptography_requirements
+    ), (
+        f"Cognee {COGNEE_VERSION} metadata rejects cryptography {CRYPTOGRAPHY_VERSION}: "
+        f"{cryptography_requirements}"
+    )
