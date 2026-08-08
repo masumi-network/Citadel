@@ -1,10 +1,12 @@
 # Status
 Last updated: 2026-08-08
 Updated by: coordinator
-Current phase: secure packaging and SQLite Lite proof
+Current phase: portable SQLite Lite container proof
 Current sprint: CITADEL-QDRANT-2026-08-08
 
 ## Completed
+- [x] CITADEL-QDRANT-2026-08-08-12, owner: implementer. VERIFIED: secure Cognee `1.4.1` source build shipped in candidate commit `420be9d`; draft PR 256 CI is green. Exact source SHA-256 is `9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9`; wheel SHA-256 is `2c1bec17b0ed9563ffa4f6ccdd4a02939cdec6dfd93db9faf852266ce3231a91`. Local full suite returned `1759 passed, 1 skipped, 11 warnings in 22.26s`.
+- [x] CITADEL-QDRANT-2026-08-08-13, owner: implementer. VERIFIED: Qdrant `1.19.0` real-server adapter and Cognee `1.4.1` SQLite restart tests returned `2 passed, 11 warnings in 25.65s`. Central and Alice retrieval stayed dataset-scoped across a fresh Python process. Blind spot: LLM and embeddings were mocked.
 - [x] CITADEL-RESEARCH-2026-08-07-01, owner: coordinator. VERIFIED: four upstream repositories pinned and audited, Citadel baseline audited, three independent verification reports completed, and ranked architecture roadmap written under `.local-review/research/`. Verification evidence: Citadel baseline `239 passed, 11 warnings`; Citadel lifecycle `152 passed, 10 warnings`; Citadel access `65 passed, 208 deselected`; Cognee retrieval `70 passed, 1 deselected, 10 warnings`; Cognee lifecycle `18 passed, 10 warnings`; Mem0 focused run `88 passed`; Graphiti focused run `51 passed, 1 warning`; Hindsight dependency-free retrieval check `3 assertions passed`.
 - [x] CITADEL-RELEASE-2026-08-07-01, owner: architect. VERIFIED: recovery path A selected. Keep production pinned on Cognee 1.2.2 during containment, fix Citadel-owned adapter and queue contracts first, then test repair and alternative retrieval only in disposable storage. Evidence: `.local-review/wayfinder/tickets/001-choose-recovery-path.md`.
 - [x] CITADEL-RELEASE-2026-08-07-02, owner: coordinator. CORRECTED: the original keep-goal decision preserved useful release gates, but the active objective still names Cognee `1.2.2`. Repository tracking now follows Cognee `1.4.1`; ticket 002 is reopened until the goal text is replaced.
@@ -22,14 +24,14 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - [x] CITADEL-PORTABLE-2026-08-08-01, owner: architect. VERIFIED: exact Cognee `1.4.1` source supports SQLite and PostgreSQL; Railway documents SQLite on volumes; DigitalOcean App Platform has no persistent volumes. REPORTED: the user selected SQLite Lite plus Qdrant for the v0.5 Railway release.
 
 ## In Progress
-- [ ] CITADEL-QDRANT-2026-08-08-02, owner: implementer, next action: resolve the secure Cognee package source, then run candidate B against a pinned real Qdrant server, file scope: draft PR 256 at commit `d223481`. VERIFIED checkpoint: Ruff returned `All checks passed!`; full tests returned `1 failed, 1751 passed, 1 skipped, 11 warnings in 35.67s`. The only failure is Cognee `1.4.1` metadata rejecting `cryptography==50.0.0`.
-- [ ] CITADEL-PORTABLE-2026-08-08-02, owner: implementer, next action: add the real SQLite plus Qdrant restart, backup, restore, and single-instance gate after the secure Cognee source is pinned, file scope: isolated v0.5 worktree plus deployment assets.
+- [ ] CITADEL-PORTABLE-2026-08-08-04, owner: implementer, next action: build and boot the candidate Docker image, then run HTTP, CLI, MCP, restart, and restore gates, file scope: uncommitted `.dockerignore`, `.env.lite.example`, `.gitignore`, `Dockerfile`, `docker-compose.yml`, `kb/lite_runtime.py`, and three live/runtime tests in `/private/tmp/citadel-v050-qdrant`. VERIFIED: Docker Engine `29.6.2`, Compose `v5.3.1`, Compose config exit `0`, runtime plus adapter tests `24 passed, 10 warnings in 3.17s`, Ruff clean, and diff check clean. No Docker image build or Railway deploy ran.
+- [ ] CITADEL-QDRANT-2026-08-08-02, owner: implementer, next action: implement the Qdrant persisted chunk census, then rerun the real provider tests, file scope: draft PR 256 plus the uncommitted Lite checkpoint. VERIFIED: secure packaging and real-server dataset isolation gates pass. Blind spot: CLI, MCP, snapshot restore, and hosted networking remain untested.
+- [ ] CITADEL-PORTABLE-2026-08-08-02, owner: implementer, next action: build the image, prove the single-instance startup gate in a container, then run backup and restore, file scope: isolated v0.5 worktree plus deployment assets.
 
 ## Blocked
+- [ ] BLK-2026-08-08-04, owner: implementer, severity: High, next escalation: add dataset-scoped Qdrant chunk enumeration and enforce the stored chunk budget after cognify. Evidence: real provider flow emitted `stored chunk budget was not measured after cognify: VECTOR_DB_PROVIDER is not pgvector`.
 - [ ] BLK-2026-08-07-01, owner: release, severity: Critical, next escalation: obtain explicit approval to rotate the exposed database credential, then verify old credential rejection and service health. Evidence: `agents/blockers.md`.
 - [ ] BLK-2026-08-08-01, owner: architect, severity: High, next escalation: retire in-place force repair from the production path and replace it with a full shadow generation plus verified cutover. Evidence: `agents/blockers.md` and ticket 005.
-- [ ] BLK-2026-08-08-02, owner: architect, severity: Critical, next escalation: prove mandatory Qdrant authorization and payload compatibility in a narrow adapter before any hosted shadow deploy. Evidence: `agents/blockers.md` and ticket 009.
-- [ ] BLK-2026-08-08-03, owner: implementer, severity: High, next escalation: obtain a reviewable Cognee `1.4.1` metadata patch that permits cryptography `50.0.0`, then rerun ordinary pip and uv resolution. Evidence: `agents/blockers.md`.
 
 ## Next priorities
 - [ ] CITADEL-GOAL-2026-08-08-01, owner: coordinator, exit criteria: active goal names Cognee `1.4.1` and the audited official-adapter patch route while preserving the old-production deletion gate.
@@ -52,6 +54,11 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - Next: design and run the disposable PostgreSQL, PGVector, and Kuzu repair canary. Do not deploy, migrate, repair production data, push, or open a pull request without a new explicit approval.
 
 ### 2026-08-08
+- Owner: coordinator
+- Completed: secure Cognee build checkpoint and real Qdrant plus SQLite restart isolation proof.
+- In Progress: uncommitted two-service Lite container stack and fail-closed single-process runtime.
+- Blocked: Qdrant chunk budget census, Docker image boot, CLI and MCP E2E, backup restore, durable source and projection receipts, then Railway shadow.
+- Next: resume in `/private/tmp/citadel-v050-qdrant`; build the Docker image before adding the local deploy CLI or changing Railway.
 - Owner: researcher
 - Completed: CITADEL-MEMORY-RETRIEVAL-02. VERIFIED: immutable artifact `/private/tmp/citadel-vector-store-bench-20260808-h.json` binds runner SHA-256 `d1d0ce0e1f42af38bcf0e1634a53b20eb45d4e08af7d7fa705617d57c050ab84`; all four lanes completed 1,050 measured queries with zero errors and identical quality.
 - Completed: disposable Qdrant on port `6333` and PostgreSQL 17 on port `55432` were stopped after the run. VERIFIED: `lsof` returned no listener for either port; the existing PostgreSQL service on port `5432` remained listening. Temporary data directories were retained.
