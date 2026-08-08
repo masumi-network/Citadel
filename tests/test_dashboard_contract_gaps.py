@@ -16,7 +16,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from kb.access import AccessStore, now_iso
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.promotion_queue import build_pending_item, scan_candidate
 from kb.promotion_refs import ReferenceAssessment
 from kb.server import app

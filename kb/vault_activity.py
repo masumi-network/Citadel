@@ -1,3 +1,12 @@
+"""Vault Activity: the live, ephemeral projection of vault operations.
+
+Tracks source syncs, searches, ingests, and index updates as they happen,
+surfaced on the Operations Dashboard and the dev CLI (``citadel activity``,
+``--watch``). This is operational signal only — it is not Structured
+Knowledge and not the Knowledge Mesh (see :mod:`kb.knowledge_mesh`), and it
+resets with the service.
+"""
+
 from __future__ import annotations
 
 import asyncio

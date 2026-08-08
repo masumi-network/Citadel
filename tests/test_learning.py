@@ -9,7 +9,7 @@ import pytest
 from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.learning import LearningProcess
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import IngestResult
 
 

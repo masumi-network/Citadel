@@ -7,7 +7,7 @@ import pytest
 
 from kb import self_improve as self_improve_module
 from kb.config import CitadelConfig
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import IngestResult
 from kb.self_improve import SelfImprovement, propose_optimizations
 

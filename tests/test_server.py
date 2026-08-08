@@ -21,7 +21,7 @@ from kb.access import AccessIdentity, AccessStore, SESSION_TRACES_DATASET
 from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
 from kb.server import app

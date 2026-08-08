@@ -69,7 +69,7 @@ from kb.mcp_server import (
     create_mcp_server,
     set_tools_list_session_resolver,
 )
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import FeedbackRequest
 from kb.obsidian_sync import ObsidianSyncStore, SyncPushDocument, normalize_path
 from kb.promotion import PromotionEngine

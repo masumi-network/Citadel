@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kb.config import CitadelConfig
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.search_feedback import (
     SCHEMA_VERSION,
     build_search_telemetry,
@@ -230,7 +230,7 @@ async def test_capture_search_feedback_attempts_write_on_every_call() -> None:
 def test_search_endpoint_records_telemetry_and_survives_feedback_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kb.mesh import MeshState as LiveMesh
+    from kb.vault_activity import MeshState as LiveMesh
     from test_server import authed_client
 
     client = authed_client()
