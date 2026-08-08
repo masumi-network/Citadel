@@ -14,11 +14,17 @@ from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.dataset_database_handler import (
+    DatasetDatabaseHandlerInterface,
+)
 from cognee.infrastructure.databases.vector import VectorDBInterface
+from cognee.infrastructure.databases.vector import get_vectordb_config
+from cognee.infrastructure.databases.vector.create_vector_engine import create_vector_engine
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.engine.utils import parse_id
+from cognee.modules.users.models import DatasetDatabase, User
 from pydantic import Field
 from qdrant_client import AsyncQdrantClient, models
 
@@ -155,6 +161,36 @@ class IndexSchema(DataPoint):
     source_content_hash: str | None = None
     metadata: dict = Field(default_factory=lambda: {"index_fields": ["text"]})
     belongs_to_set: list[str] = Field(default_factory=list)
+
+
+class CitadelQdrantDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
+    @classmethod
+    async def create_dataset(cls, dataset_id: UUID | None, user: User | None) -> dict[str, Any]:
+        del user
+        if dataset_id is None:
+            raise QdrantConfigurationError("Qdrant dataset creation requires a dataset ID")
+        vector_config = get_vectordb_config()
+        if vector_config.vector_db_provider != "qdrant":
+            raise QdrantConfigurationError(
+                "Citadel Qdrant dataset handler requires VECTOR_DB_PROVIDER=qdrant"
+            )
+        return {
+            "vector_database_provider": "qdrant",
+            "vector_database_url": vector_config.vector_db_url,
+            "vector_database_key": vector_config.vector_db_key,
+            "vector_database_name": str(dataset_id),
+            "vector_dataset_database_handler": "qdrant",
+        }
+
+    @classmethod
+    async def delete_dataset(cls, dataset_database: DatasetDatabase) -> None:
+        vector_engine = create_vector_engine(
+            vector_db_provider=dataset_database.vector_database_provider,
+            vector_db_url=dataset_database.vector_database_url,
+            vector_db_key=dataset_database.vector_database_key,
+            vector_db_name=dataset_database.vector_database_name,
+        )
+        await vector_engine.prune()
 
 
 class CitadelQdrantAdapter(VectorDBInterface):
@@ -927,6 +963,14 @@ def register_qdrant_adapter() -> None:
             "Citadel Qdrant adapter requires VECTOR_DATASET_DATABASE_HANDLER=qdrant"
         )
     _required_text(os.getenv("CITADEL_GENERATION_ID", ""), "generation scope")
+    from cognee.infrastructure.databases.dataset_database_handler import (
+        use_dataset_database_handler,
+    )
     from cognee.infrastructure.databases.vector import use_vector_adapter
 
     use_vector_adapter("qdrant", CitadelQdrantAdapter)
+    use_dataset_database_handler(
+        "qdrant",
+        CitadelQdrantDatasetDatabaseHandler,
+        "qdrant",
+    )

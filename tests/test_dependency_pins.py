@@ -9,7 +9,6 @@ Keep both install paths on the same specifier so neither can drift alone.
 from __future__ import annotations
 
 from importlib import metadata
-import json
 from pathlib import Path
 import tomllib
 
@@ -19,14 +18,6 @@ from packaging.specifiers import SpecifierSet
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COGNEE_VERSION = "1.4.1"
 CRYPTOGRAPHY_VERSION = "50.0.0"
-QDRANT_ADAPTER_COMMIT = "7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29"
-QDRANT_ADAPTER_URL = "https://github.com/topoteretes/cognee-community.git"
-QDRANT_ADAPTER_SUBDIRECTORY = "packages/vector/qdrant"
-QDRANT_ADAPTER_REQUIREMENT = (
-    "cognee-community-vector-adapter-qdrant @ "
-    f"git+{QDRANT_ADAPTER_URL}@{QDRANT_ADAPTER_COMMIT}"
-    f"#subdirectory={QDRANT_ADAPTER_SUBDIRECTORY}"
-)
 
 
 def _cognee_requirement(lines: list[str]) -> str:
@@ -56,16 +47,13 @@ def test_cognee_pin_matches_between_pyproject_and_requirements() -> None:
     assert pyproject_pin == f"cognee[fastembed]=={COGNEE_VERSION}"
 
 
-def test_official_qdrant_adapter_commit_matches_between_install_paths() -> None:
+def test_server_install_does_not_depend_on_the_community_qdrant_package() -> None:
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     server_deps = [str(item) for item in pyproject["project"]["optional-dependencies"]["server"]]
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
 
-    package = "cognee-community-vector-adapter-qdrant"
-    pyproject_pin = _requirement(server_deps, package)
-    requirements_pin = _requirement(requirements, package)
-
-    assert pyproject_pin == requirements_pin == QDRANT_ADAPTER_REQUIREMENT
+    assert not any("cognee-community-vector-adapter-qdrant" in item for item in server_deps)
+    assert not any("cognee-community-vector-adapter-qdrant" in item for item in requirements)
 
 
 def test_qdrant_client_pin_matches_between_pyproject_and_requirements() -> None:
@@ -104,15 +92,3 @@ def test_installed_cognee_141_metadata_accepts_secure_cryptography() -> None:
         f"Cognee {COGNEE_VERSION} metadata rejects cryptography {CRYPTOGRAPHY_VERSION}: "
         f"{cryptography_requirements}"
     )
-
-
-def test_installed_qdrant_adapter_matches_exact_source() -> None:
-    adapter = metadata.distribution("cognee-community-vector-adapter-qdrant")
-    direct_url_text = adapter.read_text("direct_url.json")
-
-    assert direct_url_text is not None, "adapter installation has no direct_url.json"
-    direct_url = json.loads(direct_url_text)
-    assert direct_url["url"] == QDRANT_ADAPTER_URL
-    assert direct_url["subdirectory"] == QDRANT_ADAPTER_SUBDIRECTORY
-    assert direct_url["vcs_info"]["commit_id"] == QDRANT_ADAPTER_COMMIT
-    assert direct_url["vcs_info"]["requested_revision"] == QDRANT_ADAPTER_COMMIT

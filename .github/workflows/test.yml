@@ -64,6 +64,15 @@ jobs:
         # MCP module, so a base-only sync fails collection with ModuleNotFound.
         run: uv sync --locked --all-extras --dev
 
+      - name: Install audited Cognee build
+        shell: bash
+        run: |
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          uv run python scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --reinstall --no-deps "${wheels[0]}"
+
       - name: Confirm the interpreter actually under test
         run: uv run python -c "import sys; print(sys.version)"
 
@@ -91,6 +100,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install audited Cognee build
+        shell: bash
+        run: |
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          uv run python scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --reinstall --no-deps "${wheels[0]}"
+
       - name: pip-audit
         # PYSEC-2026-2447 is ignored pending an upstream fix. CVEs that already
         # have a fixed release are pinned out via [tool.uv] override-dependencies
@@ -116,6 +134,12 @@ jobs:
           venv="$RUNNER_TEMP/citadel-requirements"
           python -m venv "$venv"
           "$venv/bin/python" -m pip install --upgrade pip
+          "$venv/bin/python" -m pip install "build==1.5.0" "hatchling==1.31.0"
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          "$venv/bin/python" scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install --no-deps "${wheels[0]}"
           "$venv/bin/python" -m pip install -r requirements.txt
           "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
           "$venv/bin/python" -m pip check
@@ -205,6 +229,12 @@ jobs:
           python -m venv "$venv"
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install "build==1.5.0" "hatchling==1.31.0"
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          "$venv/bin/python" scripts/build_secure_cognee.py --output "$secure_cognee"
+          cognee_wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#cognee_wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install --no-deps "${cognee_wheels[0]}"
           "$venv/bin/python" -m pip install "${wheels[0]}[server]"
           "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
           "$venv/bin/python" -m pip check

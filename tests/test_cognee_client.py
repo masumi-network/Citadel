@@ -760,18 +760,11 @@ def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
     assert os.environ["AUTO_FEEDBACK"] == "true"
 
 
-def test_qdrant_provider_loads_official_handler_then_citadel_adapter(monkeypatch: Any) -> None:
-    import kb.cognee_client as cognee_client_module
+def test_qdrant_provider_loads_citadel_adapter(monkeypatch: Any) -> None:
     import kb.qdrant_adapter as qdrant_adapter_module
 
-    imported: list[str] = []
     registered: list[str] = []
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
-    monkeypatch.setattr(
-        cognee_client_module.importlib,
-        "import_module",
-        lambda name: imported.append(name),
-    )
     monkeypatch.setattr(
         qdrant_adapter_module,
         "register_qdrant_adapter",
@@ -780,19 +773,19 @@ def test_qdrant_provider_loads_official_handler_then_citadel_adapter(monkeypatch
 
     CogneePublicClient()._ensure_qdrant_adapter_registered()
 
-    assert imported == ["cognee_community_vector_adapter_qdrant.register"]
     assert registered == ["citadel"]
 
 
 def test_non_qdrant_provider_does_not_load_qdrant_adapter(monkeypatch: Any) -> None:
-    import kb.cognee_client as cognee_client_module
+    import kb.qdrant_adapter as qdrant_adapter_module
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
 
-    def unexpected_import(name: str) -> None:
-        raise AssertionError(f"unexpected adapter import: {name}")
-
-    monkeypatch.setattr(cognee_client_module.importlib, "import_module", unexpected_import)
+    monkeypatch.setattr(
+        qdrant_adapter_module,
+        "register_qdrant_adapter",
+        lambda: pytest.fail("Qdrant adapter registration must not run"),
+    )
 
     CogneePublicClient()._ensure_qdrant_adapter_registered()
 

@@ -5,7 +5,6 @@ import copy
 import contextlib
 import contextvars
 from hashlib import md5
-import importlib
 import json
 import logging
 import os
@@ -568,10 +567,9 @@ class CogneePublicClient:
         self._ensure_chunk_budget()
 
     def _ensure_qdrant_adapter_registered(self) -> None:
-        """Load the official community adapter before Cognee creates an engine."""
+        """Register Citadel's Qdrant adapter before Cognee creates an engine."""
         if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
             return
-        importlib.import_module("cognee_community_vector_adapter_qdrant.register")
         from .qdrant_adapter import register_qdrant_adapter
 
         register_qdrant_adapter()

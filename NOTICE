@@ -28,3 +28,9 @@ Other dependencies are declared in `pyproject.toml` and are distributed under
 their own licenses by their respective authors. Installing Citadel's `server`
 extra pulls those packages from PyPI; this repository redistributes none of
 their source.
+
+Citadel v0.5 server images build Cognee 1.4.1 from its exact PyPI source archive.
+The build changes only Cognee's cryptography upper bound from `<50` to `<51` so
+the image can use cryptography 50.0.0. The build verifies the source SHA-256 and
+retains Cognee's LICENSE and NOTICE.md in the resulting wheel. The build script
+and pinned source record are in `scripts/build_secure_cognee.py`.

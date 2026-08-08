@@ -7,7 +7,9 @@ import pytest
 
 from kb.qdrant_adapter import (
     CitadelQdrantAdapter,
+    CitadelQdrantDatasetDatabaseHandler,
     IndexSchema,
+    QdrantConfigurationError,
     QdrantProviderError,
     QdrantScopeError,
     physical_collection_name,
@@ -269,13 +271,15 @@ def test_registration_requires_ebac_qdrant_handler_and_generation(
         register_qdrant_adapter()
 
 
-def test_registration_overrides_official_adapter_after_handler_import(
+def test_registration_installs_citadel_adapter_and_dataset_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cognee.infrastructure.databases.dataset_database_handler as handler_module
     import cognee.infrastructure.databases.vector as vector_module
     import kb.qdrant_adapter as adapter_module
 
     registered: list[tuple[str, object]] = []
+    registered_handlers: list[tuple[str, object, str]] = []
     monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "true")
     monkeypatch.setenv("VECTOR_DATASET_DATABASE_HANDLER", "qdrant")
     monkeypatch.setenv("CITADEL_GENERATION_ID", GENERATION)
@@ -285,10 +289,101 @@ def test_registration_overrides_official_adapter_after_handler_import(
         "use_vector_adapter",
         lambda name, adapter: registered.append((name, adapter)),
     )
+    monkeypatch.setattr(
+        handler_module,
+        "use_dataset_database_handler",
+        lambda name, handler, provider: registered_handlers.append(
+            (name, handler, provider)
+        ),
+    )
 
     register_qdrant_adapter()
 
     assert registered == [("qdrant", CitadelQdrantAdapter)]
+    assert registered_handlers == [
+        ("qdrant", CitadelQdrantDatasetDatabaseHandler, "qdrant")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dataset_handler_binds_qdrant_connection_to_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kb.qdrant_adapter as adapter_module
+
+    dataset_id = uuid4()
+    monkeypatch.setattr(
+        adapter_module,
+        "get_vectordb_config",
+        lambda: SimpleNamespace(
+            vector_db_provider="qdrant",
+            vector_db_url="http://qdrant:6333",
+            vector_db_key="secret",
+        ),
+    )
+
+    created = await CitadelQdrantDatasetDatabaseHandler.create_dataset(dataset_id, None)
+
+    assert created == {
+        "vector_database_provider": "qdrant",
+        "vector_database_url": "http://qdrant:6333",
+        "vector_database_key": "secret",
+        "vector_database_name": str(dataset_id),
+        "vector_dataset_database_handler": "qdrant",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dataset_handler_rejects_missing_id_and_wrong_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kb.qdrant_adapter as adapter_module
+
+    with pytest.raises(QdrantConfigurationError, match="dataset ID"):
+        await CitadelQdrantDatasetDatabaseHandler.create_dataset(None, None)
+
+    monkeypatch.setattr(
+        adapter_module,
+        "get_vectordb_config",
+        lambda: SimpleNamespace(vector_db_provider="pgvector"),
+    )
+    with pytest.raises(QdrantConfigurationError, match="VECTOR_DB_PROVIDER"):
+        await CitadelQdrantDatasetDatabaseHandler.create_dataset(uuid4(), None)
+
+
+@pytest.mark.asyncio
+async def test_dataset_handler_prunes_only_the_bound_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kb.qdrant_adapter as adapter_module
+
+    created_with: dict[str, object] = {}
+    pruned: list[bool] = []
+
+    async def prune() -> None:
+        pruned.append(True)
+
+    def create_vector_engine(**kwargs: object) -> object:
+        created_with.update(kwargs)
+        return SimpleNamespace(prune=prune)
+
+    monkeypatch.setattr(adapter_module, "create_vector_engine", create_vector_engine)
+    dataset_database = SimpleNamespace(
+        vector_database_provider="qdrant",
+        vector_database_url="http://qdrant:6333",
+        vector_database_key="secret",
+        vector_database_name=str(uuid4()),
+    )
+
+    await CitadelQdrantDatasetDatabaseHandler.delete_dataset(dataset_database)
+
+    assert created_with == {
+        "vector_db_provider": "qdrant",
+        "vector_db_url": "http://qdrant:6333",
+        "vector_db_key": "secret",
+        "vector_db_name": dataset_database.vector_database_name,
+    }
+    assert pruned == [True]
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,7 @@
-# Candidate v0.5 stack. Cognee 1.4.1 still declares cryptography <50, so plain
-# pip resolution remains blocked until the upstream metadata cap is corrected.
-# The isolated compatibility build uses the reviewed one-line metadata patch.
+# Candidate v0.5 stack. Build and install the audited Cognee wheel with
+# scripts/build_secure_cognee.py before resolving this file. The source wheel
+# carries the reviewed one-line cryptography metadata correction.
 cognee[fastembed]==1.4.1
-cognee-community-vector-adapter-qdrant @ git+https://github.com/topoteretes/cognee-community.git@7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29#subdirectory=packages/vector/qdrant
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
 aiohttp>=3.14.3,<4.0.0
