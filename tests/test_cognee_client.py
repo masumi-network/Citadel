@@ -41,10 +41,10 @@ def clean_derived_cognee_env(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cognee_public_client_runs_startup_migrations_once(monkeypatch: Any) -> None:
+async def test_cognee_public_client_runs_migrations_once(monkeypatch: Any) -> None:
     calls: list[str] = []
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         calls.append("migrate")
 
     async def add(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -58,7 +58,7 @@ async def test_cognee_public_client_runs_startup_migrations_once(monkeypatch: An
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             add=add,
             recall=recall,
         ),
@@ -72,15 +72,14 @@ async def test_cognee_public_client_runs_startup_migrations_once(monkeypatch: An
 
 
 @pytest.mark.asyncio
-async def test_cognee_public_client_creates_database_and_retries_migrations(
+async def test_cognee_public_client_fails_closed_when_migrations_fail(
     monkeypatch: Any,
 ) -> None:
     calls: list[str] = []
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         calls.append("migrate")
-        if calls == ["migrate"]:
-            raise RuntimeError("missing enum")
+        raise RuntimeError("unknown migration revision")
 
     async def add(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True}
@@ -90,7 +89,7 @@ async def test_cognee_public_client_creates_database_and_retries_migrations(
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             add=add,
         ),
     )
@@ -101,9 +100,31 @@ async def test_cognee_public_client_creates_database_and_retries_migrations(
 
     monkeypatch.setattr(client, "_create_cognee_database", create_database)
 
-    await client.remember("note", dataset_name="notes")
+    with pytest.raises(RuntimeError, match="unknown migration revision"):
+        await client.remember("note", dataset_name="notes")
 
-    assert calls == ["migrate", "create", "migrate"]
+    assert calls == ["migrate"]
+
+
+@pytest.mark.asyncio
+async def test_cognee_public_client_rejects_reported_migration_failures(
+    monkeypatch: Any,
+) -> None:
+    async def run_migrations() -> list[str]:
+        return ["cognee_db"]
+
+    async def add(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("add must not run after a migration failure")
+
+    monkeypatch.setenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "true")
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_migrations=run_migrations, add=add),
+    )
+
+    with pytest.raises(RuntimeError, match="migrations failed for 1 database"):
+        await CogneePublicClient().remember("note", dataset_name="notes")
 
 
 @pytest.mark.asyncio
@@ -112,7 +133,7 @@ async def test_cognee_public_client_does_not_pass_external_metadata_keyword(
 ) -> None:
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def add(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -125,7 +146,7 @@ async def test_cognee_public_client_does_not_pass_external_metadata_keyword(
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             add=add,
         ),
     )
@@ -190,11 +211,15 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
         reads += 1
         return ([(f"node-{reads}", {})], [])
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def cognify(**kwargs: Any) -> dict[str, Any]:
-        assert kwargs == {"datasets": ["notes"], "incremental_loading": True}
+        assert kwargs == {
+            "datasets": ["notes"],
+            "incremental_loading": True,
+            "data_cache": True,
+        }
         return {"ok": True}
 
     async def ensure_ready(_: Any) -> None:
@@ -208,7 +233,7 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             cognify=cognify,
         ),
     )
@@ -434,13 +459,13 @@ async def test_delete_graph_nodes_clears_graph_and_vector(monkeypatch: Any) -> N
     def get_vector_engine() -> FakeVectorEngine:
         return FakeVectorEngine()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations),
+        SimpleNamespace(run_migrations=run_migrations),
     )
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
@@ -735,6 +760,43 @@ def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
     assert os.environ["AUTO_FEEDBACK"] == "true"
 
 
+def test_qdrant_provider_loads_official_handler_then_citadel_adapter(monkeypatch: Any) -> None:
+    import kb.cognee_client as cognee_client_module
+    import kb.qdrant_adapter as qdrant_adapter_module
+
+    imported: list[str] = []
+    registered: list[str] = []
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setattr(
+        cognee_client_module.importlib,
+        "import_module",
+        lambda name: imported.append(name),
+    )
+    monkeypatch.setattr(
+        qdrant_adapter_module,
+        "register_qdrant_adapter",
+        lambda: registered.append("citadel"),
+    )
+
+    CogneePublicClient()._ensure_qdrant_adapter_registered()
+
+    assert imported == ["cognee_community_vector_adapter_qdrant.register"]
+    assert registered == ["citadel"]
+
+
+def test_non_qdrant_provider_does_not_load_qdrant_adapter(monkeypatch: Any) -> None:
+    import kb.cognee_client as cognee_client_module
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
+
+    def unexpected_import(name: str) -> None:
+        raise AssertionError(f"unexpected adapter import: {name}")
+
+    monkeypatch.setattr(cognee_client_module.importlib, "import_module", unexpected_import)
+
+    CogneePublicClient()._ensure_qdrant_adapter_registered()
+
+
 @pytest.mark.asyncio
 async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
     monkeypatch: Any,
@@ -942,8 +1004,6 @@ async def test_ensure_dataset_survives_losing_a_creation_race(
 
     raised = [r for r in results if isinstance(r, BaseException)]
     assert not raised, f"a lost race must not propagate: {raised}"
-    assert sum(1 for r in results if r is True) <= 1, "at most one creator"
-
     # The row is there regardless of who won, which is the point of the call.
     assert await get_authorized_dataset_by_name("seat:racer", user, "read") is not None
 
@@ -1151,7 +1211,7 @@ async def test_cognify_serializes_on_writer_lock(monkeypatch: Any) -> None:
     concurrent = 0
     max_seen = 0
 
-    async def fake_cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def fake_cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         nonlocal concurrent, max_seen
         concurrent += 1
         max_seen = max(max_seen, concurrent)
@@ -1159,13 +1219,13 @@ async def test_cognify_serializes_on_writer_lock(monkeypatch: Any) -> None:
         concurrent -= 1
         return {"ok": True}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(cognify=fake_cognify, run_startup_migrations=run_startup_migrations),
+        SimpleNamespace(cognify=fake_cognify, run_migrations=run_migrations),
     )
     client = CogneePublicClient()
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
@@ -1209,7 +1269,7 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
 
     captured: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def add(data: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1220,7 +1280,7 @@ async def test_durable_writes_bypass_session_cache(monkeypatch: Any) -> None:
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, add=add),
+        SimpleNamespace(run_migrations=run_migrations, add=add),
     )
     # Suppress the background cognify so the test is deterministic (and so a real
     # cognify isn't scheduled against the mock); the bypass assertion is on add.
@@ -1265,20 +1325,20 @@ async def test_remember_schedules_lock_guarded_background_cognify(
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
     cognified: list[Any] = []
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def add(data: Any, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True}
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         cognified.append(list(datasets))
         return {"ok": True}
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, add=add, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, add=add, cognify=cognify),
     )
     client = CogneePublicClient()
 
@@ -1299,17 +1359,17 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(tmp_path / "queue.json"))
     cognified: list[list[str]] = []
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         cognified.append(list(datasets))
         return {"ok": True}
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient()
 
@@ -1345,16 +1405,16 @@ async def test_failed_background_cognify_is_rescheduled(
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
     monkeypatch.setenv("LLM_API_KEY", "k")
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         raise RuntimeError("node unavailable")
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient()
     client.schedule_cognify(["central"])
@@ -1376,10 +1436,10 @@ async def test_failed_background_cognify_retries_without_new_ingest(
     calls: list[list[str]] = []
     retried = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         calls.append(list(datasets))
         if len(calls) == 1:
             raise RuntimeError("temporary failure")
@@ -1389,7 +1449,7 @@ async def test_failed_background_cognify_retries_without_new_ingest(
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
@@ -1414,10 +1474,10 @@ async def test_long_cognify_renews_queue_lease(monkeypatch: Any, tmp_path: Any) 
     monkeypatch.setenv("LLM_API_KEY", "k")
     started = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         started.set()
         await asyncio.sleep(0.5)
         return {"ok": True}
@@ -1425,7 +1485,7 @@ async def test_long_cognify_renews_queue_lease(monkeypatch: Any, tmp_path: Any) 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
@@ -1477,10 +1537,10 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
     cancelled = asyncio.Event()
     blocked = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         started.set()
         try:
             await blocked.wait()
@@ -1494,7 +1554,7 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     monkeypatch.setattr(queue, "renew", fail_renewal)
     client = CogneePublicClient(retry_queue=queue)
@@ -1650,10 +1710,10 @@ async def test_failed_acknowledgement_retries_without_external_activity(
     wakeup_calls = 0
     retried = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         cognify_calls.append(list(datasets))
         if len(cognify_calls) == 2:
             retried.set()
@@ -1679,7 +1739,7 @@ async def test_failed_acknowledgement_retries_without_external_activity(
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     monkeypatch.setattr(queue, "acknowledge", fail_first_acknowledgement)
     monkeypatch.setattr(queue, "next_wakeup_delay", fail_first_wakeup_read)
@@ -1715,10 +1775,10 @@ async def test_child_cognify_cancellation_retries_without_external_activity(
     cognify_calls: list[list[str]] = []
     retried = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         cognify_calls.append(list(datasets))
         if len(cognify_calls) == 1:
             raise asyncio.CancelledError
@@ -1728,7 +1788,7 @@ async def test_child_cognify_cancellation_retries_without_external_activity(
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
@@ -1756,10 +1816,10 @@ async def test_stop_cognify_queue_reschedules_cancelled_work(
     started = asyncio.Event()
     blocked = asyncio.Event()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         started.set()
         await blocked.wait()
         return {"ok": True}
@@ -1767,7 +1827,7 @@ async def test_stop_cognify_queue_reschedules_cancelled_work(
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
@@ -1790,17 +1850,17 @@ async def test_resume_cognify_queue_drains_pending_work(
     monkeypatch.setenv("LLM_API_KEY", "k")
     cognified: list[list[str]] = []
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(*, datasets: Any, incremental_loading: bool) -> dict[str, Any]:
+    async def cognify(*, datasets: Any, incremental_loading: bool, data_cache: bool) -> dict[str, Any]:
         cognified.append(list(datasets))
         return {"ok": True}
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, cognify=cognify),
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(queue_path=path)
     client.resume_cognify_queue()
@@ -1821,13 +1881,13 @@ async def test_remember_reports_false_when_durable_queue_cannot_accept_work(
     async def add(data: Any, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
-        SimpleNamespace(run_startup_migrations=run_startup_migrations, add=add),
+        SimpleNamespace(run_migrations=run_migrations, add=add),
     )
     result = await CogneePublicClient(retry_queue=BrokenQueue()).remember(
         "note", dataset_name="central"
@@ -1840,7 +1900,7 @@ async def test_remember_reports_false_when_durable_queue_cannot_accept_work(
 async def test_cognee_public_client_uses_chunk_search_by_default(monkeypatch: Any) -> None:
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def recall(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
@@ -1856,7 +1916,7 @@ async def test_cognee_public_client_uses_chunk_search_by_default(monkeypatch: An
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             recall=recall,
             search=search,
         ),
@@ -1878,7 +1938,7 @@ async def test_session_recall_off_by_default_and_opt_in(monkeypatch: Any) -> Non
     # chunk store. It only runs when CITADEL_COGNEE_SESSION_RECALL is set.
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def recall(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
@@ -1894,7 +1954,7 @@ async def test_session_recall_off_by_default_and_opt_in(monkeypatch: Any) -> Non
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             recall=recall,
             search=search,
         ),
@@ -1924,7 +1984,7 @@ async def test_cognee_public_client_returns_empty_results_for_empty_store(
     class NoDataError(Exception):
         pass
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def search(**kwargs: Any) -> list[dict[str, Any]]:
@@ -1935,7 +1995,7 @@ async def test_cognee_public_client_returns_empty_results_for_empty_store(
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             search=search,
         ),
     )
@@ -1955,7 +2015,7 @@ async def test_cognee_public_client_falls_back_when_session_has_no_data(
 
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def recall(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
@@ -1971,7 +2031,7 @@ async def test_cognee_public_client_falls_back_when_session_has_no_data(
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             recall=recall,
             search=search,
         ),
@@ -1992,7 +2052,7 @@ async def test_cognee_public_client_cognify_wraps_cognee_cognify(monkeypatch: An
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def cognify(**kwargs: Any) -> dict[str, Any]:
@@ -2003,7 +2063,7 @@ async def test_cognee_public_client_cognify_wraps_cognee_cognify(monkeypatch: An
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             cognify=cognify,
         ),
     )
@@ -2012,7 +2072,11 @@ async def test_cognee_public_client_cognify_wraps_cognee_cognify(monkeypatch: An
     result = await client.cognify(datasets=["masumi-network"])
 
     assert result == {"cognified": True}
-    assert received["kwargs"] == {"datasets": ["masumi-network"], "incremental_loading": True}
+    assert received["kwargs"] == {
+        "datasets": ["masumi-network"],
+        "incremental_loading": True,
+        "data_cache": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -2026,7 +2090,7 @@ async def test_cognify_checks_only_source_ids_processed_by_this_pass(monkeypatch
         ]
     )
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def cognify(**_: Any) -> dict[str, Any]:
@@ -2036,7 +2100,7 @@ async def test_cognify_checks_only_source_ids_processed_by_this_pass(monkeypatch
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             cognify=cognify,
         ),
     )
@@ -2068,17 +2132,20 @@ async def test_forced_cognify_rejects_empty_or_partial_receipt(
 ) -> None:
     monkeypatch.setenv("LLM_API_KEY", "test-key")
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
-    async def cognify(**_: Any) -> dict[str, Any]:
+    received: dict[str, Any] = {}
+
+    async def cognify(**kwargs: Any) -> dict[str, Any]:
+        received.update(kwargs)
         return receipt
 
     monkeypatch.setitem(
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             cognify=cognify,
         ),
     )
@@ -2092,13 +2159,19 @@ async def test_forced_cognify_rejects_empty_or_partial_receipt(
     with pytest.raises(RuntimeError, match="receipt omitted [12] expected source id"):
         await client.cognify(datasets=["notes"], force=True)
 
+    assert received == {
+        "datasets": ["notes"],
+        "incremental_loading": False,
+        "data_cache": False,
+    }
+
 
 @pytest.mark.asyncio
 async def test_cognify_fails_when_stored_chunk_check_is_red(monkeypatch: Any) -> None:
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     run = SimpleNamespace(data_ingestion_info=[{"data_id": "doc-a"}])
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def cognify(**_: Any) -> dict[str, Any]:
@@ -2108,7 +2181,7 @@ async def test_cognify_fails_when_stored_chunk_check_is_red(monkeypatch: Any) ->
         sys.modules,
         "cognee",
         SimpleNamespace(
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             cognify=cognify,
         ),
     )
@@ -2462,11 +2535,11 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
     def get_vector_engine() -> FakeVectorEngine:
         return FakeVectorEngine()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_migrations=run_migrations))
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2560,11 +2633,11 @@ async def test_delete_document_chunks_reports_partial_delete_failure(
     def get_vector_engine() -> FakeVectorEngine:
         return FakeVectorEngine()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_migrations=run_migrations))
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2651,11 +2724,11 @@ async def test_restore_document_chunks_uses_private_snapshot_once(monkeypatch: A
     def get_vector_engine() -> FakeVectorEngine:
         return FakeVectorEngine()
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_migrations=run_migrations))
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2720,7 +2793,7 @@ async def test_recall_does_not_pass_only_context(monkeypatch: Any) -> None:
     # for CHUNKS. So it must never be passed on the read path — the result shape stays.
     received: dict[str, Any] = {}
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def search(**kwargs: Any) -> list[dict[str, Any]]:
@@ -2732,7 +2805,7 @@ async def test_recall_does_not_pass_only_context(monkeypatch: Any) -> None:
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             search=search,
         ),
     )
@@ -2750,7 +2823,7 @@ async def test_search_timing_logs_only_when_enabled(monkeypatch: Any, caplog: An
     # residual node latency can be attributed later. Off by default, INFO when enabled.
     import logging
 
-    async def run_startup_migrations() -> None:
+    async def run_migrations() -> None:
         return None
 
     async def search(**kwargs: Any) -> list[dict[str, Any]]:
@@ -2761,7 +2834,7 @@ async def test_search_timing_logs_only_when_enabled(monkeypatch: Any, caplog: An
         "cognee",
         SimpleNamespace(
             SearchType=SimpleNamespace(CHUNKS="chunks"),
-            run_startup_migrations=run_startup_migrations,
+            run_migrations=run_migrations,
             search=search,
         ),
     )

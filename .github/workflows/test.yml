@@ -99,6 +99,28 @@ jobs:
           uv run pip-audit --cache-dir .pip-audit-cache \
             --ignore-vuln PYSEC-2026-2447
 
+  plain-requirements-smoke:
+    name: plain requirements install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements with plain pip
+        shell: bash
+        run: |
+          venv="$RUNNER_TEMP/citadel-requirements"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install --upgrade pip
+          "$venv/bin/python" -m pip install -r requirements.txt
+          "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" -m pytest tests/test_dependency_pins.py -q
+
   benchmark:
     name: benchmark fixtures
     runs-on: ubuntu-latest
@@ -168,17 +190,25 @@ jobs:
           version: "0.12.1"
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Build wheel and sdist
         run: uv build --wheel --sdist
 
-      - name: Install wheel and verify payloads
+      - name: Install wheel server extra and verify payloads
+        shell: bash
         run: |
           venv="$RUNNER_TEMP/citadel-wheel"
           python -m venv "$venv"
-          "$venv/bin/python" -m pip install --no-index --no-deps dist/*.whl
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install "${wheels[0]}[server]"
+          "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" -m pytest tests/test_dependency_pins.py -q
           "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
           "$venv/bin/citadel" bench --help >/dev/null
 
@@ -190,7 +220,7 @@ jobs:
     # renamed without an admin editing the branch ruleset. `if: always()` ensures
     # this job still runs — and fails — when a job it depends on fails.
     if: always()
-    needs: [test, audit, benchmark, web, package-smoke]
+    needs: [test, audit, plain-requirements-smoke, benchmark, web, package-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required job succeeded

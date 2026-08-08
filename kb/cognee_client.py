@@ -5,6 +5,7 @@ import copy
 import contextlib
 import contextvars
 from hashlib import md5
+import importlib
 import json
 import logging
 import os
@@ -542,8 +543,18 @@ class CogneePublicClient:
     def _prepare_cognee_environment(self) -> None:
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
+        self._ensure_qdrant_adapter_registered()
         self._ensure_auto_feedback_default()
         self._ensure_chunk_budget()
+
+    def _ensure_qdrant_adapter_registered(self) -> None:
+        """Load the official community adapter before Cognee creates an engine."""
+        if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
+            return
+        importlib.import_module("cognee_community_vector_adapter_qdrant.register")
+        from .qdrant_adapter import register_qdrant_adapter
+
+        register_qdrant_adapter()
 
     def _ensure_chunk_budget(self) -> None:
         """Size chunks for the embedder, and watch the embed boundary (#227).
@@ -636,17 +647,15 @@ class CogneePublicClient:
         configure_cognee_logging()
         if self._startup_migrations_done:
             return
-        run_startup_migrations = getattr(cognee, "run_startup_migrations", None)
-        if run_startup_migrations is not None:
-            try:
-                await run_startup_migrations()
-            except Exception as exc:
-                logger.warning(
-                    "Cognee startup migrations failed with %s; creating database and retrying",
-                    exc.__class__.__name__,
-                )
-                await self._create_cognee_database()
-                await run_startup_migrations()
+        run_migrations = getattr(cognee, "run_migrations", None)
+        if not callable(run_migrations):
+            raise RuntimeError("Cognee 1.4.1 run_migrations API is unavailable")
+        failed_database_ids = await run_migrations()
+        if failed_database_ids:
+            raise RuntimeError(
+                "Cognee migrations failed for "
+                f"{len(failed_database_ids)} database(s)"
+            )
         self._startup_migrations_done = True
         logger.info("Cognee startup migrations completed")
 
@@ -3681,7 +3690,9 @@ class CogneePublicClient:
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
             result = await cognee.cognify(
-                datasets=datasets, incremental_loading=not force
+                datasets=datasets,
+                incremental_loading=not force,
+                data_cache=not force,
             )
             self._invalidate_graph_data_cache()
         # The graph writer lock protects Kuzu only. Run the vector payload census

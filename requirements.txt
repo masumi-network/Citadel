@@ -1,16 +1,16 @@
-# Pinned to the 1.2.x line: ADR-0009 dataset attribution reads cognee PRIVATE
-# internals (cognee.modules.data.models, get_default_user) that a 1.3.x could
-# move, which would silently fail-closed and blank every scoped caller's vault.
-# assert_cognee_dataset_api() (boot self-check + test) catches a bump; this pin
-# stops Railway pulling one unattended on the next build.
-cognee[fastembed,postgres-binary]>=1.2.2,<1.3.0
+# Candidate v0.5 stack. Cognee 1.4.1 still declares cryptography <50, so plain
+# pip resolution remains blocked until the upstream metadata cap is corrected.
+# The isolated compatibility build uses the reviewed one-line metadata patch.
+cognee[fastembed]==1.4.1
+cognee-community-vector-adapter-qdrant @ git+https://github.com/topoteretes/cognee-community.git@7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29#subdirectory=packages/vector/qdrant
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
 aiohttp>=3.14.3,<4.0.0
-cryptography>=50.0.0,<51.0.0
+cryptography==50.0.0
 mcp>=1.28.1,<2.0.0
 pydantic>=2.10.5,<3.0.0
 python-dotenv>=1.0.1,<2.0.0
+qdrant-client==1.19.0
 requests>=2.32.0,<3.0.0
 starlette>=1.3.1,<2.0.0
 tiktoken==0.13.0
