@@ -2792,12 +2792,17 @@ def build_parser() -> argparse.ArgumentParser:
     # Not required: bare `citadel` shows the banner + command list instead of an error.
     subcommands = parser.add_subparsers(dest="command")
 
+    _node_url_parent = argparse.ArgumentParser(add_help=False)
+    _node_url_parent.add_argument("--node-url", help="Override Node URL")
+
+    _json_parent = argparse.ArgumentParser(add_help=False)
+    _json_parent.add_argument("--json", action="store_true", help="Machine-readable output")
+
     status = subcommands.add_parser(
         "status",
         help="Check Citadel connection, identity, and local setup (--json for agents)",
+        parents=[_json_parent, _node_url_parent],
     )
-    status.add_argument("--json", action="store_true", help="Machine-readable output")
-    status.add_argument("--node-url", help="Override Node URL (default: from config)")
     status.add_argument("--repo", help="Repo to check hooks/MCP in (default: git toplevel or cwd)")
     status.add_argument("--config", help="Override capture config path")
     status.add_argument(
@@ -2816,6 +2821,7 @@ def build_parser() -> argparse.ArgumentParser:
     activity = subcommands.add_parser(
         "activity",
         help="Show your Node's vault activity — captures, syncs, promotions, searches",
+        parents=[_json_parent, _node_url_parent],
     )
     activity.add_argument("--watch", action="store_true", help="Live-tail new activity (Ctrl-C to stop)")
     activity.add_argument(
@@ -2831,18 +2837,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     activity.add_argument("--limit", type=int, default=20, help="How many recent events to show (default 20)")
     activity.add_argument("--type", help="Filter by event type (ingest, search, promotion, github_sync, …)")
-    activity.add_argument("--json", action="store_true", help="Machine-readable output")
-    activity.add_argument("--node-url", help="Override Node URL (default: from config)")
     activity.add_argument("--config", help="Override capture config path")
     activity.set_defaults(handler=_activity)
 
     doctor = subcommands.add_parser(
         "doctor",
         help="Diagnose setup problems and suggest (or --fix) repairs",
+        parents=[_json_parent, _node_url_parent],
     )
     doctor.add_argument("--fix", action="store_true", help="Apply safe auto-fixes (hooks, .mcp.json)")
-    doctor.add_argument("--json", action="store_true", help="Machine-readable output")
-    doctor.add_argument("--node-url", help="Override Node URL")
     doctor.add_argument("--repo", help="Repo to check (default: git toplevel or cwd)")
     doctor.add_argument("--config", help="Override capture config path")
     doctor.set_defaults(handler=_doctor)
@@ -2857,14 +2860,11 @@ def build_parser() -> argparse.ArgumentParser:
     onboard = subcommands.add_parser(
         "onboard",
         help="One-shot teammate setup: token + hooks + MCP + capture roots",
+        parents=[_json_parent, _node_url_parent],
     )
     onboard.add_argument("--token", help="Seat token (else prompt, or use env)")
     onboard.add_argument("--repo", help="Repo root (default: git toplevel or cwd)")
     onboard.add_argument("--shell-rc", help="Shell rc file for the token export")
-    onboard.add_argument(
-        "--node-url",
-        help="Node URL to wire into MCP/capture (default: the built-in Node)",
-    )
     onboard.add_argument("--no-mcp", action="store_true", help="Skip writing .mcp.json")
     onboard.add_argument(
         "--no-capture", action="store_true", help="Skip Approved Capture Roots setup"
@@ -2875,16 +2875,13 @@ def build_parser() -> argparse.ArgumentParser:
     onboard.add_argument(
         "--non-interactive", action="store_true", help="No prompts; requires --token"
     )
-    onboard.add_argument(
-        "--json", action="store_true", help="Machine-readable output (implies no prompts)"
-    )
     onboard.set_defaults(handler=_onboard)
 
     setup = subcommands.add_parser(
         "setup",
         help="Configure local Approved Capture Roots (~/.citadel/capture.json)",
+        parents=[_json_parent, _node_url_parent],
     )
-    setup.add_argument("--node-url", help=f"Seat Node URL (default {DEFAULT_NODE_URL})")
     setup.add_argument(
         "--root",
         action="append",
@@ -2897,13 +2894,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip prompts; only apply --node-url / --root flags",
     )
     setup.add_argument("--show", action="store_true", help="Print current config and exit")
-    setup.add_argument("--json", action="store_true", help="Machine-readable output")
     setup.add_argument("--config", help="Override config path (testing)")
     setup.set_defaults(handler=_setup)
 
     capture = subcommands.add_parser(
         "capture",
         help="Summarize Approved Capture Roots and POST to your Node",
+        parents=[_json_parent],
     )
     capture.add_argument(
         "--root",
@@ -2914,7 +2911,6 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument(
         "--dry-run", action="store_true", help="Print payloads without posting"
     )
-    capture.add_argument("--json", action="store_true", help="Machine-readable output")
     capture.add_argument("--config", help="Override config path (testing)")
     capture.set_defaults(handler=_capture)
 
@@ -2924,34 +2920,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     promotion_sub = promotion.add_subparsers(dest="promotion_command", required=True)
 
-    promo_list = promotion_sub.add_parser("list", help="List pending promotion items")
+    promo_list = promotion_sub.add_parser(
+        "list", help="List pending promotion items", parents=[_json_parent, _node_url_parent]
+    )
     promo_list.add_argument(
         "--status",
         default="pending",
         choices=("pending", "approved", "rejected"),
         help="Queue filter (default: pending)",
     )
-    promo_list.add_argument("--json", action="store_true", help="Machine-readable output")
-    promo_list.add_argument("--node-url", help="Override Node URL")
     promo_list.set_defaults(handler=_promotion_list)
 
-    promo_approve = promotion_sub.add_parser("approve", help="Approve a pending item")
+    promo_approve = promotion_sub.add_parser(
+        "approve", help="Approve a pending item", parents=[_json_parent, _node_url_parent]
+    )
     promo_approve.add_argument("item_id", help="Promotion item id (promo_…)")
     promo_approve.add_argument("--note", help="Optional audit note")
-    promo_approve.add_argument("--json", action="store_true")
-    promo_approve.add_argument("--node-url", help="Override Node URL")
     promo_approve.set_defaults(handler=_promotion_approve)
 
-    promo_reject = promotion_sub.add_parser("reject", help="Reject a pending item")
+    promo_reject = promotion_sub.add_parser(
+        "reject", help="Reject a pending item", parents=[_json_parent, _node_url_parent]
+    )
     promo_reject.add_argument("item_id", help="Promotion item id (promo_…)")
     promo_reject.add_argument("--note", help="Optional audit note")
-    promo_reject.add_argument("--json", action="store_true")
-    promo_reject.add_argument("--node-url", help="Override Node URL")
     promo_reject.set_defaults(handler=_promotion_reject)
 
     promo_run = promotion_sub.add_parser(
         "run",
         help="Run the Promotion Agent for your seat (dry-run by default)",
+        parents=[_json_parent, _node_url_parent],
     )
     promo_run.add_argument(
         "--execute",
@@ -2963,8 +2960,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seat dataset to scan (default: token's seat)",
     )
     promo_run.add_argument("--max-items", type=int, help="Cap candidates per run")
-    promo_run.add_argument("--json", action="store_true")
-    promo_run.add_argument("--node-url", help="Override Node URL")
     promo_run.set_defaults(handler=_promotion_run)
 
     seat = subcommands.add_parser(
@@ -2973,13 +2968,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     seat_sub = seat.add_subparsers(dest="seat_command", required=True)
 
-    seat_list = seat_sub.add_parser("list", help="List seats, roles, and active token counts")
-    seat_list.add_argument("--json", action="store_true", help="Machine-readable output")
-    seat_list.add_argument("--node-url", help="Override Node URL")
+    seat_list = seat_sub.add_parser(
+        "list",
+        help="List seats, roles, and active token counts",
+        parents=[_json_parent, _node_url_parent],
+    )
     seat_list.set_defaults(handler=_seat_list)
 
     seat_create = seat_sub.add_parser(
-        "create", help="Create a seat and mint its writer token (printed once)"
+        "create",
+        help="Create a seat and mint its writer token (printed once)",
+        parents=[_json_parent, _node_url_parent],
     )
     seat_create.add_argument("name", help='Human name, e.g. "Alice Smith"')
     seat_create.add_argument("slug", help="Seat slug, e.g. alice (a-z, 0-9, hyphen)")
@@ -2990,17 +2989,14 @@ def build_parser() -> argparse.ArgumentParser:
     seat_create.add_argument(
         "--no-token", action="store_true", help="Create the seat without issuing a token"
     )
-    seat_create.add_argument("--json", action="store_true", help="Machine-readable output")
-    seat_create.add_argument("--node-url", help="Override Node URL")
     seat_create.set_defaults(handler=_seat_create)
 
     seat_token = seat_sub.add_parser(
         "token",
         help="Mint a fresh token for an EXISTING seat (alias of `citadel token create --seat <slug>`)",
+        parents=[_json_parent, _node_url_parent],
     )
     seat_token.add_argument("slug", help="Seat slug, e.g. sarthi")
-    seat_token.add_argument("--json", action="store_true", help="Machine-readable output")
-    seat_token.add_argument("--node-url", help="Override Node URL")
     seat_token.set_defaults(handler=_seat_token)
 
     token = subcommands.add_parser(
@@ -3012,10 +3008,10 @@ def build_parser() -> argparse.ArgumentParser:
     token_set = token_sub.add_parser(
         "set",
         help="Set/rotate the seat token this machine uses (verifies, then writes your shell rc)",
+        parents=[_node_url_parent],
     )
     token_set.add_argument("token", nargs="?", help="Seat token (omit to paste it hidden)")
     token_set.add_argument("--shell-rc", help="Shell rc file for the token export")
-    token_set.add_argument("--node-url", help="Override Node URL")
     token_set.add_argument(
         "--skip-verify", action="store_true", help="Write without checking the token against the Node"
     )
@@ -3024,6 +3020,7 @@ def build_parser() -> argparse.ArgumentParser:
     token_create = token_sub.add_parser(
         "create",
         help="Issue a token, printed once — seat-bound (--seat, or interactive picker) or standalone",
+        parents=[_json_parent, _node_url_parent],
     )
     token_create.add_argument("name", help="Token name/label")
     token_create.add_argument(
@@ -3041,14 +3038,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset", help="Default dataset for a standalone token (for seats use --seat)"
     )
     token_create.add_argument("--expires-at", help="ISO 8601 expiry timestamp (optional)")
-    token_create.add_argument("--json", action="store_true", help="Machine-readable output")
-    token_create.add_argument("--node-url", help="Override Node URL")
     token_create.set_defaults(handler=_token_create)
 
-    token_revoke = token_sub.add_parser("revoke", help="Revoke a token by id (token_…)")
+    token_revoke = token_sub.add_parser(
+        "revoke", help="Revoke a token by id (token_…)", parents=[_json_parent, _node_url_parent]
+    )
     token_revoke.add_argument("token_id", help="Token id to revoke (token_…)")
-    token_revoke.add_argument("--json", action="store_true", help="Machine-readable output")
-    token_revoke.add_argument("--node-url", help="Override Node URL")
     token_revoke.set_defaults(handler=_token_revoke)
 
     mcp = subcommands.add_parser(
@@ -3061,18 +3056,20 @@ def build_parser() -> argparse.ArgumentParser:
         "add",
         aliases=["install"],
         help="Add Citadel MCP to a tool (or 'all') — writes config or prints a snippet",
+        parents=[_node_url_parent],
     )
     mcp_add.add_argument(
         "tool", help="Tool to wire: claude, cursor, codex, gemini, windsurf, cline, zed, pi, or all"
     )
-    mcp_add.add_argument("--node-url", help="Override Node URL")
     mcp_add.set_defaults(handler=_mcp_add)
 
     mcp_list = mcp_sub.add_parser("list", help="List detected coding tools and how each is wired")
     mcp_list.set_defaults(handler=_mcp_list)
 
     ingest = subcommands.add_parser(
-        "ingest", help="Add a durable note to your Node (HTTP; --local for the server stack)"
+        "ingest",
+        help="Add a durable note to your Node (HTTP; --local for the server stack)",
+        parents=[_json_parent, _node_url_parent],
     )
     ingest.add_argument("data", help="Text (or a path) to ingest")
     ingest.add_argument("--tag", action="append", default=[], help="Tag to attach (repeatable)")
@@ -3087,8 +3084,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="Max seconds to wait for the Node (default: 180 while cognifying, 60 with --no-cognify)",
     )
-    ingest.add_argument("--json", action="store_true", help="Machine-readable output")
-    ingest.add_argument("--node-url", help="Override Node URL")
     ingest.add_argument(
         "--local",
         action="store_true",
@@ -3098,7 +3093,11 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session", help="(--local only) session id")
     ingest.set_defaults(handler=_ingest)
 
-    search = subcommands.add_parser("search", help="Search the Organization Vault (via the Node)")
+    search = subcommands.add_parser(
+        "search",
+        help="Search the Organization Vault (via the Node)",
+        parents=[_json_parent, _node_url_parent],
+    )
     search.add_argument("query", help="Search query")
     search.add_argument(
         "--top-k",
@@ -3108,7 +3107,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="top_k",
         help="Max results (default: 10); --limit is an agent-friendly alias",
     )
-    search.add_argument("--json", action="store_true", help="Machine-readable output")
     search.add_argument(
         "--type",
         help="Comma-separated doc types to keep: spec,skill,canonical-docs,issue,activity,session-trace,other",
@@ -3146,7 +3144,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Agent-friendly alias for --timeout in milliseconds (wins if both set)",
     )
-    search.add_argument("--node-url", help="Override Node URL")
     search.add_argument(
         "--local",
         action="store_true",
@@ -3159,6 +3156,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subcommands.add_parser(
         "verify",
         help="Compare a local skill/reference file to nearest vault canonical pointers (JSON)",
+        parents=[_node_url_parent],
     )
     verify.add_argument(
         "--file",
@@ -3177,12 +3175,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--timeout", type=float, default=None, help="Client soft-timeout seconds")
     verify.add_argument("--budget-ms", type=int, default=None, help="Soft-timeout in milliseconds")
-    verify.add_argument("--node-url", help="Override Node URL")
     verify.set_defaults(handler=_verify)
 
     prepare_pr = subcommands.add_parser(
         "prepare-pr-context",
         help="Brief JSON context for a repo+topic (canonical sources + org hits)",
+        parents=[_node_url_parent],
     )
     prepare_pr.add_argument("--repo", required=True, help="Repo name or org/repo substring")
     prepare_pr.add_argument("--topic", required=True, help="PR/topic focus (e.g. masumi payment)")
@@ -3196,7 +3194,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare_pr.add_argument("--timeout", type=float, default=None, help="Client soft-timeout seconds")
     prepare_pr.add_argument("--budget-ms", type=int, default=None, help="Soft-timeout in milliseconds")
-    prepare_pr.add_argument("--node-url", help="Override Node URL")
     prepare_pr.set_defaults(handler=_prepare_pr_context)
 
     feedback = subcommands.add_parser("feedback", help="Attach feedback to a Cognee QA entry")
