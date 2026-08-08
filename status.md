@@ -22,7 +22,7 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - [x] CITADEL-PORTABLE-2026-08-08-01, owner: architect. VERIFIED: exact Cognee `1.4.1` source supports SQLite and PostgreSQL; Railway documents SQLite on volumes; DigitalOcean App Platform has no persistent volumes. REPORTED: the user selected SQLite Lite plus Qdrant for the v0.5 Railway release.
 
 ## In Progress
-- [ ] CITADEL-QDRANT-2026-08-08-02, owner: implementer, next action: resolve the secure Cognee package source, then run candidate B against a pinned real Qdrant server, file scope: isolated worktree `/private/tmp/citadel-v050-qdrant` at `cc8fc02`. VERIFIED checkpoint: candidate B tests returned `15 passed, 10 warnings`; combined adapter, client, and dependency tests returned `1 failed, 106 passed, 10 warnings in 9.89s`. The only failure is Cognee `1.4.1` metadata rejecting `cryptography==50.0.0`.
+- [ ] CITADEL-QDRANT-2026-08-08-02, owner: implementer, next action: resolve the secure Cognee package source, then run candidate B against a pinned real Qdrant server, file scope: draft PR 256 at commit `01c423d`. VERIFIED checkpoint: Ruff returned `All checks passed!`; combined adapter, client, and dependency tests returned `1 failed, 106 passed, 10 warnings in 10.43s`. The only failure is Cognee `1.4.1` metadata rejecting `cryptography==50.0.0`.
 - [ ] CITADEL-PORTABLE-2026-08-08-02, owner: implementer, next action: add the real SQLite plus Qdrant restart, backup, restore, and single-instance gate after the secure Cognee source is pinned, file scope: isolated v0.5 worktree plus deployment assets.
 
 ## Blocked
@@ -109,6 +109,11 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - Next: pin the secure Cognee source, then run the real-Qdrant E2E and restore matrix on SQLite Lite before publishing the Railway template.
 - REPORTED: the user confirmed Qdrant plus SQLite as the low-cost v0.5 choice and authorized commits, pushes, and pull requests. Merge and deletion remain unauthorized.
 - VERIFIED: `git diff --check` returned exit `0`. The writing detector returned no high or critical findings for the six new coordination files. Existing tracked operations and architecture prose still contains pre-existing detector findings outside this task's added lines.
+- Completed: release-plan commit `d39a115` pushed and opened as draft PR 255, stacked on PR 254. It records SQLite Lite as the v0.5 default and keeps PostgreSQL optional later.
+- In Progress: scoped Qdrant adapter candidate commit `01c423d` pushed and opened as draft PR 256 against `main`. The PR body records its intentional secure-package failure and unrun live-provider gates.
+- VERIFIED: removing the Cognee PostgreSQL extra from the candidate lock removed `asyncpg 0.31.0`, `pgvector 0.3.6`, and `psycopg2-binary 2.9.12`. This proves dependency removal only, not SQLite runtime success.
+- HELD: no Railway app deploy, migration, source import, production mutation, service deletion, merge, or release ran. The unused PostgreSQL service in the fresh Railway project remains intact pending separate approval.
+- Next: supply the reviewed Cognee metadata patch, make the plain-pip gate green, then run empty SQLite plus real Qdrant E2E before changing Railway configuration.
 
 ## Key metrics
 CORRECTED: the prior claim of six Node hits was not supported by this session. VERIFIED: `citadel_search` for the architecture query returned zero hits after `exclude_ambient=true`; 14 candidates were fetched and all were filtered out. Blind spot: this filtered top-k search cannot enumerate the vault or prove absence.
