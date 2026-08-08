@@ -1,9 +1,9 @@
 """Knowledge Mesh: the real Cognee-backed relationship graph.
 
-This is intentionally separate from :class:`kb.mesh.MeshState`, which is a
-wrapper-level dashboard projection of runtime activity. The Knowledge Mesh
-exposes what the Organization Vault actually knows: nodes and relationships
-read from Cognee's graph engine (Kuzu in the v1 deployment).
+This is intentionally separate from :class:`kb.vault_activity.MeshState`,
+which is a wrapper-level dashboard projection of runtime activity. The
+Knowledge Mesh exposes what the Organization Vault actually knows: nodes and
+relationships read from Cognee's graph engine (Kuzu in the v1 deployment).
 
 The endpoint contract never fails hard: when Cognee has no data, the graph
 engine is unavailable, or the gateway does not expose graph access, callers

@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.search_format import (
     apply_query_ranking,
     filter_hits,

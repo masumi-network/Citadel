@@ -18,7 +18,7 @@ from kb.llm_enrichment import (
     parse_json_payload,
     redacted_preview,
 )
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import IngestResult
 
 
