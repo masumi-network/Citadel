@@ -72,7 +72,7 @@ override-dependencies = [
     # Cognee publishes corrected metadata.
     "cryptography==50.0.0",
     "pillow>=12.3.0",
-    "pypdf>=6.13.3",
+    "pypdf>=6.15.0",
     "python-multipart>=0.0.31",
     # Ten CVEs disclosed against 0.59.0 after main last ran CI on 2026-07-24.
     # Pulled in transitively; the highest fix version among them is 0.64.0.

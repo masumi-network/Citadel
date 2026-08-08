@@ -1053,12 +1053,13 @@ async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
     ) is not None, "seat still unsearchable after ensure_dataset"
 
 
-def test_assert_cognee_dataset_api_imports_real_symbols() -> None:
+def test_assert_cognee_dataset_api_imports_real_symbols(monkeypatch: Any) -> None:
     # A cognee bump that moves the private dataset-attribution internals must
     # fail HERE (loud, in CI), not silently fail-closed in prod. This imports
     # the real symbols — the boot self-check calls the same function.
     from kb.cognee_client import assert_cognee_dataset_api
 
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
     assert_cognee_dataset_api()
 
 

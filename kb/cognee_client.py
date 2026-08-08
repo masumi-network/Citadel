@@ -196,15 +196,12 @@ def assert_cognee_dataset_api() -> None:
 
     # The corpus census (corpus_page / corpus_totals / corpus_chunk_counts /
     # corpus_graph_presence) leans on more private surface than dataset
-    # attribution does: specific Data/Dataset/DatasetData columns, the pgvector
-    # adapter's table reflection + session, and the graph adapter's raw query
+    # attribution does: specific Data/Dataset/DatasetData columns, the active
+    # vector adapter's administrative methods, and the graph adapter's raw query
     # surface. Pin each one so a cognee bump that moves any of them fails loudly
     # at boot and in CI instead of quietly breaking the census.
     from cognee.infrastructure.databases.graph.ladybug.adapter import LadybugAdapter
     from cognee.infrastructure.databases.vector import get_vector_engine  # noqa: F401
-    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
-        PGVectorAdapter,
-    )
     from cognee.modules.data.models import Data
 
     for model, required in (
@@ -233,12 +230,35 @@ def assert_cognee_dataset_api() -> None:
                 f"cognee {model.__name__} table no longer carries {sorted(missing)}; "
                 "the kb.cognee_client corpus census needs updating"
             )
-    for adapter, method_name in (
-        (PGVectorAdapter, "get_table"),
-        (PGVectorAdapter, "get_async_session"),
-        (PGVectorAdapter, "delete_data_points"),
-        (LadybugAdapter, "query"),
-    ):
+    adapter_methods: list[tuple[type[Any], str]] = [(LadybugAdapter, "query")]
+    vector_provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()
+    if vector_provider == "pgvector":
+        from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
+            PGVectorAdapter,
+        )
+
+        adapter_methods.extend(
+            (
+                (PGVectorAdapter, "get_table"),
+                (PGVectorAdapter, "get_async_session"),
+                (PGVectorAdapter, "delete_data_points"),
+            )
+        )
+    elif vector_provider == "qdrant":
+        from .qdrant_adapter import CitadelQdrantAdapter
+
+        adapter_methods.extend(
+            (CitadelQdrantAdapter, method_name)
+            for method_name in (
+                "retrieve",
+                "delete_data_points",
+                "count_data_points",
+                "scroll_data_points",
+                "prune",
+            )
+        )
+
+    for adapter, method_name in adapter_methods:
         if not callable(getattr(adapter, method_name, None)):
             raise RuntimeError(
                 f"cognee {adapter.__name__} no longer exposes {method_name}; "
