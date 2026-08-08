@@ -1,6 +1,30 @@
 # Citadel Progress
 
-Last updated: 2026-07-29.
+Last updated: 2026-08-08.
+
+## 2026-08-08: Qdrant shadow route selected
+
+- CORRECTED: the earlier `1.2.2` custom-adapter route below is superseded. REPORTED: the user selected Cognee `1.4.1` and the official community Qdrant adapter as the source base.
+- VERIFIED: exact-tag research completed in `.local-review/research/cognee-1.4.1-feature-audit.md`, SHA-256 `165189d0ac418e138685755e18930360a6f7e5bd7123807d70f6f9b59f70f022`. It records migration, force-mode, authorization, telemetry, and adapter compatibility findings with blind spots.
+- VERIFIED: Cognee `1.4.1` is viable for an isolated shadow. The official adapter at commit `7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29` is not accepted unchanged because it loses CHUNKS fields, leaves raw-ID retrieve and delete unscoped, and converts provider exceptions to empty results.
+- VERIFIED: a Qdrant local-mode same-ID probe changed Alice search from one hit to zero after Bob wrote the same UUID. Alice raw retrieve then returned Bob's dataset and text. Blind spot: local mode did not exercise a real server or complete Citadel path.
+- INFERRED: active implementation route is Cognee `1.4.1` plus an audited patch based on the official adapter, backend access control, generation collections with dataset-namespaced stored IDs, mandatory dataset filters, authorized graph aggregation, and Citadel-owned receipts. Physical per-dataset collections are the fallback if any isolation test fails.
+- VERIFIED: candidate B adapter tests first returned `8 failed, 5 passed, 10 warnings`, then returned `15 passed, 10 warnings` after implementation. The combined adapter, Cognee client, and dependency run returned `1 failed, 106 passed, 10 warnings in 9.89s`; the only failure is Cognee `1.4.1` metadata rejecting `cryptography==50.0.0`.
+- HELD: real Qdrant server contracts, plain pip packaging, local Compose, Railway, GitHub bootstrap, seat bootstrap, and release E2E remain unrun. CORRECTED: Render moved to later scope.
+- HELD: no dependency or application change from the isolated worktree was committed. No deployment, schema change, production mutation, data deletion, push, or release occurred.
+
+- REPORTED: the user selected Qdrant as Citadel's next vector backend and a new Railway project as the first hosted candidate.
+- VERIFIED: the official Cognee Qdrant guide requires a separate adapter and registration before Cognee calls. Published adapter `0.2.4` pins Cognee `0.5.6`; current community main adapter `0.3.0` pins Cognee `1.1.0`; Citadel declares Cognee `>=1.2.2,<1.3.0`.
+- VERIFIED: official docs say to call `register()`, while both the published wheel and current source expose registration through module import side effects. The disposable probe printed `register_type module`; calling it raised `TypeError: 'module' object is not callable`.
+- VERIFIED: a real Qdrant server `1.18.1` plus client `1.18.0` probe stored two points under one Cognee database name. Unscoped search returned both `seat:a` and `seat:b`; a `node_name=['seat:a']` filter returned only `seat:a`.
+- VERIFIED: the raw adapter drops Cognee `1.2.2` CHUNKS reference fields, overwrites same-ID ownership payloads instead of unioning them, and returns `[]` after search exceptions. It is not accepted unchanged.
+- CORRECTED: the candidate path recorded here was superseded by exact Cognee `1.4.1` plus the audited adapter patch. REPORTED: the user selected SQLite Lite for the new Railway candidate. The fresh relational, graph, Qdrant generation, and old-production rollback boundaries remain current.
+- INFERRED: bootstrap order is GitHub Central first, then one seat at a time. Old direct notes, session traces, promotions, and generated memory require an explicit source export if they must survive cutover.
+- VERIFIED: `qdrant-advisor` was installed at `.agents/skills/qdrant-advisor` by the user-requested `npx skills add qdrant/skills/meta/qdrant-advisor`. Current official guidance says self-hosted Qdrant needs persistent storage, monitoring, backups, and mandatory tenant filters. Local mode is not accepted for production or benchmarking.
+- VERIFIED: the official `qdrant/mcp-server-qdrant` provides direct `qdrant-store` and `qdrant-find` tools. INFERRED: it stays optional and operator-only because it does not implement Citadel seat authorization, source lineage, graph projection, or projection receipts.
+- VERIFIED: `.local-review/research/qdrant-search-engineering-deployment.md` records Qdrant v1.19.0 source pins, retrieval sequencing, authorization constraints, persistence rules, health endpoints, snapshot behavior, and upgrade gates. Its SHA-256 is `8a908f8d42ea561abec8ebf975d4df6a329cf4d05c3b385a944d90d77fbb5899`.
+- VERIFIED: the research recommends Qdrant Cloud for a first production candidate. REPORTED: the active goal instead requires a portable self-hosted Railway shadow. `DEC-2026-08-08-02` selects self-hosted Qdrant for the shadow proof and keeps Qdrant Cloud as an optional later production topology.
+- HELD: no dependency, application code, schema, Railway project, Qdrant service, production data, domain, release, or old memory was changed.
 
 ## 2026-07-29 (evening) — The Kuzu lock is dead, and six things that reported success while doing nothing
 

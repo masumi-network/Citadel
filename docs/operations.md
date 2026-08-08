@@ -22,6 +22,16 @@ overview and quick start, see the [README](../README.md).
 
 ## Deployment (Railway)
 
+### Planned Qdrant candidate
+
+REPORTED: Qdrant is the selected next vector backend. Current production still uses PGVector. Do not switch `VECTOR_DB_PROVIDER` on an existing deployment.
+
+VERIFIED: the official Cognee community Qdrant adapter cannot be installed with Citadel's current Cognee declaration and does not satisfy Citadel's authorization, CHUNKS payload, ownership-upsert, or fail-loud error contracts. The official guide's environment variables alone are therefore insufficient for this repository.
+
+INFERRED: the first Qdrant deployment will use a new project and a new whole generation. It uses SQLite on the app volume, independent graph state, a private Qdrant service with persistent `/qdrant/storage`, an API key, `/readyz`, `/metrics`, snapshot restore, and a recorded generation identity. The template permits one Citadel process, one scheduler, and zero replicas. GitHub Central is rebuilt first, then each seat is imported separately after authorization checks.
+
+The executable route is tracked in [`plans/roadmap.md`](../plans/roadmap.md) and [Wayfinder ticket 009](../.local-review/wayfinder/tickets/009-prove-qdrant-adapter-and-portable-release.md). No Qdrant deployment command is published here until that adapter proof passes.
+
 The repo includes `railway.toml`. The entry command is `python -m
 scripts.run_railway`; `CITADEL_RUN_MODE` selects the role (`web` default,
 `pipeline`, `learning-agent`, `linear-sync`, `backup-mirror`). The web service
