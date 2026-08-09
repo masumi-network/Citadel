@@ -151,7 +151,7 @@ def test_get_skill_connect() -> None:
     assert connect["integrity"] == f"sha256-{base64.b64encode(digest).decode('ascii')}"
     assert response.headers["x-citadel-skill-sha256"] == sha256
     assert response.headers["x-citadel-skill-integrity"] == connect["integrity"]
-    assert response.headers["etag"] == f"\"sha256-{sha256}\""
+    assert response.headers["etag"] == f'"sha256-{sha256}"'
     assert response.headers["cache-control"] == "public, max-age=300"
 
 

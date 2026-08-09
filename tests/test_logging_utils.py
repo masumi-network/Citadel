@@ -94,21 +94,14 @@ def test_configure_cognee_logging_scopes_threshold_to_named_loggers(
     monkeypatch.delenv("CITADEL_COGNEE_LOG_LEVEL", raising=False)
     configure_cognee_logging()
 
-    assert all(
-        logger.level == logging.WARNING
-        for logger in restore_cognee_loggers.values()
-    )
+    assert all(logger.level == logging.WARNING for logger in restore_cognee_loggers.values())
 
 
-def test_configure_cognee_logging_allows_explicit_diagnostics(
-    restore_cognee_loggers, monkeypatch
-):
+def test_configure_cognee_logging_allows_explicit_diagnostics(restore_cognee_loggers, monkeypatch):
     monkeypatch.delenv("CITADEL_COGNEE_LOG_LEVEL", raising=False)
     configure_cognee_logging("debug")
 
-    assert all(
-        logger.level == logging.DEBUG for logger in restore_cognee_loggers.values()
-    )
+    assert all(logger.level == logging.DEBUG for logger in restore_cognee_loggers.values())
 
 
 # --------------------------------------------------------------------------

@@ -67,9 +67,7 @@ class FakeLearningProcess:
                 dataset_id=uuid5(NAMESPACE_URL, str(kwargs.get("dataset", "x"))),
                 dataset_name=str(kwargs.get("dataset", "x")),
                 payload=None,
-                data_ingestion_info=[
-                    {"data_id": str(uuid5(NAMESPACE_URL, f"data:{data}"))}
-                ],
+                data_ingestion_info=[{"data_id": str(uuid5(NAMESPACE_URL, f"data:{data}"))}],
             ),
             "background_cognify": True,
         }
@@ -77,9 +75,7 @@ class FakeLearningProcess:
         reason = self.reasons.pop(0) if self.reasons else "accepted"
 
         class Outcome:
-            ingest = IngestResult(
-                True, reason, kwargs.get("dataset", "x"), (), cognee_result
-            )
+            ingest = IngestResult(True, reason, kwargs.get("dataset", "x"), (), cognee_result)
             chunk_ingests = ()
             improve = {"ok": True} if kwargs.get("run_improve") else None
 
@@ -176,7 +172,10 @@ class FakeRepoContentClient(RepoContentGitHubClient):
 
 def test_resolve_repo_full_name() -> None:
     assert resolve_repo_full_name("sokosumi", "masumi-network") == "masumi-network/sokosumi"
-    assert resolve_repo_full_name("masumi-network/sokosumi", "masumi-network") == "masumi-network/sokosumi"
+    assert (
+        resolve_repo_full_name("masumi-network/sokosumi", "masumi-network")
+        == "masumi-network/sokosumi"
+    )
 
 
 def test_format_repo_content_document() -> None:
@@ -473,9 +472,7 @@ class FailingRepoContentClient(RepoContentGitHubClient):
         super().__init__(token=None)
 
     def fetch_default_branch(self, full_name: str) -> str:
-        raise GitHubAPIError(
-            "GitHub API returned 403: API rate limit exceeded for 95.90.238.57"
-        )
+        raise GitHubAPIError("GitHub API returned 403: API rate limit exceeded for 95.90.238.57")
 
 
 @pytest.mark.asyncio
@@ -512,7 +509,9 @@ class FakeAutoJoinClient(RepoContentGitHubClient):
             "masumi-network/sokosumi-cli/SKILL.md",
         }
 
-    def _repo(self, name: str, *, archived: bool = False, branch: str | None = "main") -> GitHubRepo:
+    def _repo(
+        self, name: str, *, archived: bool = False, branch: str | None = "main"
+    ) -> GitHubRepo:
         return GitHubRepo(
             name=name,
             full_name=f"masumi-network/{name}",
@@ -531,7 +530,9 @@ class FakeAutoJoinClient(RepoContentGitHubClient):
             license_name=None,
         )
 
-    def fetch_repos(self, org: str, *, max_repos: int, include_private: bool = True) -> list[GitHubRepo]:
+    def fetch_repos(
+        self, org: str, *, max_repos: int, include_private: bool = True
+    ) -> list[GitHubRepo]:
         return [
             self._repo("masumi-agent-messenger"),
             self._repo("no-markers-here"),
@@ -581,7 +582,9 @@ def test_resolved_repos_autojoin_disabled_skips_discovery() -> None:
     fetch_calls: list[int] = []
 
     class TrackingClient(FakeAutoJoinClient):
-        def fetch_repos(self, org: str, *, max_repos: int, include_private: bool = True) -> list[GitHubRepo]:
+        def fetch_repos(
+            self, org: str, *, max_repos: int, include_private: bool = True
+        ) -> list[GitHubRepo]:
             fetch_calls.append(1)
             return super().fetch_repos(org, max_repos=max_repos, include_private=include_private)
 
@@ -689,7 +692,13 @@ def test_a_truncated_tree_falls_back_instead_of_syncing_a_partial_repo() -> None
     paths = discover_repo_paths(client, "o/r", ref="sha", **_DISCOVERY_KW)
 
     assert client.probe_calls > 0, "truncation must fall back to probing"
-    assert paths == ["README.md", "AGENTS.md", "skills/a/SKILL.md", "skills/a/b/deep.md", "docs/guide.md"]
+    assert paths == [
+        "README.md",
+        "AGENTS.md",
+        "skills/a/SKILL.md",
+        "skills/a/b/deep.md",
+        "docs/guide.md",
+    ]
 
 
 def test_an_unreadable_tree_falls_back_and_still_finds_everything() -> None:
@@ -708,9 +717,8 @@ def test_max_files_cap_is_respected_identically_on_both_paths() -> None:
     via_probe.tree_fails = True
     kw = {**_DISCOVERY_KW, "max_files": 3}
 
-    assert (
-        discover_repo_paths(via_tree, "o/r", ref="sha", **kw)
-        == discover_repo_paths(via_probe, "o/r", ref="sha", **kw)
+    assert discover_repo_paths(via_tree, "o/r", ref="sha", **kw) == discover_repo_paths(
+        via_probe, "o/r", ref="sha", **kw
     )
 
 
@@ -754,7 +762,9 @@ def test_a_binding_cap_keeps_the_shallower_file_on_both_paths() -> None:
     probe_paths = discover_repo_paths(via_probe, "o/r", ref="sha", **kw)
 
     assert probe_paths == ["skills/zzz.md"], "the walk takes the prefix's own files first"
-    assert tree_paths == probe_paths, f"selection drifted under the cap: {tree_paths} != {probe_paths}"
+    assert tree_paths == probe_paths, (
+        f"selection drifted under the cap: {tree_paths} != {probe_paths}"
+    )
 
 
 # --- resumability -----------------------------------------------------------
@@ -1048,9 +1058,9 @@ def test_cognee_data_ids_reads_the_real_cognee_return_type() -> None:
         assert _cognee_data_ids(outcome({"added": real, **extra})) == [data_id]
 
     # Forward compatibility: a future cognee returning a plain mapping still works.
-    assert _cognee_data_ids(
-        outcome({"added": {"data_ingestion_info": [{"data_id": "d-9"}]}})
-    ) == ["d-9"]
+    assert _cognee_data_ids(outcome({"added": {"data_ingestion_info": [{"data_id": "d-9"}]}})) == [
+        "d-9"
+    ]
 
     # Genuinely empty stays empty, so the guard still refuses to trust a
     # claim it cannot check.
@@ -1176,9 +1186,7 @@ async def test_run_makes_no_github_call_on_the_event_loop(tmp_path: Path) -> Non
             self._stall()
             return super().fetch_last_commit_sha(full_name, path, ref=ref)
 
-        def fetch_file_text(
-            self, full_name: str, path: str, *, ref: str
-        ) -> RepoContentFile | None:
+        def fetch_file_text(self, full_name: str, path: str, *, ref: str) -> RepoContentFile | None:
             self._stall()
             return super().fetch_file_text(full_name, path, ref=ref)
 
@@ -1555,9 +1563,7 @@ async def test_content_the_ingest_can_never_accept_is_not_resubmitted_every_sync
     second = await syncer.run()
 
     assert len(learning.calls) == 2, "the same bytes were submitted for a second refusal"
-    assert second["files_skipped_by_reason"] == {
-        "refused_unchanged:unchunkable_content": 2
-    }
+    assert second["files_skipped_by_reason"] == {"refused_unchanged:unchunkable_content": 2}
     entry = json.loads(state_path.read_text(encoding="utf-8"))["files"][
         "masumi-network/sokosumi-cli/README.md"
     ]
@@ -1589,9 +1595,7 @@ async def test_a_refusal_that_is_not_about_the_content_is_retried(
     second = await syncer.run()
 
     assert len(learning.calls) == 4, "a process-scoped refusal was made permanent"
-    assert second["files_skipped_by_reason"] == {
-        "ingest_rejected:duplicate_in_process": 2
-    }
+    assert second["files_skipped_by_reason"] == {"ingest_rejected:duplicate_in_process": 2}
 
 
 @pytest.mark.asyncio

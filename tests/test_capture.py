@@ -83,9 +83,7 @@ def test_capture_no_roots_warns(tmp_path: Path, capsys) -> None:
 
 def test_capture_root_filter_no_match_message(tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "capture.json"
-    save_capture_config(
-        CaptureConfig().with_root("/tmp/approved", ["personal"]), path=config_path
-    )
+    save_capture_config(CaptureConfig().with_root("/tmp/approved", ["personal"]), path=config_path)
     args = argparse.Namespace(config=str(config_path), root=["/tmp/nope"], dry_run=True)
     rc = asyncio.run(_capture(args))
     assert rc == 1
@@ -103,7 +101,9 @@ def test_capture_corrupt_config_exits_clean(tmp_path: Path, capsys) -> None:
     assert "corrupt capture config" in capsys.readouterr().err
 
 
-def test_capture_node_down_is_handled_and_exits_nonzero(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_capture_node_down_is_handled_and_exits_nonzero(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     config_path = tmp_path / "capture.json"
     save_capture_config(
         CaptureConfig(node_url="https://node.example").with_root(str(tmp_path), ["personal"]),
@@ -125,9 +125,7 @@ def test_capture_node_down_is_handled_and_exits_nonzero(tmp_path: Path, monkeypa
 
 def test_capture_dry_run_returns_zero(tmp_path: Path) -> None:
     config_path = tmp_path / "capture.json"
-    save_capture_config(
-        CaptureConfig().with_root(str(tmp_path), ["personal"]), path=config_path
-    )
+    save_capture_config(CaptureConfig().with_root(str(tmp_path), ["personal"]), path=config_path)
     args = argparse.Namespace(config=str(config_path), root=None, dry_run=True)
     assert asyncio.run(_capture(args)) == 0
 
@@ -192,7 +190,9 @@ def test_truncate_utf8_does_not_split_codepoints() -> None:
 
 
 def test_redact_url_userinfo() -> None:
-    assert _redact_url_userinfo("https://user:tok@github.com/o/r.git") == "https://github.com/o/r.git"
+    assert (
+        _redact_url_userinfo("https://user:tok@github.com/o/r.git") == "https://github.com/o/r.git"
+    )
     assert _redact_url_userinfo("git@github.com:o/r.git") == "git@github.com:o/r.git"
 
 
@@ -231,9 +231,7 @@ def test_capture_duplicate_rejection_reports_ok_false_with_reason(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
-    monkeypatch.setattr(
-        "kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process")
-    )
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process"))
     rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
     out = json.loads(capsys.readouterr().out)
     entry = out["results"][0]
@@ -249,9 +247,7 @@ def test_capture_duplicate_human_output_says_nothing_stored(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
-    monkeypatch.setattr(
-        "kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process")
-    )
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: _rejection("duplicate_in_process"))
     rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=False)))
     captured = capsys.readouterr()
     assert rc == 0
@@ -259,9 +255,7 @@ def test_capture_duplicate_human_output_says_nothing_stored(
     assert "duplicate_in_process" in captured.out
 
 
-def test_capture_non_duplicate_rejection_is_a_failure(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_capture_non_duplicate_rejection_is_a_failure(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
     monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: _rejection("content_too_short"))
     rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=False)))

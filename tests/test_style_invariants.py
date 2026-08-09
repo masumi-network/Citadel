@@ -82,7 +82,12 @@ def test_every_stylesheet_makes_the_hidden_attribute_win() -> None:
     # we do not write.
     linked = set()
     for page in exported_pages():
-        linked.update(re.findall(r'<link rel="stylesheet" href="/next(/[^"]+\.css)"', page.read_text(encoding="utf-8")))
+        linked.update(
+            re.findall(
+                r'<link rel="stylesheet" href="/next(/[^"]+\.css)"',
+                page.read_text(encoding="utf-8"),
+            )
+        )
     assert linked, "no exported document links a stylesheet"
     for href in sorted(linked):
         css = WEBUI / href.lstrip("/")

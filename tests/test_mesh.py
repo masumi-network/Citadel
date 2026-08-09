@@ -16,7 +16,9 @@ async def test_record_ingest_adds_document_node_and_event() -> None:
     mesh = MeshState()
     result = IngestResult(True, "accepted", "notes", ("ops",))
 
-    await mesh.record_ingest(CONFIG, result, data="Runbook: rotate keys", dataset="notes", tags=["ops"])
+    await mesh.record_ingest(
+        CONFIG, result, data="Runbook: rotate keys", dataset="notes", tags=["ops"]
+    )
     snapshot = await mesh.snapshot(CONFIG)
 
     assert snapshot["stats"]["tracked_sources"] == 1
@@ -161,11 +163,7 @@ async def test_snapshot_always_includes_central_dataset_node() -> None:
 
     snapshot = await mesh.snapshot(config)
 
-    dataset_labels = {
-        node["label"]
-        for node in snapshot["nodes"]
-        if node["type"] == "dataset"
-    }
+    dataset_labels = {node["label"] for node in snapshot["nodes"] if node["type"] == "dataset"}
     assert dataset_labels == {"seat:alice", "masumi-network"}
     central_id = next(
         node["id"]

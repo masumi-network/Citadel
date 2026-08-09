@@ -52,9 +52,9 @@ def test_search_request_contains_only_supported_filter_fields() -> None:
     builder = _block(SEARCH, "function buildSearchRequest", "const SECTION_ORDER")
     assert "if (dataset) request.dataset = dataset;" in builder
     assert 'if (source !== "all") request.source = source;' in builder
-    assert 'scope:' not in builder
-    assert 'source_type' not in builder
-    assert 'filters:' not in builder
+    assert "scope:" not in builder
+    assert "source_type" not in builder
+    assert "filters:" not in builder
     assert "buildSearchRequest(query, selectedDataset, source)" in SEARCH
 
 
@@ -63,7 +63,7 @@ def test_filter_controls_preserve_query_url_and_static_csp_navigation() -> None:
     assert 'name="q"' in SEARCH
     assert 'new URLSearchParams(window.location.search).get("q")' in SEARCH
     assert 'type="button"' in SEARCH
-    assert 'aria-pressed=' in SEARCH
+    assert "aria-pressed=" in SEARCH
     assert 'label: "Everything"' in SEARCH
     assert 'label: "Central only"' in SEARCH
     assert 'label: "My Node only"' in SEARCH

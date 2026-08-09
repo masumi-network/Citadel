@@ -86,9 +86,7 @@ class MeshState:
             self._rehydrated = True
             try:
                 self._ensure_base_graph(config)
-                baselines = (
-                    sources if sources is not None else self._read_source_baselines(config)
-                )
+                baselines = sources if sources is not None else self._read_source_baselines(config)
                 latest_ts: str | None = None
                 for source in baselines:
                     ts = source.get("last_indexed_at")
@@ -176,9 +174,7 @@ class MeshState:
         so this projection is intentionally decoupled from any cognee read.
         """
         dataset_id = self._dataset_node(source.get("dataset") or config.default_dataset)
-        source_id = stable_id(
-            "source", f"rehydrate:{source.get('type')}:{source.get('label')}"
-        )
+        source_id = stable_id("source", f"rehydrate:{source.get('type')}:{source.get('label')}")
         self.nodes[source_id] = {
             "id": source_id,
             "label": source.get("label") or "Source",
@@ -292,15 +288,9 @@ class MeshState:
                 "tenant_id": config.tenant_id,
                 "default_dataset": config.default_dataset,
                 "stats": {
-                    "nodes": (
-                        corpus_total(authoritative_nodes, len(self.nodes))
-                    ),
-                    "edges": (
-                        corpus_total(authoritative_edges, len(self.edges))
-                    ),
-                    "tracked_sources": (
-                        corpus_total(authoritative_docs, self.documents)
-                    ),
+                    "nodes": (corpus_total(authoritative_nodes, len(self.nodes))),
+                    "edges": (corpus_total(authoritative_edges, len(self.edges))),
+                    "tracked_sources": (corpus_total(authoritative_docs, self.documents)),
                     "last_indexed_at": self.last_indexed_at,
                     "latest_event_id": self.revision,
                     "since_restart": since_restart,
@@ -336,9 +326,7 @@ class MeshState:
                 events = [event for event in events if event.get("type") == event_type]
             if kind:
                 events = [
-                    event
-                    for event in events
-                    if event.get("timeline", {}).get("kind") == kind
+                    event for event in events if event.get("timeline", {}).get("kind") == kind
                 ]
             if visible is not None:
                 events = [
@@ -461,11 +449,7 @@ class MeshState:
         """
         async with self._lock:
             self._ensure_base_graph(config)
-            target_dataset = (
-                dataset
-                or telemetry.get("primary_dataset")
-                or config.default_dataset
-            )
+            target_dataset = dataset or telemetry.get("primary_dataset") or config.default_dataset
             search_id = str(telemetry.get("search_id") or f"search:{self.feedback_items}")
             feedback_id = stable_id(
                 "feedback", f"search_telemetry:{target_dataset}:{search_id}:{self.feedback_items}"
@@ -622,7 +606,9 @@ class MeshState:
             dataset_id = self._dataset_node(
                 result.get("dataset") or config.repo_content_sync_dataset
             )
-            source_id = stable_id("source", f"github-repo-content:{result.get('org') or config.github_org}")
+            source_id = stable_id(
+                "source", f"github-repo-content:{result.get('org') or config.github_org}"
+            )
             self.nodes[source_id] = {
                 "id": source_id,
                 "label": f"Repo content / {result.get('org') or config.github_org}",
@@ -870,9 +856,7 @@ class MeshState:
         corpus: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         corpus = corpus or {}
-        graph_records = len(
-            [node for node in self.nodes.values() if node["type"] != "index"]
-        )
+        graph_records = len([node for node in self.nodes.values() if node["type"] != "index"])
         authoritative_nodes = corpus.get("indexed_docs")
         corpus_degraded = bool(corpus.get("degraded"))
         graph_status = "active"

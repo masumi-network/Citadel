@@ -192,9 +192,7 @@ def validate_role_scopes(role: str, scopes: tuple[str, ...] | list[str]) -> tupl
     allowed = set(default_scopes(role))
     extra = sorted(set(normalized) - allowed)
     if extra:
-        raise ValueError(
-            f"Scopes exceed {role} role: {', '.join(extra)}"
-        )
+        raise ValueError(f"Scopes exceed {role} role: {', '.join(extra)}")
     return normalized
 
 
@@ -252,9 +250,7 @@ def validate_expires_at(value: str | None) -> str | None:
     if not text:
         return None
     if _parse_time(text) is None:
-        raise ValueError(
-            f"expires_at is not an ISO 8601 timestamp: {value!r}"
-        )
+        raise ValueError(f"expires_at is not an ISO 8601 timestamp: {value!r}")
     return text
 
 
@@ -562,7 +558,9 @@ class AccessStore:
             if scopes is not None
             else validate_role_scopes(
                 resolved_role,
-                principal.scopes if resolved_role == principal.role else default_scopes(resolved_role),
+                principal.scopes
+                if resolved_role == principal.role
+                else default_scopes(resolved_role),
             )
         )
         token = new_api_token()
@@ -631,7 +629,9 @@ class AccessStore:
         next_tokens: list[ApiToken] = []
         for api_token in tokens:
             if api_token.id == token_id:
-                revoked = ApiToken(**{**asdict(api_token), "revoked_at": api_token.revoked_at or now_iso()})
+                revoked = ApiToken(
+                    **{**asdict(api_token), "revoked_at": api_token.revoked_at or now_iso()}
+                )
                 next_tokens.append(revoked)
             else:
                 next_tokens.append(api_token)

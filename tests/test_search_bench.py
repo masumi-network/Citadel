@@ -5,6 +5,7 @@ Fixtures mirror the REAL /search hit shape: repo-content hits carry a
 terminated by ``---``, an ``id`` distinct from ``document_id``, a ``_citadel``
 envelope, and NO top-level ``dataset`` key.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -48,7 +49,8 @@ def repo_hit(
     digest = hashlib.sha256(text.encode()).hexdigest()[:12]
     return {
         "id": f"chunk:{digest}",
-        "document_id": document_id or f"doc-{hashlib.sha256((path + blob).encode()).hexdigest()[:8]}",
+        "document_id": document_id
+        or f"doc-{hashlib.sha256((path + blob).encode()).hexdigest()[:8]}",
         "text": text,
         "_citadel": {
             "rank": 1,
@@ -141,9 +143,7 @@ class TestPathAndBlobDiversityBothSurvive:
 
     def test_path_and_blob_views_disagree_on_one_file_under_two_blobs(self):
         span = "the unique answer sentence lives here"
-        hits = [repo_hit(PATH_DOC, BLOB_A, span)] * 6 + [
-            repo_hit(PATH_DOC, BLOB_B, span)
-        ] * 4
+        hits = [repo_hit(PATH_DOC, BLOB_A, span)] * 6 + [repo_hit(PATH_DOC, BLOB_B, span)] * 4
         row = sb.score_question(question(spans=[span]), hits, {})
         # Blob view: two distinct (path, blob) identities in ten slots.
         assert row["duplicate_blob_rate_at_10"] == pytest.approx(0.8)
@@ -152,9 +152,7 @@ class TestPathAndBlobDiversityBothSurvive:
         assert row["distinct_source_ratio"] == pytest.approx(0.1)
         # If these ever agree on this fixture, one view has been collapsed into
         # the other and a real signal has been lost.
-        assert row["distinct_source_ratio"] != pytest.approx(
-            1 - row["duplicate_blob_rate_at_10"]
-        )
+        assert row["distinct_source_ratio"] != pytest.approx(1 - row["duplicate_blob_rate_at_10"])
 
     def test_unresolvable_sources_are_counted_and_split_out(self):
         span = "the unique answer sentence lives here"
@@ -162,10 +160,7 @@ class TestPathAndBlobDiversityBothSurvive:
         hits = (
             [repo_hit(PATH_DOC, BLOB_A, span)] * 3
             + [repo_hit(PATH_OTHER, BLOB_B, span)] * 2
-            + [
-                {"id": f"chunk:none{i}", "document_id": f"doc-{i}", "text": span}
-                for i in range(5)
-            ]
+            + [{"id": f"chunk:none{i}", "document_id": f"doc-{i}", "text": span} for i in range(5)]
         )
         row = sb.score_question(question(spans=[span]), hits, {})
         assert row["hits_with_unresolvable_source"] == 5
@@ -178,9 +173,7 @@ class TestPathAndBlobDiversityBothSurvive:
 class TestDuplicationMetrics:
     def test_two_blob_page_scores_once_with_dup_rate(self):
         span = "the unique answer sentence lives here"
-        hits = [repo_hit(PATH_DOC, BLOB_A, span)] * 6 + [
-            repo_hit(PATH_DOC, BLOB_B, span)
-        ] * 4
+        hits = [repo_hit(PATH_DOC, BLOB_A, span)] * 6 + [repo_hit(PATH_DOC, BLOB_B, span)] * 4
         row = sb.score_question(question(spans=[span]), hits, {})
         assert row["duplicate_blob_rate_at_10"] == pytest.approx(0.8)
         assert row["distinct_files_at_10"] == 1
@@ -189,7 +182,9 @@ class TestDuplicationMetrics:
         assert row["answer_pass_at_5"] is True
         # One question, one pass: recall over [row] + probe must be 1.0, not
         # inflated by the 10 duplicate slots.
-        probe = sb.score_question(question("p01", expect=["masumi-network/x/gone.md"], recall=0), [], {})
+        probe = sb.score_question(
+            question("p01", expect=["masumi-network/x/gone.md"], recall=0), [], {}
+        )
         summary = sb.summarize([row, probe], [])
         assert summary["quality"]["answer_recall_at_5"] == 1.0
         assert summary["quality"]["answer_recall_at_1"] == 1.0
@@ -214,7 +209,7 @@ class TestDuplicationMetrics:
 
 class TestSpanMatching:
     def test_normalization_survives_backticks_emphasis_whitespace(self):
-        body = "Use the **`create_coworker_task`** tool,\n  with `status=\"READY\"` set."
+        body = 'Use the **`create_coworker_task`** tool,\n  with `status="READY"` set.'
         span = 'Use the create_coworker_task tool, with status="READY" set.'
         assert sb.normalize(span) in sb.normalize(body)
 
@@ -478,12 +473,8 @@ class TestFingerprints:
         assert one["files"] == 2
 
     def test_content_fingerprint_moves_when_a_blob_changes(self, tmp_path):
-        before = sb.content_fingerprint(
-            self._state(tmp_path, [(PATH_DOC, BLOB_A)], "a.json")
-        )
-        after = sb.content_fingerprint(
-            self._state(tmp_path, [(PATH_DOC, BLOB_B)], "b.json")
-        )
+        before = sb.content_fingerprint(self._state(tmp_path, [(PATH_DOC, BLOB_A)], "a.json"))
+        after = sb.content_fingerprint(self._state(tmp_path, [(PATH_DOC, BLOB_B)], "b.json"))
         assert before["sha256"] != after["sha256"]
 
     def _fingerprint(self, sha, questions="q" * 64):
@@ -535,8 +526,7 @@ class TestLint:
         "Another paragraph with completely different content for padding.\n"
     )
     OTHER_BODY = (
-        "# Other Doc Title\n\n"
-        "Entirely unrelated prose that shares no sentences with the example.\n"
+        "# Other Doc Title\n\nEntirely unrelated prose that shares no sentences with the example.\n"
     )
 
     def _write_golden(self, tmp_path, questions):
@@ -566,9 +556,7 @@ class TestLint:
             "expect_any": [PATH_DOC],
             "category": "test",
             "expected_recall": 1,
-            "answer_spans": [
-                "persists attempted charges with a null transaction id"
-            ],
+            "answer_spans": ["persists attempted charges with a null transaction id"],
         }
         base.update(overrides)
         return base
@@ -580,9 +568,7 @@ class TestLint:
 
     def test_cmd_lint_accepts_explicit_ground_truth_path(self, tmp_path, capsys):
         path, gt = self._write_golden(tmp_path, [self._q()])
-        assert sb.main(
-            ["lint", "--questions", str(path), "--ground-truth", str(gt)]
-        ) == 0
+        assert sb.main(["lint", "--questions", str(path), "--ground-truth", str(gt)]) == 0
         assert "lint OK: 1 question(s)" in capsys.readouterr().out
 
     def test_cmd_ci_accepts_the_shipped_fixture(self, capsys):
@@ -609,9 +595,7 @@ class TestLint:
         assert any("not found in any cached ground-truth body" in p for p in problems)
 
     def test_span_matching_first_line_fails(self, tmp_path):
-        path, gt = self._write_golden(
-            tmp_path, [self._q(answer_spans=["Example Doc Title"])]
-        )
+        path, gt = self._write_golden(tmp_path, [self._q(answer_spans=["Example Doc Title"])])
         problems, _ = sb.lint_questions(path, gt)
         assert any("first line" in p for p in problems)
 
@@ -815,9 +799,7 @@ class TestRunTimestamp:
 
         span = "the unique answer sentence lives here"
         qs = [question(spans=[span]), question("p01", recall=0)]
-        result = sb.execute_benchmark(
-            qs, lambda q, k: ({"results": []}, 1.0, None), quiet=True
-        )
+        result = sb.execute_benchmark(qs, lambda q, k: ({"results": []}, 1.0, None), quiet=True)
         stamped = datetime.fromisoformat(result["run_at"])
         assert stamped.tzinfo is not None
 
@@ -826,9 +808,7 @@ class TestRunExitStatus:
     def test_cmd_run_fails_when_every_search_attempt_errors(self, tmp_path, monkeypatch, capsys):
         questions_path = tmp_path / "questions.json"
         questions_path.write_text(
-            json.dumps(
-                {"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}
-            ),
+            json.dumps({"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}),
             encoding="utf-8",
         )
         monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
@@ -880,13 +860,23 @@ class TestRunExitStatus:
             ),
         ]
         summary = sb.summarize(rows, [])
-        summary["latency"] = {"errors": 0, "p50_ms": 1.0, "p95_ms": 1.0, "mean_ms": 1.0, "samples": 3}
+        summary["latency"] = {
+            "errors": 0,
+            "p50_ms": 1.0,
+            "p95_ms": 1.0,
+            "mean_ms": 1.0,
+            "samples": 3,
+        }
         summary["repeats"] = 1
         monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
         monkeypatch.setattr(
             sb,
             "execute_benchmark",
-            lambda *args, **kwargs: {"run_at": "2026-08-06T00:00:00+00:00", "summary": summary, "rows": rows},
+            lambda *args, **kwargs: {
+                "run_at": "2026-08-06T00:00:00+00:00",
+                "summary": summary,
+                "rows": rows,
+            },
         )
         monkeypatch.setattr(
             sb,
@@ -980,9 +970,7 @@ class TestCompareCensusNote:
         assert any("census" in line and "2867" in line and "3100" in line for line in verdicts)
 
     def test_missing_census_adds_no_note(self):
-        comparable, verdicts = sb.compare_fingerprints(
-            self._fingerprint(), self._fingerprint()
-        )
+        comparable, verdicts = sb.compare_fingerprints(self._fingerprint(), self._fingerprint())
         assert comparable is True
         assert not any("census" in line for line in verdicts)
 
@@ -1113,9 +1101,7 @@ class TestEnforce:
             ("error", "HTTP 403", "census failed"),
         ],
     )
-    def test_enforce_rejects_incomplete_or_unmeasured_census(
-        self, field, value, needle
-    ):
+    def test_enforce_rejects_incomplete_or_unmeasured_census(self, field, value, needle):
         baseline = make_enforce_run()
         candidate = make_enforce_run()
         candidate["fingerprint"]["census"][field] = value
@@ -1145,9 +1131,7 @@ class TestEnforce:
     def test_enforce_rejects_unstable_trust(self):
         baseline = make_enforce_run()
         candidate = make_enforce_run()
-        candidate["summary"]["metadata_stability"][
-            "chunks_with_unstable_trust_tier"
-        ] = 1
+        candidate["summary"]["metadata_stability"]["chunks_with_unstable_trust_tier"] = 1
 
         _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
 
@@ -1165,9 +1149,7 @@ class TestEnforce:
     def test_enforce_rejects_retrieval_regression(self, section, metric):
         baseline = make_enforce_run()
         candidate = make_enforce_run()
-        candidate["summary"][section][metric] = (
-            baseline["summary"][section][metric] - 0.01
-        )
+        candidate["summary"][section][metric] = baseline["summary"][section][metric] - 0.01
 
         _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
 
@@ -1230,9 +1212,7 @@ class TestMarkdownReport:
     def test_each_row_is_self_contained_with_date_commit_and_n(self):
         markdown = sb.build_markdown_report(make_run())
         row = next(
-            line
-            for line in markdown.splitlines()
-            if "answer_recall_at_5" in line and "|" in line
+            line for line in markdown.splitlines() if "answer_recall_at_5" in line and "|" in line
         )
         # A row copied out of the table alone must still carry its value, the
         # date, the commit, the sample count, and what it matched on.
@@ -1243,11 +1223,7 @@ class TestMarkdownReport:
         assert sb.METRIC_DEFINITIONS["answer_recall_at_5"] in row
 
     def test_report_refuses_a_metric_without_a_definition(self, monkeypatch):
-        trimmed = {
-            key: value
-            for key, value in sb.METRIC_DEFINITIONS.items()
-            if key != "mrr_body"
-        }
+        trimmed = {key: value for key, value in sb.METRIC_DEFINITIONS.items() if key != "mrr_body"}
         monkeypatch.setattr(sb, "METRIC_DEFINITIONS", trimmed)
         with pytest.raises(sb.BenchError, match="mrr_body"):
             sb.build_markdown_report(make_run())
@@ -1284,9 +1260,7 @@ class TestMarkdownReport:
         run_path = tmp_path / "run.json"
         run_path.write_text(json.dumps(make_run()), encoding="utf-8")
         out_path = tmp_path / "block.md"
-        exit_code = sb.main(
-            ["report", str(run_path), "--markdown", "--out", str(out_path)]
-        )
+        exit_code = sb.main(["report", str(run_path), "--markdown", "--out", str(out_path)])
         assert exit_code == 0
         written = out_path.read_text(encoding="utf-8")
         assert "answer_recall_at_5" in written
@@ -1319,9 +1293,7 @@ class TestPublishedPathsAndProse:
         # compare_fingerprints treats EMPTY_MAP_SHA256 as unavailable; the
         # report must apply the same judgement or the two tools disagree
         # about the same run JSON.
-        markdown = sb.build_markdown_report(
-            make_run(content_sha=sb.EMPTY_MAP_SHA256)
-        )
+        markdown = sb.build_markdown_report(make_run(content_sha=sb.EMPTY_MAP_SHA256))
         assert "NOT comparable on content" in markdown
         assert "empty file map" in markdown
 
@@ -1361,25 +1333,20 @@ class TestPublishedPathsAndProse:
 
 class TestShippedGoldenSet:
     def test_every_question_has_spans_or_explicit_marker(self):
-        data = json.loads(
-            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8"))
         for q in data["questions"]:
             if q.get("expected_recall", 1) == 0:
                 continue
             has_spans = bool(q.get("answer_spans"))
             has_marker = bool(q.get(sb.UNCONVERTED_KEY))
             assert has_spans != has_marker, (
-                f"{q['id']}: must have exactly one of answer_spans / "
-                f"{sb.UNCONVERTED_KEY}"
+                f"{q['id']}: must have exactly one of answer_spans / {sb.UNCONVERTED_KEY}"
             )
 
     def test_probes_exist_and_resolve_against_live_scanner(self):
         """`run` refuses on zero probes, so the shipped set must carry them,
         and every blocked_pattern must still be a rule the scanner enforces."""
-        data = json.loads(
-            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8"))
         probes = [q for q in data["questions"] if q.get("expected_recall", 1) == 0]
         pattern_probes = [q for q in probes if q.get("blocked_pattern")]
         controls = [q for q in probes if not q.get("blocked_pattern")]
@@ -1394,8 +1361,15 @@ class TestShippedGoldenSet:
             assert control.get("expect_any"), control["id"]
 
 
-def scored_hit(path: str, blob: str, body: str, coverage: float | None,
-               *, tier: str = "unattested", sha: str | None = None) -> dict:
+def scored_hit(
+    path: str,
+    blob: str,
+    body: str,
+    coverage: float | None,
+    *,
+    tier: str = "unattested",
+    sha: str | None = None,
+) -> dict:
     """A repo hit carrying the node's own reported term_coverage and trust tier."""
     hit = repo_hit(path, blob, body)
     hit["_citadel"]["relevance"] = (
@@ -1474,9 +1448,7 @@ class TestRankingIsMeasuredSeparatelyFromRetrieval:
         assert sb.normalize(span) not in sb.normalize(
             sb.split_header_body(sb.hit_text(header_carrier))[1]
         )
-        row = sb.score_question(
-            question(spans=[span]), [header_carrier, body_carrier], {}
-        )
+        row = sb.score_question(question(spans=[span]), [header_carrier, body_carrier], {})
         assert row["answer_slot"] == 2
         assert row["answer_term_coverage"] == 1.0
         assert row["outranked_by_coverage"] == 0.05
@@ -1496,17 +1468,13 @@ class TestRankingIsMeasuredSeparatelyFromRetrieval:
         # supplies coverage above the answer's, stops being an inversion.
         answer = scored_hit(PATH_DOC, BLOB_A, f"prose {self.SPAN} prose", 0.40)
         decoy_high = scored_hit(PATH_OTHER, BLOB_B, "filler", 0.60)
-        hidden = sb.score_question(
-            question(spans=[self.SPAN]), [decoy_high, answer], {}
-        )
+        hidden = sb.score_question(question(spans=[self.SPAN]), [decoy_high, answer], {})
         assert hidden["answer_slot"] == 2
         assert hidden["outranked_by_coverage"] is None
         # Same page, same bodies, same order: only the decoy's reported
         # coverage drops to what its BODY alone would earn.
         decoy_low = scored_hit(PATH_OTHER, BLOB_B, "filler", 0.0)
-        revealed = sb.score_question(
-            question(spans=[self.SPAN]), [decoy_low, answer], {}
-        )
+        revealed = sb.score_question(question(spans=[self.SPAN]), [decoy_low, answer], {})
         assert revealed["answer_slot"] == 2
         assert revealed["outranked_by_coverage"] == 0.0
 
@@ -1651,14 +1619,18 @@ class TestEmbeddingWindowPairs:
 
         # A head with no tail: it is not a within-document comparison, so it
         # must not move the rate, the penalty, or the count.
-        dangling_head = [row for row in self._pair_rows(False, False, "w02") if row["window_role"] == "head"]
+        dangling_head = [
+            row for row in self._pair_rows(False, False, "w02") if row["window_role"] == "head"
+        ]
         with_head = sb.summarize(complete + dangling_head, [])
         assert with_head["window"]["pairs_complete"] == 1
         assert with_head["window"]["head_recall_at_5"] == 1.0
         assert with_head["window"]["window_penalty"] == 1.0
 
         # And a tail with no head, the other direction.
-        dangling_tail = [row for row in self._pair_rows(True, True, "w03") if row["window_role"] == "tail"]
+        dangling_tail = [
+            row for row in self._pair_rows(True, True, "w03") if row["window_role"] == "tail"
+        ]
         with_tail = sb.summarize(complete + dangling_tail, [])
         assert with_tail["window"]["pairs_complete"] == 1
         assert with_tail["window"]["tail_recall_at_5"] == 0.0
@@ -1678,7 +1650,11 @@ class TestEmbeddingWindowPairs:
             {},
         )
         # Both pairs name PATH_DOC (see `question`'s default expect_any).
-        rows = [plain, probe] + self._pair_rows(True, False, "w01") + self._pair_rows(True, False, "w02")
+        rows = (
+            [plain, probe]
+            + self._pair_rows(True, False, "w01")
+            + self._pair_rows(True, False, "w02")
+        )
         summary = sb.summarize(rows, [])
         assert summary["window"]["pairs_complete"] == 2
         assert summary["window"]["documents"] == 1
@@ -1725,9 +1701,10 @@ class TestEmbeddingWindowPairs:
         assert before["quality"]["header_credit_rate"] == after["quality"]["header_credit_rate"]
         # Moved: computed from positives / rows. Both are in REPORT_METRICS.
         assert after["quality"]["doc_recall_at_5"] != before["quality"]["doc_recall_at_5"]
-        assert {
-            key for _, key, _ in sb.REPORT_METRICS
-        } & {"doc_recall_at_5", "duplicate_blob_rate_at_10"} == {
+        assert {key for _, key, _ in sb.REPORT_METRICS} & {
+            "doc_recall_at_5",
+            "duplicate_blob_rate_at_10",
+        } == {
             "doc_recall_at_5",
             "duplicate_blob_rate_at_10",
         }
@@ -1751,7 +1728,7 @@ class TestEmbeddingWindowPairs:
 class TestWindowFixtureContract:
     """The rules that make a failing tail evidence rather than a failing question."""
 
-    HEAD_TEXT = "alpha beta gamma delta epsilon " * 40           # ~1200 chars
+    HEAD_TEXT = "alpha beta gamma delta epsilon " * 40  # ~1200 chars
     TAIL_TEXT = "zeta thermodynamic eigenvector quaternion sentence here to quote."
     BODY = "# Doc Title\n\n" + HEAD_TEXT + ("filler padding words. " * 200) + TAIL_TEXT
 
@@ -1784,7 +1761,9 @@ class TestWindowFixtureContract:
             "window_role": "tail",
             "source_offset_chars": self.BODY.find(self.TAIL_TEXT),
             "novel_terms_absent_from_head": [
-                "thermodynamic", "eigenvector", "quaternion",
+                "thermodynamic",
+                "eigenvector",
+                "quaternion",
             ],
         }
         base.update(overrides)
@@ -1825,9 +1804,7 @@ class TestWindowFixtureContract:
         assert any("BELOW" in p for p in problems)
         assert not any("above the" in p for p in problems), problems
 
-    def test_a_declared_offset_cannot_smuggle_a_shallow_quote_into_the_tail(
-        self, tmp_path
-    ):
+    def test_a_declared_offset_cannot_smuggle_a_shallow_quote_into_the_tail(self, tmp_path):
         """`source_offset_chars` is a claim; body.find(quote) is the fact.
 
         Trusting the claim let a quote inside the first 2000 characters ship
@@ -1868,9 +1845,7 @@ class TestWindowFixtureContract:
         contain cannot make the quote novel."""
         path, gt = self._golden(
             tmp_path,
-            self._tail_q(
-                novel_terms_absent_from_head=["absolute", "meridian", "portcullis"]
-            ),
+            self._tail_q(novel_terms_absent_from_head=["absolute", "meridian", "portcullis"]),
         )
         problems, _ = sb.lint_questions(path, gt)
         assert any("are not terms of the quote" in p for p in problems), problems
@@ -1880,9 +1855,7 @@ class TestWindowFixtureContract:
         and stricter than the generic normalize()-based span check. Nothing
         exercised it, so it could be deleted with the suite still green."""
         missing = "this exact sentence is nowhere in the cached body at all"
-        path, gt = self._golden(
-            tmp_path, self._tail_q(question=missing, answer_spans=[missing])
-        )
+        path, gt = self._golden(tmp_path, self._tail_q(question=missing, answer_spans=[missing]))
         problems, _ = sb.lint_questions(path, gt)
         assert any("not present verbatim in the cached body" in p for p in problems)
 
@@ -1907,9 +1880,7 @@ class TestWindowFixtureContract:
         assert row["window_role"] == "tail"
 
     def test_tail_without_enough_novel_terms_fails(self, tmp_path):
-        path, gt = self._golden(
-            tmp_path, self._tail_q(novel_terms_absent_from_head=["quaternion"])
-        )
+        path, gt = self._golden(tmp_path, self._tail_q(novel_terms_absent_from_head=["quaternion"]))
         problems, _ = sb.lint_questions(path, gt)
         assert any("novel_terms_absent_from_head" in p for p in problems)
 
@@ -1919,9 +1890,7 @@ class TestWindowFixtureContract:
         and a pass proves nothing about reach."""
         path, gt = self._golden(
             tmp_path,
-            self._tail_q(
-                novel_terms_absent_from_head=["thermodynamic", "eigenvector", "alpha"]
-            ),
+            self._tail_q(novel_terms_absent_from_head=["thermodynamic", "eigenvector", "alpha"]),
         )
         problems, _ = sb.lint_questions(path, gt)
         assert any("the control is void" in p for p in problems)
@@ -1929,8 +1898,11 @@ class TestWindowFixtureContract:
 
     def test_head_fixture_outside_the_window_fails(self, tmp_path):
         head = self._tail_q(
-            id="w01h", category="window_head", window_role="head",
-            question=self.TAIL_TEXT, answer_spans=[self.TAIL_TEXT],
+            id="w01h",
+            category="window_head",
+            window_role="head",
+            question=self.TAIL_TEXT,
+            answer_spans=[self.TAIL_TEXT],
         )
         head.pop("novel_terms_absent_from_head")
         path, gt = self._golden(tmp_path, head)
@@ -1940,9 +1912,7 @@ class TestWindowFixtureContract:
     def test_shipped_window_pairs_satisfy_the_contract(self):
         """The committed set, not a fixture: every pair has both sides, both
         quotes are unique to one document, and every tail clears the controls."""
-        data = json.loads(
-            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8"))
         window = [q for q in data["questions"] if sb.is_window_question(q)]
         assert len(window) >= 20
         by_pair = {}
@@ -1956,9 +1926,7 @@ class TestWindowFixtureContract:
             # buckets on window_role; a set where they disagree is one where a
             # row is scored without ever being validated. This runs in CI,
             # where ground_truth/ does not exist and `lint` cannot.
-            expected_category = (
-                "window_head" if q["window_role"] == "head" else "window_tail"
-            )
+            expected_category = "window_head" if q["window_role"] == "head" else "window_tail"
             assert q["category"] == expected_category, q["id"]
             if q["window_role"] == "tail":
                 assert q["depth_fraction"] >= sb.TAIL_MIN_DEPTH, q["id"]
@@ -2007,9 +1975,7 @@ class TestFrozenFixtureSet:
         assert any("no `frozen` block" in p for p in problems)
 
     def test_shipped_questions_file_matches_its_own_pin(self):
-        data = json.loads(
-            (Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((Path(sb.HERE) / "golden_questions.json").read_text(encoding="utf-8"))
         assert data["frozen"]["questions_sha256"] == sb.questions_pin(data["questions"])
 
 
@@ -2126,13 +2092,17 @@ class TestReportCoversTheNewMetrics:
             "run_at": "2026-08-04T00:00:00+00:00",
             "summary": {
                 "quality": {
-                    "answer_recall_at_5": 0.9, "raw_page_recall_at_5": 0.8,
-                    "doc_recall_at_5": 0.9, "mrr_body": 0.7,
-                    "header_credit_rate": 0.0, "negative_hit_rate": 0.0,
+                    "answer_recall_at_5": 0.9,
+                    "raw_page_recall_at_5": 0.8,
+                    "doc_recall_at_5": 0.9,
+                    "mrr_body": 0.7,
+                    "header_credit_rate": 0.0,
+                    "negative_hit_rate": 0.0,
                 },
                 "duplication": {"duplicate_blob_rate_at_10": 0.3},
                 "counts": {
-                    "questions_with_spans": 39, "questions_positive": 61,
+                    "questions_with_spans": 39,
+                    "questions_positive": 61,
                     "questions_blocked_probe": 8,
                 },
                 "latency": {"p50_ms": 600.0, "p95_ms": 900.0, "samples": 105},
@@ -2146,16 +2116,23 @@ class TestReportCoversTheNewMetrics:
         run = self._run(
             {
                 "window": {
-                    "head_recall_at_5": 0.667, "tail_recall_at_5": 0.0,
-                    "tail_recall_given_head_at_5": 0.0, "window_penalty": 0.667,
-                    "pairs_complete": 18, "pairs_head_reachable": 11,
+                    "head_recall_at_5": 0.667,
+                    "tail_recall_at_5": 0.0,
+                    "tail_recall_given_head_at_5": 0.0,
+                    "window_penalty": 0.667,
+                    "pairs_complete": 18,
+                    "pairs_head_reachable": 11,
                 },
                 "ranking": {"rank_inversion_rate": 0.63, "answers_ranked": 19},
             }
         )
         markdown = sb.build_markdown_report(run)
-        for key in ("head_recall_at_5", "tail_recall_at_5", "window_penalty",
-                    "rank_inversion_rate"):
+        for key in (
+            "head_recall_at_5",
+            "tail_recall_at_5",
+            "window_penalty",
+            "rank_inversion_rate",
+        ):
             assert key in markdown
             assert sb.METRIC_DEFINITIONS[key][:40] in markdown
         assert "| 18 |" in markdown
@@ -2190,8 +2167,7 @@ class TestTailRecallIsConditionedOnAReachableDocument:
         for pair, (head_pass, tail_pass) in pairs.items():
             for role, passed in (("head", head_pass), ("tail", tail_pass)):
                 q = question(f"{pair}{role[0]}", spans=[self.SPAN])
-                q.update({"category": f"window_{role}", "window_role": role,
-                          "window_pair": pair})
+                q.update({"category": f"window_{role}", "window_role": role, "window_pair": pair})
                 hits = (
                     [scored_hit(PATH_DOC, BLOB_A, self.SPAN, 1.0)]
                     if passed
@@ -2202,26 +2178,22 @@ class TestTailRecallIsConditionedOnAReachableDocument:
 
     def test_unreachable_documents_are_excluded_from_the_conditional(self):
         # w01 reachable, tail missed. w02 unreachable on both sides.
-        summary = sb.summarize(
-            self._rows({"w01": (True, False), "w02": (False, False)}), []
-        )
+        summary = sb.summarize(self._rows({"w01": (True, False), "w02": (False, False)}), [])
         window = summary["window"]
         assert window["pairs_complete"] == 2
         assert window["pairs_neither"] == 1
-        assert window["tail_recall_at_5"] == 0.0          # 0 of 2, pessimistic
-        assert window["pairs_head_reachable"] == 1        # only w01 is evidence
+        assert window["tail_recall_at_5"] == 0.0  # 0 of 2, pessimistic
+        assert window["pairs_head_reachable"] == 1  # only w01 is evidence
         assert window["tail_recall_given_head_at_5"] == 0.0
 
     def test_conditional_counts_only_proven_reachable_documents(self):
         summary = sb.summarize(
-            self._rows(
-                {"w01": (True, True), "w02": (True, False), "w03": (False, False)}
-            ),
+            self._rows({"w01": (True, True), "w02": (True, False), "w03": (False, False)}),
             [],
         )
         window = summary["window"]
         assert window["pairs_head_reachable"] == 2
-        assert window["tail_recall_given_head_at_5"] == 0.5   # 1 of 2
+        assert window["tail_recall_given_head_at_5"] == 0.5  # 1 of 2
         assert window["tail_recall_at_5"] == round(1 / 3, 4)  # 1 of 3, pessimistic
 
     def test_conditional_is_none_when_no_head_ever_retrieved(self):
@@ -2238,9 +2210,10 @@ class TestRunRecordsWhichFrozenSetItAnswered:
         reformatted.write_text(json.dumps({"questions": questions, "version": 5}, indent=4))
         # Reformatting moves the file hash but must NOT move the pin: the run
         # answered the same questions.
-        assert hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(
-            reformatted.read_bytes()
-        ).hexdigest()
+        assert (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            != hashlib.sha256(reformatted.read_bytes()).hexdigest()
+        )
         assert sb.questions_pin(sb.load_questions(path)) == sb.questions_pin(
             sb.load_questions(reformatted)
         )
@@ -2267,9 +2240,7 @@ class TestRunRecordsWhichFrozenSetItAnswered:
         assert "questions_pin" in fingerprint
         assert fingerprint["questions_pin"] == sb.questions_pin(sb.load_questions(path))
 
-    def test_build_fingerprint_records_the_ground_truth_cache(
-        self, tmp_path, monkeypatch
-    ):
+    def test_build_fingerprint_records_the_ground_truth_cache(self, tmp_path, monkeypatch):
         """ground_truth/ is gitignored, refetched from an unpinned upstream
         HEAD, and feeds doc_rank's shingle fallback and legacy_rank. Two runs
         at the same pin against the same node can therefore score differently.
@@ -2285,9 +2256,7 @@ class TestRunRecordsWhichFrozenSetItAnswered:
         assert after["ground_truth"]["sha256"] != before["ground_truth"]["sha256"]
 
     def test_an_absent_ground_truth_cache_says_so(self, tmp_path, monkeypatch):
-        fingerprint, _ = self._fingerprint(
-            tmp_path, monkeypatch, gt_dir=tmp_path / "nope"
-        )
+        fingerprint, _ = self._fingerprint(tmp_path, monkeypatch, gt_dir=tmp_path / "nope")
         assert fingerprint["ground_truth"]["sha256"] is None
         assert "NOT" in fingerprint["ground_truth"]["reason"]
 

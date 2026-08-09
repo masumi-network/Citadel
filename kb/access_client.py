@@ -126,7 +126,9 @@ def create_seat(
         payload["email"] = email
     if token_name:
         payload["token_name"] = token_name
-    return _request("POST", "/api/access/seats", base_url=base_url, key=key or admin_key(), payload=payload)
+    return _request(
+        "POST", "/api/access/seats", base_url=base_url, key=key or admin_key(), payload=payload
+    )
 
 
 def issue_seat_token(
@@ -164,7 +166,9 @@ def create_token(
         payload["allowed_datasets"] = allowed_datasets
     if expires_at:
         payload["expires_at"] = expires_at
-    return _request("POST", "/api/access/tokens", base_url=base_url, key=key or admin_key(), payload=payload)
+    return _request(
+        "POST", "/api/access/tokens", base_url=base_url, key=key or admin_key(), payload=payload
+    )
 
 
 def revoke_token(token_id: str, *, base_url: str, key: str | None = None) -> dict[str, Any]:

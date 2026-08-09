@@ -50,9 +50,7 @@ CHUNK_IDS = [str(uuid5(NAMESPACE_OID, f"{DOC_ID}-{index}")) for index in range(3
 ENTITY_ID = str(uuid5(NAMESPACE_OID, "drilldown-entity"))
 # In the chunk store but never written to the graph (the measured 404 class).
 ORPHAN_DOC_ID = str(uuid5(NAMESPACE_OID, "orphan-doc"))
-ORPHAN_CHUNK_IDS = [
-    str(uuid5(NAMESPACE_OID, f"{ORPHAN_DOC_ID}-{index}")) for index in range(4)
-]
+ORPHAN_CHUNK_IDS = [str(uuid5(NAMESPACE_OID, f"{ORPHAN_DOC_ID}-{index}")) for index in range(4)]
 FULL_BODY = "part zero\n\npart one\n\npart two"
 
 
@@ -78,9 +76,7 @@ def real_graph(tmp_path_factory: pytest.TempPathFactory) -> Any:
     direction unobservable, so the assembly must not care), and a textless
     Entity reachable from a chunk via ``contains``.
     """
-    ladybug = pytest.importorskip(
-        "cognee.infrastructure.databases.graph.ladybug.adapter"
-    )
+    ladybug = pytest.importorskip("cognee.infrastructure.databases.graph.ladybug.adapter")
     import asyncio
 
     adapter = ladybug.LadybugAdapter(
@@ -199,9 +195,7 @@ class _ChunkStore:
     async def retrieve(self, collection_name: str, data_point_ids: list[Any]) -> list[Any]:
         for row_id in data_point_ids:
             if not isinstance(row_id, str):
-                raise RuntimeError(
-                    "lance error: Invalid user input: Error optimizing sql filter"
-                )
+                raise RuntimeError("lance error: Invalid user input: Error optimizing sql filter")
         self.calls.append((collection_name, list(data_point_ids)))
         if collection_name != "DocumentChunk_text":
             return []
@@ -213,9 +207,7 @@ class _ChunkStore:
         return out
 
 
-def _install_chunk_store(
-    client: CogneePublicClient, store: _ChunkStore
-) -> None:
+def _install_chunk_store(client: CogneePublicClient, store: _ChunkStore) -> None:
     async def _engine() -> _ChunkStore:
         return store
 
@@ -325,9 +317,7 @@ async def test_graph_missing_chunk_id_resolves_from_chunk_store(
     assert document["dataset_node_ids"][0] == ORPHAN_DOC_ID
     assert ORPHAN_CHUNK_IDS[2] in document["dataset_node_ids"]
     # The fallback read the SAME collection search reads.
-    assert store.calls and all(
-        collection == "DocumentChunk_text" for collection, _ in store.calls
-    )
+    assert store.calls and all(collection == "DocumentChunk_text" for collection, _ in store.calls)
 
 
 async def test_graph_missing_document_id_resolves_from_chunk_store(

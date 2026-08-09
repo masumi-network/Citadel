@@ -11,6 +11,7 @@ from kb.llm_enrichment import (
     enrichment_enabled,
     openrouter_chat,
 )
+
 logger = logging.getLogger(__name__)
 
 __all__ = [

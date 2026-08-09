@@ -32,6 +32,7 @@ def test_agent_policy_token_authority_lines() -> None:
     assert "no authoritative hit" in text
     assert "official docs / skill first" in text
 
+
 def test_empty_recent_still_injects_agent_policy(monkeypatch, capsys) -> None:
     monkeypatch.setenv(sync_start.TOKEN_ENV, "ctdl_x")
     monkeypatch.setattr(sync_start, "fetch_recent", lambda *a, **k: [])

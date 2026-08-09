@@ -53,7 +53,9 @@ def _clip(text: str, budget: int) -> str:
     return text if len(text) <= budget else text[: max(budget - 1, 0)] + "…"
 
 
-def _render_rows(options: list[str], checked: set[int], cursor: int, *, color: bool, width: int) -> list[str]:
+def _render_rows(
+    options: list[str], checked: set[int], cursor: int, *, color: bool, width: int
+) -> list[str]:
     rows = []
     for index, label in enumerate(options):
         box = paint(f"[{OK}]", "green", enable=color) if index in checked else "[ ]"
@@ -81,8 +83,11 @@ def _select_raw(header: str, options: list[str], checked: set[int]) -> set[int] 
         nonlocal drawn
         if drawn:
             out.write(f"\033[{drawn}A")  # jump back to the top of our block
-        rows = [header, *_render_rows(options, checked, cursor, color=color, width=width),
-                "  " + paint(_clip(_HELP, width - 4), "dim", enable=color)]
+        rows = [
+            header,
+            *_render_rows(options, checked, cursor, color=color, width=width),
+            "  " + paint(_clip(_HELP, width - 4), "dim", enable=color),
+        ]
         for row in rows:
             out.write("\033[2K" + row + "\n")
         drawn = len(rows)
@@ -127,7 +132,11 @@ def _select_lines(header: str, options: list[str], checked: set[int]) -> set[int
             box = paint(f"[{OK}]", "green", enable=color) if index - 1 in checked else "[ ]"
             print(f"    {box} {index}. {label}")
         try:
-            raw = input("  Toggle by number (e.g. 1 3), a all, n none, q skip — Enter to apply: ").strip().lower()
+            raw = (
+                input("  Toggle by number (e.g. 1 3), a all, n none, q skip — Enter to apply: ")
+                .strip()
+                .lower()
+            )
         except EOFError:
             print()
             return checked
@@ -155,11 +164,7 @@ def checkbox_select(header: str, options: list[str], checked: set[int]) -> set[i
     if not options:
         return set()
     checked = {i for i in checked if 0 <= i < len(options)}
-    raw_capable = (
-        os.getenv("TERM", "") != "dumb"
-        and sys.stdin.isatty()
-        and sys.stdout.isatty()
-    )
+    raw_capable = os.getenv("TERM", "") != "dumb" and sys.stdin.isatty() and sys.stdout.isatty()
     if raw_capable:
         try:
             return _select_raw(header, options, set(checked))

@@ -21,13 +21,55 @@ from typing import IO, Iterator
 # the brand SVGs; the CLI draws the same one so there is a single fortress.
 PIXEL_SIZE = 7
 PIXEL_FLAGS: tuple[int, ...] = (
-    1, 0, 1, 0, 1, 0, 1,
-    1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1,
-    1, 1, 0, 1, 0, 1, 1,
-    1, 1, 0, 1, 0, 1, 1,
-    1, 1, 0, 1, 0, 1, 1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
 )
 # Iris Flower magenta stepped to its deep stop. The web mark runs the same two
 # stops as a per-cell gradient, which a terminal cannot do, so the ramp is laid
@@ -77,9 +119,7 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
-PIXEL_COLS_RGB: tuple[tuple[int, int, int], ...] = tuple(
-    _hex_to_rgb(c) for c in PIXEL_COLS_HEX
-)
+PIXEL_COLS_RGB: tuple[tuple[int, int, int], ...] = tuple(_hex_to_rgb(c) for c in PIXEL_COLS_HEX)
 
 
 def supports_truecolor() -> bool:
@@ -244,9 +284,7 @@ def render_pixel_mark(
                     parts.append(_CELL_OFF)
                     continue
             is_window = index in WINDOW_INDICES
-            lit = (bool(PIXEL_FLAGS[index]) or is_window) and not (
-                blank_windows and is_window
-            )
+            lit = (bool(PIXEL_FLAGS[index]) or is_window) and not (blank_windows and is_window)
             if lit:
                 parts.append(
                     _paint_cell(

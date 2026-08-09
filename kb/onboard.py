@@ -223,7 +223,7 @@ def read_token_from_rc(rc_path: Path) -> str:
         stripped = raw.strip()
         for prefix in (f"export {TOKEN_ENV}=", f"{TOKEN_ENV}="):
             if stripped.startswith(prefix):
-                value = stripped[len(prefix):].strip()
+                value = stripped[len(prefix) :].strip()
                 try:
                     parts = shlex.split(value, comments=True)
                 except ValueError:  # unbalanced quotes — treat as unreadable
@@ -375,7 +375,9 @@ def install_windsurf_agent_policy_rule(repo: Path) -> str:
     return _write_text_file_idempotent(dst, windsurf_agent_policy_rule_text())
 
 
-def install_agent_policies(repo: Path, *, detected: list[str] | None = None) -> list[tuple[str, str]]:
+def install_agent_policies(
+    repo: Path, *, detected: list[str] | None = None
+) -> list[tuple[str, str]]:
     """Install Citadel agent policy for every supported coding agent.
 
     * **AGENTS.md** — Codex (CLI + app), Cursor (fallback), Pi, Cline, Zed, and
@@ -394,7 +396,10 @@ def install_agent_policies(repo: Path, *, detected: list[str] | None = None) -> 
         detected = detect()
 
     steps: list[tuple[str, str]] = [
-        (f"Agent policy ({AGENTS_MD_FILENAME})", install_markdown_policy_file(repo / AGENTS_MD_FILENAME)),
+        (
+            f"Agent policy ({AGENTS_MD_FILENAME})",
+            install_markdown_policy_file(repo / AGENTS_MD_FILENAME),
+        ),
     ]
     if "cursor" in detected:
         steps.append(
@@ -406,7 +411,10 @@ def install_agent_policies(repo: Path, *, detected: list[str] | None = None) -> 
         )
     if "gemini" in detected:
         steps.append(
-            (f"Gemini agent policy ({GEMINI_MD_FILENAME})", install_markdown_policy_file(repo / GEMINI_MD_FILENAME))
+            (
+                f"Gemini agent policy ({GEMINI_MD_FILENAME})",
+                install_markdown_policy_file(repo / GEMINI_MD_FILENAME),
+            )
         )
     return steps
 
@@ -459,7 +467,7 @@ def read_citadel_mcp_block(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        servers = (_load_json_object(path).get("mcpServers") or {})
+        servers = _load_json_object(path).get("mcpServers") or {}
     except ValueError:
         return None
     if not isinstance(servers, dict):

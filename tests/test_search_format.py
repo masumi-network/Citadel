@@ -79,7 +79,9 @@ def test_docs_mode_excludes_ambient() -> None:
     shaped = shape_search_payload(payload, query="USDCx payment token", mode="docs")
     assert shaped["docs_mode"] is True
     assert all(h["doc_type"] != "activity" for h in shaped["results"])
-    assert any("not sole authority" in w.lower() or "skills/masumi" in w for w in shaped["warnings"])
+    assert any(
+        "not sole authority" in w.lower() or "skills/masumi" in w for w in shaped["warnings"]
+    )
 
 
 def test_shape_timeout_sets_code() -> None:
@@ -238,7 +240,9 @@ def test_shape_search_payload_filters_and_schema() -> None:
     assert hit["snippet"]
     assert "url" in hit and "path" in hit and "repo" in hit
 
-    canonical = shape_search_payload(payload, query="x", canonical_only=True, apply_spec_ranking=False)
+    canonical = shape_search_payload(
+        payload, query="x", canonical_only=True, apply_spec_ranking=False
+    )
     # canonical_only is a shape filter, not a trust filter — it must never be
     # satisfied by a tier, because a tier can no longer be earned from content.
     assert all(h["doc_type"] in {"spec", "skill", "canonical-docs"} for h in canonical["results"])
@@ -635,11 +639,7 @@ _SESSION_TRACE_WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = 
 
 
 def _module_patterns(module: object) -> dict[str, re.Pattern[str]]:
-    return {
-        name: value
-        for name, value in vars(module).items()
-        if isinstance(value, re.Pattern)
-    }
+    return {name: value for name, value in vars(module).items() if isinstance(value, re.Pattern)}
 
 
 @pytest.mark.parametrize(
@@ -696,8 +696,8 @@ def test_pattern_cost_stays_proportional_to_input_size(
         if elapsed > _PROPORTIONAL_BUDGET_SECONDS:
             over_budget.append(f"{name}.{method} on {len(text)} chars took {elapsed:.2f}s")
 
-    assert not over_budget, (
-        "matching cost grew faster than the input for: " + "; ".join(over_budget)
+    assert not over_budget, "matching cost grew faster than the input for: " + "; ".join(
+        over_budget
     )
 
 

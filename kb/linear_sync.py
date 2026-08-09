@@ -232,9 +232,7 @@ def format_workspace_digest(issues: list[LinearIssue]) -> str:
     lines = ["# Linear workspace sync", "", f"Synced {len(issues)} issues.", ""]
     for issue in issues[:120]:
         assignee = issue.assignee_name or "unassigned"
-        lines.append(
-            f"- **{issue.identifier}** [{issue.state_name}] {issue.title} — {assignee}"
-        )
+        lines.append(f"- **{issue.identifier}** [{issue.state_name}] {issue.title} — {assignee}")
     if len(issues) > 120:
         lines.append(f"- … and {len(issues) - 120} more")
     return "\n".join(lines).strip()
@@ -383,11 +381,7 @@ class LinearSyncer:
             self._save_state(state)
             logger.error("Linear sync failed: %s", exc)
             return {"ok": False, "enabled": True, "reason": "linear_api_error", "error": str(exc)}
-        email_index = (
-            seat_email_index(self.access_store)
-            if self.access_store
-            else {}
-        )
+        email_index = seat_email_index(self.access_store) if self.access_store else {}
         # Auto-resolve assignee_id -> seat by matching Linear members' emails to
         # seat emails, using the node's own Linear key (#46). This populates seat
         # mirrors without a manual CITADEL_LINEAR_USER_MAP, and works even when the

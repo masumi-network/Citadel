@@ -116,9 +116,7 @@ def summarize_hit(item: Any, *, rank: int) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
     envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
-    provenance = (
-        envelope.get("provenance") if isinstance(envelope.get("provenance"), dict) else {}
-    )
+    provenance = envelope.get("provenance") if isinstance(envelope.get("provenance"), dict) else {}
     result_id = _safe_str(
         envelope.get("result_id") or item.get("id") or item.get("url"),
         limit=MAX_ID_CHARS,
@@ -202,8 +200,10 @@ def build_search_telemetry(
             if key == "mode" and isinstance(value, str) and value.strip():
                 clean_filters[key] = value.strip().lower()[:32]
                 continue
-            if key in {"limit", "top_k"} and isinstance(value, (int, float)) and not isinstance(
-                value, bool
+            if (
+                key in {"limit", "top_k"}
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
             ):
                 clean_filters[key] = int(value)
                 continue
@@ -212,9 +212,7 @@ def build_search_telemetry(
                     continue
                 if isinstance(value, list):
                     cleaned_list = [
-                        item
-                        for item in (_safe_str(part, limit=64) for part in value)
-                        if item
+                        item for item in (_safe_str(part, limit=64) for part in value) if item
                     ]
                     if cleaned_list:
                         clean_filters["types"] = cleaned_list[:20]

@@ -140,9 +140,8 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
         return
     exc = task.exception()
     if exc is not None:
-        logger.error(
-            "Background task %s died: %s", task.get_name(), exc, exc_info=exc
-        )
+        logger.error("Background task %s died: %s", task.get_name(), exc, exc_info=exc)
+
 
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
@@ -238,6 +237,7 @@ async def _search_within_budget(
     except asyncio.TimeoutError:
         return [], True
 
+
 mcp_server = create_mcp_server()
 mcp_app = mcp_server.streamable_http_app()
 
@@ -314,7 +314,9 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
     delay = first_sleep_seconds(interval_seconds, last)
     logger.info(
         "Evolve scheduler: first pass in %.0fs of a %ss interval (last pass: %s)",
-        delay, interval_seconds, last or "none recorded",
+        delay,
+        interval_seconds,
+        last or "none recorded",
     )
     while True:
         await asyncio.sleep(delay)
@@ -581,9 +583,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.exception_handler(RequestValidationError)
-async def log_request_validation_error(
-    request: Request, exc: RequestValidationError
-) -> Any:
+async def log_request_validation_error(request: Request, exc: RequestValidationError) -> Any:
     """Say WHY a 422 happened, in the log, without echoing the payload.
 
     FastAPI answers the caller with the field-level detail but the server side
@@ -608,6 +608,7 @@ async def log_request_validation_error(
         "; ".join(problems) or "no detail",
     )
     return await request_validation_exception_handler(request, exc)
+
 
 # The Next.js static export (see docs/adr/0014-nextjs-frontend-static-export.md).
 # Its own directory rather than a corner of static/, which holds the fonts, the
@@ -653,6 +654,8 @@ PRIVATE_CACHE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 PUBLIC_CACHE_PATHS = frozenset({"/.well-known/citadel.json", "/skills"})
 PUBLIC_CACHE_PREFIXES = ("/skills/", "/static/", "/next/_next/")
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
+
+
 def _content_security_policy(style_src: str) -> str:
     """Build the policy from one template so only `style-src` can ever differ."""
     return (
@@ -824,7 +827,9 @@ def contact_rate_limit_ok(client_ip: str) -> bool:
         _contact_global_hits[:] = recent_global
         if len(recent_global) >= CONTACT_GLOBAL_LIMIT:
             return False
-        recent = [t for t in _contact_hits.get(client_ip, []) if now - t < CONTACT_PER_IP_WINDOW_SECONDS]
+        recent = [
+            t for t in _contact_hits.get(client_ip, []) if now - t < CONTACT_PER_IP_WINDOW_SECONDS
+        ]
         if len(recent) >= CONTACT_PER_IP_LIMIT:
             _contact_hits[client_ip] = recent
             return False
@@ -1088,9 +1093,7 @@ class CapturePolicyBody(BaseModel):
 
 
 class CaptureRootsBody(BaseModel):
-    roots: list[str] = Field(
-        default_factory=list, max_length=MAX_APPROVED_CAPTURE_ROOTS
-    )
+    roots: list[str] = Field(default_factory=list, max_length=MAX_APPROVED_CAPTURE_ROOTS)
 
 
 class ObsidianVaultBody(BaseModel):
@@ -1278,11 +1281,7 @@ def weak_access_keys() -> list[tuple[str, int]]:
         candidates.append(("CITADEL_ADMIN_KEY", config.admin_key))
     candidates.extend(("CITADEL_WRITER_KEYS", key) for key in config.writer_keys)
     candidates.extend(("CITADEL_READER_KEYS", key) for key in config.reader_keys)
-    return [
-        (name, len(key))
-        for name, key in candidates
-        if len(key) < WEAK_ACCESS_KEY_MIN_LENGTH
-    ]
+    return [(name, len(key)) for name, key in candidates if len(key) < WEAK_ACCESS_KEY_MIN_LENGTH]
 
 
 def allow_weak_access_keys() -> bool:
@@ -1450,9 +1449,7 @@ def record_auth_failure(client_ip: str) -> bool:
     try:
         with _auth_fail_lock:
             recent_global = [
-                hit
-                for hit in _auth_fail_global_hits
-                if now - hit < AUTH_FAIL_GLOBAL_WINDOW_SECONDS
+                hit for hit in _auth_fail_global_hits if now - hit < AUTH_FAIL_GLOBAL_WINDOW_SECONDS
             ]
             _auth_fail_global_hits[:] = recent_global
             recent = [
@@ -1460,7 +1457,10 @@ def record_auth_failure(client_ip: str) -> bool:
                 for hit in _auth_fail_hits.get(client_ip, [])
                 if now - hit < AUTH_FAIL_PER_IP_WINDOW_SECONDS
             ]
-            if len(recent) >= AUTH_FAIL_PER_IP_LIMIT or len(recent_global) >= AUTH_FAIL_GLOBAL_LIMIT:
+            if (
+                len(recent) >= AUTH_FAIL_PER_IP_LIMIT
+                or len(recent_global) >= AUTH_FAIL_GLOBAL_LIMIT
+            ):
                 _auth_fail_hits[client_ip] = recent
                 return False
             recent.append(now)
@@ -1493,9 +1493,7 @@ def _reject_unauthenticated(request: Request) -> None:
             detail="Too many failed authentication attempts. Try again later.",
             headers={"Retry-After": str(AUTH_FAIL_PER_IP_WINDOW_SECONDS)},
         )
-    logger.warning(
-        "Rejected unauthenticated request: %s %s", request.method, request.url.path
-    )
+    logger.warning("Rejected unauthenticated request: %s %s", request.method, request.url.path)
     raise HTTPException(status_code=401, detail="Access key required.")
 
 
@@ -1956,7 +1954,9 @@ def resolve_write_targets(
         dataset = requested
         guard_curated_central(identity, dataset, tags, config)
         enforce_dataset_allowlist(identity, dataset)
-        tier: IngestTier = "light" if is_seat_dataset(dataset) and not is_org_bound(tags) else "full"
+        tier: IngestTier = (
+            "light" if is_seat_dataset(dataset) and not is_org_bound(tags) else "full"
+        )
         return [WriteTarget(dataset, tier)]
 
     node_dataset = identity.default_dataset if is_seat_dataset(identity.default_dataset) else None
@@ -2097,11 +2097,7 @@ async def search_across_datasets(
             if key in seen:
                 continue
             seen.add(key)
-            if (
-                dataset != SESSION_TRACES_DATASET
-                and key in trace_keys
-                and isinstance(result, dict)
-            ):
+            if dataset != SESSION_TRACES_DATASET and key in trace_keys and isinstance(result, dict):
                 result = {**result, SHARED_TRACE_MARKER: True}
             merged.append((dataset, result))
             budget -= 1
@@ -2245,11 +2241,7 @@ def resolve_search_sessions(
     return {
         # The session scopes the caller's own node; for a caller with no node of
         # its own, a single-dataset search still scopes to that one dataset.
-        dataset: (
-            session
-            if dataset == owned or (owned is None and len(datasets) == 1)
-            else None
-        )
+        dataset: (session if dataset == owned or (owned is None and len(datasets) == 1) else None)
         for dataset in datasets
     }
 
@@ -2392,9 +2384,7 @@ async def capture_search_feedback(
         # is written presence-only. Scoping is by ``details.dataset`` alone
         # (mesh.timeline / scope_mesh_snapshot), so tagging a seat's search with
         # Central would publish their query to every reader.
-        node_dataset = (
-            actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
-        )
+        node_dataset = actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
         await mesh_state.record_search_telemetry(
             config,
             telemetry=telemetry if node_dataset else presence_only_telemetry(telemetry),
@@ -2529,10 +2519,7 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
         from cognee import datasets as cognee_datasets
 
         existing = await cognee_datasets.list_datasets()
-        names = {
-            str(getattr(item, "name", "") or "").strip()
-            for item in existing
-        }
+        names = {str(getattr(item, "name", "") or "").strip() for item in existing}
         if SESSION_TRACES_DATASET in names:
             return
     except Exception:
@@ -2697,9 +2684,7 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     return {key: value for key, value in provenance.items() if value}
 
 
-def document_endpoint_for_result(
-    result_id: str, *, document_id: str | None = None
-) -> str | None:
+def document_endpoint_for_result(result_id: str, *, document_id: str | None = None) -> str | None:
     # Any real id is now drillable (#28): ghsync:/doc_ as before, plus native
     # cognee node/chunk UUIDs that /api/documents resolves via the graph engine.
     # Prefer a hit's document-level id when present. A chunk-level id can be
@@ -2812,9 +2797,7 @@ def with_result_metadata(
     result_id = str(normalized["id"])
     document_id = first_string(normalized.get("document_id"))
     drilldown_id = document_id or result_id
-    document_endpoint = document_endpoint_for_result(
-        result_id, document_id=document_id
-    )
+    document_endpoint = document_endpoint_for_result(result_id, document_id=document_id)
     if not document_endpoint:
         drilldown_available = False
     elif drilldown_predicate is None:
@@ -2967,7 +2950,9 @@ def request_is_https(request: Request) -> bool:
 
 
 def public_cacheable_path(path: str) -> bool:
-    return path in PUBLIC_CACHE_PATHS or any(path.startswith(prefix) for prefix in PUBLIC_CACHE_PREFIXES)
+    return path in PUBLIC_CACHE_PATHS or any(
+        path.startswith(prefix) for prefix in PUBLIC_CACHE_PREFIXES
+    )
 
 
 def public_skill_rows(request: Request) -> list[dict[str, Any]]:
@@ -3005,7 +2990,11 @@ async def add_security_headers(request: Request, call_next: Any) -> Response:
     for header, value in SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
     if "cache-control" not in response.headers:
-        cache_headers = PUBLIC_CACHE_HEADERS if public_cacheable_path(request.url.path) else PRIVATE_CACHE_HEADERS
+        cache_headers = (
+            PUBLIC_CACHE_HEADERS
+            if public_cacheable_path(request.url.path)
+            else PRIVATE_CACHE_HEADERS
+        )
         for header, value in cache_headers.items():
             response.headers.setdefault(header, value)
     if request_is_https(request):
@@ -3409,7 +3398,9 @@ def _captured_last_7d(node: str | None) -> int | None:
             action = str(audit_event.get("action") or "")
             if action != "ingest" and not action.endswith("citadel_ingest"):
                 continue
-            detail = audit_event.get("detail") if isinstance(audit_event.get("detail"), dict) else {}
+            detail = (
+                audit_event.get("detail") if isinstance(audit_event.get("detail"), dict) else {}
+            )
             if detail.get("accepted") is False:
                 continue
             created = audit_event.get("created_at")
@@ -3463,7 +3454,9 @@ async def me_summary(request: Request) -> dict[str, Any]:
                     continue
                 if mesh_node.get("type") != "document":
                     continue
-                meta = mesh_node.get("metadata") if isinstance(mesh_node.get("metadata"), dict) else {}
+                meta = (
+                    mesh_node.get("metadata") if isinstance(mesh_node.get("metadata"), dict) else {}
+                )
                 if meta.get("dataset") == node:
                     document_count += 1
         except Exception:
@@ -3508,7 +3501,9 @@ async def me_summary(request: Request) -> dict[str, Any]:
             action = str(audit_event.get("action") or "")
             if action != "ingest" and not action.endswith("citadel_ingest"):
                 continue
-            detail = audit_event.get("detail") if isinstance(audit_event.get("detail"), dict) else {}
+            detail = (
+                audit_event.get("detail") if isinstance(audit_event.get("detail"), dict) else {}
+            )
             if detail.get("accepted") is False:
                 continue
             audit_ingests.append(audit_event)
@@ -3544,9 +3539,7 @@ async def me_summary(request: Request) -> dict[str, Any]:
         counts_by_dataset = getattr(cognee_client, "document_counts_by_dataset", None)
         if callable(counts_by_dataset):
             counts = await counts_by_dataset()
-            readable_document_count = sum(
-                int(counts.get(name) or 0) for name in readable_datasets
-            )
+            readable_document_count = sum(int(counts.get(name) or 0) for name in readable_datasets)
             # Prefer the durable count for the Node total too. `document_count`
             # above walks the mesh projection, which is rebuilt in memory and
             # empties on every process restart, so on a service that redeploys
@@ -3645,7 +3638,9 @@ async def access_snapshot(
 
     # Gap 9, the other half: state the seat on the token instead of making every
     # consumer join tokens against principals to discover it is missing.
-    principals_by_id = {principal["id"]: principal for principal in snapshot.get("principals") or []}
+    principals_by_id = {
+        principal["id"]: principal for principal in snapshot.get("principals") or []
+    }
     tokens: list[dict[str, Any]] = []
     for token in snapshot.get("tokens") or []:
         principal = principals_by_id.get(token.get("principal_id")) or {}
@@ -3686,7 +3681,9 @@ async def access_snapshot(
         "audit_events_returned": len(page),
         # The oldest id on this page. Pass it back as `cursor` for the next,
         # older page. Null when there is nothing older left.
-        "next_cursor": (page[0].get("id") if start > 0 and page and isinstance(page[0], dict) else None),
+        "next_cursor": (
+            page[0].get("id") if start > 0 and page and isinstance(page[0], dict) else None
+        ),
     }
 
 
@@ -3706,9 +3703,7 @@ CORPUS_CURSOR_MAX_SKEW_SECONDS = 300.0
 def _encode_corpus_cursor(created_at_iso: str, document_id: str) -> str:
     import base64
 
-    payload = json.dumps(
-        {"t": created_at_iso, "id": document_id}, separators=(",", ":")
-    )
+    payload = json.dumps({"t": created_at_iso, "id": document_id}, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
@@ -3737,9 +3732,7 @@ def _decode_corpus_cursor(cursor: str | None) -> "tuple[Any, str] | None":
 def _clamp_corpus_cursor_time(created_at: Any) -> Any:
     from datetime import datetime, timedelta, timezone
 
-    ceiling = datetime.now(timezone.utc) + timedelta(
-        seconds=CORPUS_CURSOR_MAX_SKEW_SECONDS
-    )
+    ceiling = datetime.now(timezone.utc) + timedelta(seconds=CORPUS_CURSOR_MAX_SKEW_SECONDS)
     return min(created_at, ceiling)
 
 
@@ -3772,9 +3765,7 @@ async def corpus_census(
     corpus_page = getattr(cognee_client, "corpus_page", None)
     corpus_totals = getattr(cognee_client, "corpus_totals", None)
     if not callable(corpus_page) or not callable(corpus_totals):
-        raise HTTPException(
-            status_code=503, detail="Corpus census is unavailable on this node."
-        )
+        raise HTTPException(status_code=503, detail="Corpus census is unavailable on this node.")
 
     if limit is None:
         page_size = CORPUS_DEFAULT_LIMIT
@@ -3844,12 +3835,8 @@ async def corpus_census(
 
         for row in rows:
             row_id = str(row.get("id"))
-            row["chunk_count"] = (
-                None if chunk_counts is None else int(chunk_counts.get(row_id, 0))
-            )
-            row["in_graph"] = (
-                None if in_graph_ids is None else (row_id in in_graph_ids)
-            )
+            row["chunk_count"] = None if chunk_counts is None else int(chunk_counts.get(row_id, 0))
+            row["in_graph"] = None if in_graph_ids is None else (row_id in in_graph_ids)
 
         next_cursor: str | None = None
         if has_more and rows:
@@ -3980,8 +3967,7 @@ async def list_access_seats(request: Request) -> dict[str, Any]:
                 "principal_name": principal.get("name"),
                 "principal_kind": principal.get("kind"),
                 "seat_slug": None,
-                "default_dataset": token.get("default_dataset")
-                or principal.get("default_dataset"),
+                "default_dataset": token.get("default_dataset") or principal.get("default_dataset"),
                 "revoked": bool(token.get("revoked_at")),
                 "revoked_at": token.get("revoked_at"),
                 "last_used_at": token.get("last_used_at"),
@@ -4409,9 +4395,7 @@ async def citadel_discovery_manifest(request: Request, response: Response) -> di
             },
             "tools": tools,
             "approval_recommended_for": [
-                row["name"]
-                for row in tools
-                if row["risk"] in {"additive_write", "admin_job"}
+                row["name"] for row in tools if row["risk"] in {"additive_write", "admin_job"}
             ],
             "audit": {
                 "event_action": "mcp.<tool_name>",
@@ -4476,7 +4460,7 @@ async def get_skill(slug: str) -> FileResponse:
     integrity = skill_integrity(path)
     headers = {
         **PUBLIC_CACHE_HEADERS,
-        "ETag": f"\"sha256-{integrity['sha256']}\"",
+        "ETag": f'"sha256-{integrity["sha256"]}"',
         "X-Citadel-Skill-SHA256": str(integrity["sha256"]),
         "X-Citadel-Skill-Integrity": str(integrity["integrity"]),
     }
@@ -4558,21 +4542,16 @@ async def _corpus_health_impl() -> dict[str, Any]:
             for field in ("probe_max_documents", "probe_pages"):
                 if field in measured:
                     value = measured[field]
-                    if (
-                        isinstance(value, bool)
-                        or not isinstance(value, int)
-                        or value < 0
-                    ):
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                         raise RuntimeError(f"bounded corpus probe returned invalid {field}")
-            if "probe_max_documents" in measured and measured["probe_documents"] > measured[
-                "probe_max_documents"
-            ]:
+            if (
+                "probe_max_documents" in measured
+                and measured["probe_documents"] > measured["probe_max_documents"]
+            ):
                 raise RuntimeError("bounded corpus probe exceeded its hard cap")
             if "probe_cap_exceeded" in measured:
                 if type(measured["probe_cap_exceeded"]) is not bool:
-                    raise RuntimeError(
-                        "bounded corpus probe returned invalid probe_cap_exceeded"
-                    )
+                    raise RuntimeError("bounded corpus probe returned invalid probe_cap_exceeded")
                 if measured["probe_cap_exceeded"] and (
                     measured["probe_complete"] or measured["probe_ok"]
                 ):
@@ -4593,8 +4572,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
                 "ok": measured["probe_complete"] is True
                 and measured["probe_ok"] is True
                 and not (
-                    tracked >= _MIN_TRACKED_FOR_CORPUS
-                    and measured["relational_documents"] == 0
+                    tracked >= _MIN_TRACKED_FOR_CORPUS and measured["relational_documents"] == 0
                 ),
                 "tracked_sources": tracked,
                 # Compatibility for MeshState: graph nodes are not relational
@@ -4713,9 +4691,7 @@ async def readyz(request: Request) -> Any:
     return JSONResponse(payload, status_code=200 if ok else 503)
 
 
-def _mesh_dataset_visible(
-    identity: AccessIdentity, dataset: Any, cache: dict[str, bool]
-) -> bool:
+def _mesh_dataset_visible(identity: AccessIdentity, dataset: Any, cache: dict[str, bool]) -> bool:
     if not isinstance(dataset, str) or not dataset:
         return True
     if dataset not in cache:
@@ -4723,9 +4699,7 @@ def _mesh_dataset_visible(
     return cache[dataset]
 
 
-def scope_mesh_snapshot(
-    snapshot: dict[str, Any], identity: AccessIdentity
-) -> dict[str, Any]:
+def scope_mesh_snapshot(snapshot: dict[str, Any], identity: AccessIdentity) -> dict[str, Any]:
     """Strip other seats' content from the runtime-activity projection (ADR-0009).
 
     The /api/mesh projection records each document's first line and each raw
@@ -4745,9 +4719,7 @@ def scope_mesh_snapshot(
     kept_nodes: list[dict[str, Any]] = []
     for node in snapshot.get("nodes", []):
         dataset = (node.get("metadata") or {}).get("dataset")
-        if node.get("type") != "dataset" and not _mesh_dataset_visible(
-            identity, dataset, cache
-        ):
+        if node.get("type") != "dataset" and not _mesh_dataset_visible(identity, dataset, cache):
             dropped.add(node.get("id"))
             continue
         kept_nodes.append(node)
@@ -4759,9 +4731,7 @@ def scope_mesh_snapshot(
     kept_events = [
         event
         for event in snapshot.get("events", [])
-        if _mesh_dataset_visible(
-            identity, (event.get("details") or {}).get("dataset"), cache
-        )
+        if _mesh_dataset_visible(identity, (event.get("details") or {}).get("dataset"), cache)
     ]
     return {
         **snapshot,
@@ -4784,9 +4754,7 @@ async def mesh(request: Request) -> Any:
     # `_corpus_health` is the same source /readyz and `citadel status` use, and
     # is fail-soft: on a transient read error it returns None totals and
     # `snapshot` falls back to the in-memory values rather than raising here.
-    snapshot = await get_mesh().snapshot(
-        citadel.config, corpus=await _bounded_corpus_health()
-    )
+    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _bounded_corpus_health())
     return jsonable_encoder(scope_mesh_snapshot(snapshot, identity))
 
 
@@ -4952,9 +4920,7 @@ async def indexes(request: Request) -> Any:
     citadel = get_citadel()
     # Pass the authoritative corpus figures so the dashboard reports the vault's
     # real size rather than whatever has happened since the last deploy.
-    snapshot = await get_mesh().snapshot(
-        citadel.config, corpus=await _bounded_corpus_health()
-    )
+    snapshot = await get_mesh().snapshot(citadel.config, corpus=await _bounded_corpus_health())
     return jsonable_encoder({"indexes": snapshot["indexes"], "stats": snapshot["stats"]})
 
 
@@ -5158,7 +5124,7 @@ def verify_github_signature(secret: str, body: bytes, signature_header: str) -> 
     prefix = "sha256="
     if not signature_header.startswith(prefix):
         return False
-    provided = signature_header[len(prefix):]
+    provided = signature_header[len(prefix) :]
     expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(provided, expected)
 
@@ -5189,9 +5155,7 @@ async def _run_webhook_reingest(syncer: GitHubOrgSyncer) -> None:
             exc.__class__.__name__,
             exc,
         )
-        await get_mesh().record_error(
-            get_citadel().config, operation="github_sync", error=str(exc)
-        )
+        await get_mesh().record_error(get_citadel().config, operation="github_sync", error=str(exc))
 
 
 @app.post("/api/webhooks/github")
@@ -5265,7 +5229,9 @@ async def linear_sync_issues(
 ) -> dict[str, Any]:
     identity = require_access(request, "reader", "kb:read")
     syncer = get_linear_syncer()
-    seat_dataset_name = identity.default_dataset if is_seat_dataset(identity.default_dataset) else None
+    seat_dataset_name = (
+        identity.default_dataset if is_seat_dataset(identity.default_dataset) else None
+    )
     if scope == "my" and not seat_dataset_name:
         return {"ok": True, "scope": scope, "issues": [], "count": 0}
     issues = syncer.issues_for_scope(scope=scope, seat_dataset_name=seat_dataset_name)
@@ -5601,9 +5567,7 @@ async def resolve_obsidian_conflict(
     return {"ok": True, "conflict": jsonable_encoder(result)}
 
 
-async def load_node_dataset_map(
-    *, warn_unavailable: bool = True
-) -> dict[str, list[str]] | None:
+async def load_node_dataset_map(*, warn_unavailable: bool = True) -> dict[str, list[str]] | None:
     """Fetch the gateway's cached node->dataset map ONCE for reuse across many
     ADR-0009 visibility checks in a single request.
 
@@ -5675,8 +5639,7 @@ async def cognee_document_visible(identity: AccessIdentity, node_ids: list[str])
         # The cached/timed-out lookup degrades to {} on failure (#50) —
         # indistinguishable from an empty store, so scoped callers are denied.
         logger.warning(
-            "Document drill-down denied: empty node dataset map "
-            "(fail-closed for scoped callers)"
+            "Document drill-down denied: empty node dataset map (fail-closed for scoped callers)"
         )
         return False
     return node_ids_visible_in_map(identity, node_ids, mapping)
@@ -6007,7 +5970,9 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             "ingested": result.get("ingested"),
             "improved": result.get("improved"),
             "files_ingested": (
-                repo_content_result.get("files_ingested") if isinstance(repo_content_result, dict) else None
+                repo_content_result.get("files_ingested")
+                if isinstance(repo_content_result, dict)
+                else None
             ),
             "digest_meaningful": (result.get("organization_digest") or {}).get("meaningful"),
             "google_chat_sent": google_chat_notification.get("sent"),
@@ -6040,7 +6005,9 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
     citadel = get_citadel()
     dataset = body.dataset or citadel.config.default_dataset
     try:
-        result = await citadel.cognify_dataset(dataset=dataset, verify=body.verify, force=body.force)
+        result = await citadel.cognify_dataset(
+            dataset=dataset, verify=body.verify, force=body.force
+        )
     except Exception as exc:  # pragma: no cover - depends on Cognee config.
         logger.error("Cognify run failed: %s", exc.__class__.__name__)
         get_access_store().record_event(
@@ -6583,9 +6550,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
     ]
     cognify_queued = False
     if cognify_datasets:
-        cognify_queued = citadel.cognee.schedule_cognify(
-            list(dict.fromkeys(cognify_datasets))
-        )
+        cognify_queued = citadel.cognee.schedule_cognify(list(dict.fromkeys(cognify_datasets)))
     cognify_state = "deferred" if cognify_queued else "not_scheduled"
 
     record_mcp_audit(
@@ -6650,9 +6615,7 @@ def share_session_tags_from_body(seat_slug: str, body: ShareSessionBody) -> list
 #
 # The MCP twins of contribute and share_session are excluded because their
 # non-MCP row is always written too, and listing both double-counts one write.
-CONTRIBUTION_ACTIONS = frozenset(
-    {"contribute", "ingest", "share_session", "mcp.citadel_ingest"}
-)
+CONTRIBUTION_ACTIONS = frozenset({"contribute", "ingest", "share_session", "mcp.citadel_ingest"})
 
 
 @app.get("/api/contributions/recent")
@@ -7081,9 +7044,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             # the flag never promises a 404 — textless entities and foreign-seat
             # docs/chunks fall out here.
             try:
-                owner_node_ids = await get_citadel().resolve_document_owner_ids(
-                    drilldown_id
-                )
+                owner_node_ids = await get_citadel().resolve_document_owner_ids(drilldown_id)
             except Exception:  # noqa: BLE001 - any failure fails closed, like a 404
                 return False
             if owner_node_ids is None:
@@ -7098,9 +7059,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             result_id = str(envelope.get("result_id") or "")
             document_id = first_string(item.get("document_id"))
             drilldown_id = document_id or result_id
-            document_endpoint = document_endpoint_for_result(
-                result_id, document_id=document_id
-            )
+            document_endpoint = document_endpoint_for_result(result_id, document_id=document_id)
             if not document_endpoint:
                 # Synthetic chunk:<hash> id with no backing store — honestly
                 # non-drillable, nothing to resolve.
@@ -7172,9 +7131,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         detail=audit_detail,
     )
     primary_dataset = search_datasets[0]
-    node_dataset = (
-        actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
-    )
+    node_dataset = actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
     telemetry = await capture_search_feedback(
         mesh_state=mesh_state,
         config=citadel.config,
@@ -7241,14 +7198,14 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         payload["timed_out"] = True
         payload["truncated"] = True
         payload["code"] = CODE_TIMEOUT
-    elif not normalized and body.dataset is None and (
-        not filters_active or candidates_fetched == 0
+    elif (
+        not normalized and body.dataset is None and (not filters_active or candidates_fetched == 0)
     ):
         # With filters active this fires only when retrieval itself came back
         # empty — an empty page whose candidates the filters excluded gets the
         # filter warning below instead, not dataset advice.
         payload["note"] = (
-            "No results in the default dataset. Pass an explicit \"dataset\" to search a "
+            'No results in the default dataset. Pass an explicit "dataset" to search a '
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)

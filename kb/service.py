@@ -193,8 +193,7 @@ class Citadel:
                 violation = chunk_window.validate_cognee_chunk_budget(data)
             except chunk_window.ChunkBudgetValidationError as exc:
                 logger.error(
-                    "Ingest refused for dataset %s: final chunk budget could not "
-                    "be verified (%s)",
+                    "Ingest refused for dataset %s: final chunk budget could not be verified (%s)",
                     safe_log_value(dataset),
                     safe_log_value(str(exc)),
                 )
@@ -202,8 +201,7 @@ class Citadel:
             if violation is None:
                 return None
             logger.warning(
-                "Ingest refused for dataset %s: final Cognee chunk violates its "
-                "budget (%s)",
+                "Ingest refused for dataset %s: final Cognee chunk violates its budget (%s)",
                 safe_log_value(dataset),
                 safe_log_value(violation.describe()),
             )
@@ -268,10 +266,7 @@ class Citadel:
         if not session_recorded:
             # Fall back to a durable, searchable feedback note so the signal is
             # never silently dropped.
-            note = (
-                f"Feedback for QA {request.qa_id}: score={request.score} | "
-                f"{request.text or ''}"
-            )
+            note = f"Feedback for QA {request.qa_id}: score={request.score} | {request.text or ''}"
             durable = await self.ingest(
                 note,
                 dataset=dataset,
@@ -358,11 +353,7 @@ class Citadel:
         required_ids = source_required_ids or set()
         get_document = getattr(self.cognee, "get_document", None)
         if not callable(get_document):
-            return (
-                {"reason": "repair_candidate_lookup_unavailable"}
-                if required_ids
-                else None
-            )
+            return {"reason": "repair_candidate_lookup_unavailable"} if required_ids else None
         for document_id in repair_ids:
             try:
                 document = await get_document(document_id)
@@ -382,10 +373,7 @@ class Citadel:
                     "reason": "repair_candidate_unavailable",
                 }
             body = document.get("body")
-            if (
-                document_id not in required_ids
-                and (not isinstance(body, str) or not body.strip())
-            ):
+            if document_id not in required_ids and (not isinstance(body, str) or not body.strip()):
                 continue
             datasets = repair_document_datasets.get(document_id) or []
             for target_dataset in datasets:
@@ -438,9 +426,7 @@ class Citadel:
             "after": None,
         }
 
-    async def _restore_repair_projections(
-        self, deleted: dict[str, Any] | None
-    ) -> bool:
+    async def _restore_repair_projections(self, deleted: dict[str, Any] | None) -> bool:
         restore = getattr(self.cognee, "restore_document_chunks", None)
         if not callable(restore) or deleted is None:
             return False
@@ -511,9 +497,7 @@ class Citadel:
         for document_id in document_ids:
             expected_entry = expected.get(document_id)
             current_entry = current.get(document_id)
-            if not isinstance(expected_entry, Mapping) or not isinstance(
-                current_entry, Mapping
-            ):
+            if not isinstance(expected_entry, Mapping) or not isinstance(current_entry, Mapping):
                 return {
                     "ok": False,
                     "reason": "repair_source_manifest_incomplete",
@@ -618,9 +602,7 @@ class Citadel:
             }
 
         scoped = [
-            record
-            for record in pending
-            if dataset is None or record.get("dataset") == dataset
+            record for record in pending if dataset is None or record.get("dataset") == dataset
         ]
         if len(scoped) != len(pending):
             return {
@@ -675,13 +657,9 @@ class Citadel:
                     "after": None,
                 }
 
-            verification = await self._verify_repair_source_manifest(
-                repair_ids, source_manifest
-            )
+            verification = await self._verify_repair_source_manifest(repair_ids, source_manifest)
             if verification.get("ok") is not True:
-                reason = str(
-                    verification.get("reason") or "repair_recovery_manifest_unavailable"
-                )
+                reason = str(verification.get("reason") or "repair_recovery_manifest_unavailable")
                 try:
                     self.repair_journal.append(
                         operation_id=operation_id,
@@ -715,8 +693,7 @@ class Citadel:
             )
             if membership_verification.get("ok") is not True:
                 reason = str(
-                    membership_verification.get("reason")
-                    or "repair_dataset_membership_unavailable"
+                    membership_verification.get("reason") or "repair_dataset_membership_unavailable"
                 )
                 try:
                     self.repair_journal.append(
@@ -985,9 +962,7 @@ class Citadel:
             await self._delete_marker_node(marker)
 
         after = await self._graph_counts()
-        graph_grew = (
-            after["nodes"] > before["nodes"] or after["edges"] > before["edges"]
-        )
+        graph_grew = after["nodes"] > before["nodes"] or after["edges"] > before["edges"]
         if verification is not None:
             verification["graph_grew"] = graph_grew
             # graph_grew is diagnostic detail, NOT a pass condition (#114). Any
@@ -1067,9 +1042,7 @@ class Citadel:
             try:
                 with self.repair_journal.lease():
                     if not recover:
-                        journal_gate = self._repair_journal_gate(
-                            dataset=dataset, force=force
-                        )
+                        journal_gate = self._repair_journal_gate(dataset=dataset, force=force)
                         if journal_gate is not None:
                             return journal_gate
                     async with maintenance():
@@ -1268,8 +1241,8 @@ class Citadel:
                 "after": None,
             }
 
-        source_manifest, source_manifest_failure = (
-            await self._capture_repair_source_manifest(repair_ids)
+        source_manifest, source_manifest_failure = await self._capture_repair_source_manifest(
+            repair_ids
         )
         if source_manifest_failure is not None:
             return {
@@ -1279,9 +1252,7 @@ class Citadel:
                 "force": force,
                 "reason": source_manifest_failure["reason"],
                 "error_type": source_manifest_failure.get("error_type"),
-                "missing_document_ids": source_manifest_failure.get(
-                    "missing_document_ids", []
-                ),
+                "missing_document_ids": source_manifest_failure.get("missing_document_ids", []),
                 "repair_required": True,
                 "before": before,
                 "after": None,
@@ -1421,18 +1392,10 @@ class Citadel:
                 repair_datasets=repair_datasets,
             )
             if oversized_repair_ids_set:
-                deleted = await self.cognee.delete_document_chunks(
-                    sorted(oversized_repair_ids_set)
-                )
+                deleted = await self.cognee.delete_document_chunks(sorted(oversized_repair_ids_set))
             if isinstance(deleted, dict) and deleted.get("ok") is False:
-                raise RuntimeError(
-                    str(deleted.get("reason") or "repair_delete_failed")
-                )
-            deleted_ids = (
-                deleted.get("document_ids", [])
-                if isinstance(deleted, dict)
-                else []
-            )
+                raise RuntimeError(str(deleted.get("reason") or "repair_delete_failed"))
+            deleted_ids = deleted.get("document_ids", []) if isinstance(deleted, dict) else []
             self.repair_journal.append(
                 operation_id=repair_operation_id,
                 dataset=dataset,
@@ -1500,14 +1463,9 @@ class Citadel:
                 )
         except Exception as exc:  # noqa: BLE001 - return recoverable repair state
             logger.exception("corpus reconciliation failed during %s", repair_phase)
-            deleted_ids = (
-                deleted.get("document_ids", [])
-                if isinstance(deleted, dict)
-                else []
-            )
+            deleted_ids = deleted.get("document_ids", []) if isinstance(deleted, dict) else []
             projections_preserved = (
-                isinstance(deleted, dict)
-                and deleted.get("projections_preserved") is True
+                isinstance(deleted, dict) and deleted.get("projections_preserved") is True
             )
             if deleted is not None and not projections_preserved:
                 projections_preserved = await self._restore_repair_projections(deleted)
@@ -1548,18 +1506,12 @@ class Citadel:
             }
 
         after_valid = isinstance(after, dict)
-        post_counts_valid = (
-            isinstance(post_counts, dict)
-            and all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value > 0
-                for value in (post_counts.get(document_id) for document_id in repair_ids)
-            )
+        post_counts_valid = isinstance(post_counts, dict) and all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in (post_counts.get(document_id) for document_id in repair_ids)
         )
-        post_graph_valid = (
-            post_graph_ids is not None
-            and set(repair_ids).issubset({str(document_id) for document_id in post_graph_ids})
+        post_graph_valid = post_graph_ids is not None and set(repair_ids).issubset(
+            {str(document_id) for document_id in post_graph_ids}
         )
         stored_budget = after.get("stored_chunk_budget") if isinstance(after, dict) else None
         if dataset is not None:
@@ -1811,8 +1763,8 @@ class Citadel:
                 "after": None,
             }
 
-        source_manifest, source_manifest_failure = (
-            await self._capture_repair_source_manifest(repair_ids)
+        source_manifest, source_manifest_failure = await self._capture_repair_source_manifest(
+            repair_ids
         )
         if source_manifest_failure is not None:
             return {
@@ -1822,9 +1774,7 @@ class Citadel:
                 "force": force,
                 "reason": source_manifest_failure["reason"],
                 "error_type": source_manifest_failure.get("error_type"),
-                "missing_document_ids": source_manifest_failure.get(
-                    "missing_document_ids", []
-                ),
+                "missing_document_ids": source_manifest_failure.get("missing_document_ids", []),
                 "repair_required": True,
                 "before": before,
                 "after": None,
@@ -2169,8 +2119,8 @@ class Citadel:
             document_id: ([dataset] if dataset else list(repair_datasets))
             for document_id in repair_ids
         }
-        source_manifest, source_manifest_failure = (
-            await self._capture_repair_source_manifest(repair_ids)
+        source_manifest, source_manifest_failure = await self._capture_repair_source_manifest(
+            repair_ids
         )
         if source_manifest_failure is not None:
             return {
@@ -2180,9 +2130,7 @@ class Citadel:
                 "force": True,
                 "reason": source_manifest_failure["reason"],
                 "error_type": source_manifest_failure.get("error_type"),
-                "missing_document_ids": source_manifest_failure.get(
-                    "missing_document_ids", []
-                ),
+                "missing_document_ids": source_manifest_failure.get("missing_document_ids", []),
                 "repair_required": True,
                 "before": before,
                 "after": None,
@@ -2292,9 +2240,7 @@ class Citadel:
             )
             deleted = await self.cognee.delete_document_chunks(repair_ids)
             if isinstance(deleted, dict) and deleted.get("ok") is False:
-                raise RuntimeError(
-                    str(deleted.get("reason") or "repair_delete_failed")
-                )
+                raise RuntimeError(str(deleted.get("reason") or "repair_delete_failed"))
             self.repair_journal.append(
                 operation_id=repair_operation_id,
                 dataset=dataset,
@@ -2355,14 +2301,9 @@ class Citadel:
             post_graph_ids = await self.cognee.corpus_graph_presence(repair_ids)
         except Exception as exc:  # noqa: BLE001 - return recoverable repair state
             logger.exception("oversized reconciliation failed during %s", repair_phase)
-            deleted_ids = (
-                deleted.get("document_ids", [])
-                if isinstance(deleted, dict)
-                else []
-            )
+            deleted_ids = deleted.get("document_ids", []) if isinstance(deleted, dict) else []
             projections_preserved = (
-                isinstance(deleted, dict)
-                and deleted.get("projections_preserved") is True
+                isinstance(deleted, dict) and deleted.get("projections_preserved") is True
             )
             if deleted is not None and not projections_preserved:
                 projections_preserved = await self._restore_repair_projections(deleted)
@@ -2571,10 +2512,10 @@ def _is_dataitem_garbage(text: str) -> bool:
         line = raw_line.strip()
         if line.startswith("Answer:"):
             has_answer = True
-            if line[len("Answer:"):].strip() != "[DataItem]":
+            if line[len("Answer:") :].strip() != "[DataItem]":
                 return False
         elif line.startswith("Question:"):
-            if line[len("Question:"):].strip():
+            if line[len("Question:") :].strip():
                 return False
     return has_answer
 
@@ -2705,7 +2646,13 @@ def _legacy_garbage_kind(node_id: Any, properties: Any) -> str | None:
     classified — there is no substring-of-prose match.
     """
     props = properties if isinstance(properties, dict) else {}
-    for value in (props.get("text"), props.get("name"), props.get("title"), props.get("id"), node_id):
+    for value in (
+        props.get("text"),
+        props.get("name"),
+        props.get("title"),
+        props.get("id"),
+        node_id,
+    ):
         if isinstance(value, str) and _MARKER_RE.fullmatch(value.strip()):
             return "marker"
     text = props.get("text")

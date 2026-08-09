@@ -25,9 +25,7 @@ def _assistant_edit(file_path: str) -> dict[str, Any]:
     return {
         "type": "assistant",
         "message": {
-            "content": [
-                {"type": "tool_use", "name": "Edit", "input": {"file_path": file_path}}
-            ]
+            "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": file_path}}]
         },
     }
 
@@ -58,9 +56,7 @@ class _RecordingPost:
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, base_url: str, token: str, data: str, tags: list[str]) -> None:
-        self.calls.append(
-            {"base_url": base_url, "token": token, "data": data, "tags": tags}
-        )
+        self.calls.append({"base_url": base_url, "token": token, "data": data, "tags": tags})
 
 
 # --- distillation -----------------------------------------------------------
@@ -134,9 +130,7 @@ def test_iter_transcript_missing_file_returns_empty() -> None:
     assert sync_session._iter_transcript("/nonexistent/path/to/transcript.jsonl") == []
 
 
-def test_iter_transcript_refuses_paths_outside_allowlist(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_iter_transcript_refuses_paths_outside_allowlist(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_TRANSCRIPT_ALLOW_ROOT", raising=False)
     path = _write_transcript(tmp_path, _sample_entries())
     assert sync_session._iter_transcript(str(path)) == []
@@ -145,9 +139,7 @@ def test_iter_transcript_refuses_paths_outside_allowlist(
 # --- run(): missing token -> no POST + clean exit ---------------------------
 
 
-def test_missing_token_no_post_clean_exit(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_missing_token_no_post_clean_exit(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
     recorder = _RecordingPost()
     monkeypatch.setattr(sync_session, "post_ingest", recorder)
@@ -227,19 +219,14 @@ def test_post_omits_dataset_field(monkeypatch: Any, tmp_path: Path) -> None:
 
 def test_post_refuses_non_https() -> None:
     with pytest.raises(ValueError):
-        sync_session.post_ingest(
-            "http://example.invalid", "ctdl_x", "note", ["dev-session"]
-        )
+        sync_session.post_ingest("http://example.invalid", "ctdl_x", "note", ["dev-session"])
 
 
 def test_redirects_are_not_followed() -> None:
     # A 3xx (esp. an https->http downgrade) must not re-send the Authorization
     # header. The handler refuses to follow any redirect.
     handler = sync_session._NoRedirectHandler()
-    assert (
-        handler.redirect_request(None, None, 302, "Found", {}, "http://evil.invalid")
-        is None
-    )
+    assert handler.redirect_request(None, None, 302, "Found", {}, "http://evil.invalid") is None
 
 
 def test_run_swallows_post_errors(monkeypatch: Any, tmp_path: Path) -> None:
@@ -350,9 +337,7 @@ def test_receipt_on_unreadable_body_does_not_claim_capture(
     assert "session captured" not in receipt
 
 
-def test_receipt_on_timeout_says_write_may_have_completed(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
+def test_receipt_on_timeout_says_write_may_have_completed(monkeypatch: Any, tmp_path: Path) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
     monkeypatch.setattr(sync_session, "build_tags", lambda cwd: ["dev-session"])
 

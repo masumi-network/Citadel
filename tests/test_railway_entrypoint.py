@@ -194,7 +194,13 @@ def test_pipeline_runs_all_enabled_stages_in_order(monkeypatch: Any) -> None:
     _patch_stages(monkeypatch, calls)
 
     assert run_railway.run("pipeline") == 0
-    assert calls == ["github_sync", "repo_content_sync", "skills_refresh", "self_improve", "backup_mirror"]
+    assert calls == [
+        "github_sync",
+        "repo_content_sync",
+        "skills_refresh",
+        "self_improve",
+        "backup_mirror",
+    ]
 
 
 def test_pipeline_self_improve_stage_is_off_by_default(monkeypatch: Any) -> None:
@@ -493,7 +499,9 @@ def test_evolve_runs_cognee_stage_bodies_on_one_loop(monkeypatch: Any) -> None:
         return 0
 
     monkeypatch.setattr(run_railway, "_github_sync_stage", lambda: 0)
-    monkeypatch.setattr(run_railway, "_repo_content_sync_stage", lambda: run_railway.run_async(_record()))
+    monkeypatch.setattr(
+        run_railway, "_repo_content_sync_stage", lambda: run_railway.run_async(_record())
+    )
     monkeypatch.setattr(run_railway, "_self_improve_stage", lambda: 0)
     monkeypatch.setattr(run_railway, "_promotion_stage", lambda: 0)
     monkeypatch.setattr(run_railway, "_linear_sync_stage", lambda: run_railway.run_async(_record()))
@@ -514,9 +522,7 @@ def test_evolve_stage_lists_stay_in_sync() -> None:
     Phase 2, which the old subprocess expressed via an env toggle.
     """
     sync_stages = [(name, enabled) for name, enabled, _ in run_railway.evolve_stages()]
-    async_stages = [
-        (name, enabled) for name, enabled, _ in run_railway.evolve_stages_async()
-    ]
+    async_stages = [(name, enabled) for name, enabled, _ in run_railway.evolve_stages_async()]
 
     assert [name for name, _ in sync_stages if name != "cognify"] == [
         name for name, _ in async_stages

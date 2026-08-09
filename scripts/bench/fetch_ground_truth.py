@@ -7,6 +7,7 @@ benchmark match a hit by content overlap instead, which survives chunking.
 Usage:
     GITHUB_TOKEN=... python scripts/bench/fetch_ground_truth.py
 """
+
 from __future__ import annotations
 
 import base64

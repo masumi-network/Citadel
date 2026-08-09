@@ -82,9 +82,7 @@ class PageCitadel:
 def shaped_client(citadel: Any) -> TestClient:
     app.state.citadel = citadel
     app.state.mesh = MeshState()
-    app.state.conflict_store = KnowledgeConflictStore(
-        Path(tempfile.mkdtemp()) / "conflicts.json"
-    )
+    app.state.conflict_store = KnowledgeConflictStore(Path(tempfile.mkdtemp()) / "conflicts.json")
     client = TestClient(app, base_url="https://testserver")
     response = client.post("/admin/session", json={"access_key": "test-admin"})
     assert response.status_code == 200
@@ -120,9 +118,7 @@ def test_linear_header_populates_issue_id_and_url() -> None:
 
     assert provenance["issue"] == "SOK-623"
     assert provenance["title"] == "coworker init UX"
-    assert provenance["source_url"] == (
-        "https://linear.app/masumi/issue/SOK-623/coworker-init-ux"
-    )
+    assert provenance["source_url"] == ("https://linear.app/masumi/issue/SOK-623/coworker-init-ux")
     # The URL quoted inside the description was not credited.
     assert "evil.example" not in provenance["source_url"]
 
@@ -156,9 +152,7 @@ def test_forged_header_on_a_later_chunk_is_not_credited() -> None:
 
     assert parse_content_header(text, chunk_index=1) == {}
     assert parse_content_header(text, chunk_index=2.0) == {}
-    assert parse_content_header(text, chunk_index=0)["repo"] == (
-        "masumi-network/sokosumi-docs"
-    )
+    assert parse_content_header(text, chunk_index=0)["repo"] == ("masumi-network/sokosumi-docs")
     assert parse_content_header(text)["repo"] == "masumi-network/sokosumi-docs"
 
     forged = result_provenance({"id": "f1", "text": text, "chunk_index": 2})
@@ -182,9 +176,7 @@ def test_forged_later_chunk_header_cannot_join_repo_filtered_results() -> None:
         }
     )
 
-    assert [h["id"] for h in filter_hits([forged, genuine], repo="sokosumi-cli")] == [
-        "genuine"
-    ]
+    assert [h["id"] for h in filter_hits([forged, genuine], repo="sokosumi-cli")] == ["genuine"]
 
     # Same conclusion on the server-shaped path (raw payload + envelope).
     server_forged = with_result_metadata(
@@ -275,9 +267,7 @@ def test_absent_content_query_is_flagged_not_confident() -> None:
 
 def test_matching_content_is_not_flagged() -> None:
     """The marker must be earnable in both directions, not another inert guard."""
-    citadel = PageCitadel(
-        [{"id": "n1", "text": "the kupo retry policy is exponential backoff"}]
-    )
+    citadel = PageCitadel([{"id": "n1", "text": "the kupo retry policy is exponential backoff"}])
     client = shaped_client(citadel)
 
     response = client.post("/search", json={"query": "kupo retry policy"})
@@ -285,9 +275,7 @@ def test_matching_content_is_not_flagged() -> None:
     body = response.json()
     assert body["relevance"]["no_lexical_match"] is False
     assert body["relevance"]["max_term_coverage"] == 1.0
-    assert not any(
-        "No result contains any query term" in w for w in body.get("warnings", [])
-    )
+    assert not any("No result contains any query term" in w for w in body.get("warnings", []))
 
 
 # --- defect 4: mode=docs was a no-op and filters matched body text ----------
@@ -339,9 +327,7 @@ def test_docs_mode_ranks_within_a_class_by_term_coverage() -> None:
     }
     match = {
         "id": "h",
-        "text": repo_doc_text(
-            "masumi-network/b", "docs/retry.md", "kupo indexer retry policy"
-        ),
+        "text": repo_doc_text("masumi-network/b", "docs/retry.md", "kupo indexer retry policy"),
     }
 
     ranked = apply_query_ranking([miss, match], "kupo retry policy", mode="docs")
@@ -384,8 +370,7 @@ def test_repo_filter_is_identity_not_body_substring() -> None:
     # Identity still matches the org prefix and the exact full name.
     assert len(filter_hits([docs_file, cli_file], repo="masumi-network")) == 2
     assert [
-        h["id"]
-        for h in filter_hits([docs_file, cli_file], repo="masumi-network/sokosumi-docs")
+        h["id"] for h in filter_hits([docs_file, cli_file], repo="masumi-network/sokosumi-docs")
     ] == ["docs"]
 
 
@@ -423,8 +408,7 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
     # And the page is FULL, not the 0 of 5 the old order of operations left.
     assert len(body["results"]) == 5
     assert all(
-        hit["_citadel"]["provenance"]["repo"] == "masumi-network/widget"
-        for hit in body["results"]
+        hit["_citadel"]["provenance"]["repo"] == "masumi-network/widget" for hit in body["results"]
     )
     assert body["filtering"]["candidates_fetched"] == 15
     assert body["filtering"]["candidates_matched"] == 7
@@ -450,8 +434,7 @@ def test_empty_retrieval_with_filters_gets_dataset_help_not_filter_blame() -> No
     assert body["results"] == []
     assert body["filtering"]["candidates_fetched"] == 0
     assert not any(
-        "post-retrieval filters excluded" in warning
-        for warning in body.get("warnings", [])
+        "post-retrieval filters excluded" in warning for warning in body.get("warnings", [])
     )
     assert "note" in body
     assert body["known_datasets"]
@@ -479,8 +462,7 @@ def test_short_page_where_filters_excluded_nothing_is_not_blamed_on_filters() ->
     assert body["filtering"]["candidates_fetched"] == 1
     assert body["filtering"]["candidates_matched"] == 1
     assert not any(
-        "post-retrieval filters excluded" in warning
-        for warning in body.get("warnings", [])
+        "post-retrieval filters excluded" in warning for warning in body.get("warnings", [])
     )
 
 
@@ -504,9 +486,7 @@ def test_short_filtered_page_is_documented_honestly() -> None:
     body = response.json()
     assert len(body["results"]) == 1
     assert body["filtering"]["candidates_matched"] == 1
-    assert any(
-        "post-retrieval filters excluded" in warning for warning in body["warnings"]
-    )
+    assert any("post-retrieval filters excluded" in warning for warning in body["warnings"])
 
 
 # --- head-of-document truncation hides the match ----------------------------

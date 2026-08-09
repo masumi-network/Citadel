@@ -102,9 +102,7 @@ def resolve_seat_dataset(base_url: str, token: str, explicit: str | None) -> str
         return explicit
     slug = resolve_seat_slug(base_url, token)
     if not slug:
-        raise PromotionClientError(
-            "could not resolve seat dataset — pass --dataset seat:<slug>"
-        )
+        raise PromotionClientError("could not resolve seat dataset — pass --dataset seat:<slug>")
     return f"seat:{slug}"
 
 

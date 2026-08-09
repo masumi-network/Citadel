@@ -24,10 +24,15 @@ def test_setup_json_emits_pure_config(tmp_path: Path, capsys) -> None:
     cfg = tmp_path / "cap.json"
     rc = _run(
         [
-            "setup", "--non-interactive", "--json",
-            "--node-url", "https://node.example",
-            "--root", f"{tmp_path}=org-work",
-            "--config", str(cfg),
+            "setup",
+            "--non-interactive",
+            "--json",
+            "--node-url",
+            "https://node.example",
+            "--root",
+            f"{tmp_path}=org-work",
+            "--config",
+            str(cfg),
         ]
     )
     assert rc == 0
@@ -44,12 +49,12 @@ def test_bare_citadel_shows_home_screen(monkeypatch, capsys) -> None:
     out = capsys.readouterr().out
     # Strip ANSI so colored Pixel Bastion / labels still match.
     plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
-    assert "the organization vault" in plain         # tagline beside the mark
-    assert "██" in plain                              # Pixel Bastion mark
-    assert "CITADEL" in plain                         # wordmark label beside mark
-    assert "____" not in plain                        # no figlet hero on home
-    assert "onboard" in plain and "status" in plain     # curated command menu
-    assert "Get started" in plain                     # grouped menu
+    assert "the organization vault" in plain  # tagline beside the mark
+    assert "██" in plain  # Pixel Bastion mark
+    assert "CITADEL" in plain  # wordmark label beside mark
+    assert "____" not in plain  # no figlet hero on home
+    assert "onboard" in plain and "status" in plain  # curated command menu
+    assert "Get started" in plain  # grouped menu
 
 
 def test_unknown_command_suggests_closest(capsys) -> None:
@@ -201,7 +206,17 @@ def test_setup_json_never_prompts_even_on_tty(tmp_path: Path, monkeypatch, capsy
 def test_capture_json_dry_run_is_clean(tmp_path: Path, capsys) -> None:
     cfg = tmp_path / "cap.json"
     (tmp_path / "README.md").write_text("a summary line\n")
-    _run(["setup", "--non-interactive", "--json", "--root", f"{tmp_path}=personal", "--config", str(cfg)])
+    _run(
+        [
+            "setup",
+            "--non-interactive",
+            "--json",
+            "--root",
+            f"{tmp_path}=personal",
+            "--config",
+            str(cfg),
+        ]
+    )
     capsys.readouterr()
 
     rc = _run(["capture", "--dry-run", "--json", "--config", str(cfg)])
@@ -213,8 +228,19 @@ def test_capture_json_dry_run_is_clean(tmp_path: Path, capsys) -> None:
 
 def test_capture_json_real_post_shape(tmp_path: Path, monkeypatch, capsys) -> None:
     cfg = tmp_path / "cap.json"
-    _run(["setup", "--non-interactive", "--json", "--node-url", "https://node.example",
-          "--root", f"{tmp_path}=personal", "--config", str(cfg)])
+    _run(
+        [
+            "setup",
+            "--non-interactive",
+            "--json",
+            "--node-url",
+            "https://node.example",
+            "--root",
+            f"{tmp_path}=personal",
+            "--config",
+            str(cfg),
+        ]
+    )
     capsys.readouterr()
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_headless_token")
     monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: {"status": "ok"})
@@ -235,9 +261,13 @@ def test_onboard_json_no_prompts(tmp_path: Path, monkeypatch, capsys) -> None:
 
     rc = _run(
         [
-            "onboard", "--non-interactive", "--json",
-            "--repo", str(repo),
-            "--shell-rc", str(tmp_path / ".zshrc"),
+            "onboard",
+            "--non-interactive",
+            "--json",
+            "--repo",
+            str(repo),
+            "--shell-rc",
+            str(tmp_path / ".zshrc"),
             "--no-capture",
         ]
     )

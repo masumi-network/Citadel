@@ -90,7 +90,7 @@ def test_ensure_token_shell_quote_safe(tmp_path: Path) -> None:
     nasty = "ctdl_a'b$(whoami)`id`"  # quotes + shell metachars
     ensure_token_in_rc(rc, nasty)
     out = subprocess.run(
-        ["sh", "-c", f". {rc} >/dev/null 2>&1; printf %s \"$CITADEL_MCP_ACCESS_TOKEN\""],
+        ["sh", "-c", f'. {rc} >/dev/null 2>&1; printf %s "$CITADEL_MCP_ACCESS_TOKEN"'],
         capture_output=True,
         text=True,
     )
@@ -177,11 +177,7 @@ def test_merge_claude_settings_adds_then_idempotent(tmp_path: Path) -> None:
     assert merge_claude_settings(path, python="/usr/bin/python3") == "added"
     data = json.loads(path.read_text())
     assert "PreToolUse" in data["hooks"]  # preserved
-    cmds = [
-        h["command"]
-        for g in data["hooks"]["SessionEnd"]
-        for h in g["hooks"]
-    ]
+    cmds = [h["command"] for g in data["hooks"]["SessionEnd"] for h in g["hooks"]]
     assert any("kb.hooks.sync_session" in c for c in cmds)
     assert TOKEN_ENV in data["httpHookAllowedEnvVars"]
     start_groups = data["hooks"]["SessionStart"]
@@ -229,6 +225,7 @@ def test_agent_policy_section_matches_session_start() -> None:
     assert "skills/masumi" in section
     assert "no authoritative hit" in section
     assert "Citadel confirms" in section
+
 
 def test_cursor_agent_policy_rule_matches_session_start() -> None:
     text = cursor_agent_policy_rule_text()
@@ -430,8 +427,7 @@ def test_read_token_from_rc_quoted_value_with_trailing_comment(tmp_path: Path) -
 def test_read_token_from_rc_last_export_wins_like_the_shell(tmp_path: Path) -> None:
     rc = tmp_path / ".zshrc"
     rc.write_text(
-        f"export {TOKEN_ENV}='ctdl_first_1234567890'\n"
-        f"export {TOKEN_ENV}=ctdl_last_0987654321\n"
+        f"export {TOKEN_ENV}='ctdl_first_1234567890'\nexport {TOKEN_ENV}=ctdl_last_0987654321\n"
     )
     assert read_token_from_rc(rc) == "ctdl_last_0987654321"
 
@@ -442,10 +438,7 @@ def test_ensure_env_in_rc_rewrites_last_duplicate(tmp_path: Path) -> None:
     from kb.onboard import ensure_env_in_rc
 
     rc = tmp_path / ".zshrc"
-    rc.write_text(
-        f"export {TOKEN_ENV}='ctdl_old_a'\n"
-        f"export {TOKEN_ENV}='ctdl_old_b'\n"
-    )
+    rc.write_text(f"export {TOKEN_ENV}='ctdl_old_a'\nexport {TOKEN_ENV}='ctdl_old_b'\n")
     assert ensure_env_in_rc(rc, TOKEN_ENV, "ctdl_new_c", comment="x") == "updated"
     lines = rc.read_text().splitlines()
     assert lines[0] == f"export {TOKEN_ENV}='ctdl_old_a'"  # untouched (shadowed anyway)
@@ -468,12 +461,20 @@ def _interactive_onboard_args(tmp_path: Path) -> argparse.Namespace:
 
 def _auth_ok() -> Check:
     return Check(
-        "auth", ok=True, detail="valid",
-        data={"seat_slug": "sarthi", "role": "writer", "capabilities": {"read": True, "write": True}},
+        "auth",
+        ok=True,
+        detail="valid",
+        data={
+            "seat_slug": "sarthi",
+            "role": "writer",
+            "capabilities": {"read": True, "write": True},
+        },
     )
 
 
-def test_onboard_offers_keep_or_replace_for_configured_token(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_onboard_offers_keep_or_replace_for_configured_token(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     # Token already wired in the rc (fresh shell: env unset) → onboard must show
     # it masked and let the user swap in a new one instead of silently reusing it.
     monkeypatch.delenv(TOKEN_ENV, raising=False)
@@ -534,7 +535,9 @@ def test_onboard_rc_token_wins_over_stale_env(tmp_path: Path, monkeypatch, capsy
     assert "ctdl_rotated_rc_4321" in body and "ctdl_stale_env_67890" not in body
 
 
-def test_onboard_rejected_token_offers_immediate_replacement(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_onboard_rejected_token_offers_immediate_replacement(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     # A 401 must surface before the other prompts, with an inline re-paste —
     # not "saved anyway" at the very end of the run.
     monkeypatch.setenv(TOKEN_ENV, "ctdl_stale_234567890")
@@ -545,10 +548,12 @@ def test_onboard_rejected_token_offers_immediate_replacement(tmp_path: Path, mon
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     pastes = iter(["ctdl_fresh_bcdef12345", ""])  # replacement token, skip OpenRouter key
     monkeypatch.setattr("kb.cli.getpass.getpass", lambda prompt="": next(pastes))
-    verdicts = iter([
-        Check("auth", ok=False, detail="HTTP Error 401: Unauthorized"),
-        _auth_ok(),
-    ])
+    verdicts = iter(
+        [
+            Check("auth", ok=False, detail="HTTP Error 401: Unauthorized"),
+            _auth_ok(),
+        ]
+    )
     monkeypatch.setattr("kb.status.check_auth", lambda *a, **k: next(verdicts))
 
     assert asyncio.run(_onboard(args)) == 0

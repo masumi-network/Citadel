@@ -48,6 +48,8 @@ def test_shape_verify_and_prepare() -> None:
     assert report["doc_shaped_sources"][0]["trust_tier"] == "unattested"
     assert report["doc_shaped_sources"][0]["content_hint"] == "looks-like-spec"
     assert report["known_overlaps"]
-    brief = shape_prepare_pr_context(repo="cardano-dev-skills", topic="masumi", search_payload=payload)
+    brief = shape_prepare_pr_context(
+        repo="cardano-dev-skills", topic="masumi", search_payload=payload
+    )
     assert brief["command"] == "prepare-pr-context"
     assert brief["agent_instruction"]

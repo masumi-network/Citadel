@@ -240,7 +240,11 @@ class ObsidianSyncStore:
                 conflicts.append(conflict)
                 continue
 
-            if current and incoming_hash == remote_hash and bool(current.get("deleted_at")) == incoming.deleted:
+            if (
+                current
+                and incoming_hash == remote_hash
+                and bool(current.get("deleted_at")) == incoming.deleted
+            ):
                 skipped.append(
                     {
                         "document_id": document_id,
@@ -336,7 +340,8 @@ class ObsidianSyncStore:
         changes = [
             change
             for change in data.get("changes", [])
-            if change.get("source_id") == vault_id and int(change.get("sequence", 0)) > resolved_cursor
+            if change.get("source_id") == vault_id
+            and int(change.get("sequence", 0)) > resolved_cursor
         ]
         documents: list[dict[str, Any]] = []
         for change in changes:
@@ -363,7 +368,11 @@ class ObsidianSyncStore:
             if revision.get("document_id") == document_id
         ]
         revisions.sort(key=lambda item: int(item.get("rev", 0)), reverse=True)
-        return {**document, "body": revisions[0]["body"] if revisions else "", "revisions": revisions}
+        return {
+            **document,
+            "body": revisions[0]["body"] if revisions else "",
+            "revisions": revisions,
+        }
 
     def resolve_conflict(
         self,

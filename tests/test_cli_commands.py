@@ -16,8 +16,16 @@ from kb.status import Check, StatusReport
 
 
 def _ingest_args(**kw):
-    base = dict(data="a note", tag=[], json=True, node_url="https://node.example",
-                local=False, dataset=None, session=None, no_cognify=True)
+    base = dict(
+        data="a note",
+        tag=[],
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        no_cognify=True,
+    )
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -48,8 +56,11 @@ def test_doctor_clean_reports_ok(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_x")
     monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(_all_ok()))
     args = argparse.Namespace(
-        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
-        node_url=None, json=True, fix=False,
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url=None,
+        json=True,
+        fix=False,
     )
     rc = asyncio.run(_doctor(args))
     assert rc == 0
@@ -64,8 +75,11 @@ def test_doctor_warns_when_token_in_rc_not_env(tmp_path: Path, monkeypatch, caps
     monkeypatch.setattr("kb.cli.detect_shell_rc", lambda: rc)
     monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(_all_ok()))
     args = argparse.Namespace(
-        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
-        node_url=None, json=True, fix=False,
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url=None,
+        json=True,
+        fix=False,
     )
     rc = asyncio.run(_doctor(args))
     assert rc == 1
@@ -81,8 +95,11 @@ def test_doctor_flags_legacy_stdio_mcp(tmp_path: Path, monkeypatch, capsys) -> N
     )
     monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(_all_ok()))
     args = argparse.Namespace(
-        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
-        node_url=None, json=True, fix=False,
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url=None,
+        json=True,
+        fix=False,
     )
     rc = asyncio.run(_doctor(args))
     assert rc == 1
@@ -102,8 +119,11 @@ def test_doctor_fix_installs_missing_local_setup(tmp_path: Path, monkeypatch, ca
     ]
     monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(broken))
     args = argparse.Namespace(
-        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
-        node_url="https://node.example", json=True, fix=True,
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url="https://node.example",
+        json=True,
+        fix=True,
     )
     rc = asyncio.run(_doctor(args))
     out = json.loads(capsys.readouterr().out)
@@ -174,12 +194,21 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     }
     monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
     args = argparse.Namespace(
-        query="hi", top_k=10, json=True, node_url="https://node.example",
-        local=False, dataset=None, session=None,
-        type=None, repo=None, path=None, canonical_only=False,
+        query="hi",
+        top_k=10,
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
         exclude_ambient=False,
         mode=None,
-        timeout=None, budget_ms=None,
+        timeout=None,
+        budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 0
@@ -192,10 +221,21 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
 
 def _search_args(**kw):
     base = dict(
-        query="hi", top_k=10, json=True, node_url="https://node.example",
-        local=False, dataset=None, session=None,
-        type=None, repo=None, path=None, canonical_only=False,
-        exclude_ambient=False, mode=None, timeout=None, budget_ms=None,
+        query="hi",
+        top_k=10,
+        json=True,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
+        exclude_ambient=False,
+        mode=None,
+        timeout=None,
+        budget_ms=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -300,12 +340,21 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     }
     monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
     args = argparse.Namespace(
-        query="kuzu lock", top_k=10, json=False, node_url="https://node.example",
-        local=False, dataset=None, session=None,
-        type=None, repo=None, path=None, canonical_only=False,
+        query="kuzu lock",
+        top_k=10,
+        json=False,
+        node_url="https://node.example",
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
         exclude_ambient=False,
         mode=None,
-        timeout=None, budget_ms=None,
+        timeout=None,
+        budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 0
@@ -337,12 +386,21 @@ def test_search_human_literal_query_flattens_ranked_results(monkeypatch, capsys)
 def test_search_no_token_exits_one(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: None)
     args = argparse.Namespace(
-        query="hi", top_k=10, json=False, node_url=None,
-        local=False, dataset=None, session=None,
-        type=None, repo=None, path=None, canonical_only=False,
+        query="hi",
+        top_k=10,
+        json=False,
+        node_url=None,
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
         exclude_ambient=False,
         mode=None,
-        timeout=None, budget_ms=None,
+        timeout=None,
+        budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 1
@@ -352,12 +410,21 @@ def test_search_no_token_exits_one(monkeypatch, capsys) -> None:
 def test_search_no_token_json_auth_required(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: None)
     args = argparse.Namespace(
-        query="hi", top_k=10, json=True, node_url=None,
-        local=False, dataset=None, session=None,
-        type=None, repo=None, path=None, canonical_only=False,
+        query="hi",
+        top_k=10,
+        json=True,
+        node_url=None,
+        local=False,
+        dataset=None,
+        session=None,
+        type=None,
+        repo=None,
+        path=None,
+        canonical_only=False,
         exclude_ambient=False,
         mode=None,
-        timeout=None, budget_ms=None,
+        timeout=None,
+        budget_ms=None,
     )
     rc = asyncio.run(_search(args))
     assert rc == 1
@@ -565,7 +632,9 @@ def test_verify_and_prepare_pr_context(monkeypatch, tmp_path, capsys) -> None:
 
 def test_ingest_http_accepted(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
-    monkeypatch.setattr("kb.status.ingest_node", lambda *a, **k: {"accepted": True, "dataset": "seat:alice"})
+    monkeypatch.setattr(
+        "kb.status.ingest_node", lambda *a, **k: {"accepted": True, "dataset": "seat:alice"}
+    )
     rc = asyncio.run(_ingest(_ingest_args()))
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["accepted"] is True
@@ -573,14 +642,19 @@ def test_ingest_http_accepted(monkeypatch, capsys) -> None:
 
 def test_ingest_http_rejected_exits_one(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
-    monkeypatch.setattr("kb.status.ingest_node", lambda *a, **k: {"accepted": False, "reason": "secret_content"})
+    monkeypatch.setattr(
+        "kb.status.ingest_node", lambda *a, **k: {"accepted": False, "reason": "secret_content"}
+    )
     rc = asyncio.run(_ingest(_ingest_args()))
     assert rc == 1  # a hard rejection must not exit 0
 
 
 def test_ingest_duplicate_is_benign(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
-    monkeypatch.setattr("kb.status.ingest_node", lambda *a, **k: {"accepted": False, "reason": "duplicate_in_process"})
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: {"accepted": False, "reason": "duplicate_in_process"},
+    )
     # A duplicate is idempotent: exit 0, friendly message, not a scary failure.
     rc = asyncio.run(_ingest(_ingest_args(json=False)))
     assert rc == 0
@@ -626,7 +700,9 @@ def _token_set_args(tmp_path: Path, **kw) -> argparse.Namespace:
 def test_token_set_verifies_then_writes_rc(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "kb.status.check_auth",
-        lambda *a, **k: Check("auth", True, "valid", data={"seat_slug": "sarthi", "role": "writer"}),
+        lambda *a, **k: Check(
+            "auth", True, "valid", data={"seat_slug": "sarthi", "role": "writer"}
+        ),
     )
     rc = asyncio.run(_token_set(_token_set_args(tmp_path)))
     assert rc == 0
@@ -745,8 +821,10 @@ def test_wire_detected_tools_applies_only_selection(monkeypatch, capsys) -> None
     monkeypatch.setattr("kb.tool_detect.detect", lambda: ["cursor", "codex", "zed", "pi"])
     monkeypatch.setattr(
         "kb.tool_detect.apply",
-        lambda name, node_url: applied.append(name)
-        or ToolResult(name, "note" if name == "pi" else "wrote", "ok", snippet="{}"),
+        lambda name, node_url: (
+            applied.append(name)
+            or ToolResult(name, "note" if name == "pi" else "wrote", "ok", snippet="{}")
+        ),
     )
     # The checkbox returns cursor + zed; codex (preselected) was deselected.
     monkeypatch.setattr("kb.prompt.checkbox_select", lambda header, options, checked: {0, 2})
@@ -798,7 +876,9 @@ def test_stale_env_hint_points_at_shell_rc(tmp_path: Path, monkeypatch) -> None:
 # ---- capture-roots wizard -----------------------------------------------------
 
 
-def test_wizard_offers_home_relative_guess_for_missing_root(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_wizard_offers_home_relative_guess_for_missing_root(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     # "/masumi" for ~/masumi is the common typo — the wizard should offer the
     # home-relative dir that actually exists instead of recording a dead root.
     from kb.capture_config import CaptureConfig
@@ -820,7 +900,9 @@ def test_wizard_enter_accepts_default_root(tmp_path: Path, monkeypatch) -> None:
     answers = iter(["", "", ""])  # accept default → default tags → finish
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
-    config = _wizard_roots(CaptureConfig(node_url="https://node.example"), default_root=str(tmp_path))
+    config = _wizard_roots(
+        CaptureConfig(node_url="https://node.example"), default_root=str(tmp_path)
+    )
     assert [root.path for root in config.roots] == [str(tmp_path)]
     assert "personal" in config.roots[0].tags
 
@@ -832,7 +914,9 @@ def test_wizard_default_root_is_declinable(tmp_path: Path, monkeypatch) -> None:
 
     answers = iter(["n", ""])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-    config = _wizard_roots(CaptureConfig(node_url="https://node.example"), default_root=str(tmp_path))
+    config = _wizard_roots(
+        CaptureConfig(node_url="https://node.example"), default_root=str(tmp_path)
+    )
     assert config.roots == ()
 
 
@@ -859,7 +943,9 @@ def test_read_key_handles_bare_escape_and_csi_tails() -> None:
 def test_wizard_default_suppressed_when_already_approved(tmp_path: Path, monkeypatch) -> None:
     from kb.capture_config import CaptureConfig
 
-    existing = CaptureConfig(node_url="https://node.example").with_root(str(tmp_path), ("personal",))
+    existing = CaptureConfig(node_url="https://node.example").with_root(
+        str(tmp_path), ("personal",)
+    )
     answers = iter([""])  # no default on offer → Enter just finishes
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
@@ -878,8 +964,14 @@ SEATS = [
 
 def _token_create_args(**kw):
     base = dict(
-        name="ci-bot", seat=None, dataset=None, role=None, kind=None,
-        expires_at=None, json=True, node_url="https://node.example",
+        name="ci-bot",
+        seat=None,
+        dataset=None,
+        role=None,
+        kind=None,
+        expires_at=None,
+        json=True,
+        node_url="https://node.example",
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -896,7 +988,9 @@ def _wire_access(monkeypatch, *, seats=None):
         calls["standalone"] = k
         return {"ok": True, "token": "ctdl_standalone", "principal": {"id": "p1"}, "api_token": k}
 
-    monkeypatch.setattr("kb.cli.list_seats", lambda **k: {"seats": seats if seats is not None else SEATS})
+    monkeypatch.setattr(
+        "kb.cli.list_seats", lambda **k: {"seats": seats if seats is not None else SEATS}
+    )
     monkeypatch.setattr("kb.cli.issue_seat_token", fake_issue_seat_token)
     monkeypatch.setattr("kb.cli.create_token", fake_create_token)
     return calls
@@ -1128,8 +1222,11 @@ def test_doctor_pre_push_from_non_repo_says_so(tmp_path: Path, monkeypatch, caps
     ]
     monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks))
     args = argparse.Namespace(
-        repo=str(tmp_path), config=str(tmp_path / "cap.json"),
-        node_url=None, json=True, fix=False,
+        repo=str(tmp_path),
+        config=str(tmp_path / "cap.json"),
+        node_url=None,
+        json=True,
+        fix=False,
     )
     rc = asyncio.run(_doctor(args))
     out = json.loads(capsys.readouterr().out)
@@ -1140,8 +1237,14 @@ def test_doctor_pre_push_from_non_repo_says_so(tmp_path: Path, monkeypatch, caps
 
 def _activity_args(**kw):
     base = dict(
-        local=False, config=None, node_url="https://node.example",
-        watch=False, type=None, limit=20, json=True, global_broadcast=True,
+        local=False,
+        config=None,
+        node_url="https://node.example",
+        watch=False,
+        type=None,
+        limit=20,
+        json=True,
+        global_broadcast=True,
     )
     base.update(kw)
     return argparse.Namespace(**base)

@@ -43,6 +43,7 @@ installed ``citadel`` command does not depend on the repository layout.
 Write run JSONs only under scripts/bench/runs/ (gitignored): a run JSON
 enumerates every served hit identity and must never be committed.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -74,9 +75,9 @@ HERE = REPO_BENCH_DIR if REPO_BENCH_DIR.is_dir() else PACKAGE_ROOT / "bench"
 GROUND_TRUTH = HERE / "ground_truth"
 DEFAULT_QUESTIONS = HERE / "golden_questions.json"
 
-K_ANSWER = 5          # answer_recall@5 / doc_recall@5 window
-K_DUP = 10            # duplicate_blob_rate@10 / distinct_files@10 window
-MIN_SPAN_CHARS = 15   # normalized; shorter spans match too promiscuously
+K_ANSWER = 5  # answer_recall@5 / doc_recall@5 window
+K_DUP = 10  # duplicate_blob_rate@10 / distinct_files@10 window
+MIN_SPAN_CHARS = 15  # normalized; shorter spans match too promiscuously
 MAX_SPANS = 4
 
 # Identity parsing is anchored at the START of the chunk. The old harness used
@@ -149,9 +150,7 @@ def is_window_question(question: dict[str, Any]) -> bool:
 def distinctive_terms(text: str) -> set[str]:
     """Lowercase content words used for the head/tail novelty control."""
     return {
-        word
-        for word in NOVEL_TERM_RE.findall(text.lower())
-        if word not in NOVEL_TERM_STOPWORDS
+        word for word in NOVEL_TERM_RE.findall(text.lower()) if word not in NOVEL_TERM_STOPWORDS
     }
 
 
@@ -223,9 +222,7 @@ def split_header_body(text: str) -> tuple[str, str]:
     # No separator (malformed or truncated chunk): strip the contiguous header
     # prefix (title line, blanks, known meta lines) and keep the rest as body.
     index = 1
-    while index < len(lines) and (
-        not lines[index].strip() or HEADER_META_LINE.match(lines[index])
-    ):
+    while index < len(lines) and (not lines[index].strip() or HEADER_META_LINE.match(lines[index])):
         index += 1
     return "\n".join(lines[:index]), "\n".join(lines[index:])
 
@@ -262,9 +259,7 @@ def parse_identity(hit: dict[str, Any]) -> Identity:
     doc_id = hit.get("document_id") or hit.get("id")
     if doc_id:
         return Identity("doc", str(doc_id))
-    return Identity(
-        "doc", "text:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-    )
+    return Identity("doc", "text:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
 
 
 def collapse_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -512,9 +507,7 @@ def score_question(
             bodies = [normalize(body) for body in entry["bodies"]]
             if any(span in body for body in bodies for span in spans):
                 answer_rank = entry["effective_rank"]
-                answer_from_expected = entry_matches_expected(
-                    entry, expected, gt_shingles
-                )
+                answer_from_expected = entry_matches_expected(entry, expected, gt_shingles)
                 break
 
     raw_page_pass = False
@@ -612,9 +605,7 @@ def score_question(
     # Baseline recorded 2026-07-31 by the path method: recall@5 was 0.93 while
     # the mean distinct-source ratio was 0.62, with 22 of 60 queries returning
     # only one or two distinct documents.
-    resolvable_slots = [
-        hit for hit in dup_slots if parse_identity(hit).kind in ("repo", "linear")
-    ]
+    resolvable_slots = [hit for hit in dup_slots if parse_identity(hit).kind in ("repo", "linear")]
     distinct_resolvable = len({parse_identity(hit).source for hit in resolvable_slots})
     # The ratio over ALL slots is the pessimistic bound: a hit whose source path
     # could not be resolved counts against diversity exactly like a duplicate
@@ -708,9 +699,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
     # None of those is comparable across the v5 boundary. `compare` is what
     # enforces this: two runs answering different question sets differ in
     # `questions_pin` and are refused outright.
-    span_rows = [
-        row for row in positives if row["has_spans"] and row.get("window_role") is None
-    ]
+    span_rows = [row for row in positives if row["has_spans"] and row.get("window_role") is None]
     if not probes:
         raise BenchError(
             "The blocked-probe/negatives list is empty (no expected_recall=0 "
@@ -792,8 +781,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
     neither_pass = sum(
         1
         for pair in complete_pairs
-        if not head_by_pair[pair]["answer_pass_at_5"]
-        and not tail_by_pair[pair]["answer_pass_at_5"]
+        if not head_by_pair[pair]["answer_pass_at_5"] and not tail_by_pair[pair]["answer_pass_at_5"]
     )
     tail_only_pass = len(complete_pairs) - head_only_pass - both_pass - neither_pass
 
@@ -804,9 +792,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
         if row["answer_slot"] is not None and row["answer_term_coverage"] is not None
     ]
     inverted = [row for row in ranked if row["outranked_by_coverage"] is not None]
-    zero_coverage_inversions = sum(
-        1 for row in inverted if row["outranked_by_coverage"] == 0.0
-    )
+    zero_coverage_inversions = sum(1 for row in inverted if row["outranked_by_coverage"] == 0.0)
     # rank_inversion_rate blends two populations that answer_recall_at_5 keeps
     # apart: real questions and the 36 verbatim-sentence window queries, whose
     # exact-quote form is not how anyone searches. Report the split so a reader
@@ -843,8 +829,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             "answers_from_unexpected_documents": sum(
                 1
                 for row in positives
-                if row["answer_pass_at_5"]
-                and row.get("answer_from_expected_document") is False
+                if row["answer_pass_at_5"] and row.get("answer_from_expected_document") is False
             ),
         },
         "duplication": {
@@ -906,15 +891,11 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             # quoting one document used to report `documents: 2`, overstating
             # how much of the corpus the window measurement covers -- the
             # name-versus-what-it-attests failure this harness exists to catch.
-            "documents": len(
-                {doc for row in window_rows for doc in (row.get("expect_any") or [])}
-            ),
+            "documents": len({doc for row in window_rows for doc in (row.get("expect_any") or [])}),
         },
         "ranking": {
             "answers_ranked": len(ranked),
-            "rank_inversion_rate": (
-                round(len(inverted) / len(ranked), 4) if ranked else None
-            ),
+            "rank_inversion_rate": (round(len(inverted) / len(ranked), 4) if ranked else None),
             "inversions_by_zero_coverage": zero_coverage_inversions,
             "answer_worst_slot": max((row["answer_slot"] for row in ranked), default=None),
             # The split behind the headline rate. `answer_recall_at_5` excludes
@@ -926,9 +907,7 @@ def summarize(rows: list[dict[str, Any]], stability: list[float]) -> dict[str, A
             ),
             "answers_ranked_window_only": len(ranked_window),
             "rank_inversion_rate_window_only": (
-                round(len(inverted_window) / len(ranked_window), 4)
-                if ranked_window
-                else None
+                round(len(inverted_window) / len(ranked_window), 4) if ranked_window else None
             ),
         },
         "metadata_stability": {
@@ -1066,7 +1045,7 @@ def api_fingerprint(node_url: str, token: str, timeout: float) -> dict[str, Any]
 # --------------------------------------------------------------------------
 
 CENSUS_PAGE_LIMIT = 1000  # /api/corpus CORPUS_MAX_LIMIT
-CENSUS_MAX_PAGES = 100    # 100k documents; a ceiling, not an expectation
+CENSUS_MAX_PAGES = 100  # 100k documents; a ceiling, not an expectation
 
 
 def make_corpus_fetcher(
@@ -1120,9 +1099,7 @@ def corpus_census(
     while True:
         if pages >= max_pages:
             truncated = True
-            notes.append(
-                f"census stopped at the {max_pages}-page ceiling; counts are a floor"
-            )
+            notes.append(f"census stopped at the {max_pages}-page ceiling; counts are a floor")
             break
         try:
             body = fetch_page(cursor)
@@ -1138,8 +1115,7 @@ def corpus_census(
             return {
                 "error": exc.__class__.__name__,
                 "reason": (
-                    "corpus census failed mid-walk; the never-indexed share "
-                    "was not measured"
+                    "corpus census failed mid-walk; the never-indexed share was not measured"
                 ),
             }
         pages += 1
@@ -1363,11 +1339,7 @@ def compare_fingerprints(
     # count grows daily by design and gating on it would block every compare.
     current_total = (current.get("census") or {}).get("documents_total")
     baseline_total = (baseline.get("census") or {}).get("documents_total")
-    if (
-        current_total is not None
-        and baseline_total is not None
-        and current_total != baseline_total
-    ):
+    if current_total is not None and baseline_total is not None and current_total != baseline_total:
         verdicts.append(
             "note: corpus census document totals differ "
             f"({baseline_total} -> {current_total}); repo-content is unchanged "
@@ -1407,9 +1379,7 @@ def _first_content_line(text: str) -> str:
     return ""
 
 
-def lint_questions(
-    questions_path: Path, ground_truth_dir: Path
-) -> tuple[list[str], list[str]]:
+def lint_questions(questions_path: Path, ground_truth_dir: Path) -> tuple[list[str], list[str]]:
     """Validate every answer span. Returns (problems, notes).
 
     Rules per span: present in a cached expect_any body; absent from the
@@ -1499,8 +1469,7 @@ def lint_questions(
         expected_cached = [p for p in expected if p in cached_norm]
         if not expected_cached:
             problems.append(
-                f"{qid}: has answer_spans but no expect_any document is cached "
-                "in ground_truth/"
+                f"{qid}: has answer_spans but no expect_any document is cached in ground_truth/"
             )
             continue
 
@@ -1519,9 +1488,7 @@ def lint_questions(
                 problems.append(f"{label}: not found in any cached ground-truth body")
             for repo_path in expected_cached:
                 if norm_span in _synthetic_header(repo_path):
-                    problems.append(
-                        f"{label}: appears in the sync header block for {repo_path}"
-                    )
+                    problems.append(f"{label}: appears in the sync header block for {repo_path}")
                 first_line = normalize(_first_content_line(cached_raw[repo_path]))
                 if first_line and norm_span in first_line:
                     problems.append(
@@ -1541,9 +1508,7 @@ def lint_questions(
                 if other in expected:
                     continue
                 if norm_span in body:
-                    problems.append(
-                        f"{label}: not unique, also present in cached body {other}"
-                    )
+                    problems.append(f"{label}: not unique, also present in cached body {other}")
 
         if is_window_question(question):
             window_problems, window_notes = _lint_window_question(question, cached_raw)
@@ -1580,9 +1545,7 @@ def _lint_window_question(
     if role not in ("head", "tail"):
         return [f"{qid}: window question needs window_role of 'head' or 'tail'"], notes
 
-    expected_category = (
-        WINDOW_HEAD_CATEGORY if role == "head" else WINDOW_TAIL_CATEGORY
-    )
+    expected_category = WINDOW_HEAD_CATEGORY if role == "head" else WINDOW_TAIL_CATEGORY
     if str(question.get("category", "")) != expected_category:
         problems.append(
             f"{qid}: window_role {role!r} needs category {expected_category!r} "
@@ -1729,9 +1692,7 @@ def make_http_searcher(node_url: str, token: str, timeout: float) -> Searcher:
     return searcher
 
 
-def make_ci_searcher(
-    questions: list[dict[str, Any]], ground_truth_dir: Path
-) -> Searcher:
+def make_ci_searcher(questions: list[dict[str, Any]], ground_truth_dir: Path) -> Searcher:
     """Serve the tracked synthetic fixture through the real scoring path.
 
     This is a harness self-check, not a live retrieval measurement. It proves
@@ -1753,8 +1714,7 @@ def make_ci_searcher(
         fixture = ground_truth_dir / source.replace("/", "__")
         if not fixture.is_file():
             raise BenchError(
-                f"{question.get('id', '?')}: CI ground-truth fixture is missing: "
-                f"{fixture}"
+                f"{question.get('id', '?')}: CI ground-truth fixture is missing: {fixture}"
             )
         body = fixture.read_text(encoding="utf-8")
         text = "\n".join(
@@ -1856,18 +1816,16 @@ def execute_benchmark(
         rows.append(first)
         if repeats > 1:
             reference = attempt_outcome(first)
-            agreement = sum(
-                1 for row in attempt_rows if attempt_outcome(row) == reference
-            ) / len(attempt_rows)
+            agreement = sum(1 for row in attempt_rows if attempt_outcome(row) == reference) / len(
+                attempt_rows
+            )
             stability.append(agreement)
         if not quiet:
             if question.get("expected_recall", 1) == 0:
                 state = "PROBE HIT" if first["doc_rank"] is not None else "probe miss (good)"
             elif first["has_spans"]:
                 state = (
-                    f"answer rank {first['answer_rank']}"
-                    if first["answer_rank"]
-                    else "ANSWER MISS"
+                    f"answer rank {first['answer_rank']}" if first["answer_rank"] else "ANSWER MISS"
                 )
             else:
                 state = (
@@ -1970,9 +1928,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    fingerprint = build_fingerprint(
-        args.node_url, token, args.timeout, questions_path, repo_state
-    )
+    fingerprint = build_fingerprint(args.node_url, token, args.timeout, questions_path, repo_state)
     result["fingerprint"] = fingerprint
     result["node_url"] = args.node_url
     _print_summary(result["summary"])
@@ -2011,9 +1967,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.baseline:
         baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
-        comparable, verdicts = compare_fingerprints(
-            fingerprint, baseline.get("fingerprint") or {}
-        )
+        comparable, verdicts = compare_fingerprints(fingerprint, baseline.get("fingerprint") or {})
         print("\n--- baseline comparison ---")
         for verdict in verdicts:
             print(verdict)
@@ -2021,9 +1975,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             base_quality = (baseline.get("summary") or {}).get("quality") or {}
             for key, value in result["summary"]["quality"].items():
                 previous = base_quality.get(key)
-                delta = (
-                    round(value - previous, 4) if isinstance(previous, (int, float)) else "n/a"
-                )
+                delta = round(value - previous, 4) if isinstance(previous, (int, float)) else "n/a"
                 print(f"{key:>28}: {previous} -> {value} (delta {delta})")
         else:
             print("metric deltas withheld: the runs do not measure the same corpus.")
@@ -2056,9 +2008,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    problems, notes = lint_questions(
-        Path(args.questions), Path(args.ground_truth)
-    )
+    problems, notes = lint_questions(Path(args.questions), Path(args.ground_truth))
     for note in notes:
         print(note)
     if problems:
@@ -2070,9 +2020,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
     questions = list(data.get("questions") or [])
     converted = sum(1 for q in questions if q.get("answer_spans"))
     unconverted = sum(
-        1
-        for q in questions
-        if q.get("expected_recall", 1) == 1 and not q.get("answer_spans")
+        1 for q in questions if q.get("expected_recall", 1) == 1 and not q.get("answer_spans")
     )
     print(
         f"lint OK: {converted} question(s) with validated answer_spans, "
@@ -2120,10 +2068,7 @@ def cmd_ci(args: argparse.Namespace) -> int:
     if failures:
         print("CI BENCH FAILED: " + "; ".join(failures), file=sys.stderr)
         return 1
-    print(
-        "ci benchmark OK: "
-        + " ".join(f"{key}={quality[key]}" for key in expected)
-    )
+    print("ci benchmark OK: " + " ".join(f"{key}={quality[key]}" for key in expected))
     return 0
 
 
@@ -2191,28 +2136,18 @@ def _enforce_run_evidence(
         failures.append(f"{label} census is missing; corpus coverage is unmeasured")
     else:
         if census.get("error"):
-            failures.append(
-                f"{label} census failed: {census.get('error')}"
-            )
+            failures.append(f"{label} census failed: {census.get('error')}")
         if census.get("truncated") is not False:
             failures.append(f"{label} census is incomplete or truncated")
         unmeasured = census.get("chunk_count_unmeasured")
         if not _nonnegative_count(unmeasured):
-            failures.append(
-                f"{label} census chunk_count_unmeasured is missing or invalid"
-            )
+            failures.append(f"{label} census chunk_count_unmeasured is missing or invalid")
         elif unmeasured:
-            failures.append(
-                f"{label} census has {unmeasured} unmeasured document(s)"
-            )
+            failures.append(f"{label} census has {unmeasured} unmeasured document(s)")
         documents_total = census.get("documents_total")
         documents_walked = census.get("documents_walked")
-        if not _nonnegative_count(documents_total) or not _nonnegative_count(
-            documents_walked
-        ):
-            failures.append(
-                f"{label} census total/walked document counts are missing or invalid"
-            )
+        if not _nonnegative_count(documents_total) or not _nonnegative_count(documents_walked):
+            failures.append(f"{label} census total/walked document counts are missing or invalid")
         elif documents_total != documents_walked:
             failures.append(
                 f"{label} census is incomplete: walked {documents_walked} of "
@@ -2220,16 +2155,12 @@ def _enforce_run_evidence(
             )
         zero_value = census.get("chunk_count_zero")
         if not _nonnegative_count(zero_value):
-            failures.append(
-                f"{label} census chunk_count_zero is missing or invalid"
-            )
+            failures.append(f"{label} census chunk_count_zero is missing or invalid")
         else:
             zero_chunks = zero_value
 
     ground_truth = fingerprint.get("ground_truth")
-    ground_truth_sha = (
-        ground_truth.get("sha256") if isinstance(ground_truth, dict) else None
-    )
+    ground_truth_sha = ground_truth.get("sha256") if isinstance(ground_truth, dict) else None
     if not isinstance(ground_truth_sha, str) or not ground_truth_sha:
         failures.append(f"{label} ground-truth fingerprint is missing")
 
@@ -2262,29 +2193,19 @@ def _enforce_run_evidence(
             metrics[key] = float(value)
 
     negative_hit_rate = quality.get("negative_hit_rate")
-    if not _finite_number(negative_hit_rate) or not 0.0 <= float(
-        negative_hit_rate
-    ) <= 1.0:
-        failures.append(
-            f"{label} negative_hit_rate is missing or invalid: {negative_hit_rate!r}"
-        )
+    if not _finite_number(negative_hit_rate) or not 0.0 <= float(negative_hit_rate) <= 1.0:
+        failures.append(f"{label} negative_hit_rate is missing or invalid: {negative_hit_rate!r}")
     elif negative_hit_rate:
-        failures.append(
-            f"{label} contains negative hits: negative_hit_rate={negative_hit_rate}"
-        )
+        failures.append(f"{label} contains negative hits: negative_hit_rate={negative_hit_rate}")
 
     metadata = summary.get("metadata_stability")
-    unstable = metadata.get("chunks_with_unstable_trust_tier") if isinstance(
-        metadata, dict
-    ) else None
+    unstable = (
+        metadata.get("chunks_with_unstable_trust_tier") if isinstance(metadata, dict) else None
+    )
     if not _nonnegative_count(unstable):
-        failures.append(
-            f"{label} unstable trust count is missing or invalid"
-        )
+        failures.append(f"{label} unstable trust count is missing or invalid")
     elif unstable:
-        failures.append(
-            f"{label} contains unstable trust metadata on {unstable} chunk(s)"
-        )
+        failures.append(f"{label} contains unstable trust metadata on {unstable} chunk(s)")
 
     return failures, metrics, zero_chunks
 
@@ -2300,22 +2221,14 @@ def enforce_acceptance(
     """
     baseline_fingerprint = baseline.get("fingerprint")
     candidate_fingerprint = candidate.get("fingerprint")
-    baseline_fingerprint = (
-        baseline_fingerprint if isinstance(baseline_fingerprint, dict) else {}
-    )
-    candidate_fingerprint = (
-        candidate_fingerprint if isinstance(candidate_fingerprint, dict) else {}
-    )
-    comparable, verdicts = compare_fingerprints(
-        candidate_fingerprint, baseline_fingerprint
-    )
+    baseline_fingerprint = baseline_fingerprint if isinstance(baseline_fingerprint, dict) else {}
+    candidate_fingerprint = candidate_fingerprint if isinstance(candidate_fingerprint, dict) else {}
+    comparable, verdicts = compare_fingerprints(candidate_fingerprint, baseline_fingerprint)
     failures: list[str] = []
     if not comparable:
         failures.append("fingerprints are not comparable")
 
-    baseline_failures, baseline_metrics, baseline_zero = _enforce_run_evidence(
-        baseline, "baseline"
-    )
+    baseline_failures, baseline_metrics, baseline_zero = _enforce_run_evidence(baseline, "baseline")
     candidate_failures, candidate_metrics, candidate_zero = _enforce_run_evidence(
         candidate, "candidate"
     )
@@ -2329,32 +2242,24 @@ def enforce_acceptance(
             if previous is None or current is None:
                 continue
             if current < previous:
-                failures.append(
-                    f"candidate {key} regressed: {previous:g} -> {current:g}"
-                )
+                failures.append(f"candidate {key} regressed: {previous:g} -> {current:g}")
         if baseline_zero is not None and candidate_zero is not None:
             if candidate_zero > baseline_zero:
                 failures.append(
-                    "candidate chunk_count_zero regressed: "
-                    f"{baseline_zero} -> {candidate_zero}"
+                    f"candidate chunk_count_zero regressed: {baseline_zero} -> {candidate_zero}"
                 )
         if candidate_zero != 0:
-            failures.append(
-                f"candidate chunk_count_zero must be 0, got {candidate_zero}"
-            )
+            failures.append(f"candidate chunk_count_zero must be 0, got {candidate_zero}")
         candidate_tail = candidate_metrics.get("tail_recall_given_head_at_5")
         if candidate_tail != 1.0:
             failures.append(
-                "candidate tail_recall_given_head_at_5 must be 1.0, "
-                f"got {candidate_tail}"
+                f"candidate tail_recall_given_head_at_5 must be 1.0, got {candidate_tail}"
             )
 
         baseline_gt = (baseline_fingerprint.get("ground_truth") or {}).get("sha256")
         candidate_gt = (candidate_fingerprint.get("ground_truth") or {}).get("sha256")
         if baseline_gt != candidate_gt:
-            failures.append(
-                "ground-truth fingerprints differ; benchmark scores are not comparable"
-            )
+            failures.append("ground-truth fingerprints differ; benchmark scores are not comparable")
 
     return comparable, verdicts, failures
 
@@ -2546,8 +2451,7 @@ def _census_paragraph(census: dict[str, Any] | None) -> str:
     unmeasured = census.get("chunk_count_unmeasured") or 0
     if unmeasured:
         text += (
-            f" {unmeasured} documents had no chunk_count measurement, so the "
-            "zero count is a floor."
+            f" {unmeasured} documents had no chunk_count measurement, so the zero count is a floor."
         )
     if census.get("truncated"):
         text += (
@@ -2643,8 +2547,7 @@ def build_markdown_report(run: dict[str, Any]) -> str:
         n = _metric_sample_count(run, n_source)
         n_cell = "n/a" if n is None else n
         lines.append(
-            f"| {key} | {value_cell} | {run_date} | `{short_sha}` | {n_cell} "
-            f"| {definition} |"
+            f"| {key} | {value_cell} | {run_date} | `{short_sha}` | {n_cell} | {definition} |"
         )
 
     lines += ["", _census_paragraph(fingerprint.get("census"))]
@@ -2730,9 +2633,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_parser = sub.add_parser("run", help="run the benchmark against a node")
-    run_parser.add_argument(
-        "--node-url", default=os.getenv("CITADEL_NODE_URL", DEFAULT_NODE)
-    )
+    run_parser.add_argument("--node-url", default=os.getenv("CITADEL_NODE_URL", DEFAULT_NODE))
     run_parser.add_argument("--questions", default=str(DEFAULT_QUESTIONS))
     run_parser.add_argument(
         "--repeats",
@@ -2766,12 +2667,8 @@ def main(argv: list[str] | None = None) -> int:
     ci_parser = sub.add_parser(
         "ci", help="Run the tracked, network-free benchmark harness self-check"
     )
-    ci_parser.add_argument(
-        "--questions", default=str(REPO_BENCH_DIR / "golden_questions_ci.json")
-    )
-    ci_parser.add_argument(
-        "--ground-truth", default=str(REPO_BENCH_DIR / "ground_truth_ci")
-    )
+    ci_parser.add_argument("--questions", default=str(REPO_BENCH_DIR / "golden_questions_ci.json"))
+    ci_parser.add_argument("--ground-truth", default=str(REPO_BENCH_DIR / "ground_truth_ci"))
     ci_parser.set_defaults(func=cmd_ci)
 
     compare_parser = sub.add_parser("compare", help="compare two saved runs")
@@ -2796,9 +2693,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="markdown is the only output format; the flag makes intent explicit",
     )
-    report_parser.add_argument(
-        "--out", default=None, help="write the block here instead of stdout"
-    )
+    report_parser.add_argument("--out", default=None, help="write the block here instead of stdout")
     report_parser.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)

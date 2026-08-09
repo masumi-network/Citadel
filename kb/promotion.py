@@ -41,7 +41,11 @@ from kb.promotion_queue import (
     build_pending_item,
     candidate_hash,
 )
-from kb.promotion_refs import ReferenceAssessment, assess_org_reference, parse_capture_tags_from_text
+from kb.promotion_refs import (
+    ReferenceAssessment,
+    assess_org_reference,
+    parse_capture_tags_from_text,
+)
 from kb.security_scan import SecurityScanEntry, scan_text_entries
 from kb.service import Citadel
 
@@ -137,9 +141,7 @@ def _candidate_from_result(result: Any) -> PromotionCandidate | None:
             if isinstance(meta_tags, list):
                 tags.extend(str(tag) for tag in meta_tags)
     tags.extend(parse_capture_tags_from_text(text))
-    normalized_tags = tuple(
-        dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip())
-    )
+    normalized_tags = tuple(dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip()))
     return PromotionCandidate(text=text, tags=normalized_tags)
 
 
@@ -276,9 +278,7 @@ class PromotionEngine:
                 break
             attempted += 1
             try:
-                results = await self.citadel.search(
-                    query, dataset=seat_dataset, top_k=cap
-                )
+                results = await self.citadel.search(query, dataset=seat_dataset, top_k=cap)
             except Exception as exc:  # pragma: no cover - depends on Cognee runtime.
                 logger.warning(
                     "promotion.enumerate search failed for %s: %s",
@@ -326,8 +326,7 @@ class PromotionEngine:
                     "dataset provisioning at creation; backfill it (#147)."
                 )
             raise PromotionEnumerationError(
-                f"all {attempted} seed queries failed for {seat_dataset}: "
-                f"{', '.join(distinct)}"
+                f"all {attempted} seed queries failed for {seat_dataset}: {', '.join(distinct)}"
             )
         return candidates[:cap]
 
@@ -367,11 +366,7 @@ class PromotionEngine:
         """True when the candidate trips the blocking-severity secret scanner."""
         try:
             scan = scan_text_entries(
-                [
-                    SecurityScanEntry(
-                        source="promotion", location=seat_dataset, text=text
-                    )
-                ],
+                [SecurityScanEntry(source="promotion", location=seat_dataset, text=text)],
                 block_severity=self.config.content_scan_block_severity,
             )
         except Exception:  # pragma: no cover - scan is best-effort; fail closed.
@@ -449,11 +444,7 @@ class PromotionEngine:
             )
 
         threshold = self.config.promotion_relevance_threshold
-        qualifies = (
-            verdict.relevant
-            and not verdict.sensitive
-            and verdict.score >= threshold
-        )
+        qualifies = verdict.relevant and not verdict.sensitive and verdict.score >= threshold
         base_kwargs = {
             "candidate": candidate.text,
             "relevant": verdict.relevant,
@@ -563,17 +554,14 @@ class PromotionEngine:
         attestation_identity = attested_by or identity
         attestation = {
             "promoted_by": (
-                attestation_identity.actor_id.strip()
-                or attestation_identity.actor_name.strip()
+                attestation_identity.actor_id.strip() or attestation_identity.actor_name.strip()
             ),
             "promoted_at": now_iso(),
         }
 
         central = None
         try:
-            targets = resolve_write_targets(
-                identity, None, promotion_tags, self.config
-            )
+            targets = resolve_write_targets(identity, None, promotion_tags, self.config)
             central = next(
                 (t.dataset for t in targets if t.tier == "full"),
                 targets[-1].dataset,
@@ -781,9 +769,7 @@ class PromotionEngine:
             "max_items": cap,
             "candidates": len(candidates),
             "proposed": sum(1 for p in proposals if p.decision == "promote"),
-            "pending_approval": sum(
-                1 for p in proposals if p.decision == "pending_approval"
-            ),
+            "pending_approval": sum(1 for p in proposals if p.decision == "pending_approval"),
             "promoted": promoted,
             "queued": queued,
             "proposals": [p.to_dict() for p in proposals],

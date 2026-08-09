@@ -29,6 +29,7 @@ _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
 DEFAULT_COGNIFY_QUEUE_PATH = Path(".citadel/cognify_queue.json")
 COGNIFY_EXECUTION_LOCK_POLL_SECONDS = 1.0
 
+
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -57,9 +58,7 @@ def _corpus_health_max_documents() -> int:
             "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
         ) from exc
     if value < 1:
-        raise RuntimeError(
-            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
-        )
+        raise RuntimeError("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer")
     return value
 
 
@@ -86,7 +85,9 @@ def _cognify_data_ids(result: Any) -> list[str]:
         if not isinstance(info, (list, tuple)):
             continue
         for item in info:
-            data_id = item.get("data_id") if isinstance(item, Mapping) else getattr(item, "data_id", None)
+            data_id = (
+                item.get("data_id") if isinstance(item, Mapping) else getattr(item, "data_id", None)
+            )
             if data_id is not None:
                 data_ids.append(str(data_id))
     return list(dict.fromkeys(data_ids))
@@ -139,9 +140,7 @@ def _parse_citadel_tags(external_metadata: Any) -> list[str]:
 # degrades to "no attribution" instead of stalling the endpoint. All three are
 # env-overridable so a live node can be tuned without a redeploy.
 NODE_DATASET_MAP_TTL_SECONDS = _float_env("CITADEL_NODE_DATASET_MAP_TTL_SECONDS", 60.0)
-NODE_DATASET_MAP_TIMEOUT_SECONDS = _float_env(
-    "CITADEL_NODE_DATASET_MAP_TIMEOUT_SECONDS", 5.0
-)
+NODE_DATASET_MAP_TIMEOUT_SECONDS = _float_env("CITADEL_NODE_DATASET_MAP_TIMEOUT_SECONDS", 5.0)
 # A failed/timed-out read is cached only briefly (NOT the full content TTL): a
 # transient stall must re-read quickly instead of latching a 60s content
 # blackout for every scoped caller (#50). On failure we also prefer the last
@@ -438,9 +437,7 @@ class CogneeGateway(Protocol):
     async def restore_document_chunks(self, deleted: Mapping[str, Any]) -> bool:
         raise NotImplementedError
 
-    async def discard_document_chunk_snapshot(
-        self, deleted: Mapping[str, Any]
-    ) -> bool:
+    async def discard_document_chunk_snapshot(self, deleted: Mapping[str, Any]) -> bool:
         raise NotImplementedError
 
 
@@ -835,9 +832,7 @@ class CogneePublicClient:
             )
             if heartbeat in done:
                 heartbeat.result()
-                raise RuntimeError(
-                    f"cognify retry lease heartbeat stopped for {lease.job_id}"
-                )
+                raise RuntimeError(f"cognify retry lease heartbeat stopped for {lease.job_id}")
             return await cognify
         finally:
             for task in (cognify, heartbeat):
@@ -1072,10 +1067,7 @@ class CogneePublicClient:
             return cached[1]
         async with self._graph_data_lock:
             cached = self._graph_data_cache
-            if (
-                cached is not None
-                and monotonic() - cached[0] < GRAPH_DATA_CACHE_TTL_SECONDS
-            ):
+            if cached is not None and monotonic() - cached[0] < GRAPH_DATA_CACHE_TTL_SECONDS:
                 return cached[1]
             result = await self._read_graph_data()
             self._graph_data_cache = (monotonic(), result)
@@ -1157,9 +1149,7 @@ class CogneePublicClient:
         if cached is None:
             return None
         ts, mapping, ok = cached
-        ttl = (
-            NODE_DATASET_MAP_TTL_SECONDS if ok else NODE_DATASET_MAP_FAILURE_TTL_SECONDS
-        )
+        ttl = NODE_DATASET_MAP_TTL_SECONDS if ok else NODE_DATASET_MAP_FAILURE_TTL_SECONDS
         if monotonic() - ts < ttl:
             return mapping
         return None
@@ -1229,9 +1219,7 @@ class CogneePublicClient:
             if not dataset_ids:
                 return []
             rows = await session.execute(
-                select(DatasetData.data_id).where(
-                    DatasetData.dataset_id.in_(dataset_ids)
-                )
+                select(DatasetData.data_id).where(DatasetData.dataset_id.in_(dataset_ids))
             )
         return sorted({str(data_id) for (data_id,) in rows.all() if data_id is not None})
 
@@ -1355,9 +1343,7 @@ class CogneePublicClient:
                 membership = await session.execute(
                     select(DatasetData.data_id, Dataset.name)
                     .join(Dataset, Dataset.id == DatasetData.dataset_id)
-                    .where(
-                        DatasetData.data_id.in_([UUID(row["id"]) for row in rows])
-                    )
+                    .where(DatasetData.data_id.in_([UUID(row["id"]) for row in rows]))
                 )
                 names_by_id: dict[str, list[str]] = {}
                 for data_id, dataset_name in membership.all():
@@ -1388,22 +1374,19 @@ class CogneePublicClient:
         engine = get_relational_engine()
         async with engine.get_async_session() as session:
             documents = int(
-                (await session.execute(select(func.count()).select_from(Data))).scalar()
-                or 0
+                (await session.execute(select(func.count()).select_from(Data))).scalar() or 0
             )
             documents_default_owner = int(
                 (
                     await session.execute(
-                        select(func.count())
-                        .select_from(Data)
-                        .where(Data.owner_id == user.id)
+                        select(func.count()).select_from(Data).where(Data.owner_id == user.id)
                     )
                 ).scalar()
                 or 0
             )
-            by_dataset_query = select(
-                Dataset.name, func.count(DatasetData.data_id)
-            ).join(Dataset, Dataset.id == DatasetData.dataset_id)
+            by_dataset_query = select(Dataset.name, func.count(DatasetData.data_id)).join(
+                Dataset, Dataset.id == DatasetData.dataset_id
+            )
             by_dataset = {
                 str(name): int(total or 0)
                 for name, total in (
@@ -1414,9 +1397,7 @@ class CogneePublicClient:
                 str(name): int(total or 0)
                 for name, total in (
                     await session.execute(
-                        by_dataset_query.where(Dataset.owner_id == user.id).group_by(
-                            Dataset.name
-                        )
+                        by_dataset_query.where(Dataset.owner_id == user.id).group_by(Dataset.name)
                     )
                 ).all()
             }
@@ -1493,9 +1474,7 @@ class CogneePublicClient:
                     raise RuntimeError("corpus page returned a row without an id")
                 document_id = str(row["id"])
                 if document_id in document_ids_seen:
-                    raise RuntimeError(
-                        f"corpus page returned duplicate document {document_id}"
-                    )
+                    raise RuntimeError(f"corpus page returned duplicate document {document_id}")
                 document_ids_seen.add(document_id)
                 document_ids.append(document_id)
             if len(document_ids_seen) > total_documents:
@@ -1530,9 +1509,7 @@ class CogneePublicClient:
                 for document_id in document_ids
                 if int(chunk_counts.get(document_id, 0)) > 0
             }
-            graph_ids_seen = set(document_ids) & {
-                str(document_id) for document_id in graph_ids
-            }
+            graph_ids_seen = set(document_ids) & {str(document_id) for document_id in graph_ids}
             fully_indexed_ids = chunked_ids & graph_ids_seen
 
         return {
@@ -1547,15 +1524,10 @@ class CogneePublicClient:
             "probe_graph_documents": len(graph_ids_seen),
             "probe_fully_indexed_documents": len(fully_indexed_ids),
             "probe_ok": probe_complete
-            and (
-                total_documents == 0
-                or len(fully_indexed_ids) == len(document_ids_seen)
-            ),
+            and (total_documents == 0 or len(fully_indexed_ids) == len(document_ids_seen)),
         }
 
-    async def corpus_chunk_counts(
-        self, document_ids: list[str]
-    ) -> dict[str, int] | None:
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int] | None:
         """Chunk rows per document from the vector store; None when not measured.
 
         None and 0 are different answers: 0 claims cognee accepted a document
@@ -1706,9 +1678,7 @@ class CogneePublicClient:
         try:
             wanted_ids = [UUID(document_id) for document_id in wanted]
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "dataset membership requested a non-UUID document id"
-            ) from exc
+            raise RuntimeError("dataset membership requested a non-UUID document id") from exc
 
         engine = get_relational_engine()
         names_by_id: dict[str, set[str]] = {document_id: set() for document_id in wanted}
@@ -1725,9 +1695,7 @@ class CogneePublicClient:
                 if document_id not in names_by_id:
                     raise RuntimeError("dataset membership returned an unexpected document")
                 names_by_id[document_id].add(dataset_name)
-        return {
-            document_id: sorted(names_by_id[document_id]) for document_id in wanted
-        }
+        return {document_id: sorted(names_by_id[document_id]) for document_id in wanted}
 
     async def corpus_zero_chunk_documents(
         self,
@@ -1816,9 +1784,7 @@ class CogneePublicClient:
                     raise RuntimeError("corpus page returned a row without an id")
                 document_id = str(row["id"])
                 if document_id in seen_ids:
-                    raise RuntimeError(
-                        f"corpus page returned duplicate document {document_id}"
-                    )
+                    raise RuntimeError(f"corpus page returned duplicate document {document_id}")
                 seen_ids.add(document_id)
                 page_ids.append(document_id)
 
@@ -1996,9 +1962,7 @@ class CogneePublicClient:
             "violations_truncated": violation_count > len(violations),
         }
 
-    async def stored_chunk_ids_for_documents(
-        self, document_ids: list[str]
-    ) -> list[str] | None:
+    async def stored_chunk_ids_for_documents(self, document_ids: list[str]) -> list[str] | None:
         """Return every persisted chunk id for ``document_ids``.
 
         A repair must delete the complete old projection before Cognee rebuilds
@@ -2112,9 +2076,7 @@ class CogneePublicClient:
                     raise RuntimeError("corpus page returned a row without an id")
                 document_id = str(row["id"])
                 if document_id in seen_ids:
-                    raise RuntimeError(
-                        f"corpus page returned duplicate document {document_id}"
-                    )
+                    raise RuntimeError(f"corpus page returned duplicate document {document_id}")
                 seen_ids.add(document_id)
                 corpus_rows_by_id[document_id] = row
 
@@ -2149,9 +2111,7 @@ class CogneePublicClient:
         if not isinstance(violation_counts, dict):
             raise RuntimeError("stored chunk budget returned invalid document counts")
         violation_count = check.get("violation_count")
-        missing_document_id_violation_count = check.get(
-            "missing_document_id_violation_count", 0
-        )
+        missing_document_id_violation_count = check.get("missing_document_id_violation_count", 0)
         if (
             isinstance(violation_count, bool)
             or not isinstance(violation_count, int)
@@ -2161,9 +2121,7 @@ class CogneePublicClient:
             or missing_document_id_violation_count < 0
         ):
             raise RuntimeError("stored chunk budget returned invalid violation totals")
-        grouped_violation_count = sum(
-            int(value) for value in violation_counts.values()
-        )
+        grouped_violation_count = sum(int(value) for value in violation_counts.values())
         if grouped_violation_count + missing_document_id_violation_count != violation_count:
             raise RuntimeError("stored chunk budget violation totals do not reconcile")
 
@@ -2238,8 +2196,7 @@ class CogneePublicClient:
             "oversized_document_count": len(oversized_ids),
             "oversized_chunk_count": oversized_chunk_count,
             "oversized_documents": oversized_documents,
-            "oversized_documents_truncated": len(oversized_ids)
-            > len(oversized_documents),
+            "oversized_documents_truncated": len(oversized_ids) > len(oversized_documents),
             "repair_document_ids": sorted(repair_ids),
             "repair_datasets": sorted(repair_datasets),
             "unassigned_oversized_document_count": unassigned + orphan_count,
@@ -2345,9 +2302,7 @@ class CogneePublicClient:
                     raise RuntimeError("corpus page returned a row without an id")
                 document_id = str(row["id"])
                 if document_id in seen_ids:
-                    raise RuntimeError(
-                        f"corpus page returned duplicate document {document_id}"
-                    )
+                    raise RuntimeError(f"corpus page returned duplicate document {document_id}")
                 seen_ids.add(document_id)
                 page_ids.append(document_id)
                 corpus_rows_by_id[document_id] = row
@@ -2550,11 +2505,7 @@ class CogneePublicClient:
             "repair_document_ids": sorted(repair_ids),
             "repair_document_datasets": repair_document_datasets,
             "repair_datasets": sorted(
-                {
-                    name
-                    for names in repair_document_datasets.values()
-                    for name in names
-                }
+                {name for names in repair_document_datasets.values() for name in names}
             ),
             "unassigned_zero_chunk_document_count": zero_unassigned,
             "unassigned_oversized_document_count": oversized_unassigned,
@@ -2564,9 +2515,7 @@ class CogneePublicClient:
             "census_complete": True,
         }
 
-    async def graph_chunk_ids_for_documents(
-        self, document_ids: list[str]
-    ) -> set[str] | None:
+    async def graph_chunk_ids_for_documents(self, document_ids: list[str]) -> set[str] | None:
         """Return graph node ids for ``DocumentChunk`` properties by source id."""
         if not document_ids:
             return set()
@@ -2789,9 +2738,7 @@ class CogneePublicClient:
             try:
                 vector_uuids.append(UUID(str(vector_id)))
             except (ValueError, TypeError, AttributeError) as exc:
-                raise RuntimeError(
-                    "stored chunk collection returned a non-UUID row id"
-                ) from exc
+                raise RuntimeError("stored chunk collection returned a non-UUID row id") from exc
 
         graph_engine = await get_graph_engine()
         vector_engine = get_vector_engine()
@@ -2806,9 +2753,7 @@ class CogneePublicClient:
             snapshot_token = self._store_repair_snapshot(snapshot)
             try:
                 if vector_uuids:
-                    await vector_engine.delete_data_points(
-                        "DocumentChunk_text", vector_uuids
-                    )
+                    await vector_engine.delete_data_points("DocumentChunk_text", vector_uuids)
                 if graph_ids:
                     await graph_engine.delete_nodes(sorted(graph_ids))
                 self._invalidate_graph_data_cache()
@@ -2890,9 +2835,7 @@ class CogneePublicClient:
         expected = {str(vector_id) for vector_id in vector_ids}
         actual = {str(row[0]) for row in rows if row[0] is not None}
         if actual != expected:
-            raise RuntimeError(
-                "vector projection changed while preparing repair snapshot"
-            )
+            raise RuntimeError("vector projection changed while preparing repair snapshot")
         return [
             {
                 "id": row[0],
@@ -2932,9 +2875,7 @@ class CogneePublicClient:
                 }
             )
         if {node["id"] for node in nodes} != set(graph_ids):
-            raise RuntimeError(
-                "graph projection changed while preparing repair snapshot"
-            )
+            raise RuntimeError("graph projection changed while preparing repair snapshot")
 
         edge_rows = await query(
             """
@@ -2976,9 +2917,7 @@ class CogneePublicClient:
             "graph": await self._snapshot_graph_projection(graph_engine, graph_ids),
         }
 
-    async def _restore_vector_rows(
-        self, vector_engine: Any, rows: list[dict[str, Any]]
-    ) -> None:
+    async def _restore_vector_rows(self, vector_engine: Any, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
         from sqlalchemy.dialects.postgresql import insert
@@ -3004,9 +2943,7 @@ class CogneePublicClient:
             await session.execute(statement)
             await session.commit()
 
-    async def _restore_graph_projection(
-        self, graph_engine: Any, graph: Mapping[str, Any]
-    ) -> None:
+    async def _restore_graph_projection(self, graph_engine: Any, graph: Mapping[str, Any]) -> None:
         query = getattr(graph_engine, "query", None)
         if not callable(query):
             raise RuntimeError("graph projection restore is unavailable")
@@ -3065,9 +3002,7 @@ class CogneePublicClient:
             except (TypeError, ValueError, AttributeError) as exc:
                 raise RuntimeError("current vector projection has a non-UUID id") from exc
         if current_vector_uuids:
-            await vector_engine.delete_data_points(
-                "DocumentChunk_text", current_vector_uuids
-            )
+            await vector_engine.delete_data_points("DocumentChunk_text", current_vector_uuids)
         if graph_ids:
             await graph_engine.delete_nodes(sorted(graph_ids))
         await self._restore_vector_rows(vector_engine, list(snapshot.get("vector_rows") or []))
@@ -3248,9 +3183,7 @@ class CogneePublicClient:
             if not self._is_no_data_error(exc):
                 raise
             nodes, edges = [], []
-        props, props_by_id, part_neighbor_ids = self._graph_projection(
-            doc_id, nodes, edges
-        )
+        props, props_by_id, part_neighbor_ids = self._graph_projection(doc_id, nodes, edges)
         if props is not None:
             text, _ = self._extract_text(props)
             if text is not None:
@@ -3292,18 +3225,14 @@ class CogneePublicClient:
             if not callable(retrieve):
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
-            seed_payload = (
-                self._retrieved_payload(seed_rows[0]) if seed_rows else None
-            )
+            seed_payload = self._retrieved_payload(seed_rows[0]) if seed_rows else None
             if seed_payload is not None:
                 # Chunk hit: the parent document id rides in the payload —
                 # exactly the owner attribution the full assembly reports.
                 if self._extract_text(seed_payload)[0] is None:
                     return None
                 parent_raw = seed_payload.get("document_id")
-                if not parent_raw and isinstance(
-                    seed_payload.get("is_part_of"), dict
-                ):
+                if not parent_raw and isinstance(seed_payload.get("is_part_of"), dict):
                     parent_raw = seed_payload["is_part_of"].get("id")
                 try:
                     parent_id = str(UUID(str(parent_raw))) if parent_raw else None
@@ -3318,9 +3247,7 @@ class CogneePublicClient:
                 self._CHUNK_VECTOR_COLLECTION,
                 [str(uuid5(NAMESPACE_OID, f"{requested}-0"))],
             )
-            probe_payload = (
-                self._retrieved_payload(probe_rows[0]) if probe_rows else None
-            )
+            probe_payload = self._retrieved_payload(probe_rows[0]) if probe_rows else None
             if probe_payload is None or self._extract_text(probe_payload)[0] is None:
                 return None
             owner_ids = [requested]
@@ -3413,9 +3340,7 @@ class CogneePublicClient:
                 return None
             raise
 
-        props, props_by_id, part_neighbor_ids = self._graph_projection(
-            doc_id, nodes, edges
-        )
+        props, props_by_id, part_neighbor_ids = self._graph_projection(doc_id, nodes, edges)
         if props is None:
             return None
         text, text_key = self._extract_text(props)
@@ -3431,9 +3356,7 @@ class CogneePublicClient:
                 # cannot be assembled (never worse than before).
                 parent_id = self._textless_neighbor_id(props_by_id, part_neighbor_ids)
                 if parent_id is not None:
-                    parent = await self._document_from_graph(
-                        parent_id, follow_parent=False
-                    )
+                    parent = await self._document_from_graph(parent_id, follow_parent=False)
                     if parent is not None and parent.get("body"):
                         owner_ids = list(parent.get("dataset_node_ids") or [parent_id])
                         if doc_id not in owner_ids:
@@ -3545,16 +3468,12 @@ class CogneePublicClient:
             if not callable(retrieve):
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
-            seed_payload = (
-                self._retrieved_payload(seed_rows[0]) if seed_rows else None
-            )
+            seed_payload = self._retrieved_payload(seed_rows[0]) if seed_rows else None
             document_id: str | None
             if seed_payload is not None:
                 # Chunk hit: the parent document id rides in the payload.
                 parent_raw = seed_payload.get("document_id")
-                if not parent_raw and isinstance(
-                    seed_payload.get("is_part_of"), dict
-                ):
+                if not parent_raw and isinstance(seed_payload.get("is_part_of"), dict):
                     parent_raw = seed_payload["is_part_of"].get("id")
                 document_id = str(parent_raw) if parent_raw else None
             else:
@@ -3573,9 +3492,7 @@ class CogneePublicClient:
                     str(uuid5(NAMESPACE_OID, f"{document_id}-{index}"))
                     for index in range(self._CHUNK_SIBLING_PROBE_LIMIT)
                 ]
-                for row in await retrieve(
-                    self._CHUNK_VECTOR_COLLECTION, sibling_ids
-                ):
+                for row in await retrieve(self._CHUNK_VECTOR_COLLECTION, sibling_ids):
                     payload = self._retrieved_payload(row)
                     if payload is None:
                         continue
@@ -3616,9 +3533,7 @@ class CogneePublicClient:
                 "id": document_id or doc_id,
                 "source_type": "cognee",
                 "title": title,
-                "body": "\n\n".join(
-                    self._extract_text(payload)[0] or "" for _, payload in chunks
-                ),
+                "body": "\n\n".join(self._extract_text(payload)[0] or "" for _, payload in chunks),
                 "chunk_count": len(chunks),
                 "metadata": metadata,
                 "dataset_node_ids": owner_ids,
@@ -3647,9 +3562,7 @@ class CogneePublicClient:
         async with self.maintenance():
             return await self._cognify_unlocked(datasets=datasets, force=force)
 
-    async def _cognify_unlocked(
-        self, *, datasets: list[str], force: bool = False
-    ) -> Any:
+    async def _cognify_unlocked(self, *, datasets: list[str], force: bool = False) -> Any:
         """Cognify already-added data in ``datasets``.
 
         ``cognee.cognify`` defaults to ``incremental_loading=True``, so this only
@@ -3680,9 +3593,7 @@ class CogneePublicClient:
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
-            result = await cognee.cognify(
-                datasets=datasets, incremental_loading=not force
-            )
+            result = await cognee.cognify(datasets=datasets, incremental_loading=not force)
             self._invalidate_graph_data_cache()
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
@@ -3691,13 +3602,10 @@ class CogneePublicClient:
             missing_ids = sorted(set(expected_ids) - set(processed_ids))
             if missing_ids:
                 raise RuntimeError(
-                    "forced cognify receipt omitted "
-                    f"{len(missing_ids)} expected source id(s)"
+                    f"forced cognify receipt omitted {len(missing_ids)} expected source id(s)"
                 )
         if processed_ids:
-            stored_check = await self.stored_chunk_budget_check(
-                document_ids=processed_ids
-            )
+            stored_check = await self.stored_chunk_budget_check(document_ids=processed_ids)
             if stored_check is None:
                 logger.warning(
                     "stored chunk budget was not measured after cognify: "
@@ -3749,8 +3657,7 @@ class CogneePublicClient:
         # success while doing nothing (false-green exit 0, #41).
         if not os.getenv("LLM_API_KEY"):
             raise RuntimeError(
-                "LLM_API_KEY (or OPENROUTER_API_KEY) is not set; improve requires an "
-                "LLM key."
+                "LLM_API_KEY (or OPENROUTER_API_KEY) is not set; improve requires an LLM key."
             )
         import cognee
 

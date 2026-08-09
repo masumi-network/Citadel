@@ -26,7 +26,10 @@ def test_cursor_merge_preserves_and_idempotent(tmp_path, monkeypatch) -> None:
     data = json.loads(cur.read_text())
     assert "other" in data["mcpServers"]  # sibling server preserved
     assert data["mcpServers"]["citadel"]["url"] == "https://node.example/mcp/"
-    assert "${env:CITADEL_MCP_ACCESS_TOKEN}" in data["mcpServers"]["citadel"]["headers"]["Authorization"]
+    assert (
+        "${env:CITADEL_MCP_ACCESS_TOKEN}"
+        in data["mcpServers"]["citadel"]["headers"]["Authorization"]
+    )
 
     assert td.apply("cursor", node_url=NODE).action == "unchanged"
 
@@ -62,7 +65,9 @@ def test_codex_append_fallback_idempotent(tmp_path, monkeypatch) -> None:
 def test_gemini_write_uses_httpurl_and_dollar_var(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert td.apply("gemini", node_url=NODE).action == "wrote"
-    entry = json.loads((tmp_path / ".gemini" / "settings.json").read_text())["mcpServers"]["citadel"]
+    entry = json.loads((tmp_path / ".gemini" / "settings.json").read_text())["mcpServers"][
+        "citadel"
+    ]
     assert entry["httpUrl"] == "https://node.example/mcp/"  # httpUrl, not url (SSE)
     # Gemini expands $VAR, NOT the ${env:} form.
     assert entry["headers"]["Authorization"] == "Bearer $CITADEL_MCP_ACCESS_TOKEN"
@@ -71,9 +76,9 @@ def test_gemini_write_uses_httpurl_and_dollar_var(tmp_path, monkeypatch) -> None
 def test_windsurf_write_uses_serverurl_and_env_ref(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert td.apply("windsurf", node_url=NODE).action == "wrote"
-    entry = json.loads(
-        (tmp_path / ".codeium" / "windsurf" / "mcp_config.json").read_text()
-    )["mcpServers"]["citadel"]
+    entry = json.loads((tmp_path / ".codeium" / "windsurf" / "mcp_config.json").read_text())[
+        "mcpServers"
+    ]["citadel"]
     assert entry["serverUrl"] == "https://node.example/mcp/"
     assert entry["headers"]["Authorization"] == "Bearer ${env:CITADEL_MCP_ACCESS_TOKEN}"
 

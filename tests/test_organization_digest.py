@@ -543,8 +543,7 @@ def test_llm_agent_read_logs_model_and_response_body_on_http_400(
     assert "HTTP 400" in caplog.text
     # Resolved and configured ids are both recorded, distinguishably.
     assert (
-        "for model deepseek/deepseek-v4-flash "
-        "(configured openrouter/deepseek/deepseek-v4-flash)"
+        "for model deepseek/deepseek-v4-flash (configured openrouter/deepseek/deepseek-v4-flash)"
     ) in caplog.text
     # The response body reaches the log, so the next occurrence is diagnosable.
     assert "is not a valid model ID" in caplog.text

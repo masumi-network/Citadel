@@ -67,9 +67,7 @@ def test_deduped_node_copy_of_a_shared_trace_keeps_reference_only() -> None:
 
     app.state.access_store = AccessStore(Path(tempfile.mkdtemp()) / "access.json")
     admin = authed_client()
-    token = admin.post("/api/access/seats", json={"name": "Carol", "slug": "carol"}).json()[
-        "token"
-    ]
+    token = admin.post("/api/access/seats", json={"name": "Carol", "slug": "carol"}).json()["token"]
     app.state.citadel = DualWritten()
     client = TestClient(app, base_url="https://testserver")
 

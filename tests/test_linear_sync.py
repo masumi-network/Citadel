@@ -188,7 +188,9 @@ async def test_linear_sync_writes_each_issue_to_central(
     citadel = Citadel(config)
     ingests: list[dict[str, Any]] = []
 
-    async def fake_learn(self: Any, data: str, *, dataset: str | None = None, tags: list[str] | None = None, **_: Any) -> Any:
+    async def fake_learn(
+        self: Any, data: str, *, dataset: str | None = None, tags: list[str] | None = None, **_: Any
+    ) -> Any:
         ingests.append({"dataset": dataset, "tags": tags or [], "data": data})
 
         class Outcome:
@@ -247,7 +249,9 @@ async def test_linear_sync_auto_maps_assignee_by_member_email(
             "assignee": {"id": "linear-user-john", "name": "John", "email": None},  # no email
         }
     ]
-    members = [{"id": "linear-user-john", "name": "John Doe", "email": "john@example.com", "active": True}]
+    members = [
+        {"id": "linear-user-john", "name": "John Doe", "email": "john@example.com", "active": True}
+    ]
 
     async def fake_learn(self: Any, data: str, **_: Any) -> Any:
         class Outcome:
@@ -654,9 +658,7 @@ def _incremental_syncer(
     store: AccessStore | None = None
     if with_seat:
         store = AccessStore(config.access_store_path)
-        store.create_seat(
-            name="John Doe", slug="john", email="john@example.com", issue_token=False
-        )
+        store.create_seat(name="John Doe", slug="john", email="john@example.com", issue_token=False)
     ingests: list[dict[str, Any]] = []
     _capture_learn(monkeypatch, ingests)
     scheduled: list[list[str]] = []
@@ -665,9 +667,7 @@ def _incremental_syncer(
         "schedule_cognify",
         lambda datasets: scheduled.append(list(datasets)) or True,
     )
-    syncer = LinearSyncer(
-        citadel, client=FakeLinearClient(sample_issues), access_store=store
-    )
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(sample_issues), access_store=store)
     return syncer, ingests, scheduled
 
 

@@ -89,7 +89,9 @@ class GoogleChatDelivery:
             lambda: self._post_once(url, body),
             operation="google_chat.post_digest",
             max_attempts=self.retry_count + 1,
-            should_retry_result=lambda outcome: not outcome["ok"] and bool(outcome.get("retryable")),
+            should_retry_result=lambda outcome: (
+                not outcome["ok"] and bool(outcome.get("retryable"))
+            ),
             retry_after_from_result=lambda outcome: outcome.get("retry_after"),
         )
         if result["ok"]:

@@ -10,7 +10,7 @@ def test_publish_requires_main_ancestry_and_current_ci_gate() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     guard = workflow.split("  release-guard:\n", 1)[1].split("\n  build:\n", 1)[0]
 
-    assert "git merge-base --is-ancestor \"$GITHUB_SHA\" \"origin/main\"" in guard
+    assert 'git merge-base --is-ancestor "$GITHUB_SHA" "origin/main"' in guard
     assert "commits/${GITHUB_SHA}/check-runs" in guard
     assert 'select(.name == "CI gate" and .conclusion == "success")' in guard
     assert "needs: release-guard" in workflow

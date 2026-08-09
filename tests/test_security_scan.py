@@ -221,7 +221,7 @@ def test_file_scheme_is_still_blocked() -> None:
 
 def test_env_lookups_are_not_secret_assignments() -> None:
     for snippet in (
-        'const apiKey = process.env.SOKOSUMI_API_KEY;',
+        "const apiKey = process.env.SOKOSUMI_API_KEY;",
         "const apiKey = getApiKeyFromEnv();",
         'api_key = os.environ.get("RAILWAY_API_KEY")',
         "api_key = request.query_params.get('api_key')",
@@ -307,4 +307,3 @@ def test_high_confidence_patterns_are_untouched_by_the_carve_outs() -> None:
         result = scan(f"token = {value}")
         assert expected in categories(result), value
         assert result["blocked"] is True
-

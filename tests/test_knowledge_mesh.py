@@ -78,9 +78,7 @@ async def test_graph_caps_nodes_and_drops_edges_outside_the_cap() -> None:
     graph = await mesh.graph(limit=2)
 
     assert [node["id"] for node in graph["nodes"]] == ["node-1", "node-2"]
-    assert graph["edges"] == [
-        {"source": "node-1", "target": "node-2", "relationship": "uses"}
-    ]
+    assert graph["edges"] == [{"source": "node-1", "target": "node-2", "relationship": "uses"}]
     assert graph["truncated"] is True
     assert graph["total_nodes"] == 3
 
@@ -124,9 +122,7 @@ def test_build_graph_payload_skips_malformed_rows() -> None:
     )
 
     assert [node["id"] for node in payload["nodes"]] == ["ok-node", "dupe"]
-    assert payload["edges"] == [
-        {"source": "ok-node", "target": "dupe", "relationship": "links"}
-    ]
+    assert payload["edges"] == [{"source": "ok-node", "target": "dupe", "relationship": "links"}]
 
 
 def test_fallback_graph_shape() -> None:
@@ -307,9 +303,7 @@ def test_dataset_hub_survives_node_cap_without_edges_to_dropped_nodes() -> None:
             "relationship": "belongs_to",
         }
     ]
-    assert all(
-        "chunk-1" not in (edge["source"], edge["target"]) for edge in payload["edges"]
-    )
+    assert all("chunk-1" not in (edge["source"], edge["target"]) for edge in payload["edges"])
     assert payload["truncated"] is True
     assert payload["total_nodes"] == 2
 
@@ -336,9 +330,7 @@ def test_two_datasets_on_one_document_yield_two_hubs_and_edges() -> None:
 
 async def test_graph_attributes_datasets_through_gateway() -> None:
     mesh = KnowledgeMesh(
-        FakeDatasetGateway(
-            DOC_NODES, DOC_EDGES, dataset_map={"doc-1": ["seat:alice"]}
-        )
+        FakeDatasetGateway(DOC_NODES, DOC_EDGES, dataset_map={"doc-1": ["seat:alice"]})
     )
 
     graph = await mesh.graph()
@@ -395,7 +387,14 @@ def test_internal_document_name_replaced_by_lowest_chunk_index_text() -> None:
     nodes = [
         ("doc-1", {"name": INTERNAL_DOC_NAME, "type": "TextDocument"}),
         ("chunk-b", {"text": "second chunk body", "chunk_index": 1, "type": "DocumentChunk"}),
-        ("chunk-a", {"text": "# Release checklist\nrest of the body", "chunk_index": 0, "type": "DocumentChunk"}),
+        (
+            "chunk-a",
+            {
+                "text": "# Release checklist\nrest of the body",
+                "chunk_index": 0,
+                "type": "DocumentChunk",
+            },
+        ),
     ]
     # Edge order and direction must not matter: chunk_index 0 always wins.
     for edges in (
@@ -584,9 +583,7 @@ async def test_is_a_edge_to_plain_entity_never_leaks_hidden_only_entity_name() -
     # so a hidden-only plain Entity stays hidden even across an is_a edge
     # to a visible ring-1 entity (in either direction).
     for source, target in (("ent-isa-leak", "ent-shared"), ("ent-shared", "ent-isa-leak")):
-        nodes = ISOLATION_NODES + [
-            ("ent-isa-leak", {"name": "SecretKuzuFork", "type": "Entity"})
-        ]
+        nodes = ISOLATION_NODES + [("ent-isa-leak", {"name": "SecretKuzuFork", "type": "Entity"})]
         edges = ISOLATION_EDGES + [
             ("chunk-hidden", "ent-isa-leak", "contains", {}),
             (source, target, "is_a", {}),
@@ -624,15 +621,11 @@ async def test_visible_nodes_field_reports_caller_scope() -> None:
 async def test_graph_without_dataset_visible_matches_unfiltered_payload() -> None:
     # None = bypass/admin callers: byte-identical to the unfiltered shaping,
     # no visible_nodes field, hidden content fully present.
-    gateway = FakeDatasetGateway(
-        ISOLATION_NODES, ISOLATION_EDGES, dataset_map=ISOLATION_MAP
-    )
+    gateway = FakeDatasetGateway(ISOLATION_NODES, ISOLATION_EDGES, dataset_map=ISOLATION_MAP)
 
     graph = await KnowledgeMesh(gateway).graph()
 
-    expected = build_graph_payload(
-        ISOLATION_NODES, ISOLATION_EDGES, dataset_map=ISOLATION_MAP
-    )
+    expected = build_graph_payload(ISOLATION_NODES, ISOLATION_EDGES, dataset_map=ISOLATION_MAP)
     assert graph == {"ok": True, "fallback": False, **expected}
     assert "visible_nodes" not in graph
     assert any(node["id"] == "doc-hidden" for node in graph["nodes"])
@@ -642,9 +635,7 @@ async def test_scoped_caller_sees_no_content_when_dataset_map_read_fails() -> No
     # Fail-closed: without attribution nothing is provably visible, so a
     # scoped caller gets an empty content set instead of the whole org graph.
     mesh = KnowledgeMesh(
-        FakeDatasetGateway(
-            ISOLATION_NODES, ISOLATION_EDGES, map_error=RuntimeError("db offline")
-        )
+        FakeDatasetGateway(ISOLATION_NODES, ISOLATION_EDGES, map_error=RuntimeError("db offline"))
     )
 
     graph = await mesh.graph(dataset_visible=lambda name: True)
@@ -682,9 +673,7 @@ async def test_presence_hubs_appear_even_when_caller_sees_none_of_the_content() 
     assert hubs["dataset:seat:empty"]["presence"] == {"documents": 0}
     assert hubs["dataset:masumi-network"]["presence"] == {"documents": 1}
     # Every seat hub anchors to the Central hub so it never floats.
-    presence_edges = [
-        edge for edge in graph["edges"] if edge["relationship"] == "presence"
-    ]
+    presence_edges = [edge for edge in graph["edges"] if edge["relationship"] == "presence"]
     assert {
         "source": "dataset:seat:alice",
         "target": "dataset:masumi-network",
@@ -760,9 +749,7 @@ async def test_fallback_payloads_still_carry_presence_hubs() -> None:
 async def test_graph_empty_fallback_counts_presence_from_available_map() -> None:
     # graph_empty is the one fallback where the dataset map CAN be read:
     # presence counts come from the map instead of degrading to 0.
-    mesh = KnowledgeMesh(
-        FakeDatasetGateway([], [], dataset_map={"doc-1": ["seat:alice"]})
-    )
+    mesh = KnowledgeMesh(FakeDatasetGateway([], [], dataset_map={"doc-1": ["seat:alice"]}))
 
     graph = await mesh.graph(presence=PRESENCE)
 
@@ -885,9 +872,7 @@ def test_internal_document_labeled_by_nodeset_membership() -> None:
         ("doc-1", {"name": INTERNAL_DOC_NAME, "type": "TextDocument"}),
         ("set-1", {"name": "user_sessions_from_cache", "type": "NodeSet"}),
     ]
-    payload = build_graph_payload(
-        nodes, [("doc-1", "set-1", "belongs_to_set", {})], limit=10
-    )
+    payload = build_graph_payload(nodes, [("doc-1", "set-1", "belongs_to_set", {})], limit=10)
 
     doc = next(node for node in payload["nodes"] if node["id"] == "doc-1")
     assert doc["label"] == "user_sessions_from_cache"
@@ -923,9 +908,7 @@ def test_collapse_orphans_folds_internal_documents_into_nodeset() -> None:
         ("doc-1", "set-1", "belongs_to_set", {}),
         ("doc-2", "set-1", "belongs_to_set", {}),
     ]
-    payload = build_graph_payload(
-        nodes, edges, limit=10, collapse_orphan_documents=True
-    )
+    payload = build_graph_payload(nodes, edges, limit=10, collapse_orphan_documents=True)
 
     ids = {node["id"] for node in payload["nodes"]}
     assert ids == {"set-1"}
@@ -940,9 +923,7 @@ def test_orphans_are_not_collapsed_without_opt_in() -> None:
         ("doc-1", {"name": INTERNAL_DOC_NAME, "type": "TextDocument"}),
         ("set-1", {"name": "user_sessions_from_cache", "type": "NodeSet"}),
     ]
-    payload = build_graph_payload(
-        nodes, [("doc-1", "set-1", "belongs_to_set", {})], limit=10
-    )
+    payload = build_graph_payload(nodes, [("doc-1", "set-1", "belongs_to_set", {})], limit=10)
 
     ids = {node["id"] for node in payload["nodes"]}
     assert ids == {"doc-1", "set-1"}
@@ -952,7 +933,13 @@ def test_orphans_are_not_collapsed_without_opt_in() -> None:
 
 def test_summary_boilerplate_lead_in_is_stripped_from_labels() -> None:
     nodes = [
-        ("sum-1", {"text": "This chunk is about a repository of question-answer pairs", "type": "TextSummary"}),
+        (
+            "sum-1",
+            {
+                "text": "This chunk is about a repository of question-answer pairs",
+                "type": "TextSummary",
+            },
+        ),
         ("sum-2", {"name": "This document describes the release checklist", "type": "TextSummary"}),
         ("sum-3", {"text": "This input is a list of 40 empty questions", "type": "TextSummary"}),
     ]
@@ -988,7 +975,9 @@ def test_named_document_is_never_collapsed() -> None:
         ("set-1", {"name": "user_sessions_from_cache", "type": "NodeSet"}),
     ]
     payload = build_graph_payload(
-        nodes, [("doc-1", "set-1", "belongs_to_set", {})], limit=10,
+        nodes,
+        [("doc-1", "set-1", "belongs_to_set", {})],
+        limit=10,
         collapse_orphan_documents=True,
     )
 

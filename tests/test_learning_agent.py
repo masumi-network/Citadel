@@ -23,9 +23,7 @@ def github_run_result(**overrides: Any) -> dict[str, Any]:
         "commit_count": 1,
         "open_pull_request_count": 1,
         "merged_pull_request_count": 0,
-        "changed_repositories": [
-            {"name": "agent", "full_name": "masumi-network/agent"}
-        ],
+        "changed_repositories": [{"name": "agent", "full_name": "masumi-network/agent"}],
         "recent_commits": [
             {"repo": "masumi-network/agent", "sha": "abc123def456", "message": "add retry"}
         ],
@@ -225,7 +223,9 @@ async def test_repo_content_sync_failure_propagates() -> None:
 
 
 async def test_vault_search_failure_degrades_to_empty_context() -> None:
-    learning_agent, _, _, _, _ = agent(citadel=FakeCitadel(search_error=RuntimeError("cognee down")))
+    learning_agent, _, _, _, _ = agent(
+        citadel=FakeCitadel(search_error=RuntimeError("cognee down"))
+    )
 
     result = await learning_agent.run()
 

@@ -62,7 +62,9 @@ def organization_digest_summary(result: dict[str, Any]) -> dict[str, Any]:
         "open_pull_requests": int(github.get("open_pull_request_count") or 0),
         "merged_pull_requests": int(github.get("merged_pull_request_count") or 0),
         "vault_context_items": len(_items(vault.get("recent_context"))),
-        "active_repositories": [row.get("repo") for row in active_repositories[:5] if row.get("repo")],
+        "active_repositories": [
+            row.get("repo") for row in active_repositories[:5] if row.get("repo")
+        ],
     }
 
 
@@ -171,9 +173,7 @@ def resolve_openrouter_model() -> tuple[str, str]:
     (no second slash, e.g. "openrouter/auto") is left untouched.
     """
     configured = (
-        os.getenv("CITADEL_ORG_DIGEST_LLM_MODEL")
-        or os.getenv("LLM_MODEL")
-        or default_llm_model()
+        os.getenv("CITADEL_ORG_DIGEST_LLM_MODEL") or os.getenv("LLM_MODEL") or default_llm_model()
     ).strip()
     sent = configured
     if sent.lower().startswith(LITELLM_OPENROUTER_PREFIX):
@@ -310,9 +310,7 @@ def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
         timeout=30,
     )
     if message is None:
-        logger.warning(
-            "Organization digest LLM read failed; falling back to deterministic read"
-        )
+        logger.warning("Organization digest LLM read failed; falling back to deterministic read")
         return None
     lines = []
     for raw_line in message.splitlines():

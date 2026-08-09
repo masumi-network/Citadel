@@ -69,9 +69,7 @@ def test_every_preview_route_is_served_under_the_strict_policy() -> None:
     # No preview path is in the one opt-in list that can relax the policy, and
     # none may join it. The list is empty today; while / held the opt-in, this
     # is exactly where it would have been copied across by reflex.
-    assert not any(
-        path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS
-    )
+    assert not any(path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS)
 
 
 def test_the_preview_route_set_is_closed() -> None:
@@ -201,12 +199,27 @@ def test_dashboard_views_are_role_gated_at_the_route() -> None:
     the server.
     """
     expected = {
-        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 403,
-                        "/next/app/admin": 403},
-        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
-                        "/next/app/admin": 403},
-        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
-                       "/next/app/admin": 200},
+        "test-reader": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 403,
+            "/next/app/admin": 403,
+        },
+        "test-writer": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 200,
+            "/next/app/admin": 403,
+        },
+        "test-admin": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 200,
+            "/next/app/admin": 200,
+        },
     }
 
     for access_key, paths in expected.items():
@@ -261,9 +274,7 @@ def test_graph_view_is_a_real_next_dashboard_route() -> None:
 
     compiled = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob(
-            "graph-*.js"
-        )
+        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob("graph-*.js")
     )
     assert "visible_nodes" in compiled
     assert "Presence-only view. No content nodes are visible for this scope." in compiled

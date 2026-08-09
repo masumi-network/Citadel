@@ -170,11 +170,7 @@ def _gateway_delivery_summary(result: dict[str, Any]) -> str | None:
     if isinstance(google_chat, dict) and google_chat:
         if google_chat.get("sent") is True:
             return "google_chat:sent"
-        outcome = (
-            google_chat.get("reason")
-            or google_chat.get("status_category")
-            or "not_sent"
-        )
+        outcome = google_chat.get("reason") or google_chat.get("status_category") or "not_sent"
         return f"google_chat:{outcome}"
     return None
 

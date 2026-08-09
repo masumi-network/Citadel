@@ -144,11 +144,7 @@ def count_adr_records() -> int | None:
         adr_dir = _repo_root() / "docs" / "adr"
         if not adr_dir.is_dir():
             return None
-        return sum(
-            1
-            for path in adr_dir.glob("*.md")
-            if path.name[:4].isdigit()
-        )
+        return sum(1 for path in adr_dir.glob("*.md") if path.name[:4].isdigit())
     except OSError:
         logger.debug("ADR count unavailable", exc_info=True)
         return None

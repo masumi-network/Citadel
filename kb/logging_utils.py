@@ -56,9 +56,7 @@ def resolve_log_level(value: str | None = None) -> str:
 
 
 def resolve_cognee_log_level(value: str | None = None) -> str:
-    level = (
-        value or os.getenv(COGNEE_LOG_LEVEL_ENV) or DEFAULT_COGNEE_LOG_LEVEL
-    ).strip().upper()
+    level = (value or os.getenv(COGNEE_LOG_LEVEL_ENV) or DEFAULT_COGNEE_LOG_LEVEL).strip().upper()
     return level if level in VALID_LEVELS else DEFAULT_COGNEE_LOG_LEVEL
 
 

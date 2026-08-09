@@ -219,7 +219,9 @@ async def test_search_falls_back_to_persisted_github_digest(tmp_path: Any) -> No
         cognee=EmptyCognee(),
     )
 
-    result = await kb.search("what were the new updates all week in the org", dataset="masumi-network")
+    result = await kb.search(
+        "what were the new updates all week in the org", dataset="masumi-network"
+    )
 
     assert result[0]["source"] == "github_sync_state"
     assert result[0]["metadata"]["org"] == "masumi-network"
@@ -772,8 +774,7 @@ async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock(tmp
             self, document_ids: list[str]
         ) -> dict[str, dict[str, Any]]:
             return {
-                document_id: {"content_hash": f"hash-{document_id}"}
-                for document_id in document_ids
+                document_id: {"content_hash": f"hash-{document_id}"} for document_id in document_ids
             }
 
     fake = RepairGateway()
@@ -849,9 +850,7 @@ async def test_reconcile_corpus_refuses_apply_when_source_manifest_fails(tmp_pat
                 "missing_document_id_violation_count": 0,
             }
 
-        async def source_manifest_for_documents(
-            self, _: list[str]
-        ) -> dict[str, dict[str, Any]]:
+        async def source_manifest_for_documents(self, _: list[str]) -> dict[str, dict[str, Any]]:
             raise RuntimeError("source unavailable")
 
         async def delete_document_chunks(self, document_ids: list[str]) -> dict[str, Any]:
@@ -1255,9 +1254,7 @@ async def test_reconcile_corpus_refuses_recovery_when_dataset_membership_changed
     assert result["reason"] == "repair_dataset_membership_changed"
     assert fake.cognify_calls == []
     assert result["pending_operations"][0]["operation_id"] == "membership-drift-op"
-    assert result["pending_operations"][0]["reason"] == (
-        "repair_dataset_membership_changed"
-    )
+    assert result["pending_operations"][0]["reason"] == ("repair_dataset_membership_changed")
 
 
 @pytest.mark.asyncio
@@ -1286,9 +1283,9 @@ async def test_reconcile_corpus_refuses_recovery_without_source_manifest(tmp_pat
 
 @pytest.mark.asyncio
 async def test_reconcile_corpus_recovery_requires_apply() -> None:
-    result = await Citadel(CitadelConfig(default_dataset="notes"), cognee=FakeCognee()).reconcile_corpus(
-        recover=True
-    )
+    result = await Citadel(
+        CitadelConfig(default_dataset="notes"), cognee=FakeCognee()
+    ).reconcile_corpus(recover=True)
 
     assert result["ok"] is False
     assert result["reason"] == "repair_recovery_requires_apply"
@@ -1296,9 +1293,9 @@ async def test_reconcile_corpus_recovery_requires_apply() -> None:
 
 @pytest.mark.asyncio
 async def test_reconcile_corpus_recovery_requires_force() -> None:
-    result = await Citadel(CitadelConfig(default_dataset="notes"), cognee=FakeCognee()).reconcile_corpus(
-        apply=True, recover=True
-    )
+    result = await Citadel(
+        CitadelConfig(default_dataset="notes"), cognee=FakeCognee()
+    ).reconcile_corpus(apply=True, recover=True)
 
     assert result["ok"] is False
     assert result["reason"] == "repair_recovery_requires_force"
@@ -1522,9 +1519,7 @@ async def test_reconcile_corpus_reports_failure_phase_after_deletion(tmp_path) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repair_method", ["combined", "oversized"])
-async def test_reconcile_stops_after_partial_delete_failure(
-    tmp_path, repair_method: str
-) -> None:
+async def test_reconcile_stops_after_partial_delete_failure(tmp_path, repair_method: str) -> None:
     class PartialDeleteGateway(FakeCognee):
         def __init__(self) -> None:
             super().__init__()
@@ -2245,8 +2240,7 @@ def test_github_digest_fossil_never_matches_real_content() -> None:
     # (g) A line the renderer never emitted inside the header block.
     tampered = _DIGEST_FOSSIL_DOC.replace(
         "Source: https://github.com/orgs/masumi-network/repositories",
-        "Source: https://github.com/orgs/masumi-network/repositories\n"
-        "Reviewed by: sarthi",
+        "Source: https://github.com/orgs/masumi-network/repositories\nReviewed by: sarthi",
     )
     assert _legacy_garbage_kind("d8", {"text": tampered}) is None
     # (h) Header fields out of renderer order.
@@ -2271,10 +2265,7 @@ def test_github_digest_fossil_is_matched() -> None:
     from kb.service import _legacy_garbage_kind
 
     assert _legacy_garbage_kind("g1", {"text": _DIGEST_FOSSIL_DOC}) == "github_digest_fossil"
-    assert (
-        _legacy_garbage_kind("g2", {"text": _DIGEST_FOSSIL_OLDEST_DOC})
-        == "github_digest_fossil"
-    )
+    assert _legacy_garbage_kind("g2", {"text": _DIGEST_FOSSIL_OLDEST_DOC}) == "github_digest_fossil"
     # The middle vintage rendered Checked at: without a Window started at: line.
     no_window = _DIGEST_FOSSIL_DOC.replace("Window started at: 2026-07-18T05:44:02Z\n", "")
     assert _legacy_garbage_kind("g3", {"text": no_window}) == "github_digest_fossil"

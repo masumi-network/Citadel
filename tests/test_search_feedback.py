@@ -147,9 +147,7 @@ async def test_mesh_record_search_telemetry_increments_feedback_index() -> None:
         primary_dataset="notes",
         tool_name="citadel_search",
     )
-    feedback_id = await mesh.record_search_telemetry(
-        CONFIG, telemetry=telemetry, dataset="notes"
-    )
+    feedback_id = await mesh.record_search_telemetry(CONFIG, telemetry=telemetry, dataset="notes")
     snapshot = await mesh.snapshot(CONFIG)
 
     assert feedback_id.startswith("feedback:")

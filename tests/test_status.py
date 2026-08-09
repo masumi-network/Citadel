@@ -76,7 +76,9 @@ def test_check_local_setup(tmp_path: Path, monkeypatch) -> None:
     user_settings = claude_user_settings_path()
     user_settings.parent.mkdir(parents=True, exist_ok=True)
     user_settings.write_text(
-        json.dumps({"hooks": {"SessionEnd": [{"hooks": [{"command": status_mod.SESSION_HOOK_MARKER}]}]}})
+        json.dumps(
+            {"hooks": {"SessionEnd": [{"hooks": [{"command": status_mod.SESSION_HOOK_MARKER}]}]}}
+        )
     )
     cfg = tmp_path / "capture.json"
     cfg.write_text(json.dumps({"roots": [{"path": "/tmp/x", "tags": ["org-work"]}]}))
@@ -124,7 +126,9 @@ def test_assess_mcp_setup_states(tmp_path: Path, monkeypatch) -> None:
     # a token alone will not expose hosted tools.
     monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
     (tmp_path / ".mcp.json").write_text(
-        json.dumps({"mcpServers": {"citadel": {"command": "python", "args": ["-m", "kb.mcp_server"]}}})
+        json.dumps(
+            {"mcpServers": {"citadel": {"command": "python", "args": ["-m", "kb.mcp_server"]}}}
+        )
     )
     unconfigured_no_token = status_mod.assess_mcp_setup(tmp_path)
     assert unconfigured_no_token.data["state"] == status_mod.MCP_STATE_READY_BUT_UNCONFIGURED
@@ -137,11 +141,7 @@ def test_assess_mcp_setup_states(tmp_path: Path, monkeypatch) -> None:
 
     (tmp_path / ".mcp.json").write_text(
         json.dumps(
-            {
-                "mcpServers": {
-                    "citadel": {"type": "http", "url": "https://citadel.example/mcp/"}
-                }
-            }
+            {"mcpServers": {"citadel": {"type": "http", "url": "https://citadel.example/mcp/"}}}
         )
     )
     ready = status_mod.assess_mcp_setup(tmp_path)
@@ -171,9 +171,13 @@ def test_gather_status_skips_search_by_default(tmp_path: Path, monkeypatch) -> N
         if "/healthz" in url:
             return _FakeResp({"ok": True})
         if "/api/session" in url:
-            return _FakeResp({"ok": True, "role": "writer", "seat_slug": "s", "actor": {"name": "S"}})
+            return _FakeResp(
+                {"ok": True, "role": "writer", "seat_slug": "s", "actor": {"name": "S"}}
+            )
         if "/readyz" in url:
-            return _FakeResp({"ok": True, "corpus": {"ok": True, "tracked_sources": 1, "indexed_docs": 1}})
+            return _FakeResp(
+                {"ok": True, "corpus": {"ok": True, "tracked_sources": 1, "indexed_docs": 1}}
+            )
         if "/api/contributions/recent" in url:
             return _FakeResp({"contributions": []})
         raise AssertionError(f"unexpected URL {url}")
@@ -216,7 +220,9 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
                     "actor": {"name": "Sarthi"},
                 },
                 "/search": {"results": [{"id": 1}]},
-                "/api/contributions/recent": {"contributions": [{"title": "feat: x", "created_at": "2026-06-27T10:00:00"}]},
+                "/api/contributions/recent": {
+                    "contributions": [{"title": "feat: x", "created_at": "2026-06-27T10:00:00"}]
+                },
             }
         ),
     )
@@ -247,8 +253,12 @@ def test_readiness_auth_required_and_search_codes(tmp_path: Path) -> None:
         healthy=False,
         identity={},
         checks=[
-            Check("auth", ok=False, detail="no token", data={"code": status_mod.CODE_AUTH_REQUIRED}),
-            Check("search", ok=False, detail="skipped", data={"code": status_mod.CODE_AUTH_REQUIRED}),
+            Check(
+                "auth", ok=False, detail="no token", data={"code": status_mod.CODE_AUTH_REQUIRED}
+            ),
+            Check(
+                "search", ok=False, detail="skipped", data={"code": status_mod.CODE_AUTH_REQUIRED}
+            ),
         ],
         recent=[],
         repo=str(tmp_path),
@@ -335,11 +345,17 @@ def test_check_corpus_red_when_readyz_503(monkeypatch) -> None:
     import urllib.error
 
     body = json.dumps(
-        {"ok": False, "corpus": {"ok": False, "tracked_sources": 200, "indexed_docs": 0}, "canary": None}
+        {
+            "ok": False,
+            "corpus": {"ok": False, "tracked_sources": 200, "indexed_docs": 0},
+            "canary": None,
+        }
     ).encode()
 
     def raise_503(request, timeout=None):
-        raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, io.BytesIO(body))
+        raise urllib.error.HTTPError(
+            request.full_url, 503, "Service Unavailable", {}, io.BytesIO(body)
+        )
 
     monkeypatch.setattr(status_mod._OPENER, "open", raise_503)
     check = status_mod.check_corpus("https://node.example", "ctdl_tok")
@@ -352,7 +368,15 @@ def test_check_corpus_ok_when_readyz_healthy(monkeypatch) -> None:
     monkeypatch.setattr(
         status_mod._OPENER,
         "open",
-        _route({"/readyz": {"ok": True, "corpus": {"ok": True, "tracked_sources": 200, "indexed_docs": 280}, "canary": {"ok": True}}}),
+        _route(
+            {
+                "/readyz": {
+                    "ok": True,
+                    "corpus": {"ok": True, "tracked_sources": 200, "indexed_docs": 280},
+                    "canary": {"ok": True},
+                }
+            }
+        ),
     )
     check = status_mod.check_corpus("https://node.example", "ctdl_tok")
     assert check is not None and check.ok is True
@@ -368,7 +392,9 @@ def test_gather_status_node_down(tmp_path: Path) -> None:
     original = s._OPENER.open
     s._OPENER.open = boom  # type: ignore[assignment]
     try:
-        report = gather_status("https://node.example", "ctdl_tok", repo=tmp_path, config_path=tmp_path / "c.json")
+        report = gather_status(
+            "https://node.example", "ctdl_tok", repo=tmp_path, config_path=tmp_path / "c.json"
+        )
     finally:
         s._OPENER.open = original  # type: ignore[assignment]
     assert not report.healthy
@@ -422,7 +448,12 @@ def test_render_text_search_failure_warns_not_fails() -> None:
         identity={},
         checks=[
             Check("node", ok=True, detail="healthy"),
-            Check("search", ok=False, detail="timed out after 3s — node warming up", data={"timed_out": True}),
+            Check(
+                "search",
+                ok=False,
+                detail="timed out after 3s — node warming up",
+                data={"timed_out": True},
+            ),
         ],
         recent=[],
     )
@@ -495,14 +526,24 @@ def test_humanize_net_error_translates_dns_noise() -> None:
     # Raw urllib reasons read like C errno dumps — humans get words.
     exc = OSError("<urlopen error [Errno 8] nodename nor servname provided, or not known>")
     assert status_mod._humanize_net_error(exc) == "cannot resolve host"
-    assert status_mod._humanize_net_error(OSError("[Errno 61] Connection refused")) == "connection refused"
+    assert (
+        status_mod._humanize_net_error(OSError("[Errno 61] Connection refused"))
+        == "connection refused"
+    )
 
 
 def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         status_mod._OPENER,
         "open",
-        _route({"/healthz": {"ok": True}, "/api/session": {"ok": True, "role": "writer", "seat_slug": "s"}, "/search": {"results": []}, "/api/contributions/recent": {"contributions": []}}),
+        _route(
+            {
+                "/healthz": {"ok": True},
+                "/api/session": {"ok": True, "role": "writer", "seat_slug": "s"},
+                "/search": {"results": []},
+                "/api/contributions/recent": {"contributions": []},
+            }
+        ),
     )
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_tok")
     args = argparse.Namespace(
@@ -555,7 +596,10 @@ def test_fetch_events_builds_scoped_url_and_parses(monkeypatch) -> None:
     def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
         captured["url"] = request.full_url
         return _FakeResp(
-            {"events": [{"id": 7, "type": "ingest", "message": "Memory indexed"}], "latest_event_id": 7}
+            {
+                "events": [{"id": 7, "type": "ingest", "message": "Memory indexed"}],
+                "latest_event_id": 7,
+            }
         )
 
     monkeypatch.setattr(status_mod._OPENER, "open", fake_open)
@@ -609,10 +653,18 @@ def test_fetch_presence_extracts_only_seat_hubs_no_content(monkeypatch) -> None:
     graph = {
         "nodes": [
             {"id": "doc-1", "label": "Alice private doc", "type": "TextDocument"},
-            {"id": "dataset:seat:alice", "label": "seat:alice", "type": "dataset",
-             "presence": {"documents": 5}},
-            {"id": "dataset:masumi-network", "label": "masumi-network", "type": "dataset",
-             "presence": {"documents": 100}},
+            {
+                "id": "dataset:seat:alice",
+                "label": "seat:alice",
+                "type": "dataset",
+                "presence": {"documents": 5},
+            },
+            {
+                "id": "dataset:masumi-network",
+                "label": "masumi-network",
+                "type": "dataset",
+                "presence": {"documents": 100},
+            },
         ]
     }
     monkeypatch.setattr(status_mod._OPENER, "open", _route({"/api/mesh/graph": graph}))
@@ -651,7 +703,9 @@ def test_seat_hint_suppressed_when_auth_failed() -> None:
         identity={"code": "AUTH_REQUIRED"},
         checks=[
             Check("node", ok=False, detail="unreachable (timed out)"),
-            Check("auth", ok=False, detail="unreachable (timed out)", data={"code": "AUTH_REQUIRED"}),
+            Check(
+                "auth", ok=False, detail="unreachable (timed out)", data={"code": "AUTH_REQUIRED"}
+            ),
         ],
         recent=[],
     )
@@ -674,10 +728,12 @@ def test_seat_hint_suppressed_when_auth_failed() -> None:
 def test_render_presence_board_sorts_by_count() -> None:
     from kb.cli import _render_presence
 
-    board = {"seats": [
-        {"seat": "seat:sarthi", "documents": 23},
-        {"seat": "masumi-network", "documents": 1022},
-    ]}
+    board = {
+        "seats": [
+            {"seat": "seat:sarthi", "documents": 23},
+            {"seat": "masumi-network", "documents": 1022},
+        ]
+    }
     out = _render_presence(board, color=False)
     assert "Team presence" in out
     assert "seat:sarthi" in out
@@ -690,8 +746,14 @@ def test_render_presence_board_sorts_by_count() -> None:
 
 def _activity_args(**kw) -> argparse.Namespace:
     base = dict(
-        limit=20, local=False, config=None, node_url="https://node.example",
-        json=True, watch=False, type=None, global_broadcast=False,
+        limit=20,
+        local=False,
+        config=None,
+        node_url="https://node.example",
+        json=True,
+        watch=False,
+        type=None,
+        global_broadcast=False,
     )
     base.update(kw)
     return argparse.Namespace(**base)

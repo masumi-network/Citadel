@@ -156,8 +156,4 @@ def parse_capture_tags_from_text(text: str) -> tuple[str, ...]:
     match = CAPTURE_TAGS_RE.search(text)
     if not match:
         return ()
-    return tuple(
-        tag.strip().lower()
-        for tag in match.group(1).split(",")
-        if tag.strip()
-    )
+    return tuple(tag.strip().lower() for tag in match.group(1).split(",") if tag.strip())

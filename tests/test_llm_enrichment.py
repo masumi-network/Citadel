@@ -98,9 +98,7 @@ def test_malformed_llm_output_falls_back_deterministically(
 ) -> None:
     enable_enrichment(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(
-        llm_enrichment, "openrouter_chat", lambda *a, **k: "definitely { not json"
-    )
+    monkeypatch.setattr(llm_enrichment, "openrouter_chat", lambda *a, **k: "definitely { not json")
 
     outcome = enrich_source_material(LONG_MATERIAL)
 
@@ -163,9 +161,7 @@ def test_security_flagged_material_is_never_sent_to_the_llm(
         raise AssertionError("flagged content must never reach the LLM")
 
     monkeypatch.setattr(llm_enrichment, "openrouter_chat", explode)
-    flagged = (
-        "Deploy notes\n\nghp_0123456789abcdefghijklmnopqrstuvwxyz123456\n\nMore text"
-    )
+    flagged = "Deploy notes\n\nghp_0123456789abcdefghijklmnopqrstuvwxyz123456\n\nMore text"
 
     outcome = enrich_source_material(flagged)
 
@@ -246,9 +242,7 @@ async def test_learning_process_ingests_enriched_chunks_with_merged_tags(
         "chunks": 2,
         "model": "deepseek/deepseek-v4-flash",
     }
-    enrichment_events = [
-        event for event in snapshot["events"] if event["type"] == "enrichment"
-    ]
+    enrichment_events = [event for event in snapshot["events"] if event["type"] == "enrichment"]
     assert enrichment_events[0]["details"]["used_llm"] is True
     assert enrichment_events[0]["details"]["chunks"] == 2
 
