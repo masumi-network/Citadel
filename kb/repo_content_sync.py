@@ -721,6 +721,7 @@ class RepoContentSyncer:
         ingested_files = 0
         skipped_files = 0
         blocked_files = 0
+        tombstoned_files = 0
         improved = False
         skip_totals: dict[str, int] = {}
         blocked_reasons: dict[str, int] = {}
@@ -765,6 +766,7 @@ class RepoContentSyncer:
                 "skipped": 0,
                 "skipped_reasons": {},
                 "blocked": 0,
+                "tombstoned": 0,
                 "blocked_paths": [],
                 "errors": [],
             }
@@ -798,6 +800,46 @@ class RepoContentSyncer:
                 )
                 repo_result["paths_discovered"] = len(paths)
                 repo_result["ref"] = ref
+
+                if not dry_run and getattr(self.citadel, "lifecycle_store", None) is not None:
+                    repo_prefix = f"{full_name}/"
+                    discovered_keys = {f"{full_name}/{path}" for path in paths}
+                    missing_tracked_keys = sorted(
+                        key
+                        for key in tracked
+                        if key.startswith(repo_prefix) and key not in discovered_keys
+                    )
+                    for key in missing_tracked_keys:
+                        path = key[len(repo_prefix) :]
+                        try:
+                            still_exists = await asyncio.to_thread(
+                                self.client.file_exists,
+                                full_name,
+                                path,
+                                ref=ref,
+                            )
+                        except GitHubAPIError as exc:
+                            repo_result["errors"].append(
+                                {"path": path, "error": str(exc)[:200]}
+                            )
+                            continue
+                        if still_exists:
+                            continue
+                        tombstones = await self.citadel.tombstone_source(
+                            dataset=self.config.repo_content_sync_dataset,
+                            source_key=f"github:{full_name}:path:{path}",
+                            reason="GitHub repository path deleted",
+                            source_locator=(
+                                f"https://github.com/{full_name}/blob/{ref}/{path}"
+                            ),
+                            capture_actor_id="github-repo-content-sync",
+                            capture_run_id=checked_at,
+                        )
+                        if tombstones:
+                            tombstoned_files += 1
+                            repo_result["tombstoned"] += 1
+                            tracked.pop(key, None)
+                            _checkpoint(tracked)
 
                 for path in paths:
                     key = f"{full_name}/{path}"
@@ -1162,6 +1204,7 @@ class RepoContentSyncer:
             "repos_scanned": len(repo_results),
             "repos_errored": len(repos_errored),
             "files_ingested": ingested_files,
+            "files_tombstoned": tombstoned_files,
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_blocked": blocked_files,

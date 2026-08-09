@@ -56,6 +56,9 @@ class QdrantOperationScope:
 _QDRANT_SCOPE: contextvars.ContextVar[QdrantOperationScope | None] = contextvars.ContextVar(
     "citadel_qdrant_scope", default=None
 )
+_QDRANT_DOCUMENT_IDS: contextvars.ContextVar[frozenset[str] | None] = (
+    contextvars.ContextVar("citadel_qdrant_document_ids", default=None)
+)
 
 
 def _required_text(value: str, field_name: str) -> str:
@@ -89,6 +92,17 @@ def qdrant_scope(
         yield requested
     finally:
         _QDRANT_SCOPE.reset(token)
+
+
+@contextlib.contextmanager
+def qdrant_document_scope(document_ids: Sequence[str]) -> Iterator[frozenset[str]]:
+    """Limit chunk search before ranking to lifecycle-authorized document ids."""
+    allowed = frozenset(str(document_id) for document_id in document_ids)
+    token = _QDRANT_DOCUMENT_IDS.set(allowed)
+    try:
+        yield allowed
+    finally:
+        _QDRANT_DOCUMENT_IDS.reset(token)
 
 
 def _hash(value: str, length: int = 12) -> str:
@@ -308,6 +322,7 @@ class CitadelQdrantAdapter(VectorDBInterface):
         node_names: Sequence[str] | None = None,
         node_name_filter_operator: str = "OR",
         point_ids: Sequence[str | UUID] | None = None,
+        document_ids: Sequence[str] | None = None,
     ) -> models.Filter:
         conditions: list[Any] = [
             models.FieldCondition(
@@ -321,6 +336,13 @@ class CitadelQdrantAdapter(VectorDBInterface):
         ]
         if point_ids:
             conditions.append(models.HasIdCondition(has_id=list(point_ids)))
+        if document_ids:
+            conditions.append(
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchAny(any=list(document_ids)),
+                )
+            )
         if node_names:
             names = [str(name) for name in node_names if str(name).strip()]
             if node_name_filter_operator == "AND":
@@ -365,7 +387,7 @@ class CitadelQdrantAdapter(VectorDBInterface):
                             )
                         },
                         hnsw_config=models.HnswConfigDiff(
-                            m=16,
+                            m=0,
                             ef_construct=100,
                             payload_m=16,
                         ),
@@ -386,6 +408,12 @@ class CitadelQdrantAdapter(VectorDBInterface):
                         type=models.KeywordIndexType.KEYWORD,
                         is_tenant=True,
                     ),
+                    wait=True,
+                )
+                await client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="document_id",
+                    field_schema=models.PayloadSchemaType.KEYWORD,
                     wait=True,
                 )
             except Exception as exc:
@@ -576,6 +604,9 @@ class CitadelQdrantAdapter(VectorDBInterface):
         if query_text is None and query_vector is None:
             raise MissingQueryParameterError()
         scope = self._scope({"read"})
+        allowed_document_ids = _QDRANT_DOCUMENT_IDS.get()
+        if allowed_document_ids == frozenset():
+            return []
         physical = physical_collection_name(
             self.generation_id, scope.dataset, collection_name
         )
@@ -602,6 +633,11 @@ class CitadelQdrantAdapter(VectorDBInterface):
                     scope.dataset,
                     node_names=node_name,
                     node_name_filter_operator=node_name_filter_operator,
+                    document_ids=(
+                        sorted(allowed_document_ids)
+                        if allowed_document_ids is not None
+                        else None
+                    ),
                 ),
                 limit=limit,
                 with_vectors=with_vector,
@@ -623,6 +659,9 @@ class CitadelQdrantAdapter(VectorDBInterface):
         node_name: list[str] | None = None,
     ) -> list[list[ScoredResult]]:
         scope = self._scope({"read"})
+        allowed_document_ids = _QDRANT_DOCUMENT_IDS.get()
+        if allowed_document_ids == frozenset():
+            return [[] for _ in query_texts]
         physical = physical_collection_name(
             self.generation_id, scope.dataset, collection_name
         )
@@ -651,6 +690,11 @@ class CitadelQdrantAdapter(VectorDBInterface):
                         filter=self._scope_filter(
                             scope.dataset,
                             node_names=node_name,
+                            document_ids=(
+                                sorted(allowed_document_ids)
+                                if allowed_document_ids is not None
+                                else None
+                            ),
                         ),
                         limit=limit,
                         with_vector=with_vectors,
@@ -763,6 +807,7 @@ class CitadelQdrantAdapter(VectorDBInterface):
         offset: str | int | UUID | None = None,
         limit: int = 256,
         with_vectors: bool = False,
+        document_ids: Sequence[str] | None = None,
     ) -> tuple[list[ScoredResult], str | int | UUID | None]:
         scope = self._scope({"read", "admin"})
         if limit <= 0:
@@ -776,7 +821,10 @@ class CitadelQdrantAdapter(VectorDBInterface):
         try:
             page, next_offset = await client.scroll(
                 collection_name=physical,
-                scroll_filter=self._scope_filter(scope.dataset),
+                scroll_filter=self._scope_filter(
+                    scope.dataset,
+                    document_ids=document_ids,
+                ),
                 offset=offset,
                 limit=limit,
                 with_payload=True,

@@ -13,6 +13,7 @@ from kb.qdrant_adapter import (
     QdrantProviderError,
     QdrantScopeError,
     physical_collection_name,
+    qdrant_document_scope,
     qdrant_scope,
     register_qdrant_adapter,
 )
@@ -153,6 +154,16 @@ def _filtered_ids(filter_value: object) -> list[object]:
     return []
 
 
+def _matched_any(filter_value: object, key: str) -> list[object]:
+    for condition in getattr(filter_value, "must", None) or []:
+        if getattr(condition, "key", None) != key:
+            continue
+        match = getattr(condition, "match", None)
+        if match is not None and hasattr(match, "any"):
+            return list(match.any)
+    return []
+
+
 def _assert_tenant_filter(filter_value: object, dataset: str = ALICE) -> None:
     expected = {
         "citadel_generation_id": GENERATION,
@@ -212,6 +223,30 @@ def test_physical_collection_is_shared_by_datasets_within_generation() -> None:
         "generation-next", ALICE, LOGICAL_COLLECTION
     )
     assert alice != physical_collection_name(GENERATION, ALICE, "Entity_name")
+
+
+@pytest.mark.asyncio
+async def test_new_collection_uses_tenant_hnsw_and_scope_indexes() -> None:
+    client = _FakeClient()
+    client.collection_exists_result = False
+    adapter = _adapter(client)
+
+    with qdrant_scope(mode="write", generation_id=GENERATION, dataset=ALICE):
+        await adapter.create_collection(LOGICAL_COLLECTION)
+
+    creation = client.kwargs_for("create_collection")
+    assert len(creation) == 1
+    hnsw_config = creation[0]["hnsw_config"]
+    assert hnsw_config.m == 0
+    assert hnsw_config.payload_m == 16
+
+    indexes = client.kwargs_for("create_payload_index")
+    assert [index["field_name"] for index in indexes] == [
+        "citadel_generation_id",
+        "citadel_dataset_scope",
+        "document_id",
+    ]
+    assert indexes[1]["field_schema"].is_tenant is True
 
 
 def test_read_without_scope_fails_before_provider_request() -> None:
@@ -477,6 +512,34 @@ async def test_search_uses_shared_collection_and_mandatory_tenant_filter() -> No
     )
     _assert_tenant_filter(request["query_filter"])
     assert client.kwargs_for("close")
+
+
+@pytest.mark.asyncio
+async def test_search_filters_lifecycle_documents_before_qdrant_ranking() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+
+    with qdrant_scope(mode="read", generation_id=GENERATION, dataset=ALICE):
+        with qdrant_document_scope(["current-a", "current-b"]):
+            await adapter.search(LOGICAL_COLLECTION, query_vector=[1.0, 0.0, 0.0])
+
+    request = client.kwargs_for("query_points")[-1]
+    assert _matched_any(request["query_filter"], "document_id") == [
+        "current-a",
+        "current-b",
+    ]
+
+    calls_before_empty_scope = len(client.kwargs_for("query_points"))
+    with qdrant_scope(mode="read", generation_id=GENERATION, dataset=ALICE):
+        with qdrant_document_scope([]):
+            assert (
+                await adapter.search(
+                    LOGICAL_COLLECTION,
+                    query_vector=[1.0, 0.0, 0.0],
+                )
+                == []
+            )
+    assert len(client.kwargs_for("query_points")) == calls_before_empty_scope
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,24 @@ class FakeCitadel:
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
 
+    async def tombstone_source(self, **kwargs: Any) -> tuple[IngestResult, ...]:
+        calls = getattr(self, "tombstone_calls", None)
+        if calls is None:
+            calls = []
+            self.tombstone_calls = calls
+        calls.append(kwargs)
+        return (
+            IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"],
+                (),
+                source_revision_id="tombstone-source",
+                projection_job_id="tombstone-job",
+                projection_state="pending",
+            ),
+        )
+
     def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
         if projection_job_id not in {"job-1", "job-seat"}:
             raise KeyError(projection_job_id)
@@ -519,7 +537,7 @@ def test_projection_operation_status_enforces_private_dataset_scope(
             allowed_datasets=("notes",),
         ),
     )
-    assert reader.get("/api/operations/job-seat").status_code == 403
+    assert reader.get("/api/operations/job-seat").status_code == 404
 
 
 def test_public_state_and_discovery_share_deployment_identity() -> None:
@@ -2681,6 +2699,47 @@ def test_obsidian_vault_sync_registers_pushes_pulls_and_lists_sources(tmp_path: 
         },
     )
     assert rejected.status_code == 403
+
+
+def test_obsidian_delete_tombstones_lifecycle_source(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    client = authed_client("test-writer")
+    citadel = app.state.citadel
+    vault_id = client.post(
+        "/api/obsidian/vaults",
+        json={"vault_name": "Delete Vault"},
+    ).json()["vault"]["id"]
+    first = client.post(
+        "/api/obsidian/sync/push",
+        json={
+            "vault_id": vault_id,
+            "dataset": "notes",
+            "documents": [{"path": "Old.md", "content": "old body"}],
+        },
+    )
+    revision = first.json()["accepted"][0]["rev"]
+
+    deleted = client.post(
+        "/api/obsidian/sync/push",
+        json={
+            "vault_id": vault_id,
+            "dataset": "notes",
+            "documents": [
+                {
+                    "path": "Old.md",
+                    "content": "",
+                    "base_rev": revision,
+                    "deleted": True,
+                }
+            ],
+        },
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json()["ingest_results"][0]["reason"] == "queued_not_confirmed"
+    assert citadel.tombstone_calls[0]["source_key"] == f"obsidian:{vault_id}:Old.md"
+    assert citadel.tombstone_calls[0]["dataset"] == "notes"
 
 
 def test_obsidian_vault_sync_detects_and_resolves_conflicts(tmp_path: Any) -> None:

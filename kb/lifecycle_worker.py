@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any, Protocol
 
@@ -16,6 +17,57 @@ from kb.lifecycle import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class _LeaseHeartbeat:
+    def __init__(
+        self,
+        store: LifecycleStore,
+        lease: ProjectionLease,
+        *,
+        lease_seconds: float,
+        started_at: datetime,
+    ) -> None:
+        self.store = store
+        self.lease = lease
+        self.lease_seconds = lease_seconds
+        self.started_at = started_at
+        self.loop = asyncio.get_running_loop()
+        self.started_monotonic = self.loop.time()
+        self.interval = max(0.01, min(30.0, lease_seconds / 3))
+
+    def _now(self) -> datetime:
+        return self.started_at + timedelta(
+            seconds=self.loop.time() - self.started_monotonic
+        )
+
+    async def wait(self, awaitable: Awaitable[Any]) -> Any:
+        self.store.renew_lease(
+            self.lease,
+            now=self._now(),
+            lease_seconds=self.lease_seconds,
+        )
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=self.interval,
+                    )
+                except TimeoutError:
+                    if task.done():
+                        return task.result()
+                    self.store.renew_lease(
+                        self.lease,
+                        now=self._now(),
+                        lease_seconds=self.lease_seconds,
+                    )
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
 
 
 class ProjectionGateway(Protocol):
@@ -43,6 +95,8 @@ class ProjectionGateway(Protocol):
     async def corpus_graph_presence(
         self,
         document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
     ) -> set[str] | None: ...
 
 
@@ -59,6 +113,9 @@ class LifecycleProjectionWorker:
         gateway: ProjectionGateway,
         *,
         worker_id: str,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+        config_digest: str | None = None,
         lease_seconds: float = 120,
         retry_backoff_seconds: float = 5,
         max_attempts: int = 5,
@@ -69,6 +126,9 @@ class LifecycleProjectionWorker:
         self.store = store
         self.gateway = gateway
         self.worker_id = worker_id
+        self.generation_id = generation_id
+        self.projection_version = projection_version
+        self.config_digest = config_digest
         self.lease_seconds = lease_seconds
         self.retry_backoff_seconds = retry_backoff_seconds
         self.max_attempts = max_attempts
@@ -83,13 +143,22 @@ class LifecycleProjectionWorker:
         operation_time = now or datetime.now(UTC)
         lease = self.store.claim_next_job(
             worker_id=self.worker_id,
+            generation_id=self.generation_id,
+            projection_version=self.projection_version,
+            config_digest=self.config_digest,
             now=operation_time,
             lease_seconds=self.lease_seconds,
         )
         if lease is None:
             return False
+        heartbeat = _LeaseHeartbeat(
+            self.store,
+            lease,
+            lease_seconds=self.lease_seconds,
+            started_at=operation_time,
+        )
         try:
-            await self._project(lease, now=operation_time)
+            await self._project(lease, heartbeat=heartbeat, now=operation_time)
         except BaseException as exc:
             try:
                 if isinstance(exc, Exception) and lease.attempt >= self.max_attempts:
@@ -115,7 +184,26 @@ class LifecycleProjectionWorker:
             raise
         return True
 
-    async def _project(self, lease: ProjectionLease, *, now: datetime) -> None:
+    def matches_projection(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+    ) -> bool:
+        return (
+            self.generation_id == generation_id
+            and self.projection_version == projection_version
+            and self.config_digest == config_digest
+        )
+
+    async def _project(
+        self,
+        lease: ProjectionLease,
+        *,
+        heartbeat: _LeaseHeartbeat,
+        now: datetime,
+    ) -> None:
         operation = self.store.get_operation(lease.projection_job_id)
         source = operation.source_revision
         if source.tombstone:
@@ -129,9 +217,20 @@ class LifecycleProjectionWorker:
                 f"lifecycle v1 cannot project non-UTF-8 media type {source.media_type!r}"
             ) from exc
 
-        await self._project_relational(lease, operation, text, now=now)
+        await self._project_relational(
+            lease,
+            operation,
+            text,
+            heartbeat=heartbeat,
+            now=now,
+        )
         operation = self.store.get_operation(lease.projection_job_id)
-        await self._project_vector_and_graph(lease, operation, now=now)
+        await self._project_vector_and_graph(
+            lease,
+            operation,
+            heartbeat=heartbeat,
+            now=now,
+        )
 
     def _project_tombstone(
         self,
@@ -169,12 +268,15 @@ class LifecycleProjectionWorker:
         operation: ProjectionOperation,
         text: str,
         *,
+        heartbeat: _LeaseHeartbeat,
         now: datetime,
     ) -> None:
         receipt = self._receipt(operation, "relational")
         source = operation.source_revision
         if receipt.state not in {"completed", "searchable"}:
-            existing_ids = await self.gateway.dataset_document_ids([source.dataset])
+            existing_ids = await heartbeat.wait(
+                self.gateway.dataset_document_ids([source.dataset])
+            )
             if source.source_revision_id in {str(item) for item in existing_ids}:
                 self.store.begin_backend(lease, "relational", now=now)
                 self.store.complete_backend(
@@ -208,7 +310,7 @@ class LifecycleProjectionWorker:
                 for key, value in attestation.items()
             ):
                 remember_kwargs["attestation"] = dict(attestation)
-            added = await self.gateway.remember(text, **remember_kwargs)
+            added = await heartbeat.wait(self.gateway.remember(text, **remember_kwargs))
             self._inject_fault("after_backend_write:relational")
             self.store.complete_backend(
                 lease,
@@ -221,7 +323,9 @@ class LifecycleProjectionWorker:
             )
             self._inject_fault("after_receipt_write:relational")
         if receipt.state != "searchable":
-            document_ids = await self.gateway.dataset_document_ids([source.dataset])
+            document_ids = await heartbeat.wait(
+                self.gateway.dataset_document_ids([source.dataset])
+            )
             if source.source_revision_id not in {str(item) for item in document_ids}:
                 raise ProjectionVerificationError(
                     "relational source read did not return the accepted source revision"
@@ -234,6 +338,7 @@ class LifecycleProjectionWorker:
         lease: ProjectionLease,
         operation: ProjectionOperation,
         *,
+        heartbeat: _LeaseHeartbeat,
         now: datetime,
     ) -> None:
         source = operation.source_revision
@@ -241,6 +346,10 @@ class LifecycleProjectionWorker:
             backend: self._receipt(operation, backend)
             for backend in ("vector", "graph")
         }
+        requires_reprojection = self.store.has_completed_projection_other_than(
+            source_revision_id=source.source_revision_id,
+            projection_job_id=operation.job.projection_job_id,
+        )
         if any(
             receipt.state not in {"completed", "searchable"}
             for receipt in receipts.values()
@@ -248,7 +357,9 @@ class LifecycleProjectionWorker:
             await self._reconcile_existing_vector_and_graph(
                 lease,
                 operation,
+                heartbeat=heartbeat,
                 now=now,
+                reconcile_graph=not requires_reprojection,
             )
             operation = self.store.get_operation(lease.projection_job_id)
             receipts = {
@@ -263,9 +374,11 @@ class LifecycleProjectionWorker:
         if pending:
             for backend in pending:
                 self.store.begin_backend(lease, backend, now=now)
-            cognify_result = await self.gateway.cognify(
-                datasets=[source.dataset],
-                force=False,
+            cognify_result = await heartbeat.wait(
+                self.gateway.cognify(
+                    datasets=[source.dataset],
+                    force=requires_reprojection,
+                )
             )
             provider_operation_id = self._provider_operation_id(cognify_result)
             for backend in pending:
@@ -285,8 +398,8 @@ class LifecycleProjectionWorker:
         operation = self.store.get_operation(lease.projection_job_id)
         vector = self._receipt(operation, "vector")
         if vector.state != "searchable":
-            chunk_counts = await self.gateway.corpus_chunk_counts(
-                [source.source_revision_id]
+            chunk_counts = await heartbeat.wait(
+                self.gateway.corpus_chunk_counts([source.source_revision_id])
             )
             chunk_count = None if chunk_counts is None else chunk_counts.get(
                 source.source_revision_id
@@ -312,8 +425,11 @@ class LifecycleProjectionWorker:
         operation = self.store.get_operation(lease.projection_job_id)
         graph = self._receipt(operation, "graph")
         if graph.state != "searchable":
-            graph_ids = await self.gateway.corpus_graph_presence(
-                [source.source_revision_id]
+            graph_ids = await heartbeat.wait(
+                self.gateway.corpus_graph_presence(
+                    [source.source_revision_id],
+                    datasets=[source.dataset],
+                )
             )
             if graph_ids is None or source.source_revision_id not in {
                 str(item) for item in graph_ids
@@ -329,14 +445,19 @@ class LifecycleProjectionWorker:
         lease: ProjectionLease,
         operation: ProjectionOperation,
         *,
+        heartbeat: _LeaseHeartbeat,
         now: datetime,
+        reconcile_graph: bool,
     ) -> None:
         source = operation.source_revision
-        chunk_counts = await self.gateway.corpus_chunk_counts(
-            [source.source_revision_id]
+        chunk_counts = await heartbeat.wait(
+            self.gateway.corpus_chunk_counts([source.source_revision_id])
         )
-        graph_ids = await self.gateway.corpus_graph_presence(
-            [source.source_revision_id]
+        graph_ids = await heartbeat.wait(
+            self.gateway.corpus_graph_presence(
+                [source.source_revision_id],
+                datasets=[source.dataset],
+            )
         )
         vector_count = (
             None
@@ -348,7 +469,7 @@ class LifecycleProjectionWorker:
         }
         existing = {
             "vector": vector_count if vector_count is not None and vector_count > 0 else None,
-            "graph": 1 if graph_present else None,
+            "graph": 1 if graph_present and reconcile_graph else None,
         }
         for backend, affected_count in existing.items():
             receipt = self._receipt(

@@ -5558,8 +5558,6 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
     ingest_results: list[dict[str, Any]] = []
     written_datasets: set[str] = set()
     for accepted in result["accepted"]:
-        if accepted.get("deleted"):
-            continue
         source_document = documents_by_path.get(accepted["path"])
         if not source_document:
             continue
@@ -5573,6 +5571,30 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
             document_tags,
             citadel.config,
         )
+        if accepted.get("deleted"):
+            for target in document_targets:
+                tombstones = await citadel.tombstone_source(
+                    dataset=target.dataset,
+                    source_key=f"obsidian:{body.vault_id}:{accepted['path']}",
+                    reason="Obsidian note deleted",
+                    source_locator=f"obsidian://{body.vault_id}/{accepted['path']}",
+                    capture_actor_id=actor.actor_id,
+                    capture_run_id=push_session_id,
+                )
+                ingest_results.append(
+                    {
+                        "document_id": accepted["document_id"],
+                        "accepted": True,
+                        "reason": (
+                            "queued_not_confirmed" if tombstones else "already_absent"
+                        ),
+                        "dataset": target.dataset,
+                        "tags": list(document_tags),
+                    }
+                )
+                if tombstones:
+                    written_datasets.add(target.dataset)
+            continue
         # Enforce the same byte cap as /ingest and /api/contribute on the per-document
         # obsidian write path (#51): an oversized note is rejected individually so it
         # cannot bloat the index, without failing the rest of the vault sync.
@@ -6589,7 +6611,13 @@ async def projection_operation(projection_job_id: str, request: Request) -> Any:
     dataset = payload.get("dataset")
     if not isinstance(dataset, str) or not dataset:
         raise HTTPException(status_code=500, detail="Projection operation has no dataset.")
-    enforce_dataset_allowlist(identity, dataset)
+    try:
+        enforce_dataset_allowlist(identity, dataset)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Projection operation not found.",
+        ) from exc
     return jsonable_encoder(payload)
 
 

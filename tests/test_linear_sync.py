@@ -28,6 +28,7 @@ class FakeLinearClient(LinearClient):
         self._users = users or []
 
     def fetch_issues(self, *, max_issues: int) -> list[LinearIssue]:
+        self.last_issue_fetch_complete = len(self._issues) <= max_issues
         parsed = [LinearIssue.from_node(item) for item in self._issues]
         return [item for item in parsed if item][:max_issues]
 
@@ -726,6 +727,84 @@ async def test_linear_sync_incremental_rewrites_only_updated_issue(
     assert id_tags == {"linear:ENG-1"}  # ENG-2 untouched
     assert any("linear-workspace" in item["tags"] for item in ingests)  # digest refreshed
     assert scheduled == [["masumi-network", seat_dataset("john")]]
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_tombstones_removed_issue_and_old_mirror(
+    tmp_path: Any,
+    sample_issues: list[dict[str, Any]],
+    monkeypatch: Any,
+) -> None:
+    syncer, _, _ = _incremental_syncer(tmp_path, sample_issues, monkeypatch)
+    syncer.citadel.lifecycle_store = object()
+    tombstones: list[dict[str, Any]] = []
+
+    async def tombstone_source(**kwargs: Any) -> tuple[Any, ...]:
+        tombstones.append(kwargs)
+        return (object(),)
+
+    monkeypatch.setattr(syncer.citadel, "tombstone_source", tombstone_source)
+    assert (await syncer.run(force=False))["ok"] is True
+
+    sample_issues.pop(1)
+    sample_issues[0]["assignee"] = None
+    sample_issues[0]["updatedAt"] = "2026-06-25T12:00:00Z"
+    second = await syncer.run(force=False)
+
+    assert second["tombstoned_count"] == 2
+    assert {
+        (call["dataset"], call["source_key"], call["reason"])
+        for call in tombstones
+    } == {
+        (
+            "masumi-network",
+            "linear:issue:issue-2",
+            "Linear issue removed from synchronized scope",
+        ),
+        (
+            seat_dataset("john"),
+            "linear:issue:issue-1",
+            "Linear issue mirror assignment removed",
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_truncated_listing_does_not_tombstone_omitted_live_issue(
+    tmp_path: Any,
+    sample_issues: list[dict[str, Any]],
+    monkeypatch: Any,
+) -> None:
+    visible_issues = [sample_issues[0]]
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_max_issues=1,
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+    )
+    citadel = Citadel(config)
+    _capture_learn(monkeypatch, [])
+    syncer = LinearSyncer(citadel, client=FakeLinearClient(visible_issues))
+    first = await syncer.run(force=False)
+    assert first["listing_complete"] is True
+
+    visible_issues.insert(0, sample_issues[1])
+    citadel.lifecycle_store = object()
+    tombstones: list[dict[str, Any]] = []
+
+    async def tombstone_source(**kwargs: Any) -> tuple[Any, ...]:
+        tombstones.append(kwargs)
+        return (object(),)
+
+    monkeypatch.setattr(citadel, "tombstone_source", tombstone_source)
+    second = await syncer.run(force=False)
+
+    assert second["listing_complete"] is False
+    assert second["tombstoned_count"] == 0
+    assert tombstones == []
+    assert {
+        item["id"]
+        for item in syncer.issues_for_scope(scope="org", seat_dataset_name=None)
+    } == {"issue-1", "issue-2"}
 
 
 @pytest.mark.asyncio

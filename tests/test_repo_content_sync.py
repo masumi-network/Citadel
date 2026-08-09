@@ -34,6 +34,12 @@ from kb.repository_update import GitHubRepo
 class FakeCitadel:
     def __init__(self, config: CitadelConfig) -> None:
         self.config = config
+        self.lifecycle_store: Any | None = None
+        self.tombstone_calls: list[dict[str, Any]] = []
+
+    async def tombstone_source(self, **kwargs: Any) -> tuple[Any, ...]:
+        self.tombstone_calls.append(kwargs)
+        return (object(),)
 
 
 class FakeLearningProcess:
@@ -272,6 +278,31 @@ async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None
 
     state = json.loads(Path(config.repo_content_sync_state_path).read_text(encoding="utf-8"))
     assert state["files"]["masumi-network/sokosumi-cli/README.md"]["sha"] == "abc"
+
+
+@pytest.mark.asyncio
+async def test_repo_content_sync_tombstones_confirmed_deleted_path(tmp_path: Path) -> None:
+    config = _pinning_config(tmp_path)
+    client = FakeRepoContentClient()
+    citadel = FakeCitadel(config)
+    citadel.lifecycle_store = object()
+    syncer = RepoContentSyncer(
+        citadel,
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+    assert (await syncer.run())["files_ingested"] == 2
+    client.files.pop("masumi-network/sokosumi-cli/README.md")
+
+    second = await syncer.run()
+
+    assert second["files_tombstoned"] == 1
+    assert citadel.tombstone_calls[0]["source_key"] == (
+        "github:masumi-network/sokosumi-cli:path:README.md"
+    )
+    state = json.loads(Path(config.repo_content_sync_state_path).read_text(encoding="utf-8"))
+    assert "masumi-network/sokosumi-cli/README.md" not in state["files"]
 
 
 # --- header pinning: the body must not depend on the repo HEAD ---------------

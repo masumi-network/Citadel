@@ -48,13 +48,31 @@ class FakeProjectionGateway:
             str(self.document_id): self.chunk_count if self.projected else 0
         }
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str]:
         assert document_ids == [self.document_id]
+        assert datasets == ["seat:alice"]
         return (
             {str(self.document_id)}
             if self.projected and self.graph_present
             else set()
         )
+
+
+class SlowRememberGateway(FakeProjectionGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.remember_started = asyncio.Event()
+        self.release_remember = asyncio.Event()
+
+    async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+        self.remember_started.set()
+        await self.release_remember.wait()
+        return await super().remember(data, **kwargs)
 
 
 class PersistentProjectionGateway:
@@ -89,6 +107,7 @@ class PersistentProjectionGateway:
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
         state = self._load()
         state["cognify_calls"] += 1
+        state.setdefault("cognify_force", []).append(bool(kwargs.get("force")))
         for document_id in state["document_ids"]:
             state["chunk_counts"][document_id] = 1
             if document_id not in state["graph_ids"]:
@@ -103,7 +122,13 @@ class PersistentProjectionGateway:
         counts = self._load()["chunk_counts"]
         return {document_id: int(counts.get(document_id, 0)) for document_id in document_ids}
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str]:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str]:
+        assert datasets == ["seat:alice"]
         present = set(self._load()["graph_ids"])
         return {document_id for document_id in document_ids if document_id in present}
 
@@ -423,6 +448,34 @@ async def test_worker_marks_job_failed_after_bounded_attempts(
     }
     assert store.next_wakeup_delay(now=T0) is None
 
+    retried = store.accept_source(
+        b"permanent provider read failure",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:terminal-provider-failure",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-terminal-failure",
+            captured_at=T0,
+        ),
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="projection-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+        now=T0,
+    )
+
+    assert retried.projection_job_id == accepted.projection_job_id
+    assert retried.operation.state == "pending"
+    assert {receipt.state for receipt in retried.operation.receipts} == {"pending"}
+
 
 async def test_worker_projects_tombstone_as_provider_neutral_exclusion(
     tmp_path: Path,
@@ -507,6 +560,7 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
         store,
         PersistentProjectionGateway(str(tmp_path / "provider-old.json")),
         worker_id="worker-old",
+        generation_id="generation-1",
     )
     assert await old_worker.run_once(now=T0) is True
     assert await old_worker.run_once(now=T0) is True
@@ -528,6 +582,7 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
         store,
         PersistentProjectionGateway(str(fresh_provider_path)),
         worker_id="worker-new",
+        generation_id="generation-2",
     )
 
     assert await new_worker.run_once(now=T0) is True
@@ -542,12 +597,14 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
         for item in rebuilt
     )
     provider_state = json.loads(fresh_provider_path.read_text(encoding="utf-8"))
+    assert provider_state["cognify_force"] == [True, True]
     assert set(provider_state["document_ids"]) == {
         item.source_revision_id for item in accepted
     }
     generation = store.generation_census(
         generation_id="generation-2",
         projection_version="projection-v1",
+        config_digest="sha256:config-2",
     )
     assert generation.current_sources == 2
     assert generation.current_projection_jobs == 2
@@ -557,3 +614,48 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
         "relational": 2,
         "vector": 2,
     }
+
+
+async def test_slow_provider_write_renews_lease_before_second_worker_can_claim(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = store.accept_source(
+        b"slow projection",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:slow-provider",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="slow-run",
+            captured_at=datetime.now(UTC),
+        ),
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="projection-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+    )
+    gateway = SlowRememberGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-slow",
+        lease_seconds=0.12,
+    )
+
+    projection = asyncio.create_task(worker.run_once())
+    await gateway.remember_started.wait()
+    await asyncio.sleep(0.2)
+
+    assert store.claim_next_job(worker_id="worker-second", lease_seconds=0.12) is None
+
+    gateway.release_remember.set()
+    assert await projection is True
+    assert store.get_operation(accepted.projection_job_id).state == "searchable"

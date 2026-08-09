@@ -96,9 +96,13 @@ def test_cognee_sqlite_qdrant_survives_restart_and_keeps_dataset_scope(
         "alice-only-citadel-lite-marker private source record"
     ]
     assert first["central_cross_texts"] == first["central_texts"]
+    assert first["lifecycle_texts"] == [
+        "lifecycle-qdrant-live-marker source record"
+    ]
     assert second["central_texts"] == first["central_texts"]
     assert second["alice_texts"] == first["alice_texts"]
     assert second["central_cross_texts"] == first["central_cross_texts"]
+    assert second["lifecycle_texts"] == first["lifecycle_texts"]
     assert (tmp_path / "system" / "databases" / "cognee.db").is_file()
 
 
@@ -118,7 +122,9 @@ def _result_texts(results: list[Any]) -> list[str]:
 async def _worker() -> None:
     from cognee.infrastructure.llm import LLMGateway
     from cognee.shared.data_models import KnowledgeGraph, Node, SummarizedContent
-    from kb.cognee_client import CogneePublicClient
+    from kb.cognee_client import CogneePublicClient, _cognify_data_ids
+    from kb.config import CitadelConfig
+    from kb.service import Citadel
 
     async def mock_llm(text_input: str, system_prompt: str, response_model, **kwargs):
         del system_prompt, kwargs
@@ -128,7 +134,14 @@ async def _worker() -> None:
                 description=text_input[:160],
             )
         if response_model is KnowledgeGraph:
-            marker = "alice" if "alice" in text_input.lower() else "central"
+            lowered = text_input.lower()
+            marker = (
+                "alice"
+                if "alice" in lowered
+                else "lifecycle"
+                if "lifecycle" in lowered
+                else "central"
+            )
             return KnowledgeGraph(
                 nodes=[
                     Node(
@@ -148,6 +161,17 @@ async def _worker() -> None:
     client = CogneePublicClient()
     central_marker = "central-only-citadel-lite-marker"
     alice_marker = "alice-only-citadel-lite-marker"
+    lifecycle_marker = "lifecycle-qdrant-live-marker"
+    lifecycle = Citadel(
+        CitadelConfig(
+            default_dataset="lifecycle-live",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(
+                Path(os.environ["CITADEL_STATE_DIRECTORY"]) / "lifecycle.sqlite3"
+            ),
+        ),
+        cognee=client,
+    )
     if os.environ["CITADEL_LITE_WORKER_MODE"] == "ingest":
         central_result = await client.remember(
             f"{central_marker} source record",
@@ -161,12 +185,16 @@ async def _worker() -> None:
         )
         await client.cognify(datasets=["central"])
         await client.cognify(datasets=["seat:alice"])
+        central_ids = _cognify_data_ids(central_result.get("added"))
+        alice_ids = _cognify_data_ids(alice_result.get("added"))
+        assert len(central_ids) == 1
+        assert len(alice_ids) == 1
         central_census = await client.stored_chunk_budget_check(
-            document_ids=[str(central_result[0].id)],
+            document_ids=central_ids,
             datasets=["central"],
         )
         alice_census = await client.stored_chunk_budget_check(
-            document_ids=[str(alice_result[0].id)],
+            document_ids=alice_ids,
             datasets=["seat:alice"],
         )
         assert central_census is not None
@@ -179,14 +207,35 @@ async def _worker() -> None:
         assert alice_census["chunks_scanned"] > 0
         assert central_census["missing_document_ids"] == []
         assert alice_census["missing_document_ids"] == []
+        central_counts = await client.corpus_chunk_counts(central_ids)
+        alice_counts = await client.corpus_chunk_counts(alice_ids)
+        assert central_counts is not None
+        assert alice_counts is not None
+        assert central_counts[central_ids[0]] > 0
+        assert alice_counts[alice_ids[0]] > 0
+        lifecycle_result = await lifecycle.ingest(
+            f"{lifecycle_marker} source record",
+            source_key="live:lifecycle-marker",
+        )
+        lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
+            str(lifecycle_result.projection_job_id)
+        )
+        assert lifecycle_operation["state"] == "searchable"
 
     central_hits = await client.recall(central_marker, dataset="central", top_k=10)
     central_cross_hits = await client.recall(alice_marker, dataset="central", top_k=10)
     alice_hits = await client.recall(alice_marker, dataset="seat:alice", top_k=10)
+    lifecycle_hits = await lifecycle.search(
+        lifecycle_marker,
+        dataset="lifecycle-live",
+        top_k=10,
+    )
+    await lifecycle.stop_lifecycle_queue()
     report = {
         "central_texts": _result_texts(central_hits),
         "central_cross_texts": _result_texts(central_cross_hits),
         "alice_texts": _result_texts(alice_hits),
+        "lifecycle_texts": _result_texts(lifecycle_hits),
     }
     print(_REPORT_PREFIX + json.dumps(report, sort_keys=True))
 

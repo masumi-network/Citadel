@@ -20,6 +20,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 LIFECYCLE_SCHEMA_VERSION = 1
 REQUIRED_BACKENDS = ("relational", "vector", "graph")
+LIFECYCLE_CHUNK_SOURCE_PREFIX = "citadel:chunk:v1:"
 _RECEIPT_STATES = {"pending", "running", "completed", "searchable", "failed", "stale"}
 
 
@@ -164,6 +165,7 @@ class LifecycleCensus:
 class GenerationCensus:
     generation_id: str
     projection_version: str
+    config_digest: str
     current_sources: int
     current_projection_jobs: int
     current_projection_receipts: int
@@ -201,12 +203,38 @@ def _parse_utc(value: str) -> datetime:
 
 
 def _stable_id(kind: str, *parts: str) -> str:
-    material = ":".join(("citadel", "lifecycle", "v1", kind, *parts))
+    material = json.dumps(
+        ["citadel", "lifecycle", "v1", kind, *parts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return str(uuid5(NAMESPACE_URL, material))
 
 
-def _source_revision_id(dataset: str, source_key: str, content_sha256: str) -> str:
-    return _stable_id("source", dataset, source_key, content_sha256)
+def _source_revision_id(
+    dataset: str,
+    source_key: str,
+    content_sha256: str,
+    *,
+    tombstone: bool,
+) -> str:
+    return _stable_id(
+        "source",
+        dataset,
+        source_key,
+        content_sha256,
+        "tombstone" if tombstone else "content",
+    )
+
+
+def lifecycle_chunk_source_key(source_key: str, chunk_index: int) -> str:
+    """Return one reserved deterministic child key for a logical source chunk."""
+    if not source_key:
+        raise ValueError("source_key must be a non-empty string")
+    if chunk_index < 0:
+        raise ValueError("chunk_index must be non-negative")
+    parent_id = _stable_id("chunk-parent", source_key)
+    return f"{LIFECYCLE_CHUNK_SOURCE_PREFIX}{parent_id}:{chunk_index}"
 
 
 def _projection_job_id(
@@ -392,7 +420,12 @@ class LifecycleStore:
             separators=(",", ":"),
         )
         content_digest = sha256(content).hexdigest()
-        revision_id = _source_revision_id(capture.dataset, capture.source_key, content_digest)
+        revision_id = _source_revision_id(
+            capture.dataset,
+            capture.source_key,
+            content_digest,
+            tombstone=tombstone,
+        )
         job_id = _projection_job_id(
             revision_id,
             projection.generation_id,
@@ -409,6 +442,11 @@ class LifecycleStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_generation_binding(
+                    connection,
+                    projection,
+                    providers,
+                )
                 head = connection.execute(
                     """
                     SELECT source_revision_id
@@ -418,9 +456,26 @@ class LifecycleStore:
                     (capture.dataset, capture.source_key),
                 ).fetchone()
                 previous_revision_id = str(head[0]) if head is not None else None
+                existing_revision = connection.execute(
+                    """
+                    SELECT dataset, source_key, content_sha256, tombstone
+                    FROM source_revisions
+                    WHERE source_revision_id = ?
+                    """,
+                    (revision_id,),
+                ).fetchone()
+                if existing_revision is not None and (
+                    str(existing_revision["dataset"]) != capture.dataset
+                    or str(existing_revision["source_key"]) != capture.source_key
+                    or str(existing_revision["content_sha256"]) != content_digest
+                    or bool(existing_revision["tombstone"]) != tombstone
+                ):
+                    raise LifecycleConflictError(
+                        "deterministic source revision ID has conflicting inputs"
+                    )
                 existing = connection.execute(
                     """
-                    SELECT projection_job_id, config_digest, required_backends_json
+                    SELECT projection_job_id, config_digest, required_backends_json, state
                     FROM projection_jobs
                     WHERE projection_job_id = ?
                     """,
@@ -433,40 +488,45 @@ class LifecycleStore:
                         projection,
                         providers,
                     )
-                    connection.execute("COMMIT")
-                    return self._acceptance(job_id)
+                    if (
+                        previous_revision_id == revision_id
+                        and str(existing["state"]) != "failed"
+                    ):
+                        connection.execute("COMMIT")
+                        return self._acceptance(job_id)
 
-                connection.execute(
-                    """
-                    INSERT INTO source_revisions (
-                        schema_version, source_revision_id, source_key, dataset,
-                        content_sha256, byte_length, retained_content, retained_content_ref,
-                        source_locator, media_type, previous_revision_id, capture_actor_id,
-                        capture_run_id, capture_metadata_json, captured_at, accepted_at,
-                        tombstone
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        LIFECYCLE_SCHEMA_VERSION,
-                        revision_id,
-                        capture.source_key,
-                        capture.dataset,
-                        content_digest,
-                        len(content),
-                        content,
-                        retained_ref,
-                        capture.source_locator,
-                        capture.media_type,
-                        previous_revision_id,
-                        capture.capture_actor_id,
-                        capture.capture_run_id,
-                        capture_metadata_json,
-                        captured_at,
-                        accepted_at,
-                        int(tombstone),
-                    ),
-                )
-                self._inject_fault("after_source_revision")
+                if existing_revision is None:
+                    connection.execute(
+                        """
+                        INSERT INTO source_revisions (
+                            schema_version, source_revision_id, source_key, dataset,
+                            content_sha256, byte_length, retained_content, retained_content_ref,
+                            source_locator, media_type, previous_revision_id, capture_actor_id,
+                            capture_run_id, capture_metadata_json, captured_at, accepted_at,
+                            tombstone
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            LIFECYCLE_SCHEMA_VERSION,
+                            revision_id,
+                            capture.source_key,
+                            capture.dataset,
+                            content_digest,
+                            len(content),
+                            content,
+                            retained_ref,
+                            capture.source_locator,
+                            capture.media_type,
+                            previous_revision_id,
+                            capture.capture_actor_id,
+                            capture.capture_run_id,
+                            capture_metadata_json,
+                            captured_at,
+                            accepted_at,
+                            int(tombstone),
+                        ),
+                    )
+                    self._inject_fault("after_source_revision")
                 if previous_revision_id is not None and previous_revision_id != revision_id:
                     connection.execute(
                         """
@@ -496,6 +556,32 @@ class LifecycleStore:
                     (capture.dataset, capture.source_key, revision_id, accepted_at),
                 )
                 self._inject_fault("after_source_head")
+                if existing is not None:
+                    connection.execute(
+                        """
+                        UPDATE projection_jobs
+                        SET state = 'pending', attempt = 0, lease_id = NULL,
+                            lease_owner = NULL, leased_until = NULL,
+                            available_at = ?, updated_at = ?, last_error_code = NULL,
+                            last_error_message = NULL
+                        WHERE projection_job_id = ?
+                        """,
+                        (accepted_at, accepted_at, job_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE projection_receipts
+                        SET state = 'pending', attempt = 0,
+                            provider_operation_id = NULL, affected_ids_json = '[]',
+                            affected_count = NULL, model = NULL, dimensions = NULL,
+                            metadata_json = '{}', updated_at = ?, completed_at = NULL,
+                            searchable_at = NULL, error_code = NULL, error_message = NULL
+                        WHERE projection_job_id = ?
+                        """,
+                        (accepted_at, job_id),
+                    )
+                    connection.execute("COMMIT")
+                    return self._acceptance(job_id)
                 connection.execute(
                     """
                     INSERT INTO projection_jobs (
@@ -630,6 +716,56 @@ class LifecycleStore:
         return providers
 
     @staticmethod
+    def _assert_generation_binding(
+        connection: sqlite3.Connection,
+        projection: ProjectionRequest,
+        providers: Mapping[str, str],
+    ) -> None:
+        job_bindings = connection.execute(
+            """
+            SELECT DISTINCT projection_version, config_digest, required_backends_json
+            FROM projection_jobs
+            WHERE generation_id = ?
+            """,
+            (projection.generation_id,),
+        ).fetchall()
+        for binding in job_bindings:
+            if (
+                str(binding["projection_version"]) != projection.projection_version
+                or str(binding["config_digest"]) != projection.config_digest
+                or tuple(json.loads(binding["required_backends_json"]))
+                != tuple(providers)
+            ):
+                raise LifecycleConflictError(
+                    "projection configuration changed within an existing generation; "
+                    "set a new CITADEL_GENERATION_ID"
+                )
+        stored_providers = {
+            (str(row["backend"]), str(row["provider"]))
+            for row in connection.execute(
+                """
+                SELECT DISTINCT receipt.backend, receipt.provider
+                FROM projection_receipts AS receipt
+                JOIN projection_jobs AS job
+                  ON job.projection_job_id = receipt.projection_job_id
+                WHERE job.generation_id = ?
+                """,
+                (projection.generation_id,),
+            ).fetchall()
+        }
+        if stored_providers and stored_providers != set(providers.items()):
+            raise LifecycleConflictError(
+                "projection providers changed within an existing generation; "
+                "set a new CITADEL_GENERATION_ID"
+            )
+
+    def assert_generation_binding(self, projection: ProjectionRequest) -> None:
+        """Reject projection drift inside one physical provider generation."""
+        providers = self._validate_projection(projection)
+        with self._connect() as connection:
+            self._assert_generation_binding(connection, projection, providers)
+
+    @staticmethod
     def _assert_idempotent_job(
         connection: sqlite3.Connection,
         row: sqlite3.Row,
@@ -683,6 +819,11 @@ class LifecycleStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_generation_binding(
+                    connection,
+                    projection,
+                    providers,
+                )
                 current_sources = connection.execute(
                     """
                     SELECT revision.source_revision_id, revision.dataset
@@ -792,6 +933,27 @@ class LifecycleStore:
             raise LifecycleNotFoundError(f"source revision not found: {source_revision_id}")
         return bytes(row[0])
 
+    def has_completed_projection_other_than(
+        self,
+        *,
+        source_revision_id: str,
+        projection_job_id: str,
+    ) -> bool:
+        """Return whether this source already completed under another projection."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM projection_jobs
+                WHERE source_revision_id = ?
+                  AND projection_job_id != ?
+                  AND state = 'completed'
+                LIMIT 1
+                """,
+                (source_revision_id, projection_job_id),
+            ).fetchone()
+        return row is not None
+
     def get_current_revision(self, dataset: str, source_key: str) -> SourceRevision:
         with self._connect() as connection:
             row = connection.execute(
@@ -809,6 +971,47 @@ class LifecycleStore:
                 f"current source revision not found: dataset={dataset!r} source_key={source_key!r}"
             )
         return self._source_revision(row)
+
+    def current_revisions_for_source(
+        self,
+        dataset: str,
+        source_key: str,
+        *,
+        include_chunks: bool = True,
+    ) -> tuple[SourceRevision, ...]:
+        """Return current exact and optional chunk revisions for one logical source."""
+        with self._connect() as connection:
+            if include_chunks:
+                rows = connection.execute(
+                    """
+                    SELECT revision.*
+                    FROM source_heads AS head
+                    JOIN source_revisions AS revision
+                      ON revision.source_revision_id = head.source_revision_id
+                    WHERE head.dataset = ?
+                      AND (
+                          head.source_key = ?
+                          OR json_extract(
+                              revision.capture_metadata_json,
+                              '$.lifecycle_parent_source_key'
+                          ) = ?
+                      )
+                    ORDER BY head.source_key
+                    """,
+                    (dataset, source_key, source_key),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT revision.*
+                    FROM source_heads AS head
+                    JOIN source_revisions AS revision
+                      ON revision.source_revision_id = head.source_revision_id
+                    WHERE head.dataset = ? AND head.source_key = ?
+                    """,
+                    (dataset, source_key),
+                ).fetchall()
+        return tuple(self._source_revision(row) for row in rows)
 
     def get_operation(self, projection_job_id: str) -> ProjectionOperation:
         with self._connect() as connection:
@@ -856,6 +1059,7 @@ class LifecycleStore:
         *,
         generation_id: str,
         projection_version: str,
+        config_digest: str,
         backend: str = "vector",
     ) -> RetrievalBinding | None:
         """Resolve one provider candidate against the current source head."""
@@ -888,6 +1092,7 @@ class LifecycleStore:
                     WHERE receipt.source_revision_id = ?
                       AND receipt.generation_id = ?
                       AND receipt.projection_version = ?
+                      AND job.config_digest = ?
                       AND receipt.backend = ?
                       AND receipt.state = 'searchable'
                       AND job.state = 'completed'
@@ -897,6 +1102,7 @@ class LifecycleStore:
                         source_revision_id,
                         generation_id,
                         projection_version,
+                        config_digest,
                         backend,
                     ),
                 ).fetchone()
@@ -910,16 +1116,67 @@ class LifecycleStore:
             ),
         )
 
+    def searchable_source_revision_ids(
+        self,
+        *,
+        dataset: str,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+        backend: str = "vector",
+    ) -> tuple[str, ...]:
+        """Enumerate current provider ids eligible for one scoped retrieval."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT revision.source_revision_id
+                FROM source_heads AS head
+                JOIN source_revisions AS revision
+                  ON revision.source_revision_id = head.source_revision_id
+                JOIN projection_jobs AS job
+                  ON job.source_revision_id = revision.source_revision_id
+                JOIN projection_receipts AS receipt
+                  ON receipt.projection_job_id = job.projection_job_id
+                WHERE head.dataset = ?
+                  AND revision.tombstone = 0
+                  AND job.generation_id = ?
+                  AND job.projection_version = ?
+                  AND job.config_digest = ?
+                  AND job.state = 'completed'
+                  AND receipt.backend = ?
+                  AND receipt.state = 'searchable'
+                ORDER BY revision.source_revision_id
+                """,
+                (
+                    dataset,
+                    generation_id,
+                    projection_version,
+                    config_digest,
+                    backend,
+                ),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
     def claim_next_job(
         self,
         *,
         worker_id: str,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+        config_digest: str | None = None,
         now: datetime | None = None,
         lease_seconds: float = 120,
     ) -> ProjectionLease | None:
         """Claim one due job and recover an expired lease in the same transaction."""
         if not worker_id.strip():
             raise ValueError("worker_id must be a non-empty string")
+        for value, label in (
+            (generation_id, "generation_id"),
+            (projection_version, "projection_version"),
+            (config_digest, "config_digest"),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"{label} must be non-empty when provided")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         claimed_at = now or datetime.now(UTC)
@@ -933,15 +1190,27 @@ class LifecycleStore:
                     """
                     SELECT *
                     FROM projection_jobs
-                    WHERE (
-                        state = 'pending' AND available_at <= ?
-                    ) OR (
-                        state = 'running' AND leased_until IS NOT NULL AND leased_until <= ?
-                    )
+                    WHERE (? IS NULL OR generation_id = ?)
+                      AND (? IS NULL OR projection_version = ?)
+                      AND (? IS NULL OR config_digest = ?)
+                      AND ((
+                          state = 'pending' AND available_at <= ?
+                      ) OR (
+                          state = 'running' AND leased_until IS NOT NULL AND leased_until <= ?
+                      ))
                     ORDER BY available_at, created_at, projection_job_id
                     LIMIT 1
                     """,
-                    (claimed_text, claimed_text),
+                    (
+                        generation_id,
+                        generation_id,
+                        projection_version,
+                        projection_version,
+                        config_digest,
+                        config_digest,
+                        claimed_text,
+                        claimed_text,
+                    ),
                 ).fetchone()
                 if row is None:
                     connection.execute("COMMIT")
@@ -985,6 +1254,36 @@ class LifecycleStore:
             leased_until=leased_until,
             attempt=attempt,
         )
+
+    def renew_lease(
+        self,
+        lease: ProjectionLease,
+        *,
+        now: datetime | None = None,
+        lease_seconds: float = 120,
+    ) -> None:
+        """Extend one active lease while a provider operation is still running."""
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        renewed_at = now or datetime.now(UTC)
+        renewed_text = _utc_text(renewed_at)
+        leased_until = _utc_text(renewed_at + timedelta(seconds=lease_seconds))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_lease(connection, lease, renewed_text)
+                connection.execute(
+                    """
+                    UPDATE projection_jobs
+                    SET leased_until = ?, updated_at = ?
+                    WHERE projection_job_id = ?
+                    """,
+                    (leased_until, renewed_text, lease.projection_job_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def begin_backend(
         self,
@@ -1346,13 +1645,16 @@ class LifecycleStore:
         *,
         generation_id: str,
         projection_version: str,
+        config_digest: str,
     ) -> GenerationCensus:
         """Return exact projection counts for current heads in one generation."""
         if not generation_id.strip():
             raise ValueError("generation_id must be a non-empty string")
         if not projection_version.strip():
             raise ValueError("projection_version must be a non-empty string")
-        parameters = (generation_id, projection_version)
+        if not config_digest.strip():
+            raise ValueError("config_digest must be a non-empty string")
+        parameters = (generation_id, projection_version, config_digest)
         with self._connect() as connection:
             current_sources = int(
                 connection.execute("SELECT COUNT(*) FROM source_heads").fetchone()[0]
@@ -1365,6 +1667,7 @@ class LifecycleStore:
                     JOIN projection_jobs AS job
                       ON job.source_revision_id = head.source_revision_id
                     WHERE job.generation_id = ? AND job.projection_version = ?
+                      AND job.config_digest = ?
                     """,
                     parameters,
                 ).fetchone()[0]
@@ -1378,6 +1681,7 @@ class LifecycleStore:
                 JOIN projection_receipts AS receipt
                   ON receipt.projection_job_id = job.projection_job_id
                 WHERE job.generation_id = ? AND job.projection_version = ?
+                  AND job.config_digest = ?
                 GROUP BY receipt.backend, receipt.state
                 """,
                 parameters,
@@ -1393,6 +1697,7 @@ class LifecycleStore:
         return GenerationCensus(
             generation_id=generation_id,
             projection_version=projection_version,
+            config_digest=config_digest,
             current_sources=current_sources,
             current_projection_jobs=current_projection_jobs,
             current_projection_receipts=sum(receipts_by_backend.values()),
@@ -1400,7 +1705,14 @@ class LifecycleStore:
             current_searchable_by_backend=dict(sorted(searchable_by_backend.items())),
         )
 
-    def next_wakeup_delay(self, *, now: datetime | None = None) -> float | None:
+    def next_wakeup_delay(
+        self,
+        *,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+        config_digest: str | None = None,
+        now: datetime | None = None,
+    ) -> float | None:
         """Return seconds until the next pending job or expired lease is claimable."""
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
@@ -1414,7 +1726,18 @@ class LifecycleStore:
                 END AS due_at
                 FROM projection_jobs
                 WHERE state IN ('pending', 'running')
-                """
+                  AND (? IS NULL OR generation_id = ?)
+                  AND (? IS NULL OR projection_version = ?)
+                  AND (? IS NULL OR config_digest = ?)
+                """,
+                (
+                    generation_id,
+                    generation_id,
+                    projection_version,
+                    projection_version,
+                    config_digest,
+                    config_digest,
+                ),
             ).fetchall()
         due_times = [
             _parse_utc(str(row["due_at"]))

@@ -2402,8 +2402,11 @@ async def test_stored_chunk_budget_check_qdrant_scans_multiple_pages_and_isolate
             offset: str | None,
             limit: int,
             with_vectors: bool,
+            document_ids: list[str] | None,
         ) -> tuple[list[SimpleNamespace], str | None]:
-            scroll_calls.append((self.dataset_id, offset, limit, with_vectors))
+            scroll_calls.append(
+                (self.dataset_id, offset, limit, with_vectors, document_ids)
+            )
             if self.dataset_id == "seat:alice":
                 self.calls += 1
                 if self.calls == 1:
@@ -2480,6 +2483,11 @@ async def test_stored_chunk_budget_check_qdrant_scans_multiple_pages_and_isolate
     assert report["collection_present"] is True
     assert report["scope_dataset_count"] == 2
     assert report["chunks_scanned"] == 3
+    assert report["document_chunk_counts"] == {
+        "doc-a": 1,
+        "doc-b": 1,
+        "doc-c": 1,
+    }
     assert report["missing_document_ids"] == ["doc-a"]
     assert report["missing_dataset_document_ids"] == [
         {"dataset": "seat:alice", "document_id": "doc-a"}
@@ -3601,6 +3609,45 @@ async def test_corpus_chunk_counts_says_not_measured_off_pgvector(
 
 
 @pytest.mark.asyncio
+async def test_corpus_chunk_counts_uses_dataset_scoped_qdrant_census(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    client = _real_cognee_client(monkeypatch)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    calls: list[tuple[list[str], list[str]]] = []
+
+    async def dataset_membership_for_documents(
+        document_ids: list[str],
+    ) -> dict[str, list[str]]:
+        assert document_ids == ["doc-a", "doc-b"]
+        return {
+            "doc-a": ["seat:alice"],
+            "doc-b": ["seat:bob"],
+        }
+
+    async def qdrant_census(**kwargs: Any) -> dict[str, Any]:
+        calls.append((kwargs["document_ids"], kwargs["datasets"]))
+        document_id = kwargs["document_ids"][0]
+        return {"document_chunk_counts": {document_id: 2}}
+
+    monkeypatch.setattr(
+        client,
+        "dataset_membership_for_documents",
+        dataset_membership_for_documents,
+    )
+    monkeypatch.setattr(client, "_stored_qdrant_chunk_budget_check", qdrant_census)
+
+    counts = await client.corpus_chunk_counts(["doc-a", "doc-b"])
+
+    assert counts == {"doc-a": 2, "doc-b": 2}
+    assert calls == [
+        (["doc-a"], ["seat:alice"]),
+        (["doc-b"], ["seat:bob"]),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
     monkeypatch: Any,
 ) -> None:
@@ -3806,6 +3853,71 @@ async def test_corpus_graph_presence_uses_source_document_property(
     assert "node_type = 'DocumentChunk'" in query
     assert "RETURN DISTINCT document_id_json" in query
     assert set(params["document_ids_json"]) == {json.dumps("doc-a"), json.dumps("doc-b")}
+
+
+@pytest.mark.asyncio
+async def test_corpus_graph_presence_enters_explicit_dataset_context(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    active_dataset: list[str] = []
+    contexts: list[tuple[str, str]] = []
+
+    class Dataset:
+        id = UUID("11111111-1111-1111-1111-111111111111")
+        owner_id = UUID("22222222-2222-2222-2222-222222222222")
+
+    class DatasetContext:
+        async def __aenter__(self) -> None:
+            active_dataset.append(str(Dataset.id))
+            contexts.append((str(Dataset.id), str(Dataset.owner_id)))
+
+        async def __aexit__(self, *_: Any) -> None:
+            active_dataset.pop()
+
+    async def resolve_datasets(
+        names: list[str],
+        _: Any,
+    ) -> tuple[None, list[Dataset]]:
+        assert names == ["lifecycle-live"]
+        return None, [Dataset()]
+
+    def set_context(dataset_id: UUID, owner_id: UUID) -> DatasetContext:
+        assert (str(dataset_id), str(owner_id)) == (
+            str(Dataset.id),
+            str(Dataset.owner_id),
+        )
+        return DatasetContext()
+
+    class GraphEngine:
+        async def query(self, _: str, __: dict[str, Any]) -> list[tuple[str]]:
+            assert active_dataset == [str(Dataset.id)]
+            return [(json.dumps("doc-a"),)]
+
+    async def graph_engine() -> GraphEngine:
+        assert active_dataset == [str(Dataset.id)]
+        return GraphEngine()
+
+    import cognee.context_global_variables as context_module
+    import cognee.modules.pipelines.layers.resolve_authorized_user_datasets as resolver_module
+
+    monkeypatch.setattr(
+        context_module,
+        "set_database_global_context_variables",
+        set_context,
+    )
+    monkeypatch.setattr(
+        resolver_module,
+        "resolve_authorized_user_datasets",
+        resolve_datasets,
+    )
+    monkeypatch.setattr(client, "_graph_engine", graph_engine)
+
+    assert await client.corpus_graph_presence(
+        ["doc-a"],
+        datasets=["lifecycle-live"],
+    ) == {"doc-a"}
+    assert contexts == [(str(Dataset.id), str(Dataset.owner_id))]
 
 
 @pytest.mark.asyncio

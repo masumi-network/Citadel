@@ -388,6 +388,7 @@ class CogneeGateway(Protocol):
         dataset: str,
         session_id: str | None = None,
         top_k: int = 10,
+        document_ids: list[str] | None = None,
     ) -> list[Any]:
         raise NotImplementedError
 
@@ -444,7 +445,12 @@ class CogneeGateway(Protocol):
     ) -> dict[str, list[str]]:
         raise NotImplementedError
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
         raise NotImplementedError
 
     async def corpus_zero_chunk_documents(
@@ -1010,6 +1016,35 @@ class CogneePublicClient:
             self._cognify_queue_task = None
 
     async def recall(
+        self,
+        query: str,
+        *,
+        dataset: str,
+        session_id: str | None = None,
+        top_k: int = 10,
+        document_ids: list[str] | None = None,
+    ) -> list[Any]:
+        if (
+            document_ids is None
+            or os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant"
+        ):
+            return await self._recall_unscoped(
+                query,
+                dataset=dataset,
+                session_id=session_id,
+                top_k=top_k,
+            )
+        from kb.qdrant_adapter import qdrant_document_scope
+
+        with qdrant_document_scope(document_ids):
+            return await self._recall_unscoped(
+                query,
+                dataset=dataset,
+                session_id=session_id,
+                top_k=top_k,
+            )
+
+    async def _recall_unscoped(
         self,
         query: str,
         *,
@@ -1647,7 +1682,33 @@ class CogneePublicClient:
         if not document_ids:
             return {}
         self._prepare_cognee_environment()
-        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+        provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()
+        if provider == "qdrant":
+            wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+            memberships = await self.dataset_membership_for_documents(wanted)
+            by_dataset: dict[str, list[str]] = {}
+            for document_id in wanted:
+                for dataset in memberships.get(document_id, []):
+                    by_dataset.setdefault(str(dataset), []).append(document_id)
+            counts = {document_id: 0 for document_id in wanted}
+            for dataset in sorted(by_dataset):
+                scoped_ids = by_dataset[dataset]
+                report = await self._stored_qdrant_chunk_budget_check(
+                    document_ids=scoped_ids,
+                    budget=chunk_window.resolve_chunk_budget(),
+                    datasets=[dataset],
+                    document_ids_by_dataset=None,
+                )
+                measured = report.get("document_chunk_counts")
+                if not isinstance(measured, dict):
+                    raise RuntimeError("Qdrant chunk census omitted document counts")
+                for document_id in scoped_ids:
+                    value = measured.get(document_id, 0)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise RuntimeError("Qdrant chunk census returned an invalid count")
+                    counts[document_id] = max(counts[document_id], value)
+            return counts
+        if provider != "pgvector":
             return None
         import cognee
 
@@ -2137,6 +2198,7 @@ class CogneePublicClient:
                 "scope_document_count": 0,
                 "scope_dataset_count": 0,
                 "chunks_scanned": 0,
+                "document_chunk_counts": {},
                 "violation_count": 0,
                 "violations": [],
                 "violation_document_counts": {},
@@ -2178,6 +2240,7 @@ class CogneePublicClient:
         violation_count = 0
         violation_document_counts: dict[str, int] = {}
         missing_document_id_violation_count = 0
+        document_chunk_counts: dict[str, int] = {}
         missing_dataset_document_ids: list[dict[str, str]] = []
         dataset_reports: dict[str, dict[str, Any]] = {}
 
@@ -2204,6 +2267,11 @@ class CogneePublicClient:
                             offset=offset,
                             limit=256,
                             with_vectors=False,
+                            document_ids=(
+                                sorted(dataset_wanted)
+                                if document_scope
+                                else None
+                            ),
                         )
                         for row in rows:
                             payload = getattr(row, "payload", None)
@@ -2220,6 +2288,9 @@ class CogneePublicClient:
                             dataset_chunks_scanned += 1
                             if document_id is not None:
                                 dataset_seen_document_ids.add(document_id)
+                                document_chunk_counts[document_id] = (
+                                    document_chunk_counts.get(document_id, 0) + 1
+                                )
                             violation = chunk_window.check_stored_chunk_payload(
                                 payload,
                                 chunk_id=str(getattr(row, "id", "unavailable")),
@@ -2282,6 +2353,7 @@ class CogneePublicClient:
             ),
             "scope_dataset_count": len(authorized_datasets),
             "chunks_scanned": chunks_scanned,
+            "document_chunk_counts": dict(sorted(document_chunk_counts.items())),
             "violation_count": violation_count,
             "violations": violations,
             "violation_document_counts": dict(sorted(violation_document_counts.items())),
@@ -2913,7 +2985,12 @@ class CogneePublicClient:
             node_ids.add(str(node_id))
         return node_ids
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
         """Which source documents have a graph projection; None when unmeasured.
 
         Cognee's TextChunker gives DocumentChunk nodes their own ids. The
@@ -2925,6 +3002,49 @@ class CogneePublicClient:
         """
         if not document_ids:
             return set()
+        requested_datasets = list(
+            dict.fromkeys(
+                str(dataset).strip()
+                for dataset in datasets or []
+                if str(dataset).strip()
+            )
+        )
+        if requested_datasets:
+            from cognee.context_global_variables import (
+                set_database_global_context_variables,
+            )
+            from cognee.modules.pipelines.layers.resolve_authorized_user_datasets import (
+                resolve_authorized_user_datasets,
+            )
+
+            _, authorized_datasets = await resolve_authorized_user_datasets(
+                requested_datasets,
+                None,
+            )
+            if len(authorized_datasets) != len(requested_datasets):
+                raise RuntimeError(
+                    "graph presence did not resolve every requested dataset"
+                )
+            present: set[str] = set()
+            for dataset in authorized_datasets:
+                async with set_database_global_context_variables(
+                    dataset.id,
+                    dataset.owner_id,
+                ):
+                    scoped = await self._corpus_graph_presence_current_context(
+                        document_ids
+                    )
+                if scoped is None:
+                    return None
+                present.update(scoped)
+            return present
+        return await self._corpus_graph_presence_current_context(document_ids)
+
+    async def _corpus_graph_presence_current_context(
+        self,
+        document_ids: list[str],
+    ) -> set[str] | None:
+        """Read graph presence inside the caller's active Cognee dataset context."""
         engine = await self._graph_engine()
         query = getattr(engine, "query", None)
         if not callable(query):

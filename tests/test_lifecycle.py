@@ -13,6 +13,7 @@ import pytest
 from kb.lifecycle import (
     CaptureContext,
     LifecycleConflictError,
+    LifecycleNotFoundError,
     LifecycleSchemaError,
     LifecycleStore,
     ProjectionLeaseError,
@@ -203,6 +204,56 @@ def test_duplicate_submission_reuses_revision_job_and_receipts(tmp_path: Path) -
     assert store.census().projection_receipts == 3
 
 
+def test_deterministic_ids_preserve_dataset_and_source_key_boundaries(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+
+    first = store.accept_source(
+        b"same retained source",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:x",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id=None,
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    second = store.accept_source(
+        b"same retained source",
+        capture=CaptureContext(
+            dataset="seat",
+            source_key="alice:manual:x",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id=None,
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+
+    assert second.source_revision_id != first.source_revision_id
+    assert second.operation.source_revision.dataset == "seat"
+    assert second.operation.source_revision.source_key == "alice:manual:x"
+    assert store.census().source_revisions == 2
+
+
 def test_new_revision_moves_head_and_stales_predecessor_receipts(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
     capture = CaptureContext(
@@ -251,6 +302,46 @@ def test_new_revision_moves_head_and_stales_predecessor_receipts(tmp_path: Path)
     assert store.census().current_sources == 1
     assert store.census().projection_jobs == 2
     assert store.census().projection_receipts == 6
+
+
+def test_reverting_to_prior_content_reactivates_prior_revision(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    capture = CaptureContext(
+        dataset="central",
+        source_key="manual:revertible",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="run-revert",
+        captured_at=T0,
+    )
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+
+    first = store.accept_source(b"revision A", capture=capture, projection=projection, now=T0)
+    second = store.accept_source(b"revision B", capture=capture, projection=projection, now=T0)
+    reverted = store.accept_source(b"revision A", capture=capture, projection=projection, now=T0)
+
+    assert reverted.source_revision_id == first.source_revision_id
+    assert (
+        store.get_current_revision(capture.dataset, capture.source_key).source_revision_id
+        == first.source_revision_id
+    )
+    assert reverted.operation.state == "pending"
+    assert {receipt.state for receipt in reverted.operation.receipts} == {"pending"}
+    assert store.get_operation(second.projection_job_id).state == "stale"
+    assert store.census().source_revisions == 2
+    assert store.census().current_sources == 1
 
 
 def test_tombstone_is_a_new_retained_revision_with_projection_work(
@@ -608,13 +699,173 @@ def test_duplicate_job_rejects_changed_provider_identity(tmp_path: Path) -> None
             "graph": "ladybug",
         },
     )
-    with pytest.raises(LifecycleConflictError, match="provider identity changed"):
+    with pytest.raises(LifecycleConflictError, match="CITADEL_GENERATION_ID"):
         store.accept_source(
             b"same source",
             capture=capture,
             projection=changed_provider,
             now=T0,
         )
+
+
+def test_generation_rejects_config_drift_before_accepting_a_new_source(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    providers = {
+        "relational": "sqlite",
+        "vector": "qdrant",
+        "graph": "ladybug",
+    }
+    original = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers=providers,
+    )
+    store.accept_source(
+        b"first source",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="manual:first",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="run-config-1",
+            captured_at=T0,
+        ),
+        projection=original,
+        now=T0,
+    )
+
+    with pytest.raises(LifecycleConflictError, match="CITADEL_GENERATION_ID"):
+        store.accept_source(
+            b"second source",
+            capture=CaptureContext(
+                dataset="central",
+                source_key="manual:second",
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="test",
+                capture_run_id="run-config-2",
+                captured_at=T0,
+            ),
+            projection=ProjectionRequest(
+                generation_id="generation-1",
+                projection_version="projection-v1",
+                config_digest="sha256:config-2",
+                providers=providers,
+            ),
+            now=T0,
+        )
+
+    census = store.census()
+    assert (census.source_revisions, census.projection_jobs, census.projection_receipts) == (
+        1,
+        1,
+        3,
+    )
+    with pytest.raises(LifecycleNotFoundError):
+        store.get_current_revision("central", "manual:second")
+
+
+def test_generation_rejects_provider_drift_with_reused_digest(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    capture = CaptureContext(
+        dataset="central",
+        source_key="manual:first-provider",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="run-provider-1",
+        captured_at=T0,
+    )
+    store.accept_source(
+        b"first provider source",
+        capture=capture,
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="projection-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+        now=T0,
+    )
+
+    with pytest.raises(LifecycleConflictError, match="CITADEL_GENERATION_ID"):
+        store.accept_source(
+            b"second provider source",
+            capture=CaptureContext(
+                **{
+                    **capture.__dict__,
+                    "source_key": "manual:second-provider",
+                }
+            ),
+            projection=ProjectionRequest(
+                generation_id="generation-1",
+                projection_version="projection-v1",
+                config_digest="sha256:config-1",
+                providers={
+                    "relational": "sqlite",
+                    "vector": "pgvector",
+                    "graph": "ladybug",
+                },
+            ),
+            now=T0,
+        )
+
+
+def test_retrieval_binding_requires_matching_projection_config(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = store.accept_source(
+        b"retrieval config source",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="manual:retrieval-config",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="run-retrieval-config",
+            captured_at=T0,
+        ),
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="projection-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+        now=T0,
+    )
+    lease = store.claim_next_job(worker_id="worker-config", now=T0)
+    assert lease is not None
+    for backend in ("relational", "vector", "graph"):
+        store.begin_backend(lease, backend, now=T0)
+        store.complete_backend(lease, backend, affected_count=1, now=T0)
+        store.mark_backend_searchable(lease, backend, now=T0)
+
+    matching = store.retrieval_binding(
+        accepted.source_revision_id,
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+    )
+    drifted = store.retrieval_binding(
+        accepted.source_revision_id,
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-2",
+    )
+
+    assert matching is not None and matching.receipt is not None
+    assert drifted is not None and drifted.current is True and drifted.receipt is None
 
 
 def test_generation_rebuild_queues_only_current_heads_and_is_idempotent(
@@ -697,6 +948,7 @@ def test_generation_rebuild_queues_only_current_heads_and_is_idempotent(
     generation = store.generation_census(
         generation_id="generation-2",
         projection_version="projection-v1",
+        config_digest="sha256:config-2",
     )
     assert generation.current_sources == 2
     assert generation.current_projection_jobs == 2
@@ -774,6 +1026,7 @@ def test_generation_rebuild_rolls_back_every_precommit_fault(
     target_census = recovered.generation_census(
         generation_id="generation-2",
         projection_version="projection-v1",
+        config_digest="sha256:config-2",
     )
     assert target_census.current_projection_jobs == 0
     assert target_census.current_projection_receipts == 0

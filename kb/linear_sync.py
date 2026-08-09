@@ -143,6 +143,7 @@ class LinearClient:
     def __init__(self, *, api_key: str, timeout: float = 30.0) -> None:
         self.api_key = api_key
         self.timeout = timeout
+        self.last_issue_fetch_complete = True
 
     def query(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
@@ -173,8 +174,10 @@ class LinearClient:
     def fetch_issues(self, *, max_issues: int) -> list[LinearIssue]:
         issues: list[LinearIssue] = []
         cursor: str | None = None
-        page_size = min(max(max_issues, 1), 100)
+        max_issues = max(max_issues, 1)
+        self.last_issue_fetch_complete = False
         while len(issues) < max_issues:
+            page_size = min(max_issues - len(issues), 100)
             data = self.query(
                 ISSUES_QUERY,
                 {"first": page_size, "after": cursor},
@@ -193,6 +196,7 @@ class LinearClient:
                         break
             page_info = block.get("pageInfo") if isinstance(block.get("pageInfo"), dict) else {}
             if not page_info.get("hasNextPage"):
+                self.last_issue_fetch_complete = True
                 break
             cursor = page_info.get("endCursor")
             if not cursor:
@@ -324,6 +328,7 @@ class LinearSyncer:
             "last_error": state.get("last_error"),
             "last_attempt_at": state.get("last_attempt_at"),
             "issue_count": len(issues),
+            "listing_complete": state.get("listing_complete"),
             "mirror_count": mirror_count,
             "auto_map_members_fetched": state.get("auto_map_members_fetched", 0),
             "auto_mapped_assignees": state.get("auto_mapped_assignees", 0),
@@ -374,6 +379,7 @@ class LinearSyncer:
                 client.fetch_issues,
                 max_issues=self.config.linear_sync_max_issues,
             )
+            listing_complete = client.last_issue_fetch_complete
         except LinearAPIError as exc:
             # Persist the failure so status()/list_sources surface a reason instead
             # of a stale green last_synced_at, and the evolve stage logs it (#46).
@@ -452,6 +458,11 @@ class LinearSyncer:
             )
             prior_cursor = None
         prior_issues = prior_state.get("issues")
+        prior_issue_by_id = {
+            str(item.get("id")): item
+            for item in (prior_issues if isinstance(prior_issues, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        }
         prior_ids = {
             str(item.get("id"))
             for item in (prior_issues if isinstance(prior_issues, list) else [])
@@ -473,7 +484,52 @@ class LinearSyncer:
         # A deletion changes the digest (the issue drops out of the listing)
         # without moving any surviving issue's updatedAt, so it refreshes the
         # digest too.
-        removed_ids = prior_ids - {issue.id for issue in issues}
+        removed_ids = (
+            prior_ids - {issue.id for issue in issues}
+            if listing_complete
+            else set()
+        )
+        tombstoned_count = 0
+        tombstoned_datasets: set[str] = set()
+
+        async def _tombstone_linear_issue(
+            *,
+            dataset: str,
+            issue_id: str,
+            reason: str,
+        ) -> None:
+            nonlocal tombstoned_count
+            if self.citadel.lifecycle_store is None:
+                return
+            tombstones = await self.citadel.tombstone_source(
+                dataset=dataset,
+                source_key=f"linear:issue:{issue_id}",
+                reason=reason,
+                capture_actor_id="linear-sync",
+                capture_run_id=sync_started_at,
+            )
+            tombstoned_count += len(tombstones)
+            if tombstones:
+                tombstoned_datasets.add(dataset)
+
+        for removed_id in sorted(removed_ids):
+            await _tombstone_linear_issue(
+                dataset=central_dataset,
+                issue_id=removed_id,
+                reason="Linear issue removed from synchronized scope",
+            )
+            prior_issue = prior_issue_by_id.get(removed_id, {})
+            identifier = str(prior_issue.get("identifier") or "")
+            if identifier:
+                for mirror_dataset, identifiers in prior_mirrors.items():
+                    if isinstance(identifiers, list) and identifier in {
+                        str(item) for item in identifiers
+                    }:
+                        await _tombstone_linear_issue(
+                            dataset=str(mirror_dataset),
+                            issue_id=removed_id,
+                            reason="Linear issue removed from synchronized scope",
+                        )
 
         # Coalesce cognify (#46/#52): a full resync writes the digest + ~200 issues +
         # seat mirrors. Each write used to schedule its OWN background cognify, so
@@ -648,6 +704,26 @@ class LinearSyncer:
                 written_mirror_datasets.append(mirror_dataset)
             mirrored += 1
 
+        current_issue_by_identifier = {issue.identifier: issue.id for issue in issues}
+        for mirror_dataset, prior_identifiers in prior_mirrors.items():
+            if not isinstance(prior_identifiers, list):
+                continue
+            current_identifiers = {
+                str(item) for item in mirrors.get(str(mirror_dataset), [])
+            }
+            for identifier in sorted(
+                {str(item) for item in prior_identifiers} - current_identifiers
+            ):
+                issue_id = current_issue_by_identifier.get(identifier)
+                if issue_id is not None:
+                    await _tombstone_linear_issue(
+                        dataset=str(mirror_dataset),
+                        issue_id=issue_id,
+                        reason="Linear issue mirror assignment removed",
+                    )
+                elif not listing_complete:
+                    mirrors.setdefault(str(mirror_dataset), []).append(identifier)
+
         # One coalesced cognify over Central + every seat mirror we wrote — unless
         # nothing was written (a fully-unchanged incremental pass has nothing to
         # fold in) or inline cognify is suppressed (the evolve Phase-1 subprocess
@@ -656,6 +732,8 @@ class LinearSyncer:
         if central_outcome is not None or central_issue_written:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
+        touched_datasets.extend(sorted(tombstoned_datasets))
+        touched_datasets = list(dict.fromkeys(touched_datasets))
         # What this pass OBSERVED about the coalesced graph write, reported as
         # `central_ingested` below. Only the awaited branch sees the cognify
         # finish (or fail); the scheduled branch has merely REQUESTED one, and
@@ -750,6 +828,16 @@ class LinearSyncer:
                 len(issues),
             )
 
+        persisted_issues = [
+            asdict(issue) for issue in issues if issue.identifier not in blocked
+        ]
+        if not listing_complete:
+            fetched_ids = {issue.id for issue in issues}
+            persisted_issues.extend(
+                item
+                for item in (prior_issues if isinstance(prior_issues, list) else [])
+                if isinstance(item, dict) and str(item.get("id")) not in fetched_ids
+            )
         payload = {
             "version": STATE_VERSION,
             "last_synced_at": utc_now(),
@@ -761,12 +849,13 @@ class LinearSyncer:
             "auto_map_members_fetched": auto_map_members_fetched,
             "auto_mapped_assignees": auto_mapped,
             "unresolved_assignee_count": unresolved_assignee_count,
+            "listing_complete": listing_complete,
             # Scanner-blocked issues are excluded here, not just from Central/
             # mirror writes: issues_for_scope() reads this list directly, so a
             # blocked issue's title/description landing here would re-serve
             # refused content through Linear search — identifier only (via
             # `blocked` above), never content.
-            "issues": [asdict(issue) for issue in issues if issue.identifier not in blocked],
+            "issues": persisted_issues,
             "mirrors": mirrors,
         }
         self._save_state(payload)
@@ -775,11 +864,13 @@ class LinearSyncer:
             "ok": True,
             "enabled": True,
             "issue_count": len(issues),
+            "listing_complete": listing_complete,
             # Incrementality diagnostics (#90): how many issues this pass actually
             # rewrote vs skipped as unchanged since the stored cursor.
             "written_count": len(changed_ids),
             "skipped_unchanged": skipped_unchanged,
             "mirrored_count": mirrored,
+            "tombstoned_count": tombstoned_count,
             # Diagnostics for #46: how many assignees were auto-mapped to seats by
             # email. Only read 0 as "the Linear key cannot read member emails —
             # set CITADEL_LINEAR_USER_MAP" when auto_map_error is None; a failed
