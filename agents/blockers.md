@@ -57,3 +57,12 @@ Checkpoint 2026-08-08: VERIFIED: `/private/tmp/citadel-v050-qdrant/kb/cognee_cli
 CORRECTED 2026-08-09: the Qdrant census blocker is resolved for the disposable candidate.
 Status: Completed
 Evidence: local commit `a0d5c02` contains the scoped Qdrant census and its regressions. The candidate image built after those changes, authenticated ingest accepted marker `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360`, background cognify completed, and authenticated search returned the full marker from the dataset-isolated Qdrant provider. Before commit, adapter and client tests returned `111 passed, 10 warnings in 11.29s`; after local PR 254 integration, the full suite returned `1781 passed, 3 skipped, 11 warnings in 32.97s`. Blind spot: one accepted runtime document is not a corpus-scale census, and the container has not been rebuilt from local merge commit `f3e92ff`.
+
+ID: BLK-2026-08-09-01
+Date: 2026-08-09
+Owner: architect
+Severity: High
+Description: REPORTED: lifecycle v1 schema and migration work requires explicit approval, and the approval phrase was not supplied across three consecutive goal turns. VERIFIED: the candidate remains clean at `f3e92ff`, four commits ahead of remote PR 256. `rg -n "projection_job_id|source_revision_id|projection_receipt_id|class Lifecycle" kb tests` returned exit `1` with no output in that candidate.
+Proposed resolution: user replies `yes, implement lifecycle v1`. This authorizes schema work in the disposable candidate only. Push, runtime rebuild, restart, deployment, merge, release, production mutation, and deletion keep their separate gates.
+Status: Blocked
+Evidence: `docs/interfaces.md` CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01; `.local-review/research/lifecycle-implementation-audit.md`; candidate branch readback on 2026-08-09.

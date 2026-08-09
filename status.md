@@ -1,7 +1,7 @@
 # Status
 Last updated: 2026-08-09
 Updated by: coordinator
-Current phase: lifecycle contract approval and candidate branch sync
+Current phase: Blocked at lifecycle v1 approval; candidate branch sync remains local
 Current sprint: CITADEL-QDRANT-2026-08-09
 
 ## Completed
@@ -26,13 +26,13 @@ Current sprint: CITADEL-QDRANT-2026-08-09
 - [x] CITADEL-QDRANT-2026-08-09-02, owner: release. VERIFIED: the disposable local stack accepted authenticated marker `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360`, completed background cognify, and returned the full marker through authenticated search. SQLite backup and restore plus Qdrant snapshot restore passed. Blind spot: this was one document in a disposable generation.
 
 ## In Progress
-- [ ] CITADEL-LIFECYCLE-2026-08-09-01, owner: architect, next action: obtain approval for the working v1 lifecycle and retrieval contract, file scope: `docs/interfaces.md`, `plans/roadmap.md`, and Wayfinder tickets 013 and 014. VERIFIED: the current `CognifyJob` stores dataset names and lease state only. It has no source revision, generation identity, or per-backend receipt.
 - [ ] CITADEL-QDRANT-2026-08-09-03, owner: implementer, next action: sync local commits `a0d5c02`, `92ce11a`, and merge commit `f3e92ff` to remote PR 256 after explicit push approval, file scope: `/private/tmp/citadel-v050-qdrant`. VERIFIED: the worktree is clean and four commits ahead of remote head `420be9d`.
 - [ ] CITADEL-QDRANT-2026-08-08-02, owner: reviewer, next action: close the remaining graph aggregation and destructive adapter-path evidence gaps before BLK-2026-08-08-02 can complete. VERIFIED: same-ID count, retrieve, search, and exhaustive scroll stayed dataset-scoped in the local provider receipt.
 
 ## Blocked
 - [ ] BLK-2026-08-07-01, owner: release, severity: Critical, next escalation: obtain explicit approval to rotate the exposed database credential, then verify old credential rejection and service health. Evidence: `agents/blockers.md`.
 - [ ] BLK-2026-08-08-01, owner: architect, severity: High, next escalation: retire in-place force repair from the production path and replace it with a full shadow generation plus verified cutover. Evidence: `agents/blockers.md` and ticket 005.
+- [ ] BLK-2026-08-09-01, owner: architect, severity: High, next escalation: user replies `yes, implement lifecycle v1`; schema work then starts in the disposable candidate. Evidence: `agents/blockers.md`, `docs/interfaces.md`, and `.local-review/research/lifecycle-implementation-audit.md`.
 
 ## Next priorities
 - [ ] CITADEL-LIFECYCLE-2026-08-08-01, owner: architect, exit criteria: source revision, projection job, per-backend receipt, retrieval hit, and trace contracts are approved before schema implementation.
@@ -133,6 +133,7 @@ Current sprint: CITADEL-QDRANT-2026-08-09
 - In Progress: CITADEL-LIFECYCLE-2026-08-09-01 and CITADEL-QDRANT-2026-08-09-03. Working v1 lifecycle and retrieval contracts are recorded; local PR 256 work remains four commits ahead of the remote branch.
 - Blocked: BLK-2026-08-07-01 and BLK-2026-08-08-01. Railway deploy, push, merge, release, schema migration, and production mutation still require their named gates.
 - Next: approve or revise CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01, then implement the source ledger and projection receipts before rebuilding or deploying the candidate.
+- Blocked update: BLK-2026-08-09-01 records the third consecutive lifecycle approval stop. No lifecycle schema identifiers exist in the candidate, and no safe implementation step remains before approval.
 
 ## Key metrics
 CORRECTED: the prior claim of six Node hits was not supported by this session. VERIFIED: `citadel_search` for the architecture query returned zero hits after `exclude_ambient=true`; 14 candidates were fetched and all were filtered out. Blind spot: this filtered top-k search cannot enumerate the vault or prove absence.
