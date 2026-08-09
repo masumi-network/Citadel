@@ -250,6 +250,24 @@ def test_ebac_bound_adapter_uses_dataset_without_task_scope(
     )
 
 
+def test_embedding_probe_allows_unbound_adapter_but_data_operations_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", GENERATION)
+    adapter = CitadelQdrantAdapter(
+        url="http://127.0.0.1:6333",
+        api_key="test-key",
+        embedding_engine=_EmbeddingEngine(),
+        database_name="",
+        client_factory=lambda: _FakeClient(),
+    )
+
+    assert adapter.generation_id == GENERATION
+    assert adapter.bound_dataset is None
+    with pytest.raises(QdrantScopeError, match="explicit Citadel scope"):
+        adapter.current_dataset(required_mode="read")
+
+
 def test_ebac_bound_adapter_rejects_conflicting_task_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

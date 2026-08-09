@@ -1926,6 +1926,38 @@ async def test_cognee_public_client_uses_chunk_search_by_default(monkeypatch: An
 
 
 @pytest.mark.asyncio
+async def test_cognee_public_client_unwraps_dataset_chunk_results(monkeypatch: Any) -> None:
+    marker = "citadel-v050-final-acceptance"
+
+    async def run_migrations() -> None:
+        return None
+
+    async def search(**kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "dataset_id": "dataset-id",
+                "dataset_name": "notes",
+                "dataset_tenant_id": "tenant-id",
+                "search_result": [{"id": "chunk-1", "text": marker}],
+            }
+        ]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            SearchType=SimpleNamespace(CHUNKS="chunks"),
+            run_migrations=run_migrations,
+            search=search,
+        ),
+    )
+
+    result = await CogneePublicClient().recall("marker", dataset="notes")
+
+    assert result == [{"id": "chunk-1", "text": marker}]
+
+
+@pytest.mark.asyncio
 async def test_session_recall_off_by_default_and_opt_in(monkeypatch: Any) -> None:
     # #15/#52: the per-session QA cache served stale "[DataItem]" garbage, so the
     # session-scoped recall is OFF by default — search goes straight to the durable
@@ -2101,8 +2133,15 @@ async def test_cognify_checks_only_source_ids_processed_by_this_pass(monkeypatch
     client = CogneePublicClient()
     checked: list[list[str]] = []
 
-    async def stored_chunk_budget_check(*, document_ids: list[str]) -> dict[str, Any]:
+    async def stored_chunk_budget_check(
+        *,
+        document_ids: list[str],
+        datasets: list[str],
+        document_ids_by_dataset: dict[str, list[str]],
+    ) -> dict[str, Any]:
         checked.append(document_ids)
+        assert datasets == ["notes"]
+        assert document_ids_by_dataset == {"dataset-id": ["doc-a", "doc-b"]}
         return {"ok": True, "violation_count": 0, "chunks_scanned": 2}
 
     monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
@@ -2181,8 +2220,15 @@ async def test_cognify_fails_when_stored_chunk_check_is_red(monkeypatch: Any) ->
     )
     client = CogneePublicClient()
 
-    async def stored_chunk_budget_check(*, document_ids: list[str]) -> dict[str, Any]:
+    async def stored_chunk_budget_check(
+        *,
+        document_ids: list[str],
+        datasets: list[str],
+        document_ids_by_dataset: dict[str, list[str]],
+    ) -> dict[str, Any]:
         assert document_ids == ["doc-a"]
+        assert datasets == ["notes"]
+        assert document_ids_by_dataset == {"dataset-id": ["doc-a"]}
         return {"ok": False, "violation_count": 1, "chunks_scanned": 1}
 
     monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
@@ -2272,6 +2318,427 @@ async def test_stored_chunk_budget_check_scans_exact_pgvector_payloads(
     assert report["violation_document_counts"] == {"doc-a": 1}
     assert report["violation_document_ids"] == ["doc-a"]
     assert report["violations_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_qdrant_scans_multiple_pages_and_isolates_datasets(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    rows_alice: list[SimpleNamespace] = []
+    rows_bob = [
+        SimpleNamespace(id="a1", payload={"document_id": "doc-a", "text": "small-a"}),
+        SimpleNamespace(id="a2", payload={"document_id": "doc-b", "text": "small-b"}),
+        SimpleNamespace(id="a3", payload={"document_id": "doc-c", "text": "small-c"}),
+    ]
+    scroll_calls: list[Any] = []
+    resolve_calls: list[str] = []
+
+    class FakeEngine:
+        def __init__(self, dataset_id: str) -> None:
+            self.dataset_id = dataset_id
+            self.calls = 0
+
+        async def has_collection(self, _: str) -> bool:
+            return True
+
+        async def scroll_data_points(
+            self,
+            _: str,
+            *,
+            offset: str | None,
+            limit: int,
+            with_vectors: bool,
+        ) -> tuple[list[SimpleNamespace], str | None]:
+            scroll_calls.append((self.dataset_id, offset, limit, with_vectors))
+            if self.dataset_id == "seat:alice":
+                self.calls += 1
+                if self.calls == 1:
+                    return rows_alice, "next-1"
+                return [], None
+            if self.calls == 0:
+                return rows_bob, None
+            return [], None
+
+    @asynccontextmanager
+    async def fake_context(dataset_id: str, owner_id: str):
+        del owner_id
+        resolve_calls.append(dataset_id)
+        yield None
+
+    async def fake_resolve_authorized_user_datasets(
+        datasets: list[str] | None, _user: Any
+    ) -> tuple[list[Any], list[SimpleNamespace]]:
+        del datasets
+        return [], [
+            SimpleNamespace(id="seat:alice", owner_id="owner-a"),
+            SimpleNamespace(id="seat:bob", owner_id="owner-b"),
+        ]
+
+    async def fake_vector_engine() -> FakeEngine:
+        return FakeEngine(resolve_calls[-1])
+
+    async def fake_cognee_ready(_: Any) -> None:
+        return None
+
+    vector_module = import_module("cognee.infrastructure.databases.vector")
+    cognee_module = import_module("cognee")
+    context_module = import_module("cognee.context_global_variables")
+    authorization_module = import_module(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_datasets"
+    )
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setattr(cognee_module, "run_migrations", lambda: None)
+    monkeypatch.setattr(
+        vector_module,
+        "get_vector_engine_async",
+        lambda: fake_vector_engine(),
+    )
+    monkeypatch.setattr(context_module, "set_database_global_context_variables", fake_context)
+    monkeypatch.setattr(
+        authorization_module,
+        "resolve_authorized_user_datasets",
+        fake_resolve_authorized_user_datasets,
+    )
+
+    monkeypatch.setattr(
+        import_module("kb.chunk_window"),
+        "check_stored_chunk_payload",
+        lambda payload, chunk_id, budget: None,  # clean payload -> no violation
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", fake_cognee_ready)
+
+    report = await client.stored_chunk_budget_check(
+        ["doc-a", "doc-b", "doc-c"],
+        budget=128,
+        datasets=["seat:alice", "seat:bob"],
+        document_ids_by_dataset={
+            "seat:alice": ["doc-a"],
+            "seat:bob": ["doc-a", "doc-b", "doc-c"],
+        },
+    )
+
+    assert report["ok"] is False
+    assert report["provider"] == "qdrant"
+    assert report["collection_present"] is True
+    assert report["scope_dataset_count"] == 2
+    assert report["chunks_scanned"] == 3
+    assert report["missing_document_ids"] == ["doc-a"]
+    assert report["missing_dataset_document_ids"] == [
+        {"dataset": "seat:alice", "document_id": "doc-a"}
+    ]
+    assert report["dataset_reports"]["seat:alice"]["missing_document_ids"] == ["doc-a"]
+    assert report["dataset_reports"]["seat:bob"]["missing_document_ids"] == []
+    assert report["scope_document_count"] == 4
+    assert resolve_calls == ["seat:alice", "seat:bob"]
+    assert len(scroll_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_qdrant_reports_over_budget_payloads_and_orphan_ids(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    from kb.chunk_window import StoredChunkBudgetViolation
+
+    captured: list[tuple[str, Any]] = []
+    rows = [
+        SimpleNamespace(
+            id="chunk-a",
+            payload={"document_id": "doc-a", "text": "too-large", "chunk_size": 16},
+        )
+    ]
+
+    class FakeEngine:
+        async def has_collection(self, _: str) -> bool:
+            return True
+
+        async def scroll_data_points(self, *_: Any, **__: Any) -> tuple[list[Any], None]:
+            return rows, None
+
+    async def fake_vector_engine() -> FakeEngine:
+        return FakeEngine()
+
+    @asynccontextmanager
+    async def fake_context(*_: Any, **__: Any):
+        yield None
+
+    async def fake_resolve_authorized_user_datasets(
+        datasets: list[str] | None, _user: Any
+    ) -> tuple[list[Any], list[SimpleNamespace]]:
+        del datasets
+        return [], [SimpleNamespace(id="seat:alice", owner_id="owner-a")]
+
+    def fake_check(
+        payload: dict[str, Any], chunk_id: str, budget: int | None
+    ) -> StoredChunkBudgetViolation | None:
+        captured.append(("chunk_id", chunk_id, payload["document_id"], budget))
+        return StoredChunkBudgetViolation(
+            reason="chunk_over_budget",
+            chunk_id=chunk_id,
+            document_id=payload["document_id"],
+            chunk_index=0,
+            configured_size=16,
+            measured_tokens=1024,
+            char_length=7,
+            fingerprint="ignored",
+        )
+
+    async def fake_cognee_ready(_: Any) -> None:
+        return None
+
+    vector_module = import_module("cognee.infrastructure.databases.vector")
+    cognee_module = import_module("cognee")
+    authorization_module = import_module(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_datasets"
+    )
+    context_module = import_module("cognee.context_global_variables")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setattr(cognee_module, "run_migrations", lambda: None)
+    monkeypatch.setattr(vector_module, "get_vector_engine_async", fake_vector_engine)
+    monkeypatch.setattr(context_module, "set_database_global_context_variables", fake_context)
+    monkeypatch.setattr(authorization_module, "resolve_authorized_user_datasets", fake_resolve_authorized_user_datasets)
+
+    from kb import chunk_window as chunk_window_module
+
+    monkeypatch.setattr(
+        chunk_window_module,
+        "check_stored_chunk_payload",
+        fake_check,
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", fake_cognee_ready)
+
+    report = await client.stored_chunk_budget_check(
+        ["doc-a", "doc-miss"],
+        budget=5,
+        datasets=["seat:alice"],
+    )
+
+    assert report["ok"] is False
+    assert report["provider"] == "qdrant"
+    assert report["chunks_scanned"] == 1
+    assert report["violation_count"] == 1
+    assert report["violation_document_counts"] == {"doc-a": 1}
+    assert report["violation_document_ids"] == ["doc-a"]
+    assert report["missing_document_ids"] == ["doc-miss"]
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_qdrant_zero_measurement_marks_missing_documents(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    @asynccontextmanager
+    async def fake_context(*_: Any, **__: Any):
+        yield None
+
+    async def fake_resolve_authorized_user_datasets(
+        datasets: list[str] | None, _user: Any
+    ) -> tuple[list[Any], list[SimpleNamespace]]:
+        del datasets
+        return [], [SimpleNamespace(id="seat:alice", owner_id="owner-a")]
+
+    class FakeEngine:
+        async def has_collection(self, _: str) -> bool:
+            return True
+
+        async def scroll_data_points(self, *_: Any, **__: Any) -> tuple[list[Any], None]:
+            return [], None
+
+    async def fake_vector_engine() -> FakeEngine:
+        return FakeEngine()
+
+    async def fake_ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    authorization_module = import_module(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_datasets"
+    )
+    context_module = import_module("cognee.context_global_variables")
+    vector_module = import_module("cognee.infrastructure.databases.vector")
+    monkeypatch.setattr(vector_module, "get_vector_engine_async", fake_vector_engine)
+    monkeypatch.setattr(context_module, "set_database_global_context_variables", fake_context)
+    monkeypatch.setattr(
+        authorization_module,
+        "resolve_authorized_user_datasets",
+        fake_resolve_authorized_user_datasets,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_migrations=lambda: None,
+            infrastructure=SimpleNamespace(
+                databases=SimpleNamespace(
+                    vector=SimpleNamespace(
+                        get_vector_engine_async=fake_vector_engine,
+                    )
+                )
+            ),
+        ),
+    )
+
+    from kb import chunk_window as chunk_window_module
+
+    monkeypatch.setattr(
+        chunk_window_module,
+        "check_stored_chunk_payload",
+        lambda payload, chunk_id, budget: None,
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", fake_ready)
+
+    report = await client.stored_chunk_budget_check(
+        ["doc-missing"],
+        datasets=["seat:alice"],
+    )
+
+    assert report["ok"] is False
+    assert report["provider"] == "qdrant"
+    assert report["chunks_scanned"] == 0
+    assert report["missing_document_ids"] == ["doc-missing"]
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_qdrant_fails_on_repeated_scroll_offset(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    @asynccontextmanager
+    async def fake_context(*_: Any, **__: Any):
+        yield None
+
+    async def fake_resolve_authorized_user_datasets(
+        datasets: list[str] | None, _user: Any
+    ) -> tuple[list[Any], list[SimpleNamespace]]:
+        del datasets
+        return [], [SimpleNamespace(id="seat:alice", owner_id="owner-a")]
+
+    class FakeEngine:
+        async def has_collection(self, _: str) -> bool:
+            return True
+
+        async def scroll_data_points(
+            self,
+            *_: Any,
+            **__: Any,
+        ) -> tuple[list[Any], str]:
+            return [SimpleNamespace(id="chunk-a", payload={})], "repeat"
+
+    async def fake_vector_engine() -> FakeEngine:
+        return FakeEngine()
+
+    async def fake_ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            run_migrations=lambda: None,
+            infrastructure=SimpleNamespace(
+                databases=SimpleNamespace(
+                    vector=SimpleNamespace(
+                        get_vector_engine_async=fake_vector_engine,
+                    )
+                )
+            ),
+        ),
+    )
+    authorization_module = import_module(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_datasets"
+    )
+    context_module = import_module("cognee.context_global_variables")
+    vector_module = import_module("cognee.infrastructure.databases.vector")
+    monkeypatch.setattr(vector_module, "get_vector_engine_async", fake_vector_engine)
+    monkeypatch.setattr(context_module, "set_database_global_context_variables", fake_context)
+    monkeypatch.setattr(
+        authorization_module,
+        "resolve_authorized_user_datasets",
+        fake_resolve_authorized_user_datasets,
+    )
+    from kb import chunk_window as chunk_window_module
+
+    monkeypatch.setattr(
+        chunk_window_module,
+        "check_stored_chunk_payload",
+        lambda payload, chunk_id, budget: None,
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", fake_ready)
+
+    with pytest.raises(RuntimeError, match="Qdrant chunk scroll repeated an offset"):
+        await client.stored_chunk_budget_check(
+            ["doc-a"],
+            budget=8,
+            datasets=["seat:alice"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_stored_chunk_budget_check_qdrant_bubbles_provider_exceptions(monkeypatch: Any) -> None:
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    @asynccontextmanager
+    async def fake_context(*_: Any, **__: Any):
+        yield None
+
+    async def fake_resolve_authorized_user_datasets(
+        datasets: list[str] | None, _user: Any
+    ) -> tuple[list[Any], list[SimpleNamespace]]:
+        del datasets
+        return [], [SimpleNamespace(id="seat:alice", owner_id="owner-a")]
+
+    async def fake_vector_engine() -> None:
+        raise RuntimeError("provider down")
+
+    async def fake_ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    authorization_module = import_module(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_datasets"
+    )
+    context_module = import_module("cognee.context_global_variables")
+    vector_module = import_module("cognee.infrastructure.databases.vector")
+    monkeypatch.setattr(vector_module, "get_vector_engine_async", fake_vector_engine)
+    monkeypatch.setattr(context_module, "set_database_global_context_variables", fake_context)
+    monkeypatch.setattr(
+        authorization_module,
+        "resolve_authorized_user_datasets",
+        fake_resolve_authorized_user_datasets,
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", fake_ready)
+    with pytest.raises(RuntimeError, match="provider down"):
+        await client.stored_chunk_budget_check(
+            ["doc-a"],
+            datasets=["seat:alice"],
+        )
 
 
 @pytest.mark.asyncio

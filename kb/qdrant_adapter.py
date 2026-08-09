@@ -223,11 +223,8 @@ class CitadelQdrantAdapter(VectorDBInterface):
         self.api_key = str(api_key).strip()
         self.embedding_engine = embedding_engine
         configured_generation = os.getenv("CITADEL_GENERATION_ID", "").strip()
-        self.bound_dataset = (
-            _required_text(database_name, "dataset scope")
-            if configured_generation
-            else None
-        )
+        database_scope = str(database_name or "").strip()
+        self.bound_dataset = database_scope or None if configured_generation else None
         self.generation_id = _required_text(
             configured_generation or database_name,
             "generation scope",
