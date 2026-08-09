@@ -63,11 +63,7 @@ def utc_now() -> str:
 
 def _matches_any(name: str, patterns: tuple[str, ...]) -> bool:
     candidates = {name, name.split("/")[-1]}
-    return any(
-        fnmatchcase(candidate, pattern)
-        for pattern in patterns
-        for candidate in candidates
-    )
+    return any(fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
 
 
 class GitHubAPIError(RuntimeError):
@@ -258,7 +254,9 @@ class GitHubOrgSyncer:
             if ingest_unchanged is None
             else ingest_unchanged
         )
-        self.run_improve = self.config.github_sync_run_improve if run_improve is None else run_improve
+        self.run_improve = (
+            self.config.github_sync_run_improve if run_improve is None else run_improve
+        )
         self.include_private = self.config.github_sync_include_private
         self.repo_allowlist = self.config.github_sync_repo_allowlist
         self.repo_denylist = self.config.github_sync_repo_denylist
@@ -381,7 +379,9 @@ class GitHubOrgSyncer:
         if not dry_run:
             tracked_commits = dict(previous_commits)
             for repo_name, repo_commits in commits_by_repo.items():
-                tracked_commits[repo_name] = [commit.sha for commit in repo_commits if commit.sha][:500]
+                tracked_commits[repo_name] = [commit.sha for commit in repo_commits if commit.sha][
+                    :500
+                ]
             state.update(
                 {
                     "version": STATE_VERSION,
@@ -389,9 +389,7 @@ class GitHubOrgSyncer:
                     "last_checked_at": checked_at,
                     "repos": {repo.full_name: repo.state() for repo in repos},
                     "commits": tracked_commits,
-                    "seen_event_ids": [
-                        event.id for event in events if event.id
-                    ][:500],
+                    "seen_event_ids": [event.id for event in events if event.id][:500],
                 }
             )
             if should_ingest:

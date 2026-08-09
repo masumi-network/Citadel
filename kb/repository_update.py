@@ -250,10 +250,7 @@ class RepositoryDailyUpdate:
     def meaningful(self) -> bool:
         """Whether the window contains any Meaningful Source Changes."""
         return bool(
-            self.changed_repos
-            or self.new_events
-            or self.new_commits
-            or self.recent_pull_requests
+            self.changed_repos or self.new_events or self.new_commits or self.recent_pull_requests
         )
 
     @property

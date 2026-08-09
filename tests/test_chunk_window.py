@@ -70,9 +70,7 @@ def test_bundled_gpt4o_tokenizer_is_available_without_network() -> None:
     cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR")
 
     assert cache_dir
-    assert (
-        Path(cache_dir) / chunk_window._TIKTOKEN_CACHE_FILENAME
-    ).is_file()
+    assert (Path(cache_dir) / chunk_window._TIKTOKEN_CACHE_FILENAME).is_file()
     assert chunk_window.require_bpe_encoding().name == "o200k_base"
 
 
@@ -134,9 +132,7 @@ def test_detector_fires_on_a_planted_over_window_chunk(caplog: Any) -> None:
     tokenizer = _FakeWordpieceTokenizer()
     planted = "x" * 1710  # the worst real chunk measured on this tree, in wordpieces
     with caplog.at_level(logging.WARNING, logger="kb.chunk_window"):
-        over = chunk_window.record_embed_batch(
-            [planted], count_tokens=tokenizer.count, window=512
-        )
+        over = chunk_window.record_embed_batch([planted], count_tokens=tokenizer.count, window=512)
 
     assert over == 1
     report = chunk_window.embed_window_report()
@@ -352,9 +348,10 @@ def test_newline_is_not_a_word_boundary() -> None:
 
 
 def test_final_cognee_chunk_validator_accepts_in_budget_text() -> None:
-    assert chunk_window.validate_cognee_chunk_budget(
-        "A short note with ordinary words.", budget=64
-    ) is None
+    assert (
+        chunk_window.validate_cognee_chunk_budget("A short note with ordinary words.", budget=64)
+        is None
+    )
 
 
 def test_final_cognee_chunk_validator_rejects_emitted_over_budget_chunk(
@@ -609,7 +606,7 @@ def test_the_arithmetic_floor_never_claims_more_tokens_than_there_are() -> None:
         "a" * 40_000,
         "한국어 텍스트 " * 3000,
         "🚀🔥💡" * 4000,
-        "{\"key\":\"value\"}," * 3000,
+        '{"key":"value"},' * 3000,
         "0123456789" * 4000,
         "The payment service escrows funds until the seller submits a result. " * 600,
     ]
@@ -622,9 +619,7 @@ def test_the_arithmetic_floor_never_claims_more_tokens_than_there_are() -> None:
 def test_max_token_bytes_is_read_from_the_encoding_not_asserted() -> None:
     """It must come off the vocabulary, because a cognee or tiktoken bump can move it."""
     encoding = chunk_window._bpe_encoding()
-    assert chunk_window.max_token_bytes() == max(
-        len(token) for token in encoding._mergeable_ranks
-    )
+    assert chunk_window.max_token_bytes() == max(len(token) for token in encoding._mergeable_ranks)
 
 
 # --------------------------------------------------------------------------
@@ -639,9 +634,7 @@ def test_applying_the_budget_twice_evicts_the_caches_once(monkeypatch: Any) -> N
     every cognee operation, so the second call has to be a no-op.
     """
     calls: list[int] = []
-    monkeypatch.setattr(
-        chunk_window, "_clear_cognee_budget_caches", lambda: calls.append(1)
-    )
+    monkeypatch.setattr(chunk_window, "_clear_cognee_budget_caches", lambda: calls.append(1))
     chunk_window.reset_applied_budget()
 
     chunk_window.apply_chunk_budget()
@@ -799,6 +792,6 @@ def test_word_segmentation_agrees_with_cognee() -> None:
         theirs = [word for word, _kind in chunk_by_word(sample)]
         mine = chunk_window.split_cognee_words(sample)
         assert "".join(mine) == sample, "segmentation must be lossless"
-        assert max((len(w) for w in mine), default=0) >= max(
-            (len(w) for w in theirs), default=0
-        ), "our longest segment must not be shorter than cognee's longest word"
+        assert max((len(w) for w in mine), default=0) >= max((len(w) for w in theirs), default=0), (
+            "our longest segment must not be shorter than cognee's longest word"
+        )

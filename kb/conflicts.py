@@ -103,9 +103,7 @@ class KnowledgeConflictStore:
         data["conflicts"][conflict_id] = asdict(record)
         self._prune(data)
         self._save(data)
-        logger.warning(
-            "Knowledge conflict recorded: %s (%s)", conflict_id, candidate.kind
-        )
+        logger.warning("Knowledge conflict recorded: %s (%s)", conflict_id, candidate.kind)
         return data["conflicts"][conflict_id]
 
     def list(self, *, status: str | None = None) -> list[dict[str, Any]]:

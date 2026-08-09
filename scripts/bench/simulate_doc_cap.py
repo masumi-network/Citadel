@@ -33,6 +33,7 @@ query time, and every forced sync multiplies the corpus again.
 Usage:
     python scripts/bench/simulate_doc_cap.py --pool 20 --repeats 2
 """
+
 from __future__ import annotations
 
 import argparse
@@ -143,8 +144,10 @@ def main() -> int:
             best = per_cap_best[str(cap)]
             ranks[str(cap)].append(min(best) if best else None)
 
-    print(f"questions={len(questions)} pool={args.pool} final_k={args.final_k} "
-          f"repeats={args.repeats}\n")
+    print(
+        f"questions={len(questions)} pool={args.pool} final_k={args.final_k} "
+        f"repeats={args.repeats}\n"
+    )
     print(f"{'cap':>6}  {'recall@5':>9}  {'MRR':>6}")
     summary = {}
     for cap in caps:
@@ -157,8 +160,10 @@ def main() -> int:
         summary[label] = {"recall_at_5": round(recall, 4), "mrr": round(mrr, 4)}
 
     if slot_share:
-        print(f"\nworst-case single-document share of the uncapped top-{args.final_k}: "
-              f"mean {statistics.fmean(slot_share):.2f}, max {max(slot_share):.2f}")
+        print(
+            f"\nworst-case single-document share of the uncapped top-{args.final_k}: "
+            f"mean {statistics.fmean(slot_share):.2f}, max {max(slot_share):.2f}"
+        )
 
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2), encoding="utf-8")

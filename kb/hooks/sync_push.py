@@ -160,9 +160,7 @@ def load_capture_roots() -> list[dict[str, Any]]:
             {
                 "path": _norm_path(raw_path),
                 "tags": [
-                    str(tag).strip().lower()
-                    for tag in (item.get("tags") or [])
-                    if str(tag).strip()
+                    str(tag).strip().lower() for tag in (item.get("tags") or []) if str(tag).strip()
                 ],
             }
         )

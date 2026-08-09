@@ -164,9 +164,7 @@ class GitHubMirrorPublisher:
             detail = redact_secrets(exc.read().decode("utf-8", errors="replace")[:300], self.token)
             if exc.code != 404:
                 logger.error("Backup mirror GitHub request %s failed: HTTPError %s", path, exc.code)
-            raise BackupMirrorPublishError(
-                f"GitHub API returned {exc.code}: {detail}"
-            ) from exc
+            raise BackupMirrorPublishError(f"GitHub API returned {exc.code}: {detail}") from exc
         except URLError as exc:
             logger.error(
                 "Backup mirror GitHub request %s failed: %s: %s",
@@ -261,7 +259,9 @@ class BackupMirror:
         self._write_json(self.latest_manifest_path, manifest)
         result["snapshot_manifest_path"] = str(snapshot_path)
         result["written"] = True
-        logger.info("Backup mirror manifest %s written to %s", manifest["snapshot_id"], snapshot_path)
+        logger.info(
+            "Backup mirror manifest %s written to %s", manifest["snapshot_id"], snapshot_path
+        )
         publisher = self._publisher()
         if self.config.backup_mirror_push_enabled and publisher:
             publish_result = publisher.publish_manifest(

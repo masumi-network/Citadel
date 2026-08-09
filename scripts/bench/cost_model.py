@@ -21,6 +21,7 @@ Usage:
     python scripts/bench/cost_model.py --memory-gb 2.0       # what-if
     python scripts/bench/cost_model.py --json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -64,8 +65,9 @@ class CostLine:
     share_pct: float
 
 
-def service_cost(vcpu: float, memory_gb: float, volume_gb: float,
-                 egress_gb_per_hour: float) -> dict[str, float]:
+def service_cost(
+    vcpu: float, memory_gb: float, volume_gb: float, egress_gb_per_hour: float
+) -> dict[str, float]:
     return {
         "CPU": vcpu * PRICE_VCPU_SECOND * SECONDS_PER_MONTH,
         "Memory": memory_gb * PRICE_GB_RAM_SECOND * SECONDS_PER_MONTH,
@@ -99,8 +101,12 @@ def monthly_cost(
         "Egress": f"{sum(s[4] for s in services) * 720:.1f} GB/mo",
     }
     lines = [
-        CostLine(component=name, basis=bases[name], monthly_usd=round(value, 2),
-                 share_pct=round(100 * value / grand, 1))
+        CostLine(
+            component=name,
+            basis=bases[name],
+            monthly_usd=round(value, 2),
+            share_pct=round(100 * value / grand, 1),
+        )
         for name, value in totals.items()
     ]
     return lines, per_service
@@ -174,22 +180,29 @@ def main() -> int:
     per_search = cpu_cost + egress_cost
 
     if args.json:
-        print(json.dumps({
-            "monthly_total_usd": total,
-            "monthly_total_note": (
-                "24h-average basis. Memory dominates and moves with the window: a "
-                "trailing-7-day basis gives ~$61. Quote as 'about $55', not to the cent."
-            ),
-            "services": per_service,
-            "lines": [asdict(line) for line in lines],
-            "marginal_cost_per_search_usd": round(per_search, 8),
-            "marginal_cost_cpu_usd": round(cpu_cost, 8),
-            "marginal_cost_egress_usd": round(egress_cost, 8),
-            "marginal_cost_per_1k_searches_usd": round(per_search * 1000, 4),
-            "searches_per_month_to_double_cost": int(total / per_search) if per_search else None,
-            "search_response_bytes_median": MEASURED_SEARCH_RESPONSE_BYTES,
-            "price_source": "https://railway.com/pricing, fetched 2026-07-31",
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "monthly_total_usd": total,
+                    "monthly_total_note": (
+                        "24h-average basis. Memory dominates and moves with the window: a "
+                        "trailing-7-day basis gives ~$61. Quote as 'about $55', not to the cent."
+                    ),
+                    "services": per_service,
+                    "lines": [asdict(line) for line in lines],
+                    "marginal_cost_per_search_usd": round(per_search, 8),
+                    "marginal_cost_cpu_usd": round(cpu_cost, 8),
+                    "marginal_cost_egress_usd": round(egress_cost, 8),
+                    "marginal_cost_per_1k_searches_usd": round(per_search * 1000, 4),
+                    "searches_per_month_to_double_cost": int(total / per_search)
+                    if per_search
+                    else None,
+                    "search_response_bytes_median": MEASURED_SEARCH_RESPONSE_BYTES,
+                    "price_source": "https://railway.com/pricing, fetched 2026-07-31",
+                },
+                indent=2,
+            )
+        )
         return 0
 
     print("Citadel project: monthly cost from measured resource use")
@@ -199,7 +212,9 @@ def main() -> int:
         print(f"  {name:22} ${value:7.2f}")
     print()
     for line in lines:
-        print(f"  {line.component:8} {line.basis:24} ${line.monthly_usd:7.2f}  {line.share_pct:5.1f}%")
+        print(
+            f"  {line.component:8} {line.basis:24} ${line.monthly_usd:7.2f}  {line.share_pct:5.1f}%"
+        )
     print(f"  {'':33}{'-' * 8}")
     print(f"  {'TOTAL':8} {'':24} ${total:7.2f}\n")
 
@@ -210,8 +225,10 @@ def main() -> int:
     print("  a trailing-7-day basis gives ~$61. Two decimals would be false precision.\n")
     print(f"  Marginal cost per search : ${per_search:.8f}")
     print(f"    CPU                    : ${cpu_cost:.8f}  ({100 * cpu_cost / per_search:.0f}%)")
-    print(f"    Response egress        : ${egress_cost:.8f}  ({100 * egress_cost / per_search:.0f}%)"
-          f"  at a {MEASURED_SEARCH_RESPONSE_BYTES:,}-byte median response")
+    print(
+        f"    Response egress        : ${egress_cost:.8f}  ({100 * egress_cost / per_search:.0f}%)"
+        f"  at a {MEASURED_SEARCH_RESPONSE_BYTES:,}-byte median response"
+    )
     print(f"  Per 1,000 searches       : ${per_search * 1000:.4f}")
     if per_search:
         print(f"  Searches/month needed to double the bill: {int(total / per_search):,}")

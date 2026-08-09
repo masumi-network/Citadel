@@ -93,10 +93,9 @@ def capture_token() -> str:
     Only seat-scoped tokens are accepted: the admin-key fallback is intentionally
     omitted so capture never routes to Central with elevated privileges.
     """
-    return (
-        (os.getenv("CITADEL_MCP_ACCESS_TOKEN") or "").strip()
-        or os.getenv("CITADEL_WRITER_KEYS", "").split(",")[0].strip()
-    )
+    return (os.getenv("CITADEL_MCP_ACCESS_TOKEN") or "").strip() or os.getenv(
+        "CITADEL_WRITER_KEYS", ""
+    ).split(",")[0].strip()
 
 
 def _redact_url_userinfo(url: str) -> str:

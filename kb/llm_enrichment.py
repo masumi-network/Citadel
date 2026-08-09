@@ -85,10 +85,13 @@ def enrichment_enabled() -> bool:
 
 
 def enrichment_threshold_chars() -> int:
-    return max(1, _int_env(
-        "CITADEL_LLM_ENRICHMENT_THRESHOLD_CHARS",
-        default=DEFAULT_THRESHOLD_CHARS,
-    ))
+    return max(
+        1,
+        _int_env(
+            "CITADEL_LLM_ENRICHMENT_THRESHOLD_CHARS",
+            default=DEFAULT_THRESHOLD_CHARS,
+        ),
+    )
 
 
 def redacted_preview(text: str, *, length: int = LOG_PREVIEW_CHARS) -> str:
@@ -202,9 +205,7 @@ class EnrichmentOutcome:
 
     @property
     def chunked(self) -> bool:
-        return len(self.chunks) > 1 or any(
-            chunk.summary or chunk.tags for chunk in self.chunks
-        )
+        return len(self.chunks) > 1 or any(chunk.summary or chunk.tags for chunk in self.chunks)
 
 
 def paragraph_chunks(data: str, *, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> list[str]:
@@ -321,9 +322,7 @@ def enrich_source_material(data: str) -> EnrichmentOutcome:
     if len(data) < enrichment_threshold_chars():
         return _passthrough(data, "below_threshold")
     if content_flagged_by_security_scan(data):
-        logger.warning(
-            "LLM enrichment skipped: security scan flagged the source material"
-        )
+        logger.warning("LLM enrichment skipped: security scan flagged the source material")
         return _fallback(data, "security_flagged")
     if not openrouter_api_key():
         return _fallback(data, "no_api_key")

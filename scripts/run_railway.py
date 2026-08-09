@@ -537,9 +537,7 @@ def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str
     return _stage_verdict(label, succeeded, failed, skipped)
 
 
-def _stage_verdict(
-    label: str, succeeded: list[str], failed: list[str], skipped: list[str]
-) -> int:
+def _stage_verdict(label: str, succeeded: list[str], failed: list[str], skipped: list[str]) -> int:
     """Log the pass summary and return its exit code.
 
     Shared by the sync and in-loop stage runners so the #89 rule (any failed

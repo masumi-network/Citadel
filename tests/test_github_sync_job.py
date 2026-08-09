@@ -115,12 +115,8 @@ def test_scheduled_sync_redacts_private_metadata_from_default_output(
                         "commit_count": 4,
                         "open_pull_request_count": 1,
                         "merged_pull_request_count": 1,
-                        "changed_repositories": [
-                            {"full_name": "private-org/private-repo"}
-                        ],
-                        "recent_commits": [
-                            {"message": "private customer incident details"}
-                        ],
+                        "changed_repositories": [{"full_name": "private-org/private-repo"}],
+                        "recent_commits": [{"message": "private customer incident details"}],
                         "digest": "private repo digest body",
                     }
                 },
@@ -181,15 +177,10 @@ def test_gateway_delivery_summary_prefers_generic_gateways() -> None:
 
 def test_gateway_delivery_summary_falls_back_to_google_chat() -> None:
     result = {
-        "notifications": {
-            "google_chat": {"sent": False, "status_category": "delivery_error"}
-        }
+        "notifications": {"google_chat": {"sent": False, "status_category": "delivery_error"}}
     }
 
-    assert (
-        run_github_sync._gateway_delivery_summary(result)
-        == "google_chat:delivery_error"
-    )
+    assert run_github_sync._gateway_delivery_summary(result) == "google_chat:delivery_error"
 
 
 def test_post_json_converts_read_timeout_to_clean_result(monkeypatch: Any) -> None:

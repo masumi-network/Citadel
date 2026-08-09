@@ -231,18 +231,109 @@ def is_docs_mode_query(query: str, *, mode: str | None = None) -> bool:
 _QUERY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./-]*")
 _QUERY_STOPWORDS = frozenset(
     {
-        "the", "and", "for", "with", "this", "that", "these", "those", "from",
-        "what", "how", "where", "when", "which", "who", "whose", "why", "are",
-        "was", "were", "does", "did", "doing", "not", "you", "your", "has",
-        "have", "had", "can", "could", "should", "would", "will", "shall",
-        "may", "might", "must", "about", "into", "onto", "over", "under",
-        "between", "our", "their", "they", "them", "its", "his", "her",
-        "also", "but", "nor", "either", "any", "all", "some", "than", "then",
-        "there", "here", "been", "being", "because", "just", "only", "very",
-        "much", "more", "most", "such", "each", "per", "via", "own", "off",
-        "out", "too", "get", "got", "let", "see", "say", "said", "tell", "show",
-        "find", "use", "used", "using", "one", "two", "way", "make", "made",
-        "need", "want", "know", "like", "work", "works", "please",
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "these",
+        "those",
+        "from",
+        "what",
+        "how",
+        "where",
+        "when",
+        "which",
+        "who",
+        "whose",
+        "why",
+        "are",
+        "was",
+        "were",
+        "does",
+        "did",
+        "doing",
+        "not",
+        "you",
+        "your",
+        "has",
+        "have",
+        "had",
+        "can",
+        "could",
+        "should",
+        "would",
+        "will",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "about",
+        "into",
+        "onto",
+        "over",
+        "under",
+        "between",
+        "our",
+        "their",
+        "they",
+        "them",
+        "its",
+        "his",
+        "her",
+        "also",
+        "but",
+        "nor",
+        "either",
+        "any",
+        "all",
+        "some",
+        "than",
+        "then",
+        "there",
+        "here",
+        "been",
+        "being",
+        "because",
+        "just",
+        "only",
+        "very",
+        "much",
+        "more",
+        "most",
+        "such",
+        "each",
+        "per",
+        "via",
+        "own",
+        "off",
+        "out",
+        "too",
+        "get",
+        "got",
+        "let",
+        "see",
+        "say",
+        "said",
+        "tell",
+        "show",
+        "find",
+        "use",
+        "used",
+        "using",
+        "one",
+        "two",
+        "way",
+        "make",
+        "made",
+        "need",
+        "want",
+        "know",
+        "like",
+        "work",
+        "works",
+        "please",
     }
 )
 MAX_QUERY_TERMS = 12
@@ -283,9 +374,7 @@ def text_term_matches(text: str, terms: list[str]) -> list[str]:
     return [term for term in terms if _term_pattern(term).search(lowered)]
 
 
-def best_match_window(
-    text: str, terms: list[str], *, width: int = 400
-) -> tuple[int, str] | None:
+def best_match_window(text: str, terms: list[str], *, width: int = 400) -> tuple[int, str] | None:
     """(offset, window) around the densest cluster of query terms.
 
     Returns None when no term occurs. Exists because truncating a long document
@@ -554,6 +643,7 @@ def apply_query_ranking(
         return list(results)
     dict_hits = [item for item in results if isinstance(item, dict)]
     other = [item for item in results if not isinstance(item, dict)]
+
     # Class boost first, then lexical term coverage as the tie-breaker. Without
     # the second key a page of same-class hits (ten repo-content chunks, all
     # `canonical-docs`) sorted into exactly its input order and mode=docs was
@@ -812,9 +902,7 @@ def repo_filter_matches(identity: str | None, wanted: str) -> bool:
     if not needle:
         return True
     return (
-        identity == needle
-        or identity.endswith("/" + needle)
-        or identity.startswith(needle + "/")
+        identity == needle or identity.endswith("/" + needle) or identity.startswith(needle + "/")
     )
 
 
@@ -922,9 +1010,7 @@ def filter_hits(
         # whole blob made path= another body-text filter.
         needle = path.replace("**/", "").replace("/**", "").replace("*", "").lower()
         if needle:
-            filtered = [
-                h for h in filtered if needle in (_hit_path_identity(h) or "").lower()
-            ]
+            filtered = [h for h in filtered if needle in (_hit_path_identity(h) or "").lower()]
     if canonical_only:
         # Content-shaped, NOT a trust filter: it keeps hits whose text reads like
         # documentation. It cannot vouch for any of them — the tier that could
@@ -970,7 +1056,12 @@ def shape_search_payload(
         exclude_ambient = True
     if apply_spec_ranking is None:
         apply_spec_ranking = is_spec_mode_query(query) and not docs_mode
-    if docs_mode or extract_hex_needles(query) or apply_spec_ranking or len(query_terms(query)) == 1:
+    if (
+        docs_mode
+        or extract_hex_needles(query)
+        or apply_spec_ranking
+        or len(query_terms(query)) == 1
+    ):
         ordered = apply_query_ranking(raw_results, query, mode=mode)
     else:
         ordered = list(raw_results)

@@ -31,9 +31,7 @@ def test_evolve_scheduler_config_defaults(monkeypatch: Any) -> None:
 # --- scheduler wiring ------------------------------------------------------
 
 
-def _fake_citadel(
-    *, enabled: bool, interval: int = 21600, state_path: str = ""
-) -> SimpleNamespace:
+def _fake_citadel(*, enabled: bool, interval: int = 21600, state_path: str = "") -> SimpleNamespace:
     return SimpleNamespace(
         config=SimpleNamespace(
             evolve_scheduler_enabled=enabled,
@@ -136,7 +134,9 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", forbidden_exec)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
-    task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
     try:
         for _ in range(300):
             if len(cognify_calls) >= 2:
@@ -189,7 +189,9 @@ async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(
     _patch_phase1(monkeypatch, raises=True)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
-    task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
     try:
         for _ in range(300):
             if len(cognify_calls) >= 2:
@@ -222,7 +224,9 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
     with caplog.at_level(logging.ERROR, logger=server.logger.name):
-        task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
+        task = asyncio.create_task(
+            server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+        )
         try:
             for _ in range(300):
                 if cognify_calls:

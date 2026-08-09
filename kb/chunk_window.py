@@ -639,9 +639,7 @@ def check_stored_chunk_payload(
     )
 
 
-def _iter_cognee_final_chunks(
-    text: str, budget: int
-) -> Iterable[tuple[int, str, int]]:
+def _iter_cognee_final_chunks(text: str, budget: int) -> Iterable[tuple[int, str, int]]:
     """Mirror Cognee 1.2.x TextChunker output before its storage fan-out.
 
     Cognee's paragraph chunker returns intermediate chunks, then TextChunker
@@ -652,9 +650,7 @@ def _iter_cognee_final_chunks(
     try:
         from cognee.tasks.chunks.chunk_by_paragraph import chunk_by_paragraph
     except Exception as exc:  # pragma: no cover - dependency pin/import failure
-        raise ChunkBudgetValidationError(
-            "cannot import Cognee's pinned paragraph chunker"
-        ) from exc
+        raise ChunkBudgetValidationError("cannot import Cognee's pinned paragraph chunker") from exc
 
     paragraph_chunks: list[dict[str, Any]] = []
     current_size = 0
@@ -766,9 +762,7 @@ def split_cognee_words(text: str) -> list[str]:
 
 _BPE_ENCODING: Any | None = None
 _BPE_ENCODING_UNAVAILABLE = object()
-_TIKTOKEN_CACHE_FILENAME = "".join(
-    ("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790")
-)
+_TIKTOKEN_CACHE_FILENAME = "".join(("fb374d41", "9588a463", "2f3f557e", "76b4b70a", "ebbca790"))
 _TIKTOKEN_CACHE_ARCHIVE = _TIKTOKEN_CACHE_FILENAME + ".gz"
 _TIKTOKEN_CACHE_SHA256 = "".join(
     (
@@ -805,18 +799,12 @@ def _seed_bundled_tiktoken_cache() -> None:
     global _BUNDLED_TIKTOKEN_CACHE_READY
     if "TIKTOKEN_CACHE_DIR" in os.environ:
         return
-    bundled_archive = (
-        Path(__file__).with_name("data")
-        / "tiktoken-cache"
-        / _TIKTOKEN_CACHE_ARCHIVE
-    )
+    bundled_archive = Path(__file__).with_name("data") / "tiktoken-cache" / _TIKTOKEN_CACHE_ARCHIVE
     if not bundled_archive.is_file():
         return
     configured = os.getenv("CITADEL_TIKTOKEN_CACHE_DIR")
     cache_dir = (
-        Path(configured)
-        if configured
-        else Path(tempfile.gettempdir()) / "citadel-tiktoken-cache"
+        Path(configured) if configured else Path(tempfile.gettempdir()) / "citadel-tiktoken-cache"
     )
     target = cache_dir / _TIKTOKEN_CACHE_FILENAME
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
@@ -863,8 +851,7 @@ def _bpe_encoding() -> Any | None:
     if not cache_available:
         _BPE_ENCODING = _BPE_ENCODING_UNAVAILABLE
         logger.error(
-            "No valid gpt-4o tokenizer cache is available; "
-            "exact chunk measurement is unavailable"
+            "No valid gpt-4o tokenizer cache is available; exact chunk measurement is unavailable"
         )
         return None
     try:

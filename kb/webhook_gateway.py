@@ -59,8 +59,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise WebhookConfigError(f"webhook endpoint attempted a {code} redirect")
 
 
-
-
 def _is_forbidden_address(candidate: str) -> bool:
     """True when *candidate* is an IP a webhook must never reach."""
     try:
@@ -116,9 +114,7 @@ def require_webhook_url(url: str) -> str:
     """
     parsed = urlparse(url)
     if parsed.scheme.lower() != "https":
-        raise WebhookConfigError(
-            f"webhook URL must be https, got {parsed.scheme or 'no scheme'}"
-        )
+        raise WebhookConfigError(f"webhook URL must be https, got {parsed.scheme or 'no scheme'}")
     host = (parsed.hostname or "").lower().rstrip(".")  # a trailing dot dodges suffixes
     if not host:
         raise WebhookConfigError("webhook URL has no host")
@@ -232,9 +228,7 @@ class WebhookDelivery:
             )
             if self.token:
                 request.add_header("Authorization", f"Bearer {self.token}")
-            opener = urllib.request.build_opener(
-                _NoRedirect, _PinnedHTTPSHandler(self.pinned_ip)
-            )
+            opener = urllib.request.build_opener(_NoRedirect, _PinnedHTTPSHandler(self.pinned_ip))
             with opener.open(request, timeout=self.timeout_seconds) as response:
                 status_code = response.status
         except WebhookConfigError as exc:

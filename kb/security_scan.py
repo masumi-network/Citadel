@@ -39,9 +39,7 @@ SECRET_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "database_connection_url",
         "critical",
-        re.compile(
-            r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s'\"`<>]+"
-        ),
+        re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s'\"`<>]+"),
     ),
     (
         "github_token",
@@ -94,11 +92,7 @@ REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
     re.compile(r"(?i)(token[\"'\s:=]+)[A-Za-z0-9._~+/=-]+"),
     re.compile(r"(?i)(api[_-]?key[\"'\s:=]+)[A-Za-z0-9._~+/=-]+"),
-    *(
-        pattern
-        for category, _, pattern in SECRET_PATTERNS
-        if category != "secret_assignment"
-    ),
+    *(pattern for category, _, pattern in SECRET_PATTERNS if category != "secret_assignment"),
     re.compile(
         r"(?i)(\b(?:api[_-]?key|secret|token|password|passwd|pwd)\s*[:=]\s*['\"]?)[^\s'\"]{4,}"
     ),
@@ -172,9 +166,7 @@ def redact_secrets(value: str, *known_secrets: str | None) -> str:
             redacted = redacted.replace(secret, "[REDACTED]")
     for pattern in REDACTION_PATTERNS:
         redacted = pattern.sub(
-            lambda match: f"{match.group(1)}[REDACTED]"
-            if match.groups()
-            else "[REDACTED]",
+            lambda match: f"{match.group(1)}[REDACTED]" if match.groups() else "[REDACTED]",
             redacted,
         )
     return redacted

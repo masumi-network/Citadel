@@ -15,9 +15,7 @@ _REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bctdl_[A-Za-z0-9_-]{20,}\b"), "[REDACTED_TOKEN]"),
     (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED_AWS_KEY]"),
     (
-        re.compile(
-            r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s'\"`<>]+"
-        ),
+        re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s'\"`<>]+"),
         "[REDACTED_DATABASE_URL]",
     ),
     (re.compile(r"(?i)(?:--token=|--api-key=|--password=)[^\s]+"), "=[REDACTED]"),

@@ -352,7 +352,9 @@ async def _ingest(args: argparse.Namespace) -> int:
     accepted = result.get("accepted", True)
     # A duplicate is a benign, idempotent no-op — not a failure.
     duplicate = (not accepted) and "duplicate" in str(result.get("reason") or "")
-    cognified = result.get("cognified")  # True/False from the Node, or None (not requested / old Node)
+    cognified = result.get(
+        "cognified"
+    )  # True/False from the Node, or None (not requested / old Node)
     color = supports_color()
     dataset = result.get("dataset") or "your node"
     scope = "your private seat" if str(dataset).startswith("seat:") else "shared org vault"
@@ -369,7 +371,9 @@ async def _ingest(args: argparse.Namespace) -> int:
         if cognified is True:
             print(f"  {mark(True, enable=color)} cognified — now searchable")
         elif cognified is False:
-            print(f"  {paint(SKIP, 'yellow', enable=color)} ingested, but cognify didn't finish — the next Node sync will pick it up")
+            print(
+                f"  {paint(SKIP, 'yellow', enable=color)} ingested, but cognify didn't finish — the next Node sync will pick it up"
+            )
         elif cognify:
             # Requested cognify but the Node didn't report it (older Node, pre inline-cognify).
             print(paint("  (graph update will happen on the next Node sync)", "dim", enable=color))
@@ -409,8 +413,12 @@ _SEARCH_SECTION_ORDER = ("central", "session_traces", "node")
 def _search_item_text(item: Any) -> str:
     if isinstance(item, dict):
         text = (
-            item.get("text") or item.get("content") or item.get("summary")
-            or item.get("title") or item.get("name") or json.dumps(item, default=str)
+            item.get("text")
+            or item.get("content")
+            or item.get("summary")
+            or item.get("title")
+            or item.get("name")
+            or json.dumps(item, default=str)
         )
     else:
         text = str(item)
@@ -453,7 +461,9 @@ def _render_search(payload: dict[str, Any], query: str) -> None:
             print(paint(_SEARCH_SECTION_LABELS[key], "bold", enable=color))
             for item in items:
                 meta = _search_item_meta(item, color=color) if isinstance(item, dict) else ""
-                print(f"  {paint(f'{index}.', 'cyan', enable=color)} {meta}{_search_item_text(item)}")
+                print(
+                    f"  {paint(f'{index}.', 'cyan', enable=color)} {meta}{_search_item_text(item)}"
+                )
                 index += 1
             print()
         return
@@ -633,7 +643,13 @@ async def _search(args: argparse.Namespace) -> int:
             code="HTTP_ERROR",
             extra={"http_status": exc.code},
         )
-    except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+    except (
+        TimeoutError,
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         # TimeoutError and urllib URLError("timed out") share one soft-fail path.
         if _is_timeout_exc(exc):
             return _emit_search_timeout(args, note=str(exc) or "search timed out")
@@ -650,7 +666,9 @@ async def _search(args: argparse.Namespace) -> int:
             return 0
         for warning in shaped.get("warnings") or []:
             print(paint(f"warning: {warning}", "yellow"), file=sys.stderr)
-        display_results = shaped["results"] if filters_on or shaped.get("spec_mode") else raw.get("results")
+        display_results = (
+            shaped["results"] if filters_on or shaped.get("spec_mode") else raw.get("results")
+        )
         _render_search({**raw, "results": display_results or [], "sections": None}, args.query)
         return 0
 
@@ -736,7 +754,13 @@ async def _verify(args: argparse.Namespace) -> int:
                 top_k,
                 timeout=_search_timeout_seconds(args),
             )
-    except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+    except (
+        TimeoutError,
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         if _is_timeout_exc(exc):
             report = shape_verify_report(
                 path=path,
@@ -798,7 +822,13 @@ async def _prepare_pr_context(args: argparse.Namespace) -> int:
                 top_k,
                 timeout=_search_timeout_seconds(args),
             )
-    except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+    except (
+        TimeoutError,
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         if _is_timeout_exc(exc):
             brief = shape_prepare_pr_context(
                 repo=repo,
@@ -942,11 +972,15 @@ async def _learn(args: argparse.Namespace) -> None:
     from kb.learning_agent import LearningAgent
 
     agent = LearningAgent.from_env()
-    result = await agent.status() if args.status else await agent.run(
-        force=args.force,
-        dry_run=args.dry_run,
-        post_to_chat=args.post_to_chat,
-        include_digest_preview=not args.hide_digest_preview,
+    result = (
+        await agent.status()
+        if args.status
+        else await agent.run(
+            force=args.force,
+            dry_run=args.dry_run,
+            post_to_chat=args.post_to_chat,
+            include_digest_preview=not args.hide_digest_preview,
+        )
     )
     _print_json(result)
     return _result_exit(result)
@@ -1000,9 +1034,11 @@ def _wizard_roots(config: CaptureConfig, default_root: str | None = None) -> Cap
             # recording a root that will never capture anything.
             guess = Path.home() / raw.lstrip("/") if raw.startswith("/") else None
             if guess is not None and guess.exists():
-                answer = _prompt(
-                    f"  ! {normalized} does not exist — did you mean {guess}? [Y/n]: "
-                ).strip().lower()
+                answer = (
+                    _prompt(f"  ! {normalized} does not exist — did you mean {guess}? [Y/n]: ")
+                    .strip()
+                    .lower()
+                )
                 if answer in ("", "y", "yes"):
                     normalized = normalize_path(str(guess))
                 else:
@@ -1316,7 +1352,13 @@ def _access_exit(exc: AccessClientError, *, as_json: bool) -> int:
 def _print_minted_token(token: str, api_token: dict[str, Any], *, color: bool) -> None:
     """Print a freshly minted token once, with its write-scope + adopt steps."""
     print()
-    print(paint("  Token (shown once — copy it now, it cannot be retrieved later):", "yellow", enable=color))
+    print(
+        paint(
+            "  Token (shown once — copy it now, it cannot be retrieved later):",
+            "yellow",
+            enable=color,
+        )
+    )
     print("    " + paint(token, "bold", enable=color))
     dataset = api_token.get("default_dataset")
     if dataset and str(dataset).startswith("seat:"):
@@ -1326,7 +1368,13 @@ def _print_minted_token(token: str, api_token: dict[str, Any], *, color: bool) -
     else:
         scope = "ingests go to the org default dataset — NOT a private seat"
     print(paint(f"  scope: {scope}  ·  role={api_token.get('role')}", "dim", enable=color))
-    print(paint("  Adopt:  citadel onboard --token <token-above>   ·   share over a private channel", "dim", enable=color))
+    print(
+        paint(
+            "  Adopt:  citadel onboard --token <token-above>   ·   share over a private channel",
+            "dim",
+            enable=color,
+        )
+    )
 
 
 async def _seat_list(args: argparse.Namespace) -> int:
@@ -1495,7 +1543,10 @@ async def _token_create(args: argparse.Namespace) -> int:
         if seat_slug:
             known = {seat.get("seat_slug") for seat in _active_seats(base_url)}
             if seat_slug not in known:
-                listing = ", ".join(sorted(str(slug) for slug in known)) or "none yet — `citadel seat create`"
+                listing = (
+                    ", ".join(sorted(str(slug) for slug in known))
+                    or "none yet — `citadel seat create`"
+                )
                 print(
                     f"citadel token create: no seat '{seat_slug}'. Seats: {listing}",
                     file=sys.stderr,
@@ -1518,13 +1569,13 @@ async def _token_create(args: argparse.Namespace) -> int:
                 if slug in known:
                     print(
                         f"citadel token create: '{dataset}' is a seat — mint a seat-bound token: "
-                        f"citadel token create \"{args.name}\" --seat {slug}",
+                        f'citadel token create "{args.name}" --seat {slug}',
                         file=sys.stderr,
                     )
                 else:
                     print(
                         f"citadel token create: no seat '{slug}' — create it first: "
-                        f"citadel seat create \"Name\" {slug}",
+                        f'citadel seat create "Name" {slug}',
                         file=sys.stderr,
                     )
                 return 1
@@ -1543,7 +1594,13 @@ async def _token_create(args: argparse.Namespace) -> int:
         _print_json(result)
         return 0
     color = supports_color()
-    print(paint(f"Token created  (principal {result.get('principal', {}).get('id')})", "green", enable=color))
+    print(
+        paint(
+            f"Token created  (principal {result.get('principal', {}).get('id')})",
+            "green",
+            enable=color,
+        )
+    )
     if result.get("token"):
         _print_minted_token(result["token"], result.get("api_token", {}), color=color)
     # Standalone tokens are NOT seat-scoped — steer teammate tokens to seats.
@@ -1552,7 +1609,7 @@ async def _token_create(args: argparse.Namespace) -> int:
         print(
             paint(
                 "  Note: this is a standalone token (not a private seat). For a teammate, use "
-                "`citadel seat create \"Name\" slug` so their writes land in their own seat.",
+                '`citadel seat create "Name" slug` so their writes land in their own seat.',
                 "yellow",
                 enable=color,
             )
@@ -1588,7 +1645,10 @@ async def _token_set(args: argparse.Namespace) -> int:
     token = (args.token or "").strip()
     if not token:
         if not sys.stdin.isatty():
-            print("citadel token set: pass the token as an argument (no TTY to prompt on).", file=sys.stderr)
+            print(
+                "citadel token set: pass the token as an argument (no TTY to prompt on).",
+                file=sys.stderr,
+            )
             return 2
         token = _prompt_hidden("Paste the new seat token (ctdl_…): ")
     if not token:
@@ -1605,7 +1665,10 @@ async def _token_set(args: argparse.Namespace) -> int:
                 f"  {mark(False, enable=color)} token not verified ({auth.detail}) — nothing written.",
                 file=sys.stderr,
             )
-            print(paint("  (pass --skip-verify to write it anyway)", "dim", enable=color), file=sys.stderr)
+            print(
+                paint("  (pass --skip-verify to write it anyway)", "dim", enable=color),
+                file=sys.stderr,
+            )
             return 1
         print()
         print(_render_identity(auth, node_url, color))
@@ -1613,11 +1676,19 @@ async def _token_set(args: argparse.Namespace) -> int:
 
     previous = read_token_from_rc(rc_path)
     status = ensure_token_in_rc(rc_path, token)
-    detail = status + (f" · replaced {mask_token(previous)}" if previous and previous != token else "")
-    print(f"  {mark(True, enable=color)} token {mask_token(token)} → {rc_path}  {paint(detail, 'dim', enable=color)}")
+    detail = status + (
+        f" · replaced {mask_token(previous)}" if previous and previous != token else ""
+    )
+    print(
+        f"  {mark(True, enable=color)} token {mask_token(token)} → {rc_path}  {paint(detail, 'dim', enable=color)}"
+    )
     if (os.environ.get(TOKEN_ENV) or "").strip() != token:
         print(
-            paint(f"  ! this shell still has the old value — run `source {rc_path}` or open a new shell.", "yellow", enable=color)
+            paint(
+                f"  ! this shell still has the old value — run `source {rc_path}` or open a new shell.",
+                "yellow",
+                enable=color,
+            )
         )
     return 0
 
@@ -1647,10 +1718,16 @@ def _wire_detected_tools(node_url: str, *, color: bool) -> None:
     if selectable:
         labels = [
             tool_detect.SPECS[name].label
-            + (paint("  (paste-in snippet)", "dim", enable=color) if tool_detect.SPECS[name].mode == "snippet" else "")
+            + (
+                paint("  (paste-in snippet)", "dim", enable=color)
+                if tool_detect.SPECS[name].mode == "snippet"
+                else ""
+            )
             for name in selectable
         ]
-        preselected = {i for i, name in enumerate(selectable) if tool_detect.SPECS[name].mode == "write"}
+        preselected = {
+            i for i, name in enumerate(selectable) if tool_detect.SPECS[name].mode == "write"
+        }
         print()
         picked = checkbox_select(
             paint("Coding tools", "bold", enable=color)
@@ -1668,14 +1745,20 @@ def _wire_detected_tools(node_url: str, *, color: bool) -> None:
         spec = tool_detect.SPECS[name]
         if spec.mode == "write":
             sigil = mark(result.action != "error", enable=color)
-            print(f"  {sigil} {spec.label}  {paint(f'{result.action} · {result.detail}', 'dim', enable=color)}")
+            print(
+                f"  {sigil} {spec.label}  {paint(f'{result.action} · {result.detail}', 'dim', enable=color)}"
+            )
         else:  # snippet
-            print(f"  {paint(spec.label, 'bold', enable=color)} — paste into {paint(spec.config_hint, 'dim', enable=color)}:")
+            print(
+                f"  {paint(spec.label, 'bold', enable=color)} — paste into {paint(spec.config_hint, 'dim', enable=color)}:"
+            )
             print(_indent(result.snippet or ""))
     for name in notes:
         result = tool_detect.apply(name, node_url=node_url)
         spec = tool_detect.SPECS[name]
-        print(f"  {paint('•', 'dim', enable=color)} {spec.label}: {paint(result.detail, 'dim', enable=color)}")
+        print(
+            f"  {paint('•', 'dim', enable=color)} {spec.label}: {paint(result.detail, 'dim', enable=color)}"
+        )
 
 
 async def _mcp_add(args: argparse.Namespace) -> int:
@@ -1687,8 +1770,11 @@ async def _mcp_add(args: argparse.Namespace) -> int:
     rc = 0
     for name in targets:
         if name not in tool_detect.SPECS:
-            print(f"citadel mcp add: unknown tool {name!r} "
-                  f"(choose from: {', '.join(tool_detect.ALL_TOOLS)}, all)", file=sys.stderr)
+            print(
+                f"citadel mcp add: unknown tool {name!r} "
+                f"(choose from: {', '.join(tool_detect.ALL_TOOLS)}, all)",
+                file=sys.stderr,
+            )
             rc = 1
             continue
         spec = tool_detect.SPECS[name]
@@ -1696,8 +1782,10 @@ async def _mcp_add(args: argparse.Namespace) -> int:
         if spec.mode == "write":
             ok = result.action != "error"
             rc = rc or (0 if ok else 1)
-            print(f"  {mark(ok, enable=color)} {spec.label}  "
-                  f"{paint(f'{result.action} · {result.detail}', 'dim', enable=color)}")
+            print(
+                f"  {mark(ok, enable=color)} {spec.label}  "
+                f"{paint(f'{result.action} · {result.detail}', 'dim', enable=color)}"
+            )
         elif spec.mode == "snippet":
             print(paint(f"{spec.label} — paste into {spec.config_hint}:", "bold", enable=color))
             print(_indent(result.snippet or ""))
@@ -1718,7 +1806,9 @@ async def _mcp_list(args: argparse.Namespace) -> int:
     for name in detected:
         spec = tool_detect.SPECS[name]
         mode = {"write": "auto-write", "snippet": "snippet", "note": "note"}[spec.mode]
-        print(f"  {paint(name.ljust(9), 'cyan', enable=color)} {mode:<10} {paint(spec.config_hint, 'dim', enable=color)}")
+        print(
+            f"  {paint(name.ljust(9), 'cyan', enable=color)} {mode:<10} {paint(spec.config_hint, 'dim', enable=color)}"
+        )
     return 0
 
 
@@ -1819,11 +1909,7 @@ def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
     last = stats.get("last_indexed_at")
     if last:
         parts.append(paint(f"last indexed {str(last)[:16].replace('T', ' ')}", "dim", enable=color))
-    return (
-        paint("Knowledge mesh", "bold", enable=color)
-        + "\n  "
-        + " · ".join(parts)
-    )
+    return paint("Knowledge mesh", "bold", enable=color) + "\n  " + " · ".join(parts)
 
 
 def _render_event(event: dict[str, Any], color: bool) -> str:
@@ -2029,8 +2115,13 @@ async def _doctor(args: argparse.Namespace) -> int:
 
     async def _gather() -> Any:
         return await asyncio.to_thread(
-            gather_status, node_url, token, repo=repo, config_path=config_path,
-            with_search=False, with_recent=False,
+            gather_status,
+            node_url,
+            token,
+            repo=repo,
+            config_path=config_path,
+            with_search=False,
+            with_recent=False,
         )
 
     if as_json:
@@ -2065,15 +2156,23 @@ async def _doctor(args: argparse.Namespace) -> int:
 
     node = checks.get("node")
     if node and not node.ok:
-        issues.append({"problem": f"Node unreachable at {node_url} ({node.detail})",
-                       "fix": "check the Node URL / network"})
+        issues.append(
+            {
+                "problem": f"Node unreachable at {node_url} ({node.detail})",
+                "fix": "check the Node URL / network",
+            }
+        )
     auth = checks.get("auth")
     # Only call it a token rejection when the Node is actually reachable — when
     # the Node is down, auth fails too, and we must not tell the user to rotate
     # a perfectly valid token.
     if node and node.ok and token and auth and not auth.ok:
-        issues.append({"problem": f"Node rejected the token ({auth.detail})",
-                       "fix": "token revoked/expired or wrong Node — re-mint (`citadel seat create`) or re-onboard"})
+        issues.append(
+            {
+                "problem": f"Node rejected the token ({auth.detail})",
+                "fix": "token revoked/expired or wrong Node — re-mint (`citadel seat create`) or re-onboard",
+            }
+        )
 
     # Data-plane gate: a reachable, authenticated Node whose corpus check is RED
     # (sources tracked but graph empty, or the cognify canary failed) is a real
@@ -2081,27 +2180,49 @@ async def _doctor(args: argparse.Namespace) -> int:
     # unresolved so doctor exits nonzero.
     corpus = checks.get("corpus")
     if node and node.ok and auth and auth.ok and corpus and not corpus.ok:
-        issues.append({"problem": f"data plane broken ({corpus.detail}) — Node up but retrieval is empty",
-                       "fix": "check the evolve scheduler / cognify; run `citadel cognify --verify`"})
+        issues.append(
+            {
+                "problem": f"data plane broken ({corpus.detail}) — Node up but retrieval is empty",
+                "fix": "check the evolve scheduler / cognify; run `citadel cognify --verify`",
+            }
+        )
 
     mcp_node = _mcp_node_url(repo / ".mcp.json")
     if mcp_node and cap_node and mcp_node.rstrip("/") != cap_node.rstrip("/"):
-        issues.append({"problem": f".mcp.json Node ({mcp_node}) disagrees with capture config ({cap_node})",
-                       "fix": f"citadel onboard --node-url {cap_node}"})
+        issues.append(
+            {
+                "problem": f".mcp.json Node ({mcp_node}) disagrees with capture config ({cap_node})",
+                "fix": f"citadel onboard --node-url {cap_node}",
+            }
+        )
 
     hook_check = checks.get("pre_push_hook")
     if hook_check and not hook_check.ok:
         if (hook_check.data or {}).get("git_repo") is False:
             # Not a git repo here — "hook missing" would read as "your hook is
             # gone" when there was simply nothing to inspect at this cwd.
-            issues.append({
-                "problem": f"pre-push hook not checked — {hook_check.detail}",
-                "fix": "run `citadel doctor` from inside a git repo (or pass --repo)",
-            })
+            issues.append(
+                {
+                    "problem": f"pre-push hook not checked — {hook_check.detail}",
+                    "fix": "run `citadel doctor` from inside a git repo (or pass --repo)",
+                }
+            )
         else:
-            issues.append({"problem": "git pre-push autosync hook missing", "fix": "citadel doctor --fix", "kind": "pre_push"})
+            issues.append(
+                {
+                    "problem": "git pre-push autosync hook missing",
+                    "fix": "citadel doctor --fix",
+                    "kind": "pre_push",
+                }
+            )
     if checks.get("session_hook") and not checks["session_hook"].ok:
-        issues.append({"problem": "Claude SessionEnd/SessionStart hooks missing", "fix": "citadel doctor --fix", "kind": "session"})
+        issues.append(
+            {
+                "problem": "Claude SessionEnd/SessionStart hooks missing",
+                "fix": "citadel doctor --fix",
+                "kind": "session",
+            }
+        )
     if checks.get("mcp") and not checks["mcp"].ok:
         mcp_check = checks["mcp"]
         state = (mcp_check.data or {}).get("state") or MCP_STATE_MISSING
@@ -2118,8 +2239,7 @@ async def _doctor(args: argparse.Namespace) -> int:
                 mcp_issue["fix"] = "citadel doctor --fix"
         elif state == MCP_STATE_NEEDS_AUTH:
             mcp_issue["fix"] = (
-                f"set {TOKEN_ENV} in the environment Cursor was launched from, "
-                "then restart Cursor"
+                f"set {TOKEN_ENV} in the environment Cursor was launched from, then restart Cursor"
             )
         issues.append(mcp_issue)
     for mcp_issue in diagnose_mcp_config(repo):
@@ -2152,9 +2272,7 @@ async def _doctor(args: argparse.Namespace) -> int:
                         # Demote so --fix does not claim "all clear".
                         fixed.append("MCP server (hosted HTTP)")
                         issue.pop("kind", None)
-                        issue["problem"] = (
-                            f"MCP not ready ({after_state}): {after.detail}"
-                        )
+                        issue["problem"] = f"MCP not ready ({after_state}): {after.detail}"
                         issue["fix"] = (
                             f"set {TOKEN_ENV} in the environment Cursor was "
                             "launched from, then restart Cursor"
@@ -2169,13 +2287,15 @@ async def _doctor(args: argparse.Namespace) -> int:
     rc = 1 if unresolved else 0
 
     if as_json:
-        _print_json({
-            "ok": not issues,
-            "node_url": node_url,
-            "issues": [{k: v for k, v in i.items() if k != "kind"} for i in issues],
-            "fixed": fixed,
-            "resolved": not unresolved,
-        })
+        _print_json(
+            {
+                "ok": not issues,
+                "node_url": node_url,
+                "issues": [{k: v for k, v in i.items() if k != "kind"} for i in issues],
+                "fixed": fixed,
+                "resolved": not unresolved,
+            }
+        )
         return rc
 
     if sys.stdout.isatty():
@@ -2196,10 +2316,18 @@ async def _doctor(args: argparse.Namespace) -> int:
         print(paint(f"✓ Fixed: {', '.join(fixed)}. All clear.", "green", enable=color))
     elif fixed:
         print()
-        print(paint(f"Applied: {', '.join(fixed)}. Remaining items need you (see above).", "yellow", enable=color))
+        print(
+            paint(
+                f"Applied: {', '.join(fixed)}. Remaining items need you (see above).",
+                "yellow",
+                enable=color,
+            )
+        )
     elif any(i.get("kind") for i in issues):
         print()
-        print(paint("Run `citadel doctor --fix` to apply the auto-fixable ones.", "dim", enable=color))
+        print(
+            paint("Run `citadel doctor --fix` to apply the auto-fixable ones.", "dim", enable=color)
+        )
     return rc
 
 
@@ -2238,9 +2366,18 @@ def _render_identity(auth: Any, node_url: str, color: bool) -> str:
     ident = getattr(auth, "data", None) or {}
     seat = ident.get("seat_slug") or ident.get("actor") or "—"
     caps = ident.get("capabilities") or {}
-    access = " · ".join(
-        flag for flag, on in (("read", caps.get("read")), ("write", caps.get("write")), ("admin", caps.get("admin"))) if on
-    ) or "—"
+    access = (
+        " · ".join(
+            flag
+            for flag, on in (
+                ("read", caps.get("read")),
+                ("write", caps.get("write")),
+                ("admin", caps.get("admin")),
+            )
+            if on
+        )
+        or "—"
+    )
     writes = f"seat:{seat}" if ident.get("seat_slug") else "shared org dataset"
     lines = [
         paint(f"  {mark(True, enable=color)} authenticated", "green", enable=color),
@@ -2311,7 +2448,11 @@ async def _resolve_onboard_token(
             if answer in ("n", "no"):
                 token = _prompt_hidden("  Paste the new seat token (ctdl_…): ") or existing
                 if token == existing:
-                    print(paint("  (nothing pasted — keeping the existing token)", "dim", enable=color))
+                    print(
+                        paint(
+                            "  (nothing pasted — keeping the existing token)", "dim", enable=color
+                        )
+                    )
         else:
             token = existing
     if not token and interactive:
@@ -2343,13 +2484,23 @@ async def _resolve_onboard_token(
                 # Node unreachable / network error — a new token won't help.
                 print(
                     f"  {paint('!', 'yellow', enable=color)} "
-                    + paint(f"could not verify the token ({detail}) — continuing; run `citadel status` later.", "yellow", enable=color)
+                    + paint(
+                        f"could not verify the token ({detail}) — continuing; run `citadel status` later.",
+                        "yellow",
+                        enable=color,
+                    )
                 )
                 break
             print(f"  {mark(False, enable=color)} the Node rejected this token ({detail})")
             answer = _prompt("  Paste a different token? [y/N]: ").strip().lower()
             if answer not in ("y", "yes"):
-                print(paint("  (keeping it anyway — fix it later with `citadel token set`)", "dim", enable=color))
+                print(
+                    paint(
+                        "  (keeping it anyway — fix it later with `citadel token set`)",
+                        "dim",
+                        enable=color,
+                    )
+                )
                 break
             new_token = _prompt_hidden("  Paste the new seat token (ctdl_…): ")
             if not new_token:
@@ -2422,9 +2573,7 @@ async def _onboard(args: argparse.Namespace) -> int:
     # and proactive-ingest work out of the box (#35). Interactive-only; written
     # to the shell rc next to the seat token.
     if interactive:
-        llm_key = _prompt_hidden(
-            "\nOpenRouter API key for local cognify — Enter to skip: "
-        )
+        llm_key = _prompt_hidden("\nOpenRouter API key for local cognify — Enter to skip: ")
         if llm_key:
             steps.append(
                 (
@@ -2438,9 +2587,7 @@ async def _onboard(args: argparse.Namespace) -> int:
                 )
             )
             # Only relevant once a key exists — noise for everyone who skipped.
-            print(
-                "  (local cognify also needs: pipx install 'citadel-archive[server]')"
-            )
+            print("  (local cognify also needs: pipx install 'citadel-archive[server]')")
 
     # Capture roots (unless --no-capture): the wizard asks about the repo
     # toplevel explicitly (declinable); if the config still ends up empty, it
@@ -2456,9 +2603,7 @@ async def _onboard(args: argparse.Namespace) -> int:
             cfg = _wizard_roots(cfg, default_root=str(repo))
         if not cfg.roots:
             cfg = cfg.with_root(str(repo), (DEFAULT_ROOT_TAG,))  # 'personal' never promotes
-        save_capture_config(
-            cfg, path=cfg_path, updated_at=datetime.now(timezone.utc).isoformat()
-        )
+        save_capture_config(cfg, path=cfg_path, updated_at=datetime.now(timezone.utc).isoformat())
         steps.append((f"capture roots → {cfg_path}", f"{len(cfg.roots)} root(s)"))
         sync_result = sync_local_capture_roots_to_server(
             cfg,
@@ -2525,8 +2670,8 @@ async def _onboard(args: argparse.Namespace) -> int:
     print(
         f"\nNext: restart your shell (or `source {rc_path}`), then in your agent:\n"
         '  • at task start — "use citadel_search before we code on <topic>"\n'
-        '  • proactive capture — see /skills/proactive-ingest for mid-session ingest + autosync\n'
-        '  • when a route is worth reusing — ask the user, then `citadel_share_session` '
+        "  • proactive capture — see /skills/proactive-ingest for mid-session ingest + autosync\n"
+        "  • when a route is worth reusing — ask the user, then `citadel_share_session` "
         "(Shared Session Traces are reference-only, not org truth)\n"
         '  • smoke test — "use citadel_search to find what we decided about the vault"'
     )
@@ -2610,27 +2755,42 @@ async def _update(args: argparse.Namespace) -> int:
 
 
 _HOME_MENU = (
-    ("Get started", (
-        ("onboard", "one-command setup — token · hooks · MCP · capture roots"),
-        ("status", "connection · identity · local setup (--json for agents)"),
-        ("doctor", "diagnose setup problems · --fix to repair"),
-        ("update", "update citadel to the latest release"),
-    )),
-    ("Capture", (
-        ("setup", "declare Approved Capture Roots (~/.citadel/capture.json)"),
-        ("capture", "push summaries of approved roots to your Node"),
-        ("promotion", "list · approve · reject · run the Promotion Agent queue"),
-    )),
-    ("Knowledge", (
-        ("search", "search the Organization Vault"),
-        ("ingest", "add a durable note to your Node"),
-        ("activity", "recent vault activity — captures · syncs · searches (--global for the team)"),
-    )),
-    ("Connect & admin", (
-        ("mcp", "add Citadel MCP to Claude · Cursor · Codex · …"),
-        ("seat", "create · list seats and mint tokens (admin)"),
-        ("token", "set this machine's seat token · admin create/revoke"),
-    )),
+    (
+        "Get started",
+        (
+            ("onboard", "one-command setup — token · hooks · MCP · capture roots"),
+            ("status", "connection · identity · local setup (--json for agents)"),
+            ("doctor", "diagnose setup problems · --fix to repair"),
+            ("update", "update citadel to the latest release"),
+        ),
+    ),
+    (
+        "Capture",
+        (
+            ("setup", "declare Approved Capture Roots (~/.citadel/capture.json)"),
+            ("capture", "push summaries of approved roots to your Node"),
+            ("promotion", "list · approve · reject · run the Promotion Agent queue"),
+        ),
+    ),
+    (
+        "Knowledge",
+        (
+            ("search", "search the Organization Vault"),
+            ("ingest", "add a durable note to your Node"),
+            (
+                "activity",
+                "recent vault activity — captures · syncs · searches (--global for the team)",
+            ),
+        ),
+    ),
+    (
+        "Connect & admin",
+        (
+            ("mcp", "add Citadel MCP to Claude · Cursor · Codex · …"),
+            ("seat", "create · list seats and mint tokens (admin)"),
+            ("token", "set this machine's seat token · admin create/revoke"),
+        ),
+    ),
 )
 
 
@@ -2732,12 +2892,18 @@ class CitadelParser(argparse.ArgumentParser):
                 ]
                 lines.append("")
             elif choices:
-                lines.append("  available: " + ", ".join(paint(c, "cyan", enable=color) for c in choices))
+                lines.append(
+                    "  available: " + ", ".join(paint(c, "cyan", enable=color) for c in choices)
+                )
                 lines.append("")
             if top:
-                lines.append("  run " + paint("citadel", "cyan", enable=color) + " to see all commands.")
+                lines.append(
+                    "  run " + paint("citadel", "cyan", enable=color) + " to see all commands."
+                )
             else:
-                lines.append("  run " + paint(f"{self.prog} --help", "cyan", enable=color) + " for options.")
+                lines.append(
+                    "  run " + paint(f"{self.prog} --help", "cyan", enable=color) + " for options."
+                )
             sys.stderr.write("\n".join(lines) + "\n")
             raise SystemExit(2)
 
@@ -2757,10 +2923,18 @@ class CitadelParser(argparse.ArgumentParser):
                 lines = [paint(f"✗ {self.prog} needs a subcommand:", "red", enable=color), ""]
                 for name in sub_action.choices:
                     label = paint(name.ljust(pad), "cyan", enable=color)
-                    lines.append(f"  {label}{paint(help_by_name.get(name, ''), 'dim', enable=color)}")
+                    lines.append(
+                        f"  {label}{paint(help_by_name.get(name, ''), 'dim', enable=color)}"
+                    )
                 lines.append("")
                 lines.append(
-                    "  e.g. " + paint(f"{self.prog} {next(iter(sub_action.choices))}", "bold", "cyan", enable=color)
+                    "  e.g. "
+                    + paint(
+                        f"{self.prog} {next(iter(sub_action.choices))}",
+                        "bold",
+                        "cyan",
+                        enable=color,
+                    )
                 )
                 sys.stderr.write("\n".join(lines) + "\n")
                 raise SystemExit(2)
@@ -2817,7 +2991,9 @@ def build_parser() -> argparse.ArgumentParser:
         "activity",
         help="Show your Node's vault activity — captures, syncs, promotions, searches",
     )
-    activity.add_argument("--watch", action="store_true", help="Live-tail new activity (Ctrl-C to stop)")
+    activity.add_argument(
+        "--watch", action="store_true", help="Live-tail new activity (Ctrl-C to stop)"
+    )
     activity.add_argument(
         "--global",
         dest="global_broadcast",
@@ -2829,8 +3005,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show local capture receipts from ~/.citadel/activity.log (offline, no server)",
     )
-    activity.add_argument("--limit", type=int, default=20, help="How many recent events to show (default 20)")
-    activity.add_argument("--type", help="Filter by event type (ingest, search, promotion, github_sync, …)")
+    activity.add_argument(
+        "--limit", type=int, default=20, help="How many recent events to show (default 20)"
+    )
+    activity.add_argument(
+        "--type", help="Filter by event type (ingest, search, promotion, github_sync, …)"
+    )
     activity.add_argument("--json", action="store_true", help="Machine-readable output")
     activity.add_argument("--node-url", help="Override Node URL (default: from config)")
     activity.add_argument("--config", help="Override capture config path")
@@ -2840,7 +3020,9 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Diagnose setup problems and suggest (or --fix) repairs",
     )
-    doctor.add_argument("--fix", action="store_true", help="Apply safe auto-fixes (hooks, .mcp.json)")
+    doctor.add_argument(
+        "--fix", action="store_true", help="Apply safe auto-fixes (hooks, .mcp.json)"
+    )
     doctor.add_argument("--json", action="store_true", help="Machine-readable output")
     doctor.add_argument("--node-url", help="Override Node URL")
     doctor.add_argument("--repo", help="Repo to check (default: git toplevel or cwd)")
@@ -2911,9 +3093,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Capture only this configured root (repeatable; default: all)",
     )
-    capture.add_argument(
-        "--dry-run", action="store_true", help="Print payloads without posting"
-    )
+    capture.add_argument("--dry-run", action="store_true", help="Print payloads without posting")
     capture.add_argument("--json", action="store_true", help="Machine-readable output")
     capture.add_argument("--config", help="Override config path (testing)")
     capture.set_defaults(handler=_capture)
@@ -3017,7 +3197,9 @@ def build_parser() -> argparse.ArgumentParser:
     token_set.add_argument("--shell-rc", help="Shell rc file for the token export")
     token_set.add_argument("--node-url", help="Override Node URL")
     token_set.add_argument(
-        "--skip-verify", action="store_true", help="Write without checking the token against the Node"
+        "--skip-verify",
+        action="store_true",
+        help="Write without checking the token against the Node",
     )
     token_set.set_defaults(handler=_token_set)
 
@@ -3030,11 +3212,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--seat", help="Bind the token to an EXISTING seat by slug (omit for an interactive picker)"
     )
     token_create.add_argument(
-        "--role", default=None, choices=("reader", "writer", "admin"),
+        "--role",
+        default=None,
+        choices=("reader", "writer", "admin"),
         help="Standalone-token role (default: reader; seat tokens inherit the seat's role)",
     )
     token_create.add_argument(
-        "--kind", default=None, choices=("service_account", "user"),
+        "--kind",
+        default=None,
+        choices=("service_account", "user"),
         help="Standalone-token principal kind (default: service_account)",
     )
     token_create.add_argument(
@@ -3194,8 +3380,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="top_k",
         help="Max vault hits (default: 12)",
     )
-    prepare_pr.add_argument("--timeout", type=float, default=None, help="Client soft-timeout seconds")
-    prepare_pr.add_argument("--budget-ms", type=int, default=None, help="Soft-timeout in milliseconds")
+    prepare_pr.add_argument(
+        "--timeout", type=float, default=None, help="Client soft-timeout seconds"
+    )
+    prepare_pr.add_argument(
+        "--budget-ms", type=int, default=None, help="Soft-timeout in milliseconds"
+    )
     prepare_pr.add_argument("--node-url", help="Override Node URL")
     prepare_pr.set_defaults(handler=_prepare_pr_context)
 
@@ -3215,8 +3405,13 @@ def build_parser() -> argparse.ArgumentParser:
     improve = subcommands.add_parser("improve", help="Run Cognee improvement")
     improve.add_argument("--dataset", help="Dataset to improve")
     # Accept --session as an alias for parity with ingest/search/feedback.
-    improve.add_argument("--session-id", "--session", action="append", dest="session_id",
-                         help="Session id to improve (repeatable)")
+    improve.add_argument(
+        "--session-id",
+        "--session",
+        action="append",
+        dest="session_id",
+        help="Session id to improve (repeatable)",
+    )
     improve.set_defaults(handler=_improve)
 
     cognify = subcommands.add_parser(

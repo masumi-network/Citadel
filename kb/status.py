@@ -107,7 +107,11 @@ def _humanize_net_error(exc: Exception) -> str:
     lowered = text.lower()
     if isinstance(exc, urllib.error.HTTPError):
         return text
-    if "nodename nor servname" in lowered or "name or service not known" in lowered or "getaddrinfo" in lowered:
+    if (
+        "nodename nor servname" in lowered
+        or "name or service not known" in lowered
+        or "getaddrinfo" in lowered
+    ):
         return "cannot resolve host"
     if "connection refused" in lowered:
         return "connection refused"
@@ -150,7 +154,9 @@ class StatusReport:
             reason = detail
         elif not search_probed:
             reason = "search not probed; pass --check-search"
-        elif (search.data or {}).get("timed_out") or (search.data or {}).get("code") == CODE_TIMEOUT:
+        elif (search.data or {}).get("timed_out") or (search.data or {}).get(
+            "code"
+        ) == CODE_TIMEOUT:
             code = CODE_TIMEOUT
             reason = search.detail or "search timed out"
         elif not search_ok:
@@ -211,9 +217,7 @@ def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         )
     started = time.monotonic()
     try:
-        data = _request(
-            "GET", f"{base_url.rstrip('/')}/api/session", token=token, timeout=timeout
-        )
+        data = _request("GET", f"{base_url.rstrip('/')}/api/session", token=token, timeout=timeout)
     except Exception as exc:
         detail = _humanize_net_error(exc)
         return Check("auth", ok=False, detail=detail, data={"code": CODE_AUTH_REQUIRED})
@@ -229,7 +233,13 @@ def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
     auth_data: dict[str, Any] = dict(identity)
     if not ok:
         auth_data["code"] = CODE_AUTH_REQUIRED
-    return Check("auth", ok=ok, detail="valid" if ok else "invalid session", latency_ms=latency, data=auth_data)
+    return Check(
+        "auth",
+        ok=ok,
+        detail="valid" if ok else "invalid session",
+        latency_ms=latency,
+        data=auth_data,
+    )
 
 
 def check_search(
@@ -452,7 +462,9 @@ def ingest_node(
     payload: dict[str, Any] = {"data": data, "tags": list(tags)}
     if cognify:
         payload["cognify"] = True
-    resolved = timeout if timeout is not None else (_COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT)
+    resolved = (
+        timeout if timeout is not None else (_COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT)
+    )
     return _request(
         "POST",
         f"{base_url.rstrip('/')}/ingest",
@@ -499,14 +511,19 @@ def fetch_events(
         query += f"&type={urllib.parse.quote(event_type)}"
     try:
         data = _request(
-            "GET", f"{base_url.rstrip('/')}/api/knowledge/events?{query}", token=token, timeout=timeout
+            "GET",
+            f"{base_url.rstrip('/')}/api/knowledge/events?{query}",
+            token=token,
+            timeout=timeout,
         )
     except Exception as exc:
         return {"error": _humanize_net_error(exc)}
     return data if isinstance(data, dict) else {}
 
 
-def fetch_presence(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> dict[str, Any]:
+def fetch_presence(
+    base_url: str, token: str | None, *, timeout: float = _TIMEOUT
+) -> dict[str, Any]:
     """Best-effort org **Seat Presence** board (ADR-0009): every seat's slug and
     contribution count, org-visible by design.
 
@@ -653,9 +670,7 @@ def assess_mcp_setup(repo: Path) -> Check:
 
 def check_local_setup(repo: Path, config_path: Path | None = None) -> list[Check]:
     checks: list[Check] = []
-    checks.append(
-        Check("token", ok=bool(os.getenv(TOKEN_ENV)), detail=_mask(os.getenv(TOKEN_ENV)))
-    )
+    checks.append(Check("token", ok=bool(os.getenv(TOKEN_ENV)), detail=_mask(os.getenv(TOKEN_ENV))))
     checks.append(assess_mcp_setup(repo))
 
     # The hook is per-repo, so this check only ever sees the repo it was pointed
@@ -857,7 +872,9 @@ def render_text(report: StatusReport, *, color: bool = False, verdict: bool = Tr
         # Latencies form one aligned (and dimmed) column per section, so the
         # details read as a block instead of a ragged mix of text and numbers.
         width = min(max((len(c.detail) for c in checks), default=0), max(cols - 30, 8))
-        header = paint(title, "bold", enable=color) + (paint(note, "dim", enable=color) if note else "")
+        header = paint(title, "bold", enable=color) + (
+            paint(note, "dim", enable=color) if note else ""
+        )
         return [header, *(_row(c, width) for c in checks)]
 
     if conn:
@@ -913,15 +930,21 @@ def render_verdict(report: StatusReport, *, color: bool = False) -> str:
             )
             lines.append(paint("  Run `citadel doctor --fix` to repair.", "dim", enable=color))
         if search_warming:
-            lines.append(paint("  Search is still warming up — retry in a minute.", "dim", enable=color))
+            lines.append(
+                paint("  Search is still warming up — retry in a minute.", "dim", enable=color)
+            )
         elif search_degraded:
             detail = next((c.detail for c in search_fail), "")
-            lines.append(paint(f"  Search degraded — {detail}. Not blocking.", "yellow", enable=color))
+            lines.append(
+                paint(f"  Search degraded — {detail}. Not blocking.", "yellow", enable=color)
+            )
     else:
         node_auth_fail = [c for c in conn_fail if c.name in ("node", "auth")]
         corpus_fail = next((c for c in conn if c.name == "corpus" and not c.ok), None)
         if node_auth_fail:
-            labels = ", ".join(_CHECK_LABELS.get(c.name, c.name) for c in node_auth_fail) or "Node/Auth"
+            labels = (
+                ", ".join(_CHECK_LABELS.get(c.name, c.name) for c in node_auth_fail) or "Node/Auth"
+            )
             lines.append(
                 paint(
                     f"Not connected — {labels} failing. Check the Node URL / token, or run `citadel onboard`.",

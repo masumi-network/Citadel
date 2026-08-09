@@ -60,9 +60,7 @@ TERMINAL_INGEST_REJECTIONS = frozenset(
 # ``accepted=True`` confirms source storage, not necessarily the projection.
 # These reasons mean the caller only requested cognification, so the state
 # entry must remain retryable until a later pass observes completion.
-PROJECTION_PENDING_INGEST_REASONS = frozenset(
-    {"queued_not_confirmed", "not_scheduled"}
-)
+PROJECTION_PENDING_INGEST_REASONS = frozenset({"queued_not_confirmed", "not_scheduled"})
 
 # One lock per state file, NOT per syncer instance. ``get_repo_content_syncer``
 # in kb.server builds a fresh ``RepoContentSyncer`` on every call (app.state
@@ -165,9 +163,7 @@ def _cognee_data_ids(outcome: Any) -> list[str]:
             info_list = added.get("data_ingestion_info")
         for info in info_list or ():
             data_id = (
-                info.get("data_id")
-                if isinstance(info, Mapping)
-                else getattr(info, "data_id", None)
+                info.get("data_id") if isinstance(info, Mapping) else getattr(info, "data_id", None)
             )
             if data_id:
                 ids.append(str(data_id))
@@ -250,14 +246,10 @@ class RepoContentGitHubClient(GitHubOrgClient):
             {"path": path, "sha": ref, "per_page": 1},
         )
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-            raise GitHubAPIError(
-                f"Could not resolve the last commit for {full_name}/{path}."
-            )
+            raise GitHubAPIError(f"Could not resolve the last commit for {full_name}/{path}.")
         commit_sha = data[0].get("sha")
         if not isinstance(commit_sha, str) or not commit_sha:
-            raise GitHubAPIError(
-                f"Could not resolve the last commit for {full_name}/{path}."
-            )
+            raise GitHubAPIError(f"Could not resolve the last commit for {full_name}/{path}.")
         return commit_sha
 
     def fetch_tree(self, full_name: str, *, ref: str) -> tuple[list[str], bool] | None:
@@ -562,7 +554,11 @@ class RepoContentSyncer:
         files = data.get("files")
         if not isinstance(files, dict):
             files = {}
-        return {"version": STATE_VERSION, "files": files, **{k: v for k, v in data.items() if k != "files"}}
+        return {
+            "version": STATE_VERSION,
+            "files": files,
+            **{k: v for k, v in data.items() if k != "files"},
+        }
 
     def _save_state(self, state: dict[str, Any]) -> None:
         # Atomic (temp file + rename) so a restart mid-write cannot leave the
@@ -575,8 +571,7 @@ class RepoContentSyncer:
         if not self.config.repo_content_sync_autojoin_enabled:
             return resolved
         markers = (
-            self.config.repo_content_sync_autojoin_markers
-            or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
+            self.config.repo_content_sync_autojoin_markers or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
         )
         discovered = discover_org_repos(
             self.client,
@@ -634,7 +629,8 @@ class RepoContentSyncer:
                 self.config.repo_content_sync_tree_prefixes or DEFAULT_REPO_CONTENT_TREE_PREFIXES
             ),
             "tree_extensions": list(
-                self.config.repo_content_sync_tree_extensions or DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
+                self.config.repo_content_sync_tree_extensions
+                or DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
             ),
             "max_files_per_repo": self.config.repo_content_sync_max_files_per_repo,
             "max_bytes_per_file": self.config.repo_content_sync_max_bytes_per_file,
@@ -710,7 +706,9 @@ class RepoContentSyncer:
         state = self._load_state()
         tracked: dict[str, Any] = dict(state.get("files") or {})
         root_paths = self.config.repo_content_sync_root_paths or DEFAULT_REPO_CONTENT_ROOT_PATHS
-        tree_prefixes = self.config.repo_content_sync_tree_prefixes or DEFAULT_REPO_CONTENT_TREE_PREFIXES
+        tree_prefixes = (
+            self.config.repo_content_sync_tree_prefixes or DEFAULT_REPO_CONTENT_TREE_PREFIXES
+        )
         tree_extensions = (
             self.config.repo_content_sync_tree_extensions or DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
         )
@@ -890,10 +888,7 @@ class RepoContentSyncer:
                         # re-implementing the scan by hand. Categories and
                         # severities are already redacted by public_dict().
                         categories = sorted(
-                            {
-                                str(finding.get("category"))
-                                for finding in scan.get("findings", [])
-                            }
+                            {str(finding.get("category")) for finding in scan.get("findings", [])}
                         )
                         for category in categories:
                             blocked_reasons[category] = blocked_reasons.get(category, 0) + 1
@@ -971,9 +966,7 @@ class RepoContentSyncer:
                         detect_conflicts=False,
                     )
                     ingest_results = tuple(outcome.all_ingests)
-                    accepted_results = tuple(
-                        result for result in ingest_results if result.accepted
-                    )
+                    accepted_results = tuple(result for result in ingest_results if result.accepted)
                     pending_reasons = sorted(
                         {
                             result.reason
@@ -1015,9 +1008,7 @@ class RepoContentSyncer:
                         # it in a sync report cannot tell anyone whether a human
                         # has to look at the file or whether the same bytes were
                         # merely already in flight, so carry what ingest said.
-                        reasons = sorted(
-                            {result.reason for result in outcome.all_ingests}
-                        )
+                        reasons = sorted({result.reason for result in outcome.all_ingests})
                         reason = reasons[0] if len(reasons) == 1 else "+".join(reasons)
                         if reasons and all(
                             value in TERMINAL_INGEST_REJECTIONS for value in reasons
@@ -1071,9 +1062,7 @@ class RepoContentSyncer:
 
         repos_errored = [result for result in repo_results if result["errors"]]
         all_repos_errored = (
-            bool(repo_results)
-            and len(repos_errored) == len(repo_results)
-            and ingested_files == 0
+            bool(repo_results) and len(repos_errored) == len(repo_results) and ingested_files == 0
         )
 
         logger.info(
@@ -1107,7 +1096,9 @@ class RepoContentSyncer:
 
 
 async def _cli_main() -> None:
-    parser = argparse.ArgumentParser(description="Sync allowlisted repository content into Citadel.")
+    parser = argparse.ArgumentParser(
+        description="Sync allowlisted repository content into Citadel."
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

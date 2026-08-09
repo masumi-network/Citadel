@@ -106,7 +106,9 @@ def test_backup_mirror_write_requires_enabled_flag(tmp_path: Any) -> None:
 
 def test_backup_mirror_writes_latest_manifest_when_enabled(tmp_path: Any) -> None:
     config = mirror_config(tmp_path, enabled=True)
-    (tmp_path / "github.json").write_text('{"last_checked_at":"2026-06-03T00:00:00Z"}', encoding="utf-8")
+    (tmp_path / "github.json").write_text(
+        '{"last_checked_at":"2026-06-03T00:00:00Z"}', encoding="utf-8"
+    )
     mirror = BackupMirror(config)
 
     result = mirror.run(dry_run=False)
@@ -135,7 +137,9 @@ def test_backup_mirror_pushes_manifest_tree_when_enabled(tmp_path: Any) -> None:
         push_enabled=True,
         token="ghp_not_written_to_manifest",
     )
-    (tmp_path / "github.json").write_text('{"last_checked_at":"2026-06-03T00:00:00Z"}', encoding="utf-8")
+    (tmp_path / "github.json").write_text(
+        '{"last_checked_at":"2026-06-03T00:00:00Z"}', encoding="utf-8"
+    )
     publisher = FakePublisher()
     mirror = BackupMirror(config, publisher=publisher)
 

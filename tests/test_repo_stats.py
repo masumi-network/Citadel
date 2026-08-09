@@ -43,9 +43,7 @@ def _stats(fetched_at: str, *, commits: int = 340) -> repo_stats.RepoStats:
 
 
 def _write_cache(config: CitadelConfig, stats: repo_stats.RepoStats) -> None:
-    Path(config.repo_stats_state_path).write_text(
-        json.dumps(stats.as_cache()), encoding="utf-8"
-    )
+    Path(config.repo_stats_state_path).write_text(json.dumps(stats.as_cache()), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -69,6 +67,7 @@ def test_cache_is_served_when_github_is_unreachable(tmp_path: Path, monkeypatch:
         repo_stats.RepoStatsUnavailable("still computing"),
         RuntimeError("something entirely unexpected"),
     ):
+
         def _boom(*args: Any, **kwargs: Any) -> Any:
             raise failure
 
@@ -229,9 +228,7 @@ def test_api_state_serves_cached_commits_and_flags_staleness(
 ) -> None:
     """Cached numbers are published, and old ones are labelled old."""
     config = _config(tmp_path)
-    monkeypatch.setattr(
-        "kb.server.get_citadel", lambda: type("_C", (), {"config": config})()
-    )
+    monkeypatch.setattr("kb.server.get_citadel", lambda: type("_C", (), {"config": config})())
 
     fresh = datetime.now(UTC) - timedelta(hours=3)
     _write_cache(config, _stats(fresh.isoformat()))
@@ -289,6 +286,7 @@ def test_api_state_survives_a_broken_repo_stats_module(monkeypatch: Any) -> None
     /api/state is polled by every public page load, so it fails soft on this
     the way it already does on a syncer hiccup.
     """
+
     def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("stats exploded")
 

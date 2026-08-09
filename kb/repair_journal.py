@@ -153,9 +153,7 @@ class RepairJournal:
             "repair_document_ids": sorted({str(item) for item in repair_document_ids}),
             "repair_datasets": sorted({str(item) for item in repair_datasets}),
         }
-        normalized_repair_mapping = _normalize_repair_document_datasets(
-            repair_document_datasets
-        )
+        normalized_repair_mapping = _normalize_repair_document_datasets(repair_document_datasets)
         if normalized_repair_mapping:
             record["repair_document_datasets"] = normalized_repair_mapping
         deleted = sorted({str(item) for item in deleted_document_ids})
@@ -212,9 +210,7 @@ class RepairJournal:
                     f"repair journal contains invalid JSON at line {line_number}"
                 ) from exc
             if not isinstance(record, dict):
-                raise RuntimeError(
-                    f"repair journal record at line {line_number} is not an object"
-                )
+                raise RuntimeError(f"repair journal record at line {line_number} is not an object")
             operation_id = record.get("operation_id")
             if not isinstance(operation_id, str) or not operation_id:
                 raise RuntimeError(
@@ -250,10 +246,7 @@ class RepairJournal:
                 continue
             if "source_manifest" not in record and operation_id in source_manifests:
                 record = {**record, "source_manifest": source_manifests[operation_id]}
-            if (
-                "repair_document_datasets" not in record
-                and operation_id in repair_mappings
-            ):
+            if "repair_document_datasets" not in record and operation_id in repair_mappings:
                 record = {
                     **record,
                     "repair_document_datasets": repair_mappings[operation_id],

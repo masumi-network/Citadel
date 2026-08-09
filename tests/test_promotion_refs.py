@@ -69,7 +69,9 @@ async def test_assess_org_reference_known_repo(tmp_path: Path) -> None:
 
 async def test_assess_org_reference_new_project(tmp_path: Path) -> None:
     state_path = tmp_path / "github-state.json"
-    state_path.write_text(json.dumps({"repos": {"masumi-network/Citadel-Archive": {}}}), encoding="utf-8")
+    state_path.write_text(
+        json.dumps({"repos": {"masumi-network/Citadel-Archive": {}}}), encoding="utf-8"
+    )
     text = "Remote: https://github.com/other-org/brand-new-app.git"
     result = await assess_org_reference(
         FakeCitadel(central_hits=False),

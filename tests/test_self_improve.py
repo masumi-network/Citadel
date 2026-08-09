@@ -74,8 +74,7 @@ async def test_pass_is_bounded_by_max_items(monkeypatch: pytest.MonkeyPatch) -> 
         self_improve_module,
         "propose_optimizations",
         lambda items: [
-            {"label": item["label"], "summary": "better", "tags": ["better-tag"]}
-            for item in items
+            {"label": item["label"], "summary": "better", "tags": ["better-tag"]} for item in items
         ],
     )
     optimizer = SelfImprovement(citadel, mesh=mesh)
@@ -120,9 +119,7 @@ async def test_no_llm_is_a_deterministic_noop_that_still_improves() -> None:
     assert citadel.ingest_calls == []  # nothing re-ingested without proposals
     assert citadel.improve_calls  # the existing improve step still ran
     snapshot = await mesh.snapshot(citadel.config)
-    optimization_events = [
-        event for event in snapshot["events"] if event["type"] == "optimization"
-    ]
+    optimization_events = [event for event in snapshot["events"] if event["type"] == "optimization"]
     assert optimization_events[0]["details"]["used_llm"] is False
 
 

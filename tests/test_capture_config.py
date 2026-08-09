@@ -123,10 +123,10 @@ def test_setup_interactive_wizard(tmp_path: Path, monkeypatch) -> None:
     answers = iter(
         [
             "https://wizard-node.example",  # Node URL prompt
-            "n",                             # decline the offered cwd default
-            str(repo),                       # first root path
-            "org-work, notes",               # tags
-            "",                              # empty path -> finish
+            "n",  # decline the offered cwd default
+            str(repo),  # first root path
+            "org-work, notes",  # tags
+            "",  # empty path -> finish
         ]
     )
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))

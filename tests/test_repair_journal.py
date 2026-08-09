@@ -270,7 +270,5 @@ async def test_repair_rechecks_journal_after_acquiring_lease(
 
     assert result["ok"] is False
     assert result["reason"] == "repair_interrupted"
-    assert result["pending_operations"] == [
-        {"operation_id": "crashed-after-preflight"}
-    ]
+    assert result["pending_operations"] == [{"operation_id": "crashed-after-preflight"}]
     assert journal.checks == [True]

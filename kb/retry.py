@@ -105,9 +105,7 @@ def run_with_retries(
     base_delay = (
         base_delay_seconds if base_delay_seconds is not None else default_base_delay_seconds()
     )
-    max_delay = (
-        max_delay_seconds if max_delay_seconds is not None else default_max_delay_seconds()
-    )
+    max_delay = max_delay_seconds if max_delay_seconds is not None else default_max_delay_seconds()
     chooser = rng or random
     sleeper = sleep if sleep is not None else time.sleep
 
@@ -148,4 +146,3 @@ def run_with_retries(
         )
         sleeper(delay)
     return result
-

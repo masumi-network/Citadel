@@ -59,9 +59,7 @@ def test_missing_token_no_post(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(sync_push, "_sync_one", fake_sync)
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert recorder == []
@@ -103,9 +101,7 @@ def test_post_omits_dataset_field(monkeypatch: Any, tmp_path: Path) -> None:
 
     stdin = io.StringIO(
         "refs/heads/feature abcdef0123456789abcdef0123456789abcdef0 "
-        "refs/heads/feature "
-        + "0" * 40
-        + "\n"
+        "refs/heads/feature " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     body = captured["body"]
@@ -135,9 +131,7 @@ def test_run_swallows_post_errors(monkeypatch: Any, tmp_path: Path) -> None:
 
     monkeypatch.setattr(sync_push, "_sync_one", boom)
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert called  # proves the swallowed-exception path actually executed
@@ -165,9 +159,7 @@ def test_run_absent_config_fails_closed(monkeypatch: Any, tmp_path: Path, capsys
     monkeypatch.setattr(sync_push, "_sync_one", lambda *a, **k: posted.append(k))
 
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert posted == []
@@ -214,9 +206,7 @@ def test_run_corrupt_config_fails_closed(monkeypatch: Any, tmp_path: Path) -> No
     monkeypatch.setattr(sync_push, "_sync_one", lambda *a, **k: posted.append(k))
 
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert posted == []  # corrupt allowlist captures nothing
@@ -233,9 +223,7 @@ def test_run_skips_repo_outside_allowlist(monkeypatch: Any, tmp_path: Path, caps
     monkeypatch.setattr(sync_push, "_sync_one", lambda *a, **k: posted.append(k))
 
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert posted == []
@@ -253,9 +241,7 @@ def test_run_captures_approved_repo_with_root_tags(monkeypatch: Any, tmp_path: P
     monkeypatch.setattr(sync_push, "_sync_one", lambda *a, **k: calls.append(k))
 
     stdin = io.StringIO(
-        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main "
-        + "0" * 40
-        + "\n"
+        "refs/heads/main abcdef0123456789abcdef0123456789abcdef0 refs/heads/main " + "0" * 40 + "\n"
     )
     assert sync_push.run(stdin, remote_name="origin") == 0
     assert len(calls) == 1
@@ -296,9 +282,7 @@ def _fake_urlopen_with_body(monkeypatch: Any, body: bytes) -> None:
         def read(self) -> bytes:
             return body
 
-    monkeypatch.setattr(
-        sync_push.urllib.request, "urlopen", lambda request, timeout=None: _Resp()
-    )
+    monkeypatch.setattr(sync_push.urllib.request, "urlopen", lambda request, timeout=None: _Resp())
 
 
 def _receipt_text() -> str:
@@ -353,9 +337,7 @@ def test_receipt_on_unreadable_body_does_not_claim_capture(
     assert "captured commit" not in receipt
 
 
-def test_receipt_on_timeout_says_write_may_have_completed(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
+def test_receipt_on_timeout_says_write_may_have_completed(monkeypatch: Any, tmp_path: Path) -> None:
     _approve_repo_for_real_sync(monkeypatch, tmp_path)
 
     def boom(request: Any, timeout: int | None = None) -> None:

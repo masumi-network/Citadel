@@ -13,11 +13,7 @@ def _client() -> TestClient:
 
 def test_next_login_routes_readers_to_next_and_privileged_roles_to_legacy_app() -> None:
     source = (
-        Path(server_module.__file__).resolve().parent.parent
-        / "web"
-        / "src"
-        / "pages"
-        / "login.tsx"
+        Path(server_module.__file__).resolve().parent.parent / "web" / "src" / "pages" / "login.tsx"
     ).read_text(encoding="utf-8")
 
     assert 'session.role === "reader" ? "/next/app" : "/app"' in source

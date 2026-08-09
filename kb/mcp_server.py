@@ -453,7 +453,6 @@ def _max_ingest_bytes() -> int:
     return max(1, value)
 
 
-
 def _self_base_url() -> str:
     """Base URL the hosted MCP uses to reach the Citadel HTTP API in-process."""
     configured = os.getenv("CITADEL_MCP_SELF_BASE_URL")
@@ -472,7 +471,11 @@ def _transport_security() -> TransportSecuritySettings:
     hosts via ``CITADEL_MCP_ALLOWED_HOSTS`` (comma-separated; origins optional via
     ``CITADEL_MCP_ALLOWED_ORIGINS``).
     """
-    hosts = [host.strip() for host in os.getenv("CITADEL_MCP_ALLOWED_HOSTS", "").split(",") if host.strip()]
+    hosts = [
+        host.strip()
+        for host in os.getenv("CITADEL_MCP_ALLOWED_HOSTS", "").split(",")
+        if host.strip()
+    ]
     origins = [
         origin.strip()
         for origin in os.getenv("CITADEL_MCP_ALLOWED_ORIGINS", "").split(",")
@@ -544,11 +547,7 @@ def _public_url_headers_from_context(ctx: Context | None) -> dict[str, str]:
     if request is None:
         return {}
     try:
-        host = (
-            request.headers.get("x-forwarded-host")
-            or request.headers.get("host")
-            or ""
-        )
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
         proto = request.headers.get("x-forwarded-proto") or urlparse(str(request.url)).scheme
     except Exception:
         return {}
@@ -670,16 +669,12 @@ def _compact_search_for_agent(payload: Any) -> Any:
 def _audit_query(view: str, limit: int) -> str:
     normalized_view = view.strip().lower() or "mcp"
     if normalized_view not in AUDIT_VIEWS:
-        raise CitadelMcpError(
-            f"view must be one of: {', '.join(sorted(AUDIT_VIEWS))}."
-        )
+        raise CitadelMcpError(f"view must be one of: {', '.join(sorted(AUDIT_VIEWS))}.")
     normalized_limit = min(max(int(limit), 1), MAX_AUDIT_LIMIT)
     return f"/api/audit?{urlencode({'view': normalized_view, 'limit': normalized_limit})}"
 
 
-def _filter_tools_for_session(
-    all_tools: list[Any], session: dict[str, Any] | None
-) -> list[Any]:
+def _filter_tools_for_session(all_tools: list[Any], session: dict[str, Any] | None) -> list[Any]:
     """Drop tools the caller's role/seat cannot use (#33).
 
     Hides tools whose required role exceeds the caller (so reader/writer seats
@@ -827,9 +822,7 @@ class CitadelHttpClient:
         *,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        return self._request(
-            "GET", path, require_token=False, extra_headers=extra_headers
-        )
+        return self._request("GET", path, require_token=False, extra_headers=extra_headers)
 
     def post(
         self,
@@ -892,9 +885,7 @@ class CitadelHttpClient:
                 exc.read().decode("utf-8", errors="replace")[:500],
                 self.access_token,
             )
-            logger.warning(
-                "Citadel API call %s %s returned HTTP %s", method, path, exc.code
-            )
+            logger.warning("Citadel API call %s %s returned HTTP %s", method, path, exc.code)
             raise CitadelMcpError(
                 f"Citadel returned HTTP {exc.code}: {detail}", status_code=exc.code
             ) from exc
@@ -1002,9 +993,7 @@ def create_mcp_server(
 
     def public_manifest(extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
         if fallback is not None and hasattr(fallback, "get_public"):
-            return fallback.get_public(
-                "/.well-known/citadel.json", extra_headers=extra_headers
-            )
+            return fallback.get_public("/.well-known/citadel.json", extra_headers=extra_headers)
         return resolve_public_client().get_public(
             "/.well-known/citadel.json", extra_headers=extra_headers
         )
@@ -1200,6 +1189,7 @@ def create_mcp_server(
         candidates the scope kept. The Linear workspace DIGEST carries no
         per-issue header and is excluded; use citadel_search for it.
         """
+
         def search_linear() -> dict[str, Any]:
             payload = resolve_client(ctx).post(
                 "/search",
@@ -1220,9 +1210,7 @@ def create_mcp_server(
             # never the one the request asked for.
             filtering = payload.get("filtering") if isinstance(payload, dict) else None
             applied = filtering.get("applied") if isinstance(filtering, dict) else None
-            confirmed = (
-                isinstance(applied, dict) and applied.get("source") == LINEAR_ISSUE_SOURCE
-            )
+            confirmed = isinstance(applied, dict) and applied.get("source") == LINEAR_ISSUE_SOURCE
             scoped: dict[str, Any] = {**payload, "scope_applied": confirmed}
             if not confirmed:
                 warnings = [w for w in (payload.get("warnings") or []) if w]
@@ -1285,9 +1273,7 @@ def create_mcp_server(
                 # retry a write that had landed, duplicating it. Report what is
                 # known instead: submitted, outcome unconfirmed, here is how to
                 # settle it.
-                return _unconfirmed_ingest(
-                    normalized_data, tags or [], dataset, exc.timeout_s
-                )
+                return _unconfirmed_ingest(normalized_data, tags or [], dataset, exc.timeout_s)
 
         return await _call_async(
             "citadel_ingest",
@@ -1322,9 +1308,7 @@ def create_mcp_server(
                 except ValueError:
                     roots = []
             if not roots:
-                raise ToolError(
-                    "capture_roots is required when no local capture config exists."
-                )
+                raise ToolError("capture_roots is required when no local capture config exists.")
 
             payload_data = (data or "").strip()
             tool_errors = has_tool_errors

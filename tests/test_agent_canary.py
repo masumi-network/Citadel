@@ -64,11 +64,7 @@ def test_canary_mcp_status_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     (tmp_path / ".mcp.json").write_text(
         json.dumps(
-            {
-                "mcpServers": {
-                    "citadel": {"type": "http", "url": "https://citadel.example/mcp/"}
-                }
-            }
+            {"mcpServers": {"citadel": {"type": "http", "url": "https://citadel.example/mcp/"}}}
         )
     )
     needs_auth = status_mod.assess_mcp_setup(tmp_path)
@@ -86,11 +82,7 @@ def test_canary_mcp_status_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_x")
     (tmp_path / ".mcp.json").write_text(
         json.dumps(
-            {
-                "mcpServers": {
-                    "citadel": {"type": "http", "url": "https://citadel.example/mcp/"}
-                }
-            }
+            {"mcpServers": {"citadel": {"type": "http", "url": "https://citadel.example/mcp/"}}}
         )
     )
     ready = status_mod.assess_mcp_setup(tmp_path)
@@ -221,9 +213,7 @@ def test_canary_live_node_optional() -> None:
     from kb.capture_config import DEFAULT_NODE_URL
 
     base = (os.getenv("CITADEL_NODE_URL") or DEFAULT_NODE_URL).rstrip("/")
-    payload = status_mod.search_node(
-        base, token, "MIP-003 endpoint schema", top_k=5, timeout=15.0
-    )
+    payload = status_mod.search_node(base, token, "MIP-003 endpoint schema", top_k=5, timeout=15.0)
     shaped = shape_search_payload(payload, query="MIP-003 endpoint schema")
     assert shaped["ok"] is True
     assert "results" in shaped

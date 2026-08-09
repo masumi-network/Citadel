@@ -121,8 +121,7 @@ def refresh_skill_catalog(state_path: str | Path | None = None) -> dict[str, obj
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 previous = {
-                    str(slug): str(digest)
-                    for slug, digest in (loaded.get("skills") or {}).items()
+                    str(slug): str(digest) for slug, digest in (loaded.get("skills") or {}).items()
                 }
         except (OSError, json.JSONDecodeError, AttributeError):
             previous = {}

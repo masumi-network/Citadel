@@ -146,7 +146,9 @@ def test_failure_reschedules_with_bounded_exponential_backoff(tmp_path: Path) ->
 
     second = queue.claim(now=T0 + timedelta(seconds=5))
     assert second is not None
-    failed_again = queue.reschedule(second, error="still unavailable", now=T0 + timedelta(seconds=5))
+    failed_again = queue.reschedule(
+        second, error="still unavailable", now=T0 + timedelta(seconds=5)
+    )
     assert _at(failed_again.available_at) == T0 + timedelta(seconds=15)
 
     third = queue.claim(now=T0 + timedelta(seconds=15))
@@ -186,7 +188,7 @@ def test_expired_lease_can_be_reclaimed(tmp_path: Path) -> None:
 
 def test_malformed_state_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "queue.json"
-    path.write_text("{\"version\": 1,", encoding="utf-8")
+    path.write_text('{"version": 1,', encoding="utf-8")
     queue = CognifyRetryQueue(path)
 
     with pytest.raises(CognifyQueueStateError, match="refusing to treat"):
@@ -200,7 +202,9 @@ def test_malformed_state_fails_closed(tmp_path: Path) -> None:
         {"lease_id": "lease", "leased_until": None, "lease_datasets": None},
     ],
 )
-def test_malformed_record_types_fail_closed(tmp_path: Path, record_update: dict[str, object]) -> None:
+def test_malformed_record_types_fail_closed(
+    tmp_path: Path, record_update: dict[str, object]
+) -> None:
     path = tmp_path / "queue.json"
     timestamp = T0.isoformat().replace("+00:00", "Z")
     record: dict[str, object] = {
@@ -253,7 +257,9 @@ def test_state_with_unknown_content_field_fails_closed(tmp_path: Path) -> None:
         CognifyRetryQueue(path).snapshot()
 
 
-def test_atomic_write_failure_keeps_previous_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_atomic_write_failure_keeps_previous_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "queue.json"
     queue = CognifyRetryQueue(path)
     queue.enqueue(("central",), now=T0)

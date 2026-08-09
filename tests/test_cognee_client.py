@@ -235,9 +235,7 @@ class _FakeGraphEngine:
         self, nodes: list[tuple[str, dict[str, Any]]], edges: list[tuple[Any, ...]]
     ) -> None:
         self._nodes = {str(nid): dict(props or {}) for nid, props in nodes}
-        self._edges = [
-            (str(src), str(tgt), rel) for src, tgt, rel, *_ in edges
-        ]
+        self._edges = [(str(src), str(tgt), rel) for src, tgt, rel, *_ in edges]
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
         props = self._nodes.get(str(node_id))
@@ -544,9 +542,7 @@ async def test_read_node_dataset_map_joined_query_over_real_models(
     async def get_default_user() -> Any:
         return SimpleNamespace(id=user_id, tenant_id=tenant_id)
 
-    monkeypatch.setattr(
-        relational_module, "get_relational_engine", lambda: _FakeRelEngine()
-    )
+    monkeypatch.setattr(relational_module, "get_relational_engine", lambda: _FakeRelEngine())
     monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
 
     client = CogneePublicClient()
@@ -617,9 +613,7 @@ async def test_source_manifest_requires_readable_matching_raw_source(
             async with maker() as session:
                 yield session
 
-    monkeypatch.setattr(
-        relational_module, "get_relational_engine", lambda: _FakeRelEngine()
-    )
+    monkeypatch.setattr(relational_module, "get_relational_engine", lambda: _FakeRelEngine())
     client = CogneePublicClient()
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
@@ -646,9 +640,24 @@ async def test_source_manifest_requires_readable_matching_raw_source(
 async def test_zero_chunk_census_walks_pages_and_filters_datasets(monkeypatch: Any) -> None:
     client = CogneePublicClient()
     rows = [
-        {"id": "doc-a", "name": "a", "created_at": "2026-01-01T00:00:00+00:00", "datasets": ["alpha"]},
-        {"id": "doc-b", "name": "b", "created_at": "2026-01-02T00:00:00+00:00", "datasets": ["beta"]},
-        {"id": "doc-c", "name": "c", "created_at": "2026-01-03T00:00:00+00:00", "datasets": ["alpha", "beta"]},
+        {
+            "id": "doc-a",
+            "name": "a",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "datasets": ["alpha"],
+        },
+        {
+            "id": "doc-b",
+            "name": "b",
+            "created_at": "2026-01-02T00:00:00+00:00",
+            "datasets": ["beta"],
+        },
+        {
+            "id": "doc-c",
+            "name": "c",
+            "created_at": "2026-01-03T00:00:00+00:00",
+            "datasets": ["alpha", "beta"],
+        },
     ]
     page_cursors: list[tuple[str | None, str | None, int]] = []
 
@@ -656,9 +665,7 @@ async def test_zero_chunk_census_walks_pages_and_filters_datasets(monkeypatch: A
         return {"documents": 3}
 
     async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
-        page_cursors.append(
-            (kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"])
-        )
+        page_cursors.append((kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"]))
         return rows[:2] if kwargs["after_id"] is None else rows[2:]
 
     async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
@@ -765,14 +772,10 @@ async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
         await conn.run_sync(Dataset.__table__.create)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
-        session.add(
-            Dataset(id=uuid4(), name="seat:alice", owner_id=user_id, tenant_id=tenant_id)
-        )
+        session.add(Dataset(id=uuid4(), name="seat:alice", owner_id=user_id, tenant_id=tenant_id))
         # Same NAME, different tenant. Must not read as already provisioned,
         # because the read path matches on tenant too.
-        session.add(
-            Dataset(id=uuid4(), name="seat:carol", owner_id=user_id, tenant_id=uuid4())
-        )
+        session.add(Dataset(id=uuid4(), name="seat:carol", owner_id=user_id, tenant_id=uuid4()))
         await session.commit()
 
     class _FakeRelEngine:
@@ -789,9 +792,7 @@ async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
     async def fake_create_authorized_dataset(name: str, user: Any) -> Any:
         created.append(name)
         async with maker() as session:
-            session.add(
-                Dataset(id=uuid4(), name=name, owner_id=user.id, tenant_id=user.tenant_id)
-            )
+            session.add(Dataset(id=uuid4(), name=name, owner_id=user.id, tenant_id=user.tenant_id))
             await session.commit()
 
     # get_datasets binds get_relational_engine at ITS module import, so patching
@@ -802,9 +803,7 @@ async def test_ensure_dataset_creates_a_missing_row_and_is_idempotent(
         lambda: _FakeRelEngine(),
     )
     monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
-    monkeypatch.setattr(
-        methods_pkg, "create_authorized_dataset", fake_create_authorized_dataset
-    )
+    monkeypatch.setattr(methods_pkg, "create_authorized_dataset", fake_create_authorized_dataset)
 
     client = CogneePublicClient()
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
@@ -979,18 +978,16 @@ async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
     dataset_id = await get_unique_dataset_id(dataset_name=name, user=user)
     engine = get_relational_engine()
     async with engine.get_async_session() as session:
-        session.add(
-            Dataset(id=dataset_id, name=name, owner_id=user.id, tenant_id=user.tenant_id)
-        )
+        session.add(Dataset(id=dataset_id, name=name, owner_id=user.id, tenant_id=user.tenant_id))
         await session.commit()
 
     assert await get_authorized_dataset_by_name(name, user, "read") is None
 
     await _real_cognee_client(monkeypatch).ensure_dataset(name)
 
-    assert (
-        await get_authorized_dataset_by_name(name, user, "read")
-    ) is not None, "seat still unsearchable after ensure_dataset"
+    assert (await get_authorized_dataset_by_name(name, user, "read")) is not None, (
+        "seat still unsearchable after ensure_dataset"
+    )
 
 
 def test_assert_cognee_dataset_api_imports_real_symbols() -> None:
@@ -1063,9 +1060,7 @@ async def test_node_dataset_map_single_flight_collapses_cold_burst(
 
     monkeypatch.setattr(client, "_read_node_dataset_map", fake_read)
 
-    results = await asyncio.gather(
-        *[client.node_dataset_map() for _ in range(10)]
-    )
+    results = await asyncio.gather(*[client.node_dataset_map() for _ in range(10)])
     assert all(result == {"doc": ["seat:alice"]} for result in results)
     assert reads == 1
 
@@ -1324,9 +1319,7 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
     assert cognified == []
 
 
-def test_schedule_cognify_persists_without_a_running_loop(
-    monkeypatch: Any, tmp_path: Any
-) -> None:
+def test_schedule_cognify_persists_without_a_running_loop(monkeypatch: Any, tmp_path: Any) -> None:
     path = tmp_path / "queue.json"
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
 
@@ -1338,9 +1331,7 @@ def test_schedule_cognify_persists_without_a_running_loop(
 
 
 @pytest.mark.asyncio
-async def test_failed_background_cognify_is_rescheduled(
-    monkeypatch: Any, tmp_path: Any
-) -> None:
+async def test_failed_background_cognify_is_rescheduled(monkeypatch: Any, tmp_path: Any) -> None:
     path = tmp_path / "queue.json"
     monkeypatch.setenv("CITADEL_COGNIFY_QUEUE_PATH", str(path))
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -1782,9 +1773,7 @@ async def test_stop_cognify_queue_reschedules_cancelled_work(
 
 
 @pytest.mark.asyncio
-async def test_resume_cognify_queue_drains_pending_work(
-    monkeypatch: Any, tmp_path: Any
-) -> None:
+async def test_resume_cognify_queue_drains_pending_work(monkeypatch: Any, tmp_path: Any) -> None:
     path = tmp_path / "queue.json"
     CognifyRetryQueue(path).enqueue(["central"])
     monkeypatch.setenv("LLM_API_KEY", "k")
@@ -2466,7 +2455,9 @@ async def test_delete_document_chunks_deletes_independent_graph_and_vector_ids(
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(
+        sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations)
+    )
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2564,7 +2555,9 @@ async def test_delete_document_chunks_reports_partial_delete_failure(
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(
+        sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations)
+    )
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2606,7 +2599,9 @@ async def test_delete_document_chunks_reports_partial_delete_failure(
     ) -> dict[str, list[dict[str, Any]]]:
         del graph_engine, graph_ids
         return {
-            "nodes": [{"id": graph_id, "name": "chunk", "type": "DocumentChunk", "properties": "{}"}],
+            "nodes": [
+                {"id": graph_id, "name": "chunk", "type": "DocumentChunk", "properties": "{}"}
+            ],
             "edges": [],
         }
 
@@ -2655,7 +2650,9 @@ async def test_restore_document_chunks_uses_private_snapshot_once(monkeypatch: A
         return None
 
     monkeypatch.setenv("VECTOR_DB_PROVIDER", "pgvector")
-    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations))
+    monkeypatch.setitem(
+        sys.modules, "cognee", SimpleNamespace(run_startup_migrations=run_startup_migrations)
+    )
     monkeypatch.setitem(sys.modules, "cognee.infrastructure", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "cognee.infrastructure.databases", SimpleNamespace())
     monkeypatch.setitem(
@@ -2707,9 +2704,12 @@ async def test_restore_document_chunks_uses_private_snapshot_once(monkeypatch: A
     assert result is True
     assert captured["vectors"][0]["payload"]["text"] == "private"
     assert "opaque-token" not in client._repair_snapshots
-    assert await client.restore_document_chunks(
-        {"document_ids": ["doc-a"], "snapshot_token": "opaque-token"}
-    ) is False
+    assert (
+        await client.restore_document_chunks(
+            {"document_ids": ["doc-a"], "snapshot_token": "opaque-token"}
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -2865,12 +2865,8 @@ async def _seed_corpus(user: Any) -> dict[str, Any]:
     other_owner = uuid4()
     other_data_id = uuid4()
 
-    central = Dataset(
-        id=uuid4(), name="masumi-network", owner_id=user.id, tenant_id=user.tenant_id
-    )
-    ghost = Dataset(
-        id=uuid4(), name="seat:ghost", owner_id=other_owner, tenant_id=user.tenant_id
-    )
+    central = Dataset(id=uuid4(), name="masumi-network", owner_id=user.id, tenant_id=user.tenant_id)
+    ghost = Dataset(id=uuid4(), name="seat:ghost", owner_id=other_owner, tenant_id=user.tenant_id)
     engine = get_relational_engine()
     async with engine.get_async_session() as session:
         session.add(central)
@@ -2976,9 +2972,7 @@ async def test_corpus_page_enumerates_the_real_store_with_keyset_pages(
 
 
 @pytest.mark.asyncio
-async def test_corpus_totals_reports_the_owner_split(
-    cognee_sqlite: Any, monkeypatch: Any
-) -> None:
+async def test_corpus_totals_reports_the_owner_split(cognee_sqlite: Any, monkeypatch: Any) -> None:
     """Both counts, so a row under another owner_id shows up as a difference
     instead of silently missing from an owner-scoped number."""
     from cognee.infrastructure.databases.relational import create_db_and_tables
@@ -3036,9 +3030,7 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
         return {"documents": 3}
 
     async def corpus_page(**kwargs: Any) -> list[dict[str, Any]]:
-        page_calls.append(
-            (kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"])
-        )
+        page_calls.append((kwargs["after_created_at"], kwargs["after_id"], kwargs["limit"]))
         return pages[len(page_calls) - 1]
 
     async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
@@ -3157,7 +3149,9 @@ async def test_standard_cognee_document_graph_contains_relational_data_id() -> N
     nodes, edges = await get_graph_from_model(chunk)
 
     assert str(data_id) in {str(node.id) for node in nodes}
-    assert any(str(source) == str(chunk.id) and str(target) == str(data_id) for source, target, *_ in edges)
+    assert any(
+        str(source) == str(chunk.id) and str(target) == str(data_id) for source, target, *_ in edges
+    )
 
 
 @pytest.mark.asyncio

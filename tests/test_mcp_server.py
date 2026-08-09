@@ -143,9 +143,7 @@ def test_tools_list_session_resolved_in_process_not_via_self_call(
     # ...but a clean MISS is the store answering "this token does not exist",
     # and must be distinguishable from the transient case (#171).
     monkeypatch.setattr(server_mod, "access_key_identity", lambda token: None)
-    assert isinstance(
-        mcp_server._session_from_token_inprocess("ctdl_x"), mcp_server._UnknownToken
-    )
+    assert isinstance(mcp_server._session_from_token_inprocess("ctdl_x"), mcp_server._UnknownToken)
 
 
 def test_streamable_http_uses_json_response_not_sse() -> None:
@@ -189,7 +187,9 @@ def test_streamable_http_uses_json_response_not_sse() -> None:
                 if sid:
                     headers = {**headers, "mcp-session-id": sid}
                 await client.post(
-                    "/", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"}
+                    "/",
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
                 )
                 resp = await client.post(
                     "/",
@@ -282,9 +282,7 @@ def test_discovery_resource_reads_public_manifest_only() -> None:
         "path": "/.well-known/citadel.json",
         "public": True,
     }
-    assert client.public_gets == [
-        {"path": "/.well-known/citadel.json", "extra_headers": {}}
-    ]
+    assert client.public_gets == [{"path": "/.well-known/citadel.json", "extra_headers": {}}]
     assert client.gets == []
 
 
@@ -395,9 +393,7 @@ def test_authed_resource_uses_caller_token_on_hosted_transport(
 
     fake_ctx = SimpleNamespace(
         request_context=SimpleNamespace(
-            request=SimpleNamespace(
-                headers={"authorization": "Bearer ctdl_resourcetoken"}
-            )
+            request=SimpleNamespace(headers={"authorization": "Bearer ctdl_resourcetoken"})
         )
     )
     monkeypatch.setattr(server, "get_context", lambda: fake_ctx)
@@ -1097,9 +1093,7 @@ def test_hosted_transport_tools_list_filters_through_real_resolution(
     # kb.server registers at import so this exercises the real wiring.
     server_mod.set_tools_list_session_resolver(server_mod._mcp_tools_list_session)
 
-    async def list_tool_names(
-        client: httpx.AsyncClient, authorization: str | None
-    ) -> set[str]:
+    async def list_tool_names(client: httpx.AsyncClient, authorization: str | None) -> set[str]:
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -1225,9 +1219,7 @@ def test_http_errors_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
             403,
             "Forbidden",
             {},
-            BytesIO(
-                b'{"detail":"bearer ctdl_secret_token token: ctdl_other api_key=sk-test"}'
-            ),
+            BytesIO(b'{"detail":"bearer ctdl_secret_token token: ctdl_other api_key=sk-test"}'),
         )
 
     monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
@@ -1261,9 +1253,7 @@ def test_contribute_tool_posts_through_the_contribute_endpoint() -> None:
     assert result["tool_name"] == "citadel_contribute"
     assert result["payload"]["title"] == "Decision: adopt deepseek"
     assert result["payload"]["tags"] == ["decision"]
-    assert result["payload"]["source_url"] == (
-        "https://github.com/masumi-network/Citadel-Archive"
-    )
+    assert result["payload"]["source_url"] == ("https://github.com/masumi-network/Citadel-Archive")
 
 
 def test_list_sources_includes_repo_content_sync() -> None:

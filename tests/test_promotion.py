@@ -25,7 +25,9 @@ SECRET_TEXT = "deploy creds " + "AKIA" + "ABCDEFGHIJKLMNOP" + " rotate me"
 
 
 class FakeCitadel:
-    def __init__(self, config: CitadelConfig, nodes: list[str], *, central_hits: bool = False) -> None:
+    def __init__(
+        self, config: CitadelConfig, nodes: list[str], *, central_hits: bool = False
+    ) -> None:
         self.config = config
         self._nodes = nodes
         self.central_hits = central_hits
@@ -101,10 +103,7 @@ def _engine(
 
 
 def _org_note(extra: str = "roadmap") -> str:
-    return (
-        f"Org note about the product {extra} — "
-        "https://github.com/masumi-network/Citadel-Archive"
-    )
+    return f"Org note about the product {extra} — https://github.com/masumi-network/Citadel-Archive"
 
 
 def _github_state(tmp_path: Path) -> CitadelConfig:
@@ -116,24 +115,46 @@ def _github_state(tmp_path: Path) -> CitadelConfig:
     return _config(github_sync_state_path=str(state_path))
 
 
-def _stub_llm(monkeypatch: pytest.MonkeyPatch, *, relevant: bool = True, sensitive: bool = False, score: float = 0.9, fail: bool = False) -> None:
+def _stub_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    relevant: bool = True,
+    sensitive: bool = False,
+    score: float = 0.9,
+    fail: bool = False,
+) -> None:
     def fake_chat(*args: Any, **kwargs: Any) -> str | None:
         if fail:
             return None
-        return json.dumps({"relevant": relevant, "sensitive": sensitive, "score": score, "reason": "stubbed"})
+        return json.dumps(
+            {"relevant": relevant, "sensitive": sensitive, "score": score, "reason": "stubbed"}
+        )
 
     monkeypatch.setattr(promotion, "openrouter_chat", fake_chat)
 
 
 def test_coerce_classification_rejects_malformed() -> None:
-    assert _coerce_classification({"relevant": True, "sensitive": False, "score": 0.8, "reason": "ok"}) is not None
-    assert _coerce_classification({"relevant": "yes", "sensitive": False, "score": 0.8, "reason": "ok"}) is None
-    assert _coerce_classification({"relevant": True, "sensitive": False, "score": 2, "reason": "ok"}) is None
+    assert (
+        _coerce_classification({"relevant": True, "sensitive": False, "score": 0.8, "reason": "ok"})
+        is not None
+    )
+    assert (
+        _coerce_classification(
+            {"relevant": "yes", "sensitive": False, "score": 0.8, "reason": "ok"}
+        )
+        is None
+    )
+    assert (
+        _coerce_classification({"relevant": True, "sensitive": False, "score": 2, "reason": "ok"})
+        is None
+    )
     assert _coerce_classification({"relevant": True, "sensitive": False, "score": 0.8}) is None
     assert _coerce_classification("not a dict") is None
 
 
-async def test_dry_run_proposes_but_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_dry_run_proposes_but_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, store = _engine(
         tmp_path,
         [_org_note()],
@@ -152,7 +173,9 @@ async def test_dry_run_proposes_but_writes_nothing(tmp_path: Path, monkeypatch: 
     assert store.recent_audit_events(action="promotion.promote") == []
 
 
-async def test_relevant_clean_item_is_promoted_to_central_with_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_relevant_clean_item_is_promoted_to_central_with_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, store = _engine(
         tmp_path,
         [_org_note()],
@@ -201,7 +224,9 @@ async def test_auto_promotion_attests_the_request_actor(
     assert attestation["promoted_at"].endswith("+00:00")
 
 
-async def test_sensitive_item_is_not_promoted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_sensitive_item_is_not_promoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, store = _engine(tmp_path, ["my personal salary and home address"])
     _stub_llm(monkeypatch, relevant=True, sensitive=True, score=0.95)
 
@@ -213,7 +238,9 @@ async def test_sensitive_item_is_not_promoted(tmp_path: Path, monkeypatch: pytes
     assert result["proposals"][0]["reason"] == "sensitive"
 
 
-async def test_secret_bearing_item_is_not_promoted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_secret_bearing_item_is_not_promoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, _store = _engine(tmp_path, [SECRET_TEXT])
     # Even if the classifier would say "promote", the secret gate must win.
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.99)
@@ -227,7 +254,9 @@ async def test_secret_bearing_item_is_not_promoted(tmp_path: Path, monkeypatch: 
     assert result["proposals"][0]["secret_blocked"] is True
 
 
-async def test_llm_failure_falls_back_to_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_llm_failure_falls_back_to_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, _store = _engine(
         tmp_path,
         [_org_note()],
@@ -243,7 +272,9 @@ async def test_llm_failure_falls_back_to_skip(tmp_path: Path, monkeypatch: pytes
     assert result["proposals"][0]["reason"] == "llm_unavailable"
 
 
-async def test_below_threshold_is_not_promoted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_below_threshold_is_not_promoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, learning, _store = _engine(
         tmp_path,
         [_org_note("marginal")],
@@ -258,8 +289,12 @@ async def test_below_threshold_is_not_promoted(tmp_path: Path, monkeypatch: pyte
     assert result["proposals"][0]["reason"] == "below_threshold"
 
 
-async def test_disabled_returns_status_and_does_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    engine, learning, _store = _engine(tmp_path, ["anything"], config=_config(promotion_enabled=False))
+async def test_disabled_returns_status_and_does_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, learning, _store = _engine(
+        tmp_path, ["anything"], config=_config(promotion_enabled=False)
+    )
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
 
     result = await engine.run(SEAT, dry_run=False)
@@ -275,12 +310,10 @@ async def test_non_seat_dataset_rejected(tmp_path: Path) -> None:
         await engine.run(CENTRAL, dry_run=True)
 
 
-async def test_personal_capture_tag_never_promotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    summary = (
-        "# Capture summary: notes\n"
-        "- Capture Root Tags: personal\n"
-        "- Path: `/tmp/notes`\n"
-    )
+async def test_personal_capture_tag_never_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = "# Capture summary: notes\n- Capture Root Tags: personal\n- Path: `/tmp/notes`\n"
     engine, learning, _store = _engine(tmp_path, [summary])
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.99)
 
@@ -292,7 +325,9 @@ async def test_personal_capture_tag_never_promotes(tmp_path: Path, monkeypatch: 
     assert result["proposals"][0]["reason"] == "capture_tag_personal"
 
 
-async def test_new_org_project_queues_pending_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_new_org_project_queues_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     summary = (
         "# Capture summary: side project\n"
         "- Remote: `https://github.com/other-org/new-app.git`\n"
@@ -464,7 +499,7 @@ async def test_enumerate_stays_best_effort_when_one_query_fails(tmp_path: Path) 
 
 
 async def test_enumerate_names_an_unprovisioned_seat_distinctly(tmp_path: Path) -> None:
-    """"This seat has no dataset" is a different problem from "search is broken" (#147).
+    """ "This seat has no dataset" is a different problem from "search is broken" (#147).
 
     The driver in scripts/run_railway.py logs exc.__class__.__name__, so the two
     cases were indistinguishable in production even though one is an outage to
@@ -581,9 +616,7 @@ async def test_slow_classifier_does_not_block_the_event_loop(
             # The loop never freed us: degrade to the llm_unavailable skip so
             # the red direction fails on the liveness assert, not a hang.
             return None
-        return json.dumps(
-            {"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"}
-        )
+        return json.dumps({"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"})
 
     monkeypatch.setattr(promotion, "openrouter_chat", stalled_chat)
     engine, _learning, _store = _engine(tmp_path, [_org_note()], _github_state(tmp_path))
@@ -658,9 +691,7 @@ async def test_duplicate_across_seats_skips_the_classifier_call(
 
     def counting_chat(*args: Any, **kwargs: Any) -> str:
         classifier_calls["count"] += 1
-        return json.dumps(
-            {"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"}
-        )
+        return json.dumps({"relevant": True, "sensitive": False, "score": 0.9, "reason": "stubbed"})
 
     monkeypatch.setattr(promotion, "openrouter_chat", counting_chat)
 
@@ -737,9 +768,7 @@ async def test_approve_pending_surfaces_the_write_reason(
         "- Capture Root Tags: org-work\n"
     )
     state_path = tmp_path / "github-state.json"
-    state_path.write_text(
-        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
-    )
+    state_path.write_text('{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8")
     config = _config(github_sync_state_path=str(state_path))
     learning = FakeLearning(central_reject_reason="duplicate_in_process")
     store = AccessStore(str(tmp_path / "access.json"))
@@ -777,9 +806,7 @@ async def test_approved_promotion_attests_the_approver(
         "- Capture Root Tags: org-work\n"
     )
     state_path = tmp_path / "github-state.json"
-    state_path.write_text(
-        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
-    )
+    state_path.write_text('{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8")
     config = _config(github_sync_state_path=str(state_path))
     engine, learning, store = _engine(tmp_path, [summary], config)
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.95)

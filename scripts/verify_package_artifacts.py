@@ -31,9 +31,7 @@ def verify(dist_dir: Path) -> None:
     assert any(name.endswith("/kb/webui/index.html") for name in names)
     assert any(name.endswith("/kb/retrieval_eval.py") for name in names)
     tokenizer_prefix = "/kb/data/tiktoken-cache/"
-    assert any(
-        tokenizer_prefix in name and name.endswith(".gz") for name in names
-    )
+    assert any(tokenizer_prefix in name and name.endswith(".gz") for name in names)
     print("release artifact webui, benchmark, and tokenizer payload verified")
 
 

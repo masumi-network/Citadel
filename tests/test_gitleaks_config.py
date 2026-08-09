@@ -109,9 +109,7 @@ def test_target_rules_reference_rules_that_exist(config: dict[str, Any]) -> None
     known = local | KNOWN_BUILTIN_RULES
     unknown: dict[int, list[str]] = {}
     for index, block in enumerate(_allowlists(config)):
-        missing = [
-            name for name in (block.get("targetRules") or ()) if str(name) not in known
-        ]
+        missing = [name for name in (block.get("targetRules") or ()) if str(name) not in known]
         if missing:
             unknown[index] = missing
     assert not unknown, (
@@ -122,7 +120,5 @@ def test_target_rules_reference_rules_that_exist(config: dict[str, Any]) -> None
 
 def test_every_rule_has_an_id(config: dict[str, Any]) -> None:
     """``targetRules`` addresses rules by id, so a rule without one cannot be scoped."""
-    missing = [
-        index for index, rule in enumerate(config.get("rules") or ()) if not rule.get("id")
-    ]
+    missing = [index for index, rule in enumerate(config.get("rules") or ()) if not rule.get("id")]
     assert not missing, f"rule(s) {missing} have no id, so no allowlist can target them"

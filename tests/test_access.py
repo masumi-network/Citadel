@@ -216,17 +216,13 @@ def test_concurrent_writers_do_not_lose_events(tmp_path: Path) -> None:
     import threading
 
     path = tmp_path / "access.json"
-    AccessStore(path).create_principal_token(
-        name="seed", kind="service_account", role="reader"
-    )
+    AccessStore(path).create_principal_token(name="seed", kind="service_account", role="reader")
 
     def writer(tag: str) -> None:
         # A separate instance per thread, which is the cross-process shape.
         local = AccessStore(path)
         for index in range(40):
-            local.record_event(
-                action=f"probe.{tag}", actor=None, success=True, detail={"i": index}
-            )
+            local.record_event(action=f"probe.{tag}", actor=None, success=True, detail={"i": index})
 
     threads = [threading.Thread(target=writer, args=(f"w{n}",)) for n in range(4)]
     for thread in threads:
@@ -251,9 +247,7 @@ def test_a_concurrent_write_cannot_resurrect_a_revoked_token(tmp_path: Path) -> 
 
     path = tmp_path / "access.json"
     store = AccessStore(path)
-    created = store.create_principal_token(
-        name="victim", kind="service_account", role="writer"
-    )
+    created = store.create_principal_token(name="victim", kind="service_account", role="writer")
 
     # Authenticate (loads a pre-revocation snapshot), revoke concurrently, then
     # let the stamp write land.
@@ -307,9 +301,7 @@ def test_last_used_is_stamped_but_not_on_every_request(tmp_path: Path) -> None:
     """
     path = tmp_path / "access.json"
     store = AccessStore(path)
-    created = store.create_principal_token(
-        name="hot", kind="service_account", role="reader"
-    )
+    created = store.create_principal_token(name="hot", kind="service_account", role="reader")
 
     assert store.authenticate_token(created.token) is not None
     stamped = store.snapshot()["tokens"][0]["last_used_at"]

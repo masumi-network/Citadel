@@ -28,6 +28,7 @@ def _no_real_dns(monkeypatch):
         wg.socket, "getaddrinfo", lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))]
     )
 
+
 GOOD = "https://hooks.example.com/services/T000/B000/xxxx"
 
 
@@ -219,8 +220,10 @@ def test_the_validated_ip_is_the_one_connected_to(monkeypatch) -> None:
     handlers: list[Any] = []
     monkeypatch.setattr(
         "kb.webhook_gateway.urllib.request.build_opener",
-        lambda *hs: handlers.extend(hs)
-        or type("O", (), {"open": staticmethod(lambda r, timeout: _Response(200))})(),
+        lambda *hs: (
+            handlers.extend(hs)
+            or type("O", (), {"open": staticmethod(lambda r, timeout: _Response(200))})()
+        ),
     )
     gateway.post_digest("body")
 
@@ -252,6 +255,7 @@ def test_a_trailing_dot_cannot_dodge_the_suffix_blocklist() -> None:
 
 def test_an_unresolvable_host_is_refused_not_allowed(monkeypatch) -> None:
     """Failing open on a resolution error would make DNS downtime a bypass."""
+
     def boom(*a: Any, **k: Any) -> Any:
         raise OSError("no such host")
 
@@ -300,6 +304,7 @@ def test_one_broken_provider_does_not_unregister_the_others(monkeypatch) -> None
     """GoogleChatDelivery.__init__ raises on a space name missing `spaces/`, so
     without isolation a single mistyped env var would also drop a perfectly good
     webhook and take LearningAgent.__init__ with it."""
+
     def explode(config: Any) -> Any:
         raise ValueError("CITADEL_GOOGLE_CHAT_SPACE_NAME must look like spaces/...")
 

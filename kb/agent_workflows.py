@@ -140,7 +140,9 @@ def _doc_shaped_sources(hits: list[dict[str, Any]], *, limit: int = 8) -> list[d
     return out
 
 
-def _known_overlaps(file_text: str, hits: list[dict[str, Any]], *, limit: int = 6) -> list[dict[str, Any]]:
+def _known_overlaps(
+    file_text: str, hits: list[dict[str, Any]], *, limit: int = 6
+) -> list[dict[str, Any]]:
     """Surface vault hits that share tokens with the local file (overlap pointers)."""
     file_tokens = {t.lower() for t in extract_verify_cues(file_text, limit=40)}
     overlaps: list[dict[str, Any]] = []

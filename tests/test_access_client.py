@@ -51,11 +51,18 @@ def test_create_seat_sends_payload_and_auth(monkeypatch) -> None:
         return _FakeResp({"ok": True, "token": "ctdl_new", "principal": {"seat_slug": "alice"}})
 
     monkeypatch.setattr(ac._OPENER, "open", fake_open)
-    out = ac.create_seat(base_url="https://node.example", name="Alice", slug="alice", key="owner-admin")
+    out = ac.create_seat(
+        base_url="https://node.example", name="Alice", slug="alice", key="owner-admin"
+    )
     assert out["token"] == "ctdl_new"
     assert captured["url"] == "https://node.example/api/access/seats"
     assert captured["method"] == "POST"
-    assert captured["body"] == {"name": "Alice", "slug": "alice", "role": "writer", "issue_token": True}
+    assert captured["body"] == {
+        "name": "Alice",
+        "slug": "alice",
+        "role": "writer",
+        "issue_token": True,
+    }
     assert captured["auth"] == "Bearer owner-admin"
 
 

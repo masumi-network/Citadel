@@ -202,7 +202,6 @@ def _text_of(block: Any) -> str:
     return ""
 
 
-
 def build_tags(cwd: str) -> list[str]:
     tags = ["dev-session"]
     branch = git_branch(cwd)

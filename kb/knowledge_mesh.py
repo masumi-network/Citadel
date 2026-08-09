@@ -465,9 +465,7 @@ def build_graph_payload(
     # Kept nodes still wearing a cognee-internal label (``text_<md5>`` or the
     # bare node id) get a human label derived from their chunk text below.
     internal_nodes: dict[str, dict[str, Any]] = {
-        node["id"]: node
-        for node in nodes
-        if _is_internal_label(node["id"], node["label"])
+        node["id"]: node for node in nodes if _is_internal_label(node["id"], node["label"])
     }
     doc_chunk_ids: dict[str, list[str]] = {}
 
@@ -506,11 +504,7 @@ def build_graph_payload(
                 chunk_id, properties = str(raw[0]), raw[1]
             except (TypeError, IndexError, KeyError):
                 continue
-            if (
-                chunk_id in wanted
-                and chunk_id not in chunk_props
-                and isinstance(properties, dict)
-            ):
+            if chunk_id in wanted and chunk_id not in chunk_props and isinstance(properties, dict):
                 chunk_props[chunk_id] = properties
         for doc_id, chunk_ids in doc_chunk_ids.items():
             best: tuple[tuple[int, float, int], str] | None = None
@@ -554,9 +548,7 @@ def build_graph_payload(
         # visibility filtering (KnowledgeMesh.graph), so it is display-only and
         # never widens what a scoped caller can see.
         nodeset_ids = {
-            node["id"]
-            for node in nodes
-            if "nodeset" in str(node.get("type", "")).lower()
+            node["id"] for node in nodes if "nodeset" in str(node.get("type", "")).lower()
         }
         collapse_into: dict[str, str] = {}
         if nodeset_ids:
@@ -712,9 +704,7 @@ def build_graph_payload(
     }
 
 
-def fallback_graph(
-    reason: str, presence: list[dict[str, Any]] | None = None
-) -> dict[str, Any]:
+def fallback_graph(reason: str, presence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Empty-graph payload; ``presence`` still appends Seat Presence hubs.
 
     ADR-0009: every seat is ALWAYS visible, so fallback payloads carry the
@@ -772,9 +762,7 @@ class KnowledgeMesh:
                 "Knowledge mesh graph read failed with %s; returning fallback graph",
                 exc.__class__.__name__,
             )
-            return fallback_graph(
-                f"graph_engine_error:{exc.__class__.__name__}", presence
-            )
+            return fallback_graph(f"graph_engine_error:{exc.__class__.__name__}", presence)
         raw_nodes = list(raw_nodes)
         raw_edges = list(raw_edges)
         dataset_map: dict[str, list[str]] = {}
@@ -784,8 +772,7 @@ class KnowledgeMesh:
                 dataset_map = await node_dataset_map() or {}
             except Exception as exc:
                 logger.warning(
-                    "Knowledge mesh dataset map read failed with %s; "
-                    "omitting dataset attribution",
+                    "Knowledge mesh dataset map read failed with %s; omitting dataset attribution",
                     exc.__class__.__name__,
                 )
                 dataset_map = {}

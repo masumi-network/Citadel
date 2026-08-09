@@ -140,9 +140,9 @@ def test_digest_is_stable_when_the_window_content_is_unchanged() -> None:
 
     assert first.digest == second.digest
     assert "Checked at:" not in first.digest, "a per-sync timestamp reintroduces duplicates"
-    assert (
-        "Window started at:" not in first.digest
-    ), "a wall-clock-derived window bound reintroduces duplicates"
+    assert "Window started at:" not in first.digest, (
+        "a wall-clock-derived window bound reintroduces duplicates"
+    )
 
 
 def test_force_treats_all_activity_as_new() -> None:
@@ -191,9 +191,7 @@ def test_active_repositories_rank_pull_requests_above_commits_and_events() -> No
     update = compose(
         repos=[repo(), other_repo],
         events=[event("evt-1")],
-        commits_by_repo={
-            "masumi-network/scout": [commit("ddd", repo_name="masumi-network/scout")]
-        },
+        commits_by_repo={"masumi-network/scout": [commit("ddd", repo_name="masumi-network/scout")]},
         pull_requests_by_repo={"masumi-network/agent": [pull_request(42)]},
     )
 

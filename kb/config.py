@@ -11,6 +11,7 @@ from kb.access import CENTRAL_DATASET
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - exercised only before dependencies are installed.
+
     def load_dotenv(*args: object, **kwargs: object) -> bool:
         return False
 
@@ -199,9 +200,7 @@ class CitadelConfig:
     # 429). It gets its own dedicated cap. graph_data() is TTL-cached +
     # single-flight, so concurrent mesh reads mostly hit cache and are cheap —
     # a small cpu-based cap is plenty.
-    mesh_graph_max_concurrency: int = field(
-        default_factory=lambda: max(4, os.cpu_count() or 4)
-    )
+    mesh_graph_max_concurrency: int = field(default_factory=lambda: max(4, os.cpu_count() or 4))
     default_session: str = "personal-session"
     default_tags: tuple[str, ...] = field(default_factory=tuple)
     min_chars: int = 3
@@ -319,9 +318,7 @@ class CitadelConfig:
             obsidian_sync_state_path=_obsidian_sync_state_path(
                 os.getenv("CITADEL_OBSIDIAN_SYNC_STATE_PATH")
             ),
-            conflicts_store_path=_conflicts_store_path(
-                os.getenv("CITADEL_CONFLICTS_STORE_PATH")
-            ),
+            conflicts_store_path=_conflicts_store_path(os.getenv("CITADEL_CONFLICTS_STORE_PATH")),
             conflicts_max_records=_int(
                 os.getenv("CITADEL_CONFLICTS_MAX_RECORDS"),
                 default=500,
@@ -336,9 +333,7 @@ class CitadelConfig:
             search_timeout_seconds=_float(
                 os.getenv("CITADEL_SEARCH_TIMEOUT_SECONDS"), default=20.0
             ),
-            search_max_concurrency=_int(
-                os.getenv("CITADEL_SEARCH_MAX_CONCURRENCY"), default=8
-            ),
+            search_max_concurrency=_int(os.getenv("CITADEL_SEARCH_MAX_CONCURRENCY"), default=8),
             mesh_graph_max_concurrency=_int(
                 os.getenv("CITADEL_MESH_GRAPH_MAX_CONCURRENCY"),
                 default=max(4, os.cpu_count() or 4),
@@ -370,7 +365,9 @@ class CitadelConfig:
                 os.getenv("CITADEL_GITHUB_SYNC_INCLUDE_COMMITS"),
                 default=True,
             ),
-            github_sync_run_improve=_bool(os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=True),
+            github_sync_run_improve=_bool(
+                os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=True
+            ),
             github_sync_ingest_unchanged=_bool(
                 os.getenv("CITADEL_GITHUB_SYNC_INGEST_UNCHANGED"),
                 default=True,
@@ -379,12 +376,8 @@ class CitadelConfig:
                 os.getenv("CITADEL_GITHUB_SYNC_INCLUDE_PRIVATE"),
                 default=True,
             ),
-            github_sync_repo_allowlist=tuple(
-                _csv(os.getenv("CITADEL_GITHUB_SYNC_REPO_ALLOWLIST"))
-            ),
-            github_sync_repo_denylist=tuple(
-                _csv(os.getenv("CITADEL_GITHUB_SYNC_REPO_DENYLIST"))
-            ),
+            github_sync_repo_allowlist=tuple(_csv(os.getenv("CITADEL_GITHUB_SYNC_REPO_ALLOWLIST"))),
+            github_sync_repo_denylist=tuple(_csv(os.getenv("CITADEL_GITHUB_SYNC_REPO_DENYLIST"))),
             github_sync_security_scan_enabled=_bool(
                 os.getenv("CITADEL_GITHUB_SYNC_SECURITY_SCAN_ENABLED"),
                 default=True,
@@ -459,13 +452,9 @@ class CitadelConfig:
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_STATE_PATH")
             ),
             evolve_state_path=_evolve_state_path(os.getenv("CITADEL_EVOLVE_STATE_PATH")),
-            repair_journal_path=_repair_journal_path(
-                os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
-            ),
+            repair_journal_path=_repair_journal_path(os.getenv("CITADEL_REPAIR_JOURNAL_PATH")),
             cognify_queue_path=_cognify_queue_path(os.getenv("CITADEL_COGNIFY_QUEUE_PATH")),
-            repo_content_sync_repos=tuple(
-                _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
-            ),
+            repo_content_sync_repos=tuple(_csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))),
             repo_content_sync_root_paths=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_ROOT_PATHS"))
             ),
@@ -532,9 +521,7 @@ class CitadelConfig:
             webhook_max_message_bytes=_int(
                 os.getenv("CITADEL_WEBHOOK_MAX_MESSAGE_BYTES"), default=30000
             ),
-            webhook_timeout_seconds=_int(
-                os.getenv("CITADEL_WEBHOOK_TIMEOUT_SECONDS"), default=20
-            ),
+            webhook_timeout_seconds=_int(os.getenv("CITADEL_WEBHOOK_TIMEOUT_SECONDS"), default=20),
             google_chat_enabled=_bool(os.getenv("CITADEL_GOOGLE_CHAT_ENABLED"), default=False),
             google_chat_space_name=os.getenv("CITADEL_GOOGLE_CHAT_SPACE_NAME") or None,
             google_chat_service_account_json=(
@@ -578,7 +565,9 @@ class CitadelConfig:
                 or os.getenv("CITADEL_BACKUP_MIRROR_GITHUB_TOKEN")
                 or None
             ),
-            linear_api_key=os.getenv("CITADEL_LINEAR_API_KEY") or os.getenv("LINEAR_API_KEY") or None,
+            linear_api_key=os.getenv("CITADEL_LINEAR_API_KEY")
+            or os.getenv("LINEAR_API_KEY")
+            or None,
             linear_sync_dataset=os.getenv("CITADEL_LINEAR_SYNC_DATASET", "masumi-network"),
             linear_sync_session=os.getenv("CITADEL_LINEAR_SYNC_SESSION", "masumi-linear"),
             linear_sync_state_path=_linear_sync_state_path(

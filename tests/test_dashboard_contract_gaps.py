@@ -554,9 +554,7 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     assert "document_count" not in source.replace("readable_document_count", ""), (
         "Home fell back to the Node-only document_count; that number excludes Central"
     )
-    assert "tracked_sources" not in source, (
-        "Home read a source count for a document tile"
-    )
+    assert "tracked_sources" not in source, "Home read a source count for a document tile"
     # Null renders as a dash plus a reason, not as zero.
     assert "return null" in source, "a missing count must be null, never 0"
     assert 'id="homeReadableNote"' in index_html, "no element to render why the count is missing"

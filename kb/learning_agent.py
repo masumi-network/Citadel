@@ -104,10 +104,8 @@ class LearningAgent:
                 "repo_content": repo_content_result,
                 "vault": vault_context,
             },
-            "ingested": bool(github_result.get("ingested")) or int(
-                repo_content_result.get("files_ingested") or 0
-            )
-            > 0,
+            "ingested": bool(github_result.get("ingested"))
+            or int(repo_content_result.get("files_ingested") or 0) > 0,
             "improved": bool(github_result.get("improved"))
             or bool(repo_content_result.get("improved")),
             "dry_run": dry_run,
@@ -143,7 +141,9 @@ class LearningAgent:
         config = self.citadel.config
         if not config.organization_digest_enabled:
             return {"ok": True, "dataset": None, "recent_context": [], "reason": "digest_disabled"}
-        dataset = config.search_default_dataset or config.github_sync_dataset or config.default_dataset
+        dataset = (
+            config.search_default_dataset or config.github_sync_dataset or config.default_dataset
+        )
         query = (
             "meaningful source-linked decisions ongoing work blockers features architecture "
             f"repository momentum last {config.organization_digest_window_hours} hours"
@@ -198,7 +198,10 @@ class LearningAgent:
             return self._skip_gateway_results("dry_run")
         if not digest.get("enabled"):
             return self._skip_gateway_results("digest_disabled")
-        if not digest.get("meaningful") and not self.citadel.config.organization_digest_post_on_no_updates:
+        if (
+            not digest.get("meaningful")
+            and not self.citadel.config.organization_digest_post_on_no_updates
+        ):
             return self._skip_gateway_results("no_meaningful_updates")
 
         gateway_items = sorted(self.gateways.items())
@@ -213,8 +216,7 @@ class LearningAgent:
             )
         )
         results = {
-            name: posted
-            for (name, _), posted in zip(gateway_items, posted_gateways, strict=True)
+            name: posted for (name, _), posted in zip(gateway_items, posted_gateways, strict=True)
         }
 
         if "google_chat" not in results:
@@ -239,9 +241,7 @@ class LearningAgent:
                 message_id=message_id,
             )
         except Exception as exc:
-            logger.error(
-                "Gateway digest delivery failed with %s", exc.__class__.__name__
-            )
+            logger.error("Gateway digest delivery failed with %s", exc.__class__.__name__)
             return {
                 "enabled": True,
                 "ok": False,
@@ -276,8 +276,10 @@ class LearningAgent:
                 "gateway": gateway_name,
                 "reason": reason,
             }
-        text = message or default_message or (
-            f"Citadel {gateway_name} delivery gateway test - configuration check only."
+        text = (
+            message
+            or default_message
+            or (f"Citadel {gateway_name} delivery gateway test - configuration check only.")
         )
         message_id = f"{gateway_name}-test-{datetime.now(timezone.utc).isoformat()}"
         try:

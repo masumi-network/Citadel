@@ -27,8 +27,8 @@ def test_tagline_is_brand_highlighted(monkeypatch) -> None:
 
 def test_banner_large_is_the_brand_wordmark(monkeypatch) -> None:
     plain = banner_large(color=False)
-    assert "____" in plain        # figlet CITADEL
-    assert "\033[" not in plain   # plain when piped
+    assert "____" in plain  # figlet CITADEL
+    assert "\033[" not in plain  # plain when piped
     assert len(plain.splitlines()) == 5  # just the wordmark, nothing else
 
     monkeypatch.delenv("COLORTERM", raising=False)
@@ -91,15 +91,7 @@ def test_cli_mark_matches_the_shipped_web_mark() -> None:
     narrowed) and nothing caught it, because no test compared the two. This
     pins the bitmask that kb/static/favicon.svg and info.js render.
     """
-    shipped = (
-        "1010101"
-        "1111111"
-        "1111111"
-        "1111111"
-        "1101011"
-        "1101011"
-        "1101011"
-    )
+    shipped = "1010101111111111111111111111110101111010111101011"
     assert "".join(str(flag) for flag in PIXEL_FLAGS) == shipped
 
 

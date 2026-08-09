@@ -66,7 +66,9 @@ class FakeCitadel:
     async def improve(self, **kwargs: Any) -> dict[str, Any]:
         return {"dataset": kwargs["dataset"], "session_ids": kwargs["session_ids"]}
 
-    async def cognify_dataset(self, *, dataset: Any = None, verify: bool = False, force: bool = False) -> dict[str, Any]:
+    async def cognify_dataset(
+        self, *, dataset: Any = None, verify: bool = False, force: bool = False
+    ) -> dict[str, Any]:
         return {
             "ok": True,
             "dataset": dataset or self.config.default_dataset,
@@ -75,7 +77,12 @@ class FakeCitadel:
             "graph_grew": True,
             "verify": verify,
             "verification": (
-                {"marker": "COGNIFY_TEST_MARKER_x", "search_hit": True, "graph_grew": True, "ok": True}
+                {
+                    "marker": "COGNIFY_TEST_MARKER_x",
+                    "search_hit": True,
+                    "graph_grew": True,
+                    "ok": True,
+                }
                 if verify
                 else None
             ),
@@ -150,6 +157,7 @@ class FakeCitadel:
             },
             "after": None,
         }
+
 
 class FakeLinearSyncer:
     async def status(self) -> dict[str, Any]:
@@ -330,9 +338,7 @@ def authed_client(access_key: str = "test-admin") -> TestClient:
     app.state.linear_syncer = FakeLinearSyncer()
     app.state.learning_agent = FakeLearningAgent()
     # Keep knowledge-conflict state out of the repo-local .citadel directory.
-    app.state.conflict_store = KnowledgeConflictStore(
-        Path(tempfile.mkdtemp()) / "conflicts.json"
-    )
+    app.state.conflict_store = KnowledgeConflictStore(Path(tempfile.mkdtemp()) / "conflicts.json")
     client = TestClient(app, base_url="https://testserver")
     response = client.post("/admin/session", json={"access_key": access_key})
     assert response.status_code == 200
@@ -350,9 +356,7 @@ LEGACY_PUBLIC_SOURCES = {
 def legacy_public_markup(path: str) -> str:
     if path == "/login":
         return server_module.LOGIN_HTML
-    return (server_module.STATIC_DIR / LEGACY_PUBLIC_SOURCES[path]).read_text(
-        encoding="utf-8"
-    )
+    return (server_module.STATIC_DIR / LEGACY_PUBLIC_SOURCES[path]).read_text(encoding="utf-8")
 
 
 def test_healthz() -> None:
@@ -418,9 +422,7 @@ def test_security_headers_are_applied_to_http_responses() -> None:
     assert response.headers["cross-origin-opener-policy"] == "same-origin"
     assert response.headers["cross-origin-resource-policy"] == "same-origin"
     assert "camera=()" in response.headers["permissions-policy"]
-    assert response.headers["strict-transport-security"] == (
-        "max-age=31536000; includeSubDomains"
-    )
+    assert response.headers["strict-transport-security"] == ("max-age=31536000; includeSubDomains")
 
 
 def test_no_path_relaxes_style_src() -> None:
@@ -599,6 +601,7 @@ def test_login_page_uses_the_public_design_system() -> None:
     assert 'class="topnav"' in page
     assert 'id="themebtn"' in page
 
+
 def test_use_cases_page_is_public_and_csp_clean() -> None:
     page = legacy_public_markup("/use-cases")
     # No token, no session — a coordinator or a curious engineer must be able
@@ -688,7 +691,11 @@ def test_public_pages_share_the_band_layout() -> None:
         # tracks the section in view.
         assert '<script src="/static/landing.js" defer></script>' in page, path
         # The live pill rides in the index bar, where / carries it.
-        index = page[page.index('<nav class="index"'):page.index("</nav>", page.index('<nav class="index"'))]
+        index = page[
+            page.index('<nav class="index"') : page.index(
+                "</nav>", page.index('<nav class="index"')
+            )
+        ]
         assert 'id="pill-health"' in index, path
 
 
@@ -709,9 +716,7 @@ def test_every_internal_link_on_the_public_pages_resolves() -> None:
 
     pages = ("/", "/info", "/use-cases", "/contact", "/login")
     bodies = {path: client.get(path).text for path in pages}
-    ids = {
-        path: set(re.findall(r'id="([^"]+)"', body)) for path, body in bodies.items()
-    }
+    ids = {path: set(re.findall(r'id="([^"]+)"', body)) for path, body in bodies.items()}
 
     checked = 0
     for page, body in bodies.items():
@@ -740,8 +745,7 @@ def test_every_internal_link_on_the_public_pages_resolves() -> None:
                 target = path or page
                 assert target in ids, f"{page} -> {href} targets an unaudited page"
                 assert fragment in ids[target], (
-                    f"{page} -> {href} points at #{fragment}, which does not "
-                    f"exist on {target}"
+                    f"{page} -> {href} points at #{fragment}, which does not exist on {target}"
                 )
 
     # A regex that stopped matching would pass every assertion above.
@@ -831,8 +835,7 @@ def test_home_owns_install_and_the_diagram() -> None:
     """
     home = legacy_public_markup("/")
     others = {
-        path: legacy_public_markup(path)
-        for path in ("/info", "/use-cases", "/contact", "/login")
+        path: legacy_public_markup(path) for path in ("/info", "/use-cases", "/contact", "/login")
     }
 
     assert 'class="spine"' in home
@@ -854,7 +857,7 @@ def test_home_hero_has_no_terminal_block() -> None:
     This pins the decision so it cannot drift back in.
     """
     home = legacy_public_markup("/")
-    hero = home[home.index('<header class="hero">'):home.index("</header>")]
+    hero = home[home.index('<header class="hero">') : home.index("</header>")]
 
     assert "<pre" not in hero
     assert 'class="term' not in hero
@@ -898,7 +901,7 @@ def test_home_motion_respects_reduced_motion() -> None:
     css = (server_module.STATIC_DIR / "info.css").read_text(encoding="utf-8")
 
     start = css.index("@media (prefers-reduced-motion: reduce)")
-    block = css[start:css.index("\n}", start)]
+    block = css[start : css.index("\n}", start)]
 
     # Both animations exist...
     assert "@keyframes drift" in css
@@ -929,8 +932,8 @@ def test_home_rotator_window_and_track_are_separate_elements() -> None:
     # rindex, not index: `.roll-track` also appears inside the reduced-motion
     # block earlier in the file, where it is deliberately set to `animation: none`.
     # The real declaration is the later one.
-    window = css[css.index(".roll {"):css.index("\n", css.index(".roll {"))]
-    track = css[css.rindex(".roll-track {"):css.index("\n", css.rindex(".roll-track {"))]
+    window = css[css.index(".roll {") : css.index("\n", css.index(".roll {"))]
+    track = css[css.rindex(".roll-track {") : css.index("\n", css.rindex(".roll-track {"))]
 
     assert "overflow: hidden" in window, ".roll must be the clipping window"
     assert "animation:" not in window, (
@@ -954,8 +957,8 @@ def test_home_rotator_window_and_track_are_separate_elements() -> None:
 
     # Offsets in em, not percentages: percentages resolve against the track's
     # own height, so adding or removing a word silently drifts every step.
-    frames = css[css.index("@keyframes rollup"):]
-    frames = frames[:frames.index("\n}")]
+    frames = css[css.index("@keyframes rollup") :]
+    frames = frames[: frames.index("\n}")]
     assert "%)" not in frames.replace("0%,", "").replace("%,", ""), (
         "rollup offsets must be in em, matching the item height"
     )
@@ -1258,9 +1261,7 @@ def test_knowledge_events_api_returns_resumable_timeline() -> None:
     typed = client.get("/api/knowledge/events?type=search")
     invalid_limit = client.get("/api/knowledge/events?limit=0")
     invalid_after = client.get("/api/knowledge/events?after_id=-1")
-    unauthenticated = TestClient(app, base_url="https://testserver").get(
-        "/api/knowledge/events"
-    )
+    unauthenticated = TestClient(app, base_url="https://testserver").get("/api/knowledge/events")
 
     assert ingest.status_code == 200
     assert search.status_code == 200
@@ -1398,9 +1399,7 @@ def test_mcp_accept_shim_advertises_both_content_types() -> None:
         captured.clear()
         asyncio.run(shim({"type": "http", "headers": headers}, None, None))
         return [
-            v.decode("latin-1")
-            for n, v in captured["scope"]["headers"]
-            if n.lower() == b"accept"
+            v.decode("latin-1") for n, v in captured["scope"]["headers"] if n.lower() == b"accept"
         ]
 
     both = "application/json, text/event-stream"
@@ -1545,7 +1544,7 @@ def test_app_nav_has_five_primary_entries() -> None:
     page = client.get("/app").text
 
     nav = re.search(r'<nav class="side-nav".*?</nav>', page, re.S)
-    assert nav, "the /app shell no longer renders a <nav class=\"side-nav\">"
+    assert nav, 'the /app shell no longer renders a <nav class="side-nav">'
     labels = re.findall(r'<span class="nav-label">([^<]+)</span>', nav.group(0))
 
     assert labels == ["Home", "Search", "Graph", "Review", "Admin"], labels
@@ -1608,7 +1607,9 @@ def test_app_home_leads_with_search_and_three_numbers() -> None:
     client = authed_client()
 
     page = client.get("/app").text
-    home = re.search(r'<section class="page page-active" data-page="home".*?\n          </section>', page, re.S)
+    home = re.search(
+        r'<section class="page page-active" data-page="home".*?\n          </section>', page, re.S
+    )
     assert home, "the shell no longer renders a home page section"
     home_markup = home.group(0)
 
@@ -1669,9 +1670,7 @@ def test_review_is_the_only_place_with_approve_and_reject() -> None:
     assert 'id="reviewQueueList"' in page
     assert 'id="reviewSourceList"' in page
 
-    row = re.search(
-        r"function promotionNeedsRow\(item\) \{(.*?)\n\}", app_js, re.S
-    )
+    row = re.search(r"function promotionNeedsRow\(item\) \{(.*?)\n\}", app_js, re.S)
     assert row, "promotionNeedsRow moved"
     body = row.group(1)
     assert 'canUse("admin")' in body
@@ -1755,15 +1754,9 @@ def test_graph_inspector_resolves_one_hop_document_neighbors() -> None:
     """
     app_js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-    bearing = re.search(
-        r"function isDocumentBearingNode\(node\) \{(.*?)\n\}", app_js, re.S
-    )
-    candidates = re.search(
-        r"function documentCandidates\(node\) \{(.*?)\n\}", app_js, re.S
-    )
-    loader = re.search(
-        r"async function loadNodeDocument\(node\) \{(.*?)\n\}", app_js, re.S
-    )
+    bearing = re.search(r"function isDocumentBearingNode\(node\) \{(.*?)\n\}", app_js, re.S)
+    candidates = re.search(r"function documentCandidates\(node\) \{(.*?)\n\}", app_js, re.S)
+    loader = re.search(r"async function loadNodeDocument\(node\) \{(.*?)\n\}", app_js, re.S)
     assert bearing and candidates and loader
 
     bearing_body = bearing.group(1)
@@ -3107,7 +3100,9 @@ def test_search_across_datasets_runs_concurrently() -> None:
     class ConcurrentCitadel:
         config = FakeCitadel.config
 
-        async def search(self, query: str, *, dataset: str, session_id: Any, top_k: int) -> list[Any]:
+        async def search(
+            self, query: str, *, dataset: str, session_id: Any, top_k: int
+        ) -> list[Any]:
             order.append(("start", dataset))
             await aio.sleep(0.05)
             order.append(("end", dataset))
@@ -3165,6 +3160,7 @@ def test_single_literal_search_preserves_each_dataset_candidate() -> None:
 
 def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any) -> None:
     """The API ranks the exact token before unrelated returned hits (#106)."""
+
     async def fake_search(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, Any]], bool]:
         return [
             ("central", {"id": "central", "text": "unrelated central note"}),
@@ -3172,9 +3168,7 @@ def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any)
         ], False
 
     monkeypatch.setattr(server_module, "_search_within_budget", fake_search)
-    response = authed_client().post(
-        "/search", json={"query": "quokka-beacon-8823", "top_k": 2}
-    )
+    response = authed_client().post("/search", json={"query": "quokka-beacon-8823", "top_k": 2})
 
     assert response.status_code == 200
     body = response.json()
@@ -3193,9 +3187,7 @@ def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
     assert r.headers["X-RateLimit-Remaining"] == "0"
 
 
-def test_mesh_graph_and_search_have_independent_budgets(
-    monkeypatch: Any, tmp_path: Any
-) -> None:
+def test_mesh_graph_and_search_have_independent_budgets(monkeypatch: Any, tmp_path: Any) -> None:
     # CHANGE 2 (#50): the mesh graph read and /search hold SEPARATE concurrency
     # budgets, so a ~15-seat login burst on the default Knowledge Mesh view can't
     # 429 /search — and vice versa. This is a WIRING test (distinct in-flight
@@ -3217,9 +3209,7 @@ def test_mesh_graph_and_search_have_independent_budgets(
     mesh = client.get("/api/mesh/graph")
     assert mesh.status_code == 429
     assert mesh.headers["Retry-After"] == "1"
-    assert mesh.headers["X-RateLimit-Limit"] == str(
-        FakeCitadel.config.mesh_graph_max_concurrency
-    )
+    assert mesh.headers["X-RateLimit-Limit"] == str(FakeCitadel.config.mesh_graph_max_concurrency)
     assert mesh.headers["X-RateLimit-Remaining"] == "0"
     assert client.post("/search", json={"query": "q", "top_k": 3}).status_code == 200
 
@@ -3306,12 +3296,14 @@ def test_document_endpoint_for_result_covers_real_ids_only() -> None:
     assert document_endpoint_for_result("ghsync:abc") == "/api/documents/ghsync:abc"
     assert document_endpoint_for_result("doc_123") == "/api/documents/doc_123"
     assert document_endpoint_for_result(uuid) == f"/api/documents/{uuid}"
-    assert document_endpoint_for_result(
-        "chunk-uuid", document_id="document-uuid"
-    ) == "/api/documents/document-uuid"
-    assert document_endpoint_for_result(
-        "chunk:deadbeef", document_id="document-uuid"
-    ) == "/api/documents/document-uuid"
+    assert (
+        document_endpoint_for_result("chunk-uuid", document_id="document-uuid")
+        == "/api/documents/document-uuid"
+    )
+    assert (
+        document_endpoint_for_result("chunk:deadbeef", document_id="document-uuid")
+        == "/api/documents/document-uuid"
+    )
     assert document_endpoint_for_result("../../api/access") == (
         "/api/documents/..%2F..%2Fapi%2Faccess"
     )
@@ -3372,9 +3364,7 @@ def test_search_drilldown_prefers_parent_document_id_for_chunk_hit(
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = ParentDocumentSearchCitadel()
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
     api = TestClient(app, base_url="https://testserver")
@@ -3431,9 +3421,7 @@ def test_knowledge_conflict_listing_and_resolution_are_role_gated(tmp_path: Any)
     conflict_id = conflicts[0]["id"]
 
     mesh = writer.get("/api/mesh")
-    conflict_events = [
-        event for event in mesh.json()["events"] if event["type"] == "conflict"
-    ]
+    conflict_events = [event for event in mesh.json()["events"] if event["type"] == "conflict"]
     assert conflict_events[0]["details"]["conflict_id"] == conflict_id
 
     reader_store = app.state.conflict_store
@@ -3666,14 +3654,10 @@ def test_mesh_projection_hides_seat_content_from_plain_readers(tmp_path: Any) ->
             dataset="seat:alice",
             tags=[],
         )
-        await mesh.record_search(
-            config, query=secret_query, dataset="seat:alice", result_count=1
-        )
+        await mesh.record_search(config, query=secret_query, dataset="seat:alice", result_count=1)
         await mesh.record_ingest(
             config,
-            IngestResult(
-                accepted=True, reason="stored", dataset="masumi-network", tags=()
-            ),
+            IngestResult(accepted=True, reason="stored", dataset="masumi-network", tags=()),
             data=org_doc,
             dataset="masumi-network",
             tags=[],
@@ -3682,12 +3666,8 @@ def test_mesh_projection_hides_seat_content_from_plain_readers(tmp_path: Any) ->
     asyncio.run(_populate())
 
     api = TestClient(app, base_url="https://testserver")
-    reader_view = api.get(
-        "/api/mesh", headers={"Authorization": f"Bearer {reader_token}"}
-    ).json()
-    alice_view = api.get(
-        "/api/mesh", headers={"Authorization": f"Bearer {alice_token}"}
-    ).json()
+    reader_view = api.get("/api/mesh", headers={"Authorization": f"Bearer {reader_token}"}).json()
+    alice_view = api.get("/api/mesh", headers={"Authorization": f"Bearer {alice_token}"}).json()
     admin_view = admin.get("/api/mesh").json()
 
     reader_blob = json.dumps(reader_view)
@@ -3699,14 +3679,12 @@ def test_mesh_projection_hides_seat_content_from_plain_readers(tmp_path: Any) ->
     assert org_doc in reader_blob
     # Seat presence stays universal: the seat's dataset hub is still there.
     assert any(
-        node.get("metadata", {}).get("dataset") == "seat:alice"
-        and node["type"] == "dataset"
+        node.get("metadata", {}).get("dataset") == "seat:alice" and node["type"] == "dataset"
         for node in reader_view["nodes"]
     )
     # No content-bearing seat node survives for the reader.
     assert not any(
-        node.get("metadata", {}).get("dataset") == "seat:alice"
-        and node["type"] != "dataset"
+        node.get("metadata", {}).get("dataset") == "seat:alice" and node["type"] != "dataset"
         for node in reader_view["nodes"]
     )
     # Owner and admin both retain their own/all content.
@@ -3822,9 +3800,7 @@ def test_mesh_graph_isolates_content_per_caller_but_presence_is_universal(
 def test_mesh_graph_map_failure_fails_closed_for_scoped_callers(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway(map_error=True))
     try:
         bob_view = (
@@ -3907,9 +3883,7 @@ def test_document_drilldown_enforces_read_scope_without_existence_oracle(
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = DrilldownIsolationCitadel()  # authed_client resets citadel
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
     api = TestClient(app, base_url="https://testserver")
@@ -3952,9 +3926,7 @@ def test_document_drilldown_map_failure_fails_closed_for_scoped_callers(
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = DrilldownIsolationCitadel()
     api = TestClient(app, base_url="https://testserver")
     bob = {"Authorization": f"Bearer {bob_token}"}
@@ -3989,16 +3961,12 @@ def test_document_drilldown_denies_when_gateway_lacks_node_dataset_map(
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = DrilldownIsolationCitadel()
     app.state.knowledge_mesh = KnowledgeMesh(_NoMapGateway())
     api = TestClient(app, base_url="https://testserver")
     try:
-        own = api.get(
-            "/api/documents/doc-b", headers={"Authorization": f"Bearer {bob_token}"}
-        )
+        own = api.get("/api/documents/doc-b", headers={"Authorization": f"Bearer {bob_token}"})
         admin_doc = admin.get("/api/documents/doc-a")
     finally:
         app.state.knowledge_mesh = None
@@ -4028,9 +3996,7 @@ class DrilldownSearchCitadel(DrilldownIsolationCitadel):
 
 def _search_hint(body: dict[str, Any]) -> dict[str, bool]:
     return {
-        hit["_citadel"]["result_id"]: hit["_citadel"]["retrieval"][
-            "document_drilldown_available"
-        ]
+        hit["_citadel"]["result_id"]: hit["_citadel"]["retrieval"]["document_drilldown_available"]
         for hit in body["results"]
     }
 
@@ -4044,9 +4010,7 @@ def test_search_drilldown_hint_matches_document_endpoint_per_caller(
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = DrilldownSearchCitadel()  # authed_client resets citadel
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
     api = TestClient(app, base_url="https://testserver")
@@ -4055,10 +4019,7 @@ def test_search_drilldown_hint_matches_document_endpoint_per_caller(
     try:
         bob_body = api.post("/search", json={"query": "x"}, headers=bob).json()
         admin_body = admin.post("/search", json={"query": "x"}).json()
-        bob_status = {
-            doc: api.get(f"/api/documents/{doc}", headers=bob).status_code
-            for doc in ids
-        }
+        bob_status = {doc: api.get(f"/api/documents/{doc}", headers=bob).status_code for doc in ids}
         # Admin's textless entity 404s too (get_document is None), which the
         # bypass hint cannot cheaply foresee; assert consistency on resolvable ids.
         admin_status = {
@@ -4109,9 +4070,7 @@ def test_search_drilldown_hint_fails_closed_on_cold_map(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     app.state.citadel = DrilldownSearchCitadel()
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway(empty_map=True))
     api = TestClient(app, base_url="https://testserver")
@@ -4166,9 +4125,7 @@ def test_search_hint_never_assembles_document_bodies(tmp_path: Any) -> None:
     # get_document again.
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     citadel = DrilldownCountingCitadel()
     app.state.citadel = citadel
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
@@ -4205,13 +4162,11 @@ def test_search_hint_never_assembles_document_bodies(tmp_path: Any) -> None:
     # before it (the pre-fix latency_ms was measured before the drill-down
     # pass, under-reporting exactly what it added).
     events = app.state.access_store.snapshot()["audit_events"]
-    search_events = [
-        event for event in events if event["detail"].get("operation") == "search"
-    ]
+    search_events = [event for event in events if event["detail"].get("operation") == "search"]
     assert search_events
     assert isinstance(search_events[-1]["detail"].get("drilldown_ms"), (int, float))
-    assert search_events[-1]["detail"]["latency_ms"] >= (
-        search_events[-1]["detail"]["drilldown_ms"]
+    assert (
+        search_events[-1]["detail"]["latency_ms"] >= (search_events[-1]["detail"]["drilldown_ms"])
     )
 
 
@@ -4230,18 +4185,14 @@ def test_search_hint_pass_denies_once_its_deadline_expires(tmp_path: Any) -> Non
             search_timeout_seconds=0.2,
         )
 
-        async def resolve_document_owner_ids(
-            self, document_id: str
-        ) -> list[str] | None:
+        async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
             self.owner_id_calls.append(document_id)
             await asyncio.sleep(30)  # cancelled by the pass deadline
             return None
 
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
-    bob_token = admin.post(
-        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
-    ).json()["token"]
+    bob_token = admin.post("/api/access/seats", json={"name": "Bob", "slug": "bob"}).json()["token"]
     citadel = _HungResolverCitadel()
     app.state.citadel = citadel
     app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
@@ -4511,9 +4462,7 @@ def test_optimize_endpoint_is_admin_only_bounded_and_audited(
     assert payload["llm_used"] is False
 
     events = store.snapshot()["audit_events"]
-    optimize_events = [
-        event for event in events if event["action"] == "learning_agent.optimize"
-    ]
+    optimize_events = [event for event in events if event["action"] == "learning_agent.optimize"]
     assert len(optimize_events) == 1
     assert optimize_events[0]["success"] is True
     assert optimize_events[0]["detail"]["dry_run"] is True
@@ -4526,7 +4475,10 @@ class MultiSearchCitadel(FakeCitadel):
         self.cognee = type(
             "_Cognee",
             (),
-            {"scheduled": [], "schedule_cognify": lambda self, datasets: self.scheduled.append(list(datasets))},
+            {
+                "scheduled": [],
+                "schedule_cognify": lambda self, datasets: self.scheduled.append(list(datasets)),
+            },
         )()
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
@@ -4590,9 +4542,7 @@ def test_create_seat_api_provisions_node_and_writer_token(tmp_path: Any) -> None
     assert invalid.status_code == 422
 
 
-def test_a_422_says_why_in_the_log_without_echoing_the_payload(
-    tmp_path: Any, caplog: Any
-) -> None:
+def test_a_422_says_why_in_the_log_without_echoing_the_payload(tmp_path: Any, caplog: Any) -> None:
     """A rejected write must be diagnosable from the node, not just from the caller.
 
     Production showed ten consecutive PUT .../capture-roots 422s with nothing in
@@ -4880,7 +4830,11 @@ def test_seat_cannot_recall_another_seats_session(tmp_path: Any) -> None:
 
     search = api_client.post(
         "/search",
-        json={"query": "anything", "dataset": "masumi-network", "session_id": "masumi-github-daily"},
+        json={
+            "query": "anything",
+            "dataset": "masumi-network",
+            "session_id": "masumi-github-daily",
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -5165,9 +5119,7 @@ def test_seat_session_reports_own_seat_slug_and_node(tmp_path: Any) -> None:
     ).json()["token"]
     api_client = TestClient(app, base_url="https://testserver")
 
-    session = api_client.get(
-        "/api/session", headers={"Authorization": f"Bearer {token}"}
-    )
+    session = api_client.get("/api/session", headers={"Authorization": f"Bearer {token}"})
 
     assert session.status_code == 200
     payload = session.json()
@@ -5190,9 +5142,7 @@ def test_me_summary_for_seat_reports_node_scope(tmp_path: Any) -> None:
     ).json()["token"]
     api_client = TestClient(app, base_url="https://testserver")
 
-    summary = api_client.get(
-        "/api/me/summary", headers={"Authorization": f"Bearer {token}"}
-    )
+    summary = api_client.get("/api/me/summary", headers={"Authorization": f"Bearer {token}"})
 
     assert summary.status_code == 200
     payload = summary.json()
@@ -5234,9 +5184,7 @@ def test_me_summary_uses_audit_when_mesh_empty(tmp_path: Any) -> None:
     )
     api_client = TestClient(app, base_url="https://testserver")
 
-    summary = api_client.get(
-        "/api/me/summary", headers={"Authorization": f"Bearer {token}"}
-    )
+    summary = api_client.get("/api/me/summary", headers={"Authorization": f"Bearer {token}"})
 
     assert summary.status_code == 200
     payload = summary.json()
@@ -5286,9 +5234,7 @@ def test_me_summary_keeps_node_activity_when_central_is_busy(tmp_path: Any) -> N
     asyncio.run(_populate())
     api_client = TestClient(app, base_url="https://testserver")
 
-    summary = api_client.get(
-        "/api/me/summary", headers={"Authorization": f"Bearer {token}"}
-    )
+    summary = api_client.get("/api/me/summary", headers={"Authorization": f"Bearer {token}"})
 
     assert summary.status_code == 200
     payload = summary.json()
@@ -5312,9 +5258,7 @@ def test_me_summary_non_seat_has_null_seat(tmp_path: Any) -> None:
     ).json()["token"]
     api_client = TestClient(app, base_url="https://testserver")
 
-    summary = api_client.get(
-        "/api/me/summary", headers={"Authorization": f"Bearer {token}"}
-    )
+    summary = api_client.get("/api/me/summary", headers={"Authorization": f"Bearer {token}"})
 
     assert summary.status_code == 200
     payload = summary.json()
@@ -5340,9 +5284,7 @@ def test_non_seat_token_session_nulls_seat_slug(tmp_path: Any) -> None:
     ).json()["token"]
     api_client = TestClient(app, base_url="https://testserver")
 
-    session = api_client.get(
-        "/api/session", headers={"Authorization": f"Bearer {token}"}
-    )
+    session = api_client.get("/api/session", headers={"Authorization": f"Bearer {token}"})
 
     assert session.status_code == 200
     payload = session.json()
@@ -5381,9 +5323,7 @@ def test_list_seats_returns_active_seats_with_token_counts(tmp_path: Any) -> Non
     assert "token_hash" not in seat["tokens"][0]
 
     # Revoking the seat's token drops the active count to zero but keeps the seat.
-    revoked = client.post(
-        f"/api/access/tokens/{created['api_token']['id']}/revoke"
-    )
+    revoked = client.post(f"/api/access/tokens/{created['api_token']['id']}/revoke")
     assert revoked.status_code == 200
     after = client.get("/api/access/seats").json()["seats"]
     assert after[0]["active_token_count"] == 0
@@ -5830,7 +5770,9 @@ def test_mcp_seat_contribute_forbidden(tmp_path: Any) -> None:
 def test_seat_contribute_forbidden(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
-    token = admin.post("/api/access/seats", json={"name": "Mcp Dana", "slug": "mcp-dana"}).json()["token"]
+    token = admin.post("/api/access/seats", json={"name": "Mcp Dana", "slug": "mcp-dana"}).json()[
+        "token"
+    ]
     api_client = TestClient(app, base_url="https://testserver")
 
     response = api_client.post(
@@ -5993,15 +5935,11 @@ def test_github_webhook_merged_pr_returns_202_nonblocking_and_audits(
     assert merge_events[0]["detail"]["triggered"] == "github_sync"
 
 
-def test_github_webhook_invalid_signature_returns_401(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_github_webhook_invalid_signature_returns_401(tmp_path: Path, monkeypatch: Any) -> None:
     secret = secrets.token_hex(16)
     syncer = _setup_webhook(tmp_path, secret)
     triggered: list[Any] = []
-    monkeypatch.setattr(
-        server_module, "_run_webhook_reingest", lambda s: triggered.append(s)
-    )
+    monkeypatch.setattr(server_module, "_run_webhook_reingest", lambda s: triggered.append(s))
 
     body = _merge_payload()
     client = TestClient(app, base_url="https://testserver")
@@ -6061,9 +5999,9 @@ def test_github_webhook_non_merge_close_returns_204(tmp_path: Path) -> None:
     secret = secrets.token_hex(16)
     syncer = _setup_webhook(tmp_path, secret)
 
-    body = json.dumps(
-        {"action": "closed", "pull_request": {"merged": False, "number": 7}}
-    ).encode("utf-8")
+    body = json.dumps({"action": "closed", "pull_request": {"merged": False, "number": 7}}).encode(
+        "utf-8"
+    )
     client = TestClient(app, base_url="https://testserver")
     response = client.post(
         "/api/webhooks/github",
@@ -6144,8 +6082,7 @@ def test_seat_capture_policy_admin_crud(tmp_path: Any) -> None:
 
     audit = admin.get("/api/audit")
     assert any(
-        event["action"] == "access.capture_policy.update"
-        for event in audit.json()["audit_events"]
+        event["action"] == "access.capture_policy.update" for event in audit.json()["audit_events"]
     )
 
 
@@ -6248,7 +6185,9 @@ def test_promotion_approve_reject_require_admin_not_seat_writer(tmp_path: Any) -
     for verb in ("approve", "reject"):
         # Seat-writer is 403'd for both its own real item and a bogus id (authz first).
         own = bob.post(f"/api/promotion/pending/{item.id}/{verb}", headers=bob_headers, json={})
-        bogus = bob.post(f"/api/promotion/pending/does-not-exist/{verb}", headers=bob_headers, json={})
+        bogus = bob.post(
+            f"/api/promotion/pending/does-not-exist/{verb}", headers=bob_headers, json={}
+        )
         assert own.status_code == 403, verb
         assert bogus.status_code == 403, verb
         # Admin passes the authz gate (proven by reaching the 404 id lookup).
@@ -6274,8 +6213,8 @@ class ShareCitadel(FakeCitadel):
         self.ingest_calls: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled = []
-        self.cognee.schedule_cognify = (
-            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        self.cognee.schedule_cognify = lambda datasets: (
+            self.cognee.scheduled.append(list(datasets)) or True
         )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
@@ -6292,8 +6231,8 @@ class CrossSeatTraceCitadel(FakeCitadel):
         self.traces: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = (
-            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        self.cognee.schedule_cognify = lambda datasets: (
+            self.cognee.scheduled.append(list(datasets)) or True
         )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
@@ -6348,9 +6287,7 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
 def test_share_session_surfaces_rejected_durable_queue(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
-    token = admin.post(
-        "/api/access/seats", json={"name": "Alice", "slug": "alice"}
-    ).json()["token"]
+    token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()["token"]
     citadel = ShareCitadel()
     citadel.cognee.schedule_cognify = lambda datasets: False
     app.state.citadel = citadel
@@ -6369,14 +6306,10 @@ def test_share_session_surfaces_rejected_durable_queue(tmp_path: Any) -> None:
     assert payload["ok"] is True
     assert payload["accepted"] is True
     assert payload["cognify"] == "not_scheduled"
-    assert payload["message"] == (
-        "Shared Session Trace accepted, but indexing was not scheduled."
-    )
+    assert payload["message"] == ("Shared Session Trace accepted, but indexing was not scheduled.")
     events = app.state.access_store.snapshot()["audit_events"]
     successful = [
-        event
-        for event in events
-        if event["action"] == "share_session" and event["success"]
+        event for event in events if event["action"] == "share_session" and event["success"]
     ]
     assert successful[-1]["detail"]["cognify"] == "not_scheduled"
 
@@ -6566,8 +6499,8 @@ class PartialSessionTraceWriteCitadel(FakeCitadel):
         self.ingest_calls: list[dict[str, Any]] = []
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = (
-            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        self.cognee.schedule_cognify = lambda datasets: (
+            self.cognee.scheduled.append(list(datasets)) or True
         )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
@@ -6586,8 +6519,8 @@ class FlakySessionTraceWriteCitadel(FakeCitadel):
         self.session_traces_attempts = 0
         self.cognee = type("_FakeCognee", (), {})()
         self.cognee.scheduled: list[list[str]] = []
-        self.cognee.schedule_cognify = (
-            lambda datasets: self.cognee.scheduled.append(list(datasets)) or True
+        self.cognee.schedule_cognify = lambda datasets: (
+            self.cognee.scheduled.append(list(datasets)) or True
         )
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
@@ -6669,7 +6602,9 @@ def test_share_session_fails_when_session_traces_write_rejected(tmp_path: Any) -
     ]
     assert app.state.citadel.cognee.scheduled == []
     events = app.state.access_store.snapshot()["audit_events"]
-    failed = [event for event in events if event["action"] == "share_session" and not event["success"]]
+    failed = [
+        event for event in events if event["action"] == "share_session" and not event["success"]
+    ]
     assert failed
     assert failed[-1]["detail"]["error_type"] == "partial_write_failure"
     assert failed[-1]["detail"]["retried"] is True
@@ -7055,9 +6990,7 @@ def test_weak_env_access_key_refuses_to_start(monkeypatch) -> None:
         server_module,
         "get_citadel",
         lambda: SimpleNamespace(
-            config=SimpleNamespace(
-                admin_key="owner-admin-key", writer_keys=(), reader_keys=()
-            )
+            config=SimpleNamespace(admin_key="owner-admin-key", writer_keys=(), reader_keys=())
         ),
     )
 
@@ -7074,9 +7007,7 @@ def test_a_strong_env_access_key_starts_normally(monkeypatch) -> None:
         server_module,
         "get_citadel",
         lambda: SimpleNamespace(
-            config=SimpleNamespace(
-                admin_key="x" * 64, writer_keys=(), reader_keys=()
-            )
+            config=SimpleNamespace(admin_key="x" * 64, writer_keys=(), reader_keys=())
         ),
     )
 
@@ -7317,6 +7248,8 @@ def test_api_mesh_activity_counters_are_scoped_not_top_level(
     assert {"searches", "feedback", "upgrades", "errors"} <= set(since)
     # The window the counters cover ships with them.
     assert since["started_at"]
+
+
 class FakeCorpusCognee:
     """Fake at the kb.cognee_client METHOD boundary.
 
@@ -7527,9 +7460,7 @@ def test_corpus_census_clamps_a_future_dated_cursor_so_later_rows_land() -> None
 
     # A real row arrives after the cursor was handed out, just past the skew
     # window. With the future-dated cursor it would never be seen.
-    fake.rows.append(
-        _corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat())
-    )
+    fake.rows.append(_corpus_row("doc-later", (now + timedelta(seconds=601)).isoformat()))
 
     page_two = client.get(f"/api/corpus?limit=3&cursor={cursor}").json()
     assert "doc-later" in [row["id"] for row in page_two["documents"]]

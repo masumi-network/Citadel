@@ -309,8 +309,7 @@ class CognifyRetryQueue:
             leased_overlaps = [
                 record
                 for record in jobs.values()
-                if record["lease_id"] is not None
-                and set(record["datasets"]).intersection(names)
+                if record["lease_id"] is not None and set(record["datasets"]).intersection(names)
             ]
 
             if leased_overlaps:
@@ -372,7 +371,9 @@ class CognifyRetryQueue:
             self._save(state)
             return result
 
-    def claim(self, *, now: datetime | None = None, lease_seconds: float | None = None) -> CognifyLease | None:
+    def claim(
+        self, *, now: datetime | None = None, lease_seconds: float | None = None
+    ) -> CognifyLease | None:
         """Claim the oldest due record, or return ``None`` when none is due."""
         leases = self.claim_due(now=now, limit=1, lease_seconds=lease_seconds)
         return leases[0] if leases else None
@@ -680,9 +681,7 @@ class CognifyRetryQueue:
                 if not set(lease_datasets).issubset(set(datasets)):
                     raise ValueError(f"job {job_id!r} lease datasets exceed job datasets")
             error = record["last_error"]
-            if error is not None and (
-                not isinstance(error, str) or len(error) > MAX_ERROR_LENGTH
-            ):
+            if error is not None and (not isinstance(error, str) or len(error) > MAX_ERROR_LENGTH):
                 raise ValueError(f"job {job_id!r} last_error is invalid")
 
     def _save(self, data: dict[str, Any]) -> None:

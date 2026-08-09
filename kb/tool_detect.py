@@ -45,7 +45,12 @@ class ToolSpec:
 
 # Order here is the order tools are offered during onboarding.
 SPECS: dict[str, ToolSpec] = {
-    "claude": ToolSpec("claude", "Claude Code (user scope)", "write", "~/.claude.json (or `claude mcp add --scope user`)"),
+    "claude": ToolSpec(
+        "claude",
+        "Claude Code (user scope)",
+        "write",
+        "~/.claude.json (or `claude mcp add --scope user`)",
+    ),
     "cursor": ToolSpec("cursor", "Cursor", "write", "~/.cursor/mcp.json"),
     "codex": ToolSpec("codex", "Codex CLI", "write", "~/.codex/config.toml"),
     "gemini": ToolSpec("gemini", "Gemini CLI", "write", "~/.gemini/settings.json"),
@@ -153,7 +158,16 @@ def _wire_codex(url: str) -> ToolResult:
     if _which("codex"):
         try:
             subprocess.run(
-                ["codex", "mcp", "add", "citadel", "--url", url, "--bearer-token-env-var", TOKEN_ENV],
+                [
+                    "codex",
+                    "mcp",
+                    "add",
+                    "citadel",
+                    "--url",
+                    url,
+                    "--bearer-token-env-var",
+                    TOKEN_ENV,
+                ],
                 check=True,
                 capture_output=True,
                 timeout=30,
@@ -171,7 +185,7 @@ def _wire_codex(url: str) -> ToolResult:
             return ToolResult("codex", "error", f"{path}: {exc}")
     if marker in existing:
         return ToolResult("codex", "unchanged", str(path))
-    block = f"\n{marker}\nurl = \"{url}\"\nbearer_token_env_var = \"{TOKEN_ENV}\"\n"
+    block = f'\n{marker}\nurl = "{url}"\nbearer_token_env_var = "{TOKEN_ENV}"\n'
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -202,16 +216,26 @@ def _wire_claude(url: str, *, node_base: str) -> ToolResult:
         try:
             subprocess.run(
                 [
-                    "claude", "mcp", "add", "--transport", "http", "citadel", url,
-                    "--scope", "user",
-                    "--header", f"Authorization: Bearer ${{{TOKEN_ENV}}}",
+                    "claude",
+                    "mcp",
+                    "add",
+                    "--transport",
+                    "http",
+                    "citadel",
+                    url,
+                    "--scope",
+                    "user",
+                    "--header",
+                    f"Authorization: Bearer ${{{TOKEN_ENV}}}",
                 ],
                 check=True,
                 capture_output=True,
                 timeout=30,
             )
             _ensure_claude_project_mcp(node_base)
-            return ToolResult("claude", "wrote", "via `claude mcp add --scope user` + project .mcp.json")
+            return ToolResult(
+                "claude", "wrote", "via `claude mcp add --scope user` + project .mcp.json"
+            )
         except (OSError, subprocess.SubprocessError):
             pass  # fall back to editing ~/.claude.json directly
     result = _merge_json_mcp(
@@ -282,7 +306,14 @@ def apply(name: str, *, node_url: str = DEFAULT_NODE_URL) -> ToolResult:
     if name == "zed":
         # No header env-interpolation in Zed yet → literal token in settings.json.
         snippet = json.dumps(
-            {"context_servers": {"citadel": {"url": url, "headers": {"Authorization": "Bearer <paste your ctdl_ token>"}}}},
+            {
+                "context_servers": {
+                    "citadel": {
+                        "url": url,
+                        "headers": {"Authorization": "Bearer <paste your ctdl_ token>"},
+                    }
+                }
+            },
             indent=2,
         )
         return ToolResult("zed", "snippet", spec.config_hint, snippet)

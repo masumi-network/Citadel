@@ -139,9 +139,7 @@ class LearningProcess:
                 result = await self.citadel.ingest(chunk_data, **ingest_kwargs)
             except Exception as exc:
                 if self.mesh:
-                    await self.mesh.record_error(
-                        self.config, operation=operation, error=str(exc)
-                    )
+                    await self.mesh.record_error(self.config, operation=operation, error=str(exc))
                 raise
             results.append(result)
             if self.mesh:
