@@ -1,0 +1,5 @@
+# Formatting-only commits — excluded from git blame.
+# See https://git-scm.com/docs/git-blame#Documentation/git-blame.txt---ignore-revs-fileltfilegt
+
+# style: adopt ruff format across the tree (#127)
+ed3c1b6be1f0fe39ec5ad0555bbb3291b941983e
