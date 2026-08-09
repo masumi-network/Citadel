@@ -1,6 +1,15 @@
 # Citadel Progress
 
-Last updated: 2026-08-08.
+Last updated: 2026-08-09.
+
+## 2026-08-09: Local Qdrant core passes, lifecycle remains open
+
+- VERIFIED: candidate branch `agent/citadel-v050-qdrant` is clean at local merge commit `f3e92ff`, four commits ahead of remote PR 256 head `420be9d`. Final compatibility fixes are in `a0d5c02`; the Lite runtime and deployment package are in `92ce11a`; PR 254 corpus readiness diagnostics are merged locally in `f3e92ff`.
+- VERIFIED: after the local PR 254 merge, focused status and runtime tests returned `65 passed, 10 warnings in 5.51s`; the full suite returned `1781 passed, 3 skipped, 11 warnings in 32.97s`; Ruff returned `All checks passed!`.
+- VERIFIED: the disposable local stack previously passed authenticated HTTP ingest, background Cognee `1.4.1` cognify, dataset-scoped Qdrant indexing, exact marker retrieval, process restart, SQLite backup and restore, and Qdrant snapshot restore. The running image has not been rebuilt from `f3e92ff`, so the merged readiness diagnostics have not been remeasured in the container.
+- CORRECTED: provider success does not finish the v0.5 core. The current `CognifyJob` stores dataset names and lease metadata, while accepted source, generation-specific work, and per-backend completion have no shared durable receipt. CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01 now record the working v1 contract and its approval gate.
+- VERIFIED: the 2026-08-09 GitHub refresh still returns 87 issues (19 open) and 171 pull requests (15 open). PR 254 is behind, PR 255 has two failing checks, and PR 256 remains draft and blocked with 18 successful checks on its older remote head.
+- HELD: no local commit was pushed, no Railway deployment ran, no production service or data changed, and no release was published.
 
 ## 2026-08-08: Qdrant shadow route selected
 

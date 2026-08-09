@@ -1,8 +1,8 @@
 # Status
-Last updated: 2026-08-08
+Last updated: 2026-08-09
 Updated by: coordinator
-Current phase: portable SQLite Lite container proof
-Current sprint: CITADEL-QDRANT-2026-08-08
+Current phase: lifecycle contract approval and candidate branch sync
+Current sprint: CITADEL-QDRANT-2026-08-09
 
 ## Completed
 - [x] CITADEL-QDRANT-2026-08-08-12, owner: implementer. VERIFIED: secure Cognee `1.4.1` source build shipped in candidate commit `420be9d`; draft PR 256 CI is green. Exact source SHA-256 is `9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9`; wheel SHA-256 is `2c1bec17b0ed9563ffa4f6ccdd4a02939cdec6dfd93db9faf852266ce3231a91`. Local full suite returned `1759 passed, 1 skipped, 11 warnings in 22.26s`.
@@ -22,24 +22,23 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - [x] CITADEL-RESEARCH-2026-08-08-10, owner: researcher. VERIFIED: official Railway template, variables, private networking, health, volume, backup, rollback, and publication audit completed in `.local-review/research/railway-one-click-template.md`; detector and whitespace checks were clean; SHA-256 `3f5c0ef830f5ea9964c82a968873941baa1c5661408fbcf2cedf93639156078c`. Blind spot: no Railway account or resource was accessed.
 - [x] CITADEL-RESEARCH-2026-08-08-11, owner: researcher. VERIFIED: the Cognee `1.4.1` secure package audit found a one-line `<50` to `<51` metadata patch that retained `cryptography==50.0.0`; direct Cognee crypto and OAuth tests returned `15 passed, 10 warnings in 0.07s`. Evidence: `.local-review/research/cognee-secure-packaging.md`, SHA-256 `69ab2e56dcf01db1ef1fc80d7f7c5c4c7778d4d4d9e48d2d3425f4eaf185f426`. Blind spot: no reviewable remote fork commit or public package exists.
 - [x] CITADEL-PORTABLE-2026-08-08-01, owner: architect. VERIFIED: exact Cognee `1.4.1` source supports SQLite and PostgreSQL; Railway documents SQLite on volumes; DigitalOcean App Platform has no persistent volumes. REPORTED: the user selected SQLite Lite plus Qdrant for the v0.5 Railway release.
+- [x] CITADEL-QDRANT-2026-08-09-01, owner: implementer. VERIFIED: local candidate commits `a0d5c02` and `92ce11a` preserve the final adapter, Cognee compatibility, Qdrant census, Lite runtime, and deploy work. Local merge commit `f3e92ff` integrates PR 254 corpus readiness diagnostics. After that merge, focused tests returned `65 passed, 10 warnings in 5.51s`; the full suite returned `1781 passed, 3 skipped, 11 warnings in 32.97s`; Ruff returned `All checks passed!`.
+- [x] CITADEL-QDRANT-2026-08-09-02, owner: release. VERIFIED: the disposable local stack accepted authenticated marker `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360`, completed background cognify, and returned the full marker through authenticated search. SQLite backup and restore plus Qdrant snapshot restore passed. Blind spot: this was one document in a disposable generation.
 
 ## In Progress
-- [ ] CITADEL-PORTABLE-2026-08-08-04, owner: implementer, next action: build and boot the candidate Docker image, then run HTTP, CLI, MCP, restart, and restore gates, file scope: uncommitted `.dockerignore`, `.env.lite.example`, `.gitignore`, `Dockerfile`, `docker-compose.yml`, `kb/lite_runtime.py`, and three live/runtime tests in `/private/tmp/citadel-v050-qdrant`. VERIFIED: Docker Engine `29.6.2`, Compose `v5.3.1`, Compose config exit `0`, runtime plus adapter tests `24 passed, 10 warnings in 3.17s`, Ruff clean, and diff check clean. No Docker image build or Railway deploy ran.
-- [ ] CITADEL-QDRANT-2026-08-08-02, owner: implementer, next action: implement the Qdrant persisted chunk census, then rerun the real provider tests, file scope: draft PR 256 plus the uncommitted Lite checkpoint. VERIFIED: secure packaging and real-server dataset isolation gates pass. Blind spot: CLI, MCP, snapshot restore, and hosted networking remain untested.
-- [ ] CITADEL-PORTABLE-2026-08-08-02, owner: implementer, next action: build the image, prove the single-instance startup gate in a container, then run backup and restore, file scope: isolated v0.5 worktree plus deployment assets.
+- [ ] CITADEL-LIFECYCLE-2026-08-09-01, owner: architect, next action: obtain approval for the working v1 lifecycle and retrieval contract, file scope: `docs/interfaces.md`, `plans/roadmap.md`, and Wayfinder tickets 013 and 014. VERIFIED: the current `CognifyJob` stores dataset names and lease state only. It has no source revision, generation identity, or per-backend receipt.
+- [ ] CITADEL-QDRANT-2026-08-09-03, owner: implementer, next action: sync local commits `a0d5c02`, `92ce11a`, and merge commit `f3e92ff` to remote PR 256 after explicit push approval, file scope: `/private/tmp/citadel-v050-qdrant`. VERIFIED: the worktree is clean and four commits ahead of remote head `420be9d`.
+- [ ] CITADEL-QDRANT-2026-08-08-02, owner: reviewer, next action: close the remaining graph aggregation and destructive adapter-path evidence gaps before BLK-2026-08-08-02 can complete. VERIFIED: same-ID count, retrieve, search, and exhaustive scroll stayed dataset-scoped in the local provider receipt.
 
 ## Blocked
-- [ ] BLK-2026-08-08-04, owner: implementer, severity: High, next escalation: add dataset-scoped Qdrant chunk enumeration and enforce the stored chunk budget after cognify. Evidence: real provider flow emitted `stored chunk budget was not measured after cognify: VECTOR_DB_PROVIDER is not pgvector`.
 - [ ] BLK-2026-08-07-01, owner: release, severity: Critical, next escalation: obtain explicit approval to rotate the exposed database credential, then verify old credential rejection and service health. Evidence: `agents/blockers.md`.
 - [ ] BLK-2026-08-08-01, owner: architect, severity: High, next escalation: retire in-place force repair from the production path and replace it with a full shadow generation plus verified cutover. Evidence: `agents/blockers.md` and ticket 005.
 
 ## Next priorities
-- [ ] CITADEL-GOAL-2026-08-08-01, owner: coordinator, exit criteria: active goal names Cognee `1.4.1` and the audited official-adapter patch route while preserving the old-production deletion gate.
-- [x] CITADEL-QDRANT-2026-08-08-07, owner: architect, exit criteria: DEC-2026-08-08-06 records candidate B as working boundary and candidate A as test-triggered fallback.
-- [ ] CITADEL-QDRANT-2026-08-08-04, owner: implementer, exit criteria: `pipx install citadel-archive==0.5.0` plus `citadel deploy local` and the Railway Template boot the same empty build and generation using one image, environment contract, and smoke script.
-- [ ] CITADEL-PORTABLE-2026-08-08-03, owner: implementer, exit criteria: local, Railway Lite, and DigitalOcean Droplet use the same SQLite and Qdrant image contract; crash, migration, backup, restore, and visibility gates pass.
 - [ ] CITADEL-LIFECYCLE-2026-08-08-01, owner: architect, exit criteria: source revision, projection job, per-backend receipt, retrieval hit, and trace contracts are approved before schema implementation.
 - [ ] CITADEL-LIFECYCLE-2026-08-08-02, owner: implementer, exit criteria: accepted source and queued projection work are atomic; second-process fault tests converge with exact per-backend receipts and census.
+- [ ] CITADEL-QDRANT-2026-08-09-03, owner: implementer, exit criteria: remote PR 256 contains the local candidate commits and current-head CI passes.
+- [ ] CITADEL-QDRANT-2026-08-08-04, owner: implementer, exit criteria: `pipx install citadel-archive==0.5.0` plus `citadel deploy local` and the Railway Template boot the same empty build and generation using one image, environment contract, and smoke script.
 - [ ] CITADEL-QDRANT-2026-08-08-05, owner: release, exit criteria: GitHub Central passes source and projection census, then every seat passes zero visibility violations before the next seat import.
 
 ## Daily log
@@ -123,6 +122,17 @@ Current sprint: CITADEL-QDRANT-2026-08-08
 - VERIFIED: removing the Cognee PostgreSQL extra from the candidate lock removed `asyncpg 0.31.0`, `pgvector 0.3.6`, and `psycopg2-binary 2.9.12`. This proves dependency removal only, not SQLite runtime success.
 - HELD: no Railway app deploy, migration, source import, production mutation, service deletion, merge, or release ran. The unused PostgreSQL service in the fresh Railway project remains intact pending separate approval.
 - Next: supply the reviewed Cognee metadata patch, make the plain-pip gate green, then run empty SQLite plus real Qdrant E2E before changing Railway configuration.
+- CORRECTED 2026-08-08: resumed Qdrant census patch testing in `/private/tmp/citadel-v050-qdrant`. `tests/test_cognee_client.py -k 'stored_chunk_budget_check_qdrant'` returned `5 passed`; `tests/test_cognee_client.py tests/test_lite_runtime.py` returned `93 passed`; `ruff` clean on touched files. `tests/test_qdrant_adapter_live.py` and `tests/test_cognee_qdrant_sqlite_live.py` remain skipped without explicit Qdrant/rediscovery env.
+- Next in this thread: build/run the portable Lite image startup and restore sequence, then advance `CITADEL-QDRANT-2026-08-08-02` when real-provider census execution lands.
+- CORRECTED 2026-08-08 (portable start): compose config validates when required env keys from `.env.lite.example` are supplied. `docker compose build` failed on this machine with local builder path permission (`/Users/sarthiborkar/.docker/buildx/activity/...` denied) and legacy cred-helper error `One or more parameters passed to the function were not valid. (-50)`.
+- VERIFIED 2026-08-08 (local task scope): `tests/test_cognee_client.py -k 'stored_chunk_budget_check_qdrant'` and `tests/test_cognee_client.py` + `tests/test_lite_runtime.py` remain green (`5 passed`, `93 passed`) with `ruff` clean. `./.venv/bin/pytest -q tests/test_qdrant_adapter_live.py tests/test_cognee_qdrant_sqlite_live.py` returned `2 skipped` without `CITADEL_QDRANT_LIVE_URL`.
+
+### 2026-08-09
+- Owner: coordinator
+- Completed: local candidate changes were split into `a0d5c02` and `92ce11a`, then PR 254 readiness diagnostics were integrated by merge commit `f3e92ff`. The post-merge full suite returned `1781 passed, 3 skipped, 11 warnings in 32.97s`; Ruff returned `All checks passed!`.
+- In Progress: CITADEL-LIFECYCLE-2026-08-09-01 and CITADEL-QDRANT-2026-08-09-03. Working v1 lifecycle and retrieval contracts are recorded; local PR 256 work remains four commits ahead of the remote branch.
+- Blocked: BLK-2026-08-07-01 and BLK-2026-08-08-01. Railway deploy, push, merge, release, schema migration, and production mutation still require their named gates.
+- Next: approve or revise CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01, then implement the source ledger and projection receipts before rebuilding or deploying the candidate.
 
 ## Key metrics
 CORRECTED: the prior claim of six Node hits was not supported by this session. VERIFIED: `citadel_search` for the architecture query returned zero hits after `exclude_ambient=true`; 14 candidates were fetched and all were filtered out. Blind spot: this filtered top-k search cannot enumerate the vault or prove absence.
@@ -163,3 +173,138 @@ VERIFIED: the real Qdrant authorization probe used server `1.18.1` and client `1
 - [x] Blockers owned. BLK-2026-08-07-01 is recorded in `agents/blockers.md`.
 - [x] Verification recorded. Research evidence remains in the verification reports; checkpoint evidence is recorded above.
 - [x] Handoff written. Resume from `status.md` and `.local-review/wayfinder/citadel-v0-5-release-map.md`.
+
+## 2026-08-09 Citadel v0.5 local runtime gate
+Owner: coordinator
+Status: In Progress
+
+### VERIFIED evidence
+- `./.venv/bin/ruff check .` in `/private/tmp/citadel-v050-qdrant`: `All checks passed!` and exit `0`.
+- Focused version and MCP suite: `72 passed in 2.73s`.
+- Cognee and Lite suite: `94 passed, 10 warnings in 10.90s`.
+- Local deploy suite: `6 passed in 0.14s`.
+- Secure HTTP and status suite: `59 passed in 0.26s`.
+- `citadel deploy local` rebuilt the source image and returned `ok: true`, `created: false`, generation `citadel-local-6e7632d3e6434e34931c49768ad62301`, and authenticated readiness `ok: true`.
+- Authenticated `citadel status --node-url http://localhost:18000 --no-search --no-recent --json` returned `healthy: true`, admin read/write/admin capabilities, and corpus `0 indexed / 0 tracked`.
+- MCP `initialize` returned protocol `2025-06-18`, server `Citadel Archive`, version `0.5.0`.
+- Provider smoke generation `provider-smoke-a271342180424218be6d48ea781dbbe3` used one raw UUID in `seat:alice` and `seat:bob`. Exact count was `1` per dataset. Retrieve, search, and exhaustive scroll returned only the dataset's own payload.
+- Both Citadel and Qdrant containers restarted. Citadel health returned `healthy`; the same provider receipt passed all read checks after restart and again after the v0.5.0 image replacement.
+- SQLite online backup and additive restore returned `integrity: ok` with matching logical SHA-256 `ba62674a3bee014289f53ba5c47b4dd42ac15472cbbf7564bc4ab42df5d2214c`.
+- Qdrant snapshot SHA-256 `56b2819fc4ee04d83f52f093e66235537077ee7b121908e80f718831c119d942` restored `2` exact rows into additive collection `citadel_g_f838a38a96db_DocumentChunk_4a0474601d-restore-c1ec593d`.
+
+### Blind spots and next action
+- Search was not probed through `citadel status`; provider search was verified directly through `CitadelQdrantAdapter`.
+- The isolated worktree lacks the local pre-push hook. This does not measure container health.
+- LLM-backed ingest, cognify, and user-facing search were not run. Runtime uses placeholder `LLM_API_KEY=local-no-model-call-key`; an external model call needs explicit approval and a valid configured key.
+- Next: release owner runs one authenticated ingest, cognify, and search gate after user approval, then records release readiness. No Railway deploy, merge, production mutation, or data deletion is approved.
+
+## 2026-08-09 Citadel v0.5 release acceptance attempt
+Owner: release
+Status: In Progress
+
+### VERIFIED evidence
+- Interactive shell exposes `OPENROUTER_API_KEY`; its value was not printed or written to tracked files.
+- Disposable Citadel service was recreated with that value mapped to `LLM_API_KEY`; SQLite and Qdrant volumes were preserved.
+- Container identity returned Citadel `0.5.0`; authenticated CLI status returned `healthy: true` with admin read/write/admin capabilities.
+- Provider identity: `LLM_PROVIDER=custom`, `LLM_ENDPOINT=https://openrouter.ai/api/v1`, `LLM_MODEL=openrouter/deepseek/deepseek-v4-flash`, `EMBEDDING_PROVIDER=fastembed`, `EMBEDDING_MODEL=BAAI/bge-small-en-v1.5`, dimensions `384`.
+- OpenRouter models endpoint returned HTTP `200` in `158 ms` from the container. Network reachability is verified only for that endpoint.
+- Key-shape check returned `openrouter_prefix: false` and `minimum_length: false`; the configured value does not match the expected OpenRouter key shape. This check does not reveal the key.
+- Approved authenticated ingest with inline cognify returned exit `1`, HTTP `500`: `LLM connection test timed out after 30s. Check that your LLM endpoint is reachable and responding.`
+- Post-failure status returned `0 indexed / 0 tracked`. Exact-marker search returned `max_term_coverage: 0.0` and `no_lexical_match: true`; the one nearest-vector result had empty text and did not prove ingestion.
+
+### Release handoff
+Task ID: CITADEL-V050-ACCEPTANCE
+From owner: release
+To owner: release
+Status: In Progress
+Scope: disposable local Citadel Lite runtime only
+Files changed: `status.md`
+Interfaces changed: None
+Decisions recorded: None
+Verification command and result: authenticated `citadel ingest ... --json` returned HTTP `500`; acceptance did not pass
+Known blockers: valid OpenRouter API key is not available to the runtime
+Next action: replace the interactive shell `OPENROUTER_API_KEY` with a valid `sk-or-v1-...` key, then recreate only the Citadel service and rerun one unique-marker ingest, cognify, and exact search
+
+### 2026-08-09 release acceptance continuation
+- Owner: release
+- Status: In Progress
+- VERIFIED: interactive-shell `OPENROUTER_API_KEY` remains present but fails both expected-shape checks: `openrouter_prefix: false`, `minimum_length: false`.
+- VERIFIED: assignment source is `/Users/sarthiborkar/.zshrc:145`; assignment value was not printed or copied.
+- Next: owner updates that shell assignment with a valid OpenRouter key and replies `ready`; release reruns the bounded local acceptance gate.
+
+### 2026-08-09 release acceptance blocked
+- Owner: release
+- Status: Blocked
+- VERIFIED: third consecutive interactive-shell check returned `present: true`, `openrouter_prefix: false`, `minimum_length: false`.
+- Blocking condition: `/Users/sarthiborkar/.zshrc:145` does not provide a valid OpenRouter credential, so authenticated model-backed cognify cannot be verified.
+- Resume condition: owner installs a valid `sk-or-v1-...` key at that assignment, runs `source ~/.zshrc`, and replies `ready`.
+
+## Release acceptance handoff: 2026-08-09
+
+Owner: release
+Status: Completed
+Scope: Local Citadel v0.5 acceptance and approved Railway credential copy. No deployment was performed.
+
+### Completed
+
+- VERIFIED: Copied only `LLM_API_KEY` and `OPENROUTER_API_KEY` from Railway project `Citadel`, service `Citadel-Archive`, production environment, to project `Citadel (qdrant)`, service `@citadel/web`, production environment. Railway CLI used `variables --skip-deploys`.
+- VERIFIED: Source and target comparisons returned `LLM_API_KEY_equal=true` and `OPENROUTER_API_KEY_equal=true`. Both target values returned `present=true` and `openrouter_shape=true`. Secret values were not printed or written to this file.
+- VERIFIED: Target deployment remained `36d65cbf-3699-4ba8-bedf-daffb9002e4a`, status `FAILED`, created `2026-08-08T07:12:40.667Z`, stopped `true`. The credential copy did not trigger a deployment.
+- VERIFIED: Fixed Cognee 1.4.1 embedding probe construction without weakening Qdrant data-operation dataset enforcement. Command result: `21 passed, 10 warnings in 22.31s`.
+- VERIFIED: Fixed Cognee 1.4.1 access-controlled CHUNKS response handling. Citadel now unwraps dataset envelopes and preserves nested chunk payload text. Command `uv run pytest -q tests/test_cognee_client.py` returned `90 passed, 10 warnings in 13.58s`.
+- VERIFIED: Command `uv run ruff check .` returned `All checks passed!`.
+- VERIFIED: No-cache local image build completed. Image manifest list: `sha256:1b6f6c7400f0ac66d0271c595a988e11837ee8a701567f11244953f99ec54d12`. Docker Compose reported both `citadel-lite-qdrant-1` and `citadel-lite-citadel-1` healthy.
+- VERIFIED: Authenticated ingest accepted marker `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360` in dataset `masumi-network`. Add pipeline run `b82739f7-60f3-4d6f-abb3-879711771f01` completed with data ID `d8f127ff-f5fa-55ad-983c-04ee92849a96`.
+- VERIFIED: Background cognify pipeline `4f6042fe-0441-5c0c-9423-98cfb6533d84` completed. Runtime log recorded `background cognify finished for datasets ('masumi-network',)`.
+- VERIFIED: Authenticated `POST http://localhost:18000/search` returned one result whose `text` contains the full marker. Result ID: `cfc5a400-7ee9-56db-8688-632f4e85bcb4`. The returned text was `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360. Citadel Lite release acceptance verifies authenticated HTTP ingestion, synchronous Cognee cognify through OpenRouter, FastEmbed vector indexing, and exact marker retrieval from the dataset-isolated Qdrant provider.`
+
+### Files changed
+
+- VERIFIED: `/private/tmp/citadel-v050-qdrant/kb/qdrant_adapter.py` allows Cognee's unbound embedding probe while data operations remain fail-closed without a dataset.
+- VERIFIED: `/private/tmp/citadel-v050-qdrant/tests/test_qdrant_adapter.py` covers the embedding probe and fail-closed data operation invariant.
+- VERIFIED: `/private/tmp/citadel-v050-qdrant/kb/cognee_client.py` unwraps Cognee 1.4.1 dataset-scoped search envelopes.
+- VERIFIED: `/private/tmp/citadel-v050-qdrant/tests/test_cognee_client.py` covers marker text preservation through the wrapper.
+
+### Files intentionally not touched
+
+- VERIFIED: No production database or Qdrant data was changed.
+- VERIFIED: No Railway deployment, restart, merge, publish, or data deletion was performed.
+- VERIFIED: No Railway variables other than `LLM_API_KEY` and `OPENROUTER_API_KEY` were copied.
+
+### Residual risk and next action
+
+- VERIFIED: Before the final search fix, the status endpoint reported corpus counts as null and indexes as `warming`, while direct ingest, cognify, indexing, and exact retrieval succeeded. This status behavior was not remeasured after the final fix and remains a separate follow-up.
+- Planned: Owner `release`. Review this handoff, then obtain explicit user approval before any Railway deployment.
+
+## GitHub direction and issue sync: 2026-08-09
+
+Owner: coordinator
+Status: Completed
+
+- [VERIFIED] GitHub `main` and the public production discovery build both report `cc8fc026297b64f39f387b96e30da63f77ad57fb`, version `0.4.1`.
+- [VERIFIED] Final tracker snapshot: 87 issues with 19 open and 68 closed; 171 pull requests with 15 open, 6 closed without merge, and 150 merged.
+- [VERIFIED] Focused sync posted 17 issue comments and 7 pull request comments. Issues 122 and 248 were closed as completed. PR 251 was closed as superseded.
+- [VERIFIED] Correction comments on issues 128 and 247, plus PR 256, record newer local evidence: Qdrant Lite acceptance passed in the private worktree, but the final adapter and client fixes are absent from remote PR 256 head `420be9de5e5105a45515cc1e849b9b3a5b8a1417`.
+- [VERIFIED] Exhaustive snapshot and active dispositions are indexed in `.local-review/GITHUB_INDEX.md`.
+- [PLANNED] Owner `release`. Port the final local fixes to PR 256, rerun focused tests and current-head CI, verify readiness status, then run hosted and comparable retrieval gates.
+- [VERIFIED] No merge, tag, release, production deployment, restart, or data deletion was performed during this GitHub sync.
+
+## PR 256 takeover review: 2026-08-09
+
+Owner: reviewer
+Status: In Progress
+
+- [VERIFIED] Reviewed the release handoff, current contracts, roadmap, draft PR 256, and the private worktree at `/private/tmp/citadel-v050-qdrant`.
+- [VERIFIED] The worktree is on `agent/citadel-v050-qdrant` at remote head `420be9de5e5105a45515cc1e849b9b3a5b8a1417`. It has 10 modified tracked files and 13 untracked paths.
+- [VERIFIED] Correction: the handoff's four paths describe the final embedding-probe and nested-result fixes. They do not enumerate the full dirty worktree, which also contains Qdrant census, Lite runtime, Compose, local deploy CLI, status transport, version, smoke, and test work.
+- [VERIFIED] `uv run pytest -q tests/test_qdrant_adapter.py tests/test_cognee_client.py` returned `111 passed, 10 warnings in 11.29s`.
+- [VERIFIED] `uv run pytest -q tests/test_lite_runtime.py tests/test_local_deploy.py tests/test_status.py tests/test_version_identity.py` returned `63 passed, 10 warnings in 5.12s`.
+- [VERIFIED] `uv run pytest tests/ -q` returned `1779 passed, 3 skipped, 11 warnings in 34.67s`. The three skipped tests mean this command did not repeat every live-provider gate.
+- [VERIFIED] `uv run ruff check .` returned `All checks passed!`. `git diff --check HEAD` returned exit `0`.
+- [VERIFIED] `uv build --wheel --sdist` built `citadel_archive-0.5.0` artifacts. The wheel contains `kb/lite_runtime.py`, `kb/local_deploy.py`, and `kb/deploy_assets/docker-compose.yml`.
+- [VERIFIED] Docker reports `citadel-lite-citadel-1` healthy and `citadel-lite-qdrant-1` running. This readback does not repeat ingest, cognify, or retrieval.
+- [VERIFIED] Draft PR 256 remains open, review-required, and blocked at remote head `420be9de5e5105a45515cc1e849b9b3a5b8a1417`. Its 18 remote checks attest only that head.
+- [VERIFIED] Contract state has not caught up with the implementation: `docs/interfaces.md` still marks self-host and Qdrant interfaces `Planned`; `plans/roadmap.md` keeps lifecycle Milestone 1B and portable package Milestone 2 `Planned`; ticket 016 is blocked by the unfinished lifecycle task.
+- [INFERRED] Stop decision: do not commit the full dirty worktree as one PR 256 update until the owner chooses whether to split the final adapter fix from deploy work or accepts a combined branch and updates the contract dependency state.
+- [PLANNED] Owner `coordinator`. Recommended route: keep PR 256 focused on the adapter and Cognee compatibility fixes, preserve the deploy WIP in this worktree, then open a separate branch after lifecycle contract approval.
+- [VERIFIED] No source file, commit, remote branch, pull request, deployment, production service, volume, or data was changed during this takeover review.
