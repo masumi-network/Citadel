@@ -11,7 +11,17 @@ from typing import Any
 
 import pytest
 
-from kb.cli import _activity, _doctor, _ingest, _search, _token_set, _update, _wizard_roots
+from kb.cli import (
+    _activity,
+    _doctor,
+    _ingest,
+    _operation,
+    _search,
+    _token_set,
+    _update,
+    _wizard_roots,
+    build_parser,
+)
 from kb.status import Check, StatusReport
 
 
@@ -188,6 +198,24 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     assert out["results"][0]["text"] == "hello vault"
     assert out["results"][0]["snippet"] == "hello vault"
     assert out["ok"] is True
+
+
+def test_operation_command_fetches_projection_receipts(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    payload = {
+        "projection_job_id": "job-1",
+        "state": "searchable",
+        "receipts": [{"backend": "vector", "state": "searchable"}],
+    }
+    monkeypatch.setattr("kb.status.fetch_operation", lambda *args, **kwargs: payload)
+    args = build_parser().parse_args(
+        ["operation", "job-1", "--node-url", "https://node.example", "--json"]
+    )
+
+    rc = asyncio.run(_operation(args))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def _search_args(**kw):

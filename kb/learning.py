@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Mapping
+from datetime import datetime
 import logging
 from typing import Any, Literal
 
@@ -86,6 +87,12 @@ class LearningProcess:
         detect_conflicts: bool = True,
         tier: Literal["full", "light", "shared"] = "full",
         defer_cognify: bool = False,
+        source_key: str | None = None,
+        source_locator: str | None = None,
+        media_type: str = "text/plain",
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
     ) -> LearningOutcome:
         """Filter, optionally enrich/chunk, ingest, record mesh activity,
         detect conflicts, and optionally run improvement for one piece of
@@ -126,7 +133,7 @@ class LearningProcess:
         chunk_inputs = self._chunk_inputs(data, list(tags or []), enrichment)
 
         results: list[IngestResult] = []
-        for chunk_data, chunk_tags in chunk_inputs:
+        for chunk_index, (chunk_data, chunk_tags) in enumerate(chunk_inputs):
             try:
                 ingest_kwargs: dict[str, Any] = {
                     "dataset": dataset,
@@ -136,6 +143,22 @@ class LearningProcess:
                 }
                 if attestation is not None:
                     ingest_kwargs["attestation"] = attestation
+                if source_key is not None:
+                    ingest_kwargs["source_key"] = (
+                        source_key
+                        if len(chunk_inputs) == 1
+                        else f"{source_key}:chunk:{chunk_index}"
+                    )
+                if source_locator is not None:
+                    ingest_kwargs["source_locator"] = source_locator
+                if media_type != "text/plain":
+                    ingest_kwargs["media_type"] = media_type
+                if capture_actor_id is not None:
+                    ingest_kwargs["capture_actor_id"] = capture_actor_id
+                if capture_run_id is not None:
+                    ingest_kwargs["capture_run_id"] = capture_run_id
+                if captured_at is not None:
+                    ingest_kwargs["captured_at"] = captured_at
                 result = await self.citadel.ingest(chunk_data, **ingest_kwargs)
             except Exception as exc:
                 if self.mesh:

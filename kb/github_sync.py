@@ -372,6 +372,11 @@ class GitHubOrgSyncer:
                 dataset=self.config.github_sync_dataset,
                 session_id=self.config.github_sync_session,
                 tags=["github", self.org, "daily-sync", "repository-activity"],
+                source_key=f"github:{self.org}:daily-digest",
+                source_locator=f"https://github.com/{self.org}",
+                media_type="text/markdown",
+                capture_actor_id="github-sync",
+                capture_run_id=checked_at,
                 run_improve=self.run_improve,
                 detect_conflicts=False,
             )

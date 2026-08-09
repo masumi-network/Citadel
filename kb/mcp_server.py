@@ -217,6 +217,17 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             openWorldHint=True,
         ),
     ),
+    "citadel_operation": ToolPolicy(
+        role="reader",
+        scope="kb:read",
+        risk="read",
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    ),
     "citadel_list_sources": ToolPolicy(
         role="reader",
         scope="sources:read",
@@ -1143,6 +1154,21 @@ def create_mcp_server(
             lambda: resolve_client(ctx).get(
                 f"/api/documents/{quote(normalized_id, safe='')}",
                 tool_name="citadel_get_document",
+            ),
+        )
+
+    @mcp.tool(annotations=TOOL_POLICIES["citadel_operation"].annotations)
+    async def citadel_operation(
+        projection_job_id: str,
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """Fetch one bounded source-to-provider lifecycle operation."""
+        normalized_id = _require_non_empty(projection_job_id, "projection_job_id")
+        return await _call_async(
+            "citadel_operation",
+            lambda: resolve_client(ctx).get(
+                f"/api/operations/{quote(normalized_id, safe='')}",
+                tool_name="citadel_operation",
             ),
         )
 

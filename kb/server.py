@@ -60,6 +60,7 @@ from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
+from kb.lifecycle import LifecycleNotFoundError
 from kb.session_trace import enrich_shared_trace, force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
@@ -487,8 +488,22 @@ def _start_cognify_queue() -> None:
         resume()
 
 
+def _start_lifecycle_queue() -> None:
+    resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
+    if callable(resume):
+        resume()
+
+
 async def _stop_cognify_queue() -> None:
     stop = getattr(getattr(get_citadel(), "cognee", None), "stop_cognify_queue", None)
+    if callable(stop):
+        result = stop()
+        if isawaitable(result):
+            _ = await result
+
+
+async def _stop_lifecycle_queue() -> None:
+    stop = getattr(get_citadel(), "stop_lifecycle_queue", None)
     if callable(stop):
         result = stop()
         if isawaitable(result):
@@ -546,11 +561,13 @@ async def lifespan(app: FastAPI) -> Any:
                 "may still fail every search (#147)"
             )
         _start_cognify_queue()
+        _start_lifecycle_queue()
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
             yield
         finally:
+            await _stop_lifecycle_queue()
             await _stop_cognify_queue()
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
@@ -2139,6 +2156,11 @@ async def execute_learning_writes(
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
+    source_key: str | None = None,
+    source_locator: str | None = None,
+    media_type: str = "text/plain",
+    capture_actor_id: str | None = None,
+    capture_run_id: str | None = None,
 ) -> tuple[LearningOutcome, list[LearningOutcome]]:
     outcomes: list[LearningOutcome] = []
     primary: LearningOutcome | None = None
@@ -2153,6 +2175,16 @@ async def execute_learning_writes(
             "tier": target.tier,
             "defer_cognify": defer_cognify,
         }
+        if source_key is not None:
+            learn_kwargs["source_key"] = source_key
+        if source_locator is not None:
+            learn_kwargs["source_locator"] = source_locator
+        if media_type != "text/plain":
+            learn_kwargs["media_type"] = media_type
+        if capture_actor_id is not None:
+            learn_kwargs["capture_actor_id"] = capture_actor_id
+        if capture_run_id is not None:
+            learn_kwargs["capture_run_id"] = capture_run_id
         if attestation is not None:
             learn_kwargs["attestation"] = attestation
         outcome = await learning.learn(data, **learn_kwargs)
@@ -2802,6 +2834,9 @@ def with_result_metadata(
     """
     if not isinstance(result, dict):
         return result
+    lifecycle = result.get("_lifecycle")
+    if isinstance(lifecycle, dict):
+        result = {key: value for key, value in result.items() if key != "_lifecycle"}
     # Set when this hit is the Node-side copy of a volunteered session trace that
     # won dedup against the shared one (search_across_datasets). Strip it before
     # hashing so the content hash stays stable across both copies.
@@ -2833,6 +2868,23 @@ def with_result_metadata(
             "document_drilldown_available": drilldown_available,
         },
     }
+    if isinstance(lifecycle, dict):
+        source_revision_id = first_string(lifecycle.get("source_revision_id"))
+        projection_receipt_id = first_string(lifecycle.get("projection_receipt_id"))
+        if source_revision_id and projection_receipt_id:
+            metadata["source_revision_id"] = source_revision_id
+            metadata["projection_receipt_id"] = projection_receipt_id
+            metadata["projection"] = {
+                key: lifecycle[key]
+                for key in (
+                    "generation_id",
+                    "backend",
+                    "provider",
+                    "projection_version",
+                    "state",
+                )
+                if key in lifecycle
+            }
     if drilldown_available:
         metadata["document_endpoint"] = document_endpoint
     if query is not None:
@@ -4285,6 +4337,57 @@ async def healthz() -> dict[str, str | bool]:
     return {"ok": True, "service": "citadel"}
 
 
+def lifecycle_health(citadel: Any) -> dict[str, Any]:
+    """Return a no-content lifecycle census plus relational invariant checks."""
+    if not citadel.config.lifecycle_enabled:
+        return {"enabled": False, "ok": True}
+    try:
+        census = citadel.lifecycle_census()
+    except Exception as exc:  # noqa: BLE001 - readiness reports typed failure
+        return {
+            "enabled": True,
+            "ok": False,
+            "error_type": exc.__class__.__name__,
+        }
+    source_revisions = int(census.get("source_revisions", 0))
+    projection_jobs = int(census.get("projection_jobs", 0))
+    projection_receipts = int(census.get("projection_receipts", 0))
+    failed_jobs = int((census.get("job_states") or {}).get("failed", 0))
+    failed_receipts = int((census.get("receipt_states") or {}).get("failed", 0))
+    invariant_errors: list[str] = []
+    if projection_jobs < source_revisions:
+        invariant_errors.append("source_revision_without_projection_job")
+    if projection_receipts != projection_jobs * 3:
+        invariant_errors.append("projection_receipt_census_mismatch")
+    current_generation = census.get("current_generation")
+    if isinstance(current_generation, dict):
+        current_sources = int(current_generation.get("current_sources", 0))
+        current_jobs = int(
+            current_generation.get("current_projection_jobs", 0)
+        )
+        current_receipts = int(
+            current_generation.get("current_projection_receipts", 0)
+        )
+        if current_jobs != current_sources:
+            invariant_errors.append("current_generation_job_census_mismatch")
+        if current_receipts != current_jobs * 3:
+            invariant_errors.append("current_generation_receipt_census_mismatch")
+        receipts_by_backend = current_generation.get("current_receipts_by_backend")
+        if not isinstance(receipts_by_backend, dict) or any(
+            int(receipts_by_backend.get(backend, 0)) != current_jobs
+            for backend in ("relational", "vector", "graph")
+        ):
+            invariant_errors.append("current_generation_backend_census_mismatch")
+    if failed_jobs or failed_receipts:
+        invariant_errors.append("failed_projection")
+    return {
+        "enabled": True,
+        "ok": not invariant_errors,
+        **census,
+        "invariant_errors": invariant_errors,
+    }
+
+
 @app.get("/api/state")
 async def public_state(request: Request, response: Response) -> dict[str, Any]:
     """Public, no-secrets snapshot for the /info page — safe aggregates only.
@@ -4359,6 +4462,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         }
 
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
+    lifecycle = lifecycle_health(get_citadel())
     return {
         "ok": True,
         "service": "Citadel Archive",
@@ -4372,6 +4476,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             "github_repositories": int(gh.get("tracked_repositories", 0) or 0) if gh else 0,
             "linear_issues": int(ln.get("issue_count", 0) or 0) if ln else 0,
         },
+        "lifecycle": lifecycle,
         "repo": repo_block,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -4698,8 +4803,13 @@ async def readyz(request: Request) -> Any:
     config = get_citadel().config
     corpus = await _corpus_health()
     canary = _LAST_CANARY
+    lifecycle = lifecycle_health(get_citadel())
     # RED when the corpus gate trips or the last end-to-end canary failed.
-    ok = corpus["ok"] and (canary is None or bool(canary.get("ok", True)))
+    ok = (
+        corpus["ok"]
+        and lifecycle["ok"]
+        and (canary is None or bool(canary.get("ok", True)))
+    )
     payload = {
         "ok": ok,
         "service": "citadel",
@@ -4708,6 +4818,7 @@ async def readyz(request: Request) -> Any:
         "auto_improve": config.auto_improve,
         "build_global_context_index": config.build_global_context_index,
         "corpus": corpus,
+        "lifecycle": lifecycle,
         "canary": canary,
     }
     return JSONResponse(payload, status_code=200 if ok else 503)
@@ -5486,6 +5597,11 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
                 tags=document_tags,
                 session_id=push_session_id,
                 operation="obsidian_sync",
+                source_key=f"obsidian:{body.vault_id}:{accepted['path']}",
+                source_locator=f"obsidian://{body.vault_id}/{accepted['path']}",
+                media_type="text/markdown",
+                capture_actor_id=actor.actor_id,
+                capture_run_id=push_session_id,
                 detect_conflicts=False,
             )
         except SecretContentError as exc:
@@ -6367,6 +6483,8 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             tags=body.tags,
             session_id=session_id,
             operation="ingest",
+            capture_actor_id=actor.actor_id,
+            capture_run_id=session_id,
         )
     except SecretContentError as exc:
         get_access_store().record_event(
@@ -6446,12 +6564,33 @@ async def ingest(body: IngestBody, request: Request) -> Any:
     # The write already succeeded; a cognify failure must NOT fail the ingest.
     if body.cognify and result.accepted:
         try:
-            await citadel.cognify_dataset(dataset=outcome.dataset)
-            payload["cognified"] = True
+            if result.projection_job_id:
+                operation = await citadel.wait_for_lifecycle_operation(
+                    result.projection_job_id
+                )
+                payload["projection_state"] = operation["state"]
+                payload["cognified"] = operation["state"] == "searchable"
+            else:
+                await citadel.cognify_dataset(dataset=outcome.dataset)
+                payload["cognified"] = True
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee state
             logger.error("inline cognify after ingest failed: %s", exc.__class__.__name__)
             payload["cognified"] = False
     return payload
+
+
+@app.get("/api/operations/{projection_job_id}")
+async def projection_operation(projection_job_id: str, request: Request) -> Any:
+    identity = require_access(request, "reader", "kb:read")
+    try:
+        payload = get_citadel().lifecycle_operation(projection_job_id)
+    except (LifecycleNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail="Projection operation not found.") from exc
+    dataset = payload.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise HTTPException(status_code=500, detail="Projection operation has no dataset.")
+    enforce_dataset_allowlist(identity, dataset)
+    return jsonable_encoder(payload)
 
 
 @app.post("/api/share-session")
@@ -6495,6 +6634,8 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             tags=tags,
             session_id=session_id,
             operation="share_session",
+            capture_actor_id=actor.actor_id,
+            capture_run_id=session_id,
             detect_conflicts=False,
             defer_cognify=True,
         )
@@ -6582,11 +6723,17 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         if item.ingest.accepted
     ]
     cognify_queued = False
-    if cognify_datasets:
+    lifecycle_queued = bool(
+        cognify_datasets and getattr(citadel, "lifecycle_store", None) is not None
+    )
+    if cognify_datasets and not lifecycle_queued:
         cognify_queued = citadel.cognee.schedule_cognify(
             list(dict.fromkeys(cognify_datasets))
         )
-    cognify_state = "deferred" if cognify_queued else "not_scheduled"
+    if lifecycle_queued:
+        cognify_state = "queued_not_confirmed"
+    else:
+        cognify_state = "deferred" if cognify_queued else "not_scheduled"
 
     record_mcp_audit(
         request,
@@ -6620,7 +6767,9 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "write_targets": [target.dataset for target in write_targets],
             "cognify": cognify_state,
             "message": (
-                "Shared Session Trace accepted; searchable after coalesced cognify."
+                "Shared Session Trace accepted; lifecycle projection queued."
+                if lifecycle_queued
+                else "Shared Session Trace accepted; searchable after coalesced cognify."
                 if cognify_queued
                 else "Shared Session Trace accepted, but indexing was not scheduled."
             ),
@@ -6718,6 +6867,18 @@ async def contribute(body: ContributeBody, request: Request) -> Any:
             tags=contribution_tags,
             session_id=None,
             operation="contribute",
+            source_key=(
+                f"contribution:{body.source_url.strip()}"
+                if body.source_url and body.source_url.strip()
+                else None
+            ),
+            source_locator=(
+                body.source_url.strip()
+                if body.source_url and body.source_url.strip()
+                else None
+            ),
+            media_type="text/markdown",
+            capture_actor_id=actor.actor_id,
             run_improve=citadel.config.contribute_run_improve,
         )
     except SecretContentError as exc:

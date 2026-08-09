@@ -490,6 +490,23 @@ def ingest_node(
     )
 
 
+def fetch_operation(
+    base_url: str,
+    token: str,
+    projection_job_id: str,
+    *,
+    timeout: float = _TIMEOUT,
+) -> dict[str, Any]:
+    """Fetch one lifecycle operation from the authenticated Node."""
+    encoded_id = urllib.parse.quote(projection_job_id, safe="")
+    return _request(
+        "GET",
+        f"{base_url.rstrip('/')}/api/operations/{encoded_id}",
+        token=token,
+        timeout=timeout,
+    )
+
+
 _COGNIFY_TIMEOUT = 180.0  # /ingest cognifies inline; give the combined call room
 
 

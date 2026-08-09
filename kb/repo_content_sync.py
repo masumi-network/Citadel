@@ -816,6 +816,49 @@ class RepoContentSyncer:
                         continue
 
                     previous = tracked.get(key) if isinstance(tracked.get(key), dict) else {}
+                    same_source = (
+                        not force
+                        and previous.get("sha") == file.sha
+                        and previous.get("content_hash") == file.content_hash
+                    )
+                    projection_job_ids = previous.get("projection_job_ids")
+                    lifecycle_operation = getattr(
+                        self.citadel,
+                        "lifecycle_operation",
+                        None,
+                    )
+                    if (
+                        same_source
+                        and isinstance(projection_job_ids, list)
+                        and projection_job_ids
+                        and callable(lifecycle_operation)
+                    ):
+                        try:
+                            operations = [
+                                lifecycle_operation(str(job_id))
+                                for job_id in projection_job_ids
+                            ]
+                        except Exception:  # noqa: BLE001 - retry source path below
+                            operations = []
+                        states = {
+                            str(operation.get("state"))
+                            for operation in operations
+                            if isinstance(operation, dict)
+                        }
+                        if operations and states == {"searchable"}:
+                            previous["projection_status"] = "searchable"
+                            previous["cognee_data_ids"] = [
+                                str(operation["source_revision_id"])
+                                for operation in operations
+                            ]
+                            tracked[key] = previous
+                            _checkpoint(tracked)
+                        elif operations and states <= {"pending", "running", "completed"}:
+                            resume = getattr(self.citadel, "resume_lifecycle_queue", None)
+                            if callable(resume):
+                                resume()
+                            _record_skip(repo_result, "projection_pending")
+                            continue
                     # An entry must also carry the id cognee assigned. Without
                     # it, "unchanged" only means "we told ourselves we ingested
                     # this", which is exactly how 12 files stayed permanently
@@ -964,6 +1007,15 @@ class RepoContentSyncer:
                             full_name.split("/")[-1],
                             Path(path).suffix.lstrip(".") or "text",
                         ],
+                        source_key=f"github:{full_name}:path:{path}",
+                        source_locator=file.html_url,
+                        media_type=(
+                            "text/markdown"
+                            if Path(path).suffix.lower() in {".md", ".mdx"}
+                            else "text/plain"
+                        ),
+                        capture_actor_id="github-repo-content-sync",
+                        capture_run_id=checked_at,
                         operation="repo_content_sync",
                         # Improve ONCE after the whole sync, not per file. See
                         # LearningProcess.improve_once for why.
@@ -997,6 +1049,20 @@ class RepoContentSyncer:
                             # unchanged before indexing is confirmed.
                             tracked_entry["projection_status"] = "pending"
                             tracked_entry["projection_reason"] = "+".join(pending_reasons)
+                            projection_ids = [
+                                result.projection_job_id
+                                for result in accepted_results
+                                if result.projection_job_id
+                            ]
+                            source_revision_ids = [
+                                result.source_revision_id
+                                for result in accepted_results
+                                if result.source_revision_id
+                            ]
+                            if projection_ids:
+                                tracked_entry["projection_job_ids"] = projection_ids
+                            if source_revision_ids:
+                                tracked_entry["source_revision_ids"] = source_revision_ids
                         else:
                             # What cognee actually assigned. Stored so a later
                             # run can check its own claim against the index; a

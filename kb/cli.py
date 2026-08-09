@@ -413,6 +413,54 @@ async def _ingest(args: argparse.Namespace) -> int:
     return 0 if (accepted or duplicate) else 1
 
 
+async def _operation(args: argparse.Namespace) -> int:
+    """Read one source-to-provider lifecycle operation from the Node."""
+    token = capture_token()
+    if not token:
+        return _emit_no_token("operation", as_json=getattr(args, "json", False))
+    from kb.status import fetch_operation
+
+    as_json = getattr(args, "json", False)
+    try:
+        result = await asyncio.to_thread(
+            fetch_operation,
+            node_base_url(getattr(args, "node_url", None)),
+            token,
+            args.projection_job_id,
+        )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        if not as_json:
+            _print_auth_hint("operation", exc.code)
+        return _emit_error(
+            "operation",
+            f"HTTP {exc.code} {detail}",
+            as_json=as_json,
+            code="HTTP_ERROR",
+            extra={"http_status": exc.code},
+        )
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        return _emit_error(
+            "operation",
+            str(exc),
+            as_json=as_json,
+            code="NODE_UNREACHABLE",
+        )
+    if as_json:
+        _print_json(result)
+        return 0
+    print(f"Operation {result.get('projection_job_id', args.projection_job_id)}")
+    print(f"State: {result.get('state', 'unknown')}")
+    for receipt in result.get("receipts", []):
+        if isinstance(receipt, dict):
+            print(
+                f"  {receipt.get('backend', 'unknown')}: "
+                f"{receipt.get('state', 'unknown')} "
+                f"({receipt.get('provider', 'unknown')})"
+            )
+    return 0
+
+
 @_needs_server
 async def _ingest_local(args: argparse.Namespace) -> int:
     from kb.service import Citadel
@@ -3163,6 +3211,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--dataset", help="(--local only) dataset to write to")
     ingest.add_argument("--session", help="(--local only) session id")
     ingest.set_defaults(handler=_ingest)
+
+    operation = subcommands.add_parser(
+        "operation",
+        help="Show durable source and per-backend projection status",
+    )
+    operation.add_argument("projection_job_id", help="Projection job id returned by ingest")
+    operation.add_argument("--json", action="store_true", help="Machine-readable output")
+    operation.add_argument("--node-url", help="Override Node URL")
+    operation.set_defaults(handler=_operation)
 
     search = subcommands.add_parser("search", help="Search the Organization Vault (via the Node)")
     search.add_argument("query", help="Search query")

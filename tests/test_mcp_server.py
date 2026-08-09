@@ -103,6 +103,23 @@ def test_record_feedback_does_not_require_qa_id() -> None:
     assert "qa_id" in schema["properties"]
 
 
+def test_operation_tool_fetches_bounded_lifecycle_status() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(server, "citadel_operation", "job/1", None)
+
+    assert result["path"] == "/api/operations/job%2F1"
+    assert result["tool_name"] == "citadel_operation"
+    assert client.gets == [
+        {
+            "path": "/api/operations/job%2F1",
+            "tool_name": "citadel_operation",
+            "extra_headers": {},
+        }
+    ]
+
+
 def test_mcp_server_reports_the_citadel_package_version() -> None:
     server = create_mcp_server(FakeHttpClient())
 

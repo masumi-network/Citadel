@@ -374,6 +374,7 @@ class CogneeGateway(Protocol):
         tags: tuple[str, ...] = (),
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        data_id: str | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -656,24 +657,39 @@ class CogneePublicClient:
         db_engine = get_relational_engine()
         await db_engine.create_database()
 
-    def _data_with_metadata(self, data: Any, metadata: dict[str, Any] | None) -> Any:
-        if not metadata:
+    def _data_with_metadata(
+        self,
+        data: Any,
+        metadata: dict[str, Any] | None,
+        data_id: str | None = None,
+    ) -> Any:
+        if not metadata and data_id is None:
             return data
         try:
             from cognee.tasks.ingestion.data_item import DataItem
         except Exception:
             return data
 
+        explicit_data_id = UUID(data_id) if data_id is not None else None
+        if explicit_data_id is not None and isinstance(data, list):
+            raise ValueError("one explicit lifecycle data_id cannot identify a list payload")
+
         def attach(item: Any) -> Any:
             if isinstance(item, DataItem):
-                merged = {**(item.external_metadata or {}), **metadata}
+                merged = {**(item.external_metadata or {}), **(metadata or {})}
                 return DataItem(
                     data=item.data,
                     label=item.label,
                     external_metadata=merged,
-                    data_id=item.data_id,
+                    data_id=explicit_data_id or item.data_id,
                 )
-            return DataItem(data=item, external_metadata=metadata)
+            kwargs: dict[str, Any] = {
+                "data": item,
+                "external_metadata": metadata,
+            }
+            if explicit_data_id is not None:
+                kwargs["data_id"] = explicit_data_id
+            return DataItem(**kwargs)
 
         if isinstance(data, list):
             return [attach(item) for item in data]
@@ -707,6 +723,7 @@ class CogneePublicClient:
         tags: tuple[str, ...] = (),
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        data_id: str | None = None,
     ) -> Any:
         self._prepare_cognee_environment()
         import cognee
@@ -737,7 +754,7 @@ class CogneePublicClient:
         # scaffolded "Session ID:/Question:/Answer:" blob every sync cycle.
         # session_id is still accepted (callers pass it as provenance) but no
         # longer diverts the write away from the durable path.
-        data = self._data_with_metadata(data, metadata or None)
+        data = self._data_with_metadata(data, metadata or None, data_id)
 
         # Add is a fast write to Cognee's relational/source stores; it does NOT
         # create chunks, embeddings, or a graph projection. It still opens the

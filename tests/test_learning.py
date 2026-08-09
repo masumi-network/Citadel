@@ -70,6 +70,31 @@ async def test_learn_ingests_and_records_mesh_activity(tmp_path: Path) -> None:
     assert snapshot["events"][0]["type"] == "ingest"
 
 
+async def test_learn_forwards_stable_source_identity_to_lifecycle_ingest(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path)
+    citadel = FakeCitadel(config)
+    learning = LearningProcess(citadel)
+
+    await learning.learn(
+        "Repository document",
+        tier="light",
+        source_key="github:masumi-network/Citadel:path:README.md",
+        source_locator="https://github.com/masumi-network/Citadel/blob/abc/README.md",
+        media_type="text/markdown",
+        capture_actor_id="github-repo-content-sync",
+        capture_run_id="sync-1",
+    )
+
+    call = citadel.ingest_calls[0]
+    assert call["source_key"] == "github:masumi-network/Citadel:path:README.md"
+    assert call["source_locator"].endswith("/blob/abc/README.md")
+    assert call["media_type"] == "text/markdown"
+    assert call["capture_actor_id"] == "github-repo-content-sync"
+    assert call["capture_run_id"] == "sync-1"
+
+
 async def test_learn_runs_improve_only_for_accepted_material(tmp_path: Path) -> None:
     config = config_for(tmp_path)
     citadel = FakeCitadel(config)

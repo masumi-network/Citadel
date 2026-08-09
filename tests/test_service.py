@@ -62,6 +62,13 @@ class FakeCognee:
     async def graph_data(self) -> tuple[list[Any], list[Any]]:
         return list(self.nodes), list(self.edges)
 
+    async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
+        return [
+            str(call["data_id"])
+            for call in self.remember_calls
+            if call.get("dataset_name") in datasets and call.get("data_id") is not None
+        ]
+
     async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
         return {document_id: 1 for document_id in document_ids}
 
@@ -101,6 +108,168 @@ async def test_ingest_applies_tags_and_dataset() -> None:
     assert result.tags == ("personal", "ai")
     assert fake.remember_calls[0]["dataset_name"] == "notes"
     assert fake.remember_calls[0]["tags"] == ("personal", "ai")
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_ingest_queues_durable_projection_and_returns_operation_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("DB_PROVIDER", "sqlite")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("GRAPH_DATABASE_PROVIDER", "ladybug")
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+
+    result = await kb.ingest(
+        "A retained lifecycle note",
+        tags=["architecture"],
+        session_id="session-1",
+        source_key="manual:alice:note-1",
+        source_locator="citadel://manual/note-1",
+        capture_run_id="capture-1",
+    )
+    operation_payload = await kb.wait_for_lifecycle_operation(result.projection_job_id)
+
+    assert result.accepted is True
+    assert result.reason == "queued_not_confirmed"
+    assert result.source_revision_id is not None
+    assert result.projection_job_id is not None
+    assert result.projection_state == "pending"
+    assert fake.remember_calls == [
+        {
+            "data": "A retained lifecycle note",
+            "dataset_name": "seat:alice",
+            "data_id": result.source_revision_id,
+            "defer_cognify": True,
+            "tags": ("architecture",),
+            "session_id": "session-1",
+        }
+    ]
+    operation = kb.lifecycle_store.get_operation(result.projection_job_id)
+    assert operation.state == "searchable"
+    assert operation_payload["state"] == "searchable"
+    assert operation.source_revision.source_key == "manual:alice:note-1"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_search_returns_only_current_searchable_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class LifecycleRecallCognee(FakeCognee):
+        recall_ids: list[str] = []
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": f"chunk-{index}",
+                    "document_id": document_id,
+                    "text": f"revision {index}",
+                }
+                for index, document_id in enumerate(self.recall_ids)
+            ]
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = LifecycleRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    first = await kb.ingest(
+        "revision one",
+        source_key="manual:alice:current-only",
+    )
+    await kb.wait_for_lifecycle_operation(first.projection_job_id)
+    second = await kb.ingest(
+        "revision two",
+        source_key="manual:alice:current-only",
+    )
+    await kb.wait_for_lifecycle_operation(second.projection_job_id)
+    fake.recall_ids = [first.source_revision_id, second.source_revision_id]
+
+    results = await kb.search("revision")
+
+    assert [result["document_id"] for result in results] == [
+        second.source_revision_id
+    ]
+    assert results[0]["_lifecycle"]["source_revision_id"] == second.source_revision_id
+    assert results[0]["_lifecycle"]["backend"] == "vector"
+    assert results[0]["_lifecycle"]["state"] == "searchable"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_duplicate_ingest_returns_same_operation(
+    tmp_path: Any,
+) -> None:
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+
+    first = await kb.ingest("idempotent source", source_key="connector:stable")
+    duplicate = await kb.ingest("idempotent source", source_key="connector:stable")
+
+    assert duplicate.accepted is True
+    assert duplicate.source_revision_id == first.source_revision_id
+    assert duplicate.projection_job_id == first.projection_job_id
+    assert kb.lifecycle_census()["source_revisions"] == 1
+    assert kb.lifecycle_census()["projection_jobs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_rebuild_queues_current_sources_for_target_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    accepted = await kb.ingest("rebuild retained source", source_key="connector:stable")
+    await kb.wait_for_lifecycle_operation(accepted.projection_job_id)
+
+    rebuild_job_ids = kb.queue_lifecycle_rebuild(generation_id="generation-2")
+    await kb.wait_for_lifecycle_idle()
+
+    assert len(rebuild_job_ids) == 1
+    rebuilt = kb.lifecycle_operation(rebuild_job_ids[0])
+    assert rebuilt["job"]["generation_id"] == "generation-2"
+    assert rebuilt["state"] == "searchable"
+    generation = kb.lifecycle_generation_census(
+        generation_id="generation-2",
+        projection_version=rebuilt["job"]["projection_version"],
+    )
+    assert generation["current_sources"] == 1
+    assert generation["current_projection_jobs"] == 1
+    assert generation["current_searchable_by_backend"] == {
+        "graph": 1,
+        "relational": 1,
+        "vector": 1,
+    }
 
 
 @pytest.mark.asyncio

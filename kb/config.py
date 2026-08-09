@@ -86,6 +86,12 @@ def _cognify_queue_path(value: str | None) -> str:
     return str(Path(_state_root()) / "cognify_queue.json")
 
 
+def _lifecycle_store_path(value: str | None) -> str:
+    if value:
+        return value
+    return str(Path(_state_root()) / "lifecycle.sqlite3")
+
+
 def _repo_stats_state_path(value: str | None) -> str:
     if value:
         return value
@@ -254,6 +260,11 @@ class CitadelConfig:
     evolve_state_path: str = ".citadel/evolve_state.json"
     repair_journal_path: str = ".citadel/repair_journal.jsonl"
     cognify_queue_path: str = ".citadel/cognify_queue.json"
+    # Direct dataclass construction is used by isolated unit tests and embedded
+    # callers. The server path uses from_env(), where lifecycle v1 is on unless
+    # explicitly disabled.
+    lifecycle_enabled: bool = False
+    lifecycle_store_path: str = ".citadel/lifecycle.sqlite3"
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
@@ -463,6 +474,13 @@ class CitadelConfig:
                 os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
             ),
             cognify_queue_path=_cognify_queue_path(os.getenv("CITADEL_COGNIFY_QUEUE_PATH")),
+            lifecycle_enabled=_bool(
+                os.getenv("CITADEL_LIFECYCLE_ENABLED"),
+                default=True,
+            ),
+            lifecycle_store_path=_lifecycle_store_path(
+                os.getenv("CITADEL_LIFECYCLE_STORE_PATH")
+            ),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
             ),

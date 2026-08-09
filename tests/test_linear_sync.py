@@ -123,6 +123,7 @@ async def test_linear_sync_ingests_central_and_mirror(
         detect_conflicts: bool = True,
         tier: str = "full",
         defer_cognify: bool = False,
+        **_: Any,
     ) -> Any:
         ingests.append(
             {

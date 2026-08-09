@@ -6,6 +6,7 @@ import os
 import sys
 from types import SimpleNamespace
 from typing import Any, Mapping
+from uuid import UUID
 
 import pytest
 
@@ -157,6 +158,56 @@ async def test_cognee_public_client_does_not_pass_external_metadata_keyword(
     # metadata rides in the DataItem, never as an add() keyword (external_metadata
     # is rejected by cognee.add); only dataset_name is passed.
     assert received["kwargs"] == {"dataset_name": "notes"}
+
+
+@pytest.mark.asyncio
+async def test_remember_passes_explicit_lifecycle_data_id_to_cognee(
+    monkeypatch: Any,
+) -> None:
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class DataItem:
+        data: Any
+        label: Any = None
+        external_metadata: Any = field(default=None)
+        data_id: Any = None
+
+    received: dict[str, Any] = {}
+    data_id = "508228e3-bd9d-59fb-a0cb-a69362976e9d"
+
+    async def run_migrations() -> None:
+        return None
+
+    async def add(data: Any, **kwargs: Any) -> dict[str, Any]:
+        received["data"] = data
+        received["kwargs"] = kwargs
+        return {"ok": True}
+
+    monkeypatch.setenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "true")
+    for parent in ("cognee.tasks", "cognee.tasks.ingestion"):
+        monkeypatch.setitem(sys.modules, parent, SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee.tasks.ingestion.data_item",
+        SimpleNamespace(DataItem=DataItem),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_migrations=run_migrations, add=add),
+    )
+
+    await CogneePublicClient().remember(
+        "retained lifecycle source",
+        dataset_name="central",
+        data_id=data_id,
+        defer_cognify=True,
+    )
+
+    assert received["data"].data == "retained lifecycle source"
+    assert received["data"].data_id == UUID(data_id)
+    assert received["kwargs"] == {"dataset_name": "central"}
 
 
 @pytest.mark.asyncio

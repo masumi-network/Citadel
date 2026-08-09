@@ -66,6 +66,7 @@ def mirror_config(
         access_store_path=str(tmp_path / "access.json"),
         obsidian_sync_state_path=str(tmp_path / "obsidian.json"),
         github_sync_state_path=str(tmp_path / "github.json"),
+        lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
         backup_mirror_root_path=str(tmp_path / "mirror"),
         backup_mirror_enabled=enabled,
         backup_mirror_push_enabled=push_enabled,
@@ -85,9 +86,9 @@ def test_backup_mirror_dry_run_tracks_file_hashes_without_copying_content(tmp_pa
     assert result["ok"] is True
     assert result["written"] is False
     assert result["manifest"]["summary"] == {
-        "tracked_files": 3,
+        "tracked_files": 4,
         "available_files": 2,
-        "missing_files": 1,
+        "missing_files": 2,
         "total_bytes": (tmp_path / "github.json").stat().st_size
         + (tmp_path / "access.json").stat().st_size,
     }
@@ -95,6 +96,18 @@ def test_backup_mirror_dry_run_tracks_file_hashes_without_copying_content(tmp_pa
     assert "super-secret-body" not in serialized
     assert not (tmp_path / "mirror" / "manifests" / "latest.json").exists()
     assert mirror.status()["push"]["token_configured"] is False
+
+
+def test_backup_mirror_manifest_tracks_lifecycle_ledger(tmp_path: Any) -> None:
+    config = mirror_config(tmp_path)
+    (tmp_path / "lifecycle.sqlite3").write_bytes(b"lifecycle-ledger")
+
+    tracked = BackupMirror(config).tracked_files()
+
+    lifecycle = next(item for item in tracked if item["name"] == "lifecycle_store")
+    assert lifecycle["exists"] is True
+    assert lifecycle["size_bytes"] == len(b"lifecycle-ledger")
+    assert lifecycle["sha256"]
 
 
 def test_backup_mirror_write_requires_enabled_flag(tmp_path: Any) -> None:

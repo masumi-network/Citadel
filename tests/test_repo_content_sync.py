@@ -938,6 +938,87 @@ async def test_pending_projection_checkpoint_is_retried_before_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_projection_checkpoint_polls_without_duplicate_ingest(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("missing/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+    class LifecycleCitadel(FakeCitadel):
+        operation_state = "pending"
+        resume_calls = 0
+
+        def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+            assert projection_job_id == "job-1"
+            return {
+                "projection_job_id": projection_job_id,
+                "source_revision_id": "source-1",
+                "state": self.operation_state,
+            }
+
+        def resume_lifecycle_queue(self) -> None:
+            self.resume_calls += 1
+
+    class LifecycleLearning(FakeLearningProcess):
+        async def learn(self, data: str, **kwargs: Any) -> Any:
+            self.calls.append({"data": data, **kwargs})
+
+            class Outcome:
+                ingest = IngestResult(
+                    True,
+                    "queued_not_confirmed",
+                    kwargs.get("dataset", "x"),
+                    (),
+                    source_revision_id="source-1",
+                    projection_job_id="job-1",
+                    projection_state="pending",
+                )
+                chunk_ingests = ()
+                improve = None
+
+                @property
+                def all_ingests(self) -> tuple[IngestResult, ...]:
+                    return (self.ingest,)
+
+                @property
+                def improved(self) -> bool:
+                    return False
+
+            return Outcome()
+
+    citadel = LifecycleCitadel(config)
+    learning = LifecycleLearning()
+    syncer = RepoContentSyncer(
+        citadel,
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    first = await syncer.run()
+    second = await syncer.run()
+    citadel.operation_state = "searchable"
+    third = await syncer.run()
+
+    assert first["files_ingested"] == 1
+    assert second["files_skipped_by_reason"] == {"projection_pending": 1}
+    assert third["files_skipped_by_reason"] == {"unchanged": 1}
+    assert len(learning.calls) == 1
+    assert citadel.resume_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_a_state_entry_without_a_cognee_id_is_re_ingested(tmp_path: Path) -> None:
     """State repair, and the reason 12 files stayed missing from the index.
 

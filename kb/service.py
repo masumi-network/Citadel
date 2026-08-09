@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict
+from datetime import UTC, datetime
 from hashlib import sha256
+import json
 import logging
+import os
 import re
 from uuid import uuid4
 from typing import Any
@@ -13,6 +17,13 @@ from kb.cognee_client import CogneeGateway, CogneePublicClient
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
+from kb.lifecycle import (
+    CaptureContext,
+    LifecycleNotFoundError,
+    LifecycleStore,
+    ProjectionRequest,
+)
+from kb.lifecycle_worker import LifecycleProjectionWorker
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
 from kb.repair_journal import RepairJournal, RepairJournalLeaseError
 from kb.security_scan import (
@@ -49,6 +60,16 @@ class Citadel:
     ) -> None:
         self.config = config or CitadelConfig.from_env()
         self.cognee = cognee or CogneePublicClient(queue_path=self.config.cognify_queue_path)
+        self.lifecycle_store: LifecycleStore | None = None
+        self.lifecycle_worker: LifecycleProjectionWorker | None = None
+        self._lifecycle_projection_task: asyncio.Task[Any] | None = None
+        if self.config.lifecycle_enabled:
+            self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
+            self.lifecycle_worker = LifecycleProjectionWorker(
+                self.lifecycle_store,
+                self.cognee,
+                worker_id=f"citadel-{uuid4().hex}",
+            )
         self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,
@@ -76,6 +97,12 @@ class Citadel:
         session_id: str | None = None,
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        source_key: str | None = None,
+        source_locator: str | None = None,
+        media_type: str = "text/plain",
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
     ) -> IngestResult:
         target_dataset = dataset or self.config.default_dataset
         merged_tags = merge_tags(self.config.default_tags, tags)
@@ -99,7 +126,8 @@ class Citadel:
 
         content_hash = sha256(data.encode("utf-8")).hexdigest()
         ingest_key = (target_dataset, content_hash)
-        if ingest_key in self._seen_ingest_keys:
+        already_seen = ingest_key in self._seen_ingest_keys
+        if already_seen and self.lifecycle_store is None:
             logger.info(
                 "Ingest rejected for dataset %s: duplicate_in_process",
                 safe_log_value(target_dataset),
@@ -112,6 +140,50 @@ class Citadel:
         # duplicate_in_process, and a caller that only records state on success
         # (repo_content_sync) could never recover the file.
         self._seen_ingest_keys.add(ingest_key)
+        if self.lifecycle_store is not None:
+            resolved_source_key = (source_key or "").strip() or (
+                f"manual:{target_dataset}:{content_hash}"
+            )
+            capture_metadata: dict[str, Any] = {"tags": list(merged_tags)}
+            if session_id:
+                capture_metadata["session_id"] = session_id
+            if attestation:
+                capture_metadata["attestation"] = dict(attestation)
+            try:
+                acceptance = self.lifecycle_store.accept_source(
+                    data.encode("utf-8"),
+                    capture=CaptureContext(
+                        dataset=target_dataset,
+                        source_key=resolved_source_key,
+                        source_locator=source_locator,
+                        media_type=media_type,
+                        capture_actor_id=capture_actor_id or self.config.user_id,
+                        capture_run_id=capture_run_id or session_id,
+                        captured_at=captured_at or datetime.now(UTC),
+                        metadata=capture_metadata,
+                    ),
+                    projection=self._lifecycle_projection_request(),
+                )
+            except BaseException:
+                if not already_seen:
+                    self._seen_ingest_keys.discard(ingest_key)
+                raise
+            if not self._inline_projection_suppressed():
+                self._start_lifecycle_projection()
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                target_dataset,
+                merged_tags,
+                {
+                    "source_revision_id": acceptance.source_revision_id,
+                    "projection_job_id": acceptance.projection_job_id,
+                    "state": acceptance.operation.state,
+                },
+                source_revision_id=acceptance.source_revision_id,
+                projection_job_id=acceptance.projection_job_id,
+                projection_state=acceptance.operation.state,
+            )
         try:
             remember_kwargs: dict[str, Any] = {
                 "dataset_name": target_dataset,
@@ -142,6 +214,219 @@ class Citadel:
             elif result.get("background_cognify") is False:
                 reason = "not_scheduled"
         return IngestResult(True, reason, target_dataset, merged_tags, result)
+
+    def _lifecycle_projection_request(
+        self,
+        *,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+    ) -> ProjectionRequest:
+        generation_id = (
+            generation_id
+            if generation_id is not None
+            else os.getenv("CITADEL_GENERATION_ID", "citadel-default")
+        ).strip()
+        projection_version = (
+            projection_version
+            if projection_version is not None
+            else os.getenv(
+                "CITADEL_PROJECTION_VERSION",
+                "lifecycle-v1:cognee-1.4.1",
+            )
+        ).strip()
+        providers = {
+            "relational": os.getenv("DB_PROVIDER", "sqlite").strip().lower(),
+            "vector": os.getenv("VECTOR_DB_PROVIDER", "qdrant").strip().lower(),
+            "graph": os.getenv("GRAPH_DATABASE_PROVIDER", "ladybug").strip().lower(),
+        }
+        digest_fields = {
+            "generation_id": generation_id,
+            "projection_version": projection_version,
+            "providers": providers,
+            "llm_model": os.getenv("LLM_MODEL", ""),
+            "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
+            "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
+        }
+        config_digest = sha256(
+            json.dumps(digest_fields, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return ProjectionRequest(
+            generation_id=generation_id or "citadel-default",
+            projection_version=projection_version or "lifecycle-v1:cognee-1.4.1",
+            config_digest=f"sha256:{config_digest}",
+            providers=providers,
+        )
+
+    @staticmethod
+    def _inline_projection_suppressed() -> bool:
+        return os.getenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _start_lifecycle_projection(self) -> bool:
+        if self.lifecycle_worker is None:
+            return False
+        task = self._lifecycle_projection_task
+        if task is not None and not task.done():
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error(
+                "lifecycle projection not started: no running event loop; "
+                "durable work will resume on server startup"
+            )
+            return False
+        self._lifecycle_projection_task = loop.create_task(self._drain_lifecycle())
+        return True
+
+    async def _drain_lifecycle(self) -> int:
+        if self.lifecycle_worker is None or self.lifecycle_store is None:
+            return 0
+        processed_count = 0
+        while True:
+            try:
+                processed = await self.lifecycle_worker.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("lifecycle projection failed and was rescheduled")
+                processed = False
+            if processed:
+                processed_count += 1
+                continue
+            delay = self.lifecycle_store.next_wakeup_delay()
+            if delay is None:
+                return processed_count
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    def resume_lifecycle_queue(self) -> bool:
+        """Resume durable projection jobs after process startup."""
+        return self._start_lifecycle_projection()
+
+    async def wait_for_lifecycle_idle(self) -> int:
+        """Wait until every due lifecycle job finishes or reaches a retry delay."""
+        if self.lifecycle_worker is None:
+            return 0
+        self._start_lifecycle_projection()
+        task = self._lifecycle_projection_task
+        if task is None:
+            return 0
+        return await task
+
+    async def wait_for_lifecycle_operation(
+        self,
+        projection_job_id: str,
+        *,
+        timeout_seconds: float = 120,
+        poll_seconds: float = 0.05,
+    ) -> dict[str, Any]:
+        """Wait for one accepted source to pass every backend read check."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        self._start_lifecycle_projection()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            operation = self.lifecycle_operation(projection_job_id)
+            state = str(operation["state"])
+            if state == "searchable":
+                return operation
+            if state in {"failed", "stale"}:
+                raise RuntimeError(
+                    f"projection operation {projection_job_id} reached {state}"
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"projection operation {projection_job_id} did not become searchable"
+                )
+            await asyncio.sleep(min(poll_seconds, remaining))
+
+    async def stop_lifecycle_queue(self) -> None:
+        task = self._lifecycle_projection_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+        """Return one bounded source-to-provider operation record."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        operation = self.lifecycle_store.get_operation(projection_job_id)
+        return {
+            "schema_version": operation.job.schema_version,
+            "projection_job_id": operation.job.projection_job_id,
+            "source_revision_id": operation.source_revision.source_revision_id,
+            "dataset": operation.job.dataset,
+            "state": operation.state,
+            "source_revision": asdict(operation.source_revision),
+            "job": asdict(operation.job),
+            "receipts": [asdict(receipt) for receipt in operation.receipts],
+        }
+
+    def lifecycle_census(self) -> dict[str, Any]:
+        """Return exact SQLite lifecycle counts and state buckets."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request()
+        payload = asdict(self.lifecycle_store.census())
+        payload["current_generation"] = asdict(
+            self.lifecycle_store.generation_census(
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+            )
+        )
+        return payload
+
+    def lifecycle_generation_census(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str,
+    ) -> dict[str, Any]:
+        """Return current-head projection counts for one target generation."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        return asdict(
+            self.lifecycle_store.generation_census(
+                generation_id=generation_id,
+                projection_version=projection_version,
+            )
+        )
+
+    def queue_lifecycle_rebuild(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str | None = None,
+    ) -> tuple[str, ...]:
+        """Queue current source heads into an empty target generation."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        if not generation_id.strip():
+            raise ValueError("generation_id must be a non-empty string")
+        projection = self._lifecycle_projection_request(
+            generation_id=generation_id,
+            projection_version=projection_version,
+        )
+        operations = self.lifecycle_store.queue_generation_rebuild(projection)
+        self._start_lifecycle_projection()
+        return tuple(operation.job.projection_job_id for operation in operations)
 
     def _guard_content(self, data: str, dataset: str) -> None:
         """Block storing content that carries a blocking-severity secret.
@@ -241,9 +526,59 @@ class Citadel:
             session_id=session_id or self._default_session_for_dataset(target_dataset),
             top_k=top_k,
         )
+        results = [
+            {key: value for key, value in result.items() if key != "_lifecycle"}
+            if isinstance(result, dict)
+            else result
+            for result in results
+        ]
+        if self.lifecycle_store is not None:
+            results = self._filter_lifecycle_search_results(results)
         if results or target_dataset != self.config.github_sync_dataset:
             return results
         return search_github_sync_state(query, self.config, top_k=top_k)
+
+    def _filter_lifecycle_search_results(self, results: list[Any]) -> list[Any]:
+        """Keep legacy hits, but require current receipts for lifecycle IDs."""
+        if self.lifecycle_store is None:
+            return results
+        projection = self._lifecycle_projection_request()
+        filtered: list[Any] = []
+        for result in results:
+            if not isinstance(result, dict):
+                filtered.append(result)
+                continue
+            document_id = result.get("document_id")
+            if not isinstance(document_id, str) or not document_id:
+                filtered.append(result)
+                continue
+            binding = self.lifecycle_store.retrieval_binding(
+                document_id,
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+            )
+            if binding is None:
+                filtered.append(result)
+                continue
+            receipt = binding.receipt
+            if not binding.current or binding.source_revision.tombstone or receipt is None:
+                continue
+            filtered.append(
+                {
+                    **result,
+                    "_lifecycle": {
+                        "schema_version": receipt.schema_version,
+                        "source_revision_id": binding.source_revision.source_revision_id,
+                        "projection_receipt_id": receipt.projection_receipt_id,
+                        "generation_id": receipt.generation_id,
+                        "backend": receipt.backend,
+                        "provider": receipt.provider,
+                        "projection_version": receipt.projection_version,
+                        "state": receipt.state,
+                    },
+                }
+            )
+        return filtered
 
     async def feedback(self, request: FeedbackRequest) -> FeedbackResult:
         session_id = request.session_id or self.config.default_session

@@ -30,6 +30,12 @@ COLLECTION = "DocumentChunk"
 DATASETS = ("seat:alice", "seat:bob")
 DEFAULT_RECEIPT = Path("/data/citadel-state/provider-smoke.json")
 SQLITE_PATH = Path("/data/cognee-system/databases/cognee.db")
+LIFECYCLE_SQLITE_PATH = Path(
+    os.environ.get(
+        "CITADEL_LIFECYCLE_STORE_PATH",
+        "/data/citadel-state/lifecycle.sqlite3",
+    )
+)
 
 
 class _LocalEmbeddingEngine:
@@ -231,10 +237,15 @@ def _sqlite_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
-def _backup_sqlite(backup_root: Path) -> dict[str, Any]:
-    backup_path = backup_root / "cognee.sqlite"
-    restored_path = backup_root / "cognee-restored.sqlite"
-    source = sqlite3.connect(f"file:{SQLITE_PATH}?mode=ro", uri=True)
+def _backup_sqlite(
+    source_path: Path,
+    backup_root: Path,
+    *,
+    name: str,
+) -> dict[str, Any]:
+    backup_path = backup_root / f"{name}.sqlite"
+    restored_path = backup_root / f"{name}-restored.sqlite"
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
     backup = sqlite3.connect(backup_path)
     try:
         source.backup(backup)
@@ -257,7 +268,7 @@ def _backup_sqlite(backup_root: Path) -> dict[str, Any]:
     if backup_fingerprint["integrity"] != "ok":
         raise RuntimeError("restored SQLite integrity check failed")
     return {
-        "source": str(SQLITE_PATH),
+        "source": str(source_path),
         "backup": str(backup_path),
         "restored": str(restored_path),
         **backup_fingerprint,
@@ -311,7 +322,22 @@ def _backup_restore(receipt_path: Path) -> dict[str, Any]:
     backup_root = Path("/data/citadel-state/backups") / backup_id
     backup_root.mkdir(parents=True, exist_ok=False)
 
-    sqlite_result = _backup_sqlite(backup_root)
+    sqlite_result = _backup_sqlite(SQLITE_PATH, backup_root, name="cognee")
+    lifecycle_enabled = os.environ.get(
+        "CITADEL_LIFECYCLE_ENABLED",
+        "true",
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if lifecycle_enabled:
+        lifecycle_result: dict[str, Any] = _backup_sqlite(
+            LIFECYCLE_SQLITE_PATH,
+            backup_root,
+            name="lifecycle",
+        )
+    else:
+        lifecycle_result = {
+            "enabled": False,
+            "source": str(LIFECYCLE_SQLITE_PATH),
+        }
     qdrant_url = os.environ["VECTOR_DB_URL"]
     qdrant_key = os.environ.get("VECTOR_DB_KEY")
     client = QdrantClient(url=qdrant_url, api_key=qdrant_key)
@@ -351,6 +377,7 @@ def _backup_restore(receipt_path: Path) -> dict[str, Any]:
         "backup_id": backup_id,
         "backup_root": str(backup_root),
         "sqlite": sqlite_result,
+        "lifecycle": lifecycle_result,
         "qdrant": {
             "source_collection": source_collection,
             "restored_collection": restored_collection,

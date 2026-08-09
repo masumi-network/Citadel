@@ -41,6 +41,22 @@ class FakeCitadel:
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
 
+    def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+        if projection_job_id not in {"job-1", "job-seat"}:
+            raise KeyError(projection_job_id)
+        return {
+            "schema_version": 1,
+            "projection_job_id": projection_job_id,
+            "source_revision_id": "source-1",
+            "dataset": "seat:alice" if projection_job_id == "job-seat" else "notes",
+            "state": "searchable",
+            "receipts": [
+                {"backend": "relational", "provider": "sqlite", "state": "searchable"},
+                {"backend": "vector", "provider": "qdrant", "state": "searchable"},
+                {"backend": "graph", "provider": "ladybug", "state": "searchable"},
+            ],
+        }
+
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
 
@@ -369,6 +385,141 @@ def test_public_state_uses_the_package_source_version() -> None:
     response = client.get("/api/state")
     assert response.status_code == 200
     assert response.json()["version"] == server_module._SERVICE_VERSION
+
+
+def test_public_state_and_readyz_report_lifecycle_census(
+    monkeypatch: Any,
+) -> None:
+    class LifecycleStateCitadel(FakeCitadel):
+        config = CitadelConfig(
+            tenant_id="test",
+            default_dataset="notes",
+            admin_key="test-admin",
+            reader_keys=("test-reader",),
+            lifecycle_enabled=True,
+        )
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 4,
+                "current_sources": 3,
+                "retained_bytes": 120,
+                "projection_jobs": 4,
+                "projection_receipts": 12,
+                "job_states": {"completed": 3, "pending": 1},
+                "receipt_states": {"searchable": 9, "pending": 3},
+                "current_generation": {
+                    "generation_id": "generation-1",
+                    "projection_version": "projection-v1",
+                    "current_sources": 3,
+                    "current_projection_jobs": 3,
+                    "current_projection_receipts": 9,
+                    "current_receipts_by_backend": {
+                        "graph": 3,
+                        "relational": 3,
+                        "vector": 3,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 2,
+                        "relational": 3,
+                        "vector": 2,
+                    },
+                },
+            }
+
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    client = authed_client("test-reader")
+    app.state.citadel = LifecycleStateCitadel()
+    monkeypatch.setattr(server_module, "_corpus_health", healthy_corpus)
+
+    state = client.get("/api/state")
+    ready = client.get("/readyz")
+
+    assert state.status_code == 200
+    assert state.json()["lifecycle"]["source_revisions"] == 4
+    assert state.json()["lifecycle"]["ok"] is True
+    assert ready.status_code == 200
+    assert ready.json()["lifecycle"]["projection_receipts"] == 12
+
+
+def test_lifecycle_health_rejects_incomplete_current_generation() -> None:
+    class IncompleteGenerationCitadel(FakeCitadel):
+        config = CitadelConfig(lifecycle_enabled=True)
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 2,
+                "current_sources": 2,
+                "retained_bytes": 20,
+                "projection_jobs": 2,
+                "projection_receipts": 6,
+                "job_states": {"completed": 2},
+                "receipt_states": {"searchable": 6},
+                "current_generation": {
+                    "generation_id": "generation-2",
+                    "projection_version": "projection-v1",
+                    "current_sources": 2,
+                    "current_projection_jobs": 1,
+                    "current_projection_receipts": 3,
+                    "current_receipts_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                },
+            }
+
+    health = server_module.lifecycle_health(IncompleteGenerationCitadel())
+
+    assert health["ok"] is False
+    assert "current_generation_job_census_mismatch" in health["invariant_errors"]
+
+
+def test_projection_operation_status_returns_bounded_backend_receipts() -> None:
+    client = authed_client("test-reader")
+
+    response = client.get("/api/operations/job-1")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "projection_job_id": "job-1",
+        "source_revision_id": "source-1",
+        "dataset": "notes",
+        "state": "searchable",
+        "receipts": [
+            {"backend": "relational", "provider": "sqlite", "state": "searchable"},
+            {"backend": "vector", "provider": "qdrant", "state": "searchable"},
+            {"backend": "graph", "provider": "ladybug", "state": "searchable"},
+        ],
+    }
+
+
+def test_projection_operation_status_enforces_private_dataset_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = authed_client("test-reader")
+    monkeypatch.setattr(
+        server_module,
+        "require_access",
+        lambda *_args, **_kwargs: AccessIdentity(
+            role="reader",
+            actor_id="reader-1",
+            actor_kind="service",
+            actor_name="reader",
+            source="store",
+            scopes=("kb:read",),
+            allowed_datasets=("notes",),
+        ),
+    )
+    assert reader.get("/api/operations/job-seat").status_code == 403
 
 
 def test_public_state_and_discovery_share_deployment_identity() -> None:
@@ -1367,6 +1518,47 @@ def test_ingest_inline_cognify_flag() -> None:
     assert with_cognify.json()["cognified"] is True
 
 
+def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
+    class LifecycleCitadel(FakeCitadel):
+        legacy_cognify_calls = 0
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"] or "notes",
+                tuple(kwargs["tags"]),
+                source_revision_id="source-1",
+                projection_job_id="job-1",
+                projection_state="pending",
+            )
+
+        async def wait_for_lifecycle_operation(
+            self,
+            projection_job_id: str,
+        ) -> dict[str, Any]:
+            assert projection_job_id == "job-1"
+            return {"projection_job_id": projection_job_id, "state": "searchable"}
+
+        async def cognify_dataset(self, **kwargs: Any) -> dict[str, Any]:
+            self.legacy_cognify_calls += 1
+            return {"ok": True}
+
+    client = authed_client()
+    citadel = LifecycleCitadel()
+    app.state.citadel = citadel
+
+    response = client.post(
+        "/ingest",
+        json={"data": "lifecycle note", "tags": [], "cognify": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cognified"] is True
+    assert response.json()["projection_state"] == "searchable"
+    assert citadel.legacy_cognify_calls == 0
+
+
 def test_ingest_and_contribute_reject_oversized_payloads(monkeypatch: Any) -> None:
     monkeypatch.setenv("CITADEL_MCP_MAX_INGEST_BYTES", "16")
     client = authed_client()
@@ -2302,6 +2494,7 @@ def test_backup_mirror_status_and_run_are_admin_scoped(tmp_path: Any) -> None:
         access_store_path=str(tmp_path / "access.json"),
         obsidian_sync_state_path=str(tmp_path / "obsidian.json"),
         github_sync_state_path=str(tmp_path / "github.json"),
+        lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
         backup_mirror_root_path=str(tmp_path / "mirror"),
         backup_mirror_enabled=False,
     )
@@ -4773,6 +4966,36 @@ def test_start_cognify_queue_resumes_due_work(monkeypatch: Any) -> None:
     assert calls == ["resume"]
 
 
+def test_start_lifecycle_queue_resumes_due_projection_work(monkeypatch: Any) -> None:
+    from kb import server
+
+    calls: list[str] = []
+
+    class FakeCitadel:
+        def resume_lifecycle_queue(self) -> None:
+            calls.append("resume")
+
+    monkeypatch.setattr(server, "get_citadel", lambda: FakeCitadel())
+    server._start_lifecycle_queue()
+
+    assert calls == ["resume"]
+
+
+async def test_stop_lifecycle_queue_awaits_worker_shutdown(monkeypatch: Any) -> None:
+    from kb import server
+
+    calls: list[str] = []
+
+    class FakeCitadel:
+        async def stop_lifecycle_queue(self) -> None:
+            calls.append("stop")
+
+    monkeypatch.setattr(server, "get_citadel", lambda: FakeCitadel())
+    await server._stop_lifecycle_queue()
+
+    assert calls == ["stop"]
+
+
 async def test_backfill_seat_datasets_is_a_noop_without_a_cognee_client(tmp_path: Any) -> None:
     """Boot must not break where the client has no ensure_dataset to call."""
     from kb.server import backfill_seat_datasets
@@ -6749,6 +6972,39 @@ def test_a_real_trace_quoting_a_repo_path_stays_a_trace() -> None:
     assert envelope["doc_type"] == "session-trace"
     assert envelope["trust"] == "reference-only"
     assert envelope["trust_tier"] == "reference-only"
+
+
+def test_result_metadata_promotes_lifecycle_receipt_identity() -> None:
+    result = server_module.with_result_metadata(
+        {
+            "id": "chunk-1",
+            "document_id": "source-1",
+            "text": "current lifecycle evidence",
+            "_lifecycle": {
+                "schema_version": 1,
+                "source_revision_id": "source-1",
+                "projection_receipt_id": "receipt-1",
+                "generation_id": "generation-1",
+                "backend": "vector",
+                "provider": "qdrant",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+            },
+        },
+        0,
+        "central",
+    )
+
+    assert "_lifecycle" not in result
+    assert result["_citadel"]["source_revision_id"] == "source-1"
+    assert result["_citadel"]["projection_receipt_id"] == "receipt-1"
+    assert result["_citadel"]["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "vector",
+        "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
 
 
 # --- /partners contact form -------------------------------------------------

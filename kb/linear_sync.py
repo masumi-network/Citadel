@@ -383,6 +383,7 @@ class LinearSyncer:
             self._save_state(state)
             logger.error("Linear sync failed: %s", exc)
             return {"ok": False, "enabled": True, "reason": "linear_api_error", "error": str(exc)}
+        sync_started_at = utc_now()
         email_index = (
             seat_email_index(self.access_store)
             if self.access_store
@@ -498,6 +499,10 @@ class LinearSyncer:
                     dataset=central_dataset,
                     tags=["linear-workspace", "linear-sync"],
                     session_id=session_id,
+                    source_key="linear:workspace-digest",
+                    media_type="text/markdown",
+                    capture_actor_id="linear-sync",
+                    capture_run_id=sync_started_at,
                     operation="linear_sync",
                     run_improve=self.config.linear_sync_run_improve,
                     tier="full",
@@ -550,6 +555,11 @@ class LinearSyncer:
                             f"team:{issue.team_key}" if issue.team_key else "linear",
                         ],
                         session_id=session_id,
+                        source_key=f"linear:issue:{issue.id}",
+                        source_locator=issue.url or None,
+                        media_type="text/markdown",
+                        capture_actor_id="linear-sync",
+                        capture_run_id=sync_started_at,
                         operation="linear_sync",
                         run_improve=False,
                         tier="light",
@@ -607,6 +617,11 @@ class LinearSyncer:
                         f"team:{issue.team_key}" if issue.team_key else "linear",
                     ],
                     session_id=f"linear-{mirror_dataset.removeprefix(SEAT_DATASET_PREFIX)}",
+                    source_key=f"linear:issue:{issue.id}",
+                    source_locator=issue.url or None,
+                    media_type="text/markdown",
+                    capture_actor_id="linear-sync",
+                    capture_run_id=sync_started_at,
                     operation="linear_mirror",
                     run_improve=False,
                     tier="light",
@@ -646,7 +661,19 @@ class LinearSyncer:
         # finish (or fail); the scheduled branch has merely REQUESTED one, and
         # must say so instead of implying completion.
         cognify_observed: str | None = None
-        if touched_datasets and not _suppress_inline_cognify():
+        if touched_datasets and self.citadel.lifecycle_store is not None:
+            if await_cognify:
+                try:
+                    await self.citadel.wait_for_lifecycle_idle()
+                except Exception:  # noqa: BLE001 - retained work remains retryable
+                    logger.exception("Linear lifecycle projection failed")
+                    self.citadel.resume_lifecycle_queue()
+                    cognify_observed = "cognify_failed"
+                else:
+                    cognify_observed = "cognified"
+            else:
+                cognify_observed = "queued_not_confirmed"
+        elif touched_datasets and not _suppress_inline_cognify():
             cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
                 # Standalone CITADEL_RUN_MODE=linear-sync: AWAIT the single coalesced
