@@ -174,6 +174,18 @@ VERIFIED: the real Qdrant authorization probe used server `1.18.1` and client `1
 - [x] Verification recorded. Research evidence remains in the verification reports; checkpoint evidence is recorded above.
 - [x] Handoff written. Resume from `status.md` and `.local-review/wayfinder/citadel-v0-5-release-map.md`.
 
+## Lifecycle implementation audit: 2026-08-09
+
+Owner: architect
+Status: In Progress
+
+- VERIFIED: current `Citadel.ingest` and `CogneePublicClient.remember` persist Cognee source before the content-free JSON cognify queue. Evidence: candidate `kb/service.py:70-144`, `kb/cognee_client.py:701-806`, and `kb/cognify_queue.py:1-9`.
+- VERIFIED: Cognee `1.4.1` accepts an explicit `DataItem.data_id`, and Citadel already preserves that field while attaching metadata. Evidence: candidate `.venv/lib/python3.12/site-packages/cognee/tasks/ingestion/data_item.py:6-10` and `kb/cognee_client.py:659-680`.
+- CORRECTED: v1 receipts are `relational`, `vector`, and `graph`, not PostgreSQL, Qdrant, and graph. Provider identity belongs in receipt metadata so SQLite Lite and later PostgreSQL share one state machine.
+- INFERRED: dedicated Citadel SQLite with retained bytes, source head, job, and initial receipts in one transaction is the simplest v0.5 boundary. Deterministic Cognee data IDs are the proposed retry seam after an uncertain provider return.
+- VERIFIED: detailed evidence, file scope, worker sequence, API surface, backup impact, and stop conditions are indexed in `.local-review/research/lifecycle-implementation-audit.md`.
+- Next: approve `CITADEL-INT-LIFECYCLE-01` and `CITADEL-INT-RETRIEVAL-01` with `yes, implement lifecycle v1`. Schema work remains paused until that approval.
+
 ## 2026-08-09 Citadel v0.5 local runtime gate
 Owner: coordinator
 Status: In Progress

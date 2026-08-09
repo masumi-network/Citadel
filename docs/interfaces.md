@@ -124,7 +124,7 @@ Status: In Progress
 Request or input:
 
 - INFERRED working contract version: `1`.
-- One authorized dataset resolved before storage, one stable external source key, retained evidence bytes or a Citadel-owned durable content reference, source locator, media type, capture actor, capture time, and optional previous revision ID.
+- CORRECTED working contract: one authorized dataset resolved before storage, one stable source key assigned by a connector or Citadel, retained evidence bytes or a Citadel-owned durable content reference, optional source locator for manual notes, media type, capture actor, capture time, and optional previous revision ID.
 - One immutable generation ID, projection version, required backend set, and configuration digest for projection work.
 - One idempotency key derived from source revision ID, generation ID, backend, and projection version. Provider-generated IDs are not idempotency keys.
 
@@ -133,6 +133,7 @@ Response or output:
 - `SourceRevision`: `schema_version`, `source_revision_id`, `source_key`, `dataset`, `content_sha256`, `byte_length`, `retained_content_ref`, `source_locator`, `media_type`, `previous_revision_id`, `capture_actor_id`, `capture_run_id`, `captured_at`, `accepted_at`, and `tombstone`.
 - `ProjectionJob`: `schema_version`, `projection_job_id`, `source_revision_id`, `generation_id`, `dataset`, `projection_version`, `config_digest`, `required_backends`, `idempotency_key`, `state`, `attempt`, lease fields, timestamps, and bounded last error.
 - One `ProjectionReceipt` per required backend: `schema_version`, `projection_receipt_id`, `projection_job_id`, `source_revision_id`, `generation_id`, `dataset`, `backend`, `provider`, `projection_version`, `state`, `attempt`, provider operation ID, exact affected IDs or count, model and dimension identity when applicable, timestamps, and typed error fields.
+- Required v1 backend names are provider-neutral: `relational`, `vector`, and `graph`. Provider fields record SQLite or PostgreSQL, Qdrant, and the selected graph engine.
 - Receipt states are `pending`, `running`, `completed`, `searchable`, `failed`, or `stale`. `completed` means the provider call returned. `searchable` requires a bounded read check. Whole-job success is derived from every required receipt and is never written from one provider result.
 - The ingest response returns `accepted`, the source revision ID, projection job ID, and current derived state. CLI and MCP can poll the same bounded operation record.
 
@@ -154,6 +155,8 @@ Compatibility rule:
 - The current content-free `CognifyJob` queue is a compatibility input only. It does not become a projection receipt because it stores dataset names and lease metadata without a source revision or per-backend outcome.
 - Existing Obsidian `SourceRevision` records require an explicit compatibility mapper. Their connector-local revision number is not the cross-source ledger ID.
 - Erasure writes a new tombstone revision and preserves chain verification. It does not edit a historical receipt in place.
+- A newly accepted revision updates one current head and marks predecessor projection receipts stale. Retrieval accepts current heads only. Physical deletion is separate cleanup and cannot decide acceptance success.
+- Manual HTTP, CLI, and MCP notes without an external key use a Citadel key derived from dataset plus content SHA-256.
 
 Verification:
 
