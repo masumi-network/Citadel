@@ -1,7 +1,7 @@
 # Status
 Last updated: 2026-08-09
 Updated by: coordinator
-Current phase: Blocked at lifecycle v1 approval; candidate branch sync remains local
+Current phase: Local Qdrant and lifecycle core complete at candidate `5bdcf89`; coherent backup, current-image, and remote PR gates remain
 Current sprint: CITADEL-QDRANT-2026-08-09
 
 ## Completed
@@ -24,20 +24,22 @@ Current sprint: CITADEL-QDRANT-2026-08-09
 - [x] CITADEL-PORTABLE-2026-08-08-01, owner: architect. VERIFIED: exact Cognee `1.4.1` source supports SQLite and PostgreSQL; Railway documents SQLite on volumes; DigitalOcean App Platform has no persistent volumes. REPORTED: the user selected SQLite Lite plus Qdrant for the v0.5 Railway release.
 - [x] CITADEL-QDRANT-2026-08-09-01, owner: implementer. VERIFIED: local candidate commits `a0d5c02` and `92ce11a` preserve the final adapter, Cognee compatibility, Qdrant census, Lite runtime, and deploy work. Local merge commit `f3e92ff` integrates PR 254 corpus readiness diagnostics. After that merge, focused tests returned `65 passed, 10 warnings in 5.51s`; the full suite returned `1781 passed, 3 skipped, 11 warnings in 32.97s`; Ruff returned `All checks passed!`.
 - [x] CITADEL-QDRANT-2026-08-09-02, owner: release. VERIFIED: the disposable local stack accepted authenticated marker `citadel-v050-final-acceptance-14948765-cee0-454f-a85b-bf02c47f9360`, completed background cognify, and returned the full marker through authenticated search. SQLite backup and restore plus Qdrant snapshot restore passed. Blind spot: this was one document in a disposable generation.
+- [x] CITADEL-LIFECYCLE-2026-08-08-01, owner: architect. INFERRED: lifecycle and retrieval v1 contracts are recorded in `docs/interfaces.md`. REPORTED: the user approved implementation with `yes, implement lifecycle v1` on 2026-08-09.
+- [x] CITADEL-LIFECYCLE-2026-08-08-02, owner: implementer. CORRECTED: commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` introduced lifecycle v1, then fresh-eyes and red-team review found replay, source-key, tombstone, generation, lease, legacy-result, graph-context, and memory-retention gaps. VERIFIED: follow-up commit `5bdcf89` closes those reviewed gaps. `.venv/bin/pytest -q` returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; Ruff returned `All checks passed!`.
+- [x] CITADEL-QDRANT-2026-08-09-04, owner: reviewer. VERIFIED: pinned Qdrant `1.19.0` digest `sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc` ran with an API key, loopback binding, named storage, and named snapshot volumes. Same-ID tenant isolation survived container replacement. At commit `5bdcf89`, the real-server adapter test returned `1 passed, 11 warnings in 5.85s`; Cognee, SQLite, Ladybug, Qdrant, lifecycle receipt, fresh-process retrieval returned `1 passed in 34.55s`. Blind spot: the API key crossed plain HTTP on loopback. Production needs a private network or TLS.
+- [x] CITADEL-DOCKER-LOGS-2026-08-09-01, owner: reviewer. VERIFIED: `docker logs --since 6h --timestamps --tail 1000 citadel-qdrant-proof-v119` returned 272 lines. Programmatic scan found 204 HTTP requests, zero non-2xx responses, zero warning, error, panic, fatal, OOM, corruption, or failure lines, 14 collection recoveries at 100 percent, and two snapshot events. REST and gRPC reported TLS disabled. That is accepted only for this loopback-bound disposable test.
 
 ## In Progress
-- [ ] CITADEL-QDRANT-2026-08-09-03, owner: implementer, next action: sync local commits `a0d5c02`, `92ce11a`, and merge commit `f3e92ff` to remote PR 256 after explicit push approval, file scope: `/private/tmp/citadel-v050-qdrant`. VERIFIED: the worktree is clean and four commits ahead of remote head `420be9d`.
-- [ ] CITADEL-QDRANT-2026-08-08-02, owner: reviewer, next action: close the remaining graph aggregation and destructive adapter-path evidence gaps before BLK-2026-08-08-02 can complete. VERIFIED: same-ID count, retrieve, search, and exhaustive scroll stayed dataset-scoped in the local provider receipt.
+- [ ] CITADEL-QDRANT-2026-08-09-03, owner: release, next action: after explicit approval, push local candidate head `5bdcf89` and update PR 256 plus linked issue comments, file scope: `/private/tmp/citadel-v050-qdrant`. VERIFIED: the worktree is clean and six commits ahead of remote head `420be9d`.
 
 ## Blocked
 - [ ] BLK-2026-08-07-01, owner: release, severity: Critical, next escalation: obtain explicit approval to rotate the exposed database credential, then verify old credential rejection and service health. Evidence: `agents/blockers.md`.
 - [ ] BLK-2026-08-08-01, owner: architect, severity: High, next escalation: retire in-place force repair from the production path and replace it with a full shadow generation plus verified cutover. Evidence: `agents/blockers.md` and ticket 005.
-- [ ] BLK-2026-08-09-01, owner: architect, severity: High, next escalation: user replies `yes, implement lifecycle v1`; schema work then starts in the disposable candidate. Evidence: `agents/blockers.md`, `docs/interfaces.md`, and `.local-review/research/lifecycle-implementation-audit.md`.
+- [ ] BLK-2026-08-09-02, owner: release, severity: High, next escalation: implement and verify one coherent backup manifest for lifecycle SQLite, Cognee SQLite, every generation Qdrant collection, and Ladybug graph state or a documented graph rebuild. Evidence: `agents/blockers.md`.
 
 ## Next priorities
-- [ ] CITADEL-LIFECYCLE-2026-08-08-01, owner: architect, exit criteria: source revision, projection job, per-backend receipt, retrieval hit, and trace contracts are approved before schema implementation.
-- [ ] CITADEL-LIFECYCLE-2026-08-08-02, owner: implementer, exit criteria: accepted source and queued projection work are atomic; second-process fault tests converge with exact per-backend receipts and census.
-- [ ] CITADEL-QDRANT-2026-08-09-03, owner: implementer, exit criteria: remote PR 256 contains the local candidate commits and current-head CI passes.
+- [ ] CITADEL-QDRANT-2026-08-09-03, owner: release, exit criteria: remote PR 256 contains the local candidate commits and current-head CI passes.
+- [ ] CITADEL-BACKUP-2026-08-09-01, owner: release, exit criteria: quiesced generation backup restores from downloaded artifacts, boots Citadel against restored state, and returns exact lifecycle markers.
 - [ ] CITADEL-QDRANT-2026-08-08-04, owner: implementer, exit criteria: `pipx install citadel-archive==0.5.0` plus `citadel deploy local` and the Railway Template boot the same empty build and generation using one image, environment contract, and smoke script.
 - [ ] CITADEL-QDRANT-2026-08-08-05, owner: release, exit criteria: GitHub Central passes source and projection census, then every seat passes zero visibility violations before the next seat import.
 
@@ -134,6 +136,16 @@ Current sprint: CITADEL-QDRANT-2026-08-09
 - Blocked: BLK-2026-08-07-01 and BLK-2026-08-08-01. Railway deploy, push, merge, release, schema migration, and production mutation still require their named gates.
 - Next: approve or revise CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01, then implement the source ledger and projection receipts before rebuilding or deploying the candidate.
 - Blocked update: BLK-2026-08-09-01 records the third consecutive lifecycle approval stop. No lifecycle schema identifiers exist in the candidate, and no safe implementation step remains before approval.
+- CORRECTED: the user then approved lifecycle v1. Candidate commit `275e433` now contains the implementation. The earlier approval stop remains historical evidence, not current state.
+- Completed: CITADEL-LIFECYCLE-2026-08-08-02. The final full suite returned `1847 passed, 3 skipped, 11 warnings in 25.27s`; Ruff returned `All checks passed!`.
+- In Progress: CITADEL-QDRANT-2026-08-09-03. Local candidate is five commits ahead of remote PR 256. Push and GitHub edits remain unapproved.
+- Next: obtain explicit push approval, sync PR 256, then use current-head CI to decide whether the local image rebuild and restart gate may proceed.
+- CORRECTED: later fresh-eyes and red-team review invalidated completion at `275e433`. Candidate `5bdcf89` closes the reviewed gaps. Full tests returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; both explicit Qdrant live tests passed.
+- Completed: CITADEL-QDRANT-2026-08-09-04. Pinned Qdrant `1.19.0` survived container replacement. Same-ID isolation, delete, prune, lifecycle receipts, and fresh-process exact-marker retrieval passed.
+- Completed: CITADEL-DOCKER-LOGS-2026-08-09-01. Docker log scan found zero severe lines and zero non-2xx Qdrant requests. Log review is now a required Docker test and release gate.
+- In Progress: CITADEL-QDRANT-2026-08-09-03. Candidate is now six commits ahead of remote PR 256. BLK-2026-08-09-02 owns coherent whole-generation backup.
+- Blocked: BLK-2026-08-09-02. Current smoke does not restore one coherent Citadel generation.
+- Next: commit tracking records. Push and PR or issue writes still require the external-write gate.
 
 ## Key metrics
 CORRECTED: the prior claim of six Node hits was not supported by this session. VERIFIED: `citadel_search` for the architecture query returned zero hits after `exclude_ambient=true`; 14 candidates were fetched and all were filtered out. Blind spot: this filtered top-k search cannot enumerate the vault or prove absence.
@@ -156,36 +168,48 @@ CORRECTED: the active source baseline is adapter PR `#149` commit `7311f4572b3ec
 
 VERIFIED: the real Qdrant authorization probe used server `1.18.1` and client `1.18.0`. Unscoped search returned both `seat:a` and `seat:b`; applying `node_name=['seat:a']` returned only `seat:a`. Method blind spot: this direct adapter probe did not execute the full Cognee ingestion and Citadel HTTP paths.
 
+CORRECTED: lifecycle v1 verification at `275e433` passed but did not cover later review findings. VERIFIED: hardened candidate `5bdcf89` returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; Ruff returned `All checks passed!`; `git diff --check` returned no output. Method blind spot: the full suite skips live-provider tests unless their environment variables are set.
+
+VERIFIED: explicit live-provider tests at `5bdcf89` returned `1 passed, 11 warnings in 5.85s` for same-ID tenant isolation plus scoped delete and prune, and `1 passed in 34.55s` for Cognee, SQLite, Ladybug, Qdrant, lifecycle receipts, and fresh-process exact-marker retrieval. Method blind spot: these tests used deterministic local embeddings and one disposable generation, not production corpus recall.
+
+VERIFIED: Qdrant Docker logs contained 204 HTTP request records with zero non-2xx responses. Fourteen collection recoveries reached 100 percent. No warning, error, panic, fatal, OOM, corruption, or failure line was present. Method blind spot: this scans Qdrant logs only. A current-head Citadel image log gate remains part of Milestone 2.
+
 ## Risks
 - Upstream main branches can change after research, owner: researcher, impact: stale citations, mitigation: exact commit pins are recorded in every verification report, status: Completed.
 - Hindsight focused pytest was not completed, owner: reviewer, impact: selected behavior remains source-inspection evidence plus three direct assertions, mitigation: rerun the recorded focused command after freeing disk, status: Planned.
 - CORRECTED: provider-backed vector retrieval was exercised in disposable pgvector and Qdrant. Provider-backed repair, crash recovery, transaction parity, production latency, and cost remain unmeasured, owner: reviewer, impact: a provider or repair decision would still be unsupported, mitigation: retain the disposable repair and larger same-corpus gates, status: Planned.
-- CORRECTED: Qdrant is now the selected vector direction, owner: architect, impact: the official adapter dependency and access-control contracts do not currently satisfy Citadel, mitigation: require a Citadel-owned fail-closed adapter boundary plus disposable full-generation and operations proof before any production change, status: In Progress.
+- CORRECTED: Qdrant is the selected vector direction and the Citadel-owned adapter passed its local operations boundary, owner: architect, impact: coherent backup and hosted behavior remain unproved, mitigation: finish BLK-2026-08-09-02 and current-image gates before production change, status: In Progress.
 - CORRECTED: Cognee `1.4.1` is now the selected isolated candidate. Its cryptography metadata conflicts with Citadel's floor, owner: implementer, impact: ordinary pip resolution fails or falls back to a version with a high advisory, mitigation: require a reviewed metadata patch and keep `cryptography==50.0.0`, status: In Progress.
 - Full production repair mutates more than the selected candidate set, owner: release, impact: healthy projections can change without exact rollback, mitigation: require full backup, candidate isolation proof, crash injection, and explicit production authorization, status: Planned.
-- Cognee source storage and the file queue are separate writes, owner: architect, impact: process death after `cognee.add` and before queue persistence can still leave unindexed data, mitigation: disposable crash proof plus reconciliation or transactional outbox decision before closing the durable-work goal, status: Planned.
+- Backup smoke is not a coherent whole-generation restore, owner: release, impact: SQLite, Ladybug, and Qdrant may restore from different points in time, mitigation: quiesce ingestion, inventory all collections, include or rebuild graph state, restore downloaded artifacts, then boot and search the restored generation, status: Blocked.
+- CORRECTED: lifecycle-enabled ingest now commits retained source and initial projection work in one Citadel SQLite transaction, owner: architect, impact: legacy lifecycle-disabled callers still use the separate Cognee and JSON queue path, mitigation: keep lifecycle enabled by default and remove the compatibility queue only after deployment acceptance, status: Completed.
 - Direct admin, Evolve, Linear, and repair cognify paths remain outside the queue execution owner, owner: release, impact: cross-process duplicate graph work remains possible during maintenance, mitigation: exclusive write freeze for repair and later shared durable ownership, status: Planned.
-- Raw official Qdrant adapter omits Citadel authorization and provenance contracts, owner: architect, impact: private seat data can enter an unscoped candidate set and provider outages can look empty, mitigation: audited patch based on the exact official source, physical per-dataset collections, and adversarial real-server tests, status: Blocked.
+- CORRECTED: raw official Qdrant adapter still omits Citadel authorization and provenance contracts, owner: architect, impact: using it directly could expose private-seat data, mitigation: candidate `5bdcf89` uses the Citadel-owned adapter with shared generation collections, namespaced point IDs, and mandatory tenant filters, status: Completed.
 
 ## Checklist
-- [x] Contracts current for implementation. CITADEL-INT-QDRANT-01 records candidate B as active and candidate A as the automatic fallback on any isolation failure.
+- [x] Contracts current. CITADEL-INT-LIFECYCLE-01 records candidate commits `275e433` and `5bdcf89`; CITADEL-INT-RETRIEVAL-01 remains In Progress beyond current-head receipt binding.
 - [x] Deployment route decided. VERIFIED: `docs/decisions.md` DEC-2026-08-08-02 records the self-hosted portable shadow boundary and keeps managed Qdrant outside the first proof.
 - [x] Proposed architecture decisions are recorded in `.local-review/research/target-architecture.md`.
 - [x] Blockers owned. BLK-2026-08-07-01 is recorded in `agents/blockers.md`.
 - [x] Verification recorded. Research evidence remains in the verification reports; checkpoint evidence is recorded above.
+- [x] Docker log review required. Inspect app and provider logs during startup, tests, restart, snapshot, restore, and shutdown. Record severe lines, non-2xx requests, recovery completion, and expected security warnings.
 - [x] Handoff written. Resume from `status.md` and `.local-review/wayfinder/citadel-v0-5-release-map.md`.
 
 ## Lifecycle implementation audit: 2026-08-09
 
 Owner: architect
-Status: In Progress
+Status: Completed
 
 - VERIFIED: current `Citadel.ingest` and `CogneePublicClient.remember` persist Cognee source before the content-free JSON cognify queue. Evidence: candidate `kb/service.py:70-144`, `kb/cognee_client.py:701-806`, and `kb/cognify_queue.py:1-9`.
 - VERIFIED: Cognee `1.4.1` accepts an explicit `DataItem.data_id`, and Citadel already preserves that field while attaching metadata. Evidence: candidate `.venv/lib/python3.12/site-packages/cognee/tasks/ingestion/data_item.py:6-10` and `kb/cognee_client.py:659-680`.
 - CORRECTED: v1 receipts are `relational`, `vector`, and `graph`, not PostgreSQL, Qdrant, and graph. Provider identity belongs in receipt metadata so SQLite Lite and later PostgreSQL share one state machine.
 - INFERRED: dedicated Citadel SQLite with retained bytes, source head, job, and initial receipts in one transaction is the simplest v0.5 boundary. Deterministic Cognee data IDs are the proposed retry seam after an uncertain provider return.
 - VERIFIED: detailed evidence, file scope, worker sequence, API surface, backup impact, and stop conditions are indexed in `.local-review/research/lifecycle-implementation-audit.md`.
-- Next: approve `CITADEL-INT-LIFECYCLE-01` and `CITADEL-INT-RETRIEVAL-01` with `yes, implement lifecycle v1`. Schema work remains paused until that approval.
+- REPORTED: the user approved `CITADEL-INT-LIFECYCLE-01` and `CITADEL-INT-RETRIEVAL-01` with `yes, implement lifecycle v1` on 2026-08-09.
+- VERIFIED: candidate commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` implements CITADEL-INT-LIFECYCLE-01. The full suite returned `1847 passed, 3 skipped, 11 warnings in 25.27s`; Ruff returned `All checks passed!`.
+- CORRECTED: fresh-eyes and red-team review found lifecycle gaps after `275e433`. Candidate commit `5bdcf89` closes them. Full tests returned `1867 passed, 3 skipped, 11 warnings in 42.65s`.
+- VERIFIED: the candidate worktree is clean and six commits ahead of remote PR 256 head `420be9d`. Runtime image rebuild, push, deployment, merge, release, and production mutation remain outside this approval.
+- Next: complete the local tracking commit, then request the remote push and PR update gate.
 
 ## 2026-08-09 Citadel v0.5 local runtime gate
 Owner: coordinator
@@ -296,6 +320,7 @@ Status: Completed
 
 - [VERIFIED] GitHub `main` and the public production discovery build both report `cc8fc026297b64f39f387b96e30da63f77ad57fb`, version `0.4.1`.
 - [VERIFIED] Final tracker snapshot: 87 issues with 19 open and 68 closed; 171 pull requests with 15 open, 6 closed without merge, and 150 merged.
+- [CORRECTED] Fresh tracker snapshot later on 2026-08-09: 87 issues with 19 open and 68 closed; 172 pull requests with 16 open, 6 closed without merge, and 150 merged. PR 260 is the added open pull request.
 - [VERIFIED] Focused sync posted 17 issue comments and 7 pull request comments. Issues 122 and 248 were closed as completed. PR 251 was closed as superseded.
 - [VERIFIED] Correction comments on issues 128 and 247, plus PR 256, record newer local evidence: Qdrant Lite acceptance passed in the private worktree, but the final adapter and client fixes are absent from remote PR 256 head `420be9de5e5105a45515cc1e849b9b3a5b8a1417`.
 - [VERIFIED] Exhaustive snapshot and active dispositions are indexed in `.local-review/GITHUB_INDEX.md`.

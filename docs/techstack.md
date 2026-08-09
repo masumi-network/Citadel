@@ -1,6 +1,6 @@
 # Technology Stack
 
-Last updated: 2026-08-08
+Last updated: 2026-08-09
 Owner: architect
 
 ## Current production
@@ -20,9 +20,10 @@ Owner: architect
 | --- | --- | --- | --- |
 | Memory engine | Exact Cognee `1.4.1` with `cryptography==50.0.0` | In Progress | VERIFIED: upstream metadata caps cryptography below 50, so a reviewed metadata patch is required before the candidate is installable. The disposable forced runtime passed the private API contract. |
 | Adapter | Audited Citadel patch based on official community adapter `0.3.0` from PR `#149` commit `7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29` | In Progress | VERIFIED: the official adapter loses CHUNKS fields, leaves raw-ID retrieve and delete unscoped, allows same-ID cross-dataset overwrite, and converts query failures to empty results. The official commit is a source baseline, not a release-ready dependency. |
-| Qdrant server and client | Candidate spike pins server `1.19.0` and client `1.19.0`; image digest recorded before release | Planned | VERIFIED: PyPI reported client `1.19.0`, and the official source exposes server tag `v1.19.0`. The disposable auth probe passed on server `1.18.1` and client `1.18.0`; it does not verify 1.19.0. Official guidance expects server and SDK minor versions to match. |
-| Qdrant storage | Persistent `/qdrant/storage`, API key, private network, snapshot restore | Planned | VERIFIED: official Qdrant deployment, security, and monitoring guidance. |
+| Qdrant server and client | Server `1.19.0`, client `1.19.0`, pinned image digest `sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc` | Completed | VERIFIED: authenticated runtime reported server `1.19.0`, commit `74f3e85b9473c62560006c043e13737ce6b48412`. Candidate uses exact client `1.19.0`. |
+| Qdrant storage | Persistent `/qdrant/storage` and `/qdrant/snapshots`, API key, private network or TLS, generation manifest | In Progress | VERIFIED: local named-volume container replacement and one downloaded snapshot restore passed. BLK-2026-08-09-02 owns coherent whole-generation backup and restore boot. |
 | Relational store | SQLite Lite for v0.5; PostgreSQL later optional | Planned | VERIFIED: Cognee `1.4.1` supports both. REPORTED: the user selected SQLite for the low-cost Railway release. |
+| Lifecycle ledger | Dedicated Citadel SQLite at `CITADEL_LIFECYCLE_STORE_PATH` | Completed | VERIFIED: commit `275e433` adds schema version 1. Commit `5bdcf89` closes the reviewed replay, identity, tombstone, generation, lease, legacy-result, graph-context, and memory-retention gaps. Citadel does not add lifecycle tables to Cognee's database. |
 | Graph | Independent volume or provider namespace | Planned | INFERRED: graph and relational state belong to the same whole-generation acceptance boundary. |
 
 ## Candidate packaging constraints

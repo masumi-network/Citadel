@@ -73,3 +73,15 @@ Authorized query
 - INFERRED: GitHub Central is imported first. Seats are imported serially and each seat must pass the authorization matrix before the next seat begins.
 
 See [`docs/decisions.md`](decisions.md), [`docs/interfaces.md`](interfaces.md), and [`plans/roadmap.md`](../plans/roadmap.md).
+
+## Lifecycle v1 implementation
+
+Status: Completed locally
+Owner: implementer
+
+- VERIFIED: candidate commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` stores retained source bytes, current heads, projection jobs, and three initial receipts in one dedicated SQLite transaction. Provider writes remain outside that transaction and receive deterministic source IDs.
+- VERIFIED: the worker records relational, vector, and graph completion separately, then requires bounded provider reads before marking each receipt searchable. Five failed attempts produce a terminal failed job with bounded error text.
+- VERIFIED: source replacement marks predecessor work stale. Managed retrieval accepts only the current head with a searchable vector receipt. Tombstones create new retained revisions and provider-neutral exclusion receipts.
+- VERIFIED: empty-generation rebuild queues current heads idempotently and reports exact current-source, job, receipt, backend, and searchable counts. The lifecycle SQLite file is included in backup inventory and online restore checks.
+- CORRECTED: commit `275e433` introduced lifecycle v1, then review found missing replay, tombstone, lease, generation, legacy-result, and dataset graph-context cases. Commit `5bdcf89` closes those reviewed gaps.
+- VERIFIED: local verification at `5bdcf89` returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; Ruff returned `All checks passed!`. Pinned Qdrant live tests returned `1 passed, 11 warnings in 5.85s` for tenant isolation plus delete and prune, and `1 passed in 34.55s` for lifecycle retrieval across a fresh process. Blind spot: no Railway service or production data was changed.

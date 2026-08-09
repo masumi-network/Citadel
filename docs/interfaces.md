@@ -100,6 +100,11 @@ Compatibility rule:
 - Preserve Cognee's lower-is-better distance contract when translating Qdrant cosine similarity.
 - Upserting an existing point must preserve the union of dataset ownership tags or use a physical model that prevents shared-ID overwrite.
 - Official adapter registration is not release acceptance. Citadel registers only an audited patch that satisfies this interface.
+- VERIFIED official Cognee contract: Qdrant provider registration is process-local. Environment variables alone do not register it. Citadel must register its adapter and dataset handler before any Cognee engine or operation is created.
+- Required Qdrant Cognee variables are `VECTOR_DB_PROVIDER=qdrant`, `VECTOR_DB_URL`, a nonempty `VECTOR_DB_KEY`, `VECTOR_DATASET_DATABASE_HANDLER=qdrant`, and `ENABLE_BACKEND_ACCESS_CONTROL=true`. Embedding dimensions must equal the collection vector size.
+- SQLite plus Ladybug plus Qdrant is a single-process Lite profile. SQLite WAL and process-local Cognee locks do not make Ladybug safe for multiple app replicas or concurrent writer processes.
+- New shared generation collections use a keyword tenant index on `citadel_dataset_scope`, keyword indexes on generation and document ID, and tenant-only HNSW with `m=0` and `payload_m=16`. Every query must carry the tenant filter.
+- Graph presence reads enter Cognee's authorized dataset context. A global Ladybug query is not accepted as a source-specific lifecycle receipt.
 - Prune enumerates and mutates only collections bound to the current generation and authorized dataset. Missing scope fails before listing collections.
 
 Verification:
@@ -112,6 +117,11 @@ Verification:
 - Planned migration gate: fresh database, idempotent second run, second-process restart, returned failure IDs, injected provider migration failure, and write rejection after any failure.
 - VERIFIED on 2026-08-09: local commit `a0d5c02` contains the final Qdrant census, embedding-probe, nested CHUNKS result, and regression-test changes. Adapter and client tests returned `111 passed, 10 warnings in 11.29s` before commit.
 - VERIFIED on 2026-08-09: the disposable real-provider gate used one raw UUID in `seat:alice` and `seat:bob`. Exact count was `1` per dataset, and retrieve, search, and exhaustive scroll returned only the requested dataset. Blind spot: this receipt does not prove every graph aggregation or destructive adapter path.
+- CORRECTED on 2026-08-09: candidate commit `5bdcf89` adds dataset-scoped graph checks, scoped lifecycle tombstones for connector deletions, tenant-only HNSW, stable non-colliding identities, lease heartbeat, generation-bound workers, and legacy-result exclusion. The full suite returned `1867 passed, 3 skipped, 11 warnings in 42.65s`.
+- VERIFIED on 2026-08-09: Qdrant server `1.19.0` at pinned digest `sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc` survived container replacement with named storage. The live adapter test returned `1 passed, 11 warnings in 5.85s`, including scoped delete and prune. The Cognee lifecycle live test returned `1 passed in 34.55s` and found the exact lifecycle marker through a fresh process.
+- VERIFIED narrow restore proof: a downloaded three-row `DocumentChunk_text` snapshot restored into a new collection with equal collection config, payload schema, vectors, and payloads. Blind spot: the current backup smoke omits other collections and Ladybug, has no quiesced epoch, and does not boot restored Citadel.
+- Docker verification must monitor Qdrant and Citadel logs during startup, test traffic, restart, snapshot, restore, and shutdown. Any unexpected warning, error, panic, fatal, OOM, corruption, failure, recovery shortfall, or non-2xx data-plane response fails the gate.
+- TLS-disabled log lines are acceptable only for a disposable service bound to loopback. Railway and other hosted releases require private service networking or TLS before credentials or user data cross the connection.
 
 ## CITADEL-INT-LIFECYCLE-01: Durable source and projection lifecycle
 
@@ -119,22 +129,22 @@ Interface ID: CITADEL-INT-LIFECYCLE-01
 Owner: architect
 Provider: Citadel source ledger and projection coordinator
 Consumers: ingest surfaces, Cognee orchestration, Qdrant and graph adapters, CLI, MCP, census, rebuild, and release tooling
-Status: In Progress
+Status: Completed
 
 Request or input:
 
 - INFERRED working contract version: `1`.
 - CORRECTED working contract: one authorized dataset resolved before storage, one stable source key assigned by a connector or Citadel, retained evidence bytes or a Citadel-owned durable content reference, optional source locator for manual notes, media type, capture actor, capture time, and optional previous revision ID.
 - One immutable generation ID, projection version, required backend set, and configuration digest for projection work.
-- One idempotency key derived from source revision ID, generation ID, backend, and projection version. Provider-generated IDs are not idempotency keys.
+- CORRECTED 2026-08-09: one job idempotency key is derived from source revision ID, generation ID, and projection version. Each receipt ID is then derived from the job ID and backend. Provider-generated IDs are evidence fields, not idempotency keys.
 
 Response or output:
 
-- `SourceRevision`: `schema_version`, `source_revision_id`, `source_key`, `dataset`, `content_sha256`, `byte_length`, `retained_content_ref`, `source_locator`, `media_type`, `previous_revision_id`, `capture_actor_id`, `capture_run_id`, `captured_at`, `accepted_at`, and `tombstone`.
+- `SourceRevision`: `schema_version`, `source_revision_id`, `source_key`, `dataset`, `content_sha256`, `byte_length`, `retained_content_ref`, `source_locator`, `media_type`, `previous_revision_id`, `capture_actor_id`, `capture_run_id`, `capture_metadata`, `captured_at`, `accepted_at`, and `tombstone`.
 - `ProjectionJob`: `schema_version`, `projection_job_id`, `source_revision_id`, `generation_id`, `dataset`, `projection_version`, `config_digest`, `required_backends`, `idempotency_key`, `state`, `attempt`, lease fields, timestamps, and bounded last error.
 - One `ProjectionReceipt` per required backend: `schema_version`, `projection_receipt_id`, `projection_job_id`, `source_revision_id`, `generation_id`, `dataset`, `backend`, `provider`, `projection_version`, `state`, `attempt`, provider operation ID, exact affected IDs or count, model and dimension identity when applicable, timestamps, and typed error fields.
 - Required v1 backend names are provider-neutral: `relational`, `vector`, and `graph`. Provider fields record SQLite or PostgreSQL, Qdrant, and the selected graph engine.
-- Receipt states are `pending`, `running`, `completed`, `searchable`, `failed`, or `stale`. `completed` means the provider call returned. `searchable` requires a bounded read check. Whole-job success is derived from every required receipt and is never written from one provider result.
+- Receipt states are `pending`, `running`, `completed`, `searchable`, `failed`, or `stale`. `completed` means the provider call returned. `searchable` requires a bounded read check. Whole-job success is derived from every required receipt and is never written from one provider result. A worker retries transient errors and records a terminal failed job after five attempts by default.
 - The ingest response returns `accepted`, the source revision ID, projection job ID, and current derived state. CLI and MCP can poll the same bounded operation record.
 
 Errors:
@@ -165,7 +175,10 @@ Verification:
 - Duplicate submission produces one source revision, one job per generation and projection version, and one receipt per required backend.
 - Empty-generation rebuild produces matching source, job, receipt, vector, and graph censuses.
 - Expected implementation scope: new lifecycle model and store modules, then bounded changes to `kb/service.py`, `kb/cognee_client.py`, `kb/server.py`, `kb/mcp_server.py`, `kb/cli.py`, and focused unit, crash, serialization, provider, HTTP, CLI, and MCP tests.
-- Approval gate: schema and migration implementation starts only after this v1 field set, state machine, file scope, and destructive test boundaries are approved.
+- VERIFIED 2026-08-09: candidate commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` implements the schema, worker, connector identities, HTTP operation read, CLI operation read, MCP operation read, current-head retrieval binding, backup tracking, online restore, and empty-generation rebuild census. `uv run pytest -q` returned `1847 passed, 3 skipped, 11 warnings in 25.27s`; `uv run ruff check .` returned `All checks passed!`.
+- VERIFIED 2026-08-09: process-death tests cover all seven source-acceptance stages and nine provider, receipt, and read-check stages. Rebuild rollback covers five precommit stages. Blind spot: these restart tests use temporary SQLite and deterministic fake provider state. The existing disposable container was not rebuilt or restarted from commit `275e433`.
+- CORRECTED 2026-08-09: review after `275e433` found missing replay, stable-ID boundary, connector tombstone, generation binding, lease heartbeat, legacy-result exclusion, dataset graph-context, and lifecycle dedup-retention cases. Commit `5bdcf89` closes those reviewed cases. `.venv/bin/pytest -q` returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; Ruff returned `All checks passed!`.
+- REPORTED: the user approved lifecycle v1 implementation on 2026-08-09. Push, deployment, production migration, and deletion remain separate gates.
 
 ## CITADEL-INT-RETRIEVAL-01: Citadel-owned retrieval evidence
 
@@ -210,6 +223,7 @@ Verification:
 - Score tests prove Qdrant similarity, Cognee distance, normalized score, and final rank use named directions and do not swap units.
 - Benchmark output records the profile, candidate census, exclusions, partial failures, returned hits, and trace ID for every query.
 - Approval gate: retrieval schema implementation starts with the lifecycle schema because candidates must reference durable source revisions and projection receipts.
+- VERIFIED 2026-08-09: candidate commit `275e433` filters managed provider candidates through the current source head and a searchable vector receipt, then exposes source revision and receipt identity in `_citadel`. This is the lifecycle binding only. Versioned `RetrievalCandidate`, `RetrievalHit`, `RetrievalTrace`, and `RetrievalProfile` remain In Progress.
 
 ## CITADEL-INT-GENERATION-01: Whole-generation bootstrap and activation
 

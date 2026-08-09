@@ -30,6 +30,10 @@ Evidence: CORRECTED: candidate branch `agent/citadel-v050-qdrant` now has a Cita
 
 Checkpoint 2026-08-09: VERIFIED: local commit `a0d5c02` preserves nested Cognee `1.4.1` CHUNKS text and fail-closed Qdrant scope handling. Adapter and client tests returned `111 passed, 10 warnings in 11.29s`. The local same-ID provider receipt returned exact count `1` for each of `seat:alice` and `seat:bob`; retrieve, search, and exhaustive scroll returned only the requested dataset after restart and image replacement. Status remains In Progress because the recorded runtime receipt does not cover authorized graph aggregation and every destructive adapter path.
 
+CORRECTED 2026-08-09: the candidate now applies dataset context to graph presence checks and runs connector deletion through lifecycle tombstones. The pinned Qdrant `1.19.0` live adapter test covered same-ID writes, count, retrieve, search, dataset-scoped delete, and prune, returning `1 passed, 11 warnings in 5.85s`. The Cognee, SQLite, Ladybug, Qdrant, lifecycle, and fresh-process retrieval test returned `1 passed in 34.55s`.
+Status: Completed
+Evidence: candidate commit `5bdcf89`; `tests/test_qdrant_adapter_live.py`; `tests/test_cognee_qdrant_sqlite_live.py`. Blind spot: the disposable test does not prove hosted networking, production corpus recall, or coherent whole-generation backup.
+
 ID: BLK-2026-08-08-03
 Date: 2026-08-08
 Owner: implementer
@@ -64,5 +68,16 @@ Owner: architect
 Severity: High
 Description: REPORTED: lifecycle v1 schema and migration work requires explicit approval, and the approval phrase was not supplied across three consecutive goal turns. VERIFIED: the candidate remains clean at `f3e92ff`, four commits ahead of remote PR 256. `rg -n "projection_job_id|source_revision_id|projection_receipt_id|class Lifecycle" kb tests` returned exit `1` with no output in that candidate.
 Proposed resolution: user replies `yes, implement lifecycle v1`. This authorizes schema work in the disposable candidate only. Push, runtime rebuild, restart, deployment, merge, release, production mutation, and deletion keep their separate gates.
+RESOLVED 2026-08-09: REPORTED: the user replied `yes, implement lifecycle v1` in the current task. This clears schema work in `/private/tmp/citadel-v050-qdrant` only.
+Status: Completed
+Evidence: current task user approval on 2026-08-09; `docs/interfaces.md` CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01; `.local-review/research/lifecycle-implementation-audit.md`. Push, runtime rebuild, restart, deployment, merge, release, production mutation, and deletion remain unapproved.
+VERIFIED implementation follow-up: candidate commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` completed lifecycle v1 locally. `uv run pytest -q` returned `1847 passed, 3 skipped, 11 warnings in 25.27s`; Ruff returned `All checks passed!`.
+
+ID: BLK-2026-08-09-02
+Date: 2026-08-09
+Owner: release
+Severity: High
+Description: VERIFIED: the existing backup smoke copies Cognee SQLite and lifecycle SQLite sequentially, snapshots one direct-smoke Qdrant collection, and omits Ladybug graph state. It does not define one quiesced generation cut, inventory every production collection, or boot Citadel against restored state.
+Proposed resolution: pause ingestion and projection work, record one generation manifest, back up both SQLite databases, every generation Qdrant collection, and Ladybug graph files or a documented graph rebuild input. Restore only downloaded artifacts into empty storage, boot Citadel, verify receipts and exact markers, then resume writes.
 Status: Blocked
-Evidence: `docs/interfaces.md` CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01; `.local-review/research/lifecycle-implementation-audit.md`; candidate branch readback on 2026-08-09.
+Evidence: `scripts/smoke_qdrant_provider.py:315-380`; `kb/lite_runtime.py:48-69`; Docker audit on 2026-08-09. VERIFIED narrow proof: one downloaded `DocumentChunk_text` snapshot restored to a new collection with equal config, payload schema, vectors, payloads, and three rows. Blind spot: one collection restore is not a Citadel generation restore.

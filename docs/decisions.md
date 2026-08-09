@@ -1,5 +1,44 @@
 # Architecture Decisions
 
+## DEC-2026-08-09-01: Make the Citadel lifecycle ledger the write authority
+
+Date: 2026-08-09
+Owner: architect
+
+Context:
+
+- VERIFIED: the legacy path writes Cognee source before a separate content-free JSON cognify queue. A process can stop between those writes. Evidence: the pre-implementation audit in `.local-review/research/lifecycle-implementation-audit.md`.
+- VERIFIED: Cognee `1.4.1` accepts an explicit `DataItem.data_id`. Candidate tests show that a deterministic source revision ID lets a restarted worker reconcile an uncertain provider return.
+- REPORTED: the user approved lifecycle v1 implementation in the disposable candidate on 2026-08-09.
+
+Options:
+
+- Keep Cognee source plus the JSON queue as acceptance authority. Rejected because the two writes cannot commit together and the queue has no source revision or backend receipt.
+- Add lifecycle tables to Cognee's relational database. Rejected because Citadel would couple its contract and migrations to a private dependency schema.
+- Use a dedicated Citadel SQLite ledger with retained source bytes and deterministic provider identities. Selected for the single-process Lite release.
+
+Decision:
+
+- Source revision, retained bytes, current-head update, projection job, and initial relational, vector, and graph receipts commit in one `BEGIN IMMEDIATE` transaction.
+- One deterministic job identity covers source revision, generation, and projection version. Deterministic receipt identities add the backend. Provider operation IDs remain evidence only.
+- Provider calls run outside the acceptance transaction. Each receipt becomes searchable only after a bounded read check. Five failed worker attempts produce a terminal failed job by default.
+- Source replacement marks predecessor jobs and receipts stale. Retrieval accepts managed hits only when they reference the current head and a searchable vector receipt.
+- Empty-generation rebuild reads current heads and queues target-generation work idempotently. Generation census reports current source, job, receipt, backend, and searchable counts.
+
+Consequences:
+
+- CORRECTED: commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` is the initial lifecycle implementation checkpoint. Commit `5bdcf89` is the reviewed local checkpoint.
+- The lifecycle SQLite file joins backup inventory and online restore verification.
+- Versioned retrieval candidate, hit, profile, and trace records remain separate work. Lifecycle v1 exposes only current-head and receipt binding through the compatibility response.
+- This decision does not authorize a runtime restart, remote push, Railway deployment, production migration, merge, release, or deletion.
+
+Evidence:
+
+- VERIFIED: `uv run pytest -q` returned `1847 passed, 3 skipped, 11 warnings in 25.27s` in `/private/tmp/citadel-v050-qdrant`.
+- VERIFIED: `uv run ruff check .` returned `All checks passed!`; `git diff --check` returned no output.
+- VERIFIED: implementation entry points are candidate `kb/lifecycle.py:373`, `kb/lifecycle.py:673`, `kb/lifecycle.py:1344`, `kb/lifecycle_worker.py:53`, and `kb/service.py:412`.
+- CORRECTED: later review expanded the regression set. Candidate `5bdcf89` returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; explicit Qdrant live commands returned `1 passed, 11 warnings in 5.85s` and `1 passed in 34.55s`.
+
 ## DEC-2026-08-08-07: Make SQLite Lite the v0.5 default
 
 Date: 2026-08-08
@@ -72,6 +111,9 @@ Evidence:
 - Official adapter source: `/private/tmp/cognee-community-7311/packages/vector/qdrant/cognee_community_vector_adapter_qdrant/qdrant_adapter.py:125-134,159-215,247-306,400-403`
 - `.local-review/research/cognee-1.4.1-feature-audit.md`
 - Reviewer handoffs recorded in `status.md`
+- VERIFIED 2026-08-09 implementation checkpoint: candidate commit `5bdcf89` keeps one physical collection per generation and logical Cognee type, derives stored IDs from generation plus dataset plus raw ID, and filters every operation by generation and dataset. New collections use `m=0`, `payload_m=16`, and a tenant keyword index.
+- VERIFIED 2026-08-09 real-server checkpoint: same raw ID in Alice and Bob remained isolated across count, retrieve, search, delete, prune, container replacement, and fresh-process lifecycle retrieval on Qdrant `1.19.0`. Commands returned `1 passed, 11 warnings in 5.85s` and `1 passed in 34.55s`.
+- VERIFIED official sources: [Qdrant multitenancy](https://qdrant.tech/documentation/guides/multiple-partitions/), [Qdrant Docker quickstart](https://qdrant.tech/documentation/quickstart/), and [Cognee Qdrant integration](https://docs.cognee.ai/setup-configuration/community-maintained/qdrant). Blind spot: production TLS, monitoring, coherent backup, and hosted operation remain unverified.
 
 ## DEC-2026-08-08-05: Patch the official Qdrant adapter before release
 

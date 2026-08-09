@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-09
 Owner: coordinator
-Current phase: contract approval and candidate branch sync
+Current phase: lifecycle v1 complete locally; PR sync and current-image gates remain
 
 ## Milestone 0: Lock contracts and source policy
 
@@ -26,21 +26,22 @@ Estimate: less than one day for branch sync and current-head CI, excluding lifec
 ## Milestone 1A: Lock retrieval and lifecycle contracts
 
 Owner: architect
-Status: In Progress
+Status: Completed
 Deliverable: versioned `SourceRevision`, `ProjectionJob`, `ProjectionReceipt`, `RetrievalCandidate`, `RetrievalHit`, `RetrievalTrace`, and `RetrievalProfile` interfaces.
 Dependency: Milestone 0. Adapter observations from Milestone 1 inform compatibility fields, but schema implementation does not start here.
 Exit criteria: authorization, provider, lifecycle, score, partial-failure, census, and Cognee CHUNKS compatibility rules are approved; files and tests are named; schema and migration work still require a separate task.
-Verification checkpoint: INFERRED working v1 schemas and state rules are recorded in `docs/interfaces.md` under CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01. Existing ADR-0010, ADR-0021, and ADR-0022 supply the accepted architecture. User approval of the field set, state machine, and file scope remains the exit gate before schema work.
+Verification checkpoint: INFERRED working v1 schemas and state rules are recorded in `docs/interfaces.md` under CITADEL-INT-LIFECYCLE-01 and CITADEL-INT-RETRIEVAL-01. Existing ADR-0010, ADR-0021, and ADR-0022 supply the accepted architecture. REPORTED: the user approved lifecycle v1 implementation on 2026-08-09.
 Estimate: under one review session for contract approval, excluding implementation.
 
 ## Milestone 1B: Implement durable source and projection lifecycle
 
 Owner: implementer
-Status: Planned
+Status: Completed
 Deliverable: append-only source revisions, durable projection jobs, per-backend receipts, bounded operation status, and restart convergence.
 Dependency: Milestone 1A.
 Exit criteria: fault injection after each durable stage converges in a second process; accepted source and queued work are atomic; SQLite, Qdrant, and graph receipts distinguish completion from searchability; an empty generation rebuild matches the source and projection census.
-Estimate: three to five weeks. This remains uncertain until retained-source coverage and schema scope are measured.
+Verification checkpoint: CORRECTED on 2026-08-09. Commit `275e433` introduced lifecycle v1, then fresh-eyes and red-team review found missing replay, source-key, tombstone, generation, lease, legacy-result, graph-context, and memory-retention cases. Commit `5bdcf89` closes those reviewed gaps. The full suite returned `1867 passed, 3 skipped, 11 warnings in 42.65s`; Ruff returned `All checks passed!`.
+Estimate: completed locally. Current-image rebuild and restart move to Milestone 2 after explicit approval.
 
 ## Milestone 2: Build the OCI and Compose portable package
 
@@ -48,9 +49,11 @@ Owner: implementer
 Status: In Progress
 Deliverable: multi-platform OCI image, Dockerfile, `citadel deploy local` Compose setup, SQLite Lite profile, environment reference, bootstrap command, and one shared smoke test. Keep PostgreSQL as a later optional profile.
 Dependency: Milestone 1 and Milestone 1B.
-Exit criteria: SQLite Lite boots from empty storage, reports matching build and generation identity, survives restart, restores backups, and passes the authorized write-read smoke test.
-Verification checkpoint: VERIFIED on 2026-08-09. Candidate commit `92ce11a` contains the package and local runtime. The wheel and source distribution built, the Compose stack passed local HTTP, CLI, MCP initialization, restart, SQLite backup and restore, Qdrant snapshot restore, and authenticated marker retrieval. The package remains non-release-ready until Milestone 1B closes.
-Estimate: less than one day for current-head rebuild and readiness recheck after lifecycle integration.
+Exit criteria: SQLite Lite boots from empty storage, reports matching build and generation identity, survives restart, restores backups, and passes the authorized write-read smoke test. Citadel and Qdrant logs are monitored across startup, traffic, restart, snapshot, restore, and shutdown, with every severe or non-2xx line classified.
+Verification checkpoint: VERIFIED on 2026-08-09. Candidate commit `92ce11a` contains the package and local runtime. A separate pinned Qdrant `1.19.0` container proved API-key rejection, named-volume persistence across container replacement, same-ID tenant isolation, scoped delete and prune, Cognee lifecycle receipts, and fresh-process exact-marker retrieval at commit `5bdcf89`. The image has not been rebuilt from that head.
+Log checkpoint: VERIFIED on 2026-08-09. Qdrant log scan covered 272 lines and 204 HTTP requests. It found zero non-2xx responses and zero warning, error, panic, fatal, OOM, corruption, or failure lines. Fourteen collections recovered to 100 percent. TLS was disabled only on the loopback-bound test service.
+Residual gate: BLK-2026-08-09-02. Existing backup smoke is not a coherent generation backup. It omits Ladybug, inventories one collection, and does not boot Citadel from downloaded restore artifacts.
+Estimate: less than one day for current-head image rebuild and readiness recheck. Full backup design and restore boot are separate work.
 
 ## Milestone 3: Deploy an empty Railway shadow
 
