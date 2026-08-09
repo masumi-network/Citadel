@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import socket
+import sys
+import time
+from typing import IO, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+
+class LiteConfigurationError(RuntimeError):
+    pass
+
+
+_LOCK_HANDLE: IO[str] | None = None
+_QDRANT_ADAPTER_BASELINE = "7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29"
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise LiteConfigurationError(f"{name} must not be empty")
+    return value
+
+
+def _build_id() -> str:
+    configured = os.getenv("CITADEL_BUILD_ID", "").strip()
+    if configured:
+        return configured
+    path = Path(os.getenv("CITADEL_BUILD_ID_PATH", "/opt/citadel/build-id"))
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except OSError as error:
+        raise LiteConfigurationError(f"Citadel build identity is unavailable at {path}") from error
+    if not value:
+        raise LiteConfigurationError(f"Citadel build identity is empty at {path}")
+    return value
+
+
+def configure_lite_environment(data_root: Path | None = None) -> Path:
+    root = (data_root or Path(os.getenv("CITADEL_LITE_DATA_ROOT", "/data"))).resolve()
+    defaults = {
+        "SYSTEM_ROOT_DIRECTORY": str(root / "cognee-system"),
+        "DATA_ROOT_DIRECTORY": str(root / "data-storage"),
+        "COGNEE_LOGS_DIR": str(root / "logs"),
+        "CITADEL_STATE_DIRECTORY": str(root / "citadel-state"),
+        "DB_PROVIDER": "sqlite",
+        "DB_PATH": str(root / "cognee-system" / "databases"),
+        "DB_NAME": "cognee.db",
+        "GRAPH_DATABASE_PROVIDER": "ladybug",
+        "VECTOR_DB_PROVIDER": "qdrant",
+        "VECTOR_DATASET_DATABASE_HANDLER": "qdrant",
+        "ENABLE_BACKEND_ACCESS_CONTROL": "true",
+        "REQUIRE_AUTHENTICATION": "true",
+        "TELEMETRY_DISABLED": "true",
+        "AUTO_FEEDBACK": "false",
+    }
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+    state = Path(os.environ["CITADEL_STATE_DIRECTORY"])
+    os.environ.setdefault("CITADEL_COGNIFY_QUEUE_PATH", str(state / "cognify_queue.json"))
+
+    expected = {
+        "DB_PROVIDER": "sqlite",
+        "GRAPH_DATABASE_PROVIDER": "ladybug",
+        "VECTOR_DB_PROVIDER": "qdrant",
+        "VECTOR_DATASET_DATABASE_HANDLER": "qdrant",
+        "ENABLE_BACKEND_ACCESS_CONTROL": "true",
+        "REQUIRE_AUTHENTICATION": "true",
+    }
+    for name, wanted in expected.items():
+        actual = os.environ[name].strip().lower()
+        if actual != wanted:
+            raise LiteConfigurationError(
+                f"Lite profile requires {name}={wanted}; got {os.environ[name]!r}"
+            )
+    for name in (
+        "CITADEL_GENERATION_ID",
+        "VECTOR_DB_URL",
+        "VECTOR_DB_KEY",
+        "CITADEL_QDRANT_SERVER_IMAGE",
+        "LLM_API_KEY",
+        "CITADEL_ADMIN_KEY",
+    ):
+        _required(name)
+    if len(os.environ["CITADEL_ADMIN_KEY"]) < 32:
+        raise LiteConfigurationError("CITADEL_ADMIN_KEY must contain at least 32 characters")
+    try:
+        embedding_dimensions = int(_required("EMBEDDING_DIMENSIONS"))
+    except ValueError as error:
+        raise LiteConfigurationError("EMBEDDING_DIMENSIONS must be a positive integer") from error
+    if embedding_dimensions <= 0:
+        raise LiteConfigurationError("EMBEDDING_DIMENSIONS must be a positive integer")
+    qdrant_url = urlparse(os.environ["VECTOR_DB_URL"])
+    if qdrant_url.scheme not in {"http", "https"} or not qdrant_url.hostname:
+        raise LiteConfigurationError("VECTOR_DB_URL must be an HTTP(S) Qdrant origin")
+    if qdrant_url.username or qdrant_url.password or qdrant_url.query or qdrant_url.fragment:
+        raise LiteConfigurationError(
+            "VECTOR_DB_URL must not contain credentials, query parameters, or a fragment"
+        )
+    for directory in (
+        Path(os.environ["SYSTEM_ROOT_DIRECTORY"]),
+        Path(os.environ["DATA_ROOT_DIRECTORY"]),
+        Path(os.environ["COGNEE_LOGS_DIR"]),
+        state,
+        Path(os.environ["DB_PATH"]),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def drop_root_privileges(root: Path, *, user_name: str = "citadel") -> None:
+    if os.geteuid() != 0:
+        return
+    try:
+        account = pwd.getpwnam(user_name)
+    except KeyError as error:
+        raise LiteConfigurationError(f"container user {user_name!r} does not exist") from error
+    for current_root, directories, files in os.walk(root):
+        os.chown(current_root, account.pw_uid, account.pw_gid, follow_symlinks=False)
+        for name in directories:
+            os.chown(
+                Path(current_root) / name,
+                account.pw_uid,
+                account.pw_gid,
+                follow_symlinks=False,
+            )
+        for name in files:
+            os.chown(
+                Path(current_root) / name,
+                account.pw_uid,
+                account.pw_gid,
+                follow_symlinks=False,
+            )
+    os.setgroups([])
+    os.setgid(account.pw_gid)
+    os.setuid(account.pw_uid)
+
+
+def acquire_single_instance_lock(root: Path) -> IO[str]:
+    global _LOCK_HANDLE
+    lock_path = root / "citadel-state" / "lite-runtime.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise LiteConfigurationError(
+            "SQLite Lite allows exactly one Citadel process for this data volume"
+        ) from error
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()} host={socket.gethostname()}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    os.set_inheritable(handle.fileno(), True)
+    _LOCK_HANDLE = handle
+    return handle
+
+
+def wait_for_qdrant(*, timeout_seconds: float = 90.0) -> None:
+    origin = _required("VECTOR_DB_URL").rstrip("/")
+    api_key = _required("VECTOR_DB_KEY")
+    deadline = time.monotonic() + timeout_seconds
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        request = Request(
+            f"{origin}/readyz",
+            headers={"api-key": api_key, "Accept": "text/plain"},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                if response.status == 200:
+                    return
+                last_error = RuntimeError(f"Qdrant readiness returned HTTP {response.status}")
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            last_error = error
+        time.sleep(1)
+    raise LiteConfigurationError(
+        f"Qdrant did not become ready within {timeout_seconds:.0f} seconds: {last_error}"
+    )
+
+
+async def run_migrations() -> None:
+    from kb.cognee_client import CogneePublicClient
+
+    client = CogneePublicClient()
+    client._prepare_cognee_environment()
+    import cognee
+
+    await client._ensure_cognee_ready(cognee)
+
+
+def write_bootstrap_receipt(root: Path) -> Path:
+    from importlib.metadata import version
+
+    from kb.qdrant_adapter import physical_collection_name
+
+    state = root / "citadel-state"
+    receipt_path = state / "bootstrap.json"
+    temporary = state / f".bootstrap.{os.getpid()}.tmp"
+    qdrant_url = urlparse(os.environ["VECTOR_DB_URL"])
+    generation_id = os.environ["CITADEL_GENERATION_ID"]
+    logical_collection = "DocumentChunk_text"
+    receipt: dict[str, Any] = {
+        "bootstrapped_at": datetime.now(UTC).isoformat(),
+        "build_id": _build_id(),
+        "citadel_version": version("citadel-archive"),
+        "cognee_version": version("cognee"),
+        "qdrant_client_version": version("qdrant-client"),
+        "qdrant_server_image": os.environ["CITADEL_QDRANT_SERVER_IMAGE"],
+        "qdrant_adapter_baseline": _QDRANT_ADAPTER_BASELINE,
+        "generation_id": generation_id,
+        "relational_provider": "sqlite",
+        "vector_provider": "qdrant",
+        "qdrant_origin": f"{qdrant_url.scheme}://{qdrant_url.hostname}:{qdrant_url.port or 6333}",
+        "qdrant_chunk_collection": physical_collection_name(
+            generation_id,
+            None,
+            logical_collection,
+        ),
+        "llm_provider": os.environ["LLM_PROVIDER"],
+        "llm_model": os.environ["LLM_MODEL"],
+        "embedding_provider": os.environ["EMBEDDING_PROVIDER"],
+        "embedding_model": os.environ["EMBEDDING_MODEL"],
+        "embedding_dimensions": int(os.environ["EMBEDDING_DIMENSIONS"]),
+        "backend_access_control": True,
+        "readiness_path": "/readyz",
+        "readiness_authentication_required": True,
+        "bootstrap_stage": "migrations_complete",
+    }
+    temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, receipt_path)
+    return receipt_path
+
+
+def web_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "kb.server:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        os.getenv("PORT", "8000"),
+    ]
+
+
+def main() -> None:
+    try:
+        root = configure_lite_environment()
+        drop_root_privileges(root)
+        acquire_single_instance_lock(root)
+        wait_for_qdrant()
+        asyncio.run(run_migrations())
+        receipt = write_bootstrap_receipt(root)
+    except LiteConfigurationError as error:
+        raise SystemExit(f"Citadel Lite startup refused: {error}") from error
+    print(f"Citadel Lite bootstrap complete: {receipt}", flush=True)
+    os.execv(sys.executable, web_command())
+
+
+if __name__ == "__main__":
+    main()

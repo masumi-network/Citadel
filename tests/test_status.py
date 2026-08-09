@@ -47,7 +47,7 @@ def _route(responses: dict[str, dict[str, Any]]):
 
 
 def test_request_refuses_non_https() -> None:
-    with pytest.raises(ValueError, match="non-HTTPS"):
+    with pytest.raises(ValueError, match="refusing to send credentials"):
         status_mod._request("GET", "http://node.example/healthz")
 
 
@@ -519,6 +519,23 @@ def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload["healthy"] is True
     assert payload["identity"]["seat_slug"] == "s"
+
+
+def test_status_transport_allows_loopback_http(monkeypatch) -> None:
+    monkeypatch.setattr(
+        status_mod._OPENER,
+        "open",
+        _route({"/healthz": {"ok": True}}),
+    )
+
+    assert status_mod._request("GET", "http://localhost:18000/healthz") == {
+        "ok": True
+    }
+
+
+def test_status_transport_refuses_public_http() -> None:
+    with pytest.raises(ValueError, match="refusing to send credentials"):
+        status_mod._request("GET", "http://node.example/healthz")
 
 
 def test_status_command_unhealthy_exits_one(tmp_path: Path, monkeypatch, capsys) -> None:

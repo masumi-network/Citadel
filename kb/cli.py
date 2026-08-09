@@ -105,6 +105,36 @@ def _print_json(value: Any) -> None:
     print(json.dumps(value, default=str, indent=2))
 
 
+async def _deploy_local(args: argparse.Namespace) -> int:
+    from kb.local_deploy import LocalDeployError, deploy_local
+
+    try:
+        result = await asyncio.to_thread(
+            deploy_local,
+            config_dir=Path(args.config_dir).expanduser() if args.config_dir else None,
+            source_dir=Path(args.source_dir).expanduser() if args.source_dir else None,
+            image=args.image,
+            port=args.port,
+            dry_run=args.dry_run,
+            timeout_seconds=args.timeout,
+        )
+    except LocalDeployError as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel deploy local: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    elif result["dry_run"]:
+        print(f"Citadel Lite dry run passed. Config target: {result['config_dir']}")
+    else:
+        state = "created" if result["created"] else "reused"
+        print(f"Citadel Lite ready at {result['url']} ({state} config)")
+        print(f"Config: {result['config_dir']}")
+    return 0
+
+
 class _Spinner:
     """An animated stdlib progress indicator on stderr (so stdout stays clean).
 
@@ -2853,6 +2883,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update citadel to the latest release (pipx-aware)",
     )
     update.set_defaults(handler=_update)
+
+    deploy = subcommands.add_parser(
+        "deploy",
+        help="Deploy a self-hosted Citadel stack",
+    )
+    deploy_sub = deploy.add_subparsers(dest="deploy_command", required=True)
+    deploy_local = deploy_sub.add_parser(
+        "local",
+        help="Create or resume the local SQLite Lite and Qdrant stack",
+    )
+    deploy_local.add_argument(
+        "--config-dir",
+        help="Deployment state directory (default: ~/.citadel/deploy/local)",
+    )
+    deploy_local.add_argument(
+        "--source-dir",
+        help="Build from this Citadel source tree instead of a published image",
+    )
+    deploy_local.add_argument(
+        "--image",
+        help="Digest-pinned Citadel image, required when no source tree is available",
+    )
+    deploy_local.add_argument("--port", type=int, default=8000)
+    deploy_local.add_argument("--timeout", type=float, default=180.0)
+    deploy_local.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run preflight and show the plan without writing or starting services",
+    )
+    deploy_local.add_argument("--json", action="store_true")
+    deploy_local.set_defaults(handler=_deploy_local)
 
     onboard = subcommands.add_parser(
         "onboard",

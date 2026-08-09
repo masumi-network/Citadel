@@ -5,9 +5,10 @@ surfaced two ways:
   * `citadel status` / `citadel status --json`  (humans + AI agents via Bash)
   * any agent/script parsing the JSON.
 
-All network calls are HTTPS-only and never follow redirects (the seat token is
-sent to /api/session and /search). Every check captures its own failure instead
-of raising, so the report always renders.
+All network calls require HTTPS except loopback and Railway private-network
+endpoints. Redirects are never followed because the seat token is sent to
+/api/session and /search. Every check captures its own failure instead of
+raising, so the report always renders.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from kb.capture_config import DEFAULT_NODE_URL, load_capture_config
+from kb.secure_http import require_secure_url
 
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 MCP_SERVER_NAME = "citadel"
@@ -86,8 +88,7 @@ def _request(
     payload: dict[str, Any] | None = None,
     timeout: float = _TIMEOUT,
 ) -> dict[str, Any]:
-    if not url.lower().startswith("https://"):
-        raise ValueError("refusing non-HTTPS Node URL")
+    require_secure_url(url)
     data = json.dumps(payload).encode() if payload is not None else None
     headers: dict[str, str] = {"Accept": "application/json"}
     if token:
