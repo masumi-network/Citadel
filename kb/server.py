@@ -80,10 +80,10 @@ from kb.promotion_queue import (
     REJECTED_STATUS,
     scan_candidate,
 )
+from kb.qdrant_adapter import QdrantProviderError
 from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
-    CODE_TIMEOUT,
     DOC_TYPE_CANONICAL,
     DOC_TYPE_TRACE,
     NO_LEXICAL_MATCH_WARNING,
@@ -227,8 +227,8 @@ async def _search_within_budget(
 ) -> tuple[list[tuple[str, Any]], bool]:
     """Run search_across_datasets under the per-request time budget (#44).
 
-    Returns (merged, timed_out). On timeout, degrade to empty-fast rather than
-    hanging for 100s+ on a slow cognee recall.
+    Returns (merged, timed_out). The HTTP boundary turns ``timed_out`` into a
+    typed 504 instead of misreporting an incomplete provider call as empty.
     """
     try:
         merged = await asyncio.wait_for(
@@ -2544,11 +2544,6 @@ def enforce_ingest_size(text: str) -> None:
         )
 
 
-SESSION_TRACES_BOOTSTRAP_MARKER = (
-    "Citadel bootstrap marker for the shared session-traces dataset (ADR-0011)."
-)
-
-
 async def ensure_session_traces_dataset(citadel: Citadel) -> None:
     """Ensure the Cognee dataset exists before seat search/share include it.
 
@@ -2557,37 +2552,9 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
     A missing dataset makes Cognee search fail with DatasetNotFoundError and
     share_session partial_write_failure on the shared tier.
     """
-    try:
-        from cognee import datasets as cognee_datasets
-
-        existing = await cognee_datasets.list_datasets()
-        names = {
-            str(getattr(item, "name", "") or "").strip()
-            for item in existing
-        }
-        if SESSION_TRACES_DATASET in names:
-            return
-    except Exception:
-        logger.debug(
-            "Could not list Cognee datasets before %s bootstrap; ingesting marker",
-            SESSION_TRACES_DATASET,
-            exc_info=True,
-        )
-
-    result = await citadel.ingest(
-        SESSION_TRACES_BOOTSTRAP_MARKER,
-        dataset=SESSION_TRACES_DATASET,
-        tags=["citadel-bootstrap", "shared-session-traces"],
-        defer_cognify=True,
-    )
-    if result.accepted:
-        logger.info("Bootstrapped Cognee dataset %s", SESSION_TRACES_DATASET)
-    else:
-        logger.warning(
-            "Bootstrap ingest for %s was not accepted: %s",
-            SESSION_TRACES_DATASET,
-            result.reason,
-        )
+    created = await citadel.cognee.ensure_dataset(SESSION_TRACES_DATASET)
+    if created:
+        logger.info("Provisioned Cognee dataset %s", SESSION_TRACES_DATASET)
 
 
 async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[str, int]:
@@ -3875,7 +3842,37 @@ async def corpus_census(
         try:
             graph_presence_read = getattr(cognee_client, "corpus_graph_presence", None)
             if callable(graph_presence_read):
-                in_graph_ids = await graph_presence_read(document_ids)
+                if not document_ids:
+                    in_graph_ids = set()
+                else:
+                    ids_by_dataset: dict[str, list[str]] = {}
+                    for row in rows:
+                        row_id = str(row.get("id") or "")
+                        if not row_id:
+                            continue
+                        datasets = row.get("datasets")
+                        if not isinstance(datasets, list):
+                            continue
+                        for dataset in datasets:
+                            dataset_name = str(dataset).strip()
+                            if dataset_name:
+                                ids_by_dataset.setdefault(dataset_name, []).append(
+                                    row_id
+                                )
+                    if ids_by_dataset:
+                        measured_graph_ids: set[str] | None = set()
+                        for dataset in sorted(ids_by_dataset):
+                            scoped_ids = await graph_presence_read(
+                                ids_by_dataset[dataset],
+                                datasets=[dataset],
+                            )
+                            if scoped_ids is None:
+                                measured_graph_ids = None
+                                break
+                            measured_graph_ids.update(
+                                str(document_id) for document_id in scoped_ids
+                            )
+                        in_graph_ids = measured_graph_ids
         except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
             logger.exception("corpus census: graph presence lookup failed")
         if in_graph_ids is None:
@@ -6712,12 +6709,23 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             for target, item in zip(write_targets, all_outcomes, strict=True)
             if not item.ingest.accepted
         ]
+    operations = [
+        {
+            "dataset": item.ingest.dataset,
+            "accepted": item.ingest.accepted,
+            "source_revision_id": item.ingest.source_revision_id,
+            "projection_job_id": item.ingest.projection_job_id,
+            "projection_state": item.ingest.projection_state,
+        }
+        for item in all_outcomes
+    ]
     if failed_targets:
         failure_detail = {
             "operation": "share_session",
             "error_type": "partial_write_failure",
             "failed_targets": failed_targets,
             "write_targets": [target.dataset for target in write_targets],
+            "operations": operations,
             "retried": True,
         }
         record_mcp_audit(
@@ -6762,6 +6770,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         cognify_state = "queued_not_confirmed"
     else:
         cognify_state = "deferred" if cognify_queued else "not_scheduled"
+    accepted = all(item.ingest.accepted for item in all_outcomes)
 
     record_mcp_audit(
         request,
@@ -6770,7 +6779,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         dataset=SESSION_TRACES_DATASET,
         detail={
             "operation": "share_session",
-            "accepted": outcome.ingest.accepted,
+            "accepted": accepted,
             "write_targets": [target.dataset for target in write_targets],
             "has_tool_errors": body.has_tool_errors,
             "cognify": cognify_state,
@@ -6782,6 +6791,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         success=True,
         dataset=SESSION_TRACES_DATASET,
         detail={
+            "accepted": accepted,
             "write_targets": [target.dataset for target in write_targets],
             "author_seat": actor.seat_slug,
             "cognify": cognify_state,
@@ -6790,9 +6800,10 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
     return jsonable_encoder(
         {
             "ok": True,
-            "accepted": outcome.ingest.accepted,
+            "accepted": accepted,
             "dataset": SESSION_TRACES_DATASET,
             "write_targets": [target.dataset for target in write_targets],
+            "operations": operations,
             "cognify": cognify_state,
             "message": (
                 "Shared Session Trace accepted; lifecycle projection queued."
@@ -7064,9 +7075,36 @@ async def knowledge(
                 sessions=search_sessions,
                 top_k=limit,
             )
+        except QdrantProviderError as exc:
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error="Qdrant unavailable",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "QDRANT_UNAVAILABLE",
+                    "message": "Qdrant is unavailable.",
+                },
+            ) from exc
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            safe_error = redact_secrets(str(exc))
+            await mesh_state.record_error(citadel.config, operation="search", error=safe_error)
+            raise HTTPException(status_code=500, detail=safe_error) from exc
+    if timed_out:
+        await mesh_state.record_error(
+            citadel.config,
+            operation="search",
+            error="search budget exceeded",
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "SEARCH_TIMEOUT",
+                "message": "Search exceeded the configured server budget.",
+            },
+        )
     latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset, _ in merged:
         await mesh_state.record_search(
@@ -7179,8 +7217,35 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 sessions=search_sessions,
                 top_k=fetch_k,
             )
+        except QdrantProviderError as exc:
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error="Qdrant unavailable",
+            )
+            record_mcp_audit(
+                request,
+                actor=actor,
+                success=False,
+                dataset=search_datasets[0],
+                detail={
+                    "operation": "search",
+                    "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+                    "query_length": len(body.query),
+                    "error_type": exc.__class__.__name__,
+                    "code": "QDRANT_UNAVAILABLE",
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "QDRANT_UNAVAILABLE",
+                    "message": "Qdrant is unavailable.",
+                },
+            ) from exc
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            safe_error = redact_secrets(str(exc))
+            await mesh_state.record_error(citadel.config, operation="search", error=safe_error)
             record_mcp_audit(
                 request,
                 actor=actor,
@@ -7193,10 +7258,36 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                     "error_type": exc.__class__.__name__,
                 },
             )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=safe_error) from exc
     if timed_out:
         await mesh_state.record_error(
             citadel.config, operation="search", error="search budget exceeded"
+        )
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=search_datasets[0],
+            detail={
+                "operation": "search",
+                "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+                "query_length": len(body.query),
+                "result_count": 0,
+                "top_k": body.top_k,
+                "datasets": search_datasets,
+                "scope_override": scope_override_active(actor, search_datasets),
+                "latency_ms": round(latency_ms, 1),
+                "timed_out": True,
+                "code": "SEARCH_TIMEOUT",
+            },
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "SEARCH_TIMEOUT",
+                "message": "Search exceeded the configured server budget.",
+            },
         )
 
     # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
@@ -7351,12 +7442,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        # A search that blew its budget returned empty-fast; the caller got no
-        # hits. Recording it as a success meant /api/audit?view=failures never
-        # showed it and any success-rate metric read 100% while users saw
-        # nothing — which is how the "~20% silent failure" in #50 stayed
-        # unquantified. The detail dict already carried timed_out; nothing read it.
-        success=not timed_out,
+        success=True,
         dataset=search_datasets[0],
         detail=audit_detail,
     )
@@ -7422,15 +7508,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
-    if timed_out:
-        payload["note"] = (
-            f"Search exceeded the {citadel.config.search_timeout_seconds:.0f}s budget; "
-            "returning truncated results — retry or narrow the query."
-        )
-        payload["timed_out"] = True
-        payload["truncated"] = True
-        payload["code"] = CODE_TIMEOUT
-    elif not normalized and body.dataset is None and (
+    if not normalized and body.dataset is None and (
         not filters_active or candidates_fetched == 0
     ):
         # With filters active this fires only when retrieval itself came back

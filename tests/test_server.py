@@ -3525,9 +3525,8 @@ def test_search_query_length_is_bounded_like_its_sibling_filters() -> None:
     assert client.post("/search", json={"query": ""}).status_code == 422
 
 
-def test_search_degrades_to_empty_on_timeout_budget() -> None:
-    # #44: a recall slower than the budget degrades to empty-fast with a note,
-    # instead of hanging for 100s+.
+def test_search_timeout_budget_is_a_typed_failure() -> None:
+    # An incomplete provider call is not evidence that the dataset is empty.
     import asyncio as aio
     import dataclasses
 
@@ -3542,12 +3541,73 @@ def test_search_degrades_to_empty_on_timeout_budget() -> None:
     app.state.citadel = SlowCitadel()
 
     r = client.post("/search", json={"query": "q", "top_k": 3})
-    assert r.status_code == 200
-    body = r.json()
+    assert r.status_code == 504
+    assert r.json()["detail"] == {
+        "code": "SEARCH_TIMEOUT",
+        "message": "Search exceeded the configured server budget.",
+    }
+
+
+def test_search_genuine_empty_is_a_normal_success() -> None:
+    class EmptyCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return []
+
+    client = authed_client("test-reader")
+    app.state.citadel = EmptyCitadel()
+
+    response = client.post("/search", json={"query": "absent", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
     assert body["results"] == []
-    assert body.get("timed_out") is True
-    assert body.get("truncated") is True
-    assert "budget" in body["note"]
+    assert "code" not in body
+    assert body.get("timed_out") in (None, False)
+
+
+def test_search_qdrant_outage_is_a_typed_failure() -> None:
+    class UnavailableCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            raise server_module.QdrantProviderError("qdrant secret detail")
+
+    client = authed_client("test-reader")
+    app.state.citadel = UnavailableCitadel()
+
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "QDRANT_UNAVAILABLE",
+        "message": "Qdrant is unavailable.",
+    }
+    assert "secret detail" not in response.text
+
+
+def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
+    async def timeout(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+        return [], True
+
+    monkeypatch.setattr(server_module, "_search_within_budget", timeout)
+    client = authed_client("test-reader")
+
+    response = client.get("/api/knowledge", params={"q": "absent"})
+
+    assert response.status_code == 504
+    assert response.json()["detail"]["code"] == "SEARCH_TIMEOUT"
+
+
+def test_knowledge_alias_qdrant_outage_is_a_typed_failure(monkeypatch) -> None:
+    async def unavailable(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+        raise server_module.QdrantProviderError("provider detail")
+
+    monkeypatch.setattr(server_module, "_search_within_budget", unavailable)
+    client = authed_client("test-reader")
+
+    response = client.get("/api/knowledge", params={"q": "q"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "QDRANT_UNAVAILABLE"
+    assert "provider detail" not in response.text
 
 
 def test_document_endpoint_for_result_covers_real_ids_only() -> None:
@@ -4956,6 +5016,70 @@ def test_create_seat_survives_a_failed_dataset_provision(tmp_path: Any) -> None:
     assert payload["node_dataset_provisioned"] is False, "a failure must be visible"
 
 
+async def test_session_traces_bootstrap_provisions_missing_dataset_without_ingest(
+    monkeypatch: Any,
+) -> None:
+    from cognee import datasets as cognee_datasets
+    from kb.server import ensure_session_traces_dataset
+
+    provisioned: list[str] = []
+    ingested: list[str] = []
+
+    async def no_datasets() -> list[Any]:
+        return []
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return True
+
+    class _Citadel:
+        cognee = _Cognee()
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            ingested.append(data)
+            return IngestResult(True, "accepted", kwargs["dataset"], ())
+
+    monkeypatch.setattr(cognee_datasets, "list_datasets", no_datasets)
+
+    await ensure_session_traces_dataset(_Citadel())
+
+    assert provisioned == [SESSION_TRACES_DATASET]
+    assert ingested == []
+
+
+async def test_session_traces_bootstrap_repairs_existing_dataset_idempotently(
+    monkeypatch: Any,
+) -> None:
+    from cognee import datasets as cognee_datasets
+    from kb.server import ensure_session_traces_dataset
+
+    provisioned: list[str] = []
+    ingested: list[str] = []
+
+    async def existing_dataset() -> list[Any]:
+        return [SimpleNamespace(name=SESSION_TRACES_DATASET)]
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return False
+
+    class _Citadel:
+        cognee = _Cognee()
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            ingested.append(data)
+            return IngestResult(True, "accepted", kwargs["dataset"], ())
+
+    monkeypatch.setattr(cognee_datasets, "list_datasets", existing_dataset)
+
+    await ensure_session_traces_dataset(_Citadel())
+
+    assert provisioned == [SESSION_TRACES_DATASET]
+    assert ingested == []
+
+
 async def test_backfill_seat_datasets_provisions_every_existing_seat(tmp_path: Any) -> None:
     """Seats that predate provisioning get their row on the next boot (#147).
 
@@ -4990,8 +5114,8 @@ def test_backfill_seat_datasets_is_wired_into_boot() -> None:
 
     The two tests around this one exercise the function directly, so deleting
     the call from the lifespan leaves them green and the six broken seats
-    unrepaired. Nothing else covers it: ensure_session_traces_dataset, which
-    this copies, has no test referencing it at all.
+    unrepaired. The session-traces provisioner has its own focused tests above;
+    this assertion pins the separate seat-backfill call in the lifespan.
 
     Reading the lifespan source is a blunt instrument and only proves the call
     is present, not that it runs. Running the real lifespan would drag in mesh
@@ -6566,6 +6690,22 @@ class ShareCitadel(FakeCitadel):
         return IngestResult(True, "accepted", dataset, tuple(kwargs.get("tags") or ()))
 
 
+class LifecycleShareCitadel(ShareCitadel):
+    async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+        self.ingest_calls.append({"data": data, **kwargs})
+        dataset = kwargs.get("dataset") or "notes"
+        suffix = dataset.replace(":", "-")
+        return IngestResult(
+            True,
+            "accepted",
+            dataset,
+            tuple(kwargs.get("tags") or ()),
+            source_revision_id=f"source-{suffix}",
+            projection_job_id=f"job-{suffix}",
+            projection_state="pending",
+        )
+
+
 class CrossSeatTraceCitadel(FakeCitadel):
     """Stateful fake: shared traces ingested by one seat are searchable by another."""
 
@@ -6621,10 +6761,45 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
+    assert payload["accepted"] is True
     assert payload["cognify"] == "deferred"
     datasets = [call["dataset"] for call in app.state.citadel.ingest_calls]
     assert datasets == ["seat:alice", SESSION_TRACES_DATASET]
     assert app.state.citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+
+
+def test_share_session_returns_one_lifecycle_operation_per_target(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()["token"]
+    app.state.citadel = LifecycleShareCitadel()
+    client = TestClient(app, base_url="https://testserver")
+    root = str(tmp_path)
+    register_seat_capture_roots(admin, "alice", [root])
+
+    response = client.post(
+        "/api/share-session",
+        json={"data": "Task: lifecycle receipts", "cwd": root, "capture_roots": [root]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["operations"] == [
+        {
+            "dataset": "seat:alice",
+            "accepted": True,
+            "source_revision_id": "source-seat-alice",
+            "projection_job_id": "job-seat-alice",
+            "projection_state": "pending",
+        },
+        {
+            "dataset": SESSION_TRACES_DATASET,
+            "accepted": True,
+            "source_revision_id": "source-session-traces",
+            "projection_job_id": "job-session-traces",
+            "projection_state": "pending",
+        },
+    ]
 
 
 def test_share_session_surfaces_rejected_durable_queue(tmp_path: Any) -> None:
@@ -6910,6 +7085,7 @@ def test_share_session_retries_session_traces_then_succeeds(tmp_path: Any) -> No
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
+    assert payload["accepted"] is True
     assert payload["cognify"] == "deferred"
     assert [call["dataset"] for call in citadel.ingest_calls] == [
         "seat:alice",
@@ -6918,6 +7094,13 @@ def test_share_session_retries_session_traces_then_succeeds(tmp_path: Any) -> No
     ]
     assert citadel.session_traces_attempts == 2
     assert citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+    events = app.state.access_store.snapshot()["audit_events"]
+    successful = [
+        event
+        for event in events
+        if event["action"] == "share_session" and event["success"]
+    ]
+    assert successful[-1]["detail"]["accepted"] is True
 
 
 def test_share_session_fails_when_session_traces_write_rejected(tmp_path: Any) -> None:
@@ -6944,6 +7127,22 @@ def test_share_session_fails_when_session_traces_write_rejected(tmp_path: Any) -
     assert detail["error_type"] == "partial_write_failure"
     assert detail["retried"] is True
     assert SESSION_TRACES_DATASET in detail["failed_targets"]
+    assert detail["operations"] == [
+        {
+            "dataset": "seat:alice",
+            "accepted": True,
+            "source_revision_id": None,
+            "projection_job_id": None,
+            "projection_state": None,
+        },
+        {
+            "dataset": SESSION_TRACES_DATASET,
+            "accepted": False,
+            "source_revision_id": None,
+            "projection_job_id": None,
+            "projection_state": None,
+        },
+    ]
     assert [call["dataset"] for call in app.state.citadel.ingest_calls] == [
         "seat:alice",
         SESSION_TRACES_DATASET,
@@ -7438,12 +7637,28 @@ def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
         lambda request, **kw: audited.append(kw),
     )
 
+    async def forbidden_post_timeout_work(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("timeout response continued into provider or telemetry work")
+
+    monkeypatch.setattr(
+        server_module,
+        "load_node_dataset_map",
+        forbidden_post_timeout_work,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "capture_search_feedback",
+        forbidden_post_timeout_work,
+    )
+
     client = authed_client("test-reader")
     app.state.citadel = SlowCitadel()
 
-    body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+    body = response.json()
 
-    assert body.get("timed_out") is True
+    assert response.status_code == 504
+    assert body["detail"]["code"] == "SEARCH_TIMEOUT"
     assert audited, "the search must be audited at all"
     entry = audited[-1]
     assert entry["detail"]["timed_out"] is True
@@ -7649,14 +7864,17 @@ class FakeCorpusCognee:
         totals: dict[str, Any],
         chunk_counts: dict[str, int] | None = None,
         graph_ids: set[str] | None = None,
+        graph_ids_by_dataset: dict[str, set[str]] | None = None,
         chunk_lookup_raises: bool = False,
     ) -> None:
         self.rows = rows
         self.totals = totals
         self.chunk_counts = chunk_counts
         self.graph_ids = graph_ids
+        self.graph_ids_by_dataset = graph_ids_by_dataset
         self.chunk_lookup_raises = chunk_lookup_raises
         self.seen_after: list[tuple[str | None, str | None]] = []
+        self.graph_calls: list[tuple[list[str], list[str] | None]] = []
 
     @staticmethod
     def _key(row: dict[str, Any]) -> tuple[Any, str]:
@@ -7694,7 +7912,18 @@ class FakeCorpusCognee:
             if document_id in self.chunk_counts
         }
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
+        self.graph_calls.append((document_ids, datasets))
+        if self.graph_ids_by_dataset is not None:
+            available: set[str] = set()
+            for dataset in datasets or []:
+                available.update(self.graph_ids_by_dataset.get(dataset, set()))
+            return {doc_id for doc_id in document_ids if doc_id in available}
         if self.graph_ids is None:
             return None
         return {doc_id for doc_id in document_ids if doc_id in self.graph_ids}
@@ -7774,6 +8003,41 @@ def test_corpus_census_reports_rows_presence_and_totals() -> None:
     assert second["chunk_count"] == 0
     assert second["in_graph"] is False
     assert body["notes"] == []
+
+
+def test_corpus_census_checks_each_dataset_graph() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(
+                "doc-central",
+                (now - timedelta(hours=2)).isoformat(),
+                datasets=["central"],
+            ),
+            _corpus_row(
+                "doc-alice",
+                (now - timedelta(hours=1)).isoformat(),
+                datasets=["seat:alice"],
+            ),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={"doc-central": 1, "doc-alice": 1},
+        graph_ids_by_dataset={
+            "central": {"doc-central"},
+            "seat:alice": {"doc-alice"},
+        },
+    )
+    client = _corpus_client(fake)
+
+    body = client.get("/api/corpus").json()
+
+    assert [row["in_graph"] for row in body["documents"]] == [True, True]
+    assert fake.graph_calls == [
+        (["doc-central"], ["central"]),
+        (["doc-alice"], ["seat:alice"]),
+    ]
 
 
 def test_corpus_census_pages_with_an_opaque_cursor() -> None:

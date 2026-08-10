@@ -13,7 +13,7 @@ Covers:
 1. MCP status state machine (missing / needsAuth / readyButUnconfigured / ready)
 2. Search JSON schema + --limit + filters
 3. Spec-mode ranking / MIP-/endpoint cues
-4. Soft timeout envelope (truncated + timed_out, exit 0)
+4. Search timeout typed failure (SEARCH_TIMEOUT, HTTP 504, exit 1)
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ def test_canary_spec_mode_ranking() -> None:
 
 
 @pytest.mark.canary
-def test_canary_soft_timeout_envelope(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+def test_canary_search_timeout_typed_failure(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
 
     def boom(*_a: Any, **_k: Any) -> dict[str, Any]:
@@ -175,12 +175,11 @@ def test_canary_soft_timeout_envelope(monkeypatch: pytest.MonkeyPatch, capsys: A
 
     monkeypatch.setattr("kb.status.search_node", boom)
     rc = asyncio.run(_search(_search_args(budget_ms=500)))
-    assert rc == 0
+    assert rc == 1
     out = json.loads(capsys.readouterr().out)
-    assert out["timed_out"] is True
-    assert out["truncated"] is True
-    assert out["ok"] is True
-    assert isinstance(out["results"], list)
+    assert out["ok"] is False
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["http_status"] == 504
 
 
 @pytest.mark.canary

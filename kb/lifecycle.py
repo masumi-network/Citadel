@@ -174,6 +174,48 @@ class GenerationCensus:
 
 
 @dataclass(frozen=True)
+class CurrentHeadReceiptEvidence:
+    projection_receipt_id: str
+    backend: str
+    provider: str
+    state: str
+
+
+@dataclass(frozen=True)
+class CurrentHeadProjectionEvidence:
+    source_key: str
+    dataset: str
+    source_revision_id: str
+    projection_job_id: str
+    generation_id: str
+    projection_version: str
+    config_digest: str
+    state: str
+    receipts: tuple[CurrentHeadReceiptEvidence, ...]
+
+
+@dataclass(frozen=True)
+class CurrentHeadEvidenceError:
+    code: str
+    source_key: str
+    source_revision_id: str | None = None
+    projection_job_ids: tuple[str, ...] = ()
+    job_state: str | None = None
+    backend_states: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CurrentHeadEvidenceResult:
+    ok: bool
+    dataset: str
+    generation_id: str
+    projection_version: str
+    config_digest: str
+    evidence: tuple[CurrentHeadProjectionEvidence, ...]
+    errors: tuple[CurrentHeadEvidenceError, ...]
+
+
+@dataclass(frozen=True)
 class ProjectionLease:
     projection_job_id: str
     lease_id: str
@@ -971,6 +1013,242 @@ class LifecycleStore:
                 f"current source revision not found: dataset={dataset!r} source_key={source_key!r}"
             )
         return self._source_revision(row)
+
+    def current_head_evidence(
+        self,
+        dataset: str,
+        source_keys: tuple[str, ...] | list[str],
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+    ) -> CurrentHeadEvidenceResult:
+        """Attest exact current source heads against one projection identity."""
+        for field_name, value in {
+            "dataset": dataset,
+            "generation_id": generation_id,
+            "projection_version": projection_version,
+            "config_digest": config_digest,
+        }.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if not isinstance(source_keys, (tuple, list)) or not source_keys:
+            raise ValueError("source_keys must be a non-empty list or tuple")
+        if any(not isinstance(source_key, str) or not source_key.strip() for source_key in source_keys):
+            raise ValueError("source_keys must contain only non-empty strings")
+
+        seen: set[str] = set()
+        duplicate: str | None = None
+        for source_key in source_keys:
+            if source_key in seen:
+                duplicate = source_key
+                break
+            seen.add(source_key)
+        if duplicate is not None:
+            return CurrentHeadEvidenceResult(
+                ok=False,
+                dataset=dataset,
+                generation_id=generation_id,
+                projection_version=projection_version,
+                config_digest=config_digest,
+                evidence=(),
+                errors=(
+                    CurrentHeadEvidenceError(
+                        code="SOURCE_KEY_DUPLICATE",
+                        source_key=duplicate,
+                    ),
+                ),
+            )
+
+        evidence: list[CurrentHeadProjectionEvidence] = []
+        errors: list[CurrentHeadEvidenceError] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                for source_key in source_keys:
+                    source_row = connection.execute(
+                        """
+                        SELECT revision.*
+                        FROM source_heads AS head
+                        JOIN source_revisions AS revision
+                          ON revision.source_revision_id = head.source_revision_id
+                         AND revision.dataset = head.dataset
+                         AND revision.source_key = head.source_key
+                        WHERE head.dataset = ? AND head.source_key = ?
+                        """,
+                        (dataset, source_key),
+                    ).fetchone()
+                    if source_row is None:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="CURRENT_HEAD_MISSING",
+                                source_key=source_key,
+                            )
+                        )
+                        continue
+
+                    source = self._source_revision(source_row)
+                    if source.tombstone:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="CURRENT_HEAD_TOMBSTONED",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                            )
+                        )
+                        continue
+
+                    job_rows = connection.execute(
+                        """
+                        SELECT *
+                        FROM projection_jobs
+                        WHERE source_revision_id = ?
+                        ORDER BY created_at, projection_job_id
+                        """,
+                        (source.source_revision_id,),
+                    ).fetchall()
+                    if not job_rows:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="CURRENT_JOB_MISSING",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                            )
+                        )
+                        continue
+
+                    matching_job_rows = [
+                        row
+                        for row in job_rows
+                        if str(row["dataset"]) == dataset
+                        and str(row["generation_id"]) == generation_id
+                        and str(row["projection_version"]) == projection_version
+                        and str(row["config_digest"]) == config_digest
+                    ]
+                    if not matching_job_rows:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="CURRENT_JOB_MISMATCH",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                                projection_job_ids=tuple(
+                                    str(row["projection_job_id"])
+                                    for row in job_rows[:10]
+                                ),
+                            )
+                        )
+                        continue
+                    if len(matching_job_rows) != 1:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="CURRENT_JOB_AMBIGUOUS",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                                projection_job_ids=tuple(
+                                    str(row["projection_job_id"])
+                                    for row in matching_job_rows[:10]
+                                ),
+                            )
+                        )
+                        continue
+
+                    job = self._projection_job(matching_job_rows[0])
+                    receipt_rows = connection.execute(
+                        """
+                        SELECT *
+                        FROM projection_receipts
+                        WHERE projection_job_id = ?
+                        ORDER BY CASE backend
+                            WHEN 'relational' THEN 1
+                            WHEN 'vector' THEN 2
+                            WHEN 'graph' THEN 3
+                            ELSE 4
+                        END, backend, projection_receipt_id
+                        LIMIT 4
+                        """,
+                        (job.projection_job_id,),
+                    ).fetchall()
+                    receipts = tuple(
+                        self._projection_receipt(row) for row in receipt_rows
+                    )
+                    backend_states = {
+                        receipt.backend: receipt.state for receipt in receipts
+                    }
+                    receipt_set_matches = (
+                        job.required_backends == REQUIRED_BACKENDS
+                        and tuple(receipt.backend for receipt in receipts)
+                        == REQUIRED_BACKENDS
+                        and all(
+                            receipt.source_revision_id == source.source_revision_id
+                            and receipt.generation_id == generation_id
+                            and receipt.dataset == dataset
+                            and receipt.projection_version == projection_version
+                            for receipt in receipts
+                        )
+                    )
+                    if not receipt_set_matches:
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="RECEIPT_SET_MISMATCH",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                                projection_job_ids=(job.projection_job_id,),
+                                job_state=job.state,
+                                backend_states=backend_states,
+                            )
+                        )
+                        continue
+
+                    state = self._operation_state(job, receipts)
+                    if state != "searchable" or any(
+                        receipt.state != "searchable" for receipt in receipts
+                    ):
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="RECEIPT_NOT_SEARCHABLE",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                                projection_job_ids=(job.projection_job_id,),
+                                job_state=job.state,
+                                backend_states=backend_states,
+                            )
+                        )
+                        continue
+
+                    evidence.append(
+                        CurrentHeadProjectionEvidence(
+                            source_key=source_key,
+                            dataset=dataset,
+                            source_revision_id=source.source_revision_id,
+                            projection_job_id=job.projection_job_id,
+                            generation_id=job.generation_id,
+                            projection_version=job.projection_version,
+                            config_digest=job.config_digest,
+                            state=state,
+                            receipts=tuple(
+                                CurrentHeadReceiptEvidence(
+                                    projection_receipt_id=receipt.projection_receipt_id,
+                                    backend=receipt.backend,
+                                    provider=receipt.provider,
+                                    state=receipt.state,
+                                )
+                                for receipt in receipts
+                            ),
+                        )
+                    )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return CurrentHeadEvidenceResult(
+            ok=not errors,
+            dataset=dataset,
+            generation_id=generation_id,
+            projection_version=projection_version,
+            config_digest=config_digest,
+            evidence=tuple(evidence),
+            errors=tuple(errors),
+        )
 
     def current_revisions_for_source(
         self,

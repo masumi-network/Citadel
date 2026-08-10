@@ -655,7 +655,10 @@ class CogneePublicClient:
         return getattr(search_type, raw_value, getattr(search_type, "CHUNKS", None))
 
     def _is_no_data_error(self, exc: Exception) -> bool:
-        return exc.__class__.__name__ == "NoDataError" or "No data found in the system" in str(exc)
+        return exc.__class__.__name__ in {
+            "DatasetNotFoundError",
+            "NoDataError",
+        } or "No data found in the system" in str(exc)
 
     async def _create_cognee_database(self) -> None:
         from cognee.infrastructure.databases.relational import get_relational_engine
@@ -1626,16 +1629,27 @@ class CogneePublicClient:
         graph_ids_seen: set[str] = set()
         fully_indexed_ids: set[str] = set()
         if document_ids:
-            # Both projection methods scan their backing store. Running them
-            # once after the relational walk avoids repeating a full graph scan
-            # for every source page while preserving the same complete-corpus
-            # and fail-closed checks.
+            # Projection methods scan their backing stores only after the full
+            # relational walk. Qdrant counts resolve dataset membership
+            # internally. Ladybug uses one graph per dataset, so scan each
+            # dataset's exact document ids and union the results.
             chunk_counts = await self.corpus_chunk_counts(document_ids)
             if chunk_counts is None:
                 raise RuntimeError("vector chunk measurement is unavailable")
-            graph_ids = await self.corpus_graph_presence(document_ids)
-            if graph_ids is None:
-                raise RuntimeError("graph presence measurement is unavailable")
+            memberships = await self.dataset_membership_for_documents(document_ids)
+            graph_ids: set[str] = set()
+            by_dataset: dict[str, list[str]] = {}
+            for document_id in document_ids:
+                for dataset in memberships.get(document_id, []):
+                    by_dataset.setdefault(str(dataset), []).append(document_id)
+            for dataset in sorted(by_dataset):
+                scoped_graph_ids = await self.corpus_graph_presence(
+                    by_dataset[dataset],
+                    datasets=[dataset],
+                )
+                if scoped_graph_ids is None:
+                    raise RuntimeError("graph presence measurement is unavailable")
+                graph_ids.update(str(document_id) for document_id in scoped_graph_ids)
             chunked_ids = {
                 document_id
                 for document_id in document_ids

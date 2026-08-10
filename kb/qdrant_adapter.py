@@ -197,7 +197,35 @@ class CitadelQdrantDatasetDatabaseHandler(DatasetDatabaseHandlerInterface):
         }
 
     @classmethod
+    async def resolve_dataset_connection_info(
+        cls,
+        dataset_database: DatasetDatabase,
+    ) -> DatasetDatabase:
+        """Bind restored dataset rows to this process's Qdrant endpoint.
+
+        Cognee persists the connection fields returned by ``create_dataset``.
+        A copied SQLite database can therefore retain the source container's
+        URL and API key. Resolve both fields from current runtime configuration
+        before every connection, without writing the resolved secret back.
+        """
+        vector_config = get_vectordb_config()
+        if vector_config.vector_db_provider != "qdrant":
+            raise QdrantConfigurationError(
+                "Citadel Qdrant dataset handler requires VECTOR_DB_PROVIDER=qdrant"
+            )
+        dataset_database.vector_database_url = _required_text(
+            vector_config.vector_db_url,
+            "VECTOR_DB_URL",
+        )
+        dataset_database.vector_database_key = _required_text(
+            vector_config.vector_db_key,
+            "VECTOR_DB_KEY",
+        )
+        return dataset_database
+
+    @classmethod
     async def delete_dataset(cls, dataset_database: DatasetDatabase) -> None:
+        dataset_database = await cls.resolve_dataset_connection_info(dataset_database)
         vector_engine = create_vector_engine(
             vector_db_provider=dataset_database.vector_database_provider,
             vector_db_url=dataset_database.vector_database_url,

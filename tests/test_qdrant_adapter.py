@@ -405,11 +405,53 @@ async def test_dataset_handler_rejects_missing_id_and_wrong_provider(
 
 
 @pytest.mark.asyncio
+async def test_dataset_handler_rebinds_restored_database_to_current_qdrant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kb.qdrant_adapter as adapter_module
+
+    monkeypatch.setattr(
+        adapter_module,
+        "get_vectordb_config",
+        lambda: SimpleNamespace(
+            vector_db_provider="qdrant",
+            vector_db_url="http://restored-qdrant:6333",
+            vector_db_key="restored-secret",
+        ),
+    )
+    dataset_database = SimpleNamespace(
+        vector_database_provider="qdrant",
+        vector_database_url="http://source-qdrant:6333",
+        vector_database_key="source-secret",
+        vector_database_name=str(uuid4()),
+    )
+
+    resolved = (
+        await CitadelQdrantDatasetDatabaseHandler.resolve_dataset_connection_info(
+            dataset_database
+        )
+    )
+
+    assert resolved is dataset_database
+    assert resolved.vector_database_url == "http://restored-qdrant:6333"
+    assert resolved.vector_database_key == "restored-secret"
+
+
+@pytest.mark.asyncio
 async def test_dataset_handler_prunes_only_the_bound_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import kb.qdrant_adapter as adapter_module
 
+    monkeypatch.setattr(
+        adapter_module,
+        "get_vectordb_config",
+        lambda: SimpleNamespace(
+            vector_db_provider="qdrant",
+            vector_db_url="http://qdrant:6333",
+            vector_db_key="secret",
+        ),
+    )
     created_with: dict[str, object] = {}
     pruned: list[bool] = []
 

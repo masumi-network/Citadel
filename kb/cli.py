@@ -135,6 +135,89 @@ async def _deploy_local(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backup_environment_value(explicit: str | None, name: str) -> str:
+    value = (explicit or os.getenv(name, "")).strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+async def _backup_generation_create(args: argparse.Namespace) -> int:
+    from kb.generation_backup import (
+        GenerationBackupError,
+        QdrantSnapshotStore,
+        create_generation_backup,
+    )
+
+    try:
+        generation_id = _backup_environment_value(
+            args.generation_id,
+            "CITADEL_GENERATION_ID",
+        )
+        qdrant_url = _backup_environment_value(args.qdrant_url, "VECTOR_DB_URL")
+        qdrant_key = _backup_environment_value(None, "VECTOR_DB_KEY")
+
+        def create() -> dict[str, Any]:
+            with QdrantSnapshotStore(url=qdrant_url, api_key=qdrant_key) as store:
+                return create_generation_backup(
+                    generation_id=generation_id,
+                    data_root=Path(args.data_root).expanduser(),
+                    destination=Path(args.destination).expanduser(),
+                    snapshot_store=store,
+                )
+
+        result = await asyncio.to_thread(create)
+    except (GenerationBackupError, OSError, ValueError) as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel backup create: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Citadel generation backup created: {args.destination}")
+    return 0
+
+
+async def _backup_generation_restore(args: argparse.Namespace) -> int:
+    from kb.generation_backup import (
+        GenerationBackupError,
+        QdrantSnapshotStore,
+        restore_generation_backup,
+    )
+
+    try:
+        generation_id = _backup_environment_value(
+            args.generation_id,
+            "CITADEL_GENERATION_ID",
+        )
+        qdrant_url = _backup_environment_value(args.qdrant_url, "VECTOR_DB_URL")
+        qdrant_key = _backup_environment_value(None, "VECTOR_DB_KEY")
+
+        def restore() -> dict[str, Any]:
+            with QdrantSnapshotStore(url=qdrant_url, api_key=qdrant_key) as store:
+                return restore_generation_backup(
+                    generation_id=generation_id,
+                    backup_root=Path(args.backup_root).expanduser(),
+                    target_data_root=Path(args.target_data_root).expanduser(),
+                    snapshot_store=store,
+                )
+
+        result = await asyncio.to_thread(restore)
+    except (GenerationBackupError, OSError, ValueError) as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel backup restore: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Citadel generation restored: {result['generation_id']}")
+    return 0
+
+
 class _Spinner:
     """An animated stdlib progress indicator on stderr (so stdout stays clean).
 
@@ -211,6 +294,10 @@ def _needs_server(
             return 1
 
     return wrapper
+
+
+_backup_generation_create = _needs_server(_backup_generation_create)
+_backup_generation_restore = _needs_server(_backup_generation_restore)
 
 
 def _prompt(text: str) -> str:
@@ -582,28 +669,15 @@ def _emit_search_timeout(
     note: str,
     partial: dict[str, Any] | None = None,
 ) -> int:
-    """Prefer truncated JSON (optionally with partial hits) over a hard agent fail."""
-    from kb.search_format import shape_search_payload
-
-    empty: dict[str, Any] = {
-        "query": args.query,
-        "results": (partial or {}).get("results") or [],
-        "timed_out": True,
-        "truncated": True,
-        "note": note or "search timed out",
-    }
-    if isinstance(partial, dict):
-        for key in ("sections", "dataset", "datasets", "took_ms"):
-            if key in partial:
-                empty[key] = partial[key]
-    shaped = shape_search_payload(empty, **_shape_kwargs(args))
-    if getattr(args, "json", False):
-        _print_json(shaped)
-        return 0
-    print("citadel search: timed out — returning truncated results", file=sys.stderr)
-    if shaped.get("results"):
-        _render_search({**empty, "results": shaped["results"], "sections": None}, args.query)
-    return 0
+    """Report an expired search budget as a typed failure, never empty success."""
+    del partial
+    return _emit_error(
+        "search",
+        note or "search timed out",
+        as_json=getattr(args, "json", False),
+        code="SEARCH_TIMEOUT",
+        extra={"http_status": 504},
+    )
 
 
 def _is_timeout_exc(exc: BaseException) -> bool:
@@ -700,19 +774,36 @@ async def _search(args: argparse.Namespace) -> int:
                 mode=shape_kw.get("mode"),
             )
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        from kb.security_scan import redact_secrets
+
+        raw_detail = exc.read().decode(errors="replace")[:500] if exc.fp else str(exc.reason)
+        detail = redact_secrets(raw_detail, token)
+        error_code = "HTTP_ERROR"
+        error_message = f"HTTP {exc.code} {detail}"
+        try:
+            error_payload = json.loads(raw_detail)
+        except (json.JSONDecodeError, TypeError):
+            error_payload = None
+        if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), dict):
+            typed_detail = error_payload["detail"]
+            typed_code = typed_detail.get("code")
+            typed_message = typed_detail.get("message")
+            if isinstance(typed_code, str) and typed_code:
+                error_code = typed_code
+            if isinstance(typed_message, str) and typed_message:
+                error_message = redact_secrets(typed_message, token)
         as_json = getattr(args, "json", False)
         if not as_json:
             _print_auth_hint("search", exc.code)
         return _emit_error(
             "search",
-            f"HTTP {exc.code} {detail}",
+            error_message,
             as_json=as_json,
-            code="HTTP_ERROR",
+            code=error_code,
             extra={"http_status": exc.code},
         )
     except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-        # TimeoutError and urllib URLError("timed out") share one soft-fail path.
+        # TimeoutError and urllib URLError("timed out") share one typed failure path.
         if _is_timeout_exc(exc):
             return _emit_search_timeout(args, note=str(exc) or "search timed out")
         return _emit_error(
@@ -720,17 +811,14 @@ async def _search(args: argparse.Namespace) -> int:
         )
 
     raw = payload if isinstance(payload, dict) else {"results": []}
-    # Server may already mark soft timeout with partial/empty results.
+    # Compatibility with an older Node timeout envelope. Never reinterpret it
+    # as a successful empty search.
     if raw.get("timed_out") or raw.get("truncated"):
-        shaped = shape_search_payload(raw, **shape_kw)
-        if getattr(args, "json", False):
-            _print_json(shaped)
-            return 0
-        for warning in shaped.get("warnings") or []:
-            print(paint(f"warning: {warning}", "yellow"), file=sys.stderr)
-        display_results = shaped["results"] if filters_on or shaped.get("spec_mode") else raw.get("results")
-        _render_search({**raw, "results": display_results or [], "sections": None}, args.query)
-        return 0
+        return _emit_search_timeout(
+            args,
+            note=str(raw.get("note") or "search timed out"),
+            partial=raw,
+        )
 
     shaped = shape_search_payload(raw, **shape_kw)
     if getattr(args, "json", False):
@@ -1243,9 +1331,20 @@ async def _capture(args: argparse.Namespace) -> int:
             cognee_result.get("status") if isinstance(cognee_result, dict) else None
         ) or response.get("status")
         if accepted:
-            results.append(
-                {"root": root.path, "ok": True, "status": status, "tags": payload["tags"]}
-            )
+            result = {
+                "root": root.path,
+                "ok": True,
+                "status": status,
+                "tags": payload["tags"],
+            }
+            for field in (
+                "source_revision_id",
+                "projection_job_id",
+                "projection_state",
+            ):
+                if field in response:
+                    result[field] = response[field]
+            results.append(result)
             if not as_json:
                 print(f"OK  {root.path} ({status})")
         elif reason == "duplicate_in_process":
@@ -2968,6 +3067,33 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_local.add_argument("--json", action="store_true")
     deploy_local.set_defaults(handler=_deploy_local)
 
+    backup = subcommands.add_parser(
+        "backup",
+        help="Create or restore an offline SQLite Lite generation backup",
+    )
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser(
+        "create",
+        help="Back up stopped Lite state and every generation Qdrant collection",
+    )
+    backup_create.add_argument("destination")
+    backup_create.add_argument("--data-root", default="/data")
+    backup_create.add_argument("--generation-id")
+    backup_create.add_argument("--qdrant-url")
+    backup_create.add_argument("--json", action="store_true")
+    backup_create.set_defaults(handler=_backup_generation_create)
+
+    backup_restore = backup_sub.add_parser(
+        "restore",
+        help="Restore a sealed generation backup into empty targets",
+    )
+    backup_restore.add_argument("backup_root")
+    backup_restore.add_argument("target_data_root")
+    backup_restore.add_argument("--generation-id")
+    backup_restore.add_argument("--qdrant-url")
+    backup_restore.add_argument("--json", action="store_true")
+    backup_restore.set_defaults(handler=_backup_generation_restore)
+
     onboard = subcommands.add_parser(
         "onboard",
         help="One-shot teammate setup: token + hooks + MCP + capture roots",
@@ -3261,7 +3387,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=None,
-        help="Client soft-timeout seconds (default: Node search timeout); returns truncated JSON on expiry",
+        help="Client timeout seconds (default: 35); expiry returns SEARCH_TIMEOUT and exit 1",
     )
     search.add_argument(
         "--budget-ms",

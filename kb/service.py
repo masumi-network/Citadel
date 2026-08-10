@@ -562,6 +562,26 @@ class Citadel:
         )
         return payload
 
+    def lifecycle_current_head_evidence(
+        self,
+        *,
+        dataset: str,
+        source_keys: tuple[str, ...] | list[str],
+    ) -> dict[str, Any]:
+        """Return exact current-head evidence for the active projection identity."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request()
+        return asdict(
+            self.lifecycle_store.current_head_evidence(
+                dataset,
+                source_keys,
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+                config_digest=projection.config_digest,
+            )
+        )
+
     def lifecycle_generation_census(
         self,
         *,

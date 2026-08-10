@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from io import BytesIO
 import json
 from pathlib import Path
 from typing import Any
+import urllib.error
 
 import pytest
 
@@ -198,6 +200,50 @@ def test_check_search_uses_short_smoke_timeout(monkeypatch) -> None:
     check = status_mod.check_search("https://node.example", "ctdl_tok")
     assert check.ok
     assert captured["timeout"] == status_mod._SMOKE_SEARCH_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "timed_out"),
+    [
+        (504, status_mod.CODE_SEARCH_TIMEOUT, True),
+        (503, status_mod.CODE_QDRANT_UNAVAILABLE, False),
+    ],
+)
+def test_check_search_preserves_typed_server_error(
+    monkeypatch,
+    status: int,
+    code: str,
+    timed_out: bool,
+) -> None:
+    body = json.dumps(
+        {
+            "detail": {
+                "code": code,
+                "message": "bearer ctdl_secret must not reach status output",
+            }
+        }
+    ).encode()
+
+    def raise_typed(request: Any, timeout: float | None = None) -> None:
+        raise urllib.error.HTTPError(request.full_url, status, "failure", {}, BytesIO(body))
+
+    monkeypatch.setattr(status_mod._OPENER, "open", raise_typed)
+    check = status_mod.check_search("https://node.example", "ctdl_tok")
+
+    assert check.ok is False
+    assert check.data["code"] == code
+    assert check.data["http_status"] == status
+    assert check.data.get("timed_out", False) is timed_out
+    assert "ctdl_secret" not in check.detail
+
+    report = StatusReport(
+        node_url="https://node.example",
+        healthy=True,
+        identity={"seat_slug": "a"},
+        checks=[Check("auth", ok=True, detail="valid"), check],
+        recent=[],
+    )
+    assert report.readiness()["code"] == code
 
 
 def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:

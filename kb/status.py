@@ -32,19 +32,16 @@ TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 MCP_SERVER_NAME = "citadel"
 SESSION_HOOK_MARKER = "kb.hooks.sync_session"
 _TIMEOUT = 8.0
-# Full vault search. The server caps its own recall at ``search_timeout_seconds``
-# (config default 20s) and then answers HTTP 200 with a structured
-# ``{timed_out:true, code:"TIMEOUT"}`` envelope. The client budget MUST sit above
-# that server budget plus the server's post-recall work (drilldown, telemetry,
-# mesh, audit) plus network, or the client aborts at the exact moment the server
-# is about to return — turning a recoverable soft-timeout into a hard client
-# failure, and killing normal 13-20s searches just before they'd return. 35s
-# leaves ~15s of slack over the 20s server budget.
+# Full vault search. The server caps recall at ``search_timeout_seconds``
+# (config default 20s) and answers HTTP 504 with ``SEARCH_TIMEOUT`` when that
+# budget expires. The client budget sits above the server budget plus bounded
+# response work and network latency so callers receive that typed response
+# instead of aborting the socket first. 35s leaves about 15s of slack.
 _SEARCH_TIMEOUT = 35.0
 # Status smoke must not inherit the full search budget — search never gates
 # `healthy`. But 3s sat below the FLOOR of real cognee recall latency (6-12s), so
 # `--check-search` reported "timed out — node warming up" on every healthy node.
-# 15s clears typical latency while staying under the server's 20s soft cap.
+# 15s clears typical latency while staying under the server's 20s budget.
 _SMOKE_SEARCH_TIMEOUT = 15.0
 _INGEST_TIMEOUT = 60.0  # /ingest does real write work (and cold nodes are slow)
 _SMOKE_QUERY = "citadel status connectivity smoke"
@@ -69,7 +66,10 @@ MCP_AGENT_FALLBACK = (
 CODE_AUTH_REQUIRED = "AUTH_REQUIRED"
 CODE_SEARCH_UNAVAILABLE = "SEARCH_UNAVAILABLE"
 CODE_SEARCH_NO_LEXICAL_MATCH = "SEARCH_NO_LEXICAL_MATCH"
-CODE_TIMEOUT = "TIMEOUT"
+CODE_SEARCH_TIMEOUT = "SEARCH_TIMEOUT"
+CODE_QDRANT_UNAVAILABLE = "QDRANT_UNAVAILABLE"
+# Compatibility alias for internal callers that imported the old constant name.
+CODE_TIMEOUT = CODE_SEARCH_TIMEOUT
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -117,6 +117,19 @@ def _humanize_net_error(exc: Exception) -> str:
     return text
 
 
+def _typed_http_error_code(exc: urllib.error.HTTPError) -> str | None:
+    """Read one bounded FastAPI error body and return only its stable code."""
+    try:
+        raw = exc.read(4096).decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("detail"), dict):
+        return None
+    code = payload["detail"].get("code")
+    return code if isinstance(code, str) and code else None
+
+
 @dataclass
 class Check:
     name: str
@@ -151,11 +164,18 @@ class StatusReport:
             reason = detail
         elif not search_probed:
             reason = "search not probed; pass --check-search"
-        elif (search.data or {}).get("timed_out") or (search.data or {}).get("code") == CODE_TIMEOUT:
-            code = CODE_TIMEOUT
+        elif (search.data or {}).get("timed_out") or (
+            search.data or {}
+        ).get("code") == CODE_SEARCH_TIMEOUT:
+            code = CODE_SEARCH_TIMEOUT
             reason = search.detail or "search timed out"
         elif not search_ok:
-            code = CODE_SEARCH_UNAVAILABLE
+            search_code = (search.data or {}).get("code")
+            code = (
+                CODE_QDRANT_UNAVAILABLE
+                if search_code == CODE_QDRANT_UNAVAILABLE
+                else CODE_SEARCH_UNAVAILABLE
+            )
             reason = search.detail or "search unavailable"
         else:
             reason = "ok"
@@ -252,12 +272,41 @@ def check_search(
             payload={"query": _SMOKE_QUERY, "top_k": 1},
             timeout=timeout,
         )
+    except urllib.error.HTTPError as exc:
+        typed_code = _typed_http_error_code(exc)
+        if exc.code == 504 and typed_code == CODE_SEARCH_TIMEOUT:
+            return Check(
+                "search",
+                ok=False,
+                detail="server search budget expired; node may still be warming up",
+                data={
+                    "timed_out": True,
+                    "code": CODE_SEARCH_TIMEOUT,
+                    "http_status": 504,
+                },
+            )
+        if exc.code == 503 and typed_code == CODE_QDRANT_UNAVAILABLE:
+            return Check(
+                "search",
+                ok=False,
+                detail="Qdrant unavailable",
+                data={
+                    "code": CODE_QDRANT_UNAVAILABLE,
+                    "http_status": 503,
+                },
+            )
+        return Check(
+            "search",
+            ok=False,
+            detail=_humanize_net_error(exc),
+            data={"code": CODE_SEARCH_UNAVAILABLE, "http_status": exc.code},
+        )
     except TimeoutError:
         return Check(
             "search",
             ok=False,
             detail=f"timed out after {timeout:g}s — node warming up",
-            data={"timed_out": True, "code": CODE_TIMEOUT},
+            data={"timed_out": True, "code": CODE_SEARCH_TIMEOUT},
         )
     except Exception as exc:
         # urllib may wrap a socket timeout as URLError("timed out") — treat like
@@ -267,7 +316,7 @@ def check_search(
                 "search",
                 ok=False,
                 detail=f"timed out after {timeout:g}s — node warming up",
-                data={"timed_out": True, "code": CODE_TIMEOUT},
+                data={"timed_out": True, "code": CODE_SEARCH_TIMEOUT},
             )
         return Check(
             "search",

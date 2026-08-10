@@ -677,6 +677,61 @@ def test_ingest_tool_honors_cognify_opt_out() -> None:
     assert post["timeout"] is None
 
 
+def test_share_session_tool_preserves_server_lifecycle_operations() -> None:
+    class ReceiptClient(FakeHttpClient):
+        def post(self, path: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            self.posts.append({"path": path, "payload": payload, **kwargs})
+            return {
+                "ok": True,
+                "operations": [
+                    {
+                        "dataset": "seat:alice",
+                        "accepted": True,
+                        "source_revision_id": "source-seat",
+                        "projection_job_id": "job-seat",
+                        "projection_state": "pending",
+                    },
+                    {
+                        "dataset": "session-traces",
+                        "accepted": True,
+                        "source_revision_id": "source-shared",
+                        "projection_job_id": "job-shared",
+                        "projection_state": "queued",
+                    },
+                ],
+            }
+
+    client = ReceiptClient()
+    server = create_mcp_server(client)
+
+    result = run_tool(
+        server,
+        "citadel_share_session",
+        None,
+        cwd="/workspace",
+        data="Task: preserve lifecycle receipts",
+        capture_roots=["/workspace"],
+    )
+
+    assert result["operations"] == [
+        {
+            "dataset": "seat:alice",
+            "accepted": True,
+            "source_revision_id": "source-seat",
+            "projection_job_id": "job-seat",
+            "projection_state": "pending",
+        },
+        {
+            "dataset": "session-traces",
+            "accepted": True,
+            "source_revision_id": "source-shared",
+            "projection_job_id": "job-shared",
+            "projection_state": "queued",
+        },
+    ]
+    assert client.posts[-1]["path"] == "/api/share-session"
+
+
 def test_ingest_timeout_reports_an_unconfirmed_write_not_a_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1258,6 +1313,57 @@ def test_http_errors_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "ctdl_other" not in message
     assert "sk-test" not in message
     assert "[REDACTED]" in message
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (504, "SEARCH_TIMEOUT", "Search budget expired."),
+        (503, "QDRANT_UNAVAILABLE", "Qdrant is unavailable."),
+    ],
+)
+def test_search_tool_error_carries_typed_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    code: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv("CITADEL_RETRY_MAX_ATTEMPTS", "1")
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        body = json.dumps({"detail": {"code": code, "message": message}}).encode()
+        raise HTTPError(request.full_url, status, message, {}, BytesIO(body))
+
+    monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
+    server = create_mcp_server(
+        CitadelHttpClient(base_url="http://localhost:8000", access_token="ctdl_t")
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        run_tool(server, "citadel_search", "absent", None)
+
+    error = str(exc_info.value)
+    assert f"code={code}" in error
+    assert f"http_status={status}" in error
+    assert message in error
+
+
+def test_search_genuine_empty_is_a_normal_mcp_result() -> None:
+    class EmptySearchClient(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            super().post(path, payload, tool_name=tool_name, timeout=timeout)
+            return {"results": []}
+
+    result = run_tool(create_mcp_server(EmptySearchClient()), "citadel_search", "absent", None)
+
+    assert result == {"results": []}
 
 
 def test_contribute_tool_posts_through_the_contribute_endpoint() -> None:

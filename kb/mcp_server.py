@@ -131,12 +131,19 @@ def _session_from_token_inprocess(
 
 
 class CitadelMcpError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         # HTTP status of the upstream Citadel response, when one arrived.
         # Lets tools/list tell "the node rejected this token" (401) from
         # "the node could not be asked" without parsing the message (#171).
         self.status_code = status_code
+        self.error_code = error_code
 
 
 class CitadelMcpTimeout(CitadelMcpError):
@@ -899,15 +906,30 @@ class CitadelHttpClient:
             else:
                 data = _open()
         except HTTPError as exc:
-            detail = redact_secrets(
-                exc.read().decode("utf-8", errors="replace")[:500],
-                self.access_token,
-            )
+            raw_detail = exc.read().decode("utf-8", errors="replace")[:500]
+            detail = redact_secrets(raw_detail, self.access_token)
+            error_code: str | None = None
+            try:
+                error_payload = json.loads(raw_detail)
+            except json.JSONDecodeError:
+                error_payload = None
+            if isinstance(error_payload, dict) and isinstance(
+                error_payload.get("detail"), dict
+            ):
+                typed_detail = error_payload["detail"]
+                typed_code = typed_detail.get("code")
+                typed_message = typed_detail.get("message")
+                if isinstance(typed_code, str) and typed_code:
+                    error_code = typed_code
+                if isinstance(typed_message, str) and typed_message:
+                    detail = redact_secrets(typed_message, self.access_token)
             logger.warning(
                 "Citadel API call %s %s returned HTTP %s", method, path, exc.code
             )
             raise CitadelMcpError(
-                f"Citadel returned HTTP {exc.code}: {detail}", status_code=exc.code
+                f"Citadel returned HTTP {exc.code}: {detail}",
+                status_code=exc.code,
+                error_code=error_code,
             ) from exc
         except TimeoutError as exc:
             # A read timeout escapes urlopen unwrapped (only the connect phase
@@ -959,7 +981,13 @@ def _call(operation: str, func: Any) -> dict[str, Any]:
     try:
         return func()
     except CitadelMcpError as exc:
-        raise ToolError(f"{operation} failed: {exc}") from exc
+        metadata = []
+        if exc.error_code:
+            metadata.append(f"code={exc.error_code}")
+        if exc.status_code is not None:
+            metadata.append(f"http_status={exc.status_code}")
+        suffix = f" ({', '.join(metadata)})" if metadata else ""
+        raise ToolError(f"{operation} failed: {exc}{suffix}") from exc
 
 
 async def _call_async(operation: str, func: Any) -> dict[str, Any]:

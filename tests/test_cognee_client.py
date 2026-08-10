@@ -782,7 +782,10 @@ async def test_zero_chunk_census_fails_when_vectors_are_unavailable(
         await client.corpus_zero_chunk_documents()
 
 
-def test_auto_feedback_is_off_by_default_in_cognees_own_config(monkeypatch: Any) -> None:
+def test_auto_feedback_is_off_by_default_in_cognees_own_config(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
     """cognee must actually agree the gate is off, not just see our env var (#50, #105).
 
     This asserts through cognee's own is_auto_feedback_enabled(), which is what
@@ -794,13 +797,38 @@ def test_auto_feedback_is_off_by_default_in_cognees_own_config(monkeypatch: Any)
     request while it runs. It is the leading suspect for the 25-40s /healthz
     hangs in #105, not only the per-search latency in #50.
     """
+    monkeypatch.delenv("AUTO_FEEDBACK", raising=False)
+    monkeypatch.delenv("VECTOR_DB_PROVIDER", raising=False)
+    for key, value in {
+        "SYSTEM_ROOT_DIRECTORY": tmp_path / "system",
+        "DATA_ROOT_DIRECTORY": tmp_path / "data",
+        "CACHE_ROOT_DIRECTORY": tmp_path / "cache",
+        "COGNEE_LOGS_DIR": tmp_path / "logs",
+    }.items():
+        monkeypatch.setenv(key, str(value))
+
+    from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.cache.config import get_cache_config
+    from cognee.infrastructure.databases.cache.get_cache_engine import create_cache_engine
+    from cognee.infrastructure.databases.relational.config import get_relational_config
     from cognee.infrastructure.session.get_session_manager import get_session_manager
 
-    monkeypatch.delenv("AUTO_FEEDBACK", raising=False)
-    CogneePublicClient()._prepare_cognee_environment()
+    cached_factories = (
+        create_cache_engine,
+        get_cache_config,
+        get_relational_config,
+        get_base_config,
+    )
+    for factory in cached_factories:
+        factory.cache_clear()
+    try:
+        CogneePublicClient()._prepare_cognee_environment()
 
-    assert os.environ["AUTO_FEEDBACK"] == "false"
-    assert get_session_manager().is_auto_feedback_enabled() is False
+        assert os.environ["AUTO_FEEDBACK"] == "false"
+        assert get_session_manager().is_auto_feedback_enabled() is False
+    finally:
+        for factory in cached_factories:
+            factory.cache_clear()
 
 
 def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
@@ -1499,7 +1527,7 @@ async def test_failed_background_cognify_retries_without_new_ingest(
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
 
-    await asyncio.wait_for(retried.wait(), timeout=1)
+    await asyncio.wait_for(retried.wait(), timeout=3)
 
     async def wait_for_queue_empty() -> None:
         while queue.snapshot():
@@ -2081,6 +2109,67 @@ async def test_cognee_public_client_returns_empty_results_for_empty_store(
     result = await client.recall("note", dataset="notes")
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_cognee_public_client_returns_empty_results_for_absent_dataset(
+    monkeypatch: Any,
+) -> None:
+    class DatasetNotFoundError(Exception):
+        pass
+
+    async def run_migrations() -> None:
+        return None
+
+    async def search(**kwargs: Any) -> list[dict[str, Any]]:
+        raise DatasetNotFoundError("No datasets found. (Status code: 404)")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            SearchType=SimpleNamespace(CHUNKS="chunks"),
+            run_migrations=run_migrations,
+            search=search,
+        ),
+    )
+
+    result = await CogneePublicClient().recall("note", dataset="configured-but-absent")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "search_error",
+    [
+        PermissionError("dataset access denied"),
+        RuntimeError("Qdrant unavailable"),
+    ],
+    ids=["permission", "provider"],
+)
+async def test_cognee_public_client_surfaces_non_empty_search_failures(
+    monkeypatch: Any,
+    search_error: Exception,
+) -> None:
+    async def run_migrations() -> None:
+        return None
+
+    async def search(**kwargs: Any) -> list[dict[str, Any]]:
+        raise search_error
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            SearchType=SimpleNamespace(CHUNKS="chunks"),
+            run_migrations=run_migrations,
+            search=search,
+        ),
+    )
+
+    with pytest.raises(type(search_error), match=str(search_error)):
+        await CogneePublicClient().recall("note", dataset="notes")
 
 
 @pytest.mark.asyncio
@@ -3662,7 +3751,7 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
     ]
     page_calls: list[tuple[str | None, str | None, int]] = []
     chunk_calls: list[list[str]] = []
-    graph_calls: list[list[str]] = []
+    graph_calls: list[tuple[list[str], list[str]]] = []
 
     async def corpus_totals() -> dict[str, Any]:
         return {"documents": 3}
@@ -3677,13 +3766,32 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
         chunk_calls.append(document_ids)
         return {document_id: 2 for document_id in document_ids}
 
-    async def corpus_graph_presence(document_ids: list[str]) -> set[str]:
-        graph_calls.append(document_ids)
+    async def dataset_membership_for_documents(
+        document_ids: list[str],
+    ) -> dict[str, list[str]]:
+        assert document_ids == ["doc-a", "doc-b", "doc-c"]
+        return {
+            "doc-a": ["central"],
+            "doc-b": ["seat:alice"],
+            "doc-c": ["central", "seat:alice"],
+        }
+
+    async def corpus_graph_presence(
+        document_ids: list[str],
+        *,
+        datasets: list[str],
+    ) -> set[str]:
+        graph_calls.append((document_ids, datasets))
         return set(document_ids) | {"stale-graph-node"}
 
     monkeypatch.setattr(client, "corpus_totals", corpus_totals)
     monkeypatch.setattr(client, "corpus_page", corpus_page)
     monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(
+        client,
+        "dataset_membership_for_documents",
+        dataset_membership_for_documents,
+    )
     monkeypatch.setattr(client, "corpus_graph_presence", corpus_graph_presence)
 
     health = await client.corpus_health(limit=2)
@@ -3693,7 +3801,10 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
         ("2026-01-02T00:00:00+00:00", "doc-b", 1),
     ]
     assert chunk_calls == [["doc-a", "doc-b", "doc-c"]]
-    assert graph_calls == [["doc-a", "doc-b", "doc-c"]]
+    assert graph_calls == [
+        (["doc-a", "doc-c"], ["central"]),
+        (["doc-b", "doc-c"], ["seat:alice"]),
+    ]
     assert health == {
         "relational_documents": 3,
         "probe_limit": 2,

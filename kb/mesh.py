@@ -368,7 +368,18 @@ class MeshState:
         async with self._lock:
             self._ensure_base_graph(config)
             dataset_id = self._dataset_node(dataset)
-            if result.accepted:
+            lifecycle_evidence = any(
+                value is not None
+                for value in (
+                    result.source_revision_id,
+                    result.projection_job_id,
+                    result.projection_state,
+                )
+            )
+            indexed = result.accepted and (
+                not lifecycle_evidence or result.projection_state == "searchable"
+            )
+            if indexed:
                 document_id = stable_id("document", f"{dataset}:{data}")
                 label = data.strip().splitlines()[0][:80] or "Untitled memory"
                 self.nodes[document_id] = {
@@ -398,6 +409,19 @@ class MeshState:
                         "reason": result.reason,
                         "tags": list(result.tags),
                         "chunks": 1,
+                    },
+                )
+            elif result.accepted:
+                await self._record_event(
+                    "ingest_pending",
+                    "Memory accepted, projection pending",
+                    {
+                        "dataset": dataset,
+                        "reason": result.reason,
+                        "tags": list(result.tags),
+                        "source_revision_id": result.source_revision_id,
+                        "projection_job_id": result.projection_job_id,
+                        "projection_state": result.projection_state,
                     },
                 )
             else:
@@ -969,6 +993,7 @@ class MeshState:
     def _timeline_envelope(self, event_type: str, details: dict[str, Any]) -> dict[str, Any]:
         profiles = {
             "ingest": ("chunk_indexed", "indexed", "manual_ingest"),
+            "ingest_pending": ("projection_queued", "pending", "manual_ingest"),
             "reject": ("chunk_rejected", "rejected", "manual_ingest"),
             "search": ("retrieval_served", "searched", "search"),
             "feedback": ("feedback_recorded", "recorded", "feedback"),

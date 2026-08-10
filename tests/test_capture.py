@@ -137,6 +137,33 @@ def test_post_capture_refuses_non_https() -> None:
         post_capture("http://node.example", "ctdl_x", {"data": "x", "tags": []})
 
 
+def test_post_capture_allows_loopback_http(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeResp:
+        def __enter__(self) -> "_FakeResp":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"status":"ok"}'
+
+    def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
+        captured["url"] = request.full_url
+        return _FakeResp()
+
+    monkeypatch.setattr(capture_mod._OPENER, "open", fake_open)
+
+    assert post_capture(
+        "http://127.0.0.1:8000",
+        "ctdl_tok",
+        {"data": "d", "tags": ["capture"]},
+    ) == {"status": "ok"}
+    assert captured["url"] == "http://127.0.0.1:8000/ingest"
+
+
 def test_post_capture_posts_payload(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -289,6 +316,53 @@ def test_capture_accepted_reports_ok_true(tmp_path: Path, monkeypatch, capsys) -
     assert out["ok"] is True
     assert out["results"][0]["ok"] is True
     assert out["results"][0]["status"] == "ok"
+
+
+def test_capture_json_preserves_returned_lifecycle_fields_per_root(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    config_path = tmp_path / "capture.json"
+    save_capture_config(
+        CaptureConfig(node_url="https://node.example")
+        .with_root(str(first), ["personal"])
+        .with_root(str(second), ["personal"]),
+        path=config_path,
+    )
+    responses = iter(
+        [
+            {
+                "accepted": True,
+                "status": "queued",
+                "source_revision_id": "source-first",
+                "projection_job_id": "job-first",
+                "projection_state": "pending",
+            },
+            {
+                "accepted": True,
+                "status": "queued",
+                "source_revision_id": "source-second",
+            },
+        ]
+    )
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: next(responses))
+
+    rc = asyncio.run(
+        _capture(argparse.Namespace(config=str(config_path), root=None, dry_run=False, json=True))
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["results"][0]["source_revision_id"] == "source-first"
+    assert out["results"][0]["projection_job_id"] == "job-first"
+    assert out["results"][0]["projection_state"] == "pending"
+    assert out["results"][1]["source_revision_id"] == "source-second"
+    assert "projection_job_id" not in out["results"][1]
+    assert "projection_state" not in out["results"][1]
 
 
 def test_capture_response_without_accepted_field_still_ok(
