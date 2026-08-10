@@ -18,6 +18,7 @@ from packaging.specifiers import SpecifierSet
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COGNEE_VERSION = "1.4.1"
 CRYPTOGRAPHY_VERSION = "50.0.0"
+LADYBUG_VERSION = "0.18.2"
 
 
 def _cognee_requirement(lines: list[str]) -> str:
@@ -65,6 +66,29 @@ def test_qdrant_client_pin_matches_between_pyproject_and_requirements() -> None:
     requirements_pin = _requirement(requirements, "qdrant-client")
 
     assert pyproject_pin == requirements_pin == "qdrant-client==1.19.0"
+
+
+def test_ladybug_pin_matches_its_license_exemption() -> None:
+    """Any ladybug bump must re-verify its license by hand.
+
+    dependency-review-action's purlsMatch() compares package type and name
+    only, so the allow-dependencies-licenses purl in
+    .github/workflows/dependency-review.yml exempts ladybug from the license
+    gate at EVERY version, not just the one in its @ suffix. The exemption
+    exists because the dependency graph misreads MIT ladybug 0.18.2 as
+    GPL-3.0-or-later. This equality is the compensating control: bumping
+    ladybug fails here until the new version is confirmed MIT and the pins,
+    the workflow purl, and this constant move together.
+    """
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    workflow = (REPO_ROOT / ".github" / "workflows" / "dependency-review.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert f'"ladybug=={LADYBUG_VERSION}"' in pyproject_text
+    assert _requirement(requirements, "ladybug") == f"ladybug=={LADYBUG_VERSION}"
+    assert f"pkg:pypi/ladybug@{LADYBUG_VERSION}" in workflow
 
 
 def test_project_supports_python_3_12() -> None:

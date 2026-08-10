@@ -41,4 +41,21 @@ jobs:
           # NOT denied — it is compatible when linked, not vendored.
           deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, AGPL-1.0, SSPL-1.0
 
+          # `ladybug` on PyPI is the LadybugDB embedded graph database (the
+          # Kuzu successor), MIT-licensed: the 0.18.2 PyPI metadata declares
+          # License: MIT and github.com/LadybugDB/ladybug carries an MIT
+          # LICENSE. The dependency graph misclassifies it as
+          # GPL-3.0-or-later, most plausibly stale metadata from the
+          # unrelated Ladybug Tools project that also published under this
+          # package name.
+          #
+          # The action's purlsMatch() compares package type and name only
+          # and never reads the version, so despite the @0.18.2 suffix this
+          # line exempts the package BY NAME at every version. The
+          # compensating control is tests/test_dependency_pins.py::
+          # test_ladybug_pin_matches_its_license_exemption, which fails on
+          # any ladybug bump until the new version's license is re-verified
+          # and the pins, this purl, and that test move together.
+          allow-dependencies-licenses: pkg:pypi/ladybug@0.18.2
+
           comment-summary-in-pr: on-failure
