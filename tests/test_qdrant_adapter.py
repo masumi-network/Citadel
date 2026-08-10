@@ -585,6 +585,50 @@ async def test_search_filters_lifecycle_documents_before_qdrant_ranking() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "batch_search"])
+async def test_empty_document_scope_still_reports_a_dead_provider(
+    operation: str,
+) -> None:
+    # An empty lifecycle scope and a dead Qdrant produce the same zero rows, so
+    # returning [] without one provider call makes an outage indistinguishable
+    # from an empty page all the way up to the HTTP boundary.
+    client = _FakeClient()
+    client.fail_on.add("collection_exists")
+    adapter = _adapter(client)
+
+    with qdrant_scope(mode="read", generation_id=GENERATION, dataset=ALICE):
+        with qdrant_document_scope([]):
+            with pytest.raises(
+                QdrantProviderError, match="Qdrant collection check failed"
+            ):
+                if operation == "search":
+                    await adapter.search(
+                        LOGICAL_COLLECTION, query_vector=[1.0, 0.0, 0.0]
+                    )
+                else:
+                    await adapter.batch_search(LOGICAL_COLLECTION, ["private query"])
+
+    assert client.kwargs_for("close")
+
+
+@pytest.mark.asyncio
+async def test_empty_document_scope_on_a_healthy_provider_stays_empty() -> None:
+    # The other half of the contract: a healthy store with nothing searchable
+    # still answers zero rows, and still never ranks.
+    client = _FakeClient()
+    adapter = _adapter(client)
+
+    with qdrant_scope(mode="read", generation_id=GENERATION, dataset=ALICE):
+        with qdrant_document_scope([]):
+            assert await adapter.search(LOGICAL_COLLECTION, query_text="q") == []
+            assert await adapter.batch_search(LOGICAL_COLLECTION, ["q"]) == [[]]
+
+    assert client.kwargs_for("collection_exists")
+    assert client.kwargs_for("query_points") == []
+    assert client.kwargs_for("query_batch_points") == []
+
+
+@pytest.mark.asyncio
 async def test_retrieve_derives_stored_ids_and_returns_raw_ids() -> None:
     raw_id = uuid4()
     client = _FakeClient()

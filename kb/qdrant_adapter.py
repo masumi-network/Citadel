@@ -633,12 +633,16 @@ class CitadelQdrantAdapter(VectorDBInterface):
             raise MissingQueryParameterError()
         scope = self._scope({"read"})
         allowed_document_ids = _QDRANT_DOCUMENT_IDS.get()
-        if allowed_document_ids == frozenset():
-            return []
         physical = physical_collection_name(
             self.generation_id, scope.dataset, collection_name
         )
+        # A lifecycle scope that authorizes no document and a store that is down
+        # both produce zero rows, so the collection check runs FIRST: without one
+        # provider call an outage is indistinguishable from an empty page, and the
+        # typed 503 at the HTTP boundary can never fire (BLK-2026-08-10-08).
         if not await self._collection_exists(physical):
+            return []
+        if allowed_document_ids == frozenset():
             return []
         if query_vector is None:
             query_vector = (await self.embed_data([str(query_text)]))[0]
@@ -688,12 +692,13 @@ class CitadelQdrantAdapter(VectorDBInterface):
     ) -> list[list[ScoredResult]]:
         scope = self._scope({"read"})
         allowed_document_ids = _QDRANT_DOCUMENT_IDS.get()
-        if allowed_document_ids == frozenset():
-            return [[] for _ in query_texts]
         physical = physical_collection_name(
             self.generation_id, scope.dataset, collection_name
         )
+        # Collection check first, for the reason spelled out in ``search``.
         if not await self._collection_exists(physical):
+            return [[] for _ in query_texts]
+        if allowed_document_ids == frozenset():
             return [[] for _ in query_texts]
         if not query_texts:
             return []
