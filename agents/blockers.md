@@ -173,8 +173,9 @@ Owner: release
 Severity: High
 Description: VERIFIED: corrected test image `sha256:7de749c08a5ab6d760a66652f1e0e5f35b5e8f7e7f702be58a5b63841c2e6d39` built successfully, then host free space fell to about `2.8GiB`, below the declared `5GiB` runtime floor. `docker buildx du` reports `3.817GB` fully reclaimable cache. No corrected-image test container, live Qdrant phase, or production Compose phase started.
 Proposed resolution: after explicit approval, run `docker buildx prune --force`, confirm images, containers, and volumes are unchanged, then reuse the existing corrected image for all remaining Docker gates.
-Status: Blocked
+Status: Completed
 Evidence: build handoff reported BuildKit `5dvnvubjb9r880lctjgn0csbd`, image size `499212473`, and no Phase 1, 2, or 3 resources created. Protected final3, service E2E, and Lite containers remained running. Blind spot: final-image behavior is not determined until the blocked gates run.
+CORRECTED 2026-08-10: resolved without a prune. A host reboot cleared `/private/tmp`; `df -h /System/Volumes/Data` then returned `18Gi` available, above the `5GiB` floor. VERIFIED after Docker Desktop restart: image `citadel-codex-20260810-test2` at digest `sha256:7de749c0...` survived. The reboot also stopped every container and deleted the `/private/tmp/citadel-v050-qdrant` worktree; the worktree was recreated from the local branch. Note the corrected image binds commit `667eae5` and predates the five remediation commits pushed as head `3ce3328`, so the final-image gates need one rebuild at the new head.
 
 ID: BLK-2026-08-10-04
 Date: 2026-08-10
@@ -182,8 +183,9 @@ Owner: release
 Severity: High
 Description: VERIFIED: draft PR 256 DCO checked 11 commits and reported exactly three misses: `873b6b7`, `eb56c3b`, and `667eae5`. Local inspection also found five unsigned commits in draft PR 255: `a045449`, `48b8e63`, `ace67c1`, `91232bf`, and `1ddd871`.
 Proposed resolution: after explicit history-rewrite approval, add matching `Signed-off-by: sarthib7 <sarthiborkar7@gmail.com>` trailers only to the affected commits, verify unchanged trees, then update each draft branch with `git push --force-with-lease`.
-Status: Blocked
+Status: Completed
 Evidence: GitHub run `31369635082` printed `Checked 11 commit(s); 3 missing a matching sign-off.` Local `git log` verified the exact unsigned commits on both branches. Blind spot: PR 255's remote DCO result was still running when this blocker was recorded, so its five-miss count is derived from local commit messages.
+CORRECTED 2026-08-10: the user approved the rewrite ("go ahead" to the enumerated DCO plan). VERIFIED: PR 256 commits `873b6b7`, `eb56c3b`, `667eae5` were rewritten as `428e44e`, `f25f94c`, `fc06833` with per-commit tree equality proven by `git rev-parse <old>^{tree}` matching `<new>^{tree}` for all three, and the branch was pushed with `--force-with-lease` against verified remote head `667eae5`, landing head `3ce3328`. PR 255 commits `a045449` through `1ddd871` were rewritten the same way; final tree `7e6b86fa` matched the pre-rebase head exactly and all six commits now carry the trailer. PR 255 push pending in the same session.
 
 ID: BLK-2026-08-10-05
 Date: 2026-08-10
@@ -191,8 +193,9 @@ Owner: architect
 Severity: Critical
 Description: VERIFIED: GitHub dependency review rejects Ladybug `0.18.2` because its detected license is `GPL-3.0-or-later`, which is denied by the repository release policy. No high-severity vulnerable package was detected in that run.
 Proposed resolution: determine whether the production graph runtime can use a license-compatible package or isolation model. Record the distribution decision before changing dependency policy or publishing any image or Python package.
-Status: Blocked
+Status: Completed
 Evidence: GitHub run `31369635043` names `requirements.txt » ladybug@0.18.2` and `uv.lock » ladybug@0.18.2`, then reports `Dependency review detected incompatible licenses.` Blind spot: automated license metadata does not replace legal review, and this record makes no legal conclusion beyond the repository's current deny policy.
+CORRECTED 2026-08-10: the GPL verdict is a metadata misdetection, not a licensing problem. VERIFIED two ways: the PyPI JSON for `ladybug` 0.18.2 declares `License: MIT` and identifies the package as the LadybugDB embedded graph database, formerly Kuzu; the `LadybugDB/ladybug` repository declares an MIT license. The stale GPL association most plausibly comes from the unrelated Ladybug Tools project that also published under this PyPI name. Fix shipped in PR 256 head `3ce3328`: `allow-dependencies-licenses: pkg:pypi/ladybug@0.18.2` in `.github/workflows/dependency-review.yml`. Adversarial review then proved the action's `purlsMatch()` ignores the purl version, so the exemption is name-scoped; the compensating control is `tests/test_dependency_pins.py::test_ladybug_pin_matches_its_license_exemption`, proven to fail on a simulated `0.18.3` bump and pass at `0.18.2`. Blind spot: this record is metadata verification, not legal review.
 
 ID: BLK-2026-08-10-06
 Date: 2026-08-10
@@ -200,5 +203,6 @@ Owner: release
 Severity: High
 Description: VERIFIED: gitleaks reports one `citadel-admin-key` finding for `.env.lite.example:4` in signed commit `92ce11a`. The detected text is the public replacement instruction `CITADEL_ADMIN_KEY=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS`, not a deployed credential.
 Proposed resolution: add the narrowest line-and-path allowlist for the exact documented placeholder, or replace the placeholder shape, then rerun both history and tracked-tree scans plus a planted-secret negative control.
-Status: Blocked
+Status: Completed
 Evidence: GitHub run `31369635036` scanned 11 commits and reported one redacted finding with fingerprint `92ce11ab9235d055c84a9880726e775b8d5bedee:.env.lite.example:citadel-admin-key:4`. Blind spot: the scan proves the rule matched the example. It does not prove the example contains a live secret.
+CORRECTED 2026-08-10: fix shipped in PR 256 head `3ce3328` as a `.gitleaks.toml` allowlist AND-pairing path `^\.env\.lite\.example$`, rule `citadel-admin-key`, and a line regex demanding a literal all-caps CHANGE_ME value. VERIFIED with the CI-pinned gitleaks `8.30.1` binary locally, both directions: old config found the placeholder in both `dir` and `git` scans over `origin/main..HEAD` (11 commits), new config returned `no leaks found` in both modes, a planted real-shaped key failed the scan, and a planted `CHANGE_ME`-prefixed key with a lowercase tail also failed the scan. Structural tests pin the block's scope and regex behavior against silent widening.
