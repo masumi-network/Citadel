@@ -175,3 +175,30 @@ Description: VERIFIED: corrected test image `sha256:7de749c08a5ab6d760a66652f1e0
 Proposed resolution: after explicit approval, run `docker buildx prune --force`, confirm images, containers, and volumes are unchanged, then reuse the existing corrected image for all remaining Docker gates.
 Status: Blocked
 Evidence: build handoff reported BuildKit `5dvnvubjb9r880lctjgn0csbd`, image size `499212473`, and no Phase 1, 2, or 3 resources created. Protected final3, service E2E, and Lite containers remained running. Blind spot: final-image behavior is not determined until the blocked gates run.
+
+ID: BLK-2026-08-10-04
+Date: 2026-08-10
+Owner: release
+Severity: High
+Description: VERIFIED: draft PR 256 DCO checked 11 commits and reported exactly three misses: `873b6b7`, `eb56c3b`, and `667eae5`. Local inspection also found five unsigned commits in draft PR 255: `a045449`, `48b8e63`, `ace67c1`, `91232bf`, and `1ddd871`.
+Proposed resolution: after explicit history-rewrite approval, add matching `Signed-off-by: sarthib7 <sarthiborkar7@gmail.com>` trailers only to the affected commits, verify unchanged trees, then update each draft branch with `git push --force-with-lease`.
+Status: Blocked
+Evidence: GitHub run `31369635082` printed `Checked 11 commit(s); 3 missing a matching sign-off.` Local `git log` verified the exact unsigned commits on both branches. Blind spot: PR 255's remote DCO result was still running when this blocker was recorded, so its five-miss count is derived from local commit messages.
+
+ID: BLK-2026-08-10-05
+Date: 2026-08-10
+Owner: architect
+Severity: Critical
+Description: VERIFIED: GitHub dependency review rejects Ladybug `0.18.2` because its detected license is `GPL-3.0-or-later`, which is denied by the repository release policy. No high-severity vulnerable package was detected in that run.
+Proposed resolution: determine whether the production graph runtime can use a license-compatible package or isolation model. Record the distribution decision before changing dependency policy or publishing any image or Python package.
+Status: Blocked
+Evidence: GitHub run `31369635043` names `requirements.txt » ladybug@0.18.2` and `uv.lock » ladybug@0.18.2`, then reports `Dependency review detected incompatible licenses.` Blind spot: automated license metadata does not replace legal review, and this record makes no legal conclusion beyond the repository's current deny policy.
+
+ID: BLK-2026-08-10-06
+Date: 2026-08-10
+Owner: release
+Severity: High
+Description: VERIFIED: gitleaks reports one `citadel-admin-key` finding for `.env.lite.example:4` in signed commit `92ce11a`. The detected text is the public replacement instruction `CITADEL_ADMIN_KEY=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS`, not a deployed credential.
+Proposed resolution: add the narrowest line-and-path allowlist for the exact documented placeholder, or replace the placeholder shape, then rerun both history and tracked-tree scans plus a planted-secret negative control.
+Status: Blocked
+Evidence: GitHub run `31369635036` scanned 11 commits and reported one redacted finding with fingerprint `92ce11ab9235d055c84a9880726e775b8d5bedee:.env.lite.example:citadel-admin-key:4`. Blind spot: the scan proves the rule matched the example. It does not prove the example contains a live secret.
