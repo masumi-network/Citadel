@@ -157,6 +157,53 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
 
 
+class _RaisingCitadel:
+    """cognify_dataset raises, i.e. the #27 failure the canary exists to catch."""
+
+    def __init__(self, cognify_calls: list[bool]) -> None:
+        self._cognify_calls = cognify_calls
+
+    async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
+        self._cognify_calls.append(force)
+        raise RuntimeError("cognify exploded mid-pass")
+
+
+async def test_crashed_cognify_records_the_canary_unhealthy(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A raising cognify pass must stamp the canary ok=False, not leave a stale
+    verdict standing, or /readyz reads GREEN through the exact break it gates on
+    (BLK-2026-08-10-14 / #27).
+    """
+    import kb.server as server
+
+    # Seed a prior healthy verdict, which is what makes the bug observable: the
+    # crash must overwrite it, not be swallowed and leave it True.
+    server._LAST_CANARY = {"ok": True, "search_hit": True, "graph_grew": True, "marker": "old"}
+
+    cognify_calls: list[bool] = []
+    _patch_phase1(monkeypatch)
+    monkeypatch.setattr(server, "get_citadel", lambda: _RaisingCitadel(cognify_calls))
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    try:
+        for _ in range(300):
+            if cognify_calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert cognify_calls, "cognify was never attempted"
+    assert server._LAST_CANARY is not None
+    assert server._LAST_CANARY["ok"] is False, "a crashed cognify must flip the canary unhealthy"
+    assert server._LAST_CANARY.get("error") == "RuntimeError"
+
+
 async def test_add_only_mode_does_not_leak_outside_the_pass(tmp_path: Path) -> None:
     """The suppression is scoped to the task tree, never process-wide (#88).
 

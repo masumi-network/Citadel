@@ -386,8 +386,19 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("Evolve scheduler: cognify failed")
+            # A crash in the cognify pass is precisely the failure #27's canary
+            # exists to surface. Recording only clean passes above would leave
+            # the previous verdict standing, so /readyz would read GREEN through
+            # the exact break it is meant to catch. Stamp it unhealthy.
+            _LAST_CANARY = {
+                "ok": False,
+                "search_hit": None,
+                "graph_grew": None,
+                "marker": None,
+                "error": exc.__class__.__name__,
+            }
         finally:
             # Stamp the pass even when a stage failed. This records that the
             # cycle RAN, which is what the next boot needs to resume the
