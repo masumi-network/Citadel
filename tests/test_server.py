@@ -3583,6 +3583,85 @@ def test_search_qdrant_outage_is_a_typed_failure() -> None:
     assert "secret detail" not in response.text
 
 
+def _outage_adapter(generation: str) -> Any:
+    """A real Qdrant adapter whose every call hits an unresolvable host.
+
+    The client raises the SAME qdrant_client exception a stopped container
+    produces, so ``_collection_exists`` wraps it in the real
+    QdrantProviderError rather than a stand-in the adapter never emits.
+    """
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    from kb.qdrant_adapter import CitadelQdrantAdapter
+
+    class _DeadClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            del collection_name
+            raise ResponseHandlingException("Name or service not known")
+
+        async def close(self) -> None:
+            return None
+
+    class _Embedding:
+        async def embed_text(self, values: list[str]) -> list[list[float]]:
+            return [[1.0] for _ in values]
+
+        def get_vector_size(self) -> int:
+            return 1
+
+        def get_batch_size(self) -> int:
+            return 16
+
+    return CitadelQdrantAdapter(
+        url="http://127.0.0.1:6333",
+        api_key="test-key",
+        embedding_engine=_Embedding(),
+        database_name=generation,
+        client_factory=_DeadClient,
+    )
+
+
+def test_search_provider_outage_inside_the_fanout_is_a_typed_failure(
+    monkeypatch,
+) -> None:
+    """A route mapping is worth only as much as the layer below it.
+
+    The existing outage test fakes ``Citadel.search`` itself, which cannot show
+    whether anything between the adapter and the route degrades the error. Run
+    the REAL adapter inside a fan-out arm, with a non-empty lifecycle document
+    scope so the search genuinely reaches the vector call, and assert the typed
+    503 still arrives.
+    """
+    from kb.qdrant_adapter import qdrant_document_scope, qdrant_scope
+
+    monkeypatch.delenv("CITADEL_GENERATION_ID", raising=False)
+    generation = "outage-generation"
+    adapter = _outage_adapter(generation)
+
+    class OutageCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            del kwargs
+            with qdrant_scope(
+                mode="read", generation_id=generation, dataset="notes"
+            ):
+                with qdrant_document_scope(["searchable-revision-1"]):
+                    return await adapter.search(
+                        "DocumentChunk_text", query_text=query
+                    )
+
+    client = authed_client("test-reader")
+    app.state.citadel = OutageCitadel()
+
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "QDRANT_UNAVAILABLE",
+        "message": "Qdrant is unavailable.",
+    }
+    assert "Name or service not known" not in response.text
+
+
 def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
     async def timeout(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
         return [], True

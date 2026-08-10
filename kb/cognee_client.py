@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import secrets
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import Awaitable, AsyncIterator, Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic, perf_counter
@@ -3718,9 +3718,8 @@ class CogneePublicClient:
             # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
             return None
         try:
-            engine = await self._vector_engine()
-            retrieve = getattr(engine, "retrieve", None)
-            if not callable(retrieve):
+            retrieve = await self._chunk_store_reader(requested)
+            if retrieve is None:
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
             seed_payload = (
@@ -3948,6 +3947,99 @@ class CogneePublicClient:
         payload = getattr(row, "payload", None)
         return payload if isinstance(payload, dict) else None
 
+    async def _owning_datasets(self, doc_id: str) -> list[tuple[Any, Any]]:
+        """``(dataset_id, owner_id)`` of every dataset holding ``doc_id``. READ ONLY.
+
+        Deliberately NOT cognee's ``resolve_authorized_user_datasets``: that
+        helper calls ``load_or_create_datasets``, so a name it cannot authorize
+        for the caller is CREATED and granted. Pointing a drill-down at it gave
+        this read path a relational write (measured: datasets 1 -> 2, acls 0 -> 4
+        against a foreign-owned name) and, under the mandatory
+        ENABLE_BACKEND_ACCESS_CONTROL=true, a cross-tenant dataset-creation path.
+        A read must not be able to insert a Dataset row, a permission grant, or a
+        default user, so this is the same unscoped DatasetData join
+        ``dataset_membership_for_documents`` uses, returning the identity columns
+        the dataset database context needs. Resolving by id rather than by name
+        also means a name collision across owners cannot redirect the read.
+        """
+        try:
+            document_uuid = UUID(str(doc_id))
+        except (TypeError, ValueError):
+            return []
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+
+        from sqlalchemy import select
+
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Dataset.id, Dataset.owner_id)
+                .join(DatasetData, DatasetData.dataset_id == Dataset.id)
+                .where(DatasetData.data_id == document_uuid)
+                .distinct()
+            )
+            return [(dataset_id, owner_id) for dataset_id, owner_id in rows.all()]
+
+    async def _chunk_store_reader(
+        self, doc_id: str
+    ) -> Callable[[str, list[str]], Awaitable[list[Any]]] | None:
+        """A chunk-store ``retrieve`` bound to the datasets that own ``doc_id``.
+
+        ``get_vector_engine()`` outside a dataset context builds the Qdrant
+        adapter with an EMPTY database name (cognee's ``vector_db_name`` default
+        is ""), and that adapter refuses every operation carrying no Citadel
+        scope. The unbound engine could therefore never read one chunk: the
+        drill-down fallback failed closed on every id under this provider, no
+        matter what the store held. Read inside the database context of each
+        dataset that owns the document, the same way the chunk census does, over
+        the read-only membership ``_owning_datasets`` resolves. Providers that
+        enforce no scope keep the unbound engine, and so does an id with no
+        membership row (a chunk id, a synthetic id) — the fallback stays
+        best-effort and still degrades to 404. Reading the owning dataset is not
+        a new privilege: the body still passes the ADR-0009 gate the caller
+        applies to ``dataset_node_ids`` afterwards.
+        """
+        if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
+            return await self._unbound_chunk_store_reader()
+        datasets = await self._owning_datasets(doc_id)
+        if not datasets:
+            return await self._unbound_chunk_store_reader()
+        from cognee.context_global_variables import (
+            set_database_global_context_variables,
+        )
+        from cognee.infrastructure.databases.vector import get_vector_engine_async
+
+        async def scoped_retrieve(
+            collection_name: str, data_point_ids: list[str]
+        ) -> list[Any]:
+            rows: list[Any] = []
+            for dataset_id, owner_id in datasets:
+                async with set_database_global_context_variables(
+                    dataset_id,
+                    owner_id,
+                ):
+                    engine = await get_vector_engine_async()
+                    retrieve = getattr(engine, "retrieve", None)
+                    if not callable(retrieve):
+                        continue
+                    found = await retrieve(collection_name, data_point_ids)
+                rows.extend(found or [])
+            return rows
+
+        return scoped_retrieve
+
+    async def _unbound_chunk_store_reader(
+        self,
+    ) -> Callable[[str, list[str]], Awaitable[list[Any]]] | None:
+        engine = await self._vector_engine()
+        retrieve = getattr(engine, "retrieve", None)
+        return retrieve if callable(retrieve) else None
+
     async def _document_from_chunk_store(self, doc_id: str) -> dict[str, Any] | None:
         """Assemble a document from the durable chunk store when the graph can't.
 
@@ -3971,9 +4063,8 @@ class CogneePublicClient:
             # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
             return None
         try:
-            engine = await self._vector_engine()
-            retrieve = getattr(engine, "retrieve", None)
-            if not callable(retrieve):
+            retrieve = await self._chunk_store_reader(requested)
+            if retrieve is None:
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
             seed_payload = (

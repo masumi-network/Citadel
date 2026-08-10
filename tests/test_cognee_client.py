@@ -1126,6 +1126,210 @@ async def test_ensure_dataset_repairs_a_row_that_has_no_acl(
     ) is not None, "seat still unsearchable after ensure_dataset"
 
 
+@pytest.mark.asyncio
+async def test_chunk_store_drilldown_never_creates_datasets_or_grants(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """A drill-down must not create a dataset, a grant, or a user.
+
+    cognee's ``resolve_authorized_user_datasets`` is a WRITE helper: it calls
+    ``load_or_create_datasets``, so a dataset name the caller cannot be
+    authorized for is CREATED and granted to the default user. Pointing the
+    read-only drill-down at it gave GET /api/documents, the /search owner hint
+    and MCP citadel_get_document a relational write side effect, and under
+    ENABLE_BACKEND_ACCESS_CONTROL=true (which register_qdrant_adapter mandates)
+    a cross-tenant dataset-creation path: the foreign-owned name below grows a
+    duplicate owned by the default user, and the reader then reads the empty
+    copy. The real relational stack runs here on purpose — a fake resolver
+    cannot show a create branch it does not have.
+
+    The name is deliberately narrower than "never writes": entering the dataset
+    database context DOES lazily insert one ``dataset_database`` registration row
+    per (owner, dataset), which DEC-2026-08-10-05 accepts because it grants no
+    access and is idempotent. That row is pinned below rather than left to be
+    rediscovered, so a future change that starts granting access here fails.
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import func, select
+
+    from cognee.infrastructure.databases.relational import (
+        create_db_and_tables,
+        get_relational_engine,
+    )
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.users.models import ACL, DatasetDatabase, User
+    from cognee.modules.users.methods import get_default_user
+
+    await create_db_and_tables()
+    # Warm the default user so the counts below measure the drill-down alone.
+    await get_default_user()
+
+    document_id = uuid4()
+    foreign_dataset_id = uuid4()
+    foreign_owner_id = uuid4()
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(Data(id=document_id, name="foreign-doc", owner_id=foreign_owner_id))
+        session.add(
+            Dataset(
+                id=foreign_dataset_id,
+                name="seat:foreign",
+                owner_id=foreign_owner_id,
+                tenant_id=None,
+            )
+        )
+        session.add(
+            DatasetData(dataset_id=foreign_dataset_id, data_id=document_id)
+        )
+        await session.commit()
+
+    async def counts() -> dict[str, int]:
+        async with engine.get_async_session() as session:
+            measured = {}
+            for label, model in (
+                ("datasets", Dataset),
+                ("acls", ACL),
+                ("users", User),
+                ("dataset_databases", DatasetDatabase),
+            ):
+                rows = await session.execute(select(func.count()).select_from(model))
+                measured[label] = int(rows.scalar_one())
+            return measured
+
+    before = await counts()
+    assert before == {
+        "datasets": 1,
+        "acls": 0,
+        "users": 1,
+        "dataset_databases": 0,
+    }
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    # register_qdrant_adapter refuses to install without this, so it is the only
+    # configuration the Qdrant drill-down can ever run under.
+    monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "true")
+    monkeypatch.setenv("VECTOR_DATASET_DATABASE_HANDLER", "qdrant")
+    monkeypatch.setenv("VECTOR_DB_URL", "http://127.0.0.1:6333")
+    monkeypatch.setenv("VECTOR_DB_KEY", "unused-by-this-test")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "drilldown-generation")
+    client = _real_cognee_client(monkeypatch)
+
+    # No Qdrant is reachable, so the fallback degrades to None exactly as it
+    # does in production. What is under test is what it wrote on the way.
+    assert await client.get_document(str(document_id)) is None
+    assert await client.resolve_document_owner_ids(str(document_id)) is None
+
+    after = await counts()
+    # MEASURED: not even the accepted dataset_database registration row appears
+    # on this path. The owner here is a bare id with no User row, and entering
+    # the dataset context calls get_user() first, which raises
+    # EntityNotFoundError before get_or_create_dataset_database can insert. A
+    # foreign owner therefore fails closed one step earlier than the same-owner
+    # read pinned in the test below.
+    assert after == before, (
+        f"drill-down wrote to the relational store: {before} -> {after}"
+    )
+
+    async with engine.get_async_session() as session:
+        rows = await session.execute(
+            select(Dataset.owner_id).where(Dataset.name == "seat:foreign")
+        )
+        owners = [row[0] for row in rows.all()]
+    assert owners == [foreign_owner_id], (
+        "a duplicate seat:foreign dataset was created under another owner"
+    )
+
+    # The resolver still has to WORK: it returns the foreign dataset's own
+    # identity columns, so the read is scoped to the dataset that actually holds
+    # the document rather than to a same-named one under a different owner.
+    assert await client._owning_datasets(str(document_id)) == [
+        (foreign_dataset_id, foreign_owner_id)
+    ]
+
+
+async def test_chunk_store_drilldown_dataset_database_row_is_idempotent(
+    cognee_sqlite: Any, monkeypatch: Any
+) -> None:
+    """A same-owner drill-down lazily writes exactly one dataset_database row.
+
+    DEC-2026-08-10-05: entering the owning dataset's context under
+    ENABLE_BACKEND_ACCESS_CONTROL=true materializes one dataset_database
+    registration row per (owner, dataset). It grants no access and is
+    idempotent, and this pins that accepted behavior so it cannot silently
+    become a grant. The foreign-owner test above owns the access-grant question
+    (zero acls, no duplicate dataset, and there the owner has no user row so the
+    read fails closed before the registration row); this one gives the owner a
+    real user, so the read reaches the context and the row appears exactly once
+    and never grows on a repeat, while datasets, acls and users stay flat.
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import func, select
+
+    from cognee.infrastructure.databases.relational import (
+        create_db_and_tables,
+        get_relational_engine,
+    )
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.users.methods import create_user, get_default_user
+    from cognee.modules.users.models import ACL, DatasetDatabase, User
+
+    await create_db_and_tables()
+    await get_default_user()
+    owner = await create_user("drilldown-owner@example.com", "drilldown-pw")
+
+    document_id = uuid4()
+    dataset_id = uuid4()
+    engine = get_relational_engine()
+    async with engine.get_async_session() as session:
+        session.add(Data(id=document_id, name="owned-doc", owner_id=owner.id))
+        session.add(
+            Dataset(id=dataset_id, name="seat:owned", owner_id=owner.id, tenant_id=None)
+        )
+        session.add(DatasetData(dataset_id=dataset_id, data_id=document_id))
+        await session.commit()
+
+    async def counts() -> dict[str, int]:
+        async with engine.get_async_session() as session:
+            measured = {}
+            for label, model in (
+                ("datasets", Dataset),
+                ("acls", ACL),
+                ("users", User),
+                ("dataset_databases", DatasetDatabase),
+            ):
+                rows = await session.execute(select(func.count()).select_from(model))
+                measured[label] = int(rows.scalar_one())
+            return measured
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "true")
+    monkeypatch.setenv("VECTOR_DATASET_DATABASE_HANDLER", "qdrant")
+    monkeypatch.setenv("VECTOR_DB_URL", "http://127.0.0.1:6333")
+    monkeypatch.setenv("VECTOR_DB_KEY", "unused-by-this-test")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "drilldown-generation")
+    client = _real_cognee_client(monkeypatch)
+
+    before = await counts()
+
+    # No Qdrant is reachable, so the read degrades to None; what is pinned is the
+    # registration row that entering the owning dataset context wrote first.
+    assert await client.get_document(str(document_id)) is None
+    after_first = await counts()
+    assert after_first == {
+        **before,
+        "dataset_databases": before["dataset_databases"] + 1,
+    }, f"first read did not write exactly one registration row: {before} -> {after_first}"
+
+    # A second read of the same (owner, dataset) reuses the row.
+    assert await client.get_document(str(document_id)) is None
+    after_second = await counts()
+    assert after_second == after_first, (
+        f"repeat read grew the relational store: {after_first} -> {after_second}"
+    )
+
+
 def test_assert_cognee_dataset_api_imports_real_symbols(monkeypatch: Any) -> None:
     # A cognee bump that moves the private dataset-attribution internals must
     # fail HERE (loud, in CI), not silently fail-closed in prod. This imports
