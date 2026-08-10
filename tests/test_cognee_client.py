@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID
@@ -1771,11 +1772,24 @@ async def test_failed_acknowledgement_retries_without_external_activity(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
     path = tmp_path / "queue.json"
+    # The retry after a failed acknowledgement is reclaim-on-expiry, so the
+    # first lease must expire, while the second acknowledgement needs its lease
+    # still live. Under a real 50ms lease both sides raced the runner: the 3.12
+    # CI lane expired lease two mid-cycle, acknowledge raised
+    # CognifyLeaseError, and a third retry broke the exact-two-calls assertion.
+    # An hour-long lease with a manual two-hour clock jump at the failure point
+    # forces exactly one expiry, exactly when the test intends it.
+    clock_offset = timedelta()
+
+    def manual_clock() -> datetime:
+        return datetime.now(UTC) + clock_offset
+
     queue = CognifyRetryQueue(
         path,
-        lease_seconds=0.05,
+        lease_seconds=3600.0,
         backoff_seconds=0.01,
         max_backoff_seconds=0.05,
+        clock=manual_clock,
     )
     monkeypatch.setenv("LLM_API_KEY", "k")
     cognify_calls: list[list[str]] = []
@@ -1796,9 +1810,10 @@ async def test_failed_acknowledgement_retries_without_external_activity(
     next_wakeup_delay = queue.next_wakeup_delay
 
     def fail_first_acknowledgement(lease: Any) -> None:
-        nonlocal acknowledgement_calls
+        nonlocal acknowledgement_calls, clock_offset
         acknowledgement_calls += 1
         if acknowledgement_calls == 1:
+            clock_offset = timedelta(hours=2)
             raise OSError("queue volume unavailable")
         acknowledge(lease)
 
