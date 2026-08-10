@@ -1,6 +1,6 @@
 # Technology Stack
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 Owner: architect
 
 ## Current production
@@ -23,6 +23,7 @@ Owner: architect
 | Qdrant server and client | Server `1.19.0`, client `1.19.0`, pinned image digest `sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc` | Completed | VERIFIED: authenticated runtime reported server `1.19.0`, commit `74f3e85b9473c62560006c043e13737ce6b48412`. Candidate uses exact client `1.19.0`. |
 | Qdrant storage | Persistent `/qdrant/storage` and `/qdrant/snapshots`, API key, private network or TLS, generation manifest | In Progress | VERIFIED: local named-volume container replacement and one downloaded snapshot restore passed. BLK-2026-08-09-02 owns coherent whole-generation backup and restore boot. |
 | Relational store | SQLite Lite for v0.5; PostgreSQL later optional | Planned | VERIFIED: Cognee `1.4.1` supports both. REPORTED: the user selected SQLite for the low-cost Railway release. |
+| Graph store | Exact Ladybug `0.18.2` with mutable database and extension state below the Lite data root | In Progress | VERIFIED: Cognee `1.4.1` supports Ladybug through `0.18.2`. DEC-2026-08-10-01 binds extension storage through Ladybug's connection setting. Fresh production Docker proof remains pending. |
 | Lifecycle ledger | Dedicated Citadel SQLite at `CITADEL_LIFECYCLE_STORE_PATH` | Completed | VERIFIED: commit `275e433` adds schema version 1. Commit `5bdcf89` closes the reviewed replay, identity, tombstone, generation, lease, legacy-result, graph-context, and memory-retention gaps. Citadel does not add lifecycle tables to Cognee's database. |
 | Graph | Independent volume or provider namespace | Planned | INFERRED: graph and relational state belong to the same whole-generation acceptance boundary. |
 

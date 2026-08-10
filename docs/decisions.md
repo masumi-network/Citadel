@@ -1,5 +1,155 @@
 # Architecture Decisions
 
+## DEC-2026-08-10-02: Publish one digest-first multi-platform Citadel image
+
+Date: 2026-08-10
+Owner: architect
+
+Context:
+
+- VERIFIED: `.github/workflows/publish.yml` publishes Python artifacts and a GitHub Release but contains no OCI build, registry login, image push, digest receipt, SBOM, provenance, or attestation step.
+- VERIFIED: `docker-compose.yml` accepts `CITADEL_IMAGE`, and `kb/local_deploy.py:24,221` rejects a published image unless it contains `@sha256:<64 lowercase hexadecimal characters>`.
+- REPORTED: the user approved finishing and shipping the production release on 2026-08-10.
+
+Options:
+
+- Publish mutable `latest`, major, and minor image aliases. Rejected because deployments can change without a configuration diff.
+- Build Python and OCI releases in separate tag workflows. Rejected because partial ordering and source-identity drift become harder to prove.
+- Stage one multi-platform image by commit digest inside the existing release workflow, publish PyPI, then promote the same index to the exact version tag and create the GitHub Release last. Selected.
+
+Decision:
+
+- Publish `ghcr.io/masumi-network/citadel` for `linux/amd64` and `linux/arm64` from Docker target `production`.
+- Build once as `sha-${GITHUB_SHA}`, verify the index and both runtime imports, emit BuildKit max provenance plus SBOM, and create a GitHub OIDC provenance attestation for the index digest.
+- After PyPI succeeds, copy the same index to the exact package version, such as `0.5.0`. Never publish `latest`, major, or minor aliases.
+- The GitHub Release is last and includes wheel, sdist, and a receipt containing the exact image version, index digest, and source SHA.
+
+Consequences:
+
+- A failure before exact-version promotion leaves only a commit-stage image. A failure after promotion is corrected by a forward patch release; the version tag is never moved or overwritten.
+- Compose and local deploy continue to consume a version plus digest reference. No Compose interface change is required.
+- GitHub attestation is the v0.5 signing mechanism. A separate Cosign signature is deferred until a consumer requires it.
+- Provenance does not make unpinned Python transitive dependencies reproducible. Release dependencies still require exact pins or reviewed bounds.
+
+Evidence:
+
+- `docs/interfaces.md` CITADEL-INT-SELFHOST-01
+- [GitHub container publishing](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
+- [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
+- [Docker build attestations](https://docs.docker.com/build/ci/github-actions/attestations/)
+
+## DEC-2026-08-10-01: Bind Ladybug extension state through its connection setting
+
+Date: 2026-08-10
+Owner: architect
+
+Context:
+
+- VERIFIED: production image `sha256:e2b30a1645b84b64f6c06d11c08f7fb2f3498fc71a7a766e620642943b705ce4` runs UID `10001` with a read-only root. Fresh Compose boot logged `Failed to create directory /home/citadel/.lbdb/extension/0.18.1/linux_arm64/`, then `/readyz` returned HTTP `503`.
+- VERIFIED: exact Ladybug `0.18.1` commit `1354081eb5528b3ca12e38dd4402cdd47215e57a` initializes each connection's `homeDirectory` from `HOME`, derives extension storage as `{homeDirectory}/.lbdb/extension/{version}/{platform}/`, and exposes the per-connection setting `home_directory`.
+- VERIFIED: exact Cognee `1.4.1` opens throwaway, direct, and subprocess Ladybug connections and executes JSON extension install or load without setting `home_directory`. Evidence: `cognee_db_workers/_kuzu_helpers.py:33-69`, `cognee_db_workers/kuzu_worker.py:128-134,178-198`, and `cognee/infrastructure/databases/graph/ladybug/adapter.py:404-417,490-504` in `/private/tmp/cognee-core-v1.4.1-qdrant-audit`.
+
+Options:
+
+- Change process `HOME` to `/data`. Rejected because Ladybug has a narrower supported setting and changing `HOME` affects unrelated libraries and Citadel paths.
+- Add a writable mount at `/home/citadel`. Rejected because it spreads mutable provider state outside the declared `/data` boundary and leaves direct image use dependent on an extra mount.
+- Patch the exact Cognee wheel build to apply Ladybug `home_directory` before every install or load. Selected.
+
+Decision:
+
+- Lite runtime owns `LADYBUG_HOME_DIRECTORY`. Its default is `<CITADEL_LITE_DATA_ROOT>/ladybug-home`, and it must resolve inside the Lite data root.
+- Citadel's exact Cognee wheel patch applies that value through Ladybug's connection setting before JSON extension installation or loading in throwaway, direct, and subprocess paths.
+- Process `HOME` remains `/home/citadel`. Ladybug extension state belongs below `/data`; temporary warm-up databases remain below `/tmp`.
+
+Consequences:
+
+- The read-only production root remains intact while Ladybug extension state persists with the Citadel data volume.
+- The Ladybug extension directory is rebuildable provider cache and is not part of the current generation backup manifest.
+- Fresh extension installation still downloads an upstream artifact. Offline fresh-volume restore remains unproven until a separate reviewed image-packaging decision pins or preloads that artifact.
+
+Correction:
+
+- CORRECTED on 2026-08-10: the failed earlier image contained Ladybug `0.18.1`, but a clean candidate build resolved supported patch release `0.18.2`. Official comparison from `0.18.1` commit `1354081eb5528b3ca12e38dd4402cdd47215e57a` to `0.18.2` commit `d25703bd326a54f9f23e8a1c4879480798e72d9f` changes no client-context, setting, or extension-install source file. The release pins `0.18.2`; fresh Docker evidence must use that exact version.
+
+Evidence:
+
+- `docs/interfaces.md` CITADEL-INT-SELFHOST-01
+- `agents/blockers.md` BLK-2026-08-10-01
+- [Ladybug 0.18.1 client context](https://github.com/LadybugDB/ladybug/blob/1354081eb5528b3ca12e38dd4402cdd47215e57a/src/main/client_context.cpp)
+- [Ladybug 0.18.1 settings](https://github.com/LadybugDB/ladybug/blob/1354081eb5528b3ca12e38dd4402cdd47215e57a/src/main/settings.cpp)
+
+## DEC-2026-08-09-03: Provision required datasets without bootstrap content
+
+Date: 2026-08-09
+Owner: architect
+
+Context:
+
+- VERIFIED: production startup calls `ensure_session_traces_dataset` from `kb/server.py:550`. The missing-dataset path ingests a marker at `kb/server.py:2577-2582`.
+- VERIFIED: lifecycle is enabled by default at `kb/config.py:477-480`. Lifecycle ingest starts projection at `kb/service.py:138-186`, and its worker calls cognify at `kb/lifecycle_worker.py:336-382`.
+- VERIFIED: the recovered Compose log records the bootstrap marker at `21:35:03.483`, the cognify pipeline at `21:35:09.311`, repeated OpenRouter authentication failures, and repeated `/readyz` HTTP `503` responses.
+- VERIFIED: `CogneePublicClient.ensure_dataset` at `kb/cognee_client.py:3099-3150` provisions the relational dataset row and permissions without opening the graph or ingesting content.
+
+Options:
+
+- Keep the bootstrap marker and require a real LLM key for empty readiness. Rejected because startup would create application data and make control-plane health depend on model output.
+- Disable lifecycle or the projection worker during readiness. Rejected because that would test a different runtime contract and could hide queue defects.
+- Provision the required dataset row and permissions directly. Selected.
+
+Decision:
+
+- Empty-generation startup calls the existing relational-only dataset provisioner for `session-traces`.
+- Startup does not ingest a marker, create lifecycle source revisions, schedule projection, or call a model.
+- Seeded functional gates remain responsible for proving ingestion, cognification, graph extraction, and model quality with the approved real model configuration.
+
+Consequences:
+
+- Fresh offline Compose readiness can use a dummy LLM key plus `COGNEE_SKIP_CONNECTION_TEST=true` without generating knowledge data.
+- Existing generations that already contain the old marker are not rewritten or deleted by this decision.
+- Shared trace behavior is unchanged after a user-approved share writes real trace content.
+
+Evidence:
+
+- `agents/blockers.md` BLK-2026-08-09-06
+- `/private/tmp/citadel-ring0-recovered-app-20260809.log`
+- `docs/interfaces.md` CITADEL-INT-SELFHOST-01
+
+## DEC-2026-08-09-02: Use an offline manifest for SQLite Lite recovery
+
+Date: 2026-08-09
+Owner: architect
+
+Context:
+
+- VERIFIED: `scripts/smoke_qdrant_provider.py` copies two SQLite databases sequentially, snapshots one `DocumentChunk` collection, omits Ladybug state, and restores from a Qdrant server-local path.
+- VERIFIED: the Lite runtime already rejects a second writer with a single-instance lock. Evidence: candidate `kb/lite_runtime.py` and its runtime tests.
+- INFERRED: with one Citadel process and zero replicas, stopping the writer and acquiring that same lock creates the smallest coherent backup boundary.
+
+Options:
+
+- Keep online provider-by-provider copies. Rejected because writes can cross the separate SQLite, graph, and Qdrant capture times.
+- Add a distributed snapshot epoch. Deferred because the Lite profile has one writer and does not need distributed coordination.
+- Stop the writer, acquire its lock, inventory the whole generation, and seal one manifest. Selected.
+
+Decision:
+
+- INFERRED: v0.5 Lite backup is an offline operation. It copies both SQLite databases, Ladybug and retained-data files, and downloaded snapshots for every generation Qdrant collection.
+- INFERRED: restore accepts a sealed manifest and empty targets. It verifies every digest before writing and refuses overwrite.
+- INFERRED: operator-selected backup and restore paths are containment boundaries. Symbolic-link targets and backup destinations nested under copied source trees are rejected before writes; created directories and files use private modes.
+- INFERRED: release acceptance requires booting a fresh Citadel process against restored local state and a fresh Qdrant volume, then retrieving exact markers.
+
+Consequences:
+
+- Operators get a short write outage during backup.
+- Backup artifacts are private to the creating account by default. Operators must explicitly relax permissions when transferring them through another controlled mechanism.
+- The implementation stays compatible with the one-process Lite constraint.
+- A future multi-writer PostgreSQL profile needs its own coordinated backup decision.
+
+Evidence:
+
+- `docs/interfaces.md` CITADEL-INT-BACKUP-01
+- `agents/blockers.md` BLK-2026-08-09-02
+
 ## DEC-2026-08-09-01: Make the Citadel lifecycle ledger the write authority
 
 Date: 2026-08-09

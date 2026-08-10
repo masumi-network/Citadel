@@ -15,12 +15,17 @@ Request or input:
 - Optional `--database sqlite|postgres`, `--data-dir`, `--version`, `--non-interactive`, and `--dry-run` arguments.
 - `sqlite` is the local default. The selected value is written to deployment state and never inferred from the host.
 - Docker Engine and Docker Compose v2 already installed by the operator.
+- INFERRED: `COGNEE_SKIP_CONNECTION_TEST` is an optional explicit Compose input. It defaults to `false`. CI may set it to `true` only for an offline boot and readiness phase that uses a dummy LLM key.
+- INFERRED: `LADYBUG_HOME_DIRECTORY` is a Lite-runtime provider input. It defaults to `<CITADEL_LITE_DATA_ROOT>/ladybug-home`, must resolve inside the Lite data root, and is applied through Ladybug's per-connection `home_directory` setting before any extension install or load.
+- INFERRED: an empty-generation boot provisions required Cognee dataset rows and permissions directly. It does not ingest bootstrap documents, create lifecycle source revisions or projection jobs, or invoke cognify.
 
 Response or output:
 
 - Version-pinned Citadel app and Qdrant services from one Compose project. The PostgreSQL profile adds a pinned PostgreSQL service.
+- INFERRED: the published v0.5 app image is `ghcr.io/masumi-network/citadel:<exact-version>@sha256:<index-digest>`. The release publishes only the exact version and an internal commit-stage tag. It does not publish `latest`, major, or minor aliases.
 - A generated configuration directory with restrictive file permissions, generated secrets, image and generation identity, and persistent volume locations.
 - A bounded readiness result and the path to a smoke-test receipt. Secret values are not printed in ordinary output.
+- INFERRED: in the default SQLite Lite profile, every mutable Cognee root, including system, data, cache, logs, SQLite database paths, and the Ladybug extension cache, resolves below the mounted `/data` root before Cognee imports or migrations. The non-root process never writes under installed package directories or its process home.
 
 Errors:
 
@@ -39,6 +44,8 @@ Compatibility rule:
 - SQLite is accepted only for one host, one app process, one scheduler, and zero replicas. PostgreSQL remains available through the same image and schema contract.
 - A repeated `citadel deploy local` with the same version and config is idempotent. Version changes require an explicit upgrade path and snapshot evidence.
 - Railway v0.5 uses the SQLite Lite template. A later PostgreSQL profile uses the same image. DigitalOcean uses a Droplet and the same Compose bundle because App Platform has no persistent volumes.
+- INFERRED: an offline readiness phase with `COGNEE_SKIP_CONNECTION_TEST=true` does not prove LLM connectivity, ingestion, cognification, or model quality. Seeded functional and benchmark gates must use the approved real model configuration.
+- An offline empty-generation readiness phase is a control-plane proof. It must not call an LLM or create application data merely to make a required dataset searchable.
 
 Verification:
 
@@ -49,6 +56,10 @@ Verification:
 - PostgreSQL migration and functional parity remain required before a later PostgreSQL profile is published.
 - Missing prerequisite, occupied port, image mismatch, migration failure, Qdrant outage, and smoke failure produce typed nonzero exits.
 - No secret appears in terminal output, process arguments, committed files, or smoke receipts.
+- INFERRED: the production image runs as UID `10001` with a read-only root filesystem and a writable `/data` mount; session-cache and prune-cache initialization do not attempt a package-directory write.
+- INFERRED: exact Ladybug `0.18.2` creates and loads its JSON extension only below `/data/ladybug-home/.lbdb/extension/0.18.2/<platform>/`. `/home/citadel/.lbdb` remains absent through fresh boot and restart.
+- INFERRED: the production OCI index contains `linux/amd64` and `linux/arm64`, records the tagged source SHA, includes BuildKit max provenance and an SBOM, and has GitHub OIDC provenance attestation for the immutable index digest. The GitHub Release includes a digest receipt.
+- INFERRED: fresh offline readiness returns HTTP `200`, with zero lifecycle source revisions and zero relational documents. Logs contain no model call or authentication attempt. The later seeded gate proves real cognification separately.
 - VERIFIED on 2026-08-09: candidate commit `92ce11a` packages the Lite runtime, local deploy command, Dockerfile, Compose bundle, smoke path, and release identity checks. `uv build --wheel --sdist` produced installable `0.5.0` artifacts, and the full candidate suite after local integration returned `1781 passed, 3 skipped, 11 warnings in 32.97s`.
 - VERIFIED on 2026-08-09: the local Compose stack passed authenticated readiness, HTTP ingest, background cognify, exact marker retrieval, process restart, SQLite backup and restore, and Qdrant snapshot restore. Blind spot: the running image predates the local merge of PR 254 corpus readiness diagnostics, and Railway has not been deployed.
 
@@ -123,6 +134,50 @@ Verification:
 - Docker verification must monitor Qdrant and Citadel logs during startup, test traffic, restart, snapshot, restore, and shutdown. Any unexpected warning, error, panic, fatal, OOM, corruption, failure, recovery shortfall, or non-2xx data-plane response fails the gate.
 - TLS-disabled log lines are acceptable only for a disposable service bound to loopback. Railway and other hosted releases require private service networking or TLS before credentials or user data cross the connection.
 
+## CITADEL-INT-BACKUP-01: Whole-generation backup and restore
+
+Interface ID: CITADEL-INT-BACKUP-01
+Owner: architect
+Provider: Citadel backup command and Qdrant snapshot API
+Consumers: local operators, release gates, Railway operators, and incident recovery
+Status: In Progress
+
+Request or input:
+
+- One immutable generation ID, the Lite data root, an authenticated Qdrant endpoint, and an empty backup destination.
+- INFERRED: backup and restore destinations must be direct paths, not symbolic links. A backup destination must not be inside any copied source subtree. A restore target must not resolve through a symbolic link and must not equal or be nested under the backup root.
+- The Citadel writer must be stopped. The backup command acquires the same single-instance lock used by the Lite runtime and fails if another writer owns it.
+
+Response or output:
+
+- One versioned manifest containing generation identity, Cognee SQLite and lifecycle SQLite fingerprints, Ladybug and retained-data file inventory, every Qdrant collection in the generation, downloaded snapshot artifact names, sizes, and SHA-256 digests.
+- INFERRED: backup directories use mode `0700`; regular backup files, downloaded snapshots, the manifest, and its adjacent digest use mode `0600`.
+- Restore accepts only the downloaded artifacts named by the manifest and an empty target data root plus an empty Qdrant instance.
+
+Errors:
+
+- Active writer, missing database, missing manifest entry, file digest mismatch, incomplete collection inventory, existing restore target, Qdrant snapshot failure, snapshot upload failure, and restored boot or retrieval failure return nonzero.
+- INFERRED: symbolic-link destination, backup destination nested under a copied source, restore target equal to or nested under the backup root, and unavailable backup-only dependencies return typed nonzero CLI errors before any backup or restore write.
+
+Events:
+
+- Quiesce lock acquired, local state copied, collection snapshot created, snapshot downloaded, manifest sealed, artifact verified, snapshot uploaded, local state restored, Citadel booted, and exact marker retrieved.
+
+Compatibility rule:
+
+- SQLite, Ladybug, lifecycle state, retained Cognee data, and all Qdrant collections form one offline generation cut. A partial provider backup is not a Citadel backup.
+- Snapshot recovery uses the downloaded artifact. A Qdrant server-local snapshot path is not accepted as off-host recovery evidence.
+- Restore never overwrites an existing data root or collection. Operators choose an empty target or stop for manual recovery.
+- INFERRED: failure cleanup removes only paths created by the current operation. It never follows or removes an operator-provided symbolic-link target.
+- SQLite Lite remains one app process and zero replicas. The same lock that rejects a second runtime process establishes backup quiescence.
+
+Verification:
+
+- A disposable current-head Docker image ingests exact Central, seat, and lifecycle markers, then stops the Citadel writer before backup.
+- Backup inventories every generation Qdrant collection plus both SQLite databases, Ladybug files, and retained data. Every artifact digest is rechecked before restore.
+- A fresh Qdrant volume and empty Citadel data root restore only from downloaded artifacts. The restored Citadel process returns the exact markers and matching lifecycle receipts.
+- Citadel and Qdrant logs are captured through ingest, quiesce, snapshot, restore, boot, retrieval, and shutdown. Unexpected severe lines or non-2xx data-plane responses fail the gate.
+
 ## CITADEL-INT-LIFECYCLE-01: Durable source and projection lifecycle
 
 Interface ID: CITADEL-INT-LIFECYCLE-01
@@ -136,6 +191,7 @@ Request or input:
 - INFERRED working contract version: `1`.
 - CORRECTED working contract: one authorized dataset resolved before storage, one stable source key assigned by a connector or Citadel, retained evidence bytes or a Citadel-owned durable content reference, optional source locator for manual notes, media type, capture actor, capture time, and optional previous revision ID.
 - One immutable generation ID, projection version, required backend set, and configuration digest for projection work.
+- Current-head release evidence takes one authorized dataset, an exact nonempty list of connector `source_key` values, one generation ID, one projection version, and one configuration digest. It never enumerates source keys through similarity search.
 - CORRECTED 2026-08-09: one job idempotency key is derived from source revision ID, generation ID, and projection version. Each receipt ID is then derived from the job ID and backend. Provider-generated IDs are evidence fields, not idempotency keys.
 
 Response or output:
@@ -146,12 +202,18 @@ Response or output:
 - Required v1 backend names are provider-neutral: `relational`, `vector`, and `graph`. Provider fields record SQLite or PostgreSQL, Qdrant, and the selected graph engine.
 - Receipt states are `pending`, `running`, `completed`, `searchable`, `failed`, or `stale`. `completed` means the provider call returned. `searchable` requires a bounded read check. Whole-job success is derived from every required receipt and is never written from one provider result. A worker retries transient errors and records a terminal failed job after five attempts by default.
 - The ingest response returns `accepted`, the source revision ID, projection job ID, and current derived state. CLI and MCP can poll the same bounded operation record.
+- A multi-target Shared Session Trace response returns one bounded `operations` row per write target. Each row contains `dataset`, `accepted`, `source_revision_id`, `projection_job_id`, and `projection_state` from the corresponding durable ingest result. The response does not collapse two writes into one identity.
+- `citadel capture --json` preserves `source_revision_id`, `projection_job_id`, and `projection_state` from each accepted HTTP ingest response in that root's result row. It never synthesizes an identity when a legacy server omits the field.
+- The current-head evidence result contains top-level `ok`, the requested dataset and projection identity, `evidence` rows, and `errors` rows. `CurrentHeadProjectionEvidence` contains `source_key`, `dataset`, `source_revision_id`, `projection_job_id`, `generation_id`, `projection_version`, `config_digest`, derived job `state`, and exactly one receipt row for each required backend. Each receipt row contains `projection_receipt_id`, `backend`, `provider`, and `state`. Evidence and errors preserve requested source-key order; receipts preserve required backend order.
+- A current-head evidence request succeeds only when every requested source key has one active non-tombstone head, that exact revision has one matching current-generation job, the job requires exactly `relational`, `vector`, and `graph`, and all three matching receipts are `searchable`. Historical jobs and stale receipts are returned only as bounded failure evidence, never counted toward success.
+- Source keys must be unique. A duplicate returns top-level `ok=false`, one `SOURCE_KEY_DUPLICATE` error, and no database evidence. Otherwise the read is diagnostic-complete: valid keys remain in `evidence`, every invalid key gets one bounded `errors` row, and any error makes top-level `ok=false`. Release acceptance treats the whole result as failed and never promotes partial evidence.
 
 Errors:
 
 - Authorization failure, source retention failure, transaction failure, idempotency conflict, lease loss, provider timeout, provider failure, census mismatch, and searchability timeout are typed failures.
 - A successful provider call cannot overwrite a failed or stale receipt from another backend.
 - An accepted source revision without projection work is an invariant violation. The source revision and initial projection job are written in one relational transaction.
+- Current-head release evidence uses stable codes `SOURCE_KEY_DUPLICATE`, `CURRENT_HEAD_MISSING`, `CURRENT_HEAD_TOMBSTONED`, `CURRENT_JOB_MISSING`, `CURRENT_JOB_MISMATCH`, `CURRENT_JOB_AMBIGUOUS`, `RECEIPT_SET_MISMATCH`, or `RECEIPT_NOT_SEARCHABLE`. `CURRENT_JOB_MISMATCH` means jobs exist for the active revision but none match the requested generation, projection version, and configuration digest. Each failure names the source key and bounded IDs or backend states, never retained source content.
 
 Events:
 
@@ -173,6 +235,8 @@ Verification:
 - Contract tests serialize and reject unknown schema versions for every record.
 - Crash injection after source retention, transaction commit, lease acquisition, each backend write, each receipt write, and searchability check converges in a second process.
 - Duplicate submission produces one source revision, one job per generation and projection version, and one receipt per required backend.
+- HTTP, CLI, and MCP fixtures prove Shared Session Trace dual writes expose both operation identities and capture JSON preserves the server-returned lifecycle identity for each root.
+- Deterministic lifecycle fixtures submit two revisions for one GitHub source key plus one independent key, then prove exact-key current-head evidence selects only the active revisions, rejects the historical searchable job, reports one matching job and three searchable receipts per active head, preserves request order, and returns each stable failure code under bounded corruption fixtures.
 - Empty-generation rebuild produces matching source, job, receipt, vector, and graph censuses.
 - Expected implementation scope: new lifecycle model and store modules, then bounded changes to `kb/service.py`, `kb/cognee_client.py`, `kb/server.py`, `kb/mcp_server.py`, `kb/cli.py`, and focused unit, crash, serialization, provider, HTTP, CLI, and MCP tests.
 - VERIFIED 2026-08-09: candidate commit `275e433d08251f4642d26e2136d8fa9e5e2193c1` implements the schema, worker, connector identities, HTTP operation read, CLI operation read, MCP operation read, current-head retrieval binding, backup tracking, online restore, and empty-generation rebuild census. `uv run pytest -q` returned `1847 passed, 3 skipped, 11 warnings in 25.27s`; `uv run ruff check .` returned `All checks passed!`.
@@ -185,7 +249,7 @@ Verification:
 Interface ID: CITADEL-INT-RETRIEVAL-01
 Owner: architect
 Provider: Citadel retrieval boundary with Cognee and Qdrant as implementation details
-Consumers: HTTP search, CLI, MCP, ranking, agent trace, benchmarks, and document drill-down
+Consumers: HTTP search, CLI, MCP, status and readiness, ranking, agent trace, benchmarks, and document drill-down
 Status: In Progress
 
 Request or input:
@@ -199,11 +263,15 @@ Response or output:
 - `RetrievalHit`: candidate ID plus final rank, normalized Citadel score when defined, ranking reason fields, source locator, capture fingerprint, trust tier, content hint, and document drill-down identity.
 - `RetrievalTrace`: trace ID, operation ID, identity reference, generation, authorized datasets, query digest, profile identity, provider attempts, candidate IDs, exclusion decisions, returned hit IDs, partial-failure fields, timestamps, and duration. Raw query retention follows instance policy and never leaves the instance as fleet telemetry.
 - Empty success means every authorized provider path completed and returned zero candidates. A partial provider failure returns `partial=true`, typed failures, and only the hits from completed paths.
+- A complete zero-candidate search returns HTTP `200` with `results: []`; CLI returns exit `0` with `ok=true`; MCP returns a normal tool result. No failure code is present.
 
 Errors:
 
 - Missing scope, conflicting dataset, unknown generation, invalid profile, provider timeout, malformed candidate, missing source revision, stale projection receipt, and score-direction mismatch are typed failures.
 - Authorization failure occurs before any provider request. Provider exceptions do not become empty results.
+- A server-side search budget expiry returns HTTP `504` with `detail.code="SEARCH_TIMEOUT"`. CLI returns nonzero with `ok=false`, `code="SEARCH_TIMEOUT"`, and `http_status=504`. MCP returns a tool error whose content carries the same code and status.
+- Qdrant provider unavailability returns HTTP `503` with `detail.code="QDRANT_UNAVAILABLE"`. CLI returns nonzero with `ok=false`, `code="QDRANT_UNAVAILABLE"`, and `http_status=503`. MCP returns a tool error whose content carries the same code and status.
+- Other unexpected search failures remain HTTP `500` and do not impersonate either typed failure. Error messages must not include provider credentials or request authorization values.
 
 Events:
 
@@ -222,6 +290,7 @@ Verification:
 - Two-seat tests cover search, hydrate, direct retrieve, delete, prune, graph aggregation, CLI, and MCP with same and distinct raw IDs.
 - Score tests prove Qdrant similarity, Cognee distance, normalized score, and final rank use named directions and do not swap units.
 - Benchmark output records the profile, candidate census, exclusions, partial failures, returned hits, and trace ID for every query.
+- Docker surface tests prove genuine empty search succeeds across HTTP, CLI, and MCP, then stop Qdrant and prove the typed `QDRANT_UNAVAILABLE` failure across all three surfaces. A bounded slow provider proves `SEARCH_TIMEOUT` without returning `results: []` as success.
 - Approval gate: retrieval schema implementation starts with the lifecycle schema because candidates must reference durable source revisions and projection receipts.
 - VERIFIED 2026-08-09: candidate commit `275e433` filters managed provider candidates through the current source head and a searchable vector receipt, then exposes source revision and receipt identity in `_citadel`. This is the lifecycle binding only. Versioned `RetrievalCandidate`, `RetrievalHit`, `RetrievalTrace`, and `RetrievalProfile` remain In Progress.
 
