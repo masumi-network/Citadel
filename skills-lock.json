@@ -6,6 +6,12 @@
       "sourceType": "github",
       "skillPath": "skills/citadel/SKILL.md",
       "computedHash": "2dd3752c927d0275a36412b7feaf8fea9527185965137190923c2b6d823ff495"
+    },
+    "qdrant-advisor": {
+      "source": "qdrant/skills",
+      "sourceType": "github",
+      "skillPath": "meta/qdrant-advisor/SKILL.md",
+      "computedHash": "847fd40916d767cde7cf266a4213d6645b125e6103daea3a313d99075ec209f0"
     }
   }
 }
