@@ -1,17 +1,23 @@
-name: Publish to PyPI
+name: Publish release
 
-# Publishes `citadel-archive` to PyPI on a version tag (e.g. v0.1.0) using
-# PyPI Trusted Publishing (OIDC) — no API tokens are stored anywhere.
-# One-time setup is documented in PUBLISHING.md.
+# Publishes one versioned Python and OCI release. The OCI image is staged by
+# source SHA and both platform digests must pass before public promotion.
 
 on:
   push:
     tags:
       - "v*"
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   checks: read
+
+env:
+  IMAGE_NAME: ghcr.io/masumi-network/citadel
 
 jobs:
   release-guard:
@@ -24,6 +30,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Require an exact semantic-version tag
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - name: Require the tagged commit to be on main
         run: |
           git fetch origin main --depth=1
@@ -71,14 +80,111 @@ jobs:
           name: dist
           path: dist/
 
-  publish:
+  stage-image:
+    name: Stage production OCI index
+    needs: release-guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and stage production image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+  smoke-image:
+    name: Smoke staged image (${{ matrix.platform }})
+    needs: stage-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            architecture: amd64
+          - platform: linux/arm64
+            architecture: arm64
+    steps:
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve staged platform digest
+        id: platform
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          INDEX_DIGEST: ${{ needs.stage-image.outputs.digest }}
+        run: |
+          manifest="$(docker buildx imagetools inspect "${IMAGE_NAME}@${INDEX_DIGEST}" --raw)"
+          platform_digest="$(jq -r \
+            --arg architecture "$ARCHITECTURE" \
+            '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest' \
+            <<<"$manifest")"
+          [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(grep -c "$platform_digest" <<<"$manifest")" -eq 1
+          echo "digest=$platform_digest" >> "$GITHUB_OUTPUT"
+      - name: Smoke exact platform digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PLATFORM_DIGEST: ${{ steps.platform.outputs.digest }}
+        run: |
+          docker pull --platform "$PLATFORM" "${IMAGE_NAME}@${PLATFORM_DIGEST}"
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --entrypoint python \
+            "${IMAGE_NAME}@${PLATFORM_DIGEST}" \
+            -c "import cognee, kb; assert kb.__version__ == '${GITHUB_REF_NAME#v}'"
+
+  attest-image:
+    name: Attest staged OCI index
+    needs: [stage-image, smoke-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      packages: write
+    steps:
+      - name: Create keyless GitHub provenance attestation
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.stage-image.outputs.digest }}
+          push-to-registry: true
+
+  publish-pypi:
     name: Publish to PyPI
-    needs: [release-guard, build]
+    needs: [build, attest-image]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write # required for Trusted Publishing
-      contents: write # required to create the GitHub Release
+      id-token: write
+      contents: read
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -86,12 +192,71 @@ jobs:
           path: dist/
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  promote-image:
+    name: Promote immutable OCI version
+    needs: [stage-image, attest-image, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require unused version tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          if docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
+            echo "refusing to overwrite existing image tag ${IMAGE_NAME}:${VERSION}" >&2
+            exit 1
+          fi
+      - name: Promote staged index without rebuilding
+        env:
+          INDEX_DIGEST: ${{ needs.stage-image.outputs.digest }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          metadata="$RUNNER_TEMP/citadel-promoted-image.json"
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --metadata-file "$metadata" \
+            "${IMAGE_NAME}@${INDEX_DIGEST}"
+          promoted_digest="$(jq -r '.["containerimage.descriptor"].digest' "$metadata")"
+          test "$promoted_digest" = "$INDEX_DIGEST"
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, stage-image, promote-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Write image digest receipt
+        env:
+          INDEX_DIGEST: ${{ needs.stage-image.outputs.digest }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          printf 'image=%s:%s@%s\nsource_sha=%s\n' \
+            "$IMAGE_NAME" "$VERSION" "$INDEX_DIGEST" "$GITHUB_SHA" \
+            > citadel-image-receipt.txt
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "${GITHUB_REF_NAME}"
           dist/*
+          citadel-image-receipt.txt
           --repo "${GITHUB_REPOSITORY}"
           --title "citadel-archive ${GITHUB_REF_NAME}"
           --generate-notes
