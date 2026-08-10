@@ -58,6 +58,10 @@ RUN apt-get update \
 COPY --from=builder --chown=citadel:citadel /src /src
 WORKDIR /src
 USER 10001:10001
+# The inherited runtime probe reads CITADEL_ADMIN_KEY and calls /readyz, and a
+# test container has neither, so it could only ever report unhealthy while
+# re-running a doomed exec every interval. Production keeps its probe.
+HEALTHCHECK NONE
 ENTRYPOINT []
 CMD ["python", "-m", "pytest", "-q", "-m", "not live"]
 

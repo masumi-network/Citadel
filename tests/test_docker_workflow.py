@@ -1,3 +1,4 @@
+import re
 import tomllib
 from pathlib import Path
 
@@ -64,10 +65,15 @@ def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
     assert 'restore_rollback_qdrant="${network}-restore-rollback-qdrant"' in container_tests
     assert "CITADEL_QDRANT_SERVER_IMAGE" in container_tests
     assert "CITADEL_LIFECYCLE_ENABLED=false" not in container_tests
-    assert "docker logs --follow --timestamps" in container_tests
-    assert 'tee "$log_dir/source-qdrant.log"' in container_tests
-    assert 'tee "$log_dir/restore-success-qdrant.log"' in container_tests
-    assert 'tee "$log_dir/restore-rollback-qdrant.log"' in container_tests
+    assert 'docker logs --timestamps "$source_qdrant" > "$log_dir/source-qdrant.log"' in container_tests
+    assert (
+        'docker logs --timestamps "$restore_success_qdrant" > "$log_dir/restore-success-qdrant.log"'
+        in container_tests
+    )
+    assert (
+        'docker logs --timestamps "$restore_rollback_qdrant" '
+        '> "$log_dir/restore-rollback-qdrant.log"'
+    ) in container_tests
     assert "assert_clean_container_logs" in container_tests
     assert "HTTP/[0-9.]+\" [45][0-9][0-9]" in container_tests
     assert "warn(ing)?" in container_tests
@@ -86,9 +92,14 @@ def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
     assert "CITADEL_QDRANT_RESTORE_URL=http://$restore_rollback_qdrant:6333" in container_tests
     assert "docker compose" in container_runtime
     assert "docker compose --project-name \"$project\" --env-file \"$env_file\" up" in container_runtime
-    assert "docker compose --project-name \"$project\" logs --follow" in container_runtime
-    assert 'tee "$log_dir/qdrant.log"' in container_runtime
-    assert 'tee "$log_dir/citadel.log"' in container_runtime
+    assert (
+        'docker compose --project-name "$project" --env-file "$env_file" '
+        'logs --timestamps qdrant > "$log_dir/qdrant.log"'
+    ) in container_runtime
+    assert (
+        'docker compose --project-name "$project" --env-file "$env_file" '
+        'logs --timestamps citadel > "$log_dir/citadel.log"'
+    ) in container_runtime
     assert "assert_clean_runtime_logs" in container_runtime
     assert "warn(ing)?" in container_runtime
     assert "failure" in container_runtime
@@ -100,6 +111,155 @@ def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
     assert "/readyz" in container_runtime
     assert "container-tests" in gate
     assert "container-runtime" in gate
+
+
+def test_ci_qdrant_containers_mount_volumes_rather_than_exempting_the_storage_warning() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+
+    for container in ("source_qdrant", "restore_success_qdrant", "restore_rollback_qdrant"):
+        assert f'--volume "${{{container}}}-storage:/qdrant/storage"' in container_tests
+        assert f'--volume "${{{container}}}-snapshots:/qdrant/snapshots"' in container_tests
+        assert f'"${{{container}}}-storage" "${{{container}}}-snapshots"' in container_tests
+    assert container_tests.count(":/qdrant/storage") == 3
+    assert container_tests.count(":/qdrant/snapshots") == 3
+    assert "docker volume rm" in container_tests
+    # Qdrant's container-filesystem warning reports missing durable storage, so a
+    # missing volume has to keep failing this job. Mount the volume; never teach
+    # the classifier to read the warning as benign.
+    assert "Container filesystem detected" not in container_tests
+    assert "potential issue with the filesystem" not in container_tests
+
+
+def _executable_lines(job: str) -> str:
+    return "\n".join(line for line in job.splitlines() if not line.lstrip().startswith("#"))
+
+
+def test_container_jobs_capture_logs_after_the_fact_instead_of_backgrounding_followers() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+
+    # Comments are allowed to name the old pattern; executable lines are not.
+    tests_code = _executable_lines(container_tests)
+    runtime_code = _executable_lines(container_runtime)
+    for code in (tests_code, runtime_code):
+        # `cmd | tee file &` sets $! to tee, so killing it leaves `docker logs
+        # --follow` alive on an idle container, and waiting on that job never
+        # returns.
+        backgrounded = [
+            line
+            for line in code.splitlines()
+            if line.rstrip().endswith("&") and not line.rstrip().endswith("&&")
+        ]
+        assert backgrounded == []
+        assert "--follow" not in code
+        assert "$!" not in code
+        assert "stop_log_followers" not in code
+        assert "_log_pid" not in code
+    # Capture runs inside the trap too, so a failing run still leaves evidence,
+    # and it has to precede the teardown that destroys the containers.
+    tests_cleanup = tests_code.split("cleanup() {", 1)[1].split("}", 1)[0]
+    runtime_cleanup = runtime_code.split("cleanup() {", 1)[1].split("}", 1)[0]
+    assert tests_cleanup.index("capture_container_logs") < tests_cleanup.index("docker rm -f")
+    assert runtime_cleanup.index("capture_runtime_logs") < runtime_cleanup.index("down --volumes")
+    # Definition, the call in the trap, and the call before classification.
+    assert tests_code.count("capture_container_logs") == 3
+    assert runtime_code.count("capture_runtime_logs") == 3
+    # Capture swallows its own errors, so an empty log file is the one way this
+    # rewrite could pass without evidence. Both classifiers reject it.
+    for code in (tests_code, runtime_code):
+        assert 'if [[ ! -s "$log_file" ]]; then' in code
+        assert "::error::No log was captured from $log_file" in code
+    # `docker compose logs` resolves from labels today, but it is the only
+    # compose call in the job without the env file the rest of them pass.
+    assert container_runtime.count('--env-file "$env_file" logs --timestamps') == 2
+
+
+def _job_blocks(workflow: str) -> dict[str, str]:
+    body = workflow.split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([a-z][a-z0-9-]*):$\n", body, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def test_every_job_declares_a_timeout_so_a_hang_cannot_burn_the_default_six_hours() -> None:
+    jobs = _job_blocks(WORKFLOW.read_text(encoding="utf-8"))
+
+    assert set(jobs) == {
+        "test",
+        "audit",
+        "plain-requirements-smoke",
+        "benchmark",
+        "web",
+        "package-smoke",
+        "container-tests",
+        "container-runtime",
+        "gate",
+    }
+    for name, block in jobs.items():
+        expected = 30 if name.startswith("container-") else 15
+        assert f"timeout-minutes: {expected}\n" in block, name
+
+
+def _citadel_log_exemptions(container_runtime: str) -> list[str]:
+    alternatives: list[str] = []
+    for line in container_runtime.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("expected_citadel_log_pattern"):
+            continue
+        value = stripped.split("=", 1)[1].strip()
+        assert value[:1] == value[-1:] and value[:1] in ("'", '"'), value
+        alternatives.extend(part for part in value[1:-1].split("|") if part)
+    return alternatives
+
+
+def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+
+    # '^$' can never match a severe line, so it exempted nothing and failed the
+    # job on a healthy boot.
+    assert "expected_log_pattern='^$'" not in container_runtime
+    assert 'expected_log_pattern="$expected_citadel_log_pattern"' in container_runtime
+    assert _citadel_log_exemptions(container_runtime) == [
+        r"Cognee 1\.0 changes:",
+        "IncompleteFieldDefinitionWarning: Field 'lifespan'",
+        r"warnings\.warn\(",
+        "No nodes found in the database",
+    ]
+    # Measured only on arm64; it gets an exemption when CI produces the evidence.
+    # Comments may name it; no executable line may.
+    code = _executable_lines(container_runtime)
+    assert "onnxruntime" not in code
+    assert "Unknown CPU vendor" not in code
+    # Everything outside that list stays fail-closed.
+    assert "warn(ing)?|error|panic|fatal|oom|corruption|failure" in container_runtime
+
+
+def test_docker_test_target_disables_the_inherited_runtime_healthcheck() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    runtime_stage = dockerfile.split(" AS runtime\n", 1)[1].split("FROM runtime AS test\n", 1)[0]
+    test_stage = dockerfile.split("FROM runtime AS test\n", 1)[1].split(
+        "FROM runtime AS production\n", 1
+    )[0]
+    production = dockerfile.rsplit("FROM runtime AS production\n", 1)[1]
+
+    # Production keeps the probe; test runs never set CITADEL_ADMIN_KEY, so the
+    # inherited probe could only ever report the test container unhealthy.
+    assert "HEALTHCHECK --interval=15s" in runtime_stage
+    assert "CITADEL_ADMIN_KEY" in runtime_stage
+    assert "HEALTHCHECK NONE\n" in test_stage
+    assert test_stage.count("HEALTHCHECK") == 1
+    assert "urlopen" not in test_stage
+    assert "HEALTHCHECK" not in production
 
 
 def test_compose_connection_preflight_is_opt_in_outside_offline_readiness_ci() -> None:
