@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,39 @@ from types import SimpleNamespace
 import pytest
 
 from kb import lite_runtime
+
+
+LITE_WRITTEN_ENV_KEYS = (
+    "SYSTEM_ROOT_DIRECTORY",
+    "DATA_ROOT_DIRECTORY",
+    "CACHE_ROOT_DIRECTORY",
+    "COGNEE_LOGS_DIR",
+    "CITADEL_STATE_DIRECTORY",
+    "LADYBUG_HOME_DIRECTORY",
+    "DB_PROVIDER",
+    "DB_PATH",
+    "DB_NAME",
+    "GRAPH_DATABASE_PROVIDER",
+    "VECTOR_DB_PROVIDER",
+    "VECTOR_DATASET_DATABASE_HANDLER",
+    "ENABLE_BACKEND_ACCESS_CONTROL",
+    "REQUIRE_AUTHENTICATION",
+    "TELEMETRY_DISABLED",
+    "AUTO_FEEDBACK",
+    "CITADEL_COGNIFY_QUEUE_PATH",
+)
+
+
+@pytest.fixture(autouse=True)
+def restore_lite_written_environment() -> Iterator[None]:
+    missing = object()
+    original = {key: os.environ.get(key, missing) for key in LITE_WRITTEN_ENV_KEYS}
+    yield
+    for key, value in original.items():
+        if value is missing:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _configured_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
@@ -30,8 +64,10 @@ def _configured_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> None
     for name in (
         "SYSTEM_ROOT_DIRECTORY",
         "DATA_ROOT_DIRECTORY",
+        "CACHE_ROOT_DIRECTORY",
         "COGNEE_LOGS_DIR",
         "CITADEL_STATE_DIRECTORY",
+        "LADYBUG_HOME_DIRECTORY",
         "CITADEL_COGNIFY_QUEUE_PATH",
         "DB_PROVIDER",
         "DB_PATH",
@@ -56,6 +92,81 @@ def test_configure_lite_environment_creates_sqlite_profile(
     assert os.environ["VECTOR_DB_PROVIDER"] == "qdrant"
     assert os.environ["ENABLE_BACKEND_ACCESS_CONTROL"] == "true"
     assert Path(os.environ["DB_PATH"]).is_dir()
+    cache_root = Path(os.environ["CACHE_ROOT_DIRECTORY"])
+    assert cache_root == tmp_path.resolve() / "cache"
+    assert cache_root.is_dir()
+    ladybug_home = Path(os.environ["LADYBUG_HOME_DIRECTORY"])
+    assert ladybug_home == tmp_path.resolve() / "ladybug-home"
+    assert ladybug_home.is_dir()
+
+
+def test_configure_lite_environment_preserves_contained_ladybug_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configured_environment(monkeypatch, tmp_path)
+    override = tmp_path / "provider-cache" / "ladybug"
+    monkeypatch.setenv("LADYBUG_HOME_DIRECTORY", str(override))
+    home = os.environ.get("HOME")
+
+    lite_runtime.configure_lite_environment()
+
+    assert Path(os.environ["LADYBUG_HOME_DIRECTORY"]) == override.resolve()
+    assert override.is_dir()
+    assert os.environ.get("HOME") == home
+
+
+def test_configure_lite_environment_rejects_ladybug_home_outside_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    _configured_environment(monkeypatch, root)
+    outside = tmp_path / "outside"
+    monkeypatch.setenv("LADYBUG_HOME_DIRECTORY", str(outside))
+
+    with pytest.raises(lite_runtime.LiteConfigurationError, match="must resolve inside"):
+        lite_runtime.configure_lite_environment()
+
+    assert not outside.exists()
+
+
+def test_cognee_cache_resolves_below_writable_lite_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configured_environment(monkeypatch, tmp_path)
+    root = lite_runtime.configure_lite_environment()
+
+    from cognee.base_config import get_base_config
+    from cognee.shared.cache import StorageAwareCache
+
+    get_base_config.cache_clear()
+    try:
+        cache = StorageAwareCache()
+        resolved = Path(cache.storage_manager.storage.storage_path).resolve()
+        package_root = Path(__import__("cognee").__file__).resolve().parent
+
+        assert resolved == root / "cache"
+        assert resolved.is_relative_to(root)
+        assert resolved.is_dir()
+        assert package_root not in resolved.parents
+    finally:
+        get_base_config.cache_clear()
+
+
+def test_configure_lite_environment_preserves_cache_root_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configured_environment(monkeypatch, tmp_path)
+    cache_override = tmp_path / "mounted-cache"
+    monkeypatch.setenv("CACHE_ROOT_DIRECTORY", str(cache_override))
+
+    lite_runtime.configure_lite_environment()
+
+    assert Path(os.environ["CACHE_ROOT_DIRECTORY"]) == cache_override
+    assert cache_override.is_dir()
 
 
 def test_configure_lite_environment_rejects_postgres(
@@ -140,3 +251,24 @@ def test_bootstrap_receipt_excludes_secrets(
     assert "qdrant-secret" not in content
     assert "llm-secret" not in content
     assert "a" * 32 not in content
+
+
+def test_container_healthcheck_uses_authenticated_readiness() -> None:
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+
+    healthcheck = dockerfile.split("HEALTHCHECK", maxsplit=1)[1]
+    assert "/readyz" in healthcheck
+    assert "CITADEL_ADMIN_KEY" in healthcheck
+    assert "--timeout=15s" in healthcheck
+    assert "timeout=12" in healthcheck
+    assert "/healthz" not in healthcheck
+
+
+def test_container_runtime_home_belongs_to_the_dropped_user() -> None:
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+
+    assert "HOME=/home/citadel" in dockerfile

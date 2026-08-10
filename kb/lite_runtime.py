@@ -50,8 +50,10 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
     defaults = {
         "SYSTEM_ROOT_DIRECTORY": str(root / "cognee-system"),
         "DATA_ROOT_DIRECTORY": str(root / "data-storage"),
+        "CACHE_ROOT_DIRECTORY": str(root / "cache"),
         "COGNEE_LOGS_DIR": str(root / "logs"),
         "CITADEL_STATE_DIRECTORY": str(root / "citadel-state"),
+        "LADYBUG_HOME_DIRECTORY": str(root / "ladybug-home"),
         "DB_PROVIDER": "sqlite",
         "DB_PATH": str(root / "cognee-system" / "databases"),
         "DB_NAME": "cognee.db",
@@ -67,6 +69,12 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
         os.environ.setdefault(name, value)
     state = Path(os.environ["CITADEL_STATE_DIRECTORY"])
     os.environ.setdefault("CITADEL_COGNIFY_QUEUE_PATH", str(state / "cognify_queue.json"))
+    ladybug_home = Path(os.environ["LADYBUG_HOME_DIRECTORY"]).resolve()
+    if not ladybug_home.is_relative_to(root):
+        raise LiteConfigurationError(
+            "LADYBUG_HOME_DIRECTORY must resolve inside CITADEL_LITE_DATA_ROOT"
+        )
+    os.environ["LADYBUG_HOME_DIRECTORY"] = str(ladybug_home)
 
     expected = {
         "DB_PROVIDER": "sqlite",
@@ -109,9 +117,11 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
     for directory in (
         Path(os.environ["SYSTEM_ROOT_DIRECTORY"]),
         Path(os.environ["DATA_ROOT_DIRECTORY"]),
+        Path(os.environ["CACHE_ROOT_DIRECTORY"]),
         Path(os.environ["COGNEE_LOGS_DIR"]),
         state,
         Path(os.environ["DB_PATH"]),
+        ladybug_home,
     ):
         directory.mkdir(parents=True, exist_ok=True)
     return root

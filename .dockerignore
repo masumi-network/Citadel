@@ -1,5 +1,8 @@
 .git
 .github
+!.github
+!.github/workflows
+!.github/workflows/test.yml
 .local-review
 .venv
 .pytest_cache
@@ -12,7 +15,6 @@
 !.env.lite.example
 **/__pycache__
 **/*.pyc
-tests
 node_modules
 web/node_modules
 dist

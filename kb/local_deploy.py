@@ -32,13 +32,18 @@ _REQUIRED_EXISTING_KEYS = {
 }
 
 
-def _run_checked(command: list[str], *, stage: str) -> str:
+def _run_checked(
+    command: list[str],
+    *,
+    stage: str,
+    timeout_seconds: float = 120.0,
+) -> str:
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout_seconds,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -238,7 +243,11 @@ def _run_compose(config_dir: Path, docker: str, *, source_build: bool) -> None:
     ]
     _run_checked([*base, "config", "--quiet"], stage="Docker Compose config validation")
     mode = "--build" if source_build else "--no-build"
-    _run_checked([*base, "up", "-d", mode], stage="Docker Compose startup")
+    _run_checked(
+        [*base, "up", "-d", mode],
+        stage="Docker Compose startup",
+        timeout_seconds=1800.0 if source_build else 600.0,
+    )
 
 
 def _wait_for_ready(*, port: int, token: str, timeout_seconds: float) -> dict[str, Any]:

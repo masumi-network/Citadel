@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,3 +162,28 @@ def test_existing_secret_file_with_open_permissions_is_refused(
             dry_run=False,
             timeout_seconds=30,
         )
+
+
+def test_source_compose_build_has_a_cold_build_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    timeouts: list[float] = []
+
+    def fake_run(*_args, timeout: float, **_kwargs):
+        timeouts.append(timeout)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local_deploy.subprocess, "run", fake_run)
+    config_dir = tmp_path / "deploy"
+    config_dir.mkdir()
+    (config_dir / ".env").write_text("", encoding="utf-8")
+    (config_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    local_deploy._run_compose(
+        config_dir,
+        "/usr/bin/docker",
+        source_build=True,
+    )
+
+    assert timeouts == [120.0, 1800.0]

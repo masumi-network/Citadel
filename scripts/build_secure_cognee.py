@@ -25,13 +25,112 @@ SOURCE_URL = (
     "cognee-1.4.1.tar.gz"
 )
 SOURCE_SHA256 = "9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9"
-WHEEL_SHA256 = "2c1bec17b0ed9563ffa4f6ccdd4a02939cdec6dfd93db9faf852266ce3231a91"
+WHEEL_SHA256 = "890a5a5c7d4bce9053faa45e4ce5f19aa1f7dbce235c3d4ea6ab3c3b77bb873c"
 HATCHLING_VERSION = "1.31.0"
 ORIGINAL_REQUIREMENT = '    "cryptography>=43.0.0,<50",'
 PATCHED_REQUIREMENT = '    "cryptography>=43.0.0,<51",'
 PATCH_NOTICE = (
     "    # Modified by Citadel on 2026-08-08. Cryptography 50.0.0 fixes "
     "CVE-2026-69247."
+)
+LADYBUG_HELPER_PATH = Path("cognee_db_workers/_kuzu_helpers.py")
+LADYBUG_WORKER_PATH = Path("cognee_db_workers/kuzu_worker.py")
+LADYBUG_ADAPTER_PATH = Path(
+    "cognee/infrastructure/databases/graph/ladybug/adapter.py"
+)
+LADYBUG_HOME_PATCH_MARKER = "def configure_ladybug_home_directory(connection) -> None:"
+LADYBUG_HOME_PATCHES = (
+    (
+        LADYBUG_HELPER_PATH,
+        "import os\nimport sys\nimport tempfile\n",
+        "import json\nimport os\nimport sys\nimport tempfile\n",
+    ),
+    (
+        LADYBUG_HELPER_PATH,
+        """def _safe_close(obj) -> None:
+    if obj is None:
+        return
+    try:
+        obj.close()
+    except Exception:
+        pass
+
+
+def install_json_extension_local(
+""",
+        """def _safe_close(obj) -> None:
+    if obj is None:
+        return
+    try:
+        obj.close()
+    except Exception:
+        pass
+
+
+def configure_ladybug_home_directory(connection) -> None:
+    home_directory = os.environ.get("LADYBUG_HOME_DIRECTORY", "").strip()
+    if home_directory:
+        connection.execute(f"CALL home_directory = {json.dumps(home_directory)};")
+
+
+def install_json_extension_local(
+""",
+    ),
+    (
+        LADYBUG_HELPER_PATH,
+        """            conn = ladybug.Connection(tmp_db)
+            try:
+                conn.execute("INSTALL JSON;")
+""",
+        """            conn = ladybug.Connection(tmp_db)
+            configure_ladybug_home_directory(conn)
+            try:
+                conn.execute("INSTALL JSON;")
+""",
+    ),
+    (
+        LADYBUG_WORKER_PATH,
+        "from ._kuzu_helpers import install_json_extension_local\n",
+        """from ._kuzu_helpers import (
+    configure_ladybug_home_directory,
+    install_json_extension_local,
+)
+""",
+    ),
+    (
+        LADYBUG_WORKER_PATH,
+        """    conn = ladybug.Connection(db)
+    return HandleResult(value=None, handle_id=registry.register(conn))
+""",
+        """    conn = ladybug.Connection(db)
+    # OP_OPEN_CONNECTION runs here during initial setup and every replay.
+    configure_ladybug_home_directory(conn)
+    return HandleResult(value=None, handle_id=registry.register(conn))
+""",
+    ),
+    (
+        LADYBUG_ADAPTER_PATH,
+        "from cognee_db_workers._kuzu_helpers import install_json_extension_local\n",
+        """from cognee_db_workers._kuzu_helpers import (
+            configure_ladybug_home_directory,
+            install_json_extension_local,
+        )
+""",
+    ),
+    (
+        LADYBUG_ADAPTER_PATH,
+        """            self.connection = Connection(self.db)
+
+            try:
+                self.connection.execute("LOAD EXTENSION JSON;")
+""",
+        """            self.connection = Connection(self.db)
+            configure_ladybug_home_directory(self.connection)
+
+            try:
+                self.connection.execute("LOAD EXTENSION JSON;")
+""",
+    ),
 )
 
 
@@ -86,6 +185,25 @@ def patch_pyproject(source_root: Path) -> Path:
     return pyproject
 
 
+def patch_ladybug_home_directory(source_root: Path) -> tuple[Path, ...]:
+    patched_content: dict[Path, str] = {}
+    for relative_path, original, replacement in LADYBUG_HOME_PATCHES:
+        path = source_root / relative_path
+        content = patched_content.get(path)
+        if content is None:
+            content = path.read_text(encoding="utf-8")
+        if content.count(original) != 1:
+            raise RuntimeError(
+                f"Cognee Ladybug source drifted at {relative_path}: expected one audited block"
+            )
+        content = content.replace(original, replacement, 1)
+        patched_content[path] = content
+
+    for path, content in patched_content.items():
+        path.write_text(content, encoding="utf-8")
+    return tuple(patched_content)
+
+
 def build_wheel(source_root: Path, output_dir: Path) -> Path:
     try:
         installed_hatchling = metadata.version("hatchling")
@@ -131,6 +249,31 @@ def verify_wheel(wheel_path: Path) -> dict[str, str]:
         basenames = {Path(name).name for name in names}
         if "LICENSE" not in basenames or "NOTICE.md" not in basenames:
             raise RuntimeError("Cognee wheel is missing LICENSE or NOTICE.md")
+        for relative_path in (
+            LADYBUG_HELPER_PATH,
+            LADYBUG_WORKER_PATH,
+            LADYBUG_ADAPTER_PATH,
+        ):
+            name = relative_path.as_posix()
+            if name not in names:
+                raise RuntimeError(f"Cognee wheel is missing patched source {name}")
+        helper = archive.read(LADYBUG_HELPER_PATH.as_posix()).decode("utf-8")
+        worker = archive.read(LADYBUG_WORKER_PATH.as_posix()).decode("utf-8")
+        adapter = archive.read(LADYBUG_ADAPTER_PATH.as_posix()).decode("utf-8")
+        if LADYBUG_HOME_PATCH_MARKER not in helper:
+            raise RuntimeError("Cognee wheel is missing the Ladybug home patch")
+        if helper.index("configure_ladybug_home_directory(conn)") > helper.index(
+            'conn.execute("INSTALL JSON;")'
+        ):
+            raise RuntimeError("Cognee wheel configures Ladybug home after throwaway install")
+        if worker.index("configure_ladybug_home_directory(conn)") > worker.index(
+            "return HandleResult(value=None, handle_id=registry.register(conn))"
+        ):
+            raise RuntimeError("Cognee wheel registers subprocess connection before home")
+        if adapter.index("configure_ladybug_home_directory(self.connection)") > adapter.index(
+            'self.connection.execute("LOAD EXTENSION JSON;")'
+        ):
+            raise RuntimeError("Cognee wheel configures Ladybug home after direct load")
     if metadata.get("Name") != "cognee" or metadata.get("Version") != COGNEE_VERSION:
         raise RuntimeError(
             f"unexpected Cognee wheel identity: {metadata.get('Name')} {metadata.get('Version')}"
@@ -152,6 +295,7 @@ def build(output_dir: Path) -> tuple[Path, Path]:
         download_source(archive_path)
         source_root = extract_source(archive_path, temporary_path / "source")
         patch_pyproject(source_root)
+        patch_ladybug_home_directory(source_root)
         wheel_path = build_wheel(source_root, output_dir)
     evidence = verify_wheel(wheel_path)
     if evidence["wheel_sha256"] != WHEEL_SHA256:
@@ -167,6 +311,11 @@ def build(output_dir: Path) -> tuple[Path, Path]:
         "source_sha256": SOURCE_SHA256,
         "hatchling_version": HATCHLING_VERSION,
         "patch": f"{ORIGINAL_REQUIREMENT} -> {PATCHED_REQUIREMENT}",
+        "ladybug_home_patch": [
+            LADYBUG_HELPER_PATH.as_posix(),
+            LADYBUG_WORKER_PATH.as_posix(),
+            LADYBUG_ADAPTER_PATH.as_posix(),
+        ],
         **evidence,
     }
     manifest_path = output_dir / "cognee-1.4.1-citadel-build.json"

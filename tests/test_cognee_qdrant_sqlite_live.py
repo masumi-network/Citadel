@@ -14,9 +14,9 @@ _REPORT_PREFIX = "CITADEL_LITE_REPORT="
 
 
 def _worker_environment(root: Path, *, generation: str, mode: str) -> dict[str, str]:
-    system = root / "system"
-    data = root / "data"
-    state = root / "state"
+    system = root / "cognee-system"
+    data = root / "data-storage"
+    state = root / "citadel-state"
     logs = root / "logs"
     for directory in (system / "databases", data, state, logs):
         directory.mkdir(parents=True, exist_ok=True)
@@ -95,15 +95,19 @@ def test_cognee_sqlite_qdrant_survives_restart_and_keeps_dataset_scope(
     assert first["alice_texts"] == [
         "alice-only-citadel-lite-marker private source record"
     ]
-    assert first["central_cross_texts"] == first["central_texts"]
+    assert first["central_cross_texts"] == []
     assert first["lifecycle_texts"] == [
         "lifecycle-qdrant-live-marker source record"
+    ]
+    assert first["central_lifecycle_texts"] == [
+        "central-lifecycle-qdrant-live-marker source record"
     ]
     assert second["central_texts"] == first["central_texts"]
     assert second["alice_texts"] == first["alice_texts"]
     assert second["central_cross_texts"] == first["central_cross_texts"]
     assert second["lifecycle_texts"] == first["lifecycle_texts"]
-    assert (tmp_path / "system" / "databases" / "cognee.db").is_file()
+    assert second["central_lifecycle_texts"] == first["central_lifecycle_texts"]
+    assert (tmp_path / "cognee-system" / "databases" / "cognee.db").is_file()
 
 
 def _result_texts(results: list[Any]) -> list[str]:
@@ -117,6 +121,10 @@ def _result_texts(results: list[Any]) -> list[str]:
         elif isinstance(payload, dict) and isinstance(payload.get("text"), str):
             texts.append(payload["text"])
     return texts
+
+
+def _matching_texts(results: list[Any], marker: str) -> list[str]:
+    return sorted(text for text in _result_texts(results) if marker in text)
 
 
 async def _worker() -> None:
@@ -162,6 +170,8 @@ async def _worker() -> None:
     central_marker = "central-only-citadel-lite-marker"
     alice_marker = "alice-only-citadel-lite-marker"
     lifecycle_marker = "lifecycle-qdrant-live-marker"
+    central_lifecycle_marker = "central-lifecycle-qdrant-live-marker"
+    session_trace_marker = "session-traces-citadel-lite-marker"
     lifecycle = Citadel(
         CitadelConfig(
             default_dataset="lifecycle-live",
@@ -172,6 +182,7 @@ async def _worker() -> None:
         ),
         cognee=client,
     )
+    document_ids_path = Path(os.environ["CITADEL_STATE_DIRECTORY"]) / "live-document-ids.json"
     if os.environ["CITADEL_LITE_WORKER_MODE"] == "ingest":
         central_result = await client.remember(
             f"{central_marker} source record",
@@ -183,12 +194,20 @@ async def _worker() -> None:
             dataset_name="seat:alice",
             defer_cognify=True,
         )
+        session_trace_result = await client.remember(
+            f"{session_trace_marker} bootstrap source record",
+            dataset_name="session-traces",
+            defer_cognify=True,
+        )
         await client.cognify(datasets=["central"])
         await client.cognify(datasets=["seat:alice"])
+        await client.cognify(datasets=["session-traces"])
         central_ids = _cognify_data_ids(central_result.get("added"))
         alice_ids = _cognify_data_ids(alice_result.get("added"))
+        session_trace_ids = _cognify_data_ids(session_trace_result.get("added"))
         assert len(central_ids) == 1
         assert len(alice_ids) == 1
+        assert len(session_trace_ids) == 1
         central_census = await client.stored_chunk_budget_check(
             document_ids=central_ids,
             datasets=["central"],
@@ -221,6 +240,30 @@ async def _worker() -> None:
             str(lifecycle_result.projection_job_id)
         )
         assert lifecycle_operation["state"] == "searchable"
+        central_lifecycle_result = await lifecycle.ingest(
+            f"{central_lifecycle_marker} source record",
+            dataset="central",
+            source_key="live:central-lifecycle-marker",
+        )
+        central_lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
+            str(central_lifecycle_result.projection_job_id)
+        )
+        assert central_lifecycle_operation["state"] == "searchable"
+        document_ids = {
+            "central": [
+                *central_ids,
+                str(central_lifecycle_result.source_revision_id),
+            ],
+            "seat:alice": alice_ids,
+            "session-traces": session_trace_ids,
+            "lifecycle-live": [str(lifecycle_result.source_revision_id)],
+        }
+        document_ids_path.write_text(
+            json.dumps(document_ids, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        document_ids = json.loads(document_ids_path.read_text(encoding="utf-8"))
 
     central_hits = await client.recall(central_marker, dataset="central", top_k=10)
     central_cross_hits = await client.recall(alice_marker, dataset="central", top_k=10)
@@ -230,12 +273,30 @@ async def _worker() -> None:
         dataset="lifecycle-live",
         top_k=10,
     )
+    central_lifecycle_hits = await lifecycle.search(
+        central_lifecycle_marker,
+        dataset="central",
+        top_k=10,
+    )
+    graph_presence: dict[str, list[str]] = {}
+    for dataset, expected_ids in document_ids.items():
+        present = await client.corpus_graph_presence(
+            expected_ids,
+            datasets=[dataset],
+        )
+        assert present == set(expected_ids)
+        graph_presence[dataset] = sorted(present)
     await lifecycle.stop_lifecycle_queue()
     report = {
-        "central_texts": _result_texts(central_hits),
-        "central_cross_texts": _result_texts(central_cross_hits),
-        "alice_texts": _result_texts(alice_hits),
-        "lifecycle_texts": _result_texts(lifecycle_hits),
+        "central_texts": _matching_texts(central_hits, central_marker),
+        "central_cross_texts": _matching_texts(central_cross_hits, alice_marker),
+        "alice_texts": _matching_texts(alice_hits, alice_marker),
+        "lifecycle_texts": _matching_texts(lifecycle_hits, lifecycle_marker),
+        "central_lifecycle_texts": _matching_texts(
+            central_lifecycle_hits,
+            central_lifecycle_marker,
+        ),
+        "graph_presence": graph_presence,
     }
     print(_REPORT_PREFIX + json.dumps(report, sort_keys=True))
 

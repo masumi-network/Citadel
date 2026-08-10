@@ -33,6 +33,7 @@ server = [
     # Exact pin required because Citadel reads Cognee private dataset APIs and
     # registers its audited Qdrant adapter against Cognee's internal maps.
     "cognee[fastembed]==1.4.1",
+    "ladybug==0.18.2",
     "cryptography==50.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",

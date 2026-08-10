@@ -25,6 +25,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
+    HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
     CITADEL_BUILD_ID_PATH=/opt/citadel/build-id
 
@@ -37,11 +38,29 @@ RUN install -d /opt/citadel \
     && python -m pip install /wheels/cognee-1.4.1-py3-none-any.whl \
     "/wheels/citadel_archive-0.5.0-py3-none-any.whl[server]" \
     && python -m pip check \
-    && python -c "import cognee, kb; assert cognee.__version__ == '1.4.1'" \
+    && python -c "from importlib.metadata import version; assert (version('cognee'), version('ladybug'), version('qdrant-client')) == ('1.4.1', '0.18.2', '1.19.0')" \
     && rm -rf /wheels
 
 EXPOSE 8000
 VOLUME ["/data"]
-HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=5 \
-  CMD ["python", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200"]
+HEALTHCHECK --interval=15s --timeout=15s --start-period=120s --retries=5 \
+  CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; request = Request('http://127.0.0.1:8000/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
+USER 10001:10001
 ENTRYPOINT ["python", "-m", "kb.lite_runtime"]
+
+FROM runtime AS test
+
+USER root
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y git nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install "pytest==9.1.1" "pytest-asyncio==1.4.0" "ruff==0.15.15"
+COPY --from=builder --chown=citadel:citadel /src /src
+WORKDIR /src
+USER 10001:10001
+ENTRYPOINT []
+CMD ["python", "-m", "pytest", "-q", "-m", "not live"]
+
+FROM runtime AS production
+
+USER 10001:10001

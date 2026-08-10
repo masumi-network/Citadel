@@ -2,6 +2,7 @@
 # scripts/build_secure_cognee.py before resolving this file. The source wheel
 # carries the reviewed one-line cryptography metadata correction.
 cognee[fastembed]==1.4.1
+ladybug==0.18.2
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
 aiohttp>=3.14.3,<4.0.0
