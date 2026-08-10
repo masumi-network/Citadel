@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,6 +100,7 @@ def test_new_deploy_writes_private_config_and_reuses_it(
     assert (target / ".env").read_bytes() == before
     assert stat_mode(target) == 0o700
     assert stat_mode(target / ".env") == 0o600
+    assert stat_mode(target / "docker-compose.yml") == 0o600
     assert "local-test-llm-key" not in str(first)
     assert compose_calls == [True, True]
 
@@ -151,7 +153,12 @@ def test_existing_secret_file_with_open_permissions_is_refused(
     target.mkdir()
     (target / ".env").write_text("CITADEL_ADMIN_KEY=\"secret\"\n", encoding="utf-8")
     (target / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
-    os.chmod(target / ".env", 0o644)
+    # Group-read is the narrowest bit that trips the `& 0o077` guard; granting
+    # world access in a fixture is unnecessary to prove refusal. Spelled as
+    # stat constants because CodeQL's py/overly-permissive-file flags any
+    # integer-literal mode with a nonzero group or world nibble, and this
+    # value is deliberately bad.
+    os.chmod(target / ".env", stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
 
     with pytest.raises(local_deploy.LocalDeployError, match="permissions"):
         local_deploy.deploy_local(

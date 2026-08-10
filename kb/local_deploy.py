@@ -184,7 +184,11 @@ def _create_config(
     )
     try:
         _write_exclusive(config_dir / ".env", env_content, 0o600)
-        _write_exclusive(config_dir / "docker-compose.yml", compose_content, 0o644)
+        # Owner-only like the directory itself: compose carries no secret, but
+        # nothing outside this user ever needs to read it, and a world-readable
+        # mask inside a 0700 directory is a latent leak if the directory mode
+        # is ever loosened.
+        _write_exclusive(config_dir / "docker-compose.yml", compose_content, 0o600)
     except FileExistsError as error:
         raise LocalDeployError("deployment config appeared concurrently; retry") from error
     return environment, source_build
