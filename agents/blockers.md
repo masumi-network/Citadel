@@ -81,3 +81,97 @@ Description: VERIFIED: the existing backup smoke copies Cognee SQLite and lifecy
 Proposed resolution: pause ingestion and projection work, record one generation manifest, back up both SQLite databases, every generation Qdrant collection, and Ladybug graph files or a documented graph rebuild input. Restore only downloaded artifacts into empty storage, boot Citadel, verify receipts and exact markers, then resume writes.
 Status: Blocked
 Evidence: `scripts/smoke_qdrant_provider.py:315-380`; `kb/lite_runtime.py:48-69`; Docker audit on 2026-08-09. VERIFIED narrow proof: one downloaded `DocumentChunk_text` snapshot restored to a new collection with equal config, payload schema, vectors, payloads, and three rows. Blind spot: one collection restore is not a Citadel generation restore.
+
+Checkpoint 2026-08-09: CORRECTED: an uncommitted whole-generation implementation now exists at `/private/tmp/citadel-v050-qdrant/kb/generation_backup.py`. VERIFIED earlier in this task: its focused live test returned `1 passed, 2 warnings in 52.63s`. Status remains Blocked until the same source passes inside a Docker test image, restores into fresh Qdrant and Lite storage, boots the restored production image, retrieves exact markers, and passes independent review.
+
+Fresh review 2026-08-09: REPORTED by backup reviewer and verified only by source locations at handoff: restore does not bind target runtime generation to artifact generation; the public CLI imports server-only Qdrant dependencies before its guard; count-verification failure can leave a restored collection outside rollback tracking; destination containment and symlink rollback boundaries are incomplete; the adjacent checksum does not authenticate an attacker-modified artifact. Add wrong-generation, rollback-after-real-recovery, destination containment, permissions, and production Compose orchestration regressions before closing this blocker. Evidence: candidate `kb/generation_backup.py:18,214-280,341-402`; `kb/cli.py:145-183`; `kb/local_deploy.py:153`; `tests/test_generation_backup_live.py:80`.
+
+ID: BLK-2026-08-09-03
+Date: 2026-08-09
+Owner: implementer
+Severity: High
+Description: VERIFIED: exact image `sha256:c2fdaebc720e22eb5926c8fd15e5f900d22ea46244ac3f6d99756eba87877cae` returned HTTP `500` for the CLI search probe against configured default dataset `masumi-network` when that dataset had no row. App logs recorded `DatasetNotFoundError: No datasets found. (Status code: 404)`. Exact search against populated dataset `lifecycle-live` returned HTTP `200` and the marker.
+Proposed resolution: add a regression that makes Cognee `DatasetNotFoundError` an honest no-data result at the client boundary, confirm explicit permission errors still fail, then prove empty-dataset `/search` returns HTTP `200` with zero results in the production Docker image. `citadel status --check-search` may retain its existing unavailable canary result for zero hits, but it must record the zero count without a provider exception and must not make top-level health false.
+Status: Blocked
+Evidence: `/private/tmp/citadel-v050-qdrant/kb/cognee_client.py:657-658`; Docker command `citadel status --node-url http://127.0.0.1:8000 --json --check-search --no-recent` returned `SEARCH_UNAVAILABLE`; followed Citadel logs returned the exact exception and `POST /search HTTP/1.1 500 Internal Server Error`.
+
+ID: BLK-2026-08-09-04
+Date: 2026-08-09
+Owner: release
+Severity: High
+Description: VERIFIED: the uncommitted `container-smoke` raw app run omits mandatory `CITADEL_QDRANT_SERVER_IMAGE`, while Lite validates it before startup. The job also sets `CITADEL_LIFECYCLE_ENABLED=false` and bypasses production Compose wiring. Its static test does not check the complete required environment.
+Proposed resolution: add a reproducible Docker test target, run non-live and live suites inside it, then use production `docker-compose.yml` for authenticated lifecycle ingest, operation receipts, search, CLI, MCP, capture, restart, outage, restore, security, resource, and log-classification gates.
+Status: Blocked
+Evidence: `/private/tmp/citadel-v050-qdrant/.github/workflows/test.yml:278-301`; `/private/tmp/citadel-v050-qdrant/kb/lite_runtime.py:85-93`; `/private/tmp/citadel-v050-qdrant/tests/test_docker_workflow.py:7-19`. Reviewer reproduction: `LiteConfigurationError: CITADEL_QDRANT_SERVER_IMAGE must not be empty`.
+
+ID: BLK-2026-08-09-05
+Date: 2026-08-09
+Owner: release
+Severity: Critical
+Description: VERIFIED: the host Data filesystem reached `100%` with `126MiB` available. Docker Desktop shut its Linux engine down after it could not write the VM initialization log, and the Docker socket was unavailable.
+Proposed resolution: remove only the approved recoverable UV package cache, restart Docker Desktop, verify preserved final3 resources, then prune only unreferenced BuildKit cache.
+Status: Completed
+Evidence: REPORTED: the user approved the exact cleanup on 2026-08-09. VERIFIED: `/Users/sarthiborkar/.cache/uv` measured `4,667,272 KiB`, was deleted, and `test ! -e /Users/sarthiborkar/.cache/uv` returned exit `0`. The cache is recoverable by redownloading packages. Docker Desktop was restarted after stale user-level Docker processes were terminated. Preserved final3 app image remained `sha256:c2fdaebc720e22eb5926c8fd15e5f900d22ea46244ac3f6d99756eba87877cae`; authenticated readiness returned `200`; Qdrant retained six collections. `docker buildx prune --force` removed `3.852GB` of unreferenced cache. Images remained `15`, containers `23`, and volumes `17`. Host free space became `6.3GiB`.
+
+ID: BLK-2026-08-09-06
+Date: 2026-08-09
+Owner: implementer
+Severity: High
+Description: VERIFIED: a fresh production Compose boot reached Uvicorn, then invoked OpenRouter without credentials despite `COGNEE_SKIP_CONNECTION_TEST=true`. The container healthcheck remained in `starting` because authenticated `/readyz` returned HTTP `503` repeatedly.
+Proposed resolution: trace the exact post-startup caller, add a focused regression for an empty offline boot, apply the smallest CITADEL-INT-SELFHOST-01-compatible fix, then rerun production Compose with timestamped Citadel and Qdrant logs.
+Status: In Progress
+Evidence: `/private/tmp/citadel-ring0-recovered-app-20260809.log` records `litellm.AuthenticationError`, `OpenrouterException`, and `Missing Authentication header`; recovered image `sha256:80cea13a84657b50ec3af9ff34304062c895ebf400ae612a0e3bf894e07bcf38`; app classifier returned 274 lines, 24 severe lines, and 17 strict non-2xx lines; Qdrant returned 18 lines, zero severe lines, and zero non-2xx lines. Disposable resources were removed after classification; preserved final3 remained healthy.
+
+ID: BLK-2026-08-09-07
+Date: 2026-08-09
+Owner: implementer
+Severity: High
+Description: VERIFIED by root source reproduction: restore checks an empty target, creates `citadel-state`, then acquires the shared Lite lock. If another process wins the lock race, failure cleanup can remove that process's active `citadel-state` or the entire target.
+Proposed resolution: add a bounded concurrent regression that loses the lock race after the initial emptiness check, track only paths created by the restore operation, and prove failure cleanup preserves the winning runtime's state.
+Status: In Progress
+Evidence: `/private/tmp/citadel-v050-qdrant/kb/generation_backup.py:478-496,528-539`; `/private/tmp/citadel-v050-qdrant/kb/lite_runtime.py:110-118,260-265`; CITADEL-INT-BACKUP-01 failure cleanup ownership rule. Runtime race not yet executed, which is the acceptance blind spot.
+
+ID: BLK-2026-08-09-08
+Date: 2026-08-09
+Owner: implementer
+Severity: High
+Description: VERIFIED by root source reproduction: both CI log classifiers match `error|panic|fatal|oom|corruption|recovery.*(shortfall|failed)` and therefore miss unexpected `WARN` and generic `failure` lines required by the approved release log contract.
+Proposed resolution: add structural regressions for warning and generic-failure detection, preserve phase-specific expected-line handling, then run the classifier against Docker evidence from every gate.
+Status: In Progress
+Evidence: `/private/tmp/citadel-v050-qdrant/.github/workflows/test.yml:270-278,404-410`; approved release design log classifier contract. Blind spot: current source predicate was inspected but the revised classifier has not run against real provider startup logs.
+
+ID: BLK-2026-08-09-09
+Date: 2026-08-09
+Owner: implementer
+Severity: High
+Description: VERIFIED by root source reproduction: production Citadel Compose runs as UID `10001` with capability and privilege restrictions, but neither Compose file sets `read_only: true` for the root filesystem.
+Proposed resolution: set the Citadel service root filesystem read-only in both identical Compose files, retain explicit writable `/data` and `/tmp`, add a structural regression, then prove production startup and mutable Cognee paths in Docker.
+Status: In Progress
+Evidence: `/private/tmp/citadel-v050-qdrant/docker-compose.yml:15-66`; identical deploy asset; CITADEL-INT-SELFHOST-01. Blind spot: production Compose startup is already blocked by BLK-2026-08-09-06, so the runtime proof must follow that fix.
+
+ID: BLK-2026-08-10-01
+Date: 2026-08-10
+Owner: implementer
+Severity: High
+Description: VERIFIED: production Compose now enforces a read-only root, but Ladybug warm-up tries to install its JSON extension below `/home/citadel/.lbdb/extension`. Directory creation fails, corpus health degrades, and `/readyz` returns HTTP `503`.
+Proposed resolution: identify Ladybug's supported writable-home configuration, route only its mutable extension state below `/data`, add a regression, then rerun the exact source-reverted, focused, full, and production Compose gates.
+Status: In Progress
+Evidence: production image `sha256:e2b30a1645b84b64f6c06d11c08f7fb2f3498fc71a7a766e620642943b705ce4`; exact log `RuntimeError('IO exception: Failed to create directory /home/citadel/.lbdb/extension/0.18.1/linux_arm64/...')`; disposable app classifier found 24 warning/error/failure/degraded lines and 12 strict non-2xx lines. Model-auth matches were zero. Disposable project was removed; preserved final3 remained healthy.
+
+ID: BLK-2026-08-10-02
+Date: 2026-08-10
+Owner: release
+Severity: High
+Description: VERIFIED: two clean deterministic builder proofs and one test-target attempt exhausted the host data volume. `df -h /System/Volumes/Data` returned `115Mi` available and `100%`; Docker Desktop then returned `unable to start`.
+Proposed resolution: after explicit approval, delete only named recoverable user caches sufficient to restart Docker, verify preserved final3, prune only unreferenced BuildKit cache, then resume with cached builds instead of repeated `--no-cache` runs.
+Status: Completed
+Evidence: both builder runs reported patched wheel SHA-256 `890a5a5c7d4bce9053faa45e4ce5f19aa1f7dbce235c3d4ea6ab3c3b77bb873c`. VERIFIED 2026-08-10: explicit approval removed only `~/.cache/codex-runtimes`, `~/Library/Caches/pip`, and `~/.npm`; all three paths were absent afterward. Docker Desktop required a clean quit and reopen. Preserved Citadel image `sha256:c2fdaebc720e22eb5926c8fd15e5f900d22ea46244ac3f6d99756eba87877cae` returned healthy, Qdrant image `sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc` returned running with six authenticated collections, and timestamped followers saw HTTP `200` provider traffic. Approved BuildKit-only pruning removed `10.62GB`; `docker builder du` then reported `0B`, and host free space became `10GiB`. No image, container, volume, repository, or application data was deleted.
+
+ID: BLK-2026-08-10-03
+Date: 2026-08-10
+Owner: release
+Severity: High
+Description: VERIFIED: corrected test image `sha256:7de749c08a5ab6d760a66652f1e0e5f35b5e8f7e7f702be58a5b63841c2e6d39` built successfully, then host free space fell to about `2.8GiB`, below the declared `5GiB` runtime floor. `docker buildx du` reports `3.817GB` fully reclaimable cache. No corrected-image test container, live Qdrant phase, or production Compose phase started.
+Proposed resolution: after explicit approval, run `docker buildx prune --force`, confirm images, containers, and volumes are unchanged, then reuse the existing corrected image for all remaining Docker gates.
+Status: Blocked
+Evidence: build handoff reported BuildKit `5dvnvubjb9r880lctjgn0csbd`, image size `499212473`, and no Phase 1, 2, or 3 resources created. Protected final3, service E2E, and Lite containers remained running. Blind spot: final-image behavior is not determined until the blocked gates run.
