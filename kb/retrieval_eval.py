@@ -1045,6 +1045,28 @@ def api_fingerprint(node_url: str, token: str, timeout: float) -> dict[str, Any]
             fingerprint[name] = {"error": exc.__class__.__name__}
             continue
         if name == "state":
+            # The image and the generation the run was taken against, both
+            # already published on /api/state and both previously dropped.
+            # `_release_identity_verdicts` READS them in release mode: a run
+            # taken against a different build or a re-derived generation is
+            # refused rather than reported as a retrieval delta. Recording
+            # them without a reader would have been the same defect wearing a
+            # comment that claimed otherwise.
+            fingerprint["build_id"] = body.get("build_id")
+            lifecycle = body.get("lifecycle")
+            generation = (
+                lifecycle.get("current_generation")
+                if isinstance(lifecycle, dict)
+                else None
+            )
+            fingerprint["lifecycle_generation"] = (
+                {
+                    key: generation.get(key)
+                    for key in ("generation_id", "projection_version", "config_digest")
+                }
+                if isinstance(generation, dict)
+                else None
+            )
             fingerprint["documents_tracked"] = (body.get("totals") or {}).get("documents")
             fingerprint["sources"] = [
                 {
@@ -1220,12 +1242,111 @@ def ground_truth_fingerprint(cache_dir: Path | None = None) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(canonical).hexdigest(), "files": len(digests)}
 
 
+# --------------------------------------------------------------------------
+# Release-run identity
+# --------------------------------------------------------------------------
+#
+# Two runs can agree on corpus and questions and still not be one measurement:
+# a different machine, a different Docker resource envelope, a different
+# warm-up, a different embedding model or chunk budget all move latency and
+# retrieval without anything in the vault changing. The generic gate cannot see
+# any of it. Release mode records the identity and refuses to compare across a
+# difference, so a v0.5 verdict is about the candidate and nothing else.
+#
+# `runtime_id` is a one-way digest of machine plus Docker engine identity, NOT
+# a hostname: this object is written into a run JSON, and a run JSON is an
+# artifact that travels.
+DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+def _release_digest(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not DIGEST_PATTERN.match(value):
+        raise BenchError(
+            f"release context {name} must be a 'sha256:<64 hex>' digest, got {value!r}"
+        )
+    return value
+
+
+def _release_text(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BenchError(f"release context {name} must be a nonempty string, got {value!r}")
+    return value
+
+
+def _release_count(name: str, value: Any, *, minimum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise BenchError(
+            f"release context {name} must be an integer >= {minimum}, got {value!r}"
+        )
+    return value
+
+
+RELEASE_CONTEXT_VALIDATORS: dict[str, Callable[[Any], Any]] = {
+    "runtime_id": lambda value: _release_digest("runtime_id", value),
+    "docker_resource_digest": lambda value: _release_digest(
+        "docker_resource_digest", value
+    ),
+    "warmup_count": lambda value: _release_count("warmup_count", value, minimum=0),
+    "retrieval_profile": lambda value: _release_text("retrieval_profile", value),
+    "generation_id": lambda value: _release_text("generation_id", value),
+    "model": lambda value: _release_text("model", value),
+    "dimensions": lambda value: _release_count("dimensions", value, minimum=1),
+    "chunk_budget_tokens": lambda value: _release_count(
+        "chunk_budget_tokens", value, minimum=1
+    ),
+}
+
+# What `compare` refuses to look past in release mode. The first eight come
+# from --release-context; the last three are recorded by the run itself, so a
+# top-5 page cannot be compared against a top-10 page and a 1-repeat run cannot
+# be compared against a 5-repeat one.
+RELEASE_IDENTITY_FIELDS = tuple(RELEASE_CONTEXT_VALIDATORS) + (
+    "repeat_count",
+    "requested_top_k",
+    "client_image_digest",
+)
+
+
+def parse_release_context(raw: str) -> dict[str, Any]:
+    """Validate the exact nonsecret release-context shape. Fail closed.
+
+    Unknown keys are refused rather than ignored: this object is copied into a
+    published run JSON, and "ignore what you do not recognise" is how a
+    hostname or a token ends up in an artifact that travels.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BenchError(f"--release-context is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise BenchError("--release-context must be a JSON object")
+    unknown = sorted(set(payload) - set(RELEASE_CONTEXT_VALIDATORS))
+    if unknown:
+        raise BenchError(
+            "--release-context carries unknown field(s): " + ", ".join(unknown)
+        )
+    missing = sorted(set(RELEASE_CONTEXT_VALIDATORS) - set(payload))
+    if missing:
+        raise BenchError(
+            "--release-context is missing required field(s): " + ", ".join(missing)
+        )
+    return {
+        name: validator(payload[name])
+        for name, validator in RELEASE_CONTEXT_VALIDATORS.items()
+    }
+
+
 def build_fingerprint(
     node_url: str,
     token: str,
     timeout: float,
     questions_path: Path,
     repo_state: Path | None,
+    *,
+    release_context: dict[str, Any] | None = None,
+    repeats: int = 1,
+    requested_top_k: int | None = None,
+    client_image_digest: str | None = None,
 ) -> dict[str, Any]:
     content: dict[str, Any]
     if repo_state is None:
@@ -1239,7 +1360,7 @@ def build_fingerprint(
         }
     else:
         content = content_fingerprint(repo_state)
-    return {
+    fingerprint: dict[str, Any] = {
         "api": api_fingerprint(node_url, token, timeout),
         "census": corpus_census(make_corpus_fetcher(node_url, token, timeout)),
         "content": content,
@@ -1254,6 +1375,15 @@ def build_fingerprint(
         "ground_truth": ground_truth_fingerprint(),
         "python_version": platform.python_version(),
     }
+    if release_context is not None:
+        fingerprint["release"] = dict(release_context) | {
+            "repeat_count": repeats,
+            "requested_top_k": (
+                max(K_ANSWER, K_DUP) if requested_top_k is None else requested_top_k
+            ),
+            "client_image_digest": client_image_digest,
+        }
+    return fingerprint
 
 
 # sha256 of the empty string: what content_fingerprint recorded for an empty
@@ -1272,10 +1402,104 @@ def usable_content_sha(sha: Any) -> Any:
     return None if sha == EMPTY_MAP_SHA256 else sha
 
 
-def compare_fingerprints(
+def _release_identity_verdicts(
     current: dict[str, Any], baseline: dict[str, Any]
+) -> list[str]:
+    """Every release identity difference that makes two runs one measurement no
+    longer. Empty means the two runs were taken under the same identity."""
+    current_release = current.get("release")
+    baseline_release = baseline.get("release")
+    missing = [
+        label
+        for label, value in (
+            ("candidate", current_release),
+            ("baseline", baseline_release),
+        )
+        if not isinstance(value, dict) or not value
+    ]
+    if missing:
+        return [
+            "NOT COMPARABLE: release identity is missing on "
+            + " and ".join(missing)
+            + "; run the benchmark with --release-context"
+        ]
+    verdicts: list[str] = []
+    for field in RELEASE_IDENTITY_FIELDS:
+        if field not in current_release or field not in baseline_release:
+            verdicts.append(
+                f"NOT COMPARABLE: release identity field {field} was never recorded"
+            )
+        elif current_release[field] != baseline_release[field]:
+            verdicts.append(
+                f"NOT COMPARABLE: release identity {field} differs "
+                f"({baseline_release[field]!r} -> {current_release[field]!r})"
+            )
+
+    current_api = current.get("api")
+    baseline_api = baseline.get("api")
+    current_api = current_api if isinstance(current_api, dict) else {}
+    baseline_api = baseline_api if isinstance(baseline_api, dict) else {}
+    runs = (
+        ("baseline", baseline_release, baseline_api),
+        ("candidate", current_release, current_api),
+    )
+
+    # `client_image_digest` is the one identity field the operator supplies
+    # outside the validated --release-context, and it defaults to an
+    # environment variable. Nobody setting it on EITHER run recorded None on
+    # both sides, and None == None passed as a matched identity: the likely
+    # misconfiguration read as evidence. Validate it like the digests it sits
+    # beside, per run, so an absent client image is unmeasured and not equal.
+    for label, release_block, _api_block in runs:
+        digest = release_block.get("client_image_digest")
+        if not isinstance(digest, str) or not DIGEST_PATTERN.match(digest):
+            verdicts.append(
+                f"NOT COMPARABLE: {label} client_image_digest is not a "
+                f"'sha256:<64 hex>' digest ({digest!r}); the benchmark client "
+                "image is unmeasured, not matched"
+            )
+
+    # What the NODE said it was, against what the other run's node said. The
+    # eight context fields above are typed by an operator; these two are
+    # observed, so they are what stops a run taken against a different build or
+    # a re-derived generation from being compared as the same measurement.
+    for field in ("build_id", "lifecycle_generation"):
+        current_value = current_api.get(field)
+        baseline_value = baseline_api.get(field)
+        if current_value is None or baseline_value is None:
+            verdicts.append(
+                f"NOT COMPARABLE: node {field} was never recorded on at least "
+                "one run; the node identity behind these numbers is unmeasured"
+            )
+        elif current_value != baseline_value:
+            verdicts.append(
+                f"NOT COMPARABLE: node {field} differs "
+                f"({baseline_value!r} -> {current_value!r})"
+            )
+
+    # The generation an operator TYPED against the generation the node
+    # REPORTED. Without this the typed value attests only that somebody typed
+    # it, and a typo would name a generation that never served the run.
+    for label, release_block, api_block in runs:
+        observed = api_block.get("lifecycle_generation")
+        observed_id = observed.get("generation_id") if isinstance(observed, dict) else None
+        typed_id = release_block.get("generation_id")
+        if observed_id is not None and typed_id != observed_id:
+            verdicts.append(
+                f"NOT COMPARABLE: {label} release generation_id {typed_id!r} "
+                f"does not match the generation the node reported ({observed_id!r})"
+            )
+    return verdicts
+
+
+def compare_fingerprints(
+    current: dict[str, Any], baseline: dict[str, Any], *, release: bool = False
 ) -> tuple[bool, list[str]]:
-    """Decide whether two runs are comparable. Returns (comparable, verdicts)."""
+    """Decide whether two runs are comparable. Returns (comparable, verdicts).
+
+    ``release`` layers the v0.5 release-run identity over the generic corpus
+    and question checks. It never relaxes them.
+    """
     verdicts: list[str] = []
     comparable = True
     current_sha = (current.get("content") or {}).get("sha256")
@@ -1351,6 +1575,23 @@ def compare_fingerprints(
             "header_credit_rate use it as a fallback and can move without the "
             "node changing"
         )
+    # A note in generic mode, a GATE in release mode. Every run taken before
+    # the key existed would be refused by a blanket gate, but two runs claiming
+    # to be a v0.5 release pair have no such excuse: scored against different
+    # cached bodies they are two measurements, not one.
+    if release and (
+        current_gt is None or baseline_gt is None or current_gt != baseline_gt
+    ):
+        comparable = False
+        verdicts.append(
+            "NOT COMPARABLE: release runs must be scored against one "
+            "ground-truth cache"
+        )
+    if release:
+        identity_verdicts = _release_identity_verdicts(current, baseline)
+        if identity_verdicts:
+            comparable = False
+            verdicts.extend(identity_verdicts)
     if current.get("harness_git_sha") != baseline.get("harness_git_sha"):
         verdicts.append(
             "note: harness git sha differs "
@@ -1702,6 +1943,96 @@ def _lint_freeze_pin(data: dict[str, Any]) -> list[str]:
 
 Searcher = Callable[[str, int], tuple[dict[str, Any] | None, float, str | None]]
 
+# --------------------------------------------------------------------------
+# Attempt classification
+# --------------------------------------------------------------------------
+#
+# A 200 with a body is NOT a served page. The loop below used to count only
+# `error or body is None`, so a stream that stopped mid-JSON, a provider error
+# rendered into a successful envelope, or a `results` key that never arrived
+# all scored as a clean miss: the run lost a question's worth of retrieval and
+# reported zero errors while doing it. Every one of those is now named, counted
+# and separable, because "recall moved" and "the request never completed" are
+# different findings and only one of them is about the node's quality.
+ATTEMPT_OK = "ok"
+ATTEMPT_TIMEOUT = "timeout"
+ATTEMPT_TRUNCATION = "truncation"
+ATTEMPT_PARTIAL = "partial"
+ATTEMPT_PROVIDER = "provider"
+ATTEMPT_MALFORMED = "malformed"
+ATTEMPT_TRANSPORT = "transport"
+
+FAILED_ATTEMPT_KINDS = (
+    ATTEMPT_TIMEOUT,
+    ATTEMPT_TRUNCATION,
+    ATTEMPT_PARTIAL,
+    ATTEMPT_PROVIDER,
+    ATTEMPT_MALFORMED,
+    ATTEMPT_TRANSPORT,
+)
+
+# Matched against the searcher's error string, lowercased. 408 and 504 are the
+# node's own way of reporting the deadline the client would otherwise report as
+# a socket timeout; both are the same finding.
+TIMEOUT_MARKERS = ("timeout", "timed out", "timedout", "http 408", "http 504")
+# A body that stopped arriving mid-JSON reaches the searcher as a decode or
+# short-read failure, never as an HTTP status.
+TRUNCATION_MARKERS = (
+    "jsondecodeerror",
+    "incompleteread",
+    "contenttooshort",
+    "chunkedencoding",
+)
+# Keys a 200 body uses to carry an upstream failure it did not raise.
+PROVIDER_ERROR_KEYS = ("error", "detail", "errors")
+
+
+def classify_attempt(body: Any, error: str | None) -> str:
+    """Name what one search attempt actually returned.
+
+    Order is deliberate and fail-closed: a body that declares a provider error
+    is a provider failure even when it also happens to be malformed, because
+    the provider error is the cause and the missing results are the symptom.
+    """
+    if error:
+        lowered = str(error).lower()
+        if any(marker in lowered for marker in TIMEOUT_MARKERS):
+            return ATTEMPT_TIMEOUT
+        if any(marker in lowered for marker in TRUNCATION_MARKERS):
+            return ATTEMPT_TRUNCATION
+        return ATTEMPT_TRANSPORT
+    if body is None:
+        return ATTEMPT_TRANSPORT
+    if not isinstance(body, dict):
+        return ATTEMPT_MALFORMED
+    if any(body.get(key) for key in PROVIDER_ERROR_KEYS):
+        return ATTEMPT_PROVIDER
+    results = body.get("results")
+    if not isinstance(results, list):
+        return ATTEMPT_MALFORMED
+    if any(not isinstance(item, dict) for item in results):
+        return ATTEMPT_MALFORMED
+    if body.get("truncated") is True:
+        return ATTEMPT_TRUNCATION
+    if body.get("partial") is True or body.get("complete") is False:
+        return ATTEMPT_PARTIAL
+    return ATTEMPT_OK
+
+
+def hit_dataset(hit: dict[str, Any]) -> str | None:
+    """The dataset a hit says it came from, or None when it says nothing.
+
+    None is not "the expected dataset". An unlabelled hit is unattributable and
+    is counted in its own bucket, never folded into a zero foreign-hit count.
+    """
+    for source in (hit, hit.get("_citadel")):
+        if not isinstance(source, dict):
+            continue
+        value = source.get("dataset")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
 
 def make_http_searcher(node_url: str, token: str, timeout: float) -> Searcher:
     def searcher(query: str, top_k: int) -> tuple[dict[str, Any] | None, float, str | None]:
@@ -1801,6 +2132,7 @@ def execute_benchmark(
     *,
     repeats: int = 1,
     quiet: bool = False,
+    expect_dataset: str | None = None,
 ) -> dict[str, Any]:
     """Run every question. Quality from attempt 1; repeats feed latency and
     hit_stability only. Raises BenchError before any search if the probe or
@@ -1832,6 +2164,11 @@ def execute_benchmark(
     latencies: list[float] = []
     stability: list[float] = []
     errors_total = 0
+    attempt_counts = {kind: 0 for kind in (ATTEMPT_OK,) + FAILED_ATTEMPT_KINDS}
+    slots_served_total = 0
+    underfilled_total = 0
+    foreign_dataset_total = 0
+    without_dataset_total = 0
 
     for question in questions:
         gt_shingles = load_ground_truth_shingles(list(question.get("expect_any") or []))
@@ -1841,16 +2178,55 @@ def execute_benchmark(
         for _ in range(max(1, repeats)):
             body, elapsed_ms, error = searcher(question["question"], k_request)
             latencies.append(elapsed_ms)
+            kind = classify_attempt(body, error)
+            attempt_counts[kind] += 1
             if error or body is None:
                 attempt_errors.append(error or "empty")
                 errors_total += 1
                 attempt_rows.append(
                     score_question(question, [], gt_shingles, probe_pattern)
-                    | {"error": error or "empty"}
+                    | {
+                        "error": error or "empty",
+                        "attempt_kind": kind,
+                        "slots_requested": k_request,
+                        "underfilled": False,
+                        "foreign_dataset_hits": None if expect_dataset is None else 0,
+                    }
                 )
                 continue
-            hits = [item for item in body.get("results") or [] if isinstance(item, dict)]
-            attempt_rows.append(score_question(question, hits, gt_shingles, probe_pattern))
+            results = body.get("results")
+            hits = [
+                item
+                for item in (results if isinstance(results, list) else [])
+                if isinstance(item, dict)
+            ]
+            slots_served_total += len(hits)
+            underfilled = kind == ATTEMPT_OK and len(hits) < k_request
+            if underfilled:
+                underfilled_total += 1
+            datasets = [hit_dataset(hit) for hit in hits]
+            without_dataset = sum(1 for value in datasets if value is None)
+            without_dataset_total += without_dataset
+            foreign = (
+                None
+                if expect_dataset is None
+                else sum(
+                    1
+                    for value in datasets
+                    if value is not None and value != expect_dataset
+                )
+            )
+            if foreign:
+                foreign_dataset_total += foreign
+            attempt_rows.append(
+                score_question(question, hits, gt_shingles, probe_pattern)
+                | {
+                    "attempt_kind": kind,
+                    "slots_requested": k_request,
+                    "underfilled": underfilled,
+                    "foreign_dataset_hits": foreign,
+                }
+            )
         first = attempt_rows[0]
         first["errors"] = attempt_errors
         rows.append(first)
@@ -1885,9 +2261,49 @@ def execute_benchmark(
         "p95_ms": round(percentile(latencies, 0.95), 1),
         "mean_ms": round(statistics.fmean(latencies), 1) if latencies else 0.0,
         "samples": len(latencies),
+        # TRANSPORT-level only, kept at its original meaning so a baseline taken
+        # before the attempt census still compares. `attempts.failed` is the
+        # complete count: it also carries the 200s that were never a served
+        # page (truncated, partial, provider error, malformed).
         "errors": errors_total,
     }
     summary["repeats"] = repeats
+    attempts_total = sum(attempt_counts.values())
+    summary["attempts"] = {
+        "total": attempts_total,
+        "ok": attempt_counts[ATTEMPT_OK],
+        "failed": attempts_total - attempt_counts[ATTEMPT_OK],
+        "by_kind": {kind: attempt_counts[kind] for kind in FAILED_ATTEMPT_KINDS},
+        "requested_top_k": k_request,
+        # What was asked for across every attempt, against what came back. A
+        # failed attempt serves zero, so the two only agree on a clean run.
+        "slots_requested": attempts_total * k_request,
+        "slots_served": slots_served_total,
+        "underfilled": underfilled_total,
+        # None, not 0, when no expected dataset was declared: nobody said which
+        # dataset the token was scoped to, so zero foreign hits would be an
+        # unmeasured value printed as a pass. The release gate refuses it.
+        #
+        # WHAT THIS ATTESTS, stated where the number is produced. It counts
+        # hits LABELLED with a dataset other than the expected one. The node
+        # stamps that label from the fan-out arm the row was taken from
+        # (`kb/server.py:7299` enumerates `(dataset, result)` pairs out of the
+        # merged arms), so the label names the arm that served the row, not a
+        # property of the document. A non-zero count is therefore real evidence
+        # that the page mixed arms; a zero count is NOT evidence that content
+        # stayed inside one boundary. Do not quote it as an isolation proof.
+        "foreign_dataset_hits": (
+            None if expect_dataset is None else foreign_dataset_total
+        ),
+        # What the count above was measured AGAINST. A number with no referent
+        # cannot be compared across two runs.
+        "expected_dataset": expect_dataset,
+        # BLIND SPOT, stated where the number is produced. A hit carrying no
+        # dataset label is unattributable, so it can be neither counted as
+        # foreign nor treated as clean. It lands here instead of silently
+        # improving the foreign count.
+        "hits_without_dataset": without_dataset_total,
+    }
     return {"run_at": run_at, "summary": summary, "rows": rows}
 
 
@@ -1962,16 +2378,61 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.repo_state and repo_state is None:
         print(f"--repo-state {args.repo_state} does not exist", file=sys.stderr)
         return 2
+    # Validated BEFORE any search: an invalid identity makes the whole run
+    # unusable as release evidence, and finding that out after the searches is
+    # a wasted benchmark against a live node.
+    release_context: dict[str, Any] | None = None
+    if getattr(args, "release_context", None):
+        try:
+            release_context = parse_release_context(args.release_context)
+        except BenchError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        # Required, not optional, once a run claims to be release evidence.
+        # The flag defaults to an environment variable, so the quiet failure
+        # is nobody setting it on either run: two Nones then compare equal and
+        # an unmeasured client image reads as a matched one.
+        client_digest = getattr(args, "client_image_digest", None)
+        if not client_digest:
+            print(
+                "ERROR: --client-image-digest is required with "
+                "--release-context (or set CITADEL_BENCH_CLIENT_IMAGE_DIGEST); "
+                "an unrecorded client image compares as a matched one",
+                file=sys.stderr,
+            )
+            return 2
+        if not DIGEST_PATTERN.match(client_digest):
+            print(
+                "ERROR: --client-image-digest must be a 'sha256:<64 hex>' "
+                f"digest, got {client_digest!r}",
+                file=sys.stderr,
+            )
+            return 2
 
     searcher = make_http_searcher(args.node_url, token, args.timeout)
     try:
-        result = execute_benchmark(questions, searcher, repeats=args.repeats)
+        result = execute_benchmark(
+            questions,
+            searcher,
+            repeats=args.repeats,
+            expect_dataset=getattr(args, "expect_dataset", None),
+        )
     except BenchError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
     fingerprint = build_fingerprint(
-        args.node_url, token, args.timeout, questions_path, repo_state
+        args.node_url,
+        token,
+        args.timeout,
+        questions_path,
+        repo_state,
+        release_context=release_context,
+        repeats=args.repeats,
+        requested_top_k=(result.get("summary") or {})
+        .get("attempts", {})
+        .get("requested_top_k"),
+        client_image_digest=getattr(args, "client_image_digest", None),
     )
     result["fingerprint"] = fingerprint
     result["node_url"] = args.node_url
@@ -2289,8 +2750,302 @@ def _enforce_run_evidence(
     return failures, metrics, zero_chunks
 
 
+DEFAULT_MAX_P95_REGRESSION_PERCENT = 20.0
+
+
+def _release_attempt_evidence(
+    run: dict[str, Any], label: str
+) -> tuple[list[str], dict[str, Any]]:
+    """Validate one run's attempt census. Missing evidence is a failure, never
+    a zero: an unmeasured count and a clean count look identical."""
+    failures: list[str] = []
+    summary = run.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    attempts = summary.get("attempts")
+    if not isinstance(attempts, dict):
+        failures.append(
+            f"{label} attempt census is missing; failed attempts and slot "
+            "coverage are unmeasured"
+        )
+        return failures, {}
+
+    by_kind = attempts.get("by_kind")
+    if not isinstance(by_kind, dict) or any(
+        not _nonnegative_count(by_kind.get(kind)) for kind in FAILED_ATTEMPT_KINDS
+    ):
+        failures.append(
+            f"{label} attempt census by_kind is missing or invalid; failed "
+            "attempts are unmeasured"
+        )
+    else:
+        for kind in FAILED_ATTEMPT_KINDS:
+            count = by_kind[kind]
+            if count:
+                failures.append(f"{label} contains {count} {kind} attempt failure(s)")
+
+    # The expected dataset names what the foreign count was measured AGAINST.
+    # Without it the count is a number with no referent, and two runs that
+    # expected different datasets produce foreign counts that are not one
+    # measurement.
+    expected_dataset = attempts.get("expected_dataset")
+    if not isinstance(expected_dataset, str) or not expected_dataset.strip():
+        failures.append(
+            f"{label} declares no expected dataset, so its foreign-hit count "
+            "has no referent; re-run with --expect-dataset"
+        )
+        expected_dataset = None
+
+    # SCOPE, decided rather than assumed. This gate is written for the
+    # Central-restricted single-scope token the release run uses, where every
+    # fan-out arm is the expected dataset and a differently labelled hit is an
+    # anomaly. A seat token carrying the multi-arm central reserve produces
+    # cross-arm hits BY DESIGN and would fail here: such a token is out of
+    # scope for a release run, not a bug in the node.
+    foreign = attempts.get("foreign_dataset_hits")
+    if foreign is None:
+        failures.append(
+            f"{label} foreign-dataset hit count is unmeasured; re-run with "
+            "--expect-dataset to record which fan-out arm served each hit"
+        )
+    elif not _nonnegative_count(foreign):
+        failures.append(f"{label} foreign-dataset hit count is invalid: {foreign!r}")
+    elif foreign:
+        failures.append(
+            f"{label} served {foreign} hit(s) labelled with a fan-out arm "
+            f"other than {expected_dataset!r}"
+        )
+
+    # The declared blind spot, now READ. An unlabelled hit cannot be counted as
+    # foreign, so a node that stops stamping labels drives the foreign count to
+    # a structural zero and the check above passes on entirely unattributable
+    # pages. That is the same unmeasured state this gate already refuses when
+    # the foreign count itself is absent, so it fails the same way.
+    unlabelled = attempts.get("hits_without_dataset")
+    if not _nonnegative_count(unlabelled):
+        failures.append(
+            f"{label} hits_without_dataset is missing or invalid, so the "
+            "foreign-hit count cannot be read as attributable"
+        )
+    elif unlabelled:
+        failures.append(
+            f"{label} served {unlabelled} unattributable hit(s) carrying no "
+            "dataset label; its zero foreign-hit count is unmeasured, not clean"
+        )
+
+    underfilled = attempts.get("underfilled")
+    if not _nonnegative_count(underfilled):
+        failures.append(f"{label} underfilled response count is missing or invalid")
+    requested_top_k = attempts.get("requested_top_k")
+    if not _nonnegative_count(requested_top_k) or not requested_top_k:
+        failures.append(f"{label} requested top-k is missing or invalid")
+
+    return failures, {
+        "underfilled": underfilled,
+        "requested_top_k": requested_top_k,
+        "expected_dataset": expected_dataset,
+    }
+
+
+# Which recorded pass field decides a question, keyed by whether it carries
+# answer spans. This is `attempt_outcome`'s rule (the harness's own definition
+# of a pass) applied to a SAVED row: gating on answer_pass_at_5 alone left
+# every span-less question invisible, and the shipped set carries 22 of them,
+# free to swap which document they found while the aggregate stood still.
+RELEASE_ROW_CRITERION = {True: "answer_pass_at_5", False: "doc_pass_at_5"}
+
+
+def _release_row_outcome(row: dict[str, Any]) -> bool | None:
+    """The pass this row records under its OWN criterion, or None when the row
+    does not say which criterion scores it."""
+    has_spans = row.get("has_spans")
+    if not isinstance(has_spans, bool):
+        return None
+    value = row.get(RELEASE_ROW_CRITERION[has_spans])
+    return value if isinstance(value, bool) else None
+
+
+def _release_rows(run: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Rows keyed by question id, or None when the artifact cannot supply
+    per-question evidence at all."""
+    rows = run.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    keyed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        identifier = row.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            return None
+        keyed[identifier] = row
+    return keyed if len(keyed) == len(rows) else None
+
+
+def _release_gate_failures(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    max_p95_regression_percent: float,
+) -> list[str]:
+    """The v0.5 release layer: run identity holds, every attempt completed,
+    every page was served in full, no question lost its answer, and the
+    candidate is no more than the allowed fraction slower.
+
+    These checks run whether or not the fingerprints compare. A pair that is
+    not comparable has already failed; suppressing the reason would leave an
+    operator with one line where there are several.
+    """
+    failures: list[str] = []
+    baseline_summary = baseline.get("summary")
+    candidate_summary = candidate.get("summary")
+    baseline_summary = baseline_summary if isinstance(baseline_summary, dict) else {}
+    candidate_summary = candidate_summary if isinstance(candidate_summary, dict) else {}
+
+    baseline_failures, baseline_attempts = _release_attempt_evidence(
+        baseline, "baseline"
+    )
+    candidate_failures, candidate_attempts = _release_attempt_evidence(
+        candidate, "candidate"
+    )
+    failures.extend(baseline_failures)
+    failures.extend(candidate_failures)
+
+    baseline_dataset = baseline_attempts.get("expected_dataset")
+    candidate_dataset = candidate_attempts.get("expected_dataset")
+    if (
+        baseline_dataset is not None
+        and candidate_dataset is not None
+        and baseline_dataset != candidate_dataset
+    ):
+        failures.append(
+            "release runs declare a different expected dataset "
+            f"({baseline_dataset!r} -> {candidate_dataset!r}); their "
+            "foreign-hit counts are not one measurement"
+        )
+
+    # Underfilled successes, with the carve-out the plan names: a corpus
+    # holding fewer documents than the requested top-k CANNOT fill a page, and
+    # gating there would gate on corpus size rather than on retrieval.
+    census = (candidate.get("fingerprint") or {}).get("census")
+    documents_total = census.get("documents_total") if isinstance(census, dict) else None
+    underfilled = candidate_attempts.get("underfilled")
+    requested_top_k = candidate_attempts.get("requested_top_k")
+    if (
+        _nonnegative_count(underfilled)
+        and underfilled
+        and _nonnegative_count(requested_top_k)
+        and _nonnegative_count(documents_total)
+        and documents_total >= requested_top_k
+    ):
+        failures.append(
+            f"candidate returned {underfilled} underfilled successful "
+            f"response(s) while the eligible corpus holds {documents_total} "
+            f"document(s) for a requested top-k of {requested_top_k}"
+        )
+
+    baseline_latency = baseline_summary.get("latency")
+    candidate_latency = candidate_summary.get("latency")
+    baseline_latency = baseline_latency if isinstance(baseline_latency, dict) else {}
+    candidate_latency = candidate_latency if isinstance(candidate_latency, dict) else {}
+
+    baseline_samples = baseline_latency.get("samples")
+    candidate_samples = candidate_latency.get("samples")
+    if not _nonnegative_count(baseline_samples) or not _nonnegative_count(
+        candidate_samples
+    ):
+        failures.append("release latency sample count is missing or invalid")
+    elif not baseline_samples or not candidate_samples:
+        failures.append(
+            "release latency sample count is zero; a percentile over nothing "
+            "is not a measurement"
+        )
+    elif baseline_samples != candidate_samples:
+        failures.append(
+            "release latency sample counts differ: "
+            f"{baseline_samples} -> {candidate_samples}"
+        )
+
+    baseline_repeats = baseline_summary.get("repeats")
+    candidate_repeats = candidate_summary.get("repeats")
+    if not _nonnegative_count(baseline_repeats) or not _nonnegative_count(
+        candidate_repeats
+    ):
+        failures.append("release repeat count is missing or invalid")
+    elif baseline_repeats != candidate_repeats:
+        failures.append(
+            f"release repeat counts differ: {baseline_repeats} -> {candidate_repeats}"
+        )
+
+    baseline_p95 = baseline_latency.get("p95_ms")
+    candidate_p95 = candidate_latency.get("p95_ms")
+    if (
+        not _finite_number(baseline_p95)
+        or not _finite_number(candidate_p95)
+        or float(baseline_p95) <= 0.0
+    ):
+        failures.append(
+            "release p95 latency is missing or unusable: "
+            f"baseline={baseline_p95!r}, candidate={candidate_p95!r}"
+        )
+    else:
+        ceiling = float(baseline_p95) * (1.0 + max_p95_regression_percent / 100.0)
+        if float(candidate_p95) > ceiling:
+            failures.append(
+                f"candidate p95 regressed beyond {max_p95_regression_percent:g}%: "
+                f"{float(baseline_p95):g} ms -> {float(candidate_p95):g} ms "
+                f"(ceiling {ceiling:g} ms)"
+            )
+
+    # Per-question retrieval preservation, each question judged by its OWN
+    # criterion. An aggregate can hold while a set of questions stops being
+    # answered and an equal set starts, so the headline cannot see this and
+    # only the rows can.
+    baseline_rows = _release_rows(baseline)
+    candidate_rows = _release_rows(candidate)
+    if baseline_rows is None or candidate_rows is None:
+        failures.append(
+            "release row evidence is missing; per-question retrieval "
+            "preservation is unmeasured"
+        )
+    elif set(baseline_rows) != set(candidate_rows):
+        failures.append(
+            "release row identities differ; per-question retrieval "
+            "preservation is unmeasured"
+        )
+    else:
+        unreadable = sorted(
+            identifier
+            for identifier, row in baseline_rows.items()
+            if _release_row_outcome(row) is None
+            or _release_row_outcome(candidate_rows[identifier]) is None
+        )
+        if unreadable:
+            failures.append(
+                f"{len(unreadable)} release row(s) do not state which pass "
+                "criterion scores them, so per-question retrieval preservation "
+                "is unmeasured: " + ", ".join(unreadable[:10])
+            )
+        else:
+            lost = sorted(
+                identifier
+                for identifier, row in baseline_rows.items()
+                if _release_row_outcome(row) is True
+                and _release_row_outcome(candidate_rows[identifier]) is not True
+            )
+            if lost:
+                failures.append(
+                    f"candidate lost {len(lost)} baseline retrieval pass(es): "
+                    + ", ".join(lost)
+                )
+
+    return failures
+
+
 def enforce_acceptance(
-    baseline: dict[str, Any], candidate: dict[str, Any]
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    release: bool = False,
+    max_p95_regression_percent: float = DEFAULT_MAX_P95_REGRESSION_PERCENT,
 ) -> tuple[bool, list[str], list[str]]:
     """Return ``(comparable, fingerprint_verdicts, gate_failures)``.
 
@@ -2307,7 +3062,7 @@ def enforce_acceptance(
         candidate_fingerprint if isinstance(candidate_fingerprint, dict) else {}
     )
     comparable, verdicts = compare_fingerprints(
-        candidate_fingerprint, baseline_fingerprint
+        candidate_fingerprint, baseline_fingerprint, release=release
     )
     failures: list[str] = []
     if not comparable:
@@ -2356,6 +3111,11 @@ def enforce_acceptance(
                 "ground-truth fingerprints differ; benchmark scores are not comparable"
             )
 
+    if release:
+        failures.extend(
+            _release_gate_failures(baseline, candidate, max_p95_regression_percent)
+        )
+
     return comparable, verdicts, failures
 
 
@@ -2370,8 +3130,21 @@ def cmd_enforce(args: argparse.Namespace) -> int:
     if not isinstance(baseline, dict) or not isinstance(candidate, dict):
         print("ENFORCE FAILED: run JSON root must be an object", file=sys.stderr)
         return 2
+    release = bool(getattr(args, "release", False))
+    max_p95 = float(
+        getattr(args, "max_p95_regression_percent", DEFAULT_MAX_P95_REGRESSION_PERCENT)
+    )
+    if not math.isfinite(max_p95) or max_p95 < 0.0:
+        print(
+            "ENFORCE FAILED: --max-p95-regression-percent must be a finite "
+            f"percentage >= 0, got {max_p95!r}",
+            file=sys.stderr,
+        )
+        return 2
 
-    _comparable, verdicts, failures = enforce_acceptance(baseline, candidate)
+    _comparable, verdicts, failures = enforce_acceptance(
+        baseline, candidate, release=release, max_p95_regression_percent=max_p95
+    )
     for verdict in verdicts:
         print(verdict)
     if failures:
@@ -2379,7 +3152,8 @@ def cmd_enforce(args: argparse.Namespace) -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print("ENFORCE PASSED: v0.5 benchmark acceptance gate")
+    mode = "v0.5 release" if release else "v0.5 benchmark"
+    print(f"ENFORCE PASSED: {mode} acceptance gate")
     return 0
 
 
@@ -2752,6 +3526,29 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="previous --out JSON; prints CORPUS MOVED / NOT COMPARABLE on drift",
     )
+    run_parser.add_argument(
+        "--release-context",
+        default=None,
+        help=(
+            "JSON object recording the run identity: runtime_id, "
+            "docker_resource_digest, warmup_count, retrieval_profile, "
+            "generation_id, model, dimensions, chunk_budget_tokens. Nonsecret "
+            "values only; unknown fields are refused"
+        ),
+    )
+    run_parser.add_argument(
+        "--client-image-digest",
+        default=os.getenv("CITADEL_BENCH_CLIENT_IMAGE_DIGEST"),
+        help="digest of the benchmark client image, recorded in the fingerprint",
+    )
+    run_parser.add_argument(
+        "--expect-dataset",
+        default=None,
+        help=(
+            "dataset this run's token is scoped to; without it the "
+            "foreign-dataset hit count stays unmeasured rather than zero"
+        ),
+    )
     run_parser.set_defaults(func=cmd_run)
 
     lint_parser = sub.add_parser("lint", help="validate every answer span")
@@ -2785,6 +3582,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     enforce_parser.add_argument("run_a", help="baseline run JSON")
     enforce_parser.add_argument("run_b", help="candidate run JSON")
+    enforce_parser.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "layer the v0.5 release gate over the generic one: identical run "
+            "identity, zero failed attempts, zero foreign-dataset hits, no "
+            "underfilled page, no lost answer, and a bounded p95"
+        ),
+    )
+    enforce_parser.add_argument(
+        "--max-p95-regression-percent",
+        type=float,
+        default=DEFAULT_MAX_P95_REGRESSION_PERCENT,
+        help="release mode only; candidate p95 ceiling as a percentage over baseline",
+    )
     enforce_parser.set_defaults(func=cmd_enforce)
 
     report_parser = sub.add_parser(
