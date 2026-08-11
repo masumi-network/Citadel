@@ -42,7 +42,11 @@ RUN install -d /opt/citadel \
     && rm -rf /wheels
 
 EXPOSE 8000
-VOLUME ["/data"]
+# No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway
+# Volumes mounted at /data instead), and for Compose/OCI the data volume is
+# declared by the compose file or mounted explicitly, so the anonymous volume
+# a bare VOLUME would create is unwanted. Persistence at /data is provided by
+# the platform mount, not the image.
 HEALTHCHECK --interval=15s --timeout=15s --start-period=120s --retries=5 \
   CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; request = Request('http://127.0.0.1:8000/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
 USER 10001:10001
