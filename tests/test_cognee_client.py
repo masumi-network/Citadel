@@ -13,7 +13,7 @@ import pytest
 
 from kb import chunk_window
 from kb.cognify_queue import CognifyRetryQueue
-from kb.cognee_client import CogneePublicClient, _BACKGROUND_COGNIFY_TASKS
+from kb.cognee_client import CogneePublicClient
 
 
 COGNEE_ENV_KEYS = (
@@ -1623,7 +1623,12 @@ async def test_remember_schedules_lock_guarded_background_cognify(
     result = await client.remember("note", dataset_name="seat:sarthi", tags=())
     assert result == {"added": {"ok": True}, "background_cognify": True}
     # Drain the scheduled background cognify and confirm it ran via cognify().
-    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    task = client._cognify_queue_task
+    assert task is not None
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    finally:
+        await client.stop_cognify_queue()
     assert cognified == [["seat:sarthi"]]
 
 
@@ -1652,13 +1657,17 @@ async def test_schedule_cognify_runs_one_cognify_over_all_datasets(
     client = CogneePublicClient()
 
     client.schedule_cognify(["central", "seat:a", "central"])  # duplicate central
-    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    task = client._cognify_queue_task
+    assert task is not None
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    finally:
+        await client.stop_cognify_queue()
     assert cognified == [["central", "seat:a"]]  # one cognify, de-duplicated
 
     # No datasets → no task scheduled.
     cognified.clear()
-    client.schedule_cognify([])
-    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    assert client.schedule_cognify([]) is False
     assert cognified == []
 
 
@@ -1696,12 +1705,17 @@ async def test_failed_background_cognify_is_rescheduled(
     )
     client = CogneePublicClient()
     client.schedule_cognify(["central"])
-    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    task = client._cognify_queue_task
+    assert task is not None
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
 
-    jobs = CognifyRetryQueue(path).snapshot()
-    assert len(jobs) == 1
-    assert jobs[0].leased is False
-    assert jobs[0].last_error == "RuntimeError: node unavailable"
+        jobs = CognifyRetryQueue(path).snapshot()
+        assert len(jobs) == 1
+        assert jobs[0].leased is False
+        assert jobs[0].last_error == "RuntimeError: node unavailable"
+    finally:
+        await client.stop_cognify_queue()
 
 
 @pytest.mark.asyncio
@@ -2012,6 +2026,21 @@ async def test_failed_acknowledgement_retries_without_external_activity(
 
     acknowledge = queue.acknowledge
     next_wakeup_delay = queue.next_wakeup_delay
+    loop = asyncio.get_running_loop()
+    call_later = loop.call_later
+    retry_wakeups = 0
+
+    def run_retry_next_tick(
+        delay: float,
+        callback: Any,
+        *args: Any,
+        context: Any = None,
+    ) -> Any:
+        nonlocal retry_wakeups
+        if getattr(callback, "__name__", "") == "_wake":
+            retry_wakeups += 1
+            return loop.call_soon(callback, *args, context=context)
+        return call_later(delay, callback, *args, context=context)
 
     def fail_first_acknowledgement(lease: Any) -> None:
         nonlocal acknowledgement_calls, clock_offset
@@ -2035,22 +2064,23 @@ async def test_failed_acknowledgement_retries_without_external_activity(
     )
     monkeypatch.setattr(queue, "acknowledge", fail_first_acknowledgement)
     monkeypatch.setattr(queue, "next_wakeup_delay", fail_first_wakeup_read)
+    monkeypatch.setattr(loop, "call_later", run_retry_next_tick)
     client = CogneePublicClient(retry_queue=queue)
     client.schedule_cognify(["central"])
 
-    await asyncio.wait_for(retried.wait(), timeout=1)
+    try:
+        await asyncio.wait_for(retried.wait(), timeout=5)
+        retry_task = client._cognify_queue_task
+        assert retry_task is not None
+        await asyncio.wait_for(asyncio.shield(retry_task), timeout=5)
 
-    async def wait_for_queue_empty() -> None:
-        while queue.snapshot():
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(wait_for_queue_empty(), timeout=1)
-
-    assert cognify_calls == [["central"], ["central"]]
-    assert acknowledgement_calls == 2
-    assert wakeup_calls >= 2
-    assert queue.snapshot() == ()
-    await client.stop_cognify_queue()
+        assert cognify_calls == [["central"], ["central"]]
+        assert acknowledgement_calls == 2
+        assert wakeup_calls >= 2
+        assert retry_wakeups == 1
+        assert queue.snapshot() == ()
+    finally:
+        await client.stop_cognify_queue()
 
 
 @pytest.mark.asyncio
@@ -2156,10 +2186,15 @@ async def test_resume_cognify_queue_drains_pending_work(
     )
     client = CogneePublicClient(queue_path=path)
     client.resume_cognify_queue()
-    await asyncio.gather(*list(_BACKGROUND_COGNIFY_TASKS), return_exceptions=True)
+    task = client._cognify_queue_task
+    assert task is not None
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
 
-    assert cognified == [["central"]]
-    assert CognifyRetryQueue(path).snapshot() == ()
+        assert cognified == [["central"]]
+        assert CognifyRetryQueue(path).snapshot() == ()
+    finally:
+        await client.stop_cognify_queue()
 
 
 @pytest.mark.asyncio

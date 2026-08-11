@@ -25,6 +25,9 @@ def verify(dist_dir: Path) -> None:
     # scripts.run_railway for the loop body, so the scripts package must ship in
     # the wheel or the scheduler dies on boot with ModuleNotFoundError.
     assert files("scripts").joinpath("run_railway.py").is_file()
+    from scripts.run_railway import run_evolve_in_loop
+
+    assert callable(run_evolve_in_loop)
     tokenizer_dir = files("kb").joinpath("data", "tiktoken-cache")
     tokenizer_files = [path for path in tokenizer_dir.iterdir() if path.is_file()]
     assert len(tokenizer_files) == 1

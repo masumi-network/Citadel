@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import inspect
 import json
 import multiprocessing
 import os
@@ -12,8 +13,17 @@ from typing import Any
 
 import pytest
 
-from kb.lifecycle import CaptureContext, LifecycleStore, ProjectionRequest
-from kb.lifecycle_worker import LifecycleProjectionWorker, ProjectionVerificationError
+from kb.lifecycle import (
+    CaptureContext,
+    LifecycleStore,
+    ProjectionLease,
+    ProjectionRequest,
+)
+from kb.lifecycle_worker import (
+    LifecycleProjectionWorker,
+    ProjectionVerificationError,
+    _LeaseHeartbeat,
+)
 
 
 T0 = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
@@ -67,11 +77,16 @@ class SlowRememberGateway(FakeProjectionGateway):
     def __init__(self) -> None:
         super().__init__()
         self.remember_started = asyncio.Event()
+        self.remember_cancelled = asyncio.Event()
         self.release_remember = asyncio.Event()
 
     async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
         self.remember_started.set()
-        await self.release_remember.wait()
+        try:
+            await self.release_remember.wait()
+        except asyncio.CancelledError:
+            self.remember_cancelled.set()
+            raise
         return await super().remember(data, **kwargs)
 
 
@@ -616,8 +631,90 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
     }
 
 
+@pytest.mark.parametrize("eager_task_factory", [False, True], ids=["default", "eager"])
+async def test_heartbeat_reaps_provider_when_initial_renewal_fails(
+    eager_task_factory: bool,
+) -> None:
+    renewal_error = RuntimeError("lost lease")
+
+    class FailingRenewalStore:
+        def renew_lease(self, *_args: Any, **_kwargs: Any) -> None:
+            raise renewal_error
+
+    provider_started = False
+    running_provider_started = asyncio.Event()
+    running_provider_cancelled = asyncio.Event()
+
+    async def provider() -> str:
+        nonlocal provider_started
+        provider_started = True
+        return "provider result"
+
+    async def running_provider() -> None:
+        running_provider_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            running_provider_cancelled.set()
+            raise
+
+    loop = asyncio.get_running_loop()
+    previous_task_factory = loop.get_task_factory()
+    if eager_task_factory:
+        factory = getattr(asyncio, "eager_task_factory", None)
+        if factory is None:
+            pytest.skip("asyncio.eager_task_factory requires Python 3.12+")
+        loop.set_task_factory(factory)
+
+    provider_coroutine = provider()
+    running_task: asyncio.Task[None] | None = None
+    heartbeat = _LeaseHeartbeat(
+        FailingRenewalStore(),  # type: ignore[arg-type]
+        ProjectionLease(
+            projection_job_id="job-1",
+            lease_id="lease-1",
+            worker_id="worker-1",
+            leased_until="2026-08-09T12:00:30Z",
+            attempt=1,
+        ),
+        lease_seconds=30,
+        started_at=T0,
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await heartbeat.wait(provider_coroutine)
+
+        assert raised.value is renewal_error
+        assert provider_started is False
+        assert inspect.getcoroutinestate(provider_coroutine) == inspect.CORO_CLOSED
+
+        running_task = asyncio.create_task(running_provider())
+        await running_provider_started.wait()
+
+        with pytest.raises(RuntimeError) as raised:
+            await heartbeat.wait(running_task)
+
+        assert raised.value is renewal_error
+        assert running_provider_cancelled.is_set()
+        assert running_task.cancelled()
+    finally:
+        provider_coroutine.close()
+        if running_task is not None and not running_task.done():
+            running_task.cancel()
+            await asyncio.gather(running_task, return_exceptions=True)
+        loop.set_task_factory(previous_task_factory)
+
+
+@pytest.mark.parametrize(
+    "complete_projection",
+    [False, True],
+    ids=["cancelled", "completed"],
+)
 async def test_slow_provider_write_renews_lease_before_second_worker_can_claim(
+    monkeypatch: Any,
     tmp_path: Path,
+    complete_projection: bool,
 ) -> None:
     store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
     accepted = store.accept_source(
@@ -643,19 +740,83 @@ async def test_slow_provider_write_renews_lease_before_second_worker_can_claim(
         ),
     )
     gateway = SlowRememberGateway()
+    periodic_renewal = asyncio.Event()
+    renew_calls = 0
+    periodic_renewed_at: datetime | None = None
+    renew_lease = store.renew_lease
+    lease_seconds = 1.5
+    started_at = datetime.now(UTC)
+    cleanup_renewed_at: datetime | None = None
+
+    def track_renewal(*args: Any, **kwargs: Any) -> None:
+        nonlocal periodic_renewed_at, renew_calls
+        renewal_kwargs = dict(kwargs)
+        if cleanup_renewed_at is not None:
+            renewal_kwargs["now"] = cleanup_renewed_at
+        renew_lease(*args, **renewal_kwargs)
+        renew_calls += 1
+        if gateway.remember_started.is_set() and not gateway.release_remember.is_set():
+            periodic_renewed_at = kwargs["now"]
+            periodic_renewal.set()
+
+    monkeypatch.setattr(store, "renew_lease", track_renewal)
     worker = LifecycleProjectionWorker(
         store,
         gateway,
         worker_id="worker-slow",
-        lease_seconds=0.12,
+        lease_seconds=lease_seconds,
     )
 
-    projection = asyncio.create_task(worker.run_once())
-    await gateway.remember_started.wait()
-    await asyncio.sleep(0.2)
+    projection = asyncio.create_task(worker.run_once(now=started_at))
+    try:
+        await asyncio.wait_for(gateway.remember_started.wait(), timeout=5)
+        await asyncio.wait_for(periodic_renewal.wait(), timeout=5)
 
-    assert store.claim_next_job(worker_id="worker-second", lease_seconds=0.12) is None
+        assert renew_calls >= 3
+        assert periodic_renewed_at is not None
+        original_expiry = started_at + timedelta(seconds=lease_seconds)
+        renewed_expiry = periodic_renewed_at + timedelta(seconds=lease_seconds)
+        assert renewed_expiry > original_expiry
+        probe_at = original_expiry + (renewed_expiry - original_expiry) / 2
+        assert original_expiry < probe_at < renewed_expiry
+        assert (
+            store.claim_next_job(
+                worker_id="worker-second",
+                lease_seconds=lease_seconds,
+                now=probe_at,
+            )
+            is None
+        )
+        if complete_projection:
+            cleanup_renewed_at = periodic_renewed_at
+            gateway.release_remember.set()
+            assert await asyncio.wait_for(projection, timeout=5) is True
+        else:
+            projection.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(projection, timeout=5)
+    finally:
+        if not projection.done():
+            projection.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(projection, return_exceptions=True),
+                timeout=5,
+            )
 
-    gateway.release_remember.set()
-    assert await projection is True
-    assert store.get_operation(accepted.projection_job_id).state == "searchable"
+    operation = store.get_operation(accepted.projection_job_id)
+    if complete_projection:
+        assert not gateway.remember_cancelled.is_set()
+        assert len(gateway.remember_calls) == 1
+        assert operation.state == "searchable"
+        assert operation.job.state == "completed"
+        assert {receipt.state for receipt in operation.receipts} == {"searchable"}
+    else:
+        assert gateway.remember_cancelled.is_set()
+        assert projection.cancelled()
+        assert not gateway.release_remember.is_set()
+        assert gateway.remember_calls == []
+        assert operation.state == "pending"
+        assert operation.job.lease_id is None
+        assert operation.job.lease_owner is None
+        assert operation.job.leased_until is None
+        assert {receipt.state for receipt in operation.receipts} == {"pending"}

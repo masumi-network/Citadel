@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
+import inspect
 import logging
 from typing import Any, Protocol
 
@@ -42,11 +43,22 @@ class _LeaseHeartbeat:
         )
 
     async def wait(self, awaitable: Awaitable[Any]) -> Any:
-        self.store.renew_lease(
-            self.lease,
-            now=self._now(),
-            lease_seconds=self.lease_seconds,
-        )
+        try:
+            self.store.renew_lease(
+                self.lease,
+                now=self._now(),
+                lease_seconds=self.lease_seconds,
+            )
+        except BaseException:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            else:
+                task = asyncio.ensure_future(awaitable)
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
         task = asyncio.ensure_future(awaitable)
         try:
             while True:
@@ -66,7 +78,7 @@ class _LeaseHeartbeat:
         except BaseException:
             if not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            await asyncio.gather(task, return_exceptions=True)
             raise
 
 
