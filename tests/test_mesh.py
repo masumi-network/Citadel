@@ -28,6 +28,65 @@ async def test_record_ingest_adds_document_node_and_event() -> None:
     assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 1
 
 
+@pytest.mark.parametrize("projection_state", ["queued", "pending"])
+async def test_lifecycle_ingest_waiting_for_searchability_is_not_indexed(
+    projection_state: str,
+) -> None:
+    mesh = MeshState()
+    result = IngestResult(
+        True,
+        "queued_not_confirmed",
+        "notes",
+        ("ops",),
+        source_revision_id="source-1",
+        projection_job_id="job-1",
+        projection_state=projection_state,
+    )
+
+    await mesh.record_ingest(
+        CONFIG,
+        result,
+        data="Runbook: rotate keys",
+        dataset="notes",
+        tags=["ops"],
+    )
+    snapshot = await mesh.snapshot(CONFIG)
+
+    assert not [node for node in snapshot["nodes"] if node["type"] == "document"]
+    assert not [edge for edge in snapshot["edges"] if edge["source"].startswith("document:")]
+    assert snapshot["events"][0]["message"] != "Memory indexed"
+    assert snapshot["events"][0]["timeline"]["kind"] != "chunk_indexed"
+    assert snapshot["events"][0]["timeline"]["status"] != "indexed"
+    assert snapshot["stats"]["since_restart"]["indexed_chunks"] == 0
+
+
+async def test_lifecycle_ingest_searchable_is_indexed() -> None:
+    mesh = MeshState()
+    result = IngestResult(
+        True,
+        "accepted",
+        "notes",
+        ("ops",),
+        source_revision_id="source-1",
+        projection_job_id="job-1",
+        projection_state="searchable",
+    )
+
+    await mesh.record_ingest(
+        CONFIG,
+        result,
+        data="Runbook: rotate keys",
+        dataset="notes",
+        tags=["ops"],
+    )
+    snapshot = await mesh.snapshot(CONFIG)
+
+    assert [node for node in snapshot["nodes"] if node["type"] == "document"]
+    assert [edge for edge in snapshot["edges"] if edge["source"].startswith("document:")]
+    assert snapshot["events"][0]["message"] == "Memory indexed"
+    assert snapshot["events"][0]["timeline"]["kind"] == "chunk_indexed"
+
+
 async def test_rejected_ingest_records_reject_event_without_document() -> None:
     mesh = MeshState()
     result = IngestResult(False, "too_short", "notes", ())

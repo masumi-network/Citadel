@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import secrets
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import Awaitable, AsyncIterator, Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic, perf_counter
@@ -90,6 +90,27 @@ def _cognify_data_ids(result: Any) -> list[str]:
             if data_id is not None:
                 data_ids.append(str(data_id))
     return list(dict.fromkeys(data_ids))
+
+
+def _cognify_data_ids_by_dataset(
+    result: Any,
+    datasets: list[str],
+) -> dict[str, list[str]]:
+    """Bind every processed source ID to the dataset attested by Cognee."""
+    if isinstance(result, Mapping):
+        return {
+            str(dataset_id): data_ids
+            for dataset_id, run in result.items()
+            if (data_ids := _cognify_data_ids([run]))
+        }
+    data_ids = _cognify_data_ids(result)
+    if not data_ids:
+        return {}
+    if len(datasets) != 1:
+        raise RuntimeError(
+            "multi-dataset cognify receipt does not bind processed source IDs to datasets"
+        )
+    return {str(datasets[0]): data_ids}
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -195,15 +216,12 @@ def assert_cognee_dataset_api() -> None:
 
     # The corpus census (corpus_page / corpus_totals / corpus_chunk_counts /
     # corpus_graph_presence) leans on more private surface than dataset
-    # attribution does: specific Data/Dataset/DatasetData columns, the pgvector
-    # adapter's table reflection + session, and the graph adapter's raw query
+    # attribution does: specific Data/Dataset/DatasetData columns, the active
+    # vector adapter's administrative methods, and the graph adapter's raw query
     # surface. Pin each one so a cognee bump that moves any of them fails loudly
     # at boot and in CI instead of quietly breaking the census.
     from cognee.infrastructure.databases.graph.ladybug.adapter import LadybugAdapter
     from cognee.infrastructure.databases.vector import get_vector_engine  # noqa: F401
-    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
-        PGVectorAdapter,
-    )
     from cognee.modules.data.models import Data
 
     for model, required in (
@@ -232,12 +250,35 @@ def assert_cognee_dataset_api() -> None:
                 f"cognee {model.__name__} table no longer carries {sorted(missing)}; "
                 "the kb.cognee_client corpus census needs updating"
             )
-    for adapter, method_name in (
-        (PGVectorAdapter, "get_table"),
-        (PGVectorAdapter, "get_async_session"),
-        (PGVectorAdapter, "delete_data_points"),
-        (LadybugAdapter, "query"),
-    ):
+    adapter_methods: list[tuple[type[Any], str]] = [(LadybugAdapter, "query")]
+    vector_provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()
+    if vector_provider == "pgvector":
+        from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
+            PGVectorAdapter,
+        )
+
+        adapter_methods.extend(
+            (
+                (PGVectorAdapter, "get_table"),
+                (PGVectorAdapter, "get_async_session"),
+                (PGVectorAdapter, "delete_data_points"),
+            )
+        )
+    elif vector_provider == "qdrant":
+        from .qdrant_adapter import CitadelQdrantAdapter
+
+        adapter_methods.extend(
+            (CitadelQdrantAdapter, method_name)
+            for method_name in (
+                "retrieve",
+                "delete_data_points",
+                "count_data_points",
+                "scroll_data_points",
+                "prune",
+            )
+        )
+
+    for adapter, method_name in adapter_methods:
         if not callable(getattr(adapter, method_name, None)):
             raise RuntimeError(
                 f"cognee {adapter.__name__} no longer exposes {method_name}; "
@@ -333,6 +374,7 @@ class CogneeGateway(Protocol):
         tags: tuple[str, ...] = (),
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        data_id: str | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -346,6 +388,7 @@ class CogneeGateway(Protocol):
         dataset: str,
         session_id: str | None = None,
         top_k: int = 10,
+        document_ids: list[str] | None = None,
     ) -> list[Any]:
         raise NotImplementedError
 
@@ -402,7 +445,12 @@ class CogneeGateway(Protocol):
     ) -> dict[str, list[str]]:
         raise NotImplementedError
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
         raise NotImplementedError
 
     async def corpus_zero_chunk_documents(
@@ -542,8 +590,17 @@ class CogneePublicClient:
     def _prepare_cognee_environment(self) -> None:
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
+        self._ensure_qdrant_adapter_registered()
         self._ensure_auto_feedback_default()
         self._ensure_chunk_budget()
+
+    def _ensure_qdrant_adapter_registered(self) -> None:
+        """Register Citadel's Qdrant adapter before Cognee creates an engine."""
+        if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
+            return
+        from .qdrant_adapter import register_qdrant_adapter
+
+        register_qdrant_adapter()
 
     def _ensure_chunk_budget(self) -> None:
         """Size chunks for the embedder, and watch the embed boundary (#227).
@@ -598,7 +655,10 @@ class CogneePublicClient:
         return getattr(search_type, raw_value, getattr(search_type, "CHUNKS", None))
 
     def _is_no_data_error(self, exc: Exception) -> bool:
-        return exc.__class__.__name__ == "NoDataError" or "No data found in the system" in str(exc)
+        return exc.__class__.__name__ in {
+            "DatasetNotFoundError",
+            "NoDataError",
+        } or "No data found in the system" in str(exc)
 
     async def _create_cognee_database(self) -> None:
         from cognee.infrastructure.databases.relational import get_relational_engine
@@ -606,24 +666,39 @@ class CogneePublicClient:
         db_engine = get_relational_engine()
         await db_engine.create_database()
 
-    def _data_with_metadata(self, data: Any, metadata: dict[str, Any] | None) -> Any:
-        if not metadata:
+    def _data_with_metadata(
+        self,
+        data: Any,
+        metadata: dict[str, Any] | None,
+        data_id: str | None = None,
+    ) -> Any:
+        if not metadata and data_id is None:
             return data
         try:
             from cognee.tasks.ingestion.data_item import DataItem
         except Exception:
             return data
 
+        explicit_data_id = UUID(data_id) if data_id is not None else None
+        if explicit_data_id is not None and isinstance(data, list):
+            raise ValueError("one explicit lifecycle data_id cannot identify a list payload")
+
         def attach(item: Any) -> Any:
             if isinstance(item, DataItem):
-                merged = {**(item.external_metadata or {}), **metadata}
+                merged = {**(item.external_metadata or {}), **(metadata or {})}
                 return DataItem(
                     data=item.data,
                     label=item.label,
                     external_metadata=merged,
-                    data_id=item.data_id,
+                    data_id=explicit_data_id or item.data_id,
                 )
-            return DataItem(data=item, external_metadata=metadata)
+            kwargs: dict[str, Any] = {
+                "data": item,
+                "external_metadata": metadata,
+            }
+            if explicit_data_id is not None:
+                kwargs["data_id"] = explicit_data_id
+            return DataItem(**kwargs)
 
         if isinstance(data, list):
             return [attach(item) for item in data]
@@ -636,17 +711,15 @@ class CogneePublicClient:
         configure_cognee_logging()
         if self._startup_migrations_done:
             return
-        run_startup_migrations = getattr(cognee, "run_startup_migrations", None)
-        if run_startup_migrations is not None:
-            try:
-                await run_startup_migrations()
-            except Exception as exc:
-                logger.warning(
-                    "Cognee startup migrations failed with %s; creating database and retrying",
-                    exc.__class__.__name__,
-                )
-                await self._create_cognee_database()
-                await run_startup_migrations()
+        run_migrations = getattr(cognee, "run_migrations", None)
+        if not callable(run_migrations):
+            raise RuntimeError("Cognee 1.4.1 run_migrations API is unavailable")
+        failed_database_ids = await run_migrations()
+        if failed_database_ids:
+            raise RuntimeError(
+                "Cognee migrations failed for "
+                f"{len(failed_database_ids)} database(s)"
+            )
         self._startup_migrations_done = True
         logger.info("Cognee startup migrations completed")
 
@@ -659,6 +732,7 @@ class CogneePublicClient:
         tags: tuple[str, ...] = (),
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        data_id: str | None = None,
     ) -> Any:
         self._prepare_cognee_environment()
         import cognee
@@ -689,7 +763,7 @@ class CogneePublicClient:
         # scaffolded "Session ID:/Question:/Answer:" blob every sync cycle.
         # session_id is still accepted (callers pass it as provenance) but no
         # longer diverts the write away from the durable path.
-        data = self._data_with_metadata(data, metadata or None)
+        data = self._data_with_metadata(data, metadata or None, data_id)
 
         # Add is a fast write to Cognee's relational/source stores; it does NOT
         # create chunks, embeddings, or a graph projection. It still opens the
@@ -951,6 +1025,35 @@ class CogneePublicClient:
         dataset: str,
         session_id: str | None = None,
         top_k: int = 10,
+        document_ids: list[str] | None = None,
+    ) -> list[Any]:
+        if (
+            document_ids is None
+            or os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant"
+        ):
+            return await self._recall_unscoped(
+                query,
+                dataset=dataset,
+                session_id=session_id,
+                top_k=top_k,
+            )
+        from kb.qdrant_adapter import qdrant_document_scope
+
+        with qdrant_document_scope(document_ids):
+            return await self._recall_unscoped(
+                query,
+                dataset=dataset,
+                session_id=session_id,
+                top_k=top_k,
+            )
+
+    async def _recall_unscoped(
+        self,
+        query: str,
+        *,
+        dataset: str,
+        session_id: str | None = None,
+        top_k: int = 10,
     ) -> list[Any]:
         timing = _search_timing_enabled()
         t_start = perf_counter() if timing else 0.0
@@ -1026,6 +1129,17 @@ class CogneePublicClient:
             self._log_search_timing(
                 t_start, t_ready, dataset=dataset, top_k=top_k, query_type=query_type
             )
+        if results and all(
+            isinstance(result, dict) and "search_result" in result for result in results
+        ):
+            flattened: list[Any] = []
+            for result in results:
+                search_result = result["search_result"]
+                if isinstance(search_result, list):
+                    flattened.extend(search_result)
+                elif search_result is not None:
+                    flattened.append(search_result)
+            return flattened
         return results
 
     def _log_search_timing(
@@ -1515,16 +1629,27 @@ class CogneePublicClient:
         graph_ids_seen: set[str] = set()
         fully_indexed_ids: set[str] = set()
         if document_ids:
-            # Both projection methods scan their backing store. Running them
-            # once after the relational walk avoids repeating a full graph scan
-            # for every source page while preserving the same complete-corpus
-            # and fail-closed checks.
+            # Projection methods scan their backing stores only after the full
+            # relational walk. Qdrant counts resolve dataset membership
+            # internally. Ladybug uses one graph per dataset, so scan each
+            # dataset's exact document ids and union the results.
             chunk_counts = await self.corpus_chunk_counts(document_ids)
             if chunk_counts is None:
                 raise RuntimeError("vector chunk measurement is unavailable")
-            graph_ids = await self.corpus_graph_presence(document_ids)
-            if graph_ids is None:
-                raise RuntimeError("graph presence measurement is unavailable")
+            memberships = await self.dataset_membership_for_documents(document_ids)
+            graph_ids: set[str] = set()
+            by_dataset: dict[str, list[str]] = {}
+            for document_id in document_ids:
+                for dataset in memberships.get(document_id, []):
+                    by_dataset.setdefault(str(dataset), []).append(document_id)
+            for dataset in sorted(by_dataset):
+                scoped_graph_ids = await self.corpus_graph_presence(
+                    by_dataset[dataset],
+                    datasets=[dataset],
+                )
+                if scoped_graph_ids is None:
+                    raise RuntimeError("graph presence measurement is unavailable")
+                graph_ids.update(str(document_id) for document_id in scoped_graph_ids)
             chunked_ids = {
                 document_id
                 for document_id in document_ids
@@ -1571,7 +1696,33 @@ class CogneePublicClient:
         if not document_ids:
             return {}
         self._prepare_cognee_environment()
-        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
+        provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()
+        if provider == "qdrant":
+            wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+            memberships = await self.dataset_membership_for_documents(wanted)
+            by_dataset: dict[str, list[str]] = {}
+            for document_id in wanted:
+                for dataset in memberships.get(document_id, []):
+                    by_dataset.setdefault(str(dataset), []).append(document_id)
+            counts = {document_id: 0 for document_id in wanted}
+            for dataset in sorted(by_dataset):
+                scoped_ids = by_dataset[dataset]
+                report = await self._stored_qdrant_chunk_budget_check(
+                    document_ids=scoped_ids,
+                    budget=chunk_window.resolve_chunk_budget(),
+                    datasets=[dataset],
+                    document_ids_by_dataset=None,
+                )
+                measured = report.get("document_chunk_counts")
+                if not isinstance(measured, dict):
+                    raise RuntimeError("Qdrant chunk census omitted document counts")
+                for document_id in scoped_ids:
+                    value = measured.get(document_id, 0)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise RuntimeError("Qdrant chunk census returned an invalid count")
+                    counts[document_id] = max(counts[document_id], value)
+            return counts
+        if provider != "pgvector":
             return None
         import cognee
 
@@ -1890,18 +2041,28 @@ class CogneePublicClient:
         document_ids: list[str] | None = None,
         *,
         budget: int | None = None,
+        datasets: list[str] | None = None,
+        document_ids_by_dataset: Mapping[str, list[str]] | None = None,
     ) -> dict[str, Any] | None:
         """Measure exact persisted ``DocumentChunk_text`` payloads.
 
-        Cognee's public vector interface cannot enumerate a collection. Citadel's
-        production provider is pgvector, whose reflected table can be scanned
-        directly. Other providers return ``None`` because a similarity query is
-        not evidence of corpus-wide compliance.
+        Pgvector is scanned through its reflected table. Qdrant is scanned one
+        authorized dataset context at a time through Citadel's tenant-filtered
+        scroll path. Other providers return ``None`` because a similarity query
+        is not evidence of corpus-wide compliance.
         """
         self._prepare_cognee_environment()
-        if os.getenv("VECTOR_DB_PROVIDER", "").lower() != "pgvector":
-            return None
+        provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()
         limit = budget if budget is not None else chunk_window.resolve_chunk_budget()
+        if provider == "qdrant":
+            return await self._stored_qdrant_chunk_budget_check(
+                document_ids=document_ids,
+                budget=limit,
+                datasets=datasets,
+                document_ids_by_dataset=document_ids_by_dataset,
+            )
+        if provider != "pgvector":
+            return None
         import cognee
 
         await self._ensure_cognee_ready(cognee)
@@ -1993,6 +2154,228 @@ class CogneePublicClient:
             "violation_document_counts": dict(sorted(violation_document_counts.items())),
             "violation_document_ids": sorted(violation_document_counts),
             "missing_document_id_violation_count": missing_document_id_violation_count,
+            "violations_truncated": violation_count > len(violations),
+        }
+
+    async def _stored_qdrant_chunk_budget_check(
+        self,
+        *,
+        document_ids: list[str] | None,
+        budget: int,
+        datasets: list[str] | None,
+        document_ids_by_dataset: Mapping[str, list[str]] | None,
+    ) -> dict[str, Any]:
+        """Enumerate exact Qdrant chunk payloads inside authorized dataset scopes."""
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.context_global_variables import (
+            set_database_global_context_variables,
+        )
+        from cognee.infrastructure.databases.vector import get_vector_engine_async
+        from cognee.modules.pipelines.layers.resolve_authorized_user_datasets import (
+            resolve_authorized_user_datasets,
+        )
+
+        requested_datasets = list(
+            dict.fromkeys(str(dataset).strip() for dataset in datasets or [] if str(dataset).strip())
+        )
+        if not requested_datasets:
+            raise RuntimeError("Qdrant chunk census requires explicit dataset scope")
+        expected_input = {
+            str(dataset_id).strip(): {
+                str(document_id)
+                for document_id in scoped_document_ids
+                if str(document_id)
+            }
+            for dataset_id, scoped_document_ids in (document_ids_by_dataset or {}).items()
+            if str(dataset_id).strip()
+        }
+        wanted = {
+            str(document_id) for document_id in document_ids or [] if str(document_id)
+        }
+        document_scope = document_ids is not None or document_ids_by_dataset is not None
+        if document_ids_by_dataset is not None:
+            wanted = set().union(*expected_input.values()) if expected_input else set()
+        elif document_ids is not None and len(requested_datasets) != 1:
+            raise RuntimeError(
+                "multi-dataset Qdrant census requires document_ids_by_dataset"
+            )
+        if document_scope and not wanted:
+            return {
+                "ok": True,
+                "provider": "qdrant",
+                "collection": "DocumentChunk_text",
+                "collection_present": False,
+                "budget": budget,
+                "scope": "document_ids",
+                "scope_document_count": 0,
+                "scope_dataset_count": 0,
+                "chunks_scanned": 0,
+                "document_chunk_counts": {},
+                "violation_count": 0,
+                "violations": [],
+                "violation_document_counts": {},
+                "violation_document_ids": [],
+                "missing_document_id_violation_count": 0,
+                "missing_document_ids": [],
+                "violations_truncated": False,
+            }
+
+        _, authorized_datasets = await resolve_authorized_user_datasets(
+            requested_datasets,
+            None,
+        )
+        if len(authorized_datasets) != len(requested_datasets):
+            raise RuntimeError("Qdrant chunk census did not resolve every requested dataset")
+        authorized_by_id = {str(dataset.id): dataset for dataset in authorized_datasets}
+        if len(authorized_by_id) != len(authorized_datasets):
+            raise RuntimeError("Qdrant chunk census resolved duplicate dataset identities")
+        if expected_input:
+            unknown_dataset_ids = sorted(set(expected_input) - set(authorized_by_id))
+            if unknown_dataset_ids:
+                raise RuntimeError(
+                    "Qdrant chunk census receipt contains unauthorized dataset identities"
+                )
+            expected_by_dataset = {
+                dataset_id: expected_input.get(dataset_id, set())
+                for dataset_id in authorized_by_id
+            }
+        elif document_ids is not None:
+            only_dataset_id = next(iter(authorized_by_id))
+            expected_by_dataset = {only_dataset_id: wanted}
+        else:
+            expected_by_dataset = {
+                dataset_id: set() for dataset_id in authorized_by_id
+            }
+        collection_present = False
+        chunks_scanned = 0
+        violations: list[dict[str, Any]] = []
+        violation_count = 0
+        violation_document_counts: dict[str, int] = {}
+        missing_document_id_violation_count = 0
+        document_chunk_counts: dict[str, int] = {}
+        missing_dataset_document_ids: list[dict[str, str]] = []
+        dataset_reports: dict[str, dict[str, Any]] = {}
+
+        for dataset in authorized_datasets:
+            dataset_id = str(dataset.id)
+            dataset_wanted = expected_by_dataset[dataset_id]
+            dataset_seen_document_ids: set[str] = set()
+            dataset_chunks_scanned = 0
+            dataset_violation_count = 0
+            dataset_collection_present = False
+            async with set_database_global_context_variables(
+                dataset.id,
+                dataset.owner_id,
+            ):
+                engine = await get_vector_engine_async()
+                if await engine.has_collection("DocumentChunk_text"):
+                    collection_present = True
+                    dataset_collection_present = True
+                    offset: str | int | UUID | None = None
+                    seen_offsets: set[str] = set()
+                    while True:
+                        rows, next_offset = await engine.scroll_data_points(
+                            "DocumentChunk_text",
+                            offset=offset,
+                            limit=256,
+                            with_vectors=False,
+                            document_ids=(
+                                sorted(dataset_wanted)
+                                if document_scope
+                                else None
+                            ),
+                        )
+                        for row in rows:
+                            payload = getattr(row, "payload", None)
+                            document_id = (
+                                str(payload.get("document_id"))
+                                if isinstance(payload, dict)
+                                and payload.get("document_id") is not None
+                                else None
+                            )
+                            if document_scope and document_id not in dataset_wanted:
+                                if document_id is not None:
+                                    continue
+                            chunks_scanned += 1
+                            dataset_chunks_scanned += 1
+                            if document_id is not None:
+                                dataset_seen_document_ids.add(document_id)
+                                document_chunk_counts[document_id] = (
+                                    document_chunk_counts.get(document_id, 0) + 1
+                                )
+                            violation = chunk_window.check_stored_chunk_payload(
+                                payload,
+                                chunk_id=str(getattr(row, "id", "unavailable")),
+                                budget=budget,
+                            )
+                            if violation is None:
+                                continue
+                            violation_count += 1
+                            dataset_violation_count += 1
+                            if violation.document_id is None:
+                                missing_document_id_violation_count += 1
+                            else:
+                                violation_document_counts[violation.document_id] = (
+                                    violation_document_counts.get(violation.document_id, 0)
+                                    + 1
+                                )
+                            if len(violations) < 50:
+                                violations.append(
+                                    {"dataset": dataset_id, **violation.as_dict()}
+                                )
+                        if next_offset is None:
+                            break
+                        offset_key = str(next_offset)
+                        if offset_key in seen_offsets:
+                            raise RuntimeError("Qdrant chunk scroll repeated an offset")
+                        seen_offsets.add(offset_key)
+                        offset = next_offset
+
+            dataset_missing = (
+                sorted(dataset_wanted - dataset_seen_document_ids)
+                if document_scope
+                else []
+            )
+            missing_dataset_document_ids.extend(
+                {"dataset": dataset_id, "document_id": document_id}
+                for document_id in dataset_missing
+            )
+            dataset_reports[dataset_id] = {
+                "collection_present": dataset_collection_present,
+                "scope_document_count": len(dataset_wanted) if document_scope else None,
+                "chunks_scanned": dataset_chunks_scanned,
+                "violation_count": dataset_violation_count,
+                "missing_document_ids": dataset_missing,
+            }
+
+        missing_document_ids = sorted(
+            {item["document_id"] for item in missing_dataset_document_ids}
+        )
+        return {
+            "ok": violation_count == 0 and not missing_dataset_document_ids,
+            "provider": "qdrant",
+            "collection": "DocumentChunk_text",
+            "collection_present": collection_present,
+            "budget": budget,
+            "scope": "document_ids" if document_scope else "full",
+            "scope_document_count": (
+                sum(len(ids) for ids in expected_by_dataset.values())
+                if document_scope
+                else None
+            ),
+            "scope_dataset_count": len(authorized_datasets),
+            "chunks_scanned": chunks_scanned,
+            "document_chunk_counts": dict(sorted(document_chunk_counts.items())),
+            "violation_count": violation_count,
+            "violations": violations,
+            "violation_document_counts": dict(sorted(violation_document_counts.items())),
+            "violation_document_ids": sorted(violation_document_counts),
+            "missing_document_id_violation_count": missing_document_id_violation_count,
+            "missing_document_ids": missing_document_ids,
+            "missing_dataset_document_ids": missing_dataset_document_ids,
+            "dataset_reports": dataset_reports,
             "violations_truncated": violation_count > len(violations),
         }
 
@@ -2616,7 +2999,12 @@ class CogneePublicClient:
             node_ids.add(str(node_id))
         return node_ids
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
         """Which source documents have a graph projection; None when unmeasured.
 
         Cognee's TextChunker gives DocumentChunk nodes their own ids. The
@@ -2628,6 +3016,49 @@ class CogneePublicClient:
         """
         if not document_ids:
             return set()
+        requested_datasets = list(
+            dict.fromkeys(
+                str(dataset).strip()
+                for dataset in datasets or []
+                if str(dataset).strip()
+            )
+        )
+        if requested_datasets:
+            from cognee.context_global_variables import (
+                set_database_global_context_variables,
+            )
+            from cognee.modules.pipelines.layers.resolve_authorized_user_datasets import (
+                resolve_authorized_user_datasets,
+            )
+
+            _, authorized_datasets = await resolve_authorized_user_datasets(
+                requested_datasets,
+                None,
+            )
+            if len(authorized_datasets) != len(requested_datasets):
+                raise RuntimeError(
+                    "graph presence did not resolve every requested dataset"
+                )
+            present: set[str] = set()
+            for dataset in authorized_datasets:
+                async with set_database_global_context_variables(
+                    dataset.id,
+                    dataset.owner_id,
+                ):
+                    scoped = await self._corpus_graph_presence_current_context(
+                        document_ids
+                    )
+                if scoped is None:
+                    return None
+                present.update(scoped)
+            return present
+        return await self._corpus_graph_presence_current_context(document_ids)
+
+    async def _corpus_graph_presence_current_context(
+        self,
+        document_ids: list[str],
+    ) -> set[str] | None:
+        """Read graph presence inside the caller's active Cognee dataset context."""
         engine = await self._graph_engine()
         query = getattr(engine, "query", None)
         if not callable(query):
@@ -3287,9 +3718,8 @@ class CogneePublicClient:
             # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
             return None
         try:
-            engine = await self._vector_engine()
-            retrieve = getattr(engine, "retrieve", None)
-            if not callable(retrieve):
+            retrieve = await self._chunk_store_reader(requested)
+            if retrieve is None:
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
             seed_payload = (
@@ -3517,6 +3947,99 @@ class CogneePublicClient:
         payload = getattr(row, "payload", None)
         return payload if isinstance(payload, dict) else None
 
+    async def _owning_datasets(self, doc_id: str) -> list[tuple[Any, Any]]:
+        """``(dataset_id, owner_id)`` of every dataset holding ``doc_id``. READ ONLY.
+
+        Deliberately NOT cognee's ``resolve_authorized_user_datasets``: that
+        helper calls ``load_or_create_datasets``, so a name it cannot authorize
+        for the caller is CREATED and granted. Pointing a drill-down at it gave
+        this read path a relational write (measured: datasets 1 -> 2, acls 0 -> 4
+        against a foreign-owned name) and, under the mandatory
+        ENABLE_BACKEND_ACCESS_CONTROL=true, a cross-tenant dataset-creation path.
+        A read must not be able to insert a Dataset row, a permission grant, or a
+        default user, so this is the same unscoped DatasetData join
+        ``dataset_membership_for_documents`` uses, returning the identity columns
+        the dataset database context needs. Resolving by id rather than by name
+        also means a name collision across owners cannot redirect the read.
+        """
+        try:
+            document_uuid = UUID(str(doc_id))
+        except (TypeError, ValueError):
+            return []
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Dataset, DatasetData
+
+        from sqlalchemy import select
+
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Dataset.id, Dataset.owner_id)
+                .join(DatasetData, DatasetData.dataset_id == Dataset.id)
+                .where(DatasetData.data_id == document_uuid)
+                .distinct()
+            )
+            return [(dataset_id, owner_id) for dataset_id, owner_id in rows.all()]
+
+    async def _chunk_store_reader(
+        self, doc_id: str
+    ) -> Callable[[str, list[str]], Awaitable[list[Any]]] | None:
+        """A chunk-store ``retrieve`` bound to the datasets that own ``doc_id``.
+
+        ``get_vector_engine()`` outside a dataset context builds the Qdrant
+        adapter with an EMPTY database name (cognee's ``vector_db_name`` default
+        is ""), and that adapter refuses every operation carrying no Citadel
+        scope. The unbound engine could therefore never read one chunk: the
+        drill-down fallback failed closed on every id under this provider, no
+        matter what the store held. Read inside the database context of each
+        dataset that owns the document, the same way the chunk census does, over
+        the read-only membership ``_owning_datasets`` resolves. Providers that
+        enforce no scope keep the unbound engine, and so does an id with no
+        membership row (a chunk id, a synthetic id) — the fallback stays
+        best-effort and still degrades to 404. Reading the owning dataset is not
+        a new privilege: the body still passes the ADR-0009 gate the caller
+        applies to ``dataset_node_ids`` afterwards.
+        """
+        if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
+            return await self._unbound_chunk_store_reader()
+        datasets = await self._owning_datasets(doc_id)
+        if not datasets:
+            return await self._unbound_chunk_store_reader()
+        from cognee.context_global_variables import (
+            set_database_global_context_variables,
+        )
+        from cognee.infrastructure.databases.vector import get_vector_engine_async
+
+        async def scoped_retrieve(
+            collection_name: str, data_point_ids: list[str]
+        ) -> list[Any]:
+            rows: list[Any] = []
+            for dataset_id, owner_id in datasets:
+                async with set_database_global_context_variables(
+                    dataset_id,
+                    owner_id,
+                ):
+                    engine = await get_vector_engine_async()
+                    retrieve = getattr(engine, "retrieve", None)
+                    if not callable(retrieve):
+                        continue
+                    found = await retrieve(collection_name, data_point_ids)
+                rows.extend(found or [])
+            return rows
+
+        return scoped_retrieve
+
+    async def _unbound_chunk_store_reader(
+        self,
+    ) -> Callable[[str, list[str]], Awaitable[list[Any]]] | None:
+        engine = await self._vector_engine()
+        retrieve = getattr(engine, "retrieve", None)
+        return retrieve if callable(retrieve) else None
+
     async def _document_from_chunk_store(self, doc_id: str) -> dict[str, Any] | None:
         """Assemble a document from the durable chunk store when the graph can't.
 
@@ -3540,9 +4063,8 @@ class CogneePublicClient:
             # Synthetic ids (chunk:<sha256>, ghsync:*) have no chunk-store row.
             return None
         try:
-            engine = await self._vector_engine()
-            retrieve = getattr(engine, "retrieve", None)
-            if not callable(retrieve):
+            retrieve = await self._chunk_store_reader(requested)
+            if retrieve is None:
                 return None
             seed_rows = await retrieve(self._CHUNK_VECTOR_COLLECTION, [requested])
             seed_payload = (
@@ -3681,12 +4203,15 @@ class CogneePublicClient:
         # cognify so they cannot collide on the lock (#47).
         async with self.writer_lock:
             result = await cognee.cognify(
-                datasets=datasets, incremental_loading=not force
+                datasets=datasets,
+                incremental_loading=not force,
+                data_cache=not force,
             )
             self._invalidate_graph_data_cache()
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
         processed_ids = _cognify_data_ids(result)
+        processed_ids_by_dataset = _cognify_data_ids_by_dataset(result, datasets)
         if force:
             missing_ids = sorted(set(expected_ids) - set(processed_ids))
             if missing_ids:
@@ -3696,12 +4221,14 @@ class CogneePublicClient:
                 )
         if processed_ids:
             stored_check = await self.stored_chunk_budget_check(
-                document_ids=processed_ids
+                document_ids=processed_ids,
+                datasets=datasets,
+                document_ids_by_dataset=processed_ids_by_dataset,
             )
             if stored_check is None:
                 logger.warning(
                     "stored chunk budget was not measured after cognify: "
-                    "VECTOR_DB_PROVIDER is not pgvector"
+                    "VECTOR_DB_PROVIDER does not support exact enumeration"
                 )
             elif not stored_check["ok"]:
                 logger.error(

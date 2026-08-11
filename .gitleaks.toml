@@ -133,6 +133,22 @@ regexes = [
 ]
 
 [[allowlists]]
+description = "CHANGE_ME replacement instructions in the shipped example env file"
+# .env.lite.example ships CITADEL_ADMIN_KEY=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+# as the value the operator must replace. It is long enough for
+# citadel-admin-key to fire, and it sits in git history (92ce11a), so the
+# history scan needs a config allowlist rather than a file edit. AND pairing:
+# only this file, and only lines whose whole value is a literal CHANGE_ME
+# instruction in caps. A real key pasted into the example carries no CHANGE_ME
+# marker (and any lowercase or symbol after it breaks the match), so the rule
+# stays armed here.
+condition = "AND"
+targetRules = ["citadel-admin-key"]
+paths = ['''^\.env\.lite\.example$''']
+regexTarget = "line"
+regexes = ['''=[ \t]*['"]?CHANGE_ME[A-Z0-9_]*['"]?$''']
+
+[[allowlists]]
 description = "Notes recording a token PREFIX while explaining the format"
 # tasks.md and docs/progress.md record which service-account token was minted
 # by its first few characters ("token prefix: `ctdl_…`"). A prefix is not a

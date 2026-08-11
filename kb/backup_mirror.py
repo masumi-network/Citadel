@@ -287,6 +287,7 @@ class BackupMirror:
             self._file_record("github_sync_state", Path(self.config.github_sync_state_path)),
             self._file_record("obsidian_sync_state", Path(self.config.obsidian_sync_state_path)),
             self._file_record("access_store", Path(self.config.access_store_path)),
+            self._file_record("lifecycle_store", Path(self.config.lifecycle_store_path)),
         ]
 
     def _manifest(self, *, exported_at: str, dry_run: bool) -> dict[str, Any]:

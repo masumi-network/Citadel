@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict
+from datetime import UTC, datetime
 from hashlib import sha256
+import json
 import logging
+import os
 import re
 from uuid import uuid4
 from typing import Any
@@ -13,6 +17,15 @@ from kb.cognee_client import CogneeGateway, CogneePublicClient
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
+from kb.lifecycle import (
+    CaptureContext,
+    LIFECYCLE_CHUNK_SOURCE_PREFIX,
+    LifecycleNotFoundError,
+    LifecycleStore,
+    ProjectionRequest,
+    lifecycle_chunk_source_key,
+)
+from kb.lifecycle_worker import LifecycleProjectionWorker
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
 from kb.repair_journal import RepairJournal, RepairJournalLeaseError
 from kb.security_scan import (
@@ -49,6 +62,21 @@ class Citadel:
     ) -> None:
         self.config = config or CitadelConfig.from_env()
         self.cognee = cognee or CogneePublicClient(queue_path=self.config.cognify_queue_path)
+        self.lifecycle_store: LifecycleStore | None = None
+        self.lifecycle_worker: LifecycleProjectionWorker | None = None
+        self._lifecycle_projection_task: asyncio.Task[Any] | None = None
+        if self.config.lifecycle_enabled:
+            self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
+            lifecycle_projection = self._lifecycle_projection_request()
+            self.lifecycle_store.assert_generation_binding(lifecycle_projection)
+            self.lifecycle_worker = LifecycleProjectionWorker(
+                self.lifecycle_store,
+                self.cognee,
+                worker_id=f"citadel-{uuid4().hex}",
+                generation_id=lifecycle_projection.generation_id,
+                projection_version=lifecycle_projection.projection_version,
+                config_digest=lifecycle_projection.config_digest,
+            )
         self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,
@@ -76,6 +104,14 @@ class Citadel:
         session_id: str | None = None,
         attestation: Mapping[str, str] | None = None,
         defer_cognify: bool = False,
+        source_key: str | None = None,
+        source_locator: str | None = None,
+        media_type: str = "text/plain",
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
+        _lifecycle_parent_source_key: str | None = None,
+        _lifecycle_chunk_index: int | None = None,
     ) -> IngestResult:
         target_dataset = dataset or self.config.default_dataset
         merged_tags = merge_tags(self.config.default_tags, tags)
@@ -99,18 +135,78 @@ class Citadel:
 
         content_hash = sha256(data.encode("utf-8")).hexdigest()
         ingest_key = (target_dataset, content_hash)
+        if self.lifecycle_store is not None:
+            resolved_source_key = (source_key or "").strip() or (
+                f"manual:{target_dataset}:{content_hash}"
+            )
+            capture_metadata: dict[str, Any] = {"tags": list(merged_tags)}
+            if resolved_source_key.startswith(LIFECYCLE_CHUNK_SOURCE_PREFIX):
+                if (
+                    _lifecycle_parent_source_key is None
+                    or _lifecycle_chunk_index is None
+                    or resolved_source_key
+                    != lifecycle_chunk_source_key(
+                        _lifecycle_parent_source_key,
+                        _lifecycle_chunk_index,
+                    )
+                ):
+                    raise ValueError(
+                        "reserved lifecycle chunk source key requires its exact parent binding"
+                    )
+                capture_metadata["lifecycle_parent_source_key"] = (
+                    _lifecycle_parent_source_key
+                )
+                capture_metadata["lifecycle_chunk_index"] = _lifecycle_chunk_index
+            elif (
+                _lifecycle_parent_source_key is not None
+                or _lifecycle_chunk_index is not None
+            ):
+                raise ValueError(
+                    "lifecycle chunk parent binding requires a reserved chunk source key"
+                )
+            if session_id:
+                capture_metadata["session_id"] = session_id
+            if attestation:
+                capture_metadata["attestation"] = dict(attestation)
+            acceptance = self.lifecycle_store.accept_source(
+                data.encode("utf-8"),
+                capture=CaptureContext(
+                    dataset=target_dataset,
+                    source_key=resolved_source_key,
+                    source_locator=source_locator,
+                    media_type=media_type,
+                    capture_actor_id=capture_actor_id or self.config.user_id,
+                    capture_run_id=capture_run_id or session_id,
+                    captured_at=captured_at or datetime.now(UTC),
+                    metadata=capture_metadata,
+                ),
+                projection=self._lifecycle_projection_request(),
+            )
+            if not self._inline_projection_suppressed():
+                self._start_lifecycle_projection()
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                target_dataset,
+                merged_tags,
+                {
+                    "source_revision_id": acceptance.source_revision_id,
+                    "projection_job_id": acceptance.projection_job_id,
+                    "state": acceptance.operation.state,
+                },
+                source_revision_id=acceptance.source_revision_id,
+                projection_job_id=acceptance.projection_job_id,
+                projection_state=acceptance.operation.state,
+            )
         if ingest_key in self._seen_ingest_keys:
             logger.info(
                 "Ingest rejected for dataset %s: duplicate_in_process",
                 safe_log_value(target_dataset),
             )
             return IngestResult(False, "duplicate_in_process", target_dataset, merged_tags)
-        # Claimed BEFORE the await so two concurrent ingests of identical content
-        # cannot both pass the check, and released again if the write fails. It
-        # used to be added and never removed, so one failed remember() marked that
-        # content "seen" for the life of the process: every retry then returned
-        # duplicate_in_process, and a caller that only records state on success
-        # (repo_content_sync) could never recover the file.
+        # Claimed BEFORE the await so two concurrent legacy ingests of identical
+        # content cannot both pass the check, and released again if the write
+        # fails. Lifecycle mode uses SQLite uniqueness for this boundary.
         self._seen_ingest_keys.add(ingest_key)
         try:
             remember_kwargs: dict[str, Any] = {
@@ -142,6 +238,394 @@ class Citadel:
             elif result.get("background_cognify") is False:
                 reason = "not_scheduled"
         return IngestResult(True, reason, target_dataset, merged_tags, result)
+
+    def lifecycle_source_keys(
+        self,
+        *,
+        dataset: str,
+        source_key: str,
+        include_chunks: bool = True,
+    ) -> tuple[str, ...]:
+        """Return current lifecycle keys for one logical source."""
+        if self.lifecycle_store is None:
+            return ()
+        return tuple(
+            revision.source_key
+            for revision in self.lifecycle_store.current_revisions_for_source(
+                dataset,
+                source_key,
+                include_chunks=include_chunks,
+            )
+            if not revision.tombstone
+        )
+
+    async def tombstone_source(
+        self,
+        *,
+        dataset: str,
+        source_key: str,
+        reason: str,
+        source_locator: str | None = None,
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
+        include_chunks: bool = True,
+    ) -> tuple[IngestResult, ...]:
+        """Tombstone current exact and optional chunk revisions for one source."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request()
+        current = self.lifecycle_store.current_revisions_for_source(
+            dataset,
+            source_key,
+            include_chunks=include_chunks,
+        )
+        results: list[IngestResult] = []
+        for revision in current:
+            if revision.tombstone:
+                continue
+            acceptance = self.lifecycle_store.accept_tombstone(
+                reason=reason,
+                capture=CaptureContext(
+                    dataset=dataset,
+                    source_key=revision.source_key,
+                    source_locator=source_locator or revision.source_locator,
+                    media_type=revision.media_type,
+                    capture_actor_id=capture_actor_id or self.config.user_id,
+                    capture_run_id=capture_run_id,
+                    captured_at=captured_at or datetime.now(UTC),
+                    metadata={
+                        "replaces_source_revision_id": revision.source_revision_id,
+                        **{
+                            key: revision.capture_metadata[key]
+                            for key in (
+                                "lifecycle_parent_source_key",
+                                "lifecycle_chunk_index",
+                            )
+                            if key in revision.capture_metadata
+                        },
+                    },
+                ),
+                projection=projection,
+            )
+            results.append(
+                IngestResult(
+                    True,
+                    "queued_not_confirmed",
+                    dataset,
+                    (),
+                    {
+                        "source_revision_id": acceptance.source_revision_id,
+                        "projection_job_id": acceptance.projection_job_id,
+                        "state": acceptance.operation.state,
+                    },
+                    source_revision_id=acceptance.source_revision_id,
+                    projection_job_id=acceptance.projection_job_id,
+                    projection_state=acceptance.operation.state,
+                )
+            )
+        if results and not self._inline_projection_suppressed():
+            self._start_lifecycle_projection()
+        return tuple(results)
+
+    def _lifecycle_projection_request(
+        self,
+        *,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+    ) -> ProjectionRequest:
+        generation_id = (
+            generation_id
+            if generation_id is not None
+            else os.getenv("CITADEL_GENERATION_ID", "citadel-default")
+        ).strip()
+        projection_version = (
+            projection_version
+            if projection_version is not None
+            else os.getenv(
+                "CITADEL_PROJECTION_VERSION",
+                "lifecycle-v1:cognee-1.4.1",
+            )
+        ).strip()
+        providers = {
+            "relational": os.getenv("DB_PROVIDER", "sqlite").strip().lower(),
+            "vector": os.getenv("VECTOR_DB_PROVIDER", "qdrant").strip().lower(),
+            "graph": os.getenv("GRAPH_DATABASE_PROVIDER", "ladybug").strip().lower(),
+        }
+        digest_fields = {
+            "generation_id": generation_id,
+            "projection_version": projection_version,
+            "providers": providers,
+            "llm_provider": os.getenv("LLM_PROVIDER", ""),
+            "llm_model": os.getenv("LLM_MODEL", ""),
+            "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
+            "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
+            "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
+            "chunk_budget_tokens": chunk_window.resolve_chunk_budget(),
+        }
+        config_digest = sha256(
+            json.dumps(digest_fields, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return ProjectionRequest(
+            generation_id=generation_id or "citadel-default",
+            projection_version=projection_version or "lifecycle-v1:cognee-1.4.1",
+            config_digest=f"sha256:{config_digest}",
+            providers=providers,
+        )
+
+    @staticmethod
+    def _inline_projection_suppressed() -> bool:
+        return os.getenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _start_lifecycle_projection(self) -> bool:
+        if self.lifecycle_worker is None:
+            return False
+        task = self._lifecycle_projection_task
+        if task is not None and not task.done():
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error(
+                "lifecycle projection not started: no running event loop; "
+                "durable work will resume on server startup"
+            )
+            return False
+        self._lifecycle_projection_task = loop.create_task(self._drain_lifecycle())
+        return True
+
+    async def _drain_lifecycle(self) -> int:
+        if self.lifecycle_worker is None or self.lifecycle_store is None:
+            return 0
+        processed_count = 0
+        while True:
+            try:
+                processed = await self.lifecycle_worker.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("lifecycle projection failed and was rescheduled")
+                processed = False
+            if processed:
+                processed_count += 1
+                continue
+            delay = self.lifecycle_store.next_wakeup_delay(
+                generation_id=self.lifecycle_worker.generation_id,
+                projection_version=self.lifecycle_worker.projection_version,
+                config_digest=self.lifecycle_worker.config_digest,
+            )
+            if delay is None:
+                return processed_count
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    def resume_lifecycle_queue(self) -> bool:
+        """Resume durable projection jobs after process startup."""
+        return self._start_lifecycle_projection()
+
+    async def wait_for_lifecycle_idle(self) -> int:
+        """Wait until every due lifecycle job finishes or reaches a retry delay."""
+        if self.lifecycle_worker is None:
+            return 0
+        self._start_lifecycle_projection()
+        task = self._lifecycle_projection_task
+        if task is None:
+            return 0
+        return await task
+
+    async def wait_for_lifecycle_operation(
+        self,
+        projection_job_id: str,
+        *,
+        timeout_seconds: float = 120,
+        poll_seconds: float = 0.05,
+    ) -> dict[str, Any]:
+        """Wait for one accepted source to pass every backend read check."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        self._start_lifecycle_projection()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            operation = self.lifecycle_operation(projection_job_id)
+            state = str(operation["state"])
+            if state == "searchable":
+                return operation
+            if state in {"failed", "stale"}:
+                raise RuntimeError(
+                    f"projection operation {projection_job_id} reached {state}"
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"projection operation {projection_job_id} did not become searchable"
+                )
+            await asyncio.sleep(min(poll_seconds, remaining))
+
+    async def stop_lifecycle_queue(self) -> None:
+        task = self._lifecycle_projection_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+        """Return one bounded source-to-provider operation record."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        operation = self.lifecycle_store.get_operation(projection_job_id)
+        source = operation.source_revision
+        job = operation.job
+        return {
+            "schema_version": job.schema_version,
+            "projection_job_id": job.projection_job_id,
+            "source_revision_id": source.source_revision_id,
+            "dataset": job.dataset,
+            "state": operation.state,
+            "source_revision": {
+                "schema_version": source.schema_version,
+                "source_revision_id": source.source_revision_id,
+                "source_key": source.source_key,
+                "dataset": source.dataset,
+                "byte_length": source.byte_length,
+                "media_type": source.media_type,
+                "previous_revision_id": source.previous_revision_id,
+                "captured_at": source.captured_at,
+                "accepted_at": source.accepted_at,
+                "tombstone": source.tombstone,
+            },
+            "job": {
+                "schema_version": job.schema_version,
+                "projection_job_id": job.projection_job_id,
+                "source_revision_id": job.source_revision_id,
+                "generation_id": job.generation_id,
+                "dataset": job.dataset,
+                "projection_version": job.projection_version,
+                "state": job.state,
+                "attempt": job.attempt,
+                "created_at": job.created_at,
+                "updated_at": job.updated_at,
+                "last_error_code": job.last_error_code,
+            },
+            "receipts": [
+                {
+                    "schema_version": receipt.schema_version,
+                    "projection_receipt_id": receipt.projection_receipt_id,
+                    "projection_job_id": receipt.projection_job_id,
+                    "source_revision_id": receipt.source_revision_id,
+                    "generation_id": receipt.generation_id,
+                    "dataset": receipt.dataset,
+                    "backend": receipt.backend,
+                    "provider": receipt.provider,
+                    "projection_version": receipt.projection_version,
+                    "state": receipt.state,
+                    "attempt": receipt.attempt,
+                    "affected_count": receipt.affected_count,
+                    "model": receipt.model,
+                    "dimensions": receipt.dimensions,
+                    "created_at": receipt.created_at,
+                    "updated_at": receipt.updated_at,
+                    "completed_at": receipt.completed_at,
+                    "searchable_at": receipt.searchable_at,
+                    "error_code": receipt.error_code,
+                }
+                for receipt in operation.receipts
+            ],
+        }
+
+    def lifecycle_census(self) -> dict[str, Any]:
+        """Return exact SQLite lifecycle counts and state buckets."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request()
+        payload = asdict(self.lifecycle_store.census())
+        payload["current_generation"] = asdict(
+            self.lifecycle_store.generation_census(
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+                config_digest=projection.config_digest,
+            )
+        )
+        return payload
+
+    def lifecycle_current_head_evidence(
+        self,
+        *,
+        dataset: str,
+        source_keys: tuple[str, ...] | list[str],
+    ) -> dict[str, Any]:
+        """Return exact current-head evidence for the active projection identity."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request()
+        return asdict(
+            self.lifecycle_store.current_head_evidence(
+                dataset,
+                source_keys,
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+                config_digest=projection.config_digest,
+            )
+        )
+
+    def lifecycle_generation_census(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str,
+    ) -> dict[str, Any]:
+        """Return current-head projection counts for one target generation."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        projection = self._lifecycle_projection_request(
+            generation_id=generation_id,
+            projection_version=projection_version,
+        )
+        return asdict(
+            self.lifecycle_store.generation_census(
+                generation_id=generation_id,
+                projection_version=projection_version,
+                config_digest=projection.config_digest,
+            )
+        )
+
+    def queue_lifecycle_rebuild(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str | None = None,
+    ) -> tuple[str, ...]:
+        """Queue current source heads into an empty target generation."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        if not generation_id.strip():
+            raise ValueError("generation_id must be a non-empty string")
+        projection = self._lifecycle_projection_request(
+            generation_id=generation_id,
+            projection_version=projection_version,
+        )
+        operations = self.lifecycle_store.queue_generation_rebuild(projection)
+        if self.lifecycle_worker is not None and self.lifecycle_worker.matches_projection(
+            generation_id=projection.generation_id,
+            projection_version=projection.projection_version,
+            config_digest=projection.config_digest,
+        ):
+            self._start_lifecycle_projection()
+        return tuple(operation.job.projection_job_id for operation in operations)
 
     def _guard_content(self, data: str, dataset: str) -> None:
         """Block storing content that carries a blocking-severity secret.
@@ -235,15 +719,76 @@ class Citadel:
     ) -> list[Any]:
         top_k = min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
         target_dataset = dataset or self.config.default_dataset
+        provider_top_k = MAX_SEARCH_TOP_K if self.lifecycle_store is not None else top_k
+        recall_kwargs: dict[str, Any] = {}
+        if self.lifecycle_store is not None:
+            projection = self._lifecycle_projection_request()
+            recall_kwargs["document_ids"] = list(
+                self.lifecycle_store.searchable_source_revision_ids(
+                    dataset=target_dataset,
+                    generation_id=projection.generation_id,
+                    projection_version=projection.projection_version,
+                    config_digest=projection.config_digest,
+                )
+            )
         results = await self.cognee.recall(
             query,
             dataset=target_dataset,
             session_id=session_id or self._default_session_for_dataset(target_dataset),
-            top_k=top_k,
+            top_k=provider_top_k,
+            **recall_kwargs,
         )
+        results = [
+            {key: value for key, value in result.items() if key != "_lifecycle"}
+            if isinstance(result, dict)
+            else result
+            for result in results
+        ]
+        if self.lifecycle_store is not None:
+            results = self._filter_lifecycle_search_results(results)[:top_k]
         if results or target_dataset != self.config.github_sync_dataset:
             return results
         return search_github_sync_state(query, self.config, top_k=top_k)
+
+    def _filter_lifecycle_search_results(self, results: list[Any]) -> list[Any]:
+        """Require every lifecycle-mode hit to bind to a current receipt."""
+        if self.lifecycle_store is None:
+            return results
+        projection = self._lifecycle_projection_request()
+        filtered: list[Any] = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            document_id = result.get("document_id")
+            if not isinstance(document_id, str) or not document_id:
+                continue
+            binding = self.lifecycle_store.retrieval_binding(
+                document_id,
+                generation_id=projection.generation_id,
+                projection_version=projection.projection_version,
+                config_digest=projection.config_digest,
+            )
+            if binding is None:
+                continue
+            receipt = binding.receipt
+            if not binding.current or binding.source_revision.tombstone or receipt is None:
+                continue
+            filtered.append(
+                {
+                    **result,
+                    "_lifecycle": {
+                        "schema_version": receipt.schema_version,
+                        "source_revision_id": binding.source_revision.source_revision_id,
+                        "projection_receipt_id": receipt.projection_receipt_id,
+                        "generation_id": receipt.generation_id,
+                        "backend": receipt.backend,
+                        "provider": receipt.provider,
+                        "projection_version": receipt.projection_version,
+                        "state": receipt.state,
+                    },
+                }
+            )
+        return filtered
 
     async def feedback(self, request: FeedbackRequest) -> FeedbackResult:
         session_id = request.session_id or self.config.default_session

@@ -60,6 +60,7 @@ from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
+from kb.lifecycle import LifecycleNotFoundError
 from kb.session_trace import enrich_shared_trace, force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
@@ -79,10 +80,10 @@ from kb.promotion_queue import (
     REJECTED_STATUS,
     scan_candidate,
 )
+from kb.qdrant_adapter import QdrantProviderError
 from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
-    CODE_TIMEOUT,
     DOC_TYPE_CANONICAL,
     DOC_TYPE_TRACE,
     NO_LEXICAL_MATCH_WARNING,
@@ -226,8 +227,8 @@ async def _search_within_budget(
 ) -> tuple[list[tuple[str, Any]], bool]:
     """Run search_across_datasets under the per-request time budget (#44).
 
-    Returns (merged, timed_out). On timeout, degrade to empty-fast rather than
-    hanging for 100s+ on a slow cognee recall.
+    Returns (merged, timed_out). The HTTP boundary turns ``timed_out`` into a
+    typed 504 instead of misreporting an incomplete provider call as empty.
     """
     try:
         merged = await asyncio.wait_for(
@@ -385,8 +386,19 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("Evolve scheduler: cognify failed")
+            # A crash in the cognify pass is precisely the failure #27's canary
+            # exists to surface. Recording only clean passes above would leave
+            # the previous verdict standing, so /readyz would read GREEN through
+            # the exact break it is meant to catch. Stamp it unhealthy.
+            _LAST_CANARY = {
+                "ok": False,
+                "search_hit": None,
+                "graph_grew": None,
+                "marker": None,
+                "error": exc.__class__.__name__,
+            }
         finally:
             # Stamp the pass even when a stage failed. This records that the
             # cycle RAN, which is what the next boot needs to resume the
@@ -487,8 +499,22 @@ def _start_cognify_queue() -> None:
         resume()
 
 
+def _start_lifecycle_queue() -> None:
+    resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
+    if callable(resume):
+        resume()
+
+
 async def _stop_cognify_queue() -> None:
     stop = getattr(getattr(get_citadel(), "cognee", None), "stop_cognify_queue", None)
+    if callable(stop):
+        result = stop()
+        if isawaitable(result):
+            _ = await result
+
+
+async def _stop_lifecycle_queue() -> None:
+    stop = getattr(get_citadel(), "stop_lifecycle_queue", None)
     if callable(stop):
         result = stop()
         if isawaitable(result):
@@ -546,11 +572,13 @@ async def lifespan(app: FastAPI) -> Any:
                 "may still fail every search (#147)"
             )
         _start_cognify_queue()
+        _start_lifecycle_queue()
         evolve_task = _start_evolve_scheduler()
         repo_stats_task = _start_repo_stats_scheduler()
         try:
             yield
         finally:
+            await _stop_lifecycle_queue()
             await _stop_cognify_queue()
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
@@ -2139,6 +2167,11 @@ async def execute_learning_writes(
     detect_conflicts: bool = True,
     run_improve: bool = False,
     defer_cognify: bool = False,
+    source_key: str | None = None,
+    source_locator: str | None = None,
+    media_type: str = "text/plain",
+    capture_actor_id: str | None = None,
+    capture_run_id: str | None = None,
 ) -> tuple[LearningOutcome, list[LearningOutcome]]:
     outcomes: list[LearningOutcome] = []
     primary: LearningOutcome | None = None
@@ -2153,6 +2186,16 @@ async def execute_learning_writes(
             "tier": target.tier,
             "defer_cognify": defer_cognify,
         }
+        if source_key is not None:
+            learn_kwargs["source_key"] = source_key
+        if source_locator is not None:
+            learn_kwargs["source_locator"] = source_locator
+        if media_type != "text/plain":
+            learn_kwargs["media_type"] = media_type
+        if capture_actor_id is not None:
+            learn_kwargs["capture_actor_id"] = capture_actor_id
+        if capture_run_id is not None:
+            learn_kwargs["capture_run_id"] = capture_run_id
         if attestation is not None:
             learn_kwargs["attestation"] = attestation
         outcome = await learning.learn(data, **learn_kwargs)
@@ -2512,11 +2555,6 @@ def enforce_ingest_size(text: str) -> None:
         )
 
 
-SESSION_TRACES_BOOTSTRAP_MARKER = (
-    "Citadel bootstrap marker for the shared session-traces dataset (ADR-0011)."
-)
-
-
 async def ensure_session_traces_dataset(citadel: Citadel) -> None:
     """Ensure the Cognee dataset exists before seat search/share include it.
 
@@ -2525,37 +2563,9 @@ async def ensure_session_traces_dataset(citadel: Citadel) -> None:
     A missing dataset makes Cognee search fail with DatasetNotFoundError and
     share_session partial_write_failure on the shared tier.
     """
-    try:
-        from cognee import datasets as cognee_datasets
-
-        existing = await cognee_datasets.list_datasets()
-        names = {
-            str(getattr(item, "name", "") or "").strip()
-            for item in existing
-        }
-        if SESSION_TRACES_DATASET in names:
-            return
-    except Exception:
-        logger.debug(
-            "Could not list Cognee datasets before %s bootstrap; ingesting marker",
-            SESSION_TRACES_DATASET,
-            exc_info=True,
-        )
-
-    result = await citadel.ingest(
-        SESSION_TRACES_BOOTSTRAP_MARKER,
-        dataset=SESSION_TRACES_DATASET,
-        tags=["citadel-bootstrap", "shared-session-traces"],
-        defer_cognify=True,
-    )
-    if result.accepted:
-        logger.info("Bootstrapped Cognee dataset %s", SESSION_TRACES_DATASET)
-    else:
-        logger.warning(
-            "Bootstrap ingest for %s was not accepted: %s",
-            SESSION_TRACES_DATASET,
-            result.reason,
-        )
+    created = await citadel.cognee.ensure_dataset(SESSION_TRACES_DATASET)
+    if created:
+        logger.info("Provisioned Cognee dataset %s", SESSION_TRACES_DATASET)
 
 
 async def backfill_seat_datasets(citadel: Citadel, store: AccessStore) -> dict[str, int]:
@@ -2802,6 +2812,9 @@ def with_result_metadata(
     """
     if not isinstance(result, dict):
         return result
+    lifecycle = result.get("_lifecycle")
+    if isinstance(lifecycle, dict):
+        result = {key: value for key, value in result.items() if key != "_lifecycle"}
     # Set when this hit is the Node-side copy of a volunteered session trace that
     # won dedup against the shared one (search_across_datasets). Strip it before
     # hashing so the content hash stays stable across both copies.
@@ -2833,6 +2846,23 @@ def with_result_metadata(
             "document_drilldown_available": drilldown_available,
         },
     }
+    if isinstance(lifecycle, dict):
+        source_revision_id = first_string(lifecycle.get("source_revision_id"))
+        projection_receipt_id = first_string(lifecycle.get("projection_receipt_id"))
+        if source_revision_id and projection_receipt_id:
+            metadata["source_revision_id"] = source_revision_id
+            metadata["projection_receipt_id"] = projection_receipt_id
+            metadata["projection"] = {
+                key: lifecycle[key]
+                for key in (
+                    "generation_id",
+                    "backend",
+                    "provider",
+                    "projection_version",
+                    "state",
+                )
+                if key in lifecycle
+            }
     if drilldown_available:
         metadata["document_endpoint"] = document_endpoint
     if query is not None:
@@ -3823,7 +3853,37 @@ async def corpus_census(
         try:
             graph_presence_read = getattr(cognee_client, "corpus_graph_presence", None)
             if callable(graph_presence_read):
-                in_graph_ids = await graph_presence_read(document_ids)
+                if not document_ids:
+                    in_graph_ids = set()
+                else:
+                    ids_by_dataset: dict[str, list[str]] = {}
+                    for row in rows:
+                        row_id = str(row.get("id") or "")
+                        if not row_id:
+                            continue
+                        datasets = row.get("datasets")
+                        if not isinstance(datasets, list):
+                            continue
+                        for dataset in datasets:
+                            dataset_name = str(dataset).strip()
+                            if dataset_name:
+                                ids_by_dataset.setdefault(dataset_name, []).append(
+                                    row_id
+                                )
+                    if ids_by_dataset:
+                        measured_graph_ids: set[str] | None = set()
+                        for dataset in sorted(ids_by_dataset):
+                            scoped_ids = await graph_presence_read(
+                                ids_by_dataset[dataset],
+                                datasets=[dataset],
+                            )
+                            if scoped_ids is None:
+                                measured_graph_ids = None
+                                break
+                            measured_graph_ids.update(
+                                str(document_id) for document_id in scoped_ids
+                            )
+                        in_graph_ids = measured_graph_ids
         except Exception:  # noqa: BLE001 - degrade to "not measured", never to 0
             logger.exception("corpus census: graph presence lookup failed")
         if in_graph_ids is None:
@@ -4285,6 +4345,57 @@ async def healthz() -> dict[str, str | bool]:
     return {"ok": True, "service": "citadel"}
 
 
+def lifecycle_health(citadel: Any) -> dict[str, Any]:
+    """Return a no-content lifecycle census plus relational invariant checks."""
+    if not citadel.config.lifecycle_enabled:
+        return {"enabled": False, "ok": True}
+    try:
+        census = citadel.lifecycle_census()
+    except Exception as exc:  # noqa: BLE001 - readiness reports typed failure
+        return {
+            "enabled": True,
+            "ok": False,
+            "error_type": exc.__class__.__name__,
+        }
+    source_revisions = int(census.get("source_revisions", 0))
+    projection_jobs = int(census.get("projection_jobs", 0))
+    projection_receipts = int(census.get("projection_receipts", 0))
+    failed_jobs = int((census.get("job_states") or {}).get("failed", 0))
+    failed_receipts = int((census.get("receipt_states") or {}).get("failed", 0))
+    invariant_errors: list[str] = []
+    if projection_jobs < source_revisions:
+        invariant_errors.append("source_revision_without_projection_job")
+    if projection_receipts != projection_jobs * 3:
+        invariant_errors.append("projection_receipt_census_mismatch")
+    current_generation = census.get("current_generation")
+    if isinstance(current_generation, dict):
+        current_sources = int(current_generation.get("current_sources", 0))
+        current_jobs = int(
+            current_generation.get("current_projection_jobs", 0)
+        )
+        current_receipts = int(
+            current_generation.get("current_projection_receipts", 0)
+        )
+        if current_jobs != current_sources:
+            invariant_errors.append("current_generation_job_census_mismatch")
+        if current_receipts != current_jobs * 3:
+            invariant_errors.append("current_generation_receipt_census_mismatch")
+        receipts_by_backend = current_generation.get("current_receipts_by_backend")
+        if not isinstance(receipts_by_backend, dict) or any(
+            int(receipts_by_backend.get(backend, 0)) != current_jobs
+            for backend in ("relational", "vector", "graph")
+        ):
+            invariant_errors.append("current_generation_backend_census_mismatch")
+    if failed_jobs or failed_receipts:
+        invariant_errors.append("failed_projection")
+    return {
+        "enabled": True,
+        "ok": not invariant_errors,
+        **census,
+        "invariant_errors": invariant_errors,
+    }
+
+
 @app.get("/api/state")
 async def public_state(request: Request, response: Response) -> dict[str, Any]:
     """Public, no-secrets snapshot for the /info page — safe aggregates only.
@@ -4359,6 +4470,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         }
 
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
+    lifecycle = lifecycle_health(get_citadel())
     return {
         "ok": True,
         "service": "Citadel Archive",
@@ -4372,6 +4484,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             "github_repositories": int(gh.get("tracked_repositories", 0) or 0) if gh else 0,
             "linear_issues": int(ln.get("issue_count", 0) or 0) if ln else 0,
         },
+        "lifecycle": lifecycle,
         "repo": repo_block,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -4698,8 +4811,13 @@ async def readyz(request: Request) -> Any:
     config = get_citadel().config
     corpus = await _corpus_health()
     canary = _LAST_CANARY
+    lifecycle = lifecycle_health(get_citadel())
     # RED when the corpus gate trips or the last end-to-end canary failed.
-    ok = corpus["ok"] and (canary is None or bool(canary.get("ok", True)))
+    ok = (
+        corpus["ok"]
+        and lifecycle["ok"]
+        and (canary is None or bool(canary.get("ok", True)))
+    )
     payload = {
         "ok": ok,
         "service": "citadel",
@@ -4708,6 +4826,7 @@ async def readyz(request: Request) -> Any:
         "auto_improve": config.auto_improve,
         "build_global_context_index": config.build_global_context_index,
         "corpus": corpus,
+        "lifecycle": lifecycle,
         "canary": canary,
     }
     return JSONResponse(payload, status_code=200 if ok else 503)
@@ -5447,8 +5566,6 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
     ingest_results: list[dict[str, Any]] = []
     written_datasets: set[str] = set()
     for accepted in result["accepted"]:
-        if accepted.get("deleted"):
-            continue
         source_document = documents_by_path.get(accepted["path"])
         if not source_document:
             continue
@@ -5462,6 +5579,30 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
             document_tags,
             citadel.config,
         )
+        if accepted.get("deleted"):
+            for target in document_targets:
+                tombstones = await citadel.tombstone_source(
+                    dataset=target.dataset,
+                    source_key=f"obsidian:{body.vault_id}:{accepted['path']}",
+                    reason="Obsidian note deleted",
+                    source_locator=f"obsidian://{body.vault_id}/{accepted['path']}",
+                    capture_actor_id=actor.actor_id,
+                    capture_run_id=push_session_id,
+                )
+                ingest_results.append(
+                    {
+                        "document_id": accepted["document_id"],
+                        "accepted": True,
+                        "reason": (
+                            "queued_not_confirmed" if tombstones else "already_absent"
+                        ),
+                        "dataset": target.dataset,
+                        "tags": list(document_tags),
+                    }
+                )
+                if tombstones:
+                    written_datasets.add(target.dataset)
+            continue
         # Enforce the same byte cap as /ingest and /api/contribute on the per-document
         # obsidian write path (#51): an oversized note is rejected individually so it
         # cannot bloat the index, without failing the rest of the vault sync.
@@ -5486,6 +5627,11 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
                 tags=document_tags,
                 session_id=push_session_id,
                 operation="obsidian_sync",
+                source_key=f"obsidian:{body.vault_id}:{accepted['path']}",
+                source_locator=f"obsidian://{body.vault_id}/{accepted['path']}",
+                media_type="text/markdown",
+                capture_actor_id=actor.actor_id,
+                capture_run_id=push_session_id,
                 detect_conflicts=False,
             )
         except SecretContentError as exc:
@@ -6367,6 +6513,8 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             tags=body.tags,
             session_id=session_id,
             operation="ingest",
+            capture_actor_id=actor.actor_id,
+            capture_run_id=session_id,
         )
     except SecretContentError as exc:
         get_access_store().record_event(
@@ -6446,12 +6594,39 @@ async def ingest(body: IngestBody, request: Request) -> Any:
     # The write already succeeded; a cognify failure must NOT fail the ingest.
     if body.cognify and result.accepted:
         try:
-            await citadel.cognify_dataset(dataset=outcome.dataset)
-            payload["cognified"] = True
+            if result.projection_job_id:
+                operation = await citadel.wait_for_lifecycle_operation(
+                    result.projection_job_id
+                )
+                payload["projection_state"] = operation["state"]
+                payload["cognified"] = operation["state"] == "searchable"
+            else:
+                await citadel.cognify_dataset(dataset=outcome.dataset)
+                payload["cognified"] = True
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee state
             logger.error("inline cognify after ingest failed: %s", exc.__class__.__name__)
             payload["cognified"] = False
     return payload
+
+
+@app.get("/api/operations/{projection_job_id}")
+async def projection_operation(projection_job_id: str, request: Request) -> Any:
+    identity = require_access(request, "reader", "kb:read")
+    try:
+        payload = get_citadel().lifecycle_operation(projection_job_id)
+    except (LifecycleNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail="Projection operation not found.") from exc
+    dataset = payload.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise HTTPException(status_code=500, detail="Projection operation has no dataset.")
+    try:
+        enforce_dataset_allowlist(identity, dataset)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Projection operation not found.",
+        ) from exc
+    return jsonable_encoder(payload)
 
 
 @app.post("/api/share-session")
@@ -6495,6 +6670,8 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             tags=tags,
             session_id=session_id,
             operation="share_session",
+            capture_actor_id=actor.actor_id,
+            capture_run_id=session_id,
             detect_conflicts=False,
             defer_cognify=True,
         )
@@ -6543,12 +6720,23 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             for target, item in zip(write_targets, all_outcomes, strict=True)
             if not item.ingest.accepted
         ]
+    operations = [
+        {
+            "dataset": item.ingest.dataset,
+            "accepted": item.ingest.accepted,
+            "source_revision_id": item.ingest.source_revision_id,
+            "projection_job_id": item.ingest.projection_job_id,
+            "projection_state": item.ingest.projection_state,
+        }
+        for item in all_outcomes
+    ]
     if failed_targets:
         failure_detail = {
             "operation": "share_session",
             "error_type": "partial_write_failure",
             "failed_targets": failed_targets,
             "write_targets": [target.dataset for target in write_targets],
+            "operations": operations,
             "retried": True,
         }
         record_mcp_audit(
@@ -6582,11 +6770,18 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         if item.ingest.accepted
     ]
     cognify_queued = False
-    if cognify_datasets:
+    lifecycle_queued = bool(
+        cognify_datasets and getattr(citadel, "lifecycle_store", None) is not None
+    )
+    if cognify_datasets and not lifecycle_queued:
         cognify_queued = citadel.cognee.schedule_cognify(
             list(dict.fromkeys(cognify_datasets))
         )
-    cognify_state = "deferred" if cognify_queued else "not_scheduled"
+    if lifecycle_queued:
+        cognify_state = "queued_not_confirmed"
+    else:
+        cognify_state = "deferred" if cognify_queued else "not_scheduled"
+    accepted = all(item.ingest.accepted for item in all_outcomes)
 
     record_mcp_audit(
         request,
@@ -6595,7 +6790,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         dataset=SESSION_TRACES_DATASET,
         detail={
             "operation": "share_session",
-            "accepted": outcome.ingest.accepted,
+            "accepted": accepted,
             "write_targets": [target.dataset for target in write_targets],
             "has_tool_errors": body.has_tool_errors,
             "cognify": cognify_state,
@@ -6607,6 +6802,7 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
         success=True,
         dataset=SESSION_TRACES_DATASET,
         detail={
+            "accepted": accepted,
             "write_targets": [target.dataset for target in write_targets],
             "author_seat": actor.seat_slug,
             "cognify": cognify_state,
@@ -6615,12 +6811,15 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
     return jsonable_encoder(
         {
             "ok": True,
-            "accepted": outcome.ingest.accepted,
+            "accepted": accepted,
             "dataset": SESSION_TRACES_DATASET,
             "write_targets": [target.dataset for target in write_targets],
+            "operations": operations,
             "cognify": cognify_state,
             "message": (
-                "Shared Session Trace accepted; searchable after coalesced cognify."
+                "Shared Session Trace accepted; lifecycle projection queued."
+                if lifecycle_queued
+                else "Shared Session Trace accepted; searchable after coalesced cognify."
                 if cognify_queued
                 else "Shared Session Trace accepted, but indexing was not scheduled."
             ),
@@ -6718,6 +6917,18 @@ async def contribute(body: ContributeBody, request: Request) -> Any:
             tags=contribution_tags,
             session_id=None,
             operation="contribute",
+            source_key=(
+                f"contribution:{body.source_url.strip()}"
+                if body.source_url and body.source_url.strip()
+                else None
+            ),
+            source_locator=(
+                body.source_url.strip()
+                if body.source_url and body.source_url.strip()
+                else None
+            ),
+            media_type="text/markdown",
+            capture_actor_id=actor.actor_id,
             run_improve=citadel.config.contribute_run_improve,
         )
     except SecretContentError as exc:
@@ -6875,9 +7086,36 @@ async def knowledge(
                 sessions=search_sessions,
                 top_k=limit,
             )
+        except QdrantProviderError as exc:
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error="Qdrant unavailable",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "QDRANT_UNAVAILABLE",
+                    "message": "Qdrant is unavailable.",
+                },
+            ) from exc
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            safe_error = redact_secrets(str(exc))
+            await mesh_state.record_error(citadel.config, operation="search", error=safe_error)
+            raise HTTPException(status_code=500, detail=safe_error) from exc
+    if timed_out:
+        await mesh_state.record_error(
+            citadel.config,
+            operation="search",
+            error="search budget exceeded",
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "SEARCH_TIMEOUT",
+                "message": "Search exceeded the configured server budget.",
+            },
+        )
     latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset, _ in merged:
         await mesh_state.record_search(
@@ -6990,8 +7228,35 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 sessions=search_sessions,
                 top_k=fetch_k,
             )
+        except QdrantProviderError as exc:
+            await mesh_state.record_error(
+                citadel.config,
+                operation="search",
+                error="Qdrant unavailable",
+            )
+            record_mcp_audit(
+                request,
+                actor=actor,
+                success=False,
+                dataset=search_datasets[0],
+                detail={
+                    "operation": "search",
+                    "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+                    "query_length": len(body.query),
+                    "error_type": exc.__class__.__name__,
+                    "code": "QDRANT_UNAVAILABLE",
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "QDRANT_UNAVAILABLE",
+                    "message": "Qdrant is unavailable.",
+                },
+            ) from exc
         except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-            await mesh_state.record_error(citadel.config, operation="search", error=str(exc))
+            safe_error = redact_secrets(str(exc))
+            await mesh_state.record_error(citadel.config, operation="search", error=safe_error)
             record_mcp_audit(
                 request,
                 actor=actor,
@@ -7004,10 +7269,36 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                     "error_type": exc.__class__.__name__,
                 },
             )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=safe_error) from exc
     if timed_out:
         await mesh_state.record_error(
             citadel.config, operation="search", error="search budget exceeded"
+        )
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        record_mcp_audit(
+            request,
+            actor=actor,
+            success=False,
+            dataset=search_datasets[0],
+            detail={
+                "operation": "search",
+                "query_sha256": hashlib.sha256(body.query.encode("utf-8")).hexdigest(),
+                "query_length": len(body.query),
+                "result_count": 0,
+                "top_k": body.top_k,
+                "datasets": search_datasets,
+                "scope_override": scope_override_active(actor, search_datasets),
+                "latency_ms": round(latency_ms, 1),
+                "timed_out": True,
+                "code": "SEARCH_TIMEOUT",
+            },
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "SEARCH_TIMEOUT",
+                "message": "Search exceeded the configured server budget.",
+            },
         )
 
     # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
@@ -7162,12 +7453,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     record_mcp_audit(
         request,
         actor=actor,
-        # A search that blew its budget returned empty-fast; the caller got no
-        # hits. Recording it as a success meant /api/audit?view=failures never
-        # showed it and any success-rate metric read 100% while users saw
-        # nothing — which is how the "~20% silent failure" in #50 stayed
-        # unquantified. The detail dict already carried timed_out; nothing read it.
-        success=not timed_out,
+        success=True,
         dataset=search_datasets[0],
         detail=audit_detail,
     )
@@ -7233,15 +7519,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
-    if timed_out:
-        payload["note"] = (
-            f"Search exceeded the {citadel.config.search_timeout_seconds:.0f}s budget; "
-            "returning truncated results — retry or narrow the query."
-        )
-        payload["timed_out"] = True
-        payload["truncated"] = True
-        payload["code"] = CODE_TIMEOUT
-    elif not normalized and body.dataset is None and (
+    if not normalized and body.dataset is None and (
         not filters_active or candidates_fetched == 0
     ):
         # With filters active this fires only when retrieval itself came back

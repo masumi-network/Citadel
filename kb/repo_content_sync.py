@@ -721,6 +721,7 @@ class RepoContentSyncer:
         ingested_files = 0
         skipped_files = 0
         blocked_files = 0
+        tombstoned_files = 0
         improved = False
         skip_totals: dict[str, int] = {}
         blocked_reasons: dict[str, int] = {}
@@ -765,6 +766,7 @@ class RepoContentSyncer:
                 "skipped": 0,
                 "skipped_reasons": {},
                 "blocked": 0,
+                "tombstoned": 0,
                 "blocked_paths": [],
                 "errors": [],
             }
@@ -799,6 +801,46 @@ class RepoContentSyncer:
                 repo_result["paths_discovered"] = len(paths)
                 repo_result["ref"] = ref
 
+                if not dry_run and getattr(self.citadel, "lifecycle_store", None) is not None:
+                    repo_prefix = f"{full_name}/"
+                    discovered_keys = {f"{full_name}/{path}" for path in paths}
+                    missing_tracked_keys = sorted(
+                        key
+                        for key in tracked
+                        if key.startswith(repo_prefix) and key not in discovered_keys
+                    )
+                    for key in missing_tracked_keys:
+                        path = key[len(repo_prefix) :]
+                        try:
+                            still_exists = await asyncio.to_thread(
+                                self.client.file_exists,
+                                full_name,
+                                path,
+                                ref=ref,
+                            )
+                        except GitHubAPIError as exc:
+                            repo_result["errors"].append(
+                                {"path": path, "error": str(exc)[:200]}
+                            )
+                            continue
+                        if still_exists:
+                            continue
+                        tombstones = await self.citadel.tombstone_source(
+                            dataset=self.config.repo_content_sync_dataset,
+                            source_key=f"github:{full_name}:path:{path}",
+                            reason="GitHub repository path deleted",
+                            source_locator=(
+                                f"https://github.com/{full_name}/blob/{ref}/{path}"
+                            ),
+                            capture_actor_id="github-repo-content-sync",
+                            capture_run_id=checked_at,
+                        )
+                        if tombstones:
+                            tombstoned_files += 1
+                            repo_result["tombstoned"] += 1
+                            tracked.pop(key, None)
+                            _checkpoint(tracked)
+
                 for path in paths:
                     key = f"{full_name}/{path}"
                     try:
@@ -816,6 +858,49 @@ class RepoContentSyncer:
                         continue
 
                     previous = tracked.get(key) if isinstance(tracked.get(key), dict) else {}
+                    same_source = (
+                        not force
+                        and previous.get("sha") == file.sha
+                        and previous.get("content_hash") == file.content_hash
+                    )
+                    projection_job_ids = previous.get("projection_job_ids")
+                    lifecycle_operation = getattr(
+                        self.citadel,
+                        "lifecycle_operation",
+                        None,
+                    )
+                    if (
+                        same_source
+                        and isinstance(projection_job_ids, list)
+                        and projection_job_ids
+                        and callable(lifecycle_operation)
+                    ):
+                        try:
+                            operations = [
+                                lifecycle_operation(str(job_id))
+                                for job_id in projection_job_ids
+                            ]
+                        except Exception:  # noqa: BLE001 - retry source path below
+                            operations = []
+                        states = {
+                            str(operation.get("state"))
+                            for operation in operations
+                            if isinstance(operation, dict)
+                        }
+                        if operations and states == {"searchable"}:
+                            previous["projection_status"] = "searchable"
+                            previous["cognee_data_ids"] = [
+                                str(operation["source_revision_id"])
+                                for operation in operations
+                            ]
+                            tracked[key] = previous
+                            _checkpoint(tracked)
+                        elif operations and states <= {"pending", "running", "completed"}:
+                            resume = getattr(self.citadel, "resume_lifecycle_queue", None)
+                            if callable(resume):
+                                resume()
+                            _record_skip(repo_result, "projection_pending")
+                            continue
                     # An entry must also carry the id cognee assigned. Without
                     # it, "unchanged" only means "we told ourselves we ingested
                     # this", which is exactly how 12 files stayed permanently
@@ -964,6 +1049,15 @@ class RepoContentSyncer:
                             full_name.split("/")[-1],
                             Path(path).suffix.lstrip(".") or "text",
                         ],
+                        source_key=f"github:{full_name}:path:{path}",
+                        source_locator=file.html_url,
+                        media_type=(
+                            "text/markdown"
+                            if Path(path).suffix.lower() in {".md", ".mdx"}
+                            else "text/plain"
+                        ),
+                        capture_actor_id="github-repo-content-sync",
+                        capture_run_id=checked_at,
                         operation="repo_content_sync",
                         # Improve ONCE after the whole sync, not per file. See
                         # LearningProcess.improve_once for why.
@@ -997,6 +1091,20 @@ class RepoContentSyncer:
                             # unchanged before indexing is confirmed.
                             tracked_entry["projection_status"] = "pending"
                             tracked_entry["projection_reason"] = "+".join(pending_reasons)
+                            projection_ids = [
+                                result.projection_job_id
+                                for result in accepted_results
+                                if result.projection_job_id
+                            ]
+                            source_revision_ids = [
+                                result.source_revision_id
+                                for result in accepted_results
+                                if result.source_revision_id
+                            ]
+                            if projection_ids:
+                                tracked_entry["projection_job_ids"] = projection_ids
+                            if source_revision_ids:
+                                tracked_entry["source_revision_ids"] = source_revision_ids
                         else:
                             # What cognee actually assigned. Stored so a later
                             # run can check its own claim against the index; a
@@ -1096,6 +1204,7 @@ class RepoContentSyncer:
             "repos_scanned": len(repo_results),
             "repos_errored": len(repos_errored),
             "files_ingested": ingested_files,
+            "files_tombstoned": tombstoned_files,
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_blocked": blocked_files,

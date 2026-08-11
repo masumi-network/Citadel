@@ -41,6 +41,40 @@ class FakeCitadel:
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
 
+    async def tombstone_source(self, **kwargs: Any) -> tuple[IngestResult, ...]:
+        calls = getattr(self, "tombstone_calls", None)
+        if calls is None:
+            calls = []
+            self.tombstone_calls = calls
+        calls.append(kwargs)
+        return (
+            IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"],
+                (),
+                source_revision_id="tombstone-source",
+                projection_job_id="tombstone-job",
+                projection_state="pending",
+            ),
+        )
+
+    def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+        if projection_job_id not in {"job-1", "job-seat"}:
+            raise KeyError(projection_job_id)
+        return {
+            "schema_version": 1,
+            "projection_job_id": projection_job_id,
+            "source_revision_id": "source-1",
+            "dataset": "seat:alice" if projection_job_id == "job-seat" else "notes",
+            "state": "searchable",
+            "receipts": [
+                {"backend": "relational", "provider": "sqlite", "state": "searchable"},
+                {"backend": "vector", "provider": "qdrant", "state": "searchable"},
+                {"backend": "graph", "provider": "ladybug", "state": "searchable"},
+            ],
+        }
+
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
 
@@ -369,6 +403,141 @@ def test_public_state_uses_the_package_source_version() -> None:
     response = client.get("/api/state")
     assert response.status_code == 200
     assert response.json()["version"] == server_module._SERVICE_VERSION
+
+
+def test_public_state_and_readyz_report_lifecycle_census(
+    monkeypatch: Any,
+) -> None:
+    class LifecycleStateCitadel(FakeCitadel):
+        config = CitadelConfig(
+            tenant_id="test",
+            default_dataset="notes",
+            admin_key="test-admin",
+            reader_keys=("test-reader",),
+            lifecycle_enabled=True,
+        )
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 4,
+                "current_sources": 3,
+                "retained_bytes": 120,
+                "projection_jobs": 4,
+                "projection_receipts": 12,
+                "job_states": {"completed": 3, "pending": 1},
+                "receipt_states": {"searchable": 9, "pending": 3},
+                "current_generation": {
+                    "generation_id": "generation-1",
+                    "projection_version": "projection-v1",
+                    "current_sources": 3,
+                    "current_projection_jobs": 3,
+                    "current_projection_receipts": 9,
+                    "current_receipts_by_backend": {
+                        "graph": 3,
+                        "relational": 3,
+                        "vector": 3,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 2,
+                        "relational": 3,
+                        "vector": 2,
+                    },
+                },
+            }
+
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    client = authed_client("test-reader")
+    app.state.citadel = LifecycleStateCitadel()
+    monkeypatch.setattr(server_module, "_corpus_health", healthy_corpus)
+
+    state = client.get("/api/state")
+    ready = client.get("/readyz")
+
+    assert state.status_code == 200
+    assert state.json()["lifecycle"]["source_revisions"] == 4
+    assert state.json()["lifecycle"]["ok"] is True
+    assert ready.status_code == 200
+    assert ready.json()["lifecycle"]["projection_receipts"] == 12
+
+
+def test_lifecycle_health_rejects_incomplete_current_generation() -> None:
+    class IncompleteGenerationCitadel(FakeCitadel):
+        config = CitadelConfig(lifecycle_enabled=True)
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 2,
+                "current_sources": 2,
+                "retained_bytes": 20,
+                "projection_jobs": 2,
+                "projection_receipts": 6,
+                "job_states": {"completed": 2},
+                "receipt_states": {"searchable": 6},
+                "current_generation": {
+                    "generation_id": "generation-2",
+                    "projection_version": "projection-v1",
+                    "current_sources": 2,
+                    "current_projection_jobs": 1,
+                    "current_projection_receipts": 3,
+                    "current_receipts_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                },
+            }
+
+    health = server_module.lifecycle_health(IncompleteGenerationCitadel())
+
+    assert health["ok"] is False
+    assert "current_generation_job_census_mismatch" in health["invariant_errors"]
+
+
+def test_projection_operation_status_returns_bounded_backend_receipts() -> None:
+    client = authed_client("test-reader")
+
+    response = client.get("/api/operations/job-1")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "projection_job_id": "job-1",
+        "source_revision_id": "source-1",
+        "dataset": "notes",
+        "state": "searchable",
+        "receipts": [
+            {"backend": "relational", "provider": "sqlite", "state": "searchable"},
+            {"backend": "vector", "provider": "qdrant", "state": "searchable"},
+            {"backend": "graph", "provider": "ladybug", "state": "searchable"},
+        ],
+    }
+
+
+def test_projection_operation_status_enforces_private_dataset_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = authed_client("test-reader")
+    monkeypatch.setattr(
+        server_module,
+        "require_access",
+        lambda *_args, **_kwargs: AccessIdentity(
+            role="reader",
+            actor_id="reader-1",
+            actor_kind="service",
+            actor_name="reader",
+            source="store",
+            scopes=("kb:read",),
+            allowed_datasets=("notes",),
+        ),
+    )
+    assert reader.get("/api/operations/job-seat").status_code == 404
 
 
 def test_public_state_and_discovery_share_deployment_identity() -> None:
@@ -1367,6 +1536,47 @@ def test_ingest_inline_cognify_flag() -> None:
     assert with_cognify.json()["cognified"] is True
 
 
+def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
+    class LifecycleCitadel(FakeCitadel):
+        legacy_cognify_calls = 0
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"] or "notes",
+                tuple(kwargs["tags"]),
+                source_revision_id="source-1",
+                projection_job_id="job-1",
+                projection_state="pending",
+            )
+
+        async def wait_for_lifecycle_operation(
+            self,
+            projection_job_id: str,
+        ) -> dict[str, Any]:
+            assert projection_job_id == "job-1"
+            return {"projection_job_id": projection_job_id, "state": "searchable"}
+
+        async def cognify_dataset(self, **kwargs: Any) -> dict[str, Any]:
+            self.legacy_cognify_calls += 1
+            return {"ok": True}
+
+    client = authed_client()
+    citadel = LifecycleCitadel()
+    app.state.citadel = citadel
+
+    response = client.post(
+        "/ingest",
+        json={"data": "lifecycle note", "tags": [], "cognify": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cognified"] is True
+    assert response.json()["projection_state"] == "searchable"
+    assert citadel.legacy_cognify_calls == 0
+
+
 def test_ingest_and_contribute_reject_oversized_payloads(monkeypatch: Any) -> None:
     monkeypatch.setenv("CITADEL_MCP_MAX_INGEST_BYTES", "16")
     client = authed_client()
@@ -2302,6 +2512,7 @@ def test_backup_mirror_status_and_run_are_admin_scoped(tmp_path: Any) -> None:
         access_store_path=str(tmp_path / "access.json"),
         obsidian_sync_state_path=str(tmp_path / "obsidian.json"),
         github_sync_state_path=str(tmp_path / "github.json"),
+        lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
         backup_mirror_root_path=str(tmp_path / "mirror"),
         backup_mirror_enabled=False,
     )
@@ -2488,6 +2699,47 @@ def test_obsidian_vault_sync_registers_pushes_pulls_and_lists_sources(tmp_path: 
         },
     )
     assert rejected.status_code == 403
+
+
+def test_obsidian_delete_tombstones_lifecycle_source(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    client = authed_client("test-writer")
+    citadel = app.state.citadel
+    vault_id = client.post(
+        "/api/obsidian/vaults",
+        json={"vault_name": "Delete Vault"},
+    ).json()["vault"]["id"]
+    first = client.post(
+        "/api/obsidian/sync/push",
+        json={
+            "vault_id": vault_id,
+            "dataset": "notes",
+            "documents": [{"path": "Old.md", "content": "old body"}],
+        },
+    )
+    revision = first.json()["accepted"][0]["rev"]
+
+    deleted = client.post(
+        "/api/obsidian/sync/push",
+        json={
+            "vault_id": vault_id,
+            "dataset": "notes",
+            "documents": [
+                {
+                    "path": "Old.md",
+                    "content": "",
+                    "base_rev": revision,
+                    "deleted": True,
+                }
+            ],
+        },
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json()["ingest_results"][0]["reason"] == "queued_not_confirmed"
+    assert citadel.tombstone_calls[0]["source_key"] == f"obsidian:{vault_id}:Old.md"
+    assert citadel.tombstone_calls[0]["dataset"] == "notes"
 
 
 def test_obsidian_vault_sync_detects_and_resolves_conflicts(tmp_path: Any) -> None:
@@ -3273,9 +3525,8 @@ def test_search_query_length_is_bounded_like_its_sibling_filters() -> None:
     assert client.post("/search", json={"query": ""}).status_code == 422
 
 
-def test_search_degrades_to_empty_on_timeout_budget() -> None:
-    # #44: a recall slower than the budget degrades to empty-fast with a note,
-    # instead of hanging for 100s+.
+def test_search_timeout_budget_is_a_typed_failure() -> None:
+    # An incomplete provider call is not evidence that the dataset is empty.
     import asyncio as aio
     import dataclasses
 
@@ -3290,12 +3541,152 @@ def test_search_degrades_to_empty_on_timeout_budget() -> None:
     app.state.citadel = SlowCitadel()
 
     r = client.post("/search", json={"query": "q", "top_k": 3})
-    assert r.status_code == 200
-    body = r.json()
+    assert r.status_code == 504
+    assert r.json()["detail"] == {
+        "code": "SEARCH_TIMEOUT",
+        "message": "Search exceeded the configured server budget.",
+    }
+
+
+def test_search_genuine_empty_is_a_normal_success() -> None:
+    class EmptyCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return []
+
+    client = authed_client("test-reader")
+    app.state.citadel = EmptyCitadel()
+
+    response = client.post("/search", json={"query": "absent", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
     assert body["results"] == []
-    assert body.get("timed_out") is True
-    assert body.get("truncated") is True
-    assert "budget" in body["note"]
+    assert "code" not in body
+    assert body.get("timed_out") in (None, False)
+
+
+def test_search_qdrant_outage_is_a_typed_failure() -> None:
+    class UnavailableCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            raise server_module.QdrantProviderError("qdrant secret detail")
+
+    client = authed_client("test-reader")
+    app.state.citadel = UnavailableCitadel()
+
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "QDRANT_UNAVAILABLE",
+        "message": "Qdrant is unavailable.",
+    }
+    assert "secret detail" not in response.text
+
+
+def _outage_adapter(generation: str) -> Any:
+    """A real Qdrant adapter whose every call hits an unresolvable host.
+
+    The client raises the SAME qdrant_client exception a stopped container
+    produces, so ``_collection_exists`` wraps it in the real
+    QdrantProviderError rather than a stand-in the adapter never emits.
+    """
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    from kb.qdrant_adapter import CitadelQdrantAdapter
+
+    class _DeadClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            del collection_name
+            raise ResponseHandlingException("Name or service not known")
+
+        async def close(self) -> None:
+            return None
+
+    class _Embedding:
+        async def embed_text(self, values: list[str]) -> list[list[float]]:
+            return [[1.0] for _ in values]
+
+        def get_vector_size(self) -> int:
+            return 1
+
+        def get_batch_size(self) -> int:
+            return 16
+
+    return CitadelQdrantAdapter(
+        url="http://127.0.0.1:6333",
+        api_key="test-key",
+        embedding_engine=_Embedding(),
+        database_name=generation,
+        client_factory=_DeadClient,
+    )
+
+
+def test_search_provider_outage_inside_the_fanout_is_a_typed_failure(
+    monkeypatch,
+) -> None:
+    """A route mapping is worth only as much as the layer below it.
+
+    The existing outage test fakes ``Citadel.search`` itself, which cannot show
+    whether anything between the adapter and the route degrades the error. Run
+    the REAL adapter inside a fan-out arm, with a non-empty lifecycle document
+    scope so the search genuinely reaches the vector call, and assert the typed
+    503 still arrives.
+    """
+    from kb.qdrant_adapter import qdrant_document_scope, qdrant_scope
+
+    monkeypatch.delenv("CITADEL_GENERATION_ID", raising=False)
+    generation = "outage-generation"
+    adapter = _outage_adapter(generation)
+
+    class OutageCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            del kwargs
+            with qdrant_scope(
+                mode="read", generation_id=generation, dataset="notes"
+            ):
+                with qdrant_document_scope(["searchable-revision-1"]):
+                    return await adapter.search(
+                        "DocumentChunk_text", query_text=query
+                    )
+
+    client = authed_client("test-reader")
+    app.state.citadel = OutageCitadel()
+
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "QDRANT_UNAVAILABLE",
+        "message": "Qdrant is unavailable.",
+    }
+    assert "Name or service not known" not in response.text
+
+
+def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
+    async def timeout(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+        return [], True
+
+    monkeypatch.setattr(server_module, "_search_within_budget", timeout)
+    client = authed_client("test-reader")
+
+    response = client.get("/api/knowledge", params={"q": "absent"})
+
+    assert response.status_code == 504
+    assert response.json()["detail"]["code"] == "SEARCH_TIMEOUT"
+
+
+def test_knowledge_alias_qdrant_outage_is_a_typed_failure(monkeypatch) -> None:
+    async def unavailable(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+        raise server_module.QdrantProviderError("provider detail")
+
+    monkeypatch.setattr(server_module, "_search_within_budget", unavailable)
+    client = authed_client("test-reader")
+
+    response = client.get("/api/knowledge", params={"q": "q"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "QDRANT_UNAVAILABLE"
+    assert "provider detail" not in response.text
 
 
 def test_document_endpoint_for_result_covers_real_ids_only() -> None:
@@ -4704,6 +5095,70 @@ def test_create_seat_survives_a_failed_dataset_provision(tmp_path: Any) -> None:
     assert payload["node_dataset_provisioned"] is False, "a failure must be visible"
 
 
+async def test_session_traces_bootstrap_provisions_missing_dataset_without_ingest(
+    monkeypatch: Any,
+) -> None:
+    from cognee import datasets as cognee_datasets
+    from kb.server import ensure_session_traces_dataset
+
+    provisioned: list[str] = []
+    ingested: list[str] = []
+
+    async def no_datasets() -> list[Any]:
+        return []
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return True
+
+    class _Citadel:
+        cognee = _Cognee()
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            ingested.append(data)
+            return IngestResult(True, "accepted", kwargs["dataset"], ())
+
+    monkeypatch.setattr(cognee_datasets, "list_datasets", no_datasets)
+
+    await ensure_session_traces_dataset(_Citadel())
+
+    assert provisioned == [SESSION_TRACES_DATASET]
+    assert ingested == []
+
+
+async def test_session_traces_bootstrap_repairs_existing_dataset_idempotently(
+    monkeypatch: Any,
+) -> None:
+    from cognee import datasets as cognee_datasets
+    from kb.server import ensure_session_traces_dataset
+
+    provisioned: list[str] = []
+    ingested: list[str] = []
+
+    async def existing_dataset() -> list[Any]:
+        return [SimpleNamespace(name=SESSION_TRACES_DATASET)]
+
+    class _Cognee:
+        async def ensure_dataset(self, name: str) -> bool:
+            provisioned.append(name)
+            return False
+
+    class _Citadel:
+        cognee = _Cognee()
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            ingested.append(data)
+            return IngestResult(True, "accepted", kwargs["dataset"], ())
+
+    monkeypatch.setattr(cognee_datasets, "list_datasets", existing_dataset)
+
+    await ensure_session_traces_dataset(_Citadel())
+
+    assert provisioned == [SESSION_TRACES_DATASET]
+    assert ingested == []
+
+
 async def test_backfill_seat_datasets_provisions_every_existing_seat(tmp_path: Any) -> None:
     """Seats that predate provisioning get their row on the next boot (#147).
 
@@ -4738,8 +5193,8 @@ def test_backfill_seat_datasets_is_wired_into_boot() -> None:
 
     The two tests around this one exercise the function directly, so deleting
     the call from the lifespan leaves them green and the six broken seats
-    unrepaired. Nothing else covers it: ensure_session_traces_dataset, which
-    this copies, has no test referencing it at all.
+    unrepaired. The session-traces provisioner has its own focused tests above;
+    this assertion pins the separate seat-backfill call in the lifespan.
 
     Reading the lifespan source is a blunt instrument and only proves the call
     is present, not that it runs. Running the real lifespan would drag in mesh
@@ -4771,6 +5226,36 @@ def test_start_cognify_queue_resumes_due_work(monkeypatch: Any) -> None:
     server._start_cognify_queue()
 
     assert calls == ["resume"]
+
+
+def test_start_lifecycle_queue_resumes_due_projection_work(monkeypatch: Any) -> None:
+    from kb import server
+
+    calls: list[str] = []
+
+    class FakeCitadel:
+        def resume_lifecycle_queue(self) -> None:
+            calls.append("resume")
+
+    monkeypatch.setattr(server, "get_citadel", lambda: FakeCitadel())
+    server._start_lifecycle_queue()
+
+    assert calls == ["resume"]
+
+
+async def test_stop_lifecycle_queue_awaits_worker_shutdown(monkeypatch: Any) -> None:
+    from kb import server
+
+    calls: list[str] = []
+
+    class FakeCitadel:
+        async def stop_lifecycle_queue(self) -> None:
+            calls.append("stop")
+
+    monkeypatch.setattr(server, "get_citadel", lambda: FakeCitadel())
+    await server._stop_lifecycle_queue()
+
+    assert calls == ["stop"]
 
 
 async def test_backfill_seat_datasets_is_a_noop_without_a_cognee_client(tmp_path: Any) -> None:
@@ -6284,6 +6769,22 @@ class ShareCitadel(FakeCitadel):
         return IngestResult(True, "accepted", dataset, tuple(kwargs.get("tags") or ()))
 
 
+class LifecycleShareCitadel(ShareCitadel):
+    async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+        self.ingest_calls.append({"data": data, **kwargs})
+        dataset = kwargs.get("dataset") or "notes"
+        suffix = dataset.replace(":", "-")
+        return IngestResult(
+            True,
+            "accepted",
+            dataset,
+            tuple(kwargs.get("tags") or ()),
+            source_revision_id=f"source-{suffix}",
+            projection_job_id=f"job-{suffix}",
+            projection_state="pending",
+        )
+
+
 class CrossSeatTraceCitadel(FakeCitadel):
     """Stateful fake: shared traces ingested by one seat are searchable by another."""
 
@@ -6339,10 +6840,45 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
+    assert payload["accepted"] is True
     assert payload["cognify"] == "deferred"
     datasets = [call["dataset"] for call in app.state.citadel.ingest_calls]
     assert datasets == ["seat:alice", SESSION_TRACES_DATASET]
     assert app.state.citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+
+
+def test_share_session_returns_one_lifecycle_operation_per_target(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()["token"]
+    app.state.citadel = LifecycleShareCitadel()
+    client = TestClient(app, base_url="https://testserver")
+    root = str(tmp_path)
+    register_seat_capture_roots(admin, "alice", [root])
+
+    response = client.post(
+        "/api/share-session",
+        json={"data": "Task: lifecycle receipts", "cwd": root, "capture_roots": [root]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["operations"] == [
+        {
+            "dataset": "seat:alice",
+            "accepted": True,
+            "source_revision_id": "source-seat-alice",
+            "projection_job_id": "job-seat-alice",
+            "projection_state": "pending",
+        },
+        {
+            "dataset": SESSION_TRACES_DATASET,
+            "accepted": True,
+            "source_revision_id": "source-session-traces",
+            "projection_job_id": "job-session-traces",
+            "projection_state": "pending",
+        },
+    ]
 
 
 def test_share_session_surfaces_rejected_durable_queue(tmp_path: Any) -> None:
@@ -6628,6 +7164,7 @@ def test_share_session_retries_session_traces_then_succeeds(tmp_path: Any) -> No
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
+    assert payload["accepted"] is True
     assert payload["cognify"] == "deferred"
     assert [call["dataset"] for call in citadel.ingest_calls] == [
         "seat:alice",
@@ -6636,6 +7173,13 @@ def test_share_session_retries_session_traces_then_succeeds(tmp_path: Any) -> No
     ]
     assert citadel.session_traces_attempts == 2
     assert citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+    events = app.state.access_store.snapshot()["audit_events"]
+    successful = [
+        event
+        for event in events
+        if event["action"] == "share_session" and event["success"]
+    ]
+    assert successful[-1]["detail"]["accepted"] is True
 
 
 def test_share_session_fails_when_session_traces_write_rejected(tmp_path: Any) -> None:
@@ -6662,6 +7206,22 @@ def test_share_session_fails_when_session_traces_write_rejected(tmp_path: Any) -
     assert detail["error_type"] == "partial_write_failure"
     assert detail["retried"] is True
     assert SESSION_TRACES_DATASET in detail["failed_targets"]
+    assert detail["operations"] == [
+        {
+            "dataset": "seat:alice",
+            "accepted": True,
+            "source_revision_id": None,
+            "projection_job_id": None,
+            "projection_state": None,
+        },
+        {
+            "dataset": SESSION_TRACES_DATASET,
+            "accepted": False,
+            "source_revision_id": None,
+            "projection_job_id": None,
+            "projection_state": None,
+        },
+    ]
     assert [call["dataset"] for call in app.state.citadel.ingest_calls] == [
         "seat:alice",
         SESSION_TRACES_DATASET,
@@ -6749,6 +7309,39 @@ def test_a_real_trace_quoting_a_repo_path_stays_a_trace() -> None:
     assert envelope["doc_type"] == "session-trace"
     assert envelope["trust"] == "reference-only"
     assert envelope["trust_tier"] == "reference-only"
+
+
+def test_result_metadata_promotes_lifecycle_receipt_identity() -> None:
+    result = server_module.with_result_metadata(
+        {
+            "id": "chunk-1",
+            "document_id": "source-1",
+            "text": "current lifecycle evidence",
+            "_lifecycle": {
+                "schema_version": 1,
+                "source_revision_id": "source-1",
+                "projection_receipt_id": "receipt-1",
+                "generation_id": "generation-1",
+                "backend": "vector",
+                "provider": "qdrant",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+            },
+        },
+        0,
+        "central",
+    )
+
+    assert "_lifecycle" not in result
+    assert result["_citadel"]["source_revision_id"] == "source-1"
+    assert result["_citadel"]["projection_receipt_id"] == "receipt-1"
+    assert result["_citadel"]["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "vector",
+        "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
 
 
 # --- /partners contact form -------------------------------------------------
@@ -7123,12 +7716,28 @@ def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
         lambda request, **kw: audited.append(kw),
     )
 
+    async def forbidden_post_timeout_work(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("timeout response continued into provider or telemetry work")
+
+    monkeypatch.setattr(
+        server_module,
+        "load_node_dataset_map",
+        forbidden_post_timeout_work,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "capture_search_feedback",
+        forbidden_post_timeout_work,
+    )
+
     client = authed_client("test-reader")
     app.state.citadel = SlowCitadel()
 
-    body = client.post("/search", json={"query": "q", "top_k": 3}).json()
+    response = client.post("/search", json={"query": "q", "top_k": 3})
+    body = response.json()
 
-    assert body.get("timed_out") is True
+    assert response.status_code == 504
+    assert body["detail"]["code"] == "SEARCH_TIMEOUT"
     assert audited, "the search must be audited at all"
     entry = audited[-1]
     assert entry["detail"]["timed_out"] is True
@@ -7334,14 +7943,17 @@ class FakeCorpusCognee:
         totals: dict[str, Any],
         chunk_counts: dict[str, int] | None = None,
         graph_ids: set[str] | None = None,
+        graph_ids_by_dataset: dict[str, set[str]] | None = None,
         chunk_lookup_raises: bool = False,
     ) -> None:
         self.rows = rows
         self.totals = totals
         self.chunk_counts = chunk_counts
         self.graph_ids = graph_ids
+        self.graph_ids_by_dataset = graph_ids_by_dataset
         self.chunk_lookup_raises = chunk_lookup_raises
         self.seen_after: list[tuple[str | None, str | None]] = []
+        self.graph_calls: list[tuple[list[str], list[str] | None]] = []
 
     @staticmethod
     def _key(row: dict[str, Any]) -> tuple[Any, str]:
@@ -7379,7 +7991,18 @@ class FakeCorpusCognee:
             if document_id in self.chunk_counts
         }
 
-    async def corpus_graph_presence(self, document_ids: list[str]) -> set[str] | None:
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str] | None:
+        self.graph_calls.append((document_ids, datasets))
+        if self.graph_ids_by_dataset is not None:
+            available: set[str] = set()
+            for dataset in datasets or []:
+                available.update(self.graph_ids_by_dataset.get(dataset, set()))
+            return {doc_id for doc_id in document_ids if doc_id in available}
         if self.graph_ids is None:
             return None
         return {doc_id for doc_id in document_ids if doc_id in self.graph_ids}
@@ -7459,6 +8082,41 @@ def test_corpus_census_reports_rows_presence_and_totals() -> None:
     assert second["chunk_count"] == 0
     assert second["in_graph"] is False
     assert body["notes"] == []
+
+
+def test_corpus_census_checks_each_dataset_graph() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fake = FakeCorpusCognee(
+        [
+            _corpus_row(
+                "doc-central",
+                (now - timedelta(hours=2)).isoformat(),
+                datasets=["central"],
+            ),
+            _corpus_row(
+                "doc-alice",
+                (now - timedelta(hours=1)).isoformat(),
+                datasets=["seat:alice"],
+            ),
+        ],
+        totals=_corpus_totals(2),
+        chunk_counts={"doc-central": 1, "doc-alice": 1},
+        graph_ids_by_dataset={
+            "central": {"doc-central"},
+            "seat:alice": {"doc-alice"},
+        },
+    )
+    client = _corpus_client(fake)
+
+    body = client.get("/api/corpus").json()
+
+    assert [row["in_graph"] for row in body["documents"]] == [True, True]
+    assert fake.graph_calls == [
+        (["doc-central"], ["central"]),
+        (["doc-alice"], ["seat:alice"]),
+    ]
 
 
 def test_corpus_census_pages_with_an_opaque_cursor() -> None:

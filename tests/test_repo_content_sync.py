@@ -34,6 +34,12 @@ from kb.repository_update import GitHubRepo
 class FakeCitadel:
     def __init__(self, config: CitadelConfig) -> None:
         self.config = config
+        self.lifecycle_store: Any | None = None
+        self.tombstone_calls: list[dict[str, Any]] = []
+
+    async def tombstone_source(self, **kwargs: Any) -> tuple[Any, ...]:
+        self.tombstone_calls.append(kwargs)
+        return (object(),)
 
 
 class FakeLearningProcess:
@@ -272,6 +278,31 @@ async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None
 
     state = json.loads(Path(config.repo_content_sync_state_path).read_text(encoding="utf-8"))
     assert state["files"]["masumi-network/sokosumi-cli/README.md"]["sha"] == "abc"
+
+
+@pytest.mark.asyncio
+async def test_repo_content_sync_tombstones_confirmed_deleted_path(tmp_path: Path) -> None:
+    config = _pinning_config(tmp_path)
+    client = FakeRepoContentClient()
+    citadel = FakeCitadel(config)
+    citadel.lifecycle_store = object()
+    syncer = RepoContentSyncer(
+        citadel,
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+    assert (await syncer.run())["files_ingested"] == 2
+    client.files.pop("masumi-network/sokosumi-cli/README.md")
+
+    second = await syncer.run()
+
+    assert second["files_tombstoned"] == 1
+    assert citadel.tombstone_calls[0]["source_key"] == (
+        "github:masumi-network/sokosumi-cli:path:README.md"
+    )
+    state = json.loads(Path(config.repo_content_sync_state_path).read_text(encoding="utf-8"))
+    assert "masumi-network/sokosumi-cli/README.md" not in state["files"]
 
 
 # --- header pinning: the body must not depend on the repo HEAD ---------------
@@ -935,6 +966,87 @@ async def test_pending_projection_checkpoint_is_retried_before_unchanged(
     ]
     assert completed_entry["cognee_data_ids"]
     assert "projection_status" not in completed_entry
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_projection_checkpoint_polls_without_duplicate_ingest(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(state_path),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("missing/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=False,
+    )
+
+    class LifecycleCitadel(FakeCitadel):
+        operation_state = "pending"
+        resume_calls = 0
+
+        def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
+            assert projection_job_id == "job-1"
+            return {
+                "projection_job_id": projection_job_id,
+                "source_revision_id": "source-1",
+                "state": self.operation_state,
+            }
+
+        def resume_lifecycle_queue(self) -> None:
+            self.resume_calls += 1
+
+    class LifecycleLearning(FakeLearningProcess):
+        async def learn(self, data: str, **kwargs: Any) -> Any:
+            self.calls.append({"data": data, **kwargs})
+
+            class Outcome:
+                ingest = IngestResult(
+                    True,
+                    "queued_not_confirmed",
+                    kwargs.get("dataset", "x"),
+                    (),
+                    source_revision_id="source-1",
+                    projection_job_id="job-1",
+                    projection_state="pending",
+                )
+                chunk_ingests = ()
+                improve = None
+
+                @property
+                def all_ingests(self) -> tuple[IngestResult, ...]:
+                    return (self.ingest,)
+
+                @property
+                def improved(self) -> bool:
+                    return False
+
+            return Outcome()
+
+    citadel = LifecycleCitadel(config)
+    learning = LifecycleLearning()
+    syncer = RepoContentSyncer(
+        citadel,
+        client=FakeRepoContentClient(),
+        state_path=str(state_path),
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    first = await syncer.run()
+    second = await syncer.run()
+    citadel.operation_state = "searchable"
+    third = await syncer.run()
+
+    assert first["files_ingested"] == 1
+    assert second["files_skipped_by_reason"] == {"projection_pending": 1}
+    assert third["files_skipped_by_reason"] == {"unchanged": 1}
+    assert len(learning.calls) == 1
+    assert citadel.resume_calls == 1
 
 
 @pytest.mark.asyncio

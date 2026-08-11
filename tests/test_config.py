@@ -46,6 +46,23 @@ def test_cognify_queue_path_defaults_to_state_root_and_honors_override(
     assert CitadelConfig.from_env(env_file=None).cognify_queue_path == str(explicit)
 
 
+def test_lifecycle_store_path_defaults_to_state_root_and_honors_override(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(tmp_path / "state"))
+    monkeypatch.delenv("CITADEL_LIFECYCLE_STORE_PATH", raising=False)
+    config = CitadelConfig.from_env(env_file=None)
+    assert config.lifecycle_enabled is True
+    assert config.lifecycle_store_path == str(tmp_path / "state" / "lifecycle.sqlite3")
+
+    explicit = tmp_path / "explicit-lifecycle.sqlite3"
+    monkeypatch.setenv("CITADEL_LIFECYCLE_STORE_PATH", str(explicit))
+    assert CitadelConfig.from_env(env_file=None).lifecycle_store_path == str(explicit)
+
+    monkeypatch.setenv("CITADEL_LIFECYCLE_ENABLED", "false")
+    assert CitadelConfig.from_env(env_file=None).lifecycle_enabled is False
+
+
 def test_repo_content_autojoin_env(monkeypatch) -> None:
     monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_ENABLED", "true")
     monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_MARKERS", "AGENTS.md, SKILL.md")

@@ -9,6 +9,7 @@ from typing import Any
 
 from kb.capture import capture_token
 from kb.capture_config import DEFAULT_NODE_URL, load_capture_config
+from kb.secure_http import InsecureEndpointError, require_secure_url
 
 _TIMEOUT = 120.0
 
@@ -49,8 +50,10 @@ def _request(
     payload: dict[str, Any] | None = None,
     timeout: float = _TIMEOUT,
 ) -> Any:
-    if not base_url.lower().startswith("https://"):
-        raise PromotionClientError("refusing non-HTTPS Node URL")
+    try:
+        require_secure_url(base_url)
+    except InsecureEndpointError as exc:
+        raise PromotionClientError("refusing non-HTTPS Node URL") from exc
     if not token:
         raise PromotionClientError("missing token (set CITADEL_MCP_ACCESS_TOKEN)")
     url = f"{base_url}{path}"

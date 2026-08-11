@@ -33,6 +33,7 @@ jobs:
     # the required check name stays stable when this matrix changes.
     name: pytest + ruff
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +65,15 @@ jobs:
         # MCP module, so a base-only sync fails collection with ModuleNotFound.
         run: uv sync --locked --all-extras --dev
 
+      - name: Install audited Cognee build
+        shell: bash
+        run: |
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          uv run python scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --reinstall --no-deps "${wheels[0]}"
+
       - name: Confirm the interpreter actually under test
         run: uv run python -c "import sys; print(sys.version)"
 
@@ -76,6 +86,7 @@ jobs:
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -91,6 +102,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install audited Cognee build
+        shell: bash
+        run: |
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          uv run python scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          uv pip install --reinstall --no-deps "${wheels[0]}"
+
       - name: pip-audit
         # PYSEC-2026-2447 is ignored pending an upstream fix. CVEs that already
         # have a fixed release are pinned out via [tool.uv] override-dependencies
@@ -99,9 +119,39 @@ jobs:
           uv run pip-audit --cache-dir .pip-audit-cache \
             --ignore-vuln PYSEC-2026-2447
 
+  plain-requirements-smoke:
+    name: plain requirements install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements with plain pip
+        shell: bash
+        run: |
+          venv="$RUNNER_TEMP/citadel-requirements"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install --upgrade pip
+          "$venv/bin/python" -m pip install "build==1.5.0" "hatchling==1.31.0"
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          "$venv/bin/python" scripts/build_secure_cognee.py --output "$secure_cognee"
+          wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install --no-deps "${wheels[0]}"
+          "$venv/bin/python" -m pip install -r requirements.txt
+          "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" -m pytest tests/test_dependency_pins.py -q
+
   benchmark:
     name: benchmark fixtures
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -128,6 +178,7 @@ jobs:
   web:
     name: frontend export
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -159,6 +210,7 @@ jobs:
   package-smoke:
     name: package smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -168,19 +220,312 @@ jobs:
           version: "0.12.1"
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Build wheel and sdist
         run: uv build --wheel --sdist
 
-      - name: Install wheel and verify payloads
+      - name: Install wheel server extra and verify payloads
+        shell: bash
         run: |
           venv="$RUNNER_TEMP/citadel-wheel"
           python -m venv "$venv"
-          "$venv/bin/python" -m pip install --no-index --no-deps dist/*.whl
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install "build==1.5.0" "hatchling==1.31.0"
+          secure_cognee="$RUNNER_TEMP/secure-cognee"
+          "$venv/bin/python" scripts/build_secure_cognee.py --output "$secure_cognee"
+          cognee_wheels=("$secure_cognee"/cognee-*.whl)
+          test "${#cognee_wheels[@]}" -eq 1
+          "$venv/bin/python" -m pip install --no-deps "${cognee_wheels[0]}"
+          "$venv/bin/python" -m pip install "${wheels[0]}[server]"
+          "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" -m pytest tests/test_dependency_pins.py -q
           "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
           "$venv/bin/citadel" bench --help >/dev/null
+
+  container-tests:
+    name: Docker test target
+    runs-on: ubuntu-latest
+    # Roughly a minute to build and a few more to run the suites, so this is
+    # several times the working duration. It exists to cap a hang, not to pace
+    # the job: without it a stuck step burns the 360-minute default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker test target
+        run: docker build --target test --tag citadel-archive:ci-test .
+
+      - name: Run non-live and Qdrant contract suites with captured logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          network="citadel-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source_qdrant="${network}-source-qdrant"
+          restore_success_qdrant="${network}-restore-success-qdrant"
+          restore_rollback_qdrant="${network}-restore-rollback-qdrant"
+          qdrant_key="citadel-ci-qdrant-key"
+          qdrant_image="qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc"
+          log_dir="$RUNNER_TEMP/citadel-container-tests-logs"
+          expected_qdrant_log_pattern='TLS (is )?disabled'
+          mkdir -p "$log_dir"
+          # Read each container's log once, after the fact. The daemon buffers
+          # all of it, so this captures what a live follower would have, minus
+          # that pattern's failure mode: in `docker logs --follow | tee f &` the
+          # recorded pid is tee's, so killing it leaves docker logs running on an
+          # idle container, and waiting on that job then never returns.
+          capture_container_logs() {
+            docker logs --timestamps "$source_qdrant" > "$log_dir/source-qdrant.log" 2>&1 || true
+            docker logs --timestamps "$restore_success_qdrant" > "$log_dir/restore-success-qdrant.log" 2>&1 || true
+            docker logs --timestamps "$restore_rollback_qdrant" > "$log_dir/restore-rollback-qdrant.log" 2>&1 || true
+          }
+          assert_clean_container_logs() {
+            local log_file
+            for log_file in "$@"; do
+              # capture_container_logs swallows its own errors, so an empty file
+              # would otherwise read as a clean log rather than a missing one.
+              if [[ ! -s "$log_file" ]]; then
+                echo "::error::No log was captured from $log_file"
+                return 1
+              fi
+              if rg --line-number --ignore-case \
+                'warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
+                "$log_file" | rg --invert-match --ignore-case "$expected_qdrant_log_pattern"; then
+                echo "::error::Unexpected severe container log in $log_file"
+                return 1
+              fi
+              if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' "$log_file"; then
+                echo "::error::Unexpected HTTP 4xx/5xx container log in $log_file"
+                return 1
+              fi
+            done
+          }
+          cleanup() {
+            capture_container_logs
+            docker inspect "$source_qdrant" "$restore_success_qdrant" "$restore_rollback_qdrant" 2>/dev/null || true
+            docker rm -f "$source_qdrant" "$restore_success_qdrant" "$restore_rollback_qdrant" 2>/dev/null || true
+            docker volume rm \
+              "${source_qdrant}-storage" "${source_qdrant}-snapshots" \
+              "${restore_success_qdrant}-storage" "${restore_success_qdrant}-snapshots" \
+              "${restore_rollback_qdrant}-storage" "${restore_rollback_qdrant}-snapshots" 2>/dev/null || true
+            docker network rm "$network" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          docker network create "$network"
+          # Every Qdrant here gets its own storage and snapshot volumes. Without
+          # them Qdrant reports its data as living on the container filesystem,
+          # which assert_clean_container_logs treats as the durability failure it
+          # is. The volume names carry the run id, so each run starts empty and
+          # cleanup removes them.
+          docker run --detach --name "$source_qdrant" --network "$network" \
+            --env "QDRANT__SERVICE__API_KEY=$qdrant_key" \
+            --env QDRANT__TELEMETRY_DISABLED=true \
+            --volume "${source_qdrant}-storage:/qdrant/storage" \
+            --volume "${source_qdrant}-snapshots:/qdrant/snapshots" \
+            --security-opt no-new-privileges:true \
+            qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+          docker run --detach --name "$restore_success_qdrant" --network "$network" \
+            --env "QDRANT__SERVICE__API_KEY=$qdrant_key" \
+            --env QDRANT__TELEMETRY_DISABLED=true \
+            --volume "${restore_success_qdrant}-storage:/qdrant/storage" \
+            --volume "${restore_success_qdrant}-snapshots:/qdrant/snapshots" \
+            --security-opt no-new-privileges:true \
+            qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+          docker run --detach --name "$restore_rollback_qdrant" --network "$network" \
+            --env "QDRANT__SERVICE__API_KEY=$qdrant_key" \
+            --env QDRANT__TELEMETRY_DISABLED=true \
+            --volume "${restore_rollback_qdrant}-storage:/qdrant/storage" \
+            --volume "${restore_rollback_qdrant}-snapshots:/qdrant/snapshots" \
+            --security-opt no-new-privileges:true \
+            qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+          for attempt in {1..30}; do
+            if docker run --rm --network "$network" citadel-archive:ci-test python -c \
+              "from qdrant_client import QdrantClient; client = QdrantClient(url='http://$source_qdrant:6333', api_key='$qdrant_key'); client.get_collections(); client.close()" \
+              && docker run --rm --network "$network" citadel-archive:ci-test python -c \
+                "from qdrant_client import QdrantClient; client = QdrantClient(url='http://$restore_success_qdrant:6333', api_key='$qdrant_key'); client.get_collections(); client.close()" \
+              && docker run --rm --network "$network" citadel-archive:ci-test python -c \
+                "from qdrant_client import QdrantClient; client = QdrantClient(url='http://$restore_rollback_qdrant:6333', api_key='$qdrant_key'); client.get_collections(); client.close()"; then
+              break
+            fi
+            sleep 2
+          done
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_SERVER_IMAGE=$qdrant_image" \
+            citadel-archive:ci-test python -m pytest -q -m "not live"
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_SERVER_IMAGE=$qdrant_image" \
+            citadel-archive:ci-test python -m ruff check .
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_SERVER_IMAGE=$qdrant_image" \
+            --env "CITADEL_QDRANT_LIVE_URL=http://$source_qdrant:6333" \
+            --env "CITADEL_QDRANT_LIVE_KEY=$qdrant_key" \
+            --env "CITADEL_QDRANT_RESTORE_URL=http://$restore_success_qdrant:6333" \
+            --env "CITADEL_QDRANT_RESTORE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -m pytest -q \
+              tests/test_qdrant_adapter_live.py \
+              tests/test_cognee_qdrant_sqlite_live.py
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_LIVE_URL=http://$source_qdrant:6333" \
+            --env "CITADEL_QDRANT_LIVE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -c \
+              "from qdrant_client import QdrantClient; client = QdrantClient(url='http://$source_qdrant:6333', api_key='$qdrant_key'); assert client.get_collections().collections; client.close()"
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_SERVER_IMAGE=$qdrant_image" \
+            --env "CITADEL_QDRANT_LIVE_URL=http://$source_qdrant:6333" \
+            --env "CITADEL_QDRANT_LIVE_KEY=$qdrant_key" \
+            --env "CITADEL_QDRANT_RESTORE_URL=http://$restore_success_qdrant:6333" \
+            --env "CITADEL_QDRANT_RESTORE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -m pytest -q \
+              tests/test_generation_backup_live.py::test_generation_backup_restores_fresh_qdrant_and_lite_root
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_RESTORE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -c \
+              "from qdrant_client import QdrantClient; import os; client = QdrantClient(url='http://$restore_success_qdrant:6333', api_key=os.environ['CITADEL_QDRANT_RESTORE_KEY']); assert client.get_collections().collections; client.close()"
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_SERVER_IMAGE=$qdrant_image" \
+            --env "CITADEL_QDRANT_LIVE_URL=http://$source_qdrant:6333" \
+            --env "CITADEL_QDRANT_LIVE_KEY=$qdrant_key" \
+            --env "CITADEL_QDRANT_RESTORE_URL=http://$restore_rollback_qdrant:6333" \
+            --env "CITADEL_QDRANT_RESTORE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -m pytest -q \
+              tests/test_generation_backup_live.py::test_generation_restore_count_mismatch_rolls_back_real_qdrant_and_lite_root
+          docker run --rm --network "$network" \
+            --env "CITADEL_QDRANT_RESTORE_KEY=$qdrant_key" \
+            citadel-archive:ci-test python -c \
+              "from qdrant_client import QdrantClient; import os; client = QdrantClient(url='http://$restore_rollback_qdrant:6333', api_key=os.environ['CITADEL_QDRANT_RESTORE_KEY']); assert client.get_collections().collections == []; client.close()"
+          capture_container_logs
+          assert_clean_container_logs \
+            "$log_dir/source-qdrant.log" "$log_dir/restore-success-qdrant.log" "$log_dir/restore-rollback-qdrant.log"
+
+  container-runtime:
+    name: production Compose readiness
+    runs-on: ubuntu-latest
+    # Same reasoning as container-tests: a cap on a hang, not a pace.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build --tag citadel-archive:ci-runtime .
+
+      - name: Prove Compose readiness with captured logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="citadel-compose-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          env_file="$RUNNER_TEMP/citadel-compose.env"
+          qdrant_key="citadel-ci-qdrant-key"
+          admin_key="citadel-ci-admin-key-000000000000"
+          log_dir="$RUNNER_TEMP/citadel-container-runtime-logs"
+          expected_qdrant_log_pattern='TLS (is )?disabled'
+          expected_citadel_http_pattern='GET /readyz HTTP/1.1" 401 Unauthorized'
+          # The severe-line classifier below is fail-closed, so a healthy boot
+          # needs an exemption for each benign line it actually prints. One entry
+          # per measured line class, each a distinctive substring of that line.
+          # A healthy boot printed nine severe-pattern lines when this was
+          # measured. These four entries cover seven of them; the other two are
+          # arm64-only onnxruntime lines, left unexempted until CI shows them.
+          # "warning  Cognee 1.0 changes: New API ...", the cognee import banner,
+          # printed four times. An upstream notice about its own API, not a fault.
+          expected_citadel_log_pattern='Cognee 1\.0 changes:'
+          # "pydantic_settings/sources/utils.py:47: IncompleteFieldDefinitionWarning:
+          # Field 'lifespan' has an incomplete definition ...", raised upstream while
+          # the settings model is built. The app boots and serves through it.
+          expected_citadel_log_pattern+="|IncompleteFieldDefinitionWarning: Field 'lifespan'"
+          # The source echo Python prints beneath that warning. Exempting the echo
+          # alone stays fail-closed: a new warning still fails on its message line.
+          expected_citadel_log_pattern+='|warnings\.warn\('
+          # "warning  No nodes found in the database", which is what an empty graph
+          # reports, and a fresh CI boot has an empty graph.
+          expected_citadel_log_pattern+='|No nodes found in the database'
+          mkdir -p "$log_dir"
+          cat > "$env_file" <<EOF
+          CITADEL_IMAGE=citadel-archive:ci-runtime
+          QDRANT_API_KEY=$qdrant_key
+          CITADEL_GENERATION_ID=ci-compose-readiness
+          CITADEL_ADMIN_KEY=$admin_key
+          LLM_API_KEY=ci-dummy-key
+          COGNEE_SKIP_CONNECTION_TEST=true
+          EOF
+          # Read both service logs once, after the fact, for the same reason as
+          # container-tests: a backgrounded `logs --follow | tee` records tee's
+          # pid, and the follower it leaves behind never returns.
+          capture_runtime_logs() {
+            docker compose --project-name "$project" --env-file "$env_file" logs --timestamps qdrant > "$log_dir/qdrant.log" 2>&1 || true
+            docker compose --project-name "$project" --env-file "$env_file" logs --timestamps citadel > "$log_dir/citadel.log" 2>&1 || true
+          }
+          assert_clean_runtime_logs() {
+            local log_file
+            for log_file in "$@"; do
+              # An empty file means the capture failed, not that the boot was
+              # quiet, and a quiet boot is not something this stack produces.
+              if [[ ! -s "$log_file" ]]; then
+                echo "::error::No log was captured from $log_file"
+                return 1
+              fi
+              local expected_log_pattern="$expected_citadel_log_pattern"
+              if [[ "$log_file" == "$log_dir/qdrant.log" ]]; then
+                expected_log_pattern="$expected_qdrant_log_pattern"
+              fi
+              if rg --line-number --ignore-case \
+                'warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
+                "$log_file" | rg --invert-match --ignore-case "$expected_log_pattern"; then
+                echo "::error::Unexpected severe container log in $log_file"
+                return 1
+              fi
+            done
+            if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' \
+              "$log_dir/qdrant.log"; then
+              echo "::error::Unexpected Qdrant HTTP 4xx/5xx log"
+              return 1
+            fi
+            if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' \
+              "$log_dir/citadel.log" \
+              | rg --invert-match "$expected_citadel_http_pattern"; then
+              echo "::error::Unexpected Citadel HTTP 4xx/5xx log"
+              return 1
+            fi
+          }
+          cleanup() {
+            capture_runtime_logs
+            docker compose --project-name "$project" --env-file "$env_file" ps || true
+            docker compose --project-name "$project" --env-file "$env_file" down --volumes --remove-orphans || true
+            rm -f "$env_file"
+          }
+          trap cleanup EXIT
+          docker compose --project-name "$project" --env-file "$env_file" up --detach --no-build
+          app="$(docker compose --project-name "$project" ps -q citadel)"
+          for attempt in {1..60}; do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$app")"
+            if [[ "$status" == healthy ]]; then
+              break
+            fi
+            if [[ "$status" == unhealthy ]]; then
+              exit 1
+            fi
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.Config.User}}' "$app")" = "10001:10001"
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$app")" = healthy
+          docker compose --project-name "$project" exec -T citadel python -c '
+          from urllib.error import HTTPError
+          from urllib.request import urlopen
+          try:
+              urlopen("http://127.0.0.1:8000/readyz")
+          except HTTPError as error:
+              assert error.code == 401
+          else:
+              raise AssertionError("unauthenticated readiness was accepted")
+          '
+          docker compose --project-name "$project" exec -T citadel python -c \
+            "import os; from urllib.request import Request, urlopen; request=Request('http://127.0.0.1:8000/readyz', headers={'Authorization':'Bearer '+os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"
+          capture_runtime_logs
+          assert_clean_runtime_logs "$log_dir/qdrant.log" "$log_dir/citadel.log"
 
   gate:
     name: CI gate
@@ -190,8 +535,9 @@ jobs:
     # renamed without an admin editing the branch ruleset. `if: always()` ensures
     # this job still runs — and fails — when a job it depends on fails.
     if: always()
-    needs: [test, audit, benchmark, web, package-smoke]
+    needs: [test, audit, plain-requirements-smoke, benchmark, web, package-smoke, container-tests, container-runtime]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Verify every required job succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')

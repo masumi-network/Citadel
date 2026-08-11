@@ -9,6 +9,8 @@ import pytest
 from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.learning import LearningProcess
+from kb.llm_enrichment import EnrichedChunk, EnrichmentOutcome
+from kb.lifecycle import lifecycle_chunk_source_key
 from kb.mesh import MeshState
 from kb.models import IngestResult
 
@@ -43,6 +45,41 @@ class FailingImproveCitadel(FakeCitadel):
         raise RuntimeError("llm unavailable")
 
 
+class LifecycleTrackingCitadel(FakeCitadel):
+    def __init__(self, config: CitadelConfig) -> None:
+        super().__init__(config)
+        self.current_source_keys: set[str] = set()
+        self.parent_by_source_key: dict[str, str] = {}
+        self.tombstone_calls: list[dict[str, Any]] = []
+
+    async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+        result = await super().ingest(data, **kwargs)
+        if result.accepted and kwargs.get("source_key"):
+            accepted_key = str(kwargs["source_key"])
+            self.current_source_keys.add(accepted_key)
+            parent = kwargs.get("_lifecycle_parent_source_key")
+            if parent is not None:
+                self.parent_by_source_key[accepted_key] = str(parent)
+        return result
+
+    def lifecycle_source_keys(self, **kwargs: Any) -> tuple[str, ...]:
+        source_key = str(kwargs["source_key"])
+        return tuple(
+            sorted(
+                key
+                for key in self.current_source_keys
+                if key == source_key or self.parent_by_source_key.get(key) == source_key
+            )
+        )
+
+    async def tombstone_source(self, **kwargs: Any) -> tuple[IngestResult, ...]:
+        self.tombstone_calls.append(kwargs)
+        tombstoned_key = str(kwargs["source_key"])
+        self.current_source_keys.discard(tombstoned_key)
+        self.parent_by_source_key.pop(tombstoned_key, None)
+        return ()
+
+
 def config_for(tmp_path: Path) -> CitadelConfig:
     return CitadelConfig(
         default_dataset="notes",
@@ -68,6 +105,66 @@ async def test_learn_ingests_and_records_mesh_activity(tmp_path: Path) -> None:
     assert citadel.ingest_calls[0]["tags"] == ["ops"]
     assert snapshot["stats"]["tracked_sources"] == 1
     assert snapshot["events"][0]["type"] == "ingest"
+
+
+async def test_learn_forwards_stable_source_identity_to_lifecycle_ingest(
+    tmp_path: Path,
+) -> None:
+    config = config_for(tmp_path)
+    citadel = FakeCitadel(config)
+    learning = LearningProcess(citadel)
+
+    await learning.learn(
+        "Repository document",
+        tier="light",
+        source_key="github:masumi-network/Citadel:path:README.md",
+        source_locator="https://github.com/masumi-network/Citadel/blob/abc/README.md",
+        media_type="text/markdown",
+        capture_actor_id="github-repo-content-sync",
+        capture_run_id="sync-1",
+    )
+
+    call = citadel.ingest_calls[0]
+    assert call["source_key"] == "github:masumi-network/Citadel:path:README.md"
+    assert call["source_locator"].endswith("/blob/abc/README.md")
+    assert call["media_type"] == "text/markdown"
+    assert call["capture_actor_id"] == "github-repo-content-sync"
+    assert call["capture_run_id"] == "sync-1"
+
+
+async def test_learn_tombstones_chunks_removed_by_content_contraction(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    citadel = LifecycleTrackingCitadel(config_for(tmp_path))
+    learning = LearningProcess(citadel)
+    outcomes = iter(
+        (
+            EnrichmentOutcome(
+                chunks=(
+                    EnrichedChunk(text="one"),
+                    EnrichedChunk(text="two"),
+                    EnrichedChunk(text="three"),
+                ),
+                used_llm=False,
+                reason="test",
+            ),
+            EnrichmentOutcome(
+                chunks=(EnrichedChunk(text="one"), EnrichedChunk(text="two")),
+                used_llm=False,
+                reason="test",
+            ),
+        )
+    )
+    monkeypatch.setattr(learning, "_enrich", lambda _: next(outcomes))
+
+    await learning.learn("first", source_key="connector:item")
+    await learning.learn("second", source_key="connector:item")
+
+    assert [call["source_key"] for call in citadel.tombstone_calls] == [
+        lifecycle_chunk_source_key("connector:item", 2)
+    ]
+    assert citadel.tombstone_calls[0]["include_chunks"] is False
 
 
 async def test_learn_runs_improve_only_for_accepted_material(tmp_path: Path) -> None:

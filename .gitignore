@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .env.*
+!.env.lite.example
 !.env.example
 .venv/
 node_modules/

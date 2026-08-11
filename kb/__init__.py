@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 # hatchling dynamic versioning, and server discovery / the CLI fall back to it
 # when the package is not dist-installed (the Railway node runs from source, so
 # importlib.metadata.version raises there). Keeps server + CLI from drifting.
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 if TYPE_CHECKING:
     from kb.config import CitadelConfig

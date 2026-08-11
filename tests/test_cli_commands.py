@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from io import BytesIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,17 @@ from typing import Any
 
 import pytest
 
-from kb.cli import _activity, _doctor, _ingest, _search, _token_set, _update, _wizard_roots
+from kb.cli import (
+    _activity,
+    _doctor,
+    _ingest,
+    _operation,
+    _search,
+    _token_set,
+    _update,
+    _wizard_roots,
+    build_parser,
+)
 from kb.status import Check, StatusReport
 
 
@@ -188,6 +199,24 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     assert out["results"][0]["text"] == "hello vault"
     assert out["results"][0]["snippet"] == "hello vault"
     assert out["ok"] is True
+
+
+def test_operation_command_fetches_projection_receipts(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    payload = {
+        "projection_job_id": "job-1",
+        "state": "searchable",
+        "receipts": [{"backend": "vector", "state": "searchable"}],
+    }
+    monkeypatch.setattr("kb.status.fetch_operation", lambda *args, **kwargs: payload)
+    args = build_parser().parse_args(
+        ["operation", "job-1", "--node-url", "https://node.example", "--json"]
+    )
+
+    rc = asyncio.run(_operation(args))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def _search_args(**kw):
@@ -397,6 +426,46 @@ def test_search_json_http_error_emits_json(monkeypatch, capsys) -> None:
     assert out["http_status"] == 503
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (504, "SEARCH_TIMEOUT", "Search budget expired."),
+        (503, "QDRANT_UNAVAILABLE", "Qdrant is unavailable."),
+    ],
+)
+def test_search_json_preserves_typed_server_error(
+    monkeypatch,
+    capsys,
+    status: int,
+    code: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def boom(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "https://node.example",
+            status,
+            message,
+            {},
+            BytesIO(
+                json.dumps({"detail": {"code": code, "message": message}}).encode()
+            ),
+        )
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    rc = asyncio.run(_search(_search_args(query="hi")))
+
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out == {
+        "ok": False,
+        "error": message,
+        "code": code,
+        "http_status": status,
+    }
+
+
 def test_ingest_json_connection_error_emits_json(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
 
@@ -411,7 +480,7 @@ def test_ingest_json_connection_error_emits_json(monkeypatch, capsys) -> None:
     assert out["code"] == "NODE_UNREACHABLE"
 
 
-def test_search_timeout_returns_truncated_json(monkeypatch, capsys) -> None:
+def test_search_timeout_returns_typed_failure_json(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
 
     def boom(*_a, **_k):
@@ -436,13 +505,11 @@ def test_search_timeout_returns_truncated_json(monkeypatch, capsys) -> None:
         budget_ms=None,
     )
     rc = asyncio.run(_search(args))
-    assert rc == 0
+    assert rc == 1
     out = json.loads(capsys.readouterr().out)
-    assert out["timed_out"] is True
-    assert out["truncated"] is True
-    assert out["ok"] is True
-    assert out["code"] == "TIMEOUT"
-    assert out["results"] == []
+    assert out["ok"] is False
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["http_status"] == 504
 
 
 def test_search_urlerror_timeout_deduped(monkeypatch, capsys) -> None:
@@ -470,9 +537,47 @@ def test_search_urlerror_timeout_deduped(monkeypatch, capsys) -> None:
         budget_ms=1500,
     )
     rc = asyncio.run(_search(args))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["http_status"] == 504
+
+
+def test_search_genuine_empty_is_a_normal_cli_success(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr("kb.status.search_node", lambda *_a, **_k: {"results": []})
+
+    rc = asyncio.run(_search(_search_args(query="absent")))
+
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["truncated"] is True and out["timed_out"] is True
+    assert out["ok"] is True
+    assert out["results"] == []
+    assert "code" not in out
+
+
+def test_search_legacy_soft_timeout_envelope_is_a_typed_failure(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.search_node",
+        lambda *_a, **_k: {
+            "results": [],
+            "timed_out": True,
+            "truncated": True,
+            "note": "server budget expired",
+        },
+    )
+
+    rc = asyncio.run(_search(_search_args(query="absent")))
+
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["http_status"] == 504
 
 
 def test_search_human_spec_mode_flattens_ranked(monkeypatch, capsys) -> None:

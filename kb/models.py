@@ -25,6 +25,9 @@ class IngestResult:
     dataset: str
     tags: tuple[str, ...]
     cognee_result: Any = None
+    source_revision_id: str | None = None
+    projection_job_id: str | None = None
+    projection_state: str | None = None
 
 
 @dataclass(frozen=True)

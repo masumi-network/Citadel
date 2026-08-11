@@ -6,8 +6,9 @@ Finding gate and per-seat Capture Policy deny globs remain the authoritative
 secret guard on the Node side.
 
 The network primitive (`post_capture`) mirrors the hardening of the standalone
-pre-push hook (`sync_push.post_ingest`): HTTPS-only, no redirect following (so a
-30x never re-sends the seat Bearer token to another host), and a UTF-8 byte cap.
+pre-push hook (`sync_push.post_ingest`): HTTPS except for loopback or a Railway
+private service, no redirect following (so a 30x never re-sends the seat Bearer
+token to another host), and a UTF-8 byte cap.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from kb.capture_config import CaptureRoot, normalize_tags
+from kb.secure_http import InsecureEndpointError, require_secure_url
 
 CAPTURE_TAG = "capture"
 _README_NAMES = ("README.md", "README.rst", "README.txt", "README")
@@ -193,15 +195,17 @@ def post_capture(
     *,
     timeout: float | None = None,
 ) -> dict[str, Any]:
-    """POST a capture summary to the Node `/ingest` endpoint (HTTPS-only).
+    """POST a capture summary to the Node `/ingest` endpoint.
 
     ``timeout=None`` resolves to :func:`http_timeout_seconds` at call time so
     the env override applies without threading a value through every caller.
     """
     if timeout is None:
         timeout = http_timeout_seconds()
-    if not node_url.lower().startswith("https://"):
-        raise ValueError("refusing non-HTTPS Node URL")
+    try:
+        require_secure_url(node_url)
+    except InsecureEndpointError as error:
+        raise ValueError("refusing non-HTTPS Node URL") from error
     req = urllib.request.Request(
         f"{node_url.rstrip('/')}/ingest",
         data=json.dumps(payload).encode(),

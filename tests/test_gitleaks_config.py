@@ -16,6 +16,7 @@ true, and it was true because nothing was running.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -126,3 +127,58 @@ def test_every_rule_has_an_id(config: dict[str, Any]) -> None:
         index for index, rule in enumerate(config.get("rules") or ()) if not rule.get("id")
     ]
     assert not missing, f"rule(s) {missing} have no id, so no allowlist can target them"
+
+
+def test_example_env_allowlist_stays_narrow(config: dict[str, Any]) -> None:
+    """The CHANGE_ME block must never widen past the one file and one rule.
+
+    The block exists for a single documented placeholder in .env.lite.example.
+    If it ever grows extra paths, extra rules, or a regex that does not demand
+    a literal CHANGE_ME value, it stops being an allowlist for an instruction
+    and becomes one for credentials.
+    """
+    blocks = [
+        block
+        for block in _allowlists(config)
+        if any("CHANGE_ME" in regex for regex in (block.get("regexes") or ()))
+    ]
+    assert blocks, "the CHANGE_ME example-env allowlist block is gone"
+    for block in blocks:
+        assert block.get("condition", "OR").upper() == "AND"
+        assert block.get("targetRules") == ["citadel-admin-key"]
+        assert block.get("paths") == ["^\\.env\\.lite\\.example$"]
+        for regex in block.get("regexes") or ():
+            assert "CHANGE_ME" in regex
+
+
+def test_example_env_allowlist_regexes_reject_real_values(config: dict[str, Any]) -> None:
+    """The CHANGE_ME regexes must cover the instruction and nothing else.
+
+    The scope test above checks the regexes only for a CHANGE_ME substring,
+    which a widened pattern like ``=.*$|CHANGE_ME`` would still satisfy while
+    allowlisting every finding in the file. So test behavior, not spelling:
+    each regex must match the documented placeholder line and must not match
+    a real-shaped value, with or without a CHANGE_ME prefix stuck onto it.
+    The patterns are simple enough that Python ``re`` is a faithful oracle
+    for gitleaks' RE2 engine.
+    """
+    # Built by concatenation so this file never contains a contiguous
+    # CITADEL_ADMIN_KEY= assignment: these are oracle inputs for the regex
+    # behavior above, and the secret scan must not find credential-shaped
+    # lines inside the file that verifies the scanner.
+    variable = "CITADEL_" + "ADMIN_KEY"
+    placeholder = f"{variable}=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS"
+    real_value = f"{variable}=aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0rU"
+    prefixed_real = f"{variable}=CHANGE_MEaB3dE6gH9jK2mN5pQ8sT1vW4yZ"
+    blocks = [
+        block
+        for block in _allowlists(config)
+        if any("CHANGE_ME" in regex for regex in (block.get("regexes") or ()))
+    ]
+    assert blocks, "the CHANGE_ME example-env allowlist block is gone"
+    for block in blocks:
+        for regex in block.get("regexes") or ():
+            pattern = re.compile(regex)
+            assert pattern.search(placeholder), f"no longer covers the placeholder: {regex}"
+            assert not pattern.search(real_value), f"pardons a real-shaped value: {regex}"
+            assert not pattern.search(prefixed_real), f"pardons a prefixed real value: {regex}"

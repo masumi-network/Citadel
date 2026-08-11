@@ -840,7 +840,7 @@ class TestRunExitStatus:
         monkeypatch.setattr(
             sb,
             "build_fingerprint",
-            lambda *args: {
+            lambda *args, **kwargs: {
                 "content": {"sha256": "a" * 64, "files": 1},
                 "api": {"documents_tracked": 1, "node_version": "test"},
                 "harness_git_sha": "test",
@@ -891,7 +891,7 @@ class TestRunExitStatus:
         monkeypatch.setattr(
             sb,
             "build_fingerprint",
-            lambda *args: {
+            lambda *args, **kwargs: {
                 "content": {"sha256": "a" * 64, "files": 1},
                 "api": {"documents_tracked": 1, "node_version": "test"},
                 "harness_git_sha": "test",
@@ -2346,3 +2346,1142 @@ class TestCompareGatesOnThePinNotTheFileBytes:
         comparable, verdicts = sb.compare_fingerprints(current, self._fingerprint())
         assert comparable is True
         assert any("ground-truth cache fingerprint unavailable" in line for line in verdicts)
+
+
+# --------------------------------------------------------------------------
+# Release mode: attempt classification, run identity, and the Docker p95 gate
+# --------------------------------------------------------------------------
+#
+# The generic gate answers "did retrieval quality regress against a comparable
+# corpus". Release mode answers a narrower question: "were these two runs taken
+# on the same machine, the same image, the same generation, the same model and
+# the same request shape, and did the candidate serve every question as fully
+# and as fast". A quality metric can hold steady while the run silently
+# degraded underneath it, so every degradation mode is counted rather than
+# inferred from the headline.
+
+RELEASE_CONTEXT = {
+    "runtime_id": "sha256:" + "1" * 64,
+    "docker_resource_digest": "sha256:" + "2" * 64,
+    "warmup_count": 2,
+    "retrieval_profile": "v0.5-default-top10",
+    "generation_id": "citadel-v050-ring12-g1",
+    "model": "BAAI/bge-small-en-v1.5",
+    "dimensions": 384,
+    "chunk_budget_tokens": 256,
+}
+CLIENT_IMAGE_DIGEST = "sha256:" + "3" * 64
+NODE_BUILD_ID = "c0ffee1"
+NODE_GENERATION = {
+    "generation_id": "citadel-v050-ring12-g1",
+    "projection_version": 3,
+    "config_digest": "sha256:" + "4" * 64,
+}
+FAILED_KINDS = ("timeout", "truncation", "partial", "provider", "malformed", "transport")
+
+
+def make_release_run(*, rows=None, attempts=None):
+    """A run JSON carrying complete release evidence.
+
+    Built on top of `make_enforce_run` so the generic gate's evidence stays in
+    one place: release mode LAYERS over it and never replaces it.
+    """
+    run = make_enforce_run()
+    run["fingerprint"]["release"] = dict(RELEASE_CONTEXT) | {
+        "repeat_count": 5,
+        "requested_top_k": 10,
+        "client_image_digest": CLIENT_IMAGE_DIGEST,
+    }
+    run["fingerprint"]["api"] = {
+        "documents_tracked": 2867,
+        "node_version": "9.9.9",
+        "build_id": NODE_BUILD_ID,
+        "lifecycle_generation": dict(NODE_GENERATION),
+    }
+    run["summary"]["repeats"] = 5
+    run["summary"]["latency"]["samples"] = 25
+    run["summary"]["attempts"] = attempts if attempts is not None else {
+        "total": 25,
+        "ok": 25,
+        "failed": 0,
+        "by_kind": {kind: 0 for kind in FAILED_KINDS},
+        "requested_top_k": 10,
+        "slots_requested": 250,
+        "slots_served": 250,
+        "underfilled": 0,
+        "foreign_dataset_hits": 0,
+        "hits_without_dataset": 0,
+        "expected_dataset": "masumi-network",
+    }
+    run["rows"] = rows if rows is not None else [
+        release_row(f"q{index:02d}") for index in range(1, 6)
+    ]
+    return run
+
+
+def release_row(identifier, *, has_spans=True, answer=True, doc=True):
+    """One saved row carrying everything the preservation gate needs.
+
+    `has_spans` is what decides WHICH pass field is the question's criterion,
+    so a fixture that omits it is a fixture the gate cannot read.
+    """
+    return {
+        "id": identifier,
+        "has_spans": has_spans,
+        "answer_pass_at_5": answer,
+        "doc_pass_at_5": doc,
+        "slots_served": 10,
+        "slots_requested": 10,
+    }
+
+
+class TestReleaseAttemptClassification:
+    """A 200 with a body is not a served page. The old loop counted only
+    transport failures, so a truncated page, a provider error rendered as a
+    successful body, or a `results` key that never arrived all scored as a
+    clean miss and moved recall without ever being called a failure."""
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            ("timeout", "timeout"),
+            ("TimeoutError", "timeout"),
+            ("socket.timeout", "timeout"),
+            ("HTTP 504", "timeout"),
+            ("HTTP 408", "timeout"),
+            ("JSONDecodeError", "truncation"),
+            ("IncompleteRead", "truncation"),
+            ("ContentTooShortError", "truncation"),
+            ("connection refused", "transport"),
+            ("HTTP 502", "transport"),
+            ("URLError", "transport"),
+        ],
+    )
+    def test_release_classifies_a_transport_level_failure(self, error, expected):
+        assert sb.classify_attempt(None, error) == expected
+
+    def test_release_classifies_a_missing_body_as_transport(self):
+        assert sb.classify_attempt(None, None) == "transport"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"error": "upstream provider unavailable"},
+            {"detail": "embedding provider returned 500"},
+            {"errors": ["provider timed out"], "results": []},
+            {"results": [], "error": {"code": "provider_error"}},
+        ],
+    )
+    def test_release_classifies_an_embedded_provider_error(self, body):
+        assert sb.classify_attempt(body, None) == "provider"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"hits": []},
+            {"results": {"0": {"text": "x"}}},
+            {"results": ["not a dict"]},
+            {"results": [{"text": "ok"}, 42]},
+        ],
+    )
+    def test_release_classifies_a_malformed_success(self, body):
+        assert sb.classify_attempt(body, None) == "malformed"
+
+    def test_release_classifies_a_body_that_declares_truncation(self):
+        assert sb.classify_attempt({"results": [], "truncated": True}, None) == "truncation"
+
+    @pytest.mark.parametrize(
+        "body",
+        [{"results": [], "partial": True}, {"results": [], "complete": False}],
+    )
+    def test_release_classifies_a_partial_response(self, body):
+        assert sb.classify_attempt(body, None) == "partial"
+
+    def test_release_classifies_a_well_formed_page_as_ok(self):
+        body = {"results": [repo_hit(PATH_DOC, BLOB_A, "body text")]}
+        assert sb.classify_attempt(body, None) == "ok"
+
+    def test_release_failed_kinds_cover_every_documented_mode(self):
+        assert set(sb.FAILED_ATTEMPT_KINDS) == set(FAILED_KINDS)
+
+
+class TestReleaseAttemptCensus:
+    SPAN = "the subsystem persists attempted charges with a null transaction id"
+
+    def _questions(self):
+        return [question(spans=[self.SPAN]), question("p01", recall=0)]
+
+    def test_release_run_records_an_attempt_census(self):
+        pages = iter(
+            [
+                (None, 1.0, "TimeoutError"),
+                ({"results": [], "partial": True}, 1.0, None),
+            ]
+        )
+        result = sb.execute_benchmark(
+            self._questions(), lambda q, k: next(pages), quiet=True
+        )
+        attempts = result["summary"]["attempts"]
+        assert attempts["total"] == 2
+        assert attempts["failed"] == 2
+        assert attempts["ok"] == 0
+        assert attempts["by_kind"]["timeout"] == 1
+        assert attempts["by_kind"]["partial"] == 1
+        assert attempts["requested_top_k"] == 10
+        assert attempts["slots_requested"] == 20
+
+    def test_release_underfilled_successful_pages_are_counted(self):
+        hit = repo_hit(PATH_DOC, BLOB_A, self.SPAN)
+        result = sb.execute_benchmark(
+            self._questions(), lambda q, k: ({"results": [hit]}, 1.0, None), quiet=True
+        )
+        attempts = result["summary"]["attempts"]
+        assert attempts["ok"] == 2
+        assert attempts["underfilled"] == 2
+        assert attempts["slots_served"] == 2
+        assert result["rows"][0]["slots_requested"] == 10
+        assert result["rows"][0]["underfilled"] is True
+
+    def test_release_a_full_page_is_not_underfilled(self):
+        hits = [
+            repo_hit(f"{PATH_DOC}.{index}", BLOB_A, self.SPAN) for index in range(10)
+        ]
+        result = sb.execute_benchmark(
+            self._questions(), lambda q, k: ({"results": hits}, 1.0, None), quiet=True
+        )
+        assert result["summary"]["attempts"]["underfilled"] == 0
+
+    def test_release_visibility_counts_foreign_dataset_hits(self):
+        """A hit served from a dataset the run was not scoped to is a
+        visibility failure, not a quality one, and no recall metric can see
+        it."""
+        own = repo_hit(PATH_DOC, BLOB_A, self.SPAN)
+        foreign = repo_hit(PATH_OTHER, BLOB_B, "other body")
+        foreign["_citadel"]["dataset"] = "another-seat"
+        result = sb.execute_benchmark(
+            self._questions(),
+            lambda q, k: ({"results": [own, foreign]}, 1.0, None),
+            quiet=True,
+            expect_dataset="masumi-network",
+        )
+        assert result["summary"]["attempts"]["foreign_dataset_hits"] == 2
+
+    def test_release_visibility_is_unmeasured_without_an_expected_dataset(self):
+        """Nobody declared which dataset the token was scoped to, so zero
+        foreign hits would be an unmeasured value printed as a pass."""
+        hit = repo_hit(PATH_DOC, BLOB_A, self.SPAN)
+        result = sb.execute_benchmark(
+            self._questions(), lambda q, k: ({"results": [hit]}, 1.0, None), quiet=True
+        )
+        assert result["summary"]["attempts"]["foreign_dataset_hits"] is None
+
+    def test_release_visibility_counts_unlabelled_hits_separately(self):
+        """An unattributable hit is not evidence of a clean read. It is
+        counted in its own bucket so it can never be silently folded into
+        zero foreign hits."""
+        hit = repo_hit(PATH_DOC, BLOB_A, self.SPAN)
+        hit["_citadel"].pop("dataset")
+        result = sb.execute_benchmark(
+            self._questions(),
+            lambda q, k: ({"results": [hit]}, 1.0, None),
+            quiet=True,
+            expect_dataset="masumi-network",
+        )
+        attempts = result["summary"]["attempts"]
+        assert attempts["foreign_dataset_hits"] == 0
+        assert attempts["hits_without_dataset"] == 2
+
+
+class TestReleaseContextArgument:
+    def test_release_context_accepts_the_exact_shape(self):
+        assert sb.parse_release_context(json.dumps(RELEASE_CONTEXT)) == RELEASE_CONTEXT
+
+    @pytest.mark.parametrize("field", sorted(RELEASE_CONTEXT))
+    def test_release_context_rejects_a_missing_field(self, field):
+        payload = dict(RELEASE_CONTEXT)
+        payload.pop(field)
+        with pytest.raises(sb.BenchError, match=field):
+            sb.parse_release_context(json.dumps(payload))
+
+    def test_release_context_rejects_an_unknown_field(self):
+        payload = dict(RELEASE_CONTEXT) | {"hostname": "bench-01"}
+        with pytest.raises(sb.BenchError, match="hostname"):
+            sb.parse_release_context(json.dumps(payload))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("runtime_id", "bench-host-01"),
+            ("runtime_id", "sha256:" + "z" * 64),
+            ("docker_resource_digest", "sha256:abc"),
+            ("warmup_count", -1),
+            ("warmup_count", "2"),
+            ("dimensions", 0),
+            ("dimensions", 384.5),
+            ("chunk_budget_tokens", 0),
+            ("retrieval_profile", ""),
+            ("generation_id", "   "),
+            ("model", 384),
+        ],
+    )
+    def test_release_context_rejects_an_invalid_value(self, field, value):
+        payload = dict(RELEASE_CONTEXT) | {field: value}
+        with pytest.raises(sb.BenchError, match=field):
+            sb.parse_release_context(json.dumps(payload))
+
+    def test_release_context_rejects_non_object_json(self):
+        with pytest.raises(sb.BenchError, match="object"):
+            sb.parse_release_context("[]")
+
+    def test_release_context_rejects_unparsable_json(self):
+        with pytest.raises(sb.BenchError, match="JSON"):
+            sb.parse_release_context("{not json")
+
+
+class TestReleaseFingerprintIdentity:
+    def _stub(self, monkeypatch):
+        monkeypatch.setattr(sb, "api_fingerprint", lambda *a, **k: {"node_version": "9.9.9"})
+        monkeypatch.setattr(sb, "corpus_census", lambda *a, **k: {"truncated": False})
+        monkeypatch.setattr(sb, "harness_git_sha", lambda: "deadbeef")
+        monkeypatch.setattr(sb, "ground_truth_fingerprint", lambda *a, **k: {"sha256": "g" * 64})
+
+    def _questions_file(self, tmp_path):
+        path = tmp_path / "questions.json"
+        path.write_text(json.dumps({"questions": [question()]}), encoding="utf-8")
+        return path
+
+    def test_release_fingerprint_records_the_run_identity(self, tmp_path, monkeypatch):
+        self._stub(monkeypatch)
+        fingerprint = sb.build_fingerprint(
+            "https://node.example",
+            "token",
+            5.0,
+            self._questions_file(tmp_path),
+            None,
+            release_context=dict(RELEASE_CONTEXT),
+            repeats=5,
+            requested_top_k=10,
+            client_image_digest=CLIENT_IMAGE_DIGEST,
+        )
+        release = fingerprint["release"]
+        assert release["runtime_id"] == RELEASE_CONTEXT["runtime_id"]
+        assert release["repeat_count"] == 5
+        assert release["requested_top_k"] == 10
+        assert release["client_image_digest"] == CLIENT_IMAGE_DIGEST
+
+    def test_release_fingerprint_is_absent_without_a_release_context(
+        self, tmp_path, monkeypatch
+    ):
+        self._stub(monkeypatch)
+        fingerprint = sb.build_fingerprint(
+            "https://node.example", "token", 5.0, self._questions_file(tmp_path), None
+        )
+        assert "release" not in fingerprint
+
+    def test_release_api_fingerprint_preserves_build_and_generation_identity(
+        self, monkeypatch
+    ):
+        """`compare` can only reject a swapped image or a re-derived generation
+        if the run recorded them. Both are published on /api/state and both
+        were being dropped."""
+        state = {
+            "version": "0.5.0",
+            "build_id": "c0ffee1",
+            "totals": {"documents": 7},
+            "sources": [],
+            "lifecycle": {
+                "enabled": True,
+                "current_generation": {
+                    "generation_id": "citadel-v050-ring12-g1",
+                    "projection_version": 3,
+                    "config_digest": "sha256:" + "4" * 64,
+                    "current_sources": 8,
+                },
+            },
+        }
+
+        class _Response:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps(self._payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            if request.full_url.endswith("/api/state"):
+                return _Response(state)
+            return _Response({"stats": {}})
+
+        monkeypatch.setattr(sb.urllib.request, "urlopen", fake_urlopen)
+        fingerprint = sb.api_fingerprint("https://node.example", "token", 5.0)
+        assert fingerprint["build_id"] == "c0ffee1"
+        assert fingerprint["lifecycle_generation"] == {
+            "generation_id": "citadel-v050-ring12-g1",
+            "projection_version": 3,
+            "config_digest": "sha256:" + "4" * 64,
+        }
+
+
+class TestReleaseCompareRejectsIdentityDrift:
+    def _fingerprint(self):
+        return {
+            "content": {"sha256": "f" * 64},
+            "questions_sha256": "q" * 64,
+            "questions_pin": "p" * 64,
+            "harness_git_sha": "deadbeef",
+            "ground_truth": {"sha256": "g" * 64, "files": 3},
+            "api": {
+                "build_id": NODE_BUILD_ID,
+                "lifecycle_generation": dict(NODE_GENERATION),
+            },
+            "release": dict(RELEASE_CONTEXT)
+            | {
+                "repeat_count": 5,
+                "requested_top_k": 10,
+                "client_image_digest": CLIENT_IMAGE_DIGEST,
+            },
+        }
+
+    def test_release_compare_accepts_an_identical_identity(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(), self._fingerprint(), release=True
+        )
+        assert comparable is True, verdicts
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("runtime_id", "sha256:" + "9" * 64),
+            ("docker_resource_digest", "sha256:" + "9" * 64),
+            ("warmup_count", 3),
+            ("retrieval_profile", "v0.5-wide-top50"),
+            ("generation_id", "citadel-v050-ring12-g2"),
+            ("model", "BAAI/bge-base-en-v1.5"),
+            ("dimensions", 768),
+            ("chunk_budget_tokens", 512),
+            ("repeat_count", 3),
+            ("requested_top_k", 5),
+            ("client_image_digest", "sha256:" + "9" * 64),
+        ],
+    )
+    def test_release_compare_rejects_a_changed_identity_field(self, field, value):
+        current = self._fingerprint()
+        current["release"][field] = value
+        comparable, verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+        assert comparable is False
+        assert any(field in line for line in verdicts), verdicts
+
+    def test_release_compare_requires_the_identity_on_both_runs(self):
+        current = self._fingerprint()
+        current.pop("release")
+        comparable, verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+        assert comparable is False
+        assert any("release identity" in line for line in verdicts), verdicts
+
+    def test_release_compare_gates_on_the_ground_truth_sha(self):
+        """A note in generic mode, a gate in release mode: two release runs
+        scored against different cached bodies are not one measurement."""
+        current = self._fingerprint()
+        current["ground_truth"]["sha256"] = "h" * 64
+        comparable, _verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+        assert comparable is False
+
+    def test_release_generic_mode_still_treats_ground_truth_as_a_note(self):
+        current = self._fingerprint()
+        current["ground_truth"]["sha256"] = "h" * 64
+        comparable, verdicts = sb.compare_fingerprints(current, self._fingerprint())
+        assert comparable is True
+        assert any("ground-truth cache differs" in line for line in verdicts)
+
+    def test_release_generic_mode_ignores_a_changed_identity(self):
+        current = self._fingerprint()
+        current["release"]["runtime_id"] = "sha256:" + "9" * 64
+        comparable, _verdicts = sb.compare_fingerprints(current, self._fingerprint())
+        assert comparable is True
+
+
+class TestReleaseEnforce:
+    def test_release_enforce_accepts_a_healthy_pair(self):
+        comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), make_release_run(), release=True
+        )
+        assert comparable is True
+        assert failures == []
+
+    @pytest.mark.parametrize("kind", FAILED_KINDS)
+    def test_release_enforce_rejects_every_failed_attempt_kind(self, kind):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["by_kind"][kind] = 1
+        candidate["summary"]["attempts"]["failed"] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any(kind in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_a_missing_attempt_census(self):
+        candidate = make_release_run()
+        candidate["summary"].pop("attempts")
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("attempt census" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_visibility_failures(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["foreign_dataset_hits"] = 2
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("fan-out arm" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_unmeasured_visibility(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["foreign_dataset_hits"] = None
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("unmeasured" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_underfilled_successes(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["underfilled"] = 3
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("underfilled" in failure for failure in failures), failures
+
+    def test_release_enforce_allows_underfilled_when_the_corpus_is_too_small(self):
+        """The carve-out the plan names: a corpus holding fewer documents than
+        the requested top-k cannot fill a page, and calling that a regression
+        would gate on corpus size rather than on retrieval."""
+        baseline = make_release_run()
+        candidate = make_release_run()
+        for run in (baseline, candidate):
+            run["fingerprint"]["census"]["documents_total"] = 4
+            run["fingerprint"]["census"]["documents_walked"] = 4
+        candidate["summary"]["attempts"]["underfilled"] = 3
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            baseline, candidate, release=True
+        )
+
+        assert not any("underfilled" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_answer_preservation_loss(self):
+        candidate = make_release_run(
+            rows=[release_row("q01", answer=False)]
+            + [release_row(f"q{index:02d}") for index in range(2, 6)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("q01" in failure for failure in failures), failures
+
+    def test_release_enforce_accepts_answer_preservation_gains(self):
+        baseline = make_release_run(
+            rows=[release_row("q01", answer=False)]
+            + [release_row(f"q{index:02d}") for index in range(2, 6)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            baseline, make_release_run(), release=True
+        )
+
+        assert failures == []
+
+    def test_release_enforce_rejects_mismatched_question_identities(self):
+        candidate = make_release_run(
+            rows=[release_row(f"z{index:02d}") for index in range(5)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("row identities" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_unequal_latency_samples(self):
+        candidate = make_release_run()
+        candidate["summary"]["latency"]["samples"] = 24
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("latency sample" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_zero_latency_samples(self):
+        baseline = make_release_run()
+        candidate = make_release_run()
+        for run in (baseline, candidate):
+            run["summary"]["latency"]["samples"] = 0
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            baseline, candidate, release=True
+        )
+
+        assert any("latency sample" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_unequal_repeat_counts(self):
+        candidate = make_release_run()
+        candidate["summary"]["repeats"] = 3
+        candidate["fingerprint"]["release"]["repeat_count"] = 3
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("repeat count" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_a_p95_regression_beyond_the_ceiling(self):
+        candidate = make_release_run()
+        candidate["summary"]["latency"]["p95_ms"] = 1086.1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("p95" in failure for failure in failures), failures
+
+    def test_release_enforce_accepts_a_p95_within_the_ceiling(self):
+        candidate = make_release_run()
+        candidate["summary"]["latency"]["p95_ms"] = 1086.0
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert failures == []
+
+    def test_release_enforce_honours_a_tighter_p95_budget(self):
+        candidate = make_release_run()
+        candidate["summary"]["latency"]["p95_ms"] = 950.0
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True, max_p95_regression_percent=0.0
+        )
+
+        assert any("p95" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_an_unusable_baseline_p95(self):
+        baseline = make_release_run()
+        baseline["summary"]["latency"]["p95_ms"] = 0.0
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            baseline, make_release_run(), release=True
+        )
+
+        assert any("p95" in failure for failure in failures), failures
+
+    def test_release_enforce_still_applies_the_generic_gate(self):
+        candidate = make_release_run()
+        candidate["summary"]["quality"]["answer_recall_at_5"] -= 0.01
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("regressed" in failure for failure in failures), failures
+
+    def test_release_evidence_is_ignored_when_release_is_absent(self):
+        """Generic enforce keeps its exact behaviour: a run with no attempt
+        census, no release identity and a slower p95 still passes."""
+        candidate = make_enforce_run()
+        candidate["summary"]["latency"]["p95_ms"] = 90000.0
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_enforce_run(), candidate
+        )
+
+        assert failures == []
+
+
+class TestReleaseEnforceCli:
+    def _write(self, tmp_path, name, run):
+        path = tmp_path / name
+        path.write_text(json.dumps(run), encoding="utf-8")
+        return str(path)
+
+    def test_release_enforce_cli_passes_a_healthy_pair(self, tmp_path, capsys):
+        baseline = self._write(tmp_path, "baseline.json", make_release_run())
+        candidate = self._write(tmp_path, "candidate.json", make_release_run())
+
+        exit_code = sb.main(
+            [
+                "enforce",
+                "--release",
+                "--max-p95-regression-percent",
+                "20",
+                baseline,
+                candidate,
+            ]
+        )
+
+        assert exit_code == 0
+        assert "ENFORCE PASSED" in capsys.readouterr().out
+
+    def test_release_enforce_cli_fails_on_a_p95_regression(self, tmp_path, capsys):
+        slower = make_release_run()
+        slower["summary"]["latency"]["p95_ms"] = 2000.0
+        baseline = self._write(tmp_path, "baseline.json", make_release_run())
+        candidate = self._write(tmp_path, "candidate.json", slower)
+
+        exit_code = sb.main(["enforce", "--release", baseline, candidate])
+
+        assert exit_code == 1
+        assert "p95" in capsys.readouterr().err
+
+    def test_release_enforce_cli_rejects_a_negative_p95_budget(self, tmp_path, capsys):
+        baseline = self._write(tmp_path, "baseline.json", make_release_run())
+        candidate = self._write(tmp_path, "candidate.json", make_release_run())
+
+        exit_code = sb.main(
+            [
+                "enforce",
+                "--release",
+                "--max-p95-regression-percent",
+                "-1",
+                baseline,
+                candidate,
+            ]
+        )
+
+        assert exit_code == 2
+        assert "max-p95-regression-percent" in capsys.readouterr().err
+
+    def test_release_run_cli_records_the_release_context(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps({"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}),
+            encoding="utf-8",
+        )
+        out_path = tmp_path / "run.json"
+        hit = repo_hit(PATH_DOC, BLOB_A, "x" * 20)
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.setattr(
+            sb,
+            "make_http_searcher",
+            lambda *args: lambda _query, _top_k: ({"results": [hit]}, 2.0, None),
+        )
+        monkeypatch.setattr(sb, "api_fingerprint", lambda *a, **k: {"node_version": "9.9.9"})
+        monkeypatch.setattr(sb, "corpus_census", lambda *a, **k: {"truncated": False})
+        monkeypatch.setattr(sb, "harness_git_sha", lambda: "deadbeef")
+        monkeypatch.setattr(
+            sb, "ground_truth_fingerprint", lambda *a, **k: {"sha256": "g" * 64}
+        )
+
+        exit_code = sb.main(
+            [
+                "run",
+                "--questions",
+                str(questions_path),
+                "--node-url",
+                "https://node.example",
+                "--out",
+                str(out_path),
+                "--release-context",
+                json.dumps(RELEASE_CONTEXT),
+                "--client-image-digest",
+                CLIENT_IMAGE_DIGEST,
+                "--expect-dataset",
+                "masumi-network",
+            ]
+        )
+
+        assert exit_code == 0, capsys.readouterr()
+        saved = json.loads(out_path.read_text(encoding="utf-8"))
+        assert saved["fingerprint"]["release"]["generation_id"] == "citadel-v050-ring12-g1"
+        assert saved["fingerprint"]["release"]["client_image_digest"] == CLIENT_IMAGE_DIGEST
+        assert saved["summary"]["attempts"]["foreign_dataset_hits"] == 0
+
+    def test_release_run_cli_rejects_an_invalid_release_context(self, tmp_path, monkeypatch, capsys):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps({"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+
+        exit_code = sb.main(
+            [
+                "run",
+                "--questions",
+                str(questions_path),
+                "--node-url",
+                "https://node.example",
+                "--release-context",
+                json.dumps(dict(RELEASE_CONTEXT) | {"dimensions": 0}),
+            ]
+        )
+
+        assert exit_code == 2
+        assert "dimensions" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Release mode, second pass: the six defects adversarial review confirmed
+# --------------------------------------------------------------------------
+#
+# Every one of these was a gate that READ less than it recorded. A field
+# written into the artifact and never examined is the same defect as no field
+# at all, except it also reads as coverage.
+
+
+class TestReleasePreservesEveryQuestionsOwnCriterion:
+    """`answer_pass_at_5` is the criterion for questions WITH spans. The
+    harness's own rule for the rest is `doc_pass_at_5` (`attempt_outcome`),
+    and 22 of the shipped positives carry no spans. Gating on the answer
+    field alone left those questions free to swap which document they found
+    while the aggregate stood still."""
+
+    def test_release_enforce_rejects_a_doc_pass_loss_on_a_span_less_question(self):
+        baseline = make_release_run(
+            rows=[
+                release_row("l01", has_spans=False, answer=False, doc=True),
+                release_row("l02", has_spans=False, answer=False, doc=False),
+            ]
+            + [release_row(f"q{index:02d}") for index in range(3, 6)]
+        )
+        candidate = make_release_run(
+            rows=[
+                release_row("l01", has_spans=False, answer=False, doc=False),
+                release_row("l02", has_spans=False, answer=False, doc=True),
+            ]
+            + [release_row(f"q{index:02d}") for index in range(3, 6)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            baseline, candidate, release=True
+        )
+
+        assert any("l01" in failure for failure in failures), failures
+        assert not any("l02" in failure for failure in failures), failures
+
+    def test_release_enforce_ignores_a_doc_loss_on_a_question_scored_by_spans(self):
+        """A span-scored question is judged on its answer text. Its
+        `doc_pass_at_5` moving is not the criterion and must not fail the
+        release on its own."""
+        candidate = make_release_run(
+            rows=[release_row("q01", doc=False)]
+            + [release_row(f"q{index:02d}") for index in range(2, 6)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert failures == []
+
+    def test_release_enforce_rejects_a_row_that_cannot_name_its_criterion(self):
+        candidate = make_release_run(
+            rows=[{"id": "q01", "answer_pass_at_5": True}]
+            + [release_row(f"q{index:02d}") for index in range(2, 6)]
+        )
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("unmeasured" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_a_span_less_row_missing_its_doc_pass(self):
+        rows = [
+            {"id": "l01", "has_spans": False, "answer_pass_at_5": False}
+        ] + [release_row(f"q{index:02d}") for index in range(2, 6)]
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(rows=rows), make_release_run(rows=rows), release=True
+        )
+
+        assert any("unmeasured" in failure for failure in failures), failures
+
+
+class TestReleaseVisibilityRefusesUnlabelledPages:
+    """`hits_without_dataset` was recorded as the foreign count's declared
+    blind spot and then never read. A node that stops stamping labels drives
+    the foreign count to a structural zero, and the gate that already refuses
+    `foreign_dataset_hits=None` for being unmeasured passed the same
+    unmeasured state in its other shape."""
+
+    def test_release_enforce_rejects_unlabelled_hits_as_unmeasured_visibility(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["foreign_dataset_hits"] = 0
+        candidate["summary"]["attempts"]["hits_without_dataset"] = 50
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("unattributable" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_a_missing_unlabelled_hit_count(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"].pop("hits_without_dataset")
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("hits_without_dataset" in failure for failure in failures), failures
+
+    def test_release_enforce_requires_both_runs_to_expect_one_dataset(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["expected_dataset"] = "another-seat"
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("expected dataset" in failure for failure in failures), failures
+
+    def test_release_enforce_rejects_an_undeclared_expected_dataset(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["expected_dataset"] = None
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert any("expected dataset" in failure for failure in failures), failures
+
+    def test_release_run_records_the_expected_dataset_it_was_given(self):
+        span = "the subsystem persists attempted charges with a null transaction id"
+        hit = repo_hit(PATH_DOC, BLOB_A, span)
+        result = sb.execute_benchmark(
+            [question(spans=[span]), question("p01", recall=0)],
+            lambda q, k: ({"results": [hit]}, 1.0, None),
+            quiet=True,
+            expect_dataset="masumi-network",
+        )
+        assert result["summary"]["attempts"]["expected_dataset"] == "masumi-network"
+
+
+class TestReleaseClientImageDigestIsMeasured:
+    """Eight context fields are pattern-validated and mandatory. The ninth
+    identity field defaulted to an environment variable, so the likely
+    misconfiguration (nobody sets it on either run) recorded None on both
+    sides and compared equal: an unmeasured identity accepted as a matched
+    one."""
+
+    def _fingerprint(self, digest):
+        return {
+            "content": {"sha256": "f" * 64},
+            "questions_sha256": "q" * 64,
+            "questions_pin": "p" * 64,
+            "ground_truth": {"sha256": "g" * 64, "files": 3},
+            "api": {
+                "build_id": NODE_BUILD_ID,
+                "lifecycle_generation": dict(NODE_GENERATION),
+            },
+            "release": dict(RELEASE_CONTEXT)
+            | {
+                "repeat_count": 5,
+                "requested_top_k": 10,
+                "client_image_digest": digest,
+            },
+        }
+
+    @pytest.mark.parametrize("digest", [None, "latest", "sha256:abc", ""])
+    def test_release_compare_rejects_an_unmeasured_client_image(self, digest):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(digest), self._fingerprint(digest), release=True
+        )
+        assert comparable is False
+        assert any("client_image_digest" in line for line in verdicts), verdicts
+
+    def test_release_compare_accepts_a_valid_client_image_digest(self):
+        comparable, verdicts = sb.compare_fingerprints(
+            self._fingerprint(CLIENT_IMAGE_DIGEST),
+            self._fingerprint(CLIENT_IMAGE_DIGEST),
+            release=True,
+        )
+        assert comparable is True, verdicts
+
+    def _run_cli(self, tmp_path, monkeypatch, *extra):
+        questions_path = tmp_path / "questions.json"
+        questions_path.write_text(
+            json.dumps(
+                {"questions": [question(spans=["x" * 20]), question("p01", recall=0)]}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test_token")
+        monkeypatch.delenv("CITADEL_BENCH_CLIENT_IMAGE_DIGEST", raising=False)
+        return sb.main(
+            [
+                "run",
+                "--questions",
+                str(questions_path),
+                "--node-url",
+                "https://node.example",
+                "--release-context",
+                json.dumps(RELEASE_CONTEXT),
+                *extra,
+            ]
+        )
+
+    def test_release_run_cli_requires_a_client_image_digest(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        assert self._run_cli(tmp_path, monkeypatch) == 2
+        assert "--client-image-digest" in capsys.readouterr().err
+
+    def test_release_run_cli_rejects_a_junk_client_image_digest(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        exit_code = self._run_cli(
+            tmp_path, monkeypatch, "--client-image-digest", "latest"
+        )
+        assert exit_code == 2
+        assert "client-image-digest" in capsys.readouterr().err
+
+
+class TestReleaseComparesTheNodeItActuallyRan:
+    """`build_id` and `lifecycle_generation` were recorded and read by nobody,
+    which is this repo's guards-ship-inert defect wearing a comment that
+    claimed the opposite. The generation the OPERATOR typed is also now
+    checked against the generation the NODE reported, so a typo cannot
+    attest a generation that never served the run."""
+
+    def _fingerprint(self):
+        return {
+            "content": {"sha256": "f" * 64},
+            "questions_sha256": "q" * 64,
+            "questions_pin": "p" * 64,
+            "ground_truth": {"sha256": "g" * 64, "files": 3},
+            "api": {
+                "build_id": NODE_BUILD_ID,
+                "lifecycle_generation": dict(NODE_GENERATION),
+            },
+            "release": dict(RELEASE_CONTEXT)
+            | {
+                "repeat_count": 5,
+                "requested_top_k": 10,
+                "client_image_digest": CLIENT_IMAGE_DIGEST,
+            },
+        }
+
+    def test_release_compare_rejects_a_swapped_node_build(self):
+        current = self._fingerprint()
+        current["api"]["build_id"] = "deadbee"
+
+        comparable, verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+
+        assert comparable is False
+        assert any("build_id" in line for line in verdicts), verdicts
+
+    def test_release_compare_rejects_a_re_derived_generation(self):
+        current = self._fingerprint()
+        current["api"]["lifecycle_generation"]["config_digest"] = "sha256:" + "9" * 64
+
+        comparable, verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+
+        assert comparable is False
+        assert any("lifecycle_generation" in line for line in verdicts), verdicts
+
+    @pytest.mark.parametrize("missing", ["build_id", "lifecycle_generation"])
+    def test_release_compare_rejects_an_unrecorded_node_identity(self, missing):
+        current = self._fingerprint()
+        current["api"].pop(missing)
+
+        comparable, verdicts = sb.compare_fingerprints(
+            current, self._fingerprint(), release=True
+        )
+
+        assert comparable is False
+        assert any(missing in line for line in verdicts), verdicts
+
+    def test_release_compare_rejects_a_generation_the_node_never_reported(self):
+        """The operator typed one generation into --release-context and the
+        node served another. Recording both and comparing neither is how a
+        release attests a generation that never ran."""
+        current = self._fingerprint()
+        baseline = self._fingerprint()
+        for fingerprint in (current, baseline):
+            fingerprint["release"]["generation_id"] = "citadel-v050-ring12-g2"
+
+        comparable, verdicts = sb.compare_fingerprints(
+            current, baseline, release=True
+        )
+
+        assert comparable is False
+        assert any("does not match" in line for line in verdicts), verdicts
+
+    def test_release_enforce_rejects_a_swapped_node_build_end_to_end(self):
+        candidate = make_release_run()
+        candidate["fingerprint"]["api"]["build_id"] = "deadbee"
+
+        comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        assert comparable is False
+        assert failures != []
+
+    def test_release_generic_mode_ignores_the_node_identity(self):
+        current = self._fingerprint()
+        current["api"]["build_id"] = "deadbee"
+
+        comparable, _verdicts = sb.compare_fingerprints(current, self._fingerprint())
+
+        assert comparable is True
+
+
+class TestReleaseVisibilityMessageSaysWhatItMeasures:
+    """The unmeasured-visibility message told an operator that running with
+    --expect-dataset would measure cross-dataset visibility. The label it
+    counts is the fan-out arm the row was served from, so that promise was
+    one the mechanism cannot keep."""
+
+    def test_release_unmeasured_visibility_message_does_not_promise_isolation(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["foreign_dataset_hits"] = None
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        message = next(failure for failure in failures if "unmeasured" in failure)
+        assert "cross-dataset visibility is measured" not in message
+        assert "arm" in message
+
+    def test_release_foreign_hit_message_names_the_arm_not_a_boundary(self):
+        candidate = make_release_run()
+        candidate["summary"]["attempts"]["foreign_dataset_hits"] = 2
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(
+            make_release_run(), candidate, release=True
+        )
+
+        message = next(failure for failure in failures if "2 hit" in failure)
+        assert "arm" in message
+        assert "masumi-network" in message

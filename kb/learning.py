@@ -13,11 +13,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Mapping
+from datetime import datetime
 import logging
 from typing import Any, Literal
 
 from kb.conflicts import KnowledgeConflictStore, detect_contribution_conflict
 from kb.llm_enrichment import EnrichedChunk, EnrichmentOutcome, enrich_source_material
+from kb.lifecycle import lifecycle_chunk_source_key
 from kb.mesh import MeshState
 from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
 from kb.models import IngestResult
@@ -86,6 +88,12 @@ class LearningProcess:
         detect_conflicts: bool = True,
         tier: Literal["full", "light", "shared"] = "full",
         defer_cognify: bool = False,
+        source_key: str | None = None,
+        source_locator: str | None = None,
+        media_type: str = "text/plain",
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
     ) -> LearningOutcome:
         """Filter, optionally enrich/chunk, ingest, record mesh activity,
         detect conflicts, and optionally run improvement for one piece of
@@ -124,9 +132,25 @@ class LearningProcess:
             enrichment = self._enrich(data)
             effective_run_improve = run_improve
         chunk_inputs = self._chunk_inputs(data, list(tags or []), enrichment)
+        active_source_keys = {
+            source_key
+            if len(chunk_inputs) == 1
+            else lifecycle_chunk_source_key(source_key, index)
+            for index in range(len(chunk_inputs))
+        } if source_key is not None else set()
+        previous_source_keys: set[str] = set()
+        lifecycle_source_keys = getattr(self.citadel, "lifecycle_source_keys", None)
+        if source_key is not None and callable(lifecycle_source_keys):
+            previous_source_keys = set(
+                lifecycle_source_keys(
+                    dataset=target_dataset,
+                    source_key=source_key,
+                    include_chunks=True,
+                )
+            )
 
         results: list[IngestResult] = []
-        for chunk_data, chunk_tags in chunk_inputs:
+        for chunk_index, (chunk_data, chunk_tags) in enumerate(chunk_inputs):
             try:
                 ingest_kwargs: dict[str, Any] = {
                     "dataset": dataset,
@@ -136,6 +160,26 @@ class LearningProcess:
                 }
                 if attestation is not None:
                     ingest_kwargs["attestation"] = attestation
+                if source_key is not None:
+                    if len(chunk_inputs) == 1:
+                        ingest_kwargs["source_key"] = source_key
+                    else:
+                        ingest_kwargs["source_key"] = lifecycle_chunk_source_key(
+                            source_key,
+                            chunk_index,
+                        )
+                        ingest_kwargs["_lifecycle_parent_source_key"] = source_key
+                        ingest_kwargs["_lifecycle_chunk_index"] = chunk_index
+                if source_locator is not None:
+                    ingest_kwargs["source_locator"] = source_locator
+                if media_type != "text/plain":
+                    ingest_kwargs["media_type"] = media_type
+                if capture_actor_id is not None:
+                    ingest_kwargs["capture_actor_id"] = capture_actor_id
+                if capture_run_id is not None:
+                    ingest_kwargs["capture_run_id"] = capture_run_id
+                if captured_at is not None:
+                    ingest_kwargs["captured_at"] = captured_at
                 result = await self.citadel.ingest(chunk_data, **ingest_kwargs)
             except Exception as exc:
                 if self.mesh:
@@ -165,6 +209,20 @@ class LearningProcess:
 
         primary = next((result for result in results if result.accepted), results[0])
         accepted_any = any(result.accepted for result in results)
+        if source_key is not None and results and all(result.accepted for result in results):
+            tombstone_source = getattr(self.citadel, "tombstone_source", None)
+            if callable(tombstone_source):
+                for obsolete_key in sorted(previous_source_keys - active_source_keys):
+                    await tombstone_source(
+                        dataset=target_dataset,
+                        source_key=obsolete_key,
+                        reason="source chunk set replaced",
+                        source_locator=source_locator,
+                        capture_actor_id=capture_actor_id,
+                        capture_run_id=capture_run_id,
+                        captured_at=captured_at,
+                        include_chunks=False,
+                    )
 
         conflict = None
         if detect_conflicts and accepted_any:

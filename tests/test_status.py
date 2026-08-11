@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from io import BytesIO
 import json
 from pathlib import Path
 from typing import Any
+import urllib.error
 
 import pytest
 
@@ -47,7 +49,7 @@ def _route(responses: dict[str, dict[str, Any]]):
 
 
 def test_request_refuses_non_https() -> None:
-    with pytest.raises(ValueError, match="non-HTTPS"):
+    with pytest.raises(ValueError, match="refusing to send credentials"):
         status_mod._request("GET", "http://node.example/healthz")
 
 
@@ -198,6 +200,50 @@ def test_check_search_uses_short_smoke_timeout(monkeypatch) -> None:
     check = status_mod.check_search("https://node.example", "ctdl_tok")
     assert check.ok
     assert captured["timeout"] == status_mod._SMOKE_SEARCH_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "timed_out"),
+    [
+        (504, status_mod.CODE_SEARCH_TIMEOUT, True),
+        (503, status_mod.CODE_QDRANT_UNAVAILABLE, False),
+    ],
+)
+def test_check_search_preserves_typed_server_error(
+    monkeypatch,
+    status: int,
+    code: str,
+    timed_out: bool,
+) -> None:
+    body = json.dumps(
+        {
+            "detail": {
+                "code": code,
+                "message": "bearer ctdl_secret must not reach status output",
+            }
+        }
+    ).encode()
+
+    def raise_typed(request: Any, timeout: float | None = None) -> None:
+        raise urllib.error.HTTPError(request.full_url, status, "failure", {}, BytesIO(body))
+
+    monkeypatch.setattr(status_mod._OPENER, "open", raise_typed)
+    check = status_mod.check_search("https://node.example", "ctdl_tok")
+
+    assert check.ok is False
+    assert check.data["code"] == code
+    assert check.data["http_status"] == status
+    assert check.data.get("timed_out", False) is timed_out
+    assert "ctdl_secret" not in check.detail
+
+    report = StatusReport(
+        node_url="https://node.example",
+        healthy=True,
+        identity={"seat_slug": "a"},
+        checks=[Check("auth", ok=True, detail="valid"), check],
+        recent=[],
+    )
+    assert report.readiness()["code"] == code
 
 
 def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
@@ -357,6 +403,52 @@ def test_check_corpus_ok_when_readyz_healthy(monkeypatch) -> None:
     check = status_mod.check_corpus("https://node.example", "ctdl_tok")
     assert check is not None and check.ok is True
     assert "280 indexed / 200 tracked" in check.detail
+
+
+def test_check_corpus_reports_bounded_probe_and_preserves_payload(monkeypatch) -> None:
+    body = {
+        "ok": False,
+        "corpus": {
+            "ok": False,
+            "tracked_sources": 330,
+            "indexed_docs": 33788,
+            "relational_documents": 2867,
+            "probe_documents": 64,
+            "probe_complete": False,
+            "probe_ok": False,
+            "probe_fully_indexed_documents": 0,
+        },
+        "canary": None,
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+
+    assert check is not None and check.ok is False
+    assert check.detail == (
+        "corpus probe incomplete: 0/64 sampled documents fully indexed (64/2867 sampled)"
+    )
+    assert check.data["corpus"]["relational_documents"] == 2867
+
+
+def test_render_verdict_does_not_infer_empty_search_from_corpus_failure() -> None:
+    report = StatusReport(
+        node_url="https://node.example",
+        healthy=False,
+        identity={},
+        checks=[
+            Check("node", ok=True, detail="healthy"),
+            Check("auth", ok=True, detail="valid"),
+            Check("corpus", ok=False, detail="corpus probe incomplete: 0/64 sampled"),
+        ],
+        recent=[],
+    )
+
+    out = status_mod.render_verdict(report)
+
+    assert "Data plane not ready" in out
+    assert "search availability is reported separately" in out
+    assert "search returns nothing" not in out
 
 
 def test_gather_status_node_down(tmp_path: Path) -> None:
@@ -519,6 +611,23 @@ def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload["healthy"] is True
     assert payload["identity"]["seat_slug"] == "s"
+
+
+def test_status_transport_allows_loopback_http(monkeypatch) -> None:
+    monkeypatch.setattr(
+        status_mod._OPENER,
+        "open",
+        _route({"/healthz": {"ok": True}}),
+    )
+
+    assert status_mod._request("GET", "http://localhost:18000/healthz") == {
+        "ok": True
+    }
+
+
+def test_status_transport_refuses_public_http() -> None:
+    with pytest.raises(ValueError, match="refusing to send credentials"):
+        status_mod._request("GET", "http://node.example/healthz")
 
 
 def test_status_command_unhealthy_exits_one(tmp_path: Path, monkeypatch, capsys) -> None:

@@ -105,6 +105,119 @@ def _print_json(value: Any) -> None:
     print(json.dumps(value, default=str, indent=2))
 
 
+async def _deploy_local(args: argparse.Namespace) -> int:
+    from kb.local_deploy import LocalDeployError, deploy_local
+
+    try:
+        result = await asyncio.to_thread(
+            deploy_local,
+            config_dir=Path(args.config_dir).expanduser() if args.config_dir else None,
+            source_dir=Path(args.source_dir).expanduser() if args.source_dir else None,
+            image=args.image,
+            port=args.port,
+            dry_run=args.dry_run,
+            timeout_seconds=args.timeout,
+        )
+    except LocalDeployError as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel deploy local: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    elif result["dry_run"]:
+        print(f"Citadel Lite dry run passed. Config target: {result['config_dir']}")
+    else:
+        state = "created" if result["created"] else "reused"
+        print(f"Citadel Lite ready at {result['url']} ({state} config)")
+        print(f"Config: {result['config_dir']}")
+    return 0
+
+
+def _backup_environment_value(explicit: str | None, name: str) -> str:
+    value = (explicit or os.getenv(name, "")).strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+async def _backup_generation_create(args: argparse.Namespace) -> int:
+    from kb.generation_backup import (
+        GenerationBackupError,
+        QdrantSnapshotStore,
+        create_generation_backup,
+    )
+
+    try:
+        generation_id = _backup_environment_value(
+            args.generation_id,
+            "CITADEL_GENERATION_ID",
+        )
+        qdrant_url = _backup_environment_value(args.qdrant_url, "VECTOR_DB_URL")
+        qdrant_key = _backup_environment_value(None, "VECTOR_DB_KEY")
+
+        def create() -> dict[str, Any]:
+            with QdrantSnapshotStore(url=qdrant_url, api_key=qdrant_key) as store:
+                return create_generation_backup(
+                    generation_id=generation_id,
+                    data_root=Path(args.data_root).expanduser(),
+                    destination=Path(args.destination).expanduser(),
+                    snapshot_store=store,
+                )
+
+        result = await asyncio.to_thread(create)
+    except (GenerationBackupError, OSError, ValueError) as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel backup create: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Citadel generation backup created: {args.destination}")
+    return 0
+
+
+async def _backup_generation_restore(args: argparse.Namespace) -> int:
+    from kb.generation_backup import (
+        GenerationBackupError,
+        QdrantSnapshotStore,
+        restore_generation_backup,
+    )
+
+    try:
+        generation_id = _backup_environment_value(
+            args.generation_id,
+            "CITADEL_GENERATION_ID",
+        )
+        qdrant_url = _backup_environment_value(args.qdrant_url, "VECTOR_DB_URL")
+        qdrant_key = _backup_environment_value(None, "VECTOR_DB_KEY")
+
+        def restore() -> dict[str, Any]:
+            with QdrantSnapshotStore(url=qdrant_url, api_key=qdrant_key) as store:
+                return restore_generation_backup(
+                    generation_id=generation_id,
+                    backup_root=Path(args.backup_root).expanduser(),
+                    target_data_root=Path(args.target_data_root).expanduser(),
+                    snapshot_store=store,
+                )
+
+        result = await asyncio.to_thread(restore)
+    except (GenerationBackupError, OSError, ValueError) as error:
+        if args.json:
+            _print_json({"ok": False, "error": str(error)})
+        else:
+            print(f"citadel backup restore: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Citadel generation restored: {result['generation_id']}")
+    return 0
+
+
 class _Spinner:
     """An animated stdlib progress indicator on stderr (so stdout stays clean).
 
@@ -181,6 +294,10 @@ def _needs_server(
             return 1
 
     return wrapper
+
+
+_backup_generation_create = _needs_server(_backup_generation_create)
+_backup_generation_restore = _needs_server(_backup_generation_restore)
 
 
 def _prompt(text: str) -> str:
@@ -383,6 +500,54 @@ async def _ingest(args: argparse.Namespace) -> int:
     return 0 if (accepted or duplicate) else 1
 
 
+async def _operation(args: argparse.Namespace) -> int:
+    """Read one source-to-provider lifecycle operation from the Node."""
+    token = capture_token()
+    if not token:
+        return _emit_no_token("operation", as_json=getattr(args, "json", False))
+    from kb.status import fetch_operation
+
+    as_json = getattr(args, "json", False)
+    try:
+        result = await asyncio.to_thread(
+            fetch_operation,
+            node_base_url(getattr(args, "node_url", None)),
+            token,
+            args.projection_job_id,
+        )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        if not as_json:
+            _print_auth_hint("operation", exc.code)
+        return _emit_error(
+            "operation",
+            f"HTTP {exc.code} {detail}",
+            as_json=as_json,
+            code="HTTP_ERROR",
+            extra={"http_status": exc.code},
+        )
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        return _emit_error(
+            "operation",
+            str(exc),
+            as_json=as_json,
+            code="NODE_UNREACHABLE",
+        )
+    if as_json:
+        _print_json(result)
+        return 0
+    print(f"Operation {result.get('projection_job_id', args.projection_job_id)}")
+    print(f"State: {result.get('state', 'unknown')}")
+    for receipt in result.get("receipts", []):
+        if isinstance(receipt, dict):
+            print(
+                f"  {receipt.get('backend', 'unknown')}: "
+                f"{receipt.get('state', 'unknown')} "
+                f"({receipt.get('provider', 'unknown')})"
+            )
+    return 0
+
+
 @_needs_server
 async def _ingest_local(args: argparse.Namespace) -> int:
     from kb.service import Citadel
@@ -504,28 +669,15 @@ def _emit_search_timeout(
     note: str,
     partial: dict[str, Any] | None = None,
 ) -> int:
-    """Prefer truncated JSON (optionally with partial hits) over a hard agent fail."""
-    from kb.search_format import shape_search_payload
-
-    empty: dict[str, Any] = {
-        "query": args.query,
-        "results": (partial or {}).get("results") or [],
-        "timed_out": True,
-        "truncated": True,
-        "note": note or "search timed out",
-    }
-    if isinstance(partial, dict):
-        for key in ("sections", "dataset", "datasets", "took_ms"):
-            if key in partial:
-                empty[key] = partial[key]
-    shaped = shape_search_payload(empty, **_shape_kwargs(args))
-    if getattr(args, "json", False):
-        _print_json(shaped)
-        return 0
-    print("citadel search: timed out — returning truncated results", file=sys.stderr)
-    if shaped.get("results"):
-        _render_search({**empty, "results": shaped["results"], "sections": None}, args.query)
-    return 0
+    """Report an expired search budget as a typed failure, never empty success."""
+    del partial
+    return _emit_error(
+        "search",
+        note or "search timed out",
+        as_json=getattr(args, "json", False),
+        code="SEARCH_TIMEOUT",
+        extra={"http_status": 504},
+    )
 
 
 def _is_timeout_exc(exc: BaseException) -> bool:
@@ -622,19 +774,36 @@ async def _search(args: argparse.Namespace) -> int:
                 mode=shape_kw.get("mode"),
             )
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        from kb.security_scan import redact_secrets
+
+        raw_detail = exc.read().decode(errors="replace")[:500] if exc.fp else str(exc.reason)
+        detail = redact_secrets(raw_detail, token)
+        error_code = "HTTP_ERROR"
+        error_message = f"HTTP {exc.code} {detail}"
+        try:
+            error_payload = json.loads(raw_detail)
+        except (json.JSONDecodeError, TypeError):
+            error_payload = None
+        if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), dict):
+            typed_detail = error_payload["detail"]
+            typed_code = typed_detail.get("code")
+            typed_message = typed_detail.get("message")
+            if isinstance(typed_code, str) and typed_code:
+                error_code = typed_code
+            if isinstance(typed_message, str) and typed_message:
+                error_message = redact_secrets(typed_message, token)
         as_json = getattr(args, "json", False)
         if not as_json:
             _print_auth_hint("search", exc.code)
         return _emit_error(
             "search",
-            f"HTTP {exc.code} {detail}",
+            error_message,
             as_json=as_json,
-            code="HTTP_ERROR",
+            code=error_code,
             extra={"http_status": exc.code},
         )
     except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-        # TimeoutError and urllib URLError("timed out") share one soft-fail path.
+        # TimeoutError and urllib URLError("timed out") share one typed failure path.
         if _is_timeout_exc(exc):
             return _emit_search_timeout(args, note=str(exc) or "search timed out")
         return _emit_error(
@@ -642,17 +811,14 @@ async def _search(args: argparse.Namespace) -> int:
         )
 
     raw = payload if isinstance(payload, dict) else {"results": []}
-    # Server may already mark soft timeout with partial/empty results.
+    # Compatibility with an older Node timeout envelope. Never reinterpret it
+    # as a successful empty search.
     if raw.get("timed_out") or raw.get("truncated"):
-        shaped = shape_search_payload(raw, **shape_kw)
-        if getattr(args, "json", False):
-            _print_json(shaped)
-            return 0
-        for warning in shaped.get("warnings") or []:
-            print(paint(f"warning: {warning}", "yellow"), file=sys.stderr)
-        display_results = shaped["results"] if filters_on or shaped.get("spec_mode") else raw.get("results")
-        _render_search({**raw, "results": display_results or [], "sections": None}, args.query)
-        return 0
+        return _emit_search_timeout(
+            args,
+            note=str(raw.get("note") or "search timed out"),
+            partial=raw,
+        )
 
     shaped = shape_search_payload(raw, **shape_kw)
     if getattr(args, "json", False):
@@ -1165,9 +1331,20 @@ async def _capture(args: argparse.Namespace) -> int:
             cognee_result.get("status") if isinstance(cognee_result, dict) else None
         ) or response.get("status")
         if accepted:
-            results.append(
-                {"root": root.path, "ok": True, "status": status, "tags": payload["tags"]}
-            )
+            result = {
+                "root": root.path,
+                "ok": True,
+                "status": status,
+                "tags": payload["tags"],
+            }
+            for field in (
+                "source_revision_id",
+                "projection_job_id",
+                "projection_state",
+            ):
+                if field in response:
+                    result[field] = response[field]
+            results.append(result)
             if not as_json:
                 print(f"OK  {root.path} ({status})")
         elif reason == "duplicate_in_process":
@@ -2081,8 +2258,13 @@ async def _doctor(args: argparse.Namespace) -> int:
     # unresolved so doctor exits nonzero.
     corpus = checks.get("corpus")
     if node and node.ok and auth and auth.ok and corpus and not corpus.ok:
-        issues.append({"problem": f"data plane broken ({corpus.detail}) — Node up but retrieval is empty",
-                       "fix": "check the evolve scheduler / cognify; run `citadel cognify --verify`"})
+        issues.append({
+            "problem": f"data plane not ready ({corpus.detail}); Node and auth are healthy",
+            "fix": (
+                "inspect the corpus probe in `citadel status --json`; "
+                "check the evolve scheduler / cognify; run `citadel cognify --verify`"
+            ),
+        })
 
     mcp_node = _mcp_node_url(repo / ".mcp.json")
     if mcp_node and cap_node and mcp_node.rstrip("/") != cap_node.rstrip("/"):
@@ -2854,6 +3036,64 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update.set_defaults(handler=_update)
 
+    deploy = subcommands.add_parser(
+        "deploy",
+        help="Deploy a self-hosted Citadel stack",
+    )
+    deploy_sub = deploy.add_subparsers(dest="deploy_command", required=True)
+    deploy_local = deploy_sub.add_parser(
+        "local",
+        help="Create or resume the local SQLite Lite and Qdrant stack",
+    )
+    deploy_local.add_argument(
+        "--config-dir",
+        help="Deployment state directory (default: ~/.citadel/deploy/local)",
+    )
+    deploy_local.add_argument(
+        "--source-dir",
+        help="Build from this Citadel source tree instead of a published image",
+    )
+    deploy_local.add_argument(
+        "--image",
+        help="Digest-pinned Citadel image, required when no source tree is available",
+    )
+    deploy_local.add_argument("--port", type=int, default=8000)
+    deploy_local.add_argument("--timeout", type=float, default=180.0)
+    deploy_local.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run preflight and show the plan without writing or starting services",
+    )
+    deploy_local.add_argument("--json", action="store_true")
+    deploy_local.set_defaults(handler=_deploy_local)
+
+    backup = subcommands.add_parser(
+        "backup",
+        help="Create or restore an offline SQLite Lite generation backup",
+    )
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser(
+        "create",
+        help="Back up stopped Lite state and every generation Qdrant collection",
+    )
+    backup_create.add_argument("destination")
+    backup_create.add_argument("--data-root", default="/data")
+    backup_create.add_argument("--generation-id")
+    backup_create.add_argument("--qdrant-url")
+    backup_create.add_argument("--json", action="store_true")
+    backup_create.set_defaults(handler=_backup_generation_create)
+
+    backup_restore = backup_sub.add_parser(
+        "restore",
+        help="Restore a sealed generation backup into empty targets",
+    )
+    backup_restore.add_argument("backup_root")
+    backup_restore.add_argument("target_data_root")
+    backup_restore.add_argument("--generation-id")
+    backup_restore.add_argument("--qdrant-url")
+    backup_restore.add_argument("--json", action="store_true")
+    backup_restore.set_defaults(handler=_backup_generation_restore)
+
     onboard = subcommands.add_parser(
         "onboard",
         help="One-shot teammate setup: token + hooks + MCP + capture roots",
@@ -3098,6 +3338,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session", help="(--local only) session id")
     ingest.set_defaults(handler=_ingest)
 
+    operation = subcommands.add_parser(
+        "operation",
+        help="Show durable source and per-backend projection status",
+    )
+    operation.add_argument("projection_job_id", help="Projection job id returned by ingest")
+    operation.add_argument("--json", action="store_true", help="Machine-readable output")
+    operation.add_argument("--node-url", help="Override Node URL")
+    operation.set_defaults(handler=_operation)
+
     search = subcommands.add_parser("search", help="Search the Organization Vault (via the Node)")
     search.add_argument("query", help="Search query")
     search.add_argument(
@@ -3138,7 +3387,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=None,
-        help="Client soft-timeout seconds (default: Node search timeout); returns truncated JSON on expiry",
+        help="Client timeout seconds (default: 35); expiry returns SEARCH_TIMEOUT and exit 1",
     )
     search.add_argument(
         "--budget-ms",

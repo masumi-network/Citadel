@@ -372,6 +372,105 @@ async def test_chunk_store_failure_degrades_to_none(real_graph: Any) -> None:
     assert await client.get_document(ghost) is None
 
 
+async def test_chunk_store_reads_inside_the_owning_dataset_context(
+    real_graph: Any, monkeypatch: Any
+) -> None:
+    """Under Qdrant the fallback must carry a dataset scope, or it reads nothing.
+
+    ``get_vector_engine()`` outside a dataset context builds the Qdrant adapter
+    with an EMPTY database name (cognee's ``vector_db_name`` default is ""), and
+    the adapter refuses every operation that carries no Citadel scope. The
+    unbound engine below therefore raises the SAME QdrantScopeError production
+    logged, so a fallback that still used it can only degrade to 404.
+    """
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    from kb.qdrant_adapter import QdrantScopeError
+
+    class _Unscoped:
+        async def retrieve(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            raise QdrantScopeError(
+                "Qdrant operation requires an explicit Citadel scope"
+            )
+
+    entered: list[str] = []
+    store = _orphan_store()
+
+    @asynccontextmanager
+    async def fake_context(dataset_id: Any, owner_id: Any, **_: Any) -> Any:
+        del owner_id
+        entered.append(str(dataset_id))
+        try:
+            yield None
+        finally:
+            entered.pop()
+
+    async def fake_vector_engine() -> Any:
+        assert entered, "the scoped read escaped its dataset database context"
+        return store
+
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setattr(
+        import_module("cognee.context_global_variables"),
+        "set_database_global_context_variables",
+        fake_context,
+    )
+    monkeypatch.setattr(
+        import_module("cognee.infrastructure.databases.vector"),
+        "get_vector_engine_async",
+        fake_vector_engine,
+    )
+
+    client = _client_over(real_graph)
+
+    async def _unbound_engine() -> Any:
+        return _Unscoped()
+
+    client._vector_engine = _unbound_engine  # type: ignore[method-assign]
+
+    # The resolver itself runs against a real relational store in
+    # tests/test_cognee_client.py, including the assertion that it writes
+    # nothing; this test owns the context question only.
+    async def fake_owning_datasets(doc_id: str) -> list[tuple[Any, Any]]:
+        del doc_id
+        return [("dataset-alice", "owner-alice")]
+
+    client._owning_datasets = fake_owning_datasets  # type: ignore[method-assign]
+
+    document = await client.get_document(ORPHAN_DOC_ID)
+
+    assert document is not None
+    assert document["metadata"]["assembled_from"] == "chunk_store"
+    assert document["chunk_count"] == 4
+    assert store.calls
+
+    owner_ids = await client.resolve_document_owner_ids(ORPHAN_DOC_ID)
+    assert owner_ids == [ORPHAN_DOC_ID]
+
+
+async def test_chunk_store_without_dataset_membership_keeps_the_unbound_engine(
+    real_graph: Any, monkeypatch: Any
+) -> None:
+    """An id with no relational membership row degrades exactly as before."""
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    client = _client_over(real_graph)
+    store = _orphan_store()
+    _install_chunk_store(client, store)
+
+    async def fake_owning_datasets(doc_id: str) -> list[tuple[Any, Any]]:
+        del doc_id
+        return []
+
+    client._owning_datasets = fake_owning_datasets  # type: ignore[method-assign]
+
+    document = await client.get_document(ORPHAN_DOC_ID)
+
+    assert document is not None
+    assert document["chunk_count"] == 4
+    assert store.calls
+
+
 async def test_non_uuid_id_skips_chunk_store(real_graph: Any) -> None:
     """Synthetic ids (chunk:<sha>, ghsync:*) never touch the vector engine."""
     client = _client_over(real_graph)
