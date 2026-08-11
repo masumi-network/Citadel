@@ -7,11 +7,20 @@ import tomllib
 from scripts import run_railway
 
 
-def test_railway_toml_uses_testable_dispatcher() -> None:
+def test_railway_toml_boots_the_published_image_entrypoint() -> None:
+    # The deployed web build (RAILPACK) installs the `kb` package but not the
+    # top-level scripts/ directory, so `python -m scripts.run_railway` raises
+    # ModuleNotFoundError on boot. railway.toml must start the image via
+    # kb.lite_runtime, which is importable there. The scripts.run_railway
+    # dispatcher and its job modes still exist for source/RAILPACK job services
+    # and are exercised by the tests below.
+    import importlib.util
+
     with open("railway.toml", "rb") as file:
         config = tomllib.load(file)
 
-    assert config["deploy"]["startCommand"] == "python -m scripts.run_railway"
+    assert config["deploy"]["startCommand"] == "python -m kb.lite_runtime"
+    assert importlib.util.find_spec("kb.lite_runtime") is not None
 
 
 def test_web_mode_execs_uvicorn(monkeypatch: Any) -> None:
