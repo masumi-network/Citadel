@@ -105,6 +105,19 @@ packages = ["kb", "scripts"]
 # generated output does not belong in the tree.
 artifacts = ["kb/webui/**", "kb/data/tiktoken-cache/*"]
 
+# kb.skills and kb.repo_stats resolve public runtime data relative to the
+# installed site-packages root. Keep both complete tracked trees there so the
+# hosted catalog and locally derived ADR count match a source checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "skills"
+"docs/adr" = "docs/adr"
+
+# The repository-wide `*-export.md` ignore pattern matches ADR 0014 even though
+# it is tracked. Force the complete tree into the sdist so wheel and source
+# distributions carry the same public runtime records.
+[tool.hatch.build.targets.sdist.force-include]
+"docs/adr" = "docs/adr"
+
 [tool.ruff]
 line-length = 100
 

@@ -57,7 +57,16 @@ def test_each_platform_digest_is_resolved_and_smoked() -> None:
     assert ".platform.architecture == $architecture" in smoke
     assert 'docker pull --platform "$PLATFORM" "${IMAGE_NAME}@${PLATFORM_DIGEST}"' in smoke
     assert '"${IMAGE_NAME}@${PLATFORM_DIGEST}"' in smoke
-    assert "import cognee, kb; assert kb.__version__ ==" in smoke
+    assert "import cognee" in smoke
+    assert "import kb" in smoke
+    assert "import scripts" in smoke
+    assert 'distribution("citadel-archive")' in smoke
+    assert "scripts/run_railway.py" in smoke
+    assert "skills/citadel-data-boundary/SKILL.md" in smoke
+    assert "skills/citadel/SKILL.md" in smoke
+    assert "count_adr_records() > 0" in smoke
+    assert "CITADEL_EXPECTED_VERSION" in smoke
+    assert 'Path("/src").exists()' in smoke
 
 
 def test_keyless_attestation_and_pypi_fail_closed_on_oci_gates() -> None:

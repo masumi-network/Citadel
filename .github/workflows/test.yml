@@ -245,7 +245,16 @@ jobs:
           "$venv/bin/python" -m pip install "pytest>=9.0.3,<10"
           "$venv/bin/python" -m pip check
           "$venv/bin/python" -m pytest tests/test_dependency_pins.py -q
-          "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
+          verifier_home="$RUNNER_TEMP/citadel-verifier-home"
+          mkdir -p "$verifier_home"
+          (
+            cd "$RUNNER_TEMP"
+            HOME="$verifier_home" env -u PYTHONPATH "$venv/bin/python" -I \
+              "$GITHUB_WORKSPACE/scripts/verify_package_artifacts.py" \
+              --dist "$GITHUB_WORKSPACE/dist" \
+              --public-routes
+          )
+          test -z "$(find "$verifier_home" -mindepth 1 -print -quit)"
           "$venv/bin/citadel" bench --help >/dev/null
 
   container-tests:
@@ -428,8 +437,8 @@ jobs:
           # needs an exemption for each benign line it actually prints. One entry
           # per measured line class, each a distinctive substring of that line.
           # A healthy boot printed nine severe-pattern lines when this was
-          # measured. These four entries cover seven of them; the other two are
-          # arm64-only onnxruntime lines, left unexempted until CI shows them.
+          # measured. These entries cover those known lines, including the exact
+          # onnxruntime CPU-vendor warning printed by an ARM Docker Desktop run.
           # "warning  Cognee 1.0 changes: New API ...", the cognee import banner,
           # printed four times. An upstream notice about its own API, not a fault.
           expected_citadel_log_pattern='Cognee 1\.0 changes:'
@@ -443,6 +452,9 @@ jobs:
           # "warning  No nodes found in the database", which is what an empty graph
           # reports, and a fresh CI boot has an empty graph.
           expected_citadel_log_pattern+='|No nodes found in the database'
+          # "onnxruntime cpuid_info warning: Unknown CPU vendor. cpuinfo_vendor
+          # value: 0", printed twice while loading the embedding runtime on ARM.
+          expected_citadel_log_pattern+='|onnxruntime cpuid_info warning: Unknown CPU vendor'
           mkdir -p "$log_dir"
           cat > "$env_file" <<EOF
           CITADEL_IMAGE=citadel-archive:ci-runtime
@@ -473,7 +485,7 @@ jobs:
                 expected_log_pattern="$expected_qdrant_log_pattern"
               fi
               if rg --line-number --ignore-case \
-                'warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
+                'traceback|exception|died|warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
                 "$log_file" | rg --invert-match --ignore-case "$expected_log_pattern"; then
                 echo "::error::Unexpected severe container log in $log_file"
                 return 1
@@ -490,12 +502,40 @@ jobs:
               echo "::error::Unexpected Citadel HTTP 4xx/5xx log"
               return 1
             fi
+            local public_path
+            for public_path in \
+              "/.well-known/citadel.json" \
+              "/api/state" \
+              "/skills" \
+              "/skills/boundary" \
+              "/skills/connect" \
+              "/skills/proactive-ingest" \
+              "/skills/vault"; do
+              if ! rg --fixed-strings \
+                "GET $public_path HTTP/1.1\" 200 OK" "$log_dir/citadel.log"; then
+                echo "::error::Missing successful public-route log for $public_path"
+                return 1
+              fi
+            done
           }
           cleanup() {
+            local exit_code=$?
             capture_runtime_logs
+            if (( exit_code != 0 )); then
+              local log_file
+              for log_file in "$log_dir/qdrant.log" "$log_dir/citadel.log"; do
+                if [[ -s "$log_file" ]]; then
+                  echo "::group::Last 200 lines from $log_file"
+                  tail --lines=200 "$log_file" || true
+                  echo "::endgroup::"
+                fi
+              done
+            fi
             docker compose --project-name "$project" --env-file "$env_file" ps || true
             docker compose --project-name "$project" --env-file "$env_file" down --volumes --remove-orphans || true
             rm -f "$env_file"
+            trap - EXIT
+            exit "$exit_code"
           }
           trap cleanup EXIT
           docker compose --project-name "$project" --env-file "$env_file" up --detach --no-build
@@ -512,6 +552,114 @@ jobs:
           done
           test "$(docker inspect --format '{{.Config.User}}' "$app")" = "10001:10001"
           test "$(docker inspect --format '{{.State.Health.Status}}' "$app")" = healthy
+          docker inspect --format '{{json .Mounts}}' "$app" \
+            | python -c 'import json, sys; mounts = json.load(sys.stdin); assert not any(mount["Type"] == "bind" for mount in mounts), mounts'
+          docker compose --project-name "$project" exec -T citadel python -I - <<'PY'
+          import base64
+          import hashlib
+          import json
+          from importlib.metadata import distribution
+          from pathlib import Path
+          import sysconfig
+          from urllib.request import urlopen
+
+          import kb
+          import scripts
+          from kb.repo_stats import count_adr_records
+          from scripts.run_railway import run_evolve_in_loop
+
+          purelib = Path(sysconfig.get_path("purelib")).resolve()
+          assert Path(kb.__file__).resolve().is_relative_to(purelib)
+          assert Path(scripts.__file__).resolve().is_relative_to(purelib)
+          assert not Path("/src").exists()
+          assert callable(run_evolve_in_loop)
+
+          package_distribution = distribution("citadel-archive")
+          installed = {
+              str(path): package_distribution.locate_file(path)
+              for path in package_distribution.files or ()
+          }
+          required = {
+              "scripts/run_railway.py",
+              "skills/citadel-data-boundary/SKILL.md",
+              "skills/citadel-mcp-connector/SKILL.md",
+              "skills/citadel-onboard/SKILL.md",
+              "skills/citadel-proactive-ingest/README.md",
+              "skills/citadel-proactive-ingest/SKILL.md",
+              "skills/citadel-vault/SKILL.md",
+              "skills/citadel/SKILL.md",
+          }
+          assert required <= installed.keys(), sorted(required - installed.keys())
+          for name in required:
+              installed_path = installed[name].resolve()
+              assert installed_path.is_relative_to(purelib), installed_path
+              assert installed_path.is_file(), installed_path
+          adr_records = {
+              name: path
+              for name, path in installed.items()
+              if name.startswith("docs/adr/")
+              and name.endswith(".md")
+              and name.rsplit("/", 1)[-1][:4].isdigit()
+          }
+          assert adr_records
+          for installed_path in adr_records.values():
+              installed_path = installed_path.resolve()
+              assert installed_path.is_relative_to(purelib), installed_path
+              assert installed_path.is_file(), installed_path
+          assert count_adr_records() == len(adr_records)
+
+          def fetch(path):
+              with urlopen(f"http://127.0.0.1:8000{path}", timeout=12) as response:
+                  assert response.status == 200
+                  return response.headers, response.read()
+
+          discovery_headers, discovery_body = fetch("/.well-known/citadel.json")
+          catalog_headers, catalog_body = fetch("/skills")
+          _, state_body = fetch("/api/state")
+          assert discovery_headers["Cache-Control"] == "public, max-age=300"
+          assert catalog_headers["Cache-Control"] == "public, max-age=300"
+          discovery = json.loads(discovery_body)
+          catalog = json.loads(catalog_body)
+          assert discovery["ok"] is True
+          assert catalog["ok"] is True
+          assert discovery["skills"] == catalog["skills"]
+          state = json.loads(state_body)
+          assert state["repo"]["adrs"] == len(adr_records)
+
+          expected = {
+              "boundary": "citadel-data-boundary",
+              "connect": "citadel-mcp-connector",
+              "proactive-ingest": "citadel-proactive-ingest",
+              "vault": "citadel-vault",
+          }
+          expected_aliases = {
+              "boundary": ["citadel-data-boundary", "policy", "privacy", "public-private"],
+              "connect": ["citadel-mcp-connector", "mcp", "mcp-connector"],
+              "proactive-ingest": ["autosync", "citadel-proactive-ingest"],
+              "vault": ["citadel-vault"],
+          }
+          rows = {row["slug"]: row for row in catalog["skills"]}
+          assert set(rows) == set(expected)
+          for slug, row in rows.items():
+              assert row["aliases"] == expected_aliases[slug]
+              headers, body = fetch(f"/skills/{slug}")
+              assert body.startswith(f"---\nname: {expected[slug]}\n".encode())
+              digest = hashlib.sha256(body).digest()
+              sha256 = digest.hex()
+              integrity = f"sha256-{base64.b64encode(digest).decode('ascii')}"
+              assert headers["Content-Type"].startswith("text/markdown")
+              assert headers["Cache-Control"] == "public, max-age=300"
+              assert headers["ETag"] == f'"sha256-{sha256}"'
+              assert headers["X-Citadel-Skill-SHA256"] == sha256
+              assert headers["X-Citadel-Skill-Integrity"] == integrity
+              assert row["sha256"] == sha256
+              assert row["integrity"] == integrity
+              assert row["size_bytes"] == len(body)
+              for alias in row["aliases"]:
+                  alias_headers, alias_body = fetch(f"/skills/{alias}")
+                  assert alias_body == body
+                  assert alias_headers["X-Citadel-Skill-SHA256"] == sha256
+          PY
           docker compose --project-name "$project" exec -T citadel python -c '
           from urllib.error import HTTPError
           from urllib.request import urlopen

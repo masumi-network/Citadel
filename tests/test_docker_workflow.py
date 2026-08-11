@@ -113,6 +113,56 @@ def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
     assert "container-runtime" in gate
 
 
+def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    package_smoke = workflow.split("  package-smoke:\n", 1)[1].split(
+        "\n  container-tests:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+    public_paths = (
+        "/.well-known/citadel.json",
+        "/api/state",
+        "/skills",
+        "/skills/boundary",
+        "/skills/connect",
+        "/skills/proactive-ingest",
+        "/skills/vault",
+    )
+    skill_names = (
+        "citadel-data-boundary",
+        "citadel-mcp-connector",
+        "citadel-proactive-ingest",
+        "citadel-vault",
+    )
+
+    assert "--public-routes" in package_smoke
+    assert '"$GITHUB_WORKSPACE/scripts/verify_package_artifacts.py"' in package_smoke
+    assert '"$GITHUB_WORKSPACE/dist"' in package_smoke
+    assert 'HOME="$verifier_home" env -u PYTHONPATH "$venv/bin/python" -I' in package_smoke
+    assert 'find "$verifier_home" -mindepth 1 -print -quit' in package_smoke
+    assert "Path(sysconfig.get_path(\"purelib\"))" in container_runtime
+    assert 'distribution("citadel-archive")' in container_runtime
+    assert "locate_file" in container_runtime
+    assert "is_file()" in container_runtime
+    assert 'name.startswith("docs/adr/")' in container_runtime
+    assert "count_adr_records" in container_runtime
+    assert 'Path("/src").exists()' in container_runtime
+    assert "run_evolve_in_loop" in container_runtime
+    assert 'assert row["aliases"] == expected_aliases[slug]' in container_runtime
+    assert '"mcp-connector"' in container_runtime
+    assert '"public-private"' in container_runtime
+    assert 'for alias in row["aliases"]' in container_runtime
+    assert 'mount["Type"] == "bind"' in container_runtime
+    assert "traceback|exception|died" in container_runtime
+    assert "onnxruntime cpuid_info warning: Unknown CPU vendor" in container_runtime
+    for path in public_paths:
+        assert path in container_runtime
+    for name in skill_names:
+        assert name in container_runtime
+
+
 def test_ci_qdrant_containers_mount_volumes_rather_than_exempting_the_storage_warning() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     container_tests = workflow.split("  container-tests:\n", 1)[1].split(
@@ -169,6 +219,9 @@ def test_container_jobs_capture_logs_after_the_fact_instead_of_backgrounding_fol
     runtime_cleanup = runtime_code.split("cleanup() {", 1)[1].split("}", 1)[0]
     assert tests_cleanup.index("capture_container_logs") < tests_cleanup.index("docker rm -f")
     assert runtime_cleanup.index("capture_runtime_logs") < runtime_cleanup.index("down --volumes")
+    assert "local exit_code=$?" in runtime_cleanup
+    assert "tail --lines=200" in runtime_cleanup
+    assert 'exit "$exit_code"' in runtime_cleanup
     # Definition, the call in the trap, and the call before classification.
     assert tests_code.count("capture_container_logs") == 3
     assert runtime_code.count("capture_runtime_logs") == 3
@@ -234,12 +287,12 @@ def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines()
         "IncompleteFieldDefinitionWarning: Field 'lifespan'",
         r"warnings\.warn\(",
         "No nodes found in the database",
+        "onnxruntime cpuid_info warning: Unknown CPU vendor",
     ]
-    # Measured only on arm64; it gets an exemption when CI produces the evidence.
-    # Comments may name it; no executable line may.
+    # Measured on an ARM Docker Desktop production boot. Keep one exact
+    # executable exemption rather than a broad onnxruntime pattern.
     code = _executable_lines(container_runtime)
-    assert "onnxruntime" not in code
-    assert "Unknown CPU vendor" not in code
+    assert code.count("onnxruntime cpuid_info warning: Unknown CPU vendor") == 1
     # Everything outside that list stays fail-closed.
     assert "warn(ing)?|error|panic|fatal|oom|corruption|failure" in container_runtime
 
