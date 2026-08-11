@@ -21,6 +21,10 @@ def verify(dist_dir: Path) -> None:
     assert webui.joinpath("404.html").is_file()
     assert webui.joinpath("_next").is_dir()
     assert files("kb").joinpath("retrieval_eval.py").is_file()
+    # kb.server runs the evolve scheduler in-process and imports
+    # scripts.run_railway for the loop body, so the scripts package must ship in
+    # the wheel or the scheduler dies on boot with ModuleNotFoundError.
+    assert files("scripts").joinpath("run_railway.py").is_file()
     tokenizer_dir = files("kb").joinpath("data", "tiktoken-cache")
     tokenizer_files = [path for path in tokenizer_dir.iterdir() if path.is_file()]
     assert len(tokenizer_files) == 1
@@ -30,6 +34,7 @@ def verify(dist_dir: Path) -> None:
         names = set(archive.getnames())
     assert any(name.endswith("/kb/webui/index.html") for name in names)
     assert any(name.endswith("/kb/retrieval_eval.py") for name in names)
+    assert any(name.endswith("/scripts/run_railway.py") for name in names)
     tokenizer_prefix = "/kb/data/tiktoken-cache/"
     assert any(
         tokenizer_prefix in name and name.endswith(".gz") for name in names
