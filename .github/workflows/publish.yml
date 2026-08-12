@@ -154,10 +154,53 @@ jobs:
         run: |
           docker pull --platform "$PLATFORM" "${IMAGE_NAME}@${PLATFORM_DIGEST}"
           docker run --rm \
+            --interactive \
             --platform "$PLATFORM" \
+            --env "CITADEL_EXPECTED_VERSION=${GITHUB_REF_NAME#v}" \
             --entrypoint python \
             "${IMAGE_NAME}@${PLATFORM_DIGEST}" \
-            -c "import cognee, kb; assert kb.__version__ == '${GITHUB_REF_NAME#v}'"
+            -I - <<'PY'
+          from importlib.metadata import distribution
+          import os
+          from pathlib import Path
+          import sysconfig
+
+          import cognee
+          import kb
+          import scripts
+          from kb.repo_stats import count_adr_records
+          from scripts.run_railway import run_evolve_in_loop
+
+          assert kb.__version__ == os.environ["CITADEL_EXPECTED_VERSION"]
+          purelib = Path(sysconfig.get_path("purelib")).resolve()
+          assert Path(kb.__file__).resolve().is_relative_to(purelib)
+          assert Path(scripts.__file__).resolve().is_relative_to(purelib)
+          assert not Path("/src").exists()
+          assert callable(run_evolve_in_loop)
+
+          package = distribution("citadel-archive")
+          installed = {
+              str(item): package.locate_file(item)
+              for item in package.files or ()
+          }
+          required = {
+              "scripts/run_railway.py",
+              "skills/citadel-data-boundary/SKILL.md",
+              "skills/citadel-mcp-connector/SKILL.md",
+              "skills/citadel-onboard/SKILL.md",
+              "skills/citadel-proactive-ingest/README.md",
+              "skills/citadel-proactive-ingest/SKILL.md",
+              "skills/citadel-vault/SKILL.md",
+              "skills/citadel/SKILL.md",
+          }
+          assert required <= installed.keys(), sorted(required - installed.keys())
+          assert all(
+              installed[name].resolve().is_relative_to(purelib)
+              and installed[name].is_file()
+              for name in required
+          )
+          assert count_adr_records() > 0
+          PY
 
   attest-image:
     name: Attest staged OCI index

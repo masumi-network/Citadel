@@ -1,4 +1,6 @@
 import re
+import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -113,6 +115,56 @@ def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
     assert "container-runtime" in gate
 
 
+def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    package_smoke = workflow.split("  package-smoke:\n", 1)[1].split(
+        "\n  container-tests:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+    public_paths = (
+        "/.well-known/citadel.json",
+        "/api/state",
+        "/skills",
+        "/skills/boundary",
+        "/skills/connect",
+        "/skills/proactive-ingest",
+        "/skills/vault",
+    )
+    skill_names = (
+        "citadel-data-boundary",
+        "citadel-mcp-connector",
+        "citadel-proactive-ingest",
+        "citadel-vault",
+    )
+
+    assert "--public-routes" in package_smoke
+    assert '"$GITHUB_WORKSPACE/scripts/verify_package_artifacts.py"' in package_smoke
+    assert '"$GITHUB_WORKSPACE/dist"' in package_smoke
+    assert 'HOME="$verifier_home" env -u PYTHONPATH "$venv/bin/python" -I' in package_smoke
+    assert 'find "$verifier_home" -mindepth 1 -print -quit' in package_smoke
+    assert "Path(sysconfig.get_path(\"purelib\"))" in container_runtime
+    assert 'distribution("citadel-archive")' in container_runtime
+    assert "locate_file" in container_runtime
+    assert "is_file()" in container_runtime
+    assert 'name.startswith("docs/adr/")' in container_runtime
+    assert "count_adr_records" in container_runtime
+    assert 'Path("/src").exists()' in container_runtime
+    assert "run_evolve_in_loop" in container_runtime
+    assert 'assert row["aliases"] == expected_aliases[slug]' in container_runtime
+    assert '"mcp-connector"' in container_runtime
+    assert '"public-private"' in container_runtime
+    assert 'for alias in row["aliases"]' in container_runtime
+    assert 'mount["Type"] == "bind"' in container_runtime
+    assert "traceback|exception|died" in container_runtime
+    assert "onnxruntime cpuid_info warning: Unknown CPU vendor" in container_runtime
+    for path in public_paths:
+        assert path in container_runtime
+    for name in skill_names:
+        assert name in container_runtime
+
+
 def test_ci_qdrant_containers_mount_volumes_rather_than_exempting_the_storage_warning() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     container_tests = workflow.split("  container-tests:\n", 1)[1].split(
@@ -135,6 +187,121 @@ def test_ci_qdrant_containers_mount_volumes_rather_than_exempting_the_storage_wa
 
 def _executable_lines(job: str) -> str:
     return "\n".join(line for line in job.splitlines() if not line.lstrip().startswith("#"))
+
+
+def test_container_log_classifiers_use_portable_guarded_grep() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+
+    tests_code = _executable_lines(container_tests)
+    runtime_code = _executable_lines(container_runtime)
+    hard_failure_pattern = (
+        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+    )
+    for code in (tests_code, runtime_code):
+        assert "command -v grep >/dev/null" in code
+        assert re.search(r"\brg\b", code) is None
+        assert hard_failure_pattern in code
+        assert code.index(hard_failure_pattern) < code.index("grep -Evi --")
+        assert "grep -Eni" in code
+        assert "grep -Evi --" in code
+        assert "grep -En" in code
+        assert 'grep_statuses=("${PIPESTATUS[@]}")' in code
+        assert "grep_statuses[0] > 1 || grep_statuses[1] > 1" in code
+        assert "grep_status > 1" in code
+    assert "grep -Ev --" in runtime_code
+    assert "grep -Fq --" in runtime_code
+
+
+def test_container_log_classifier_rejects_grep_errors(tmp_path: Path) -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    run_block = textwrap.dedent(
+        container_tests.split("        shell: bash\n        run: |\n", 1)[1]
+    )
+    function_start = run_block.index("assert_clean_container_logs() {")
+    function_end = run_block.index("\ncleanup() {", function_start)
+    classifier = run_block[function_start:function_end]
+    log_file = tmp_path / "qdrant.log"
+    log_file.write_text("WARNING injected classifier fault\n", encoding="utf-8")
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "expected_qdrant_log_pattern='['",
+            classifier,
+            'assert_clean_container_logs "$1"',
+        )
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(log_file)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Container log classifier grep failed" in result.stdout
+    assert "grep:" in result.stderr
+
+
+def test_container_log_classifiers_reject_fatal_tokens_before_exemptions(
+    tmp_path: Path,
+) -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+    classifiers = (
+        (container_tests, "assert_clean_container_logs", "container"),
+        (container_runtime, "assert_clean_runtime_logs", "runtime"),
+    )
+    severe_lines = (
+        "snapshot upload failed\n",
+        "CRITICAL database unavailable\n",
+        "WARNING TLS disabled; FATAL corruption\n",
+        "WARNING TLS disabled; ERROR request rejected\n",
+        "warning Cognee 1.0 changes: ERROR request rejected\n",
+    )
+
+    for job, function_name, label in classifiers:
+        run_block = textwrap.dedent(job.split("        shell: bash\n        run: |\n", 1)[1])
+        function_start = run_block.index(f"{function_name}() {{")
+        function_end = run_block.index("\ncleanup() {", function_start)
+        classifier = run_block[function_start:function_end]
+        for index, line in enumerate(severe_lines):
+            log_file = tmp_path / f"{label}-{index}.log"
+            log_file.write_text(line, encoding="utf-8")
+            script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    "expected_qdrant_log_pattern='TLS (is )?disabled'",
+                    "expected_citadel_log_pattern='Cognee 1\\.0 changes:'",
+                    'log_dir="$2"',
+                    classifier,
+                    f'{function_name} "$1"',
+                )
+            )
+
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(log_file), str(tmp_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            assert result.returncode != 0, (label, line, result)
+            assert "Unexpected fatal" in result.stdout
 
 
 def test_container_jobs_capture_logs_after_the_fact_instead_of_backgrounding_followers() -> None:
@@ -169,6 +336,9 @@ def test_container_jobs_capture_logs_after_the_fact_instead_of_backgrounding_fol
     runtime_cleanup = runtime_code.split("cleanup() {", 1)[1].split("}", 1)[0]
     assert tests_cleanup.index("capture_container_logs") < tests_cleanup.index("docker rm -f")
     assert runtime_cleanup.index("capture_runtime_logs") < runtime_cleanup.index("down --volumes")
+    assert "local exit_code=$?" in runtime_cleanup
+    assert "tail --lines=200" in runtime_cleanup
+    assert 'exit "$exit_code"' in runtime_cleanup
     # Definition, the call in the trap, and the call before classification.
     assert tests_code.count("capture_container_logs") == 3
     assert runtime_code.count("capture_runtime_logs") == 3
@@ -234,14 +404,18 @@ def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines()
         "IncompleteFieldDefinitionWarning: Field 'lifespan'",
         r"warnings\.warn\(",
         "No nodes found in the database",
+        "onnxruntime cpuid_info warning: Unknown CPU vendor",
     ]
-    # Measured only on arm64; it gets an exemption when CI produces the evidence.
-    # Comments may name it; no executable line may.
+    # Measured on an ARM Docker Desktop production boot. Keep one exact
+    # executable exemption rather than a broad onnxruntime pattern.
     code = _executable_lines(container_runtime)
-    assert "onnxruntime" not in code
-    assert "Unknown CPU vendor" not in code
+    assert code.count("onnxruntime cpuid_info warning: Unknown CPU vendor") == 1
     # Everything outside that list stays fail-closed.
-    assert "warn(ing)?|error|panic|fatal|oom|corruption|failure" in container_runtime
+    assert (
+        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        in container_runtime
+    )
+    assert "warn(ing)?|recovery.*(shortfall|failed)" in container_runtime
 
 
 def test_docker_test_target_disables_the_inherited_runtime_healthcheck() -> None:

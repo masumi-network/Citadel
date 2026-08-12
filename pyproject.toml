@@ -89,7 +89,13 @@ build-backend = "hatchling.build"
 path = "kb/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["kb"]
+# kb.server runs the evolve scheduler in-process (Ladybug is single-writer, so
+# it cannot move to a separate process) and imports scripts.run_railway for the
+# loop body. The published image installs only this wheel, so scripts/ must ship
+# in it or the scheduler dies on boot with ModuleNotFoundError: No module named
+# 'scripts'. The scripts.run_railway job/dispatcher modes are packaged for the
+# same reason (github-sync, backup-mirror, evolve).
+packages = ["kb", "scripts"]
 # The browser frontend ships inside the wheel. A self-hoster runs
 # `pip install citadel-archive[server]` on a machine that has Python and may not
 # have Node, so the built files have to be package data rather than something
@@ -98,6 +104,19 @@ packages = ["kb"]
 # here keeps it in the wheel even if a future .gitignore rule ever decides
 # generated output does not belong in the tree.
 artifacts = ["kb/webui/**", "kb/data/tiktoken-cache/*"]
+
+# kb.skills and kb.repo_stats resolve public runtime data relative to the
+# installed site-packages root. Keep both complete tracked trees there so the
+# hosted catalog and locally derived ADR count match a source checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "skills"
+"docs/adr" = "docs/adr"
+
+# The repository-wide `*-export.md` ignore pattern matches ADR 0014 even though
+# it is tracked. Force the complete tree into the sdist so wheel and source
+# distributions carry the same public runtime records.
+[tool.hatch.build.targets.sdist.force-include]
+"docs/adr" = "docs/adr"
 
 [tool.ruff]
 line-length = 100

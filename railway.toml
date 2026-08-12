@@ -2,13 +2,11 @@
 builder = "RAILPACK"
 
 [deploy]
-# The published image (Dockerfile) is the SQLite-Lite + Qdrant runtime and does
-# not vendor scripts/, so `python -m scripts.run_railway` is unavailable in it.
-# kb.lite_runtime is the image's own entrypoint: it validates the Lite profile,
-# prepares the SQLite/Ladybug/cache layout under the mounted /data volume, then
-# serves the FastAPI Organization Vault. The job/dispatcher modes that used
-# scripts.run_railway (github-sync, backup-mirror, pipeline) run from a
-# source/RAILPACK build and are configured per-service, not here.
+# The published image vendors scripts/ for scheduler and dispatcher imports.
+# This web service still starts through kb.lite_runtime: it validates the Lite
+# profile, prepares SQLite, Ladybug, and cache paths under /data, then serves the
+# FastAPI Organization Vault. Other Railway services select scripts.run_railway
+# modes such as github-sync, backup-mirror, and pipeline in their own config.
 startCommand = "python -m kb.lite_runtime"
 healthcheckPath = "/healthz"
 # Cold boot downloads the fastembed embedding model and initialises cognee +
