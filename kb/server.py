@@ -6609,6 +6609,22 @@ async def ingest(body: IngestBody, request: Request) -> Any:
     return payload
 
 
+@app.post("/api/lifecycle/requeue-failed")
+async def lifecycle_requeue_failed(request: Request) -> dict[str, Any]:
+    """Reset every failed projection job to pending so the worker re-drains it.
+
+    The manual half of the heal design: accept_source heals a failed job only
+    when the same bytes are re-submitted, and sync skips unchanged content, so
+    failed jobs for stable content are otherwise permanent (2026-08-12).
+    """
+    require_access(request, "admin", "access:manage")
+    try:
+        requeued = get_citadel().lifecycle_requeue_failed()
+    except LifecycleNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "requeued": requeued}
+
+
 @app.get("/api/operations/{projection_job_id}")
 async def projection_operation(projection_job_id: str, request: Request) -> Any:
     identity = require_access(request, "reader", "kb:read")

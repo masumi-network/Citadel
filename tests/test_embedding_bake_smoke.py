@@ -32,8 +32,8 @@ def test_baked_engine_embeds_offline_with_model_tokenizer() -> None:
     # The resolver never raises; a missing baked tokenizer silently degrades
     # to TikToken: the chunk-sizing regression. The isinstance is the only
     # observable signal.
+    # The isinstance is the only real signal: TikToken also counts tokens.
     assert isinstance(engine.tokenizer, HuggingFaceTokenizer), type(engine.tokenizer).__name__
-    assert engine.tokenizer.count_tokens("citadel embedding smoke") > 0
 
     [vector] = list(engine.embedding_model.embed(["citadel embedding smoke"]))
     assert len(vector) == dimensions

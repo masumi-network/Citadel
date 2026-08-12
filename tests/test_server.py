@@ -1325,6 +1325,22 @@ def test_cognify_run_requires_admin() -> None:
     assert response.status_code == 403
 
 
+def test_lifecycle_requeue_failed_requires_admin() -> None:
+    client = authed_client("test-writer")
+    assert client.post("/api/lifecycle/requeue-failed").status_code == 403
+
+
+def test_lifecycle_requeue_failed_returns_the_reset_count(monkeypatch) -> None:
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+    monkeypatch.setattr(type(citadel), "lifecycle_requeue_failed", lambda self: 7, raising=False)
+    response = client.post("/api/lifecycle/requeue-failed")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "requeued": 7}
+
+
 def test_admin_can_audit_combined_reconciliation_and_writer_cannot() -> None:
     admin = authed_client()
 

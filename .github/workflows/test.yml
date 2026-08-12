@@ -260,16 +260,16 @@ jobs:
   container-tests:
     name: Docker test target
     runs-on: ubuntu-latest
-    # Roughly a minute to build and a few more to run the suites, so this is
-    # several times the working duration. It exists to cap a hang, not to pace
-    # the job: without it a stuck step burns the 360-minute default.
+    # A few minutes to build (including ~64 MiB of baked ONNX weights) and a
+    # few more to run the suites, so this is several times the working
+    # duration. It exists to cap a hang, not to pace the job: without it a
+    # stuck step burns the 360-minute default.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - name: Build Docker test target
         run: docker build --target test --tag citadel-archive:ci-test .
-
 
       - name: Prove baked embedding engine works offline
         run: |

@@ -39,11 +39,18 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
     # build-time offline embed proof are unconditional policy (a conditional
     # guard passes vacuously when the ENV and the bake are removed together),
     # and the offline pin must come after all of them.
-    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in dockerfile
-    assert "from fastembed import TextEmbedding" in dockerfile
-    assert "HF_HUB_OFFLINE=1 python -c" in dockerfile
-    assert "ENV HF_HUB_OFFLINE=1" in dockerfile
-    offline_prefix = dockerfile.split("ENV HF_HUB_OFFLINE=1", 1)[0]
+    # Executable lines of the runtime stage only: a commented-out bake, or a
+    # bake moved into the builder stage where it never reaches the image, must
+    # not satisfy this guard.
+    runtime_stage = dockerfile.split("FROM python", 2)[2].split("FROM runtime AS test", 1)[0]
+    executable = "\n".join(
+        line for line in runtime_stage.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in executable
+    assert "from fastembed import TextEmbedding" in executable
+    assert "HF_HUB_OFFLINE=1 python -c" in executable
+    assert "ENV HF_HUB_OFFLINE=1" in executable
+    offline_prefix = executable.split("ENV HF_HUB_OFFLINE=1", 1)[0]
     assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in offline_prefix
     assert "from fastembed import TextEmbedding" in offline_prefix
     assert "HF_HUB_OFFLINE=1 python -c" in offline_prefix
@@ -62,6 +69,19 @@ def test_ci_proves_the_baked_embedding_engine_offline() -> None:
     assert "--network none" in container_tests
     assert "CITADEL_EMBEDDING_BAKE_SMOKE=1" in container_tests
     assert "tests/test_embedding_bake_smoke.py" in container_tests
+    smoke_step = container_tests.split("Prove baked embedding engine works offline", 1)[1]
+    assert "citadel-archive:ci-test" in smoke_step.split("- name:", 1)[0]
+
+
+def test_compose_does_not_override_the_baked_hf_home() -> None:
+    # HF_HOME pointed at the volume made the baked tokenizer unreachable under
+    # the offline pin and silently degraded chunk sizing (2026-08-12).
+    for name in ("docker-compose.yml", "kb/deploy_assets/docker-compose.yml"):
+        compose = (Path(__file__).resolve().parents[1] / name).read_text(encoding="utf-8")
+        executable = "\n".join(
+            line for line in compose.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "HF_HOME" not in executable, name
 
 
 def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:

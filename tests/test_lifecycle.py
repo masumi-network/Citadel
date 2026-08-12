@@ -1030,3 +1030,63 @@ def test_generation_rebuild_rolls_back_every_precommit_fault(
     )
     assert target_census.current_projection_jobs == 0
     assert target_census.current_projection_receipts == 0
+
+
+def test_requeue_failed_projections_resets_jobs_and_receipts(tmp_path: Path) -> None:
+    # 2026-08-12: 235 jobs failed while the embedding engine was down. The
+    # heal-on-recapture path never fires for unchanged content, so this manual
+    # requeue is the only way back for stable sources.
+    store = LifecycleStore(str(tmp_path / "lifecycle.db"))
+    capture = CaptureContext(
+        dataset="central",
+        source_key="manual:requeue-case",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="run-1",
+        captured_at=T0,
+    )
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    accepted = store.accept_source(b"requeue me", capture=capture, projection=projection, now=T0)
+    lease = store.claim_next_job(worker_id="worker-1", now=T0, lease_seconds=30)
+    assert lease is not None
+    store.fail_job(lease, error_code="model_load", error_message="engine down", now=T0)
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "failed"
+
+    assert store.requeue_failed_projections(now=T0) == 1
+
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "pending"
+    assert operation.job.attempt == 0
+    assert {receipt.state for receipt in operation.receipts} == {"pending"}
+    # The worker can claim it again: the reset is not cosmetic.
+    release = store.claim_next_job(worker_id="worker-2", now=T0, lease_seconds=30)
+    assert release is not None
+    assert release.projection_job_id == accepted.projection_job_id
+
+
+def test_requeue_failed_projections_ignores_healthy_jobs(tmp_path: Path) -> None:
+    store = LifecycleStore(str(tmp_path / "lifecycle.db"))
+    capture = CaptureContext(
+        dataset="central",
+        source_key="manual:healthy-case",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="run-1",
+        captured_at=T0,
+    )
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    store.accept_source(b"leave me queued", capture=capture, projection=projection, now=T0)
+    assert store.requeue_failed_projections(now=T0) == 0
