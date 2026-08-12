@@ -32,6 +32,11 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
 
     assert expected_pins <= set(server_dependencies)
     assert expected_pins <= requirements
+    # A global offline pin breaks fastembed's runtime ONNX weight download and
+    # froze vector/graph projection in production on 2026-08-12. Offline mode
+    # may only return together with baked fastembed weights.
+    assert "ENV HF_HUB_OFFLINE" not in dockerfile
+
     assert "(version('cognee'), version('ladybug'), version('qdrant-client'))" in dockerfile
     assert "('1.4.1', '0.18.2', '1.19.0')" in dockerfile
 

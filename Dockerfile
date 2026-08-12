@@ -45,9 +45,12 @@ RUN install -d /opt/citadel \
 # tokenizer under a read-only rootfs with no runtime network fetch.
 RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-small-en-v1.5')" \
     && chmod -R a+rX /opt/hf-cache
-# Verified: with the cache populated, transformers loads the tokenizer under
-# HF_HUB_OFFLINE=1, so the runtime never reaches the network for it.
-ENV HF_HUB_OFFLINE=1
+# Do NOT set HF_HUB_OFFLINE here: the baked cache covers only the transformers
+# tokenizer, while fastembed downloads its ONNX embedding weights at runtime
+# into its own cache. Offline mode blocked that download in production on
+# 2026-08-12 ("Could not find model in cache_dir" every ~2.5s) and froze the
+# vector and graph projection backends. Offline hardening needs the fastembed
+# weights baked too; see issue #266.
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway
