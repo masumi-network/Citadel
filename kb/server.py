@@ -6618,10 +6618,20 @@ async def lifecycle_requeue_failed(request: Request) -> dict[str, Any]:
     failed jobs for stable content are otherwise permanent (2026-08-12).
     """
     require_access(request, "admin", "access:manage")
+    citadel = get_citadel()
     try:
-        requeued = get_citadel().lifecycle_requeue_failed()
+        requeued = citadel.lifecycle_requeue_failed()
     except LifecycleNotFoundError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Resetting rows is not enough on its own. next_wakeup_delay only counts
+    # 'pending' and 'running' jobs, so while every job sat in 'failed' the
+    # drain task had already returned (kb/service.py:424-425) and nothing was
+    # left polling. Without this kick the requeued work waits for the next
+    # caller of resume_lifecycle_queue, which is the hourly evolve pass, so a
+    # 200 here would report success while the corpus stayed frozen.
+    resume = getattr(citadel, "resume_lifecycle_queue", None)
+    if callable(resume):
+        resume()
     return {"ok": True, "requeued": requeued}
 
 
