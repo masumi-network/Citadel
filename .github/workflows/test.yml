@@ -274,6 +274,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          command -v grep >/dev/null
           network="citadel-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source_qdrant="${network}-source-qdrant"
           restore_success_qdrant="${network}-restore-success-qdrant"
@@ -295,6 +296,8 @@ jobs:
           }
           assert_clean_container_logs() {
             local log_file
+            local -a grep_statuses
+            local grep_status
             for log_file in "$@"; do
               # capture_container_logs swallows its own errors, so an empty file
               # would otherwise read as a clean log rather than a missing one.
@@ -302,15 +305,41 @@ jobs:
                 echo "::error::No log was captured from $log_file"
                 return 1
               fi
-              if rg --line-number --ignore-case \
-                'warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
-                "$log_file" | rg --invert-match --ignore-case "$expected_qdrant_log_pattern"; then
+              # Fatal classes cannot share the warning allowlist. Otherwise a
+              # warning substring on the same line can hide a fatal condition.
+              if grep -Eni \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                "$log_file"; then
+                echo "::error::Unexpected fatal container log in $log_file"
+                return 1
+              else
+                grep_status=$?
+                if (( grep_status > 1 )); then
+                  echo "::error::Fatal container log grep failed for $log_file"
+                  return 1
+                fi
+              fi
+              if grep -Eni \
+                'warn(ing)?|recovery.*(shortfall|failed)' \
+                "$log_file" | grep -Evi -- "$expected_qdrant_log_pattern"; then
                 echo "::error::Unexpected severe container log in $log_file"
                 return 1
+              else
+                grep_statuses=("${PIPESTATUS[@]}")
+                if (( grep_statuses[0] > 1 || grep_statuses[1] > 1 )); then
+                  echo "::error::Container log classifier grep failed for $log_file"
+                  return 1
+                fi
               fi
-              if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' "$log_file"; then
+              if grep -En 'HTTP/[0-9.]+" [45][0-9][0-9]' "$log_file"; then
                 echo "::error::Unexpected HTTP 4xx/5xx container log in $log_file"
                 return 1
+              else
+                grep_status=$?
+                if (( grep_status > 1 )); then
+                  echo "::error::Container HTTP log grep failed for $log_file"
+                  return 1
+                fi
               fi
             done
           }
@@ -426,6 +455,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          command -v grep >/dev/null
           project="citadel-compose-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           env_file="$RUNNER_TEMP/citadel-compose.env"
           qdrant_key="citadel-ci-qdrant-key"
@@ -473,6 +503,8 @@ jobs:
           }
           assert_clean_runtime_logs() {
             local log_file
+            local -a grep_statuses
+            local grep_status
             for log_file in "$@"; do
               # An empty file means the capture failed, not that the boot was
               # quiet, and a quiet boot is not something this stack produces.
@@ -480,27 +512,59 @@ jobs:
                 echo "::error::No log was captured from $log_file"
                 return 1
               fi
+              # Fatal classes cannot share the warning allowlist. Otherwise a
+              # warning substring on the same line can hide a fatal condition.
+              if grep -Eni \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                "$log_file"; then
+                echo "::error::Unexpected fatal runtime log in $log_file"
+                return 1
+              else
+                grep_status=$?
+                if (( grep_status > 1 )); then
+                  echo "::error::Fatal runtime log grep failed for $log_file"
+                  return 1
+                fi
+              fi
               local expected_log_pattern="$expected_citadel_log_pattern"
               if [[ "$log_file" == "$log_dir/qdrant.log" ]]; then
                 expected_log_pattern="$expected_qdrant_log_pattern"
               fi
-              if rg --line-number --ignore-case \
-                'traceback|exception|died|warn(ing)?|error|panic|fatal|oom|corruption|failure|recovery.*(shortfall|failed)' \
-                "$log_file" | rg --invert-match --ignore-case "$expected_log_pattern"; then
+              if grep -Eni \
+                'warn(ing)?|recovery.*(shortfall|failed)' \
+                "$log_file" | grep -Evi -- "$expected_log_pattern"; then
                 echo "::error::Unexpected severe container log in $log_file"
                 return 1
+              else
+                grep_statuses=("${PIPESTATUS[@]}")
+                if (( grep_statuses[0] > 1 || grep_statuses[1] > 1 )); then
+                  echo "::error::Runtime log classifier grep failed for $log_file"
+                  return 1
+                fi
               fi
             done
-            if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' \
+            if grep -En 'HTTP/[0-9.]+" [45][0-9][0-9]' \
               "$log_dir/qdrant.log"; then
               echo "::error::Unexpected Qdrant HTTP 4xx/5xx log"
               return 1
+            else
+              grep_status=$?
+              if (( grep_status > 1 )); then
+                echo "::error::Qdrant HTTP log grep failed"
+                return 1
+              fi
             fi
-            if rg --line-number 'HTTP/[0-9.]+" [45][0-9][0-9]' \
+            if grep -En 'HTTP/[0-9.]+" [45][0-9][0-9]' \
               "$log_dir/citadel.log" \
-              | rg --invert-match "$expected_citadel_http_pattern"; then
+              | grep -Ev -- "$expected_citadel_http_pattern"; then
               echo "::error::Unexpected Citadel HTTP 4xx/5xx log"
               return 1
+            else
+              grep_statuses=("${PIPESTATUS[@]}")
+              if (( grep_statuses[0] > 1 || grep_statuses[1] > 1 )); then
+                echo "::error::Citadel HTTP log classifier grep failed"
+                return 1
+              fi
             fi
             local public_path
             for public_path in \
@@ -511,7 +575,7 @@ jobs:
               "/skills/connect" \
               "/skills/proactive-ingest" \
               "/skills/vault"; do
-              if ! rg --fixed-strings \
+              if ! grep -Fq -- \
                 "GET $public_path HTTP/1.1\" 200 OK" "$log_dir/citadel.log"; then
                 echo "::error::Missing successful public-route log for $public_path"
                 return 1

@@ -1,4 +1,6 @@
 import re
+import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -187,6 +189,121 @@ def _executable_lines(job: str) -> str:
     return "\n".join(line for line in job.splitlines() if not line.lstrip().startswith("#"))
 
 
+def test_container_log_classifiers_use_portable_guarded_grep() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+
+    tests_code = _executable_lines(container_tests)
+    runtime_code = _executable_lines(container_runtime)
+    hard_failure_pattern = (
+        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+    )
+    for code in (tests_code, runtime_code):
+        assert "command -v grep >/dev/null" in code
+        assert re.search(r"\brg\b", code) is None
+        assert hard_failure_pattern in code
+        assert code.index(hard_failure_pattern) < code.index("grep -Evi --")
+        assert "grep -Eni" in code
+        assert "grep -Evi --" in code
+        assert "grep -En" in code
+        assert 'grep_statuses=("${PIPESTATUS[@]}")' in code
+        assert "grep_statuses[0] > 1 || grep_statuses[1] > 1" in code
+        assert "grep_status > 1" in code
+    assert "grep -Ev --" in runtime_code
+    assert "grep -Fq --" in runtime_code
+
+
+def test_container_log_classifier_rejects_grep_errors(tmp_path: Path) -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    run_block = textwrap.dedent(
+        container_tests.split("        shell: bash\n        run: |\n", 1)[1]
+    )
+    function_start = run_block.index("assert_clean_container_logs() {")
+    function_end = run_block.index("\ncleanup() {", function_start)
+    classifier = run_block[function_start:function_end]
+    log_file = tmp_path / "qdrant.log"
+    log_file.write_text("WARNING injected classifier fault\n", encoding="utf-8")
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "expected_qdrant_log_pattern='['",
+            classifier,
+            'assert_clean_container_logs "$1"',
+        )
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(log_file)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Container log classifier grep failed" in result.stdout
+    assert "grep:" in result.stderr
+
+
+def test_container_log_classifiers_reject_fatal_tokens_before_exemptions(
+    tmp_path: Path,
+) -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    container_runtime = workflow.split("  container-runtime:\n", 1)[1].split(
+        "\n  gate:\n", 1
+    )[0]
+    classifiers = (
+        (container_tests, "assert_clean_container_logs", "container"),
+        (container_runtime, "assert_clean_runtime_logs", "runtime"),
+    )
+    severe_lines = (
+        "snapshot upload failed\n",
+        "CRITICAL database unavailable\n",
+        "WARNING TLS disabled; FATAL corruption\n",
+        "WARNING TLS disabled; ERROR request rejected\n",
+        "warning Cognee 1.0 changes: ERROR request rejected\n",
+    )
+
+    for job, function_name, label in classifiers:
+        run_block = textwrap.dedent(job.split("        shell: bash\n        run: |\n", 1)[1])
+        function_start = run_block.index(f"{function_name}() {{")
+        function_end = run_block.index("\ncleanup() {", function_start)
+        classifier = run_block[function_start:function_end]
+        for index, line in enumerate(severe_lines):
+            log_file = tmp_path / f"{label}-{index}.log"
+            log_file.write_text(line, encoding="utf-8")
+            script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    "expected_qdrant_log_pattern='TLS (is )?disabled'",
+                    "expected_citadel_log_pattern='Cognee 1\\.0 changes:'",
+                    'log_dir="$2"',
+                    classifier,
+                    f'{function_name} "$1"',
+                )
+            )
+
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(log_file), str(tmp_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            assert result.returncode != 0, (label, line, result)
+            assert "Unexpected fatal" in result.stdout
+
+
 def test_container_jobs_capture_logs_after_the_fact_instead_of_backgrounding_followers() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     container_tests = workflow.split("  container-tests:\n", 1)[1].split(
@@ -294,7 +411,11 @@ def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines()
     code = _executable_lines(container_runtime)
     assert code.count("onnxruntime cpuid_info warning: Unknown CPU vendor") == 1
     # Everything outside that list stays fail-closed.
-    assert "warn(ing)?|error|panic|fatal|oom|corruption|failure" in container_runtime
+    assert (
+        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        in container_runtime
+    )
+    assert "warn(ing)?|recovery.*(shortfall|failed)" in container_runtime
 
 
 def test_docker_test_target_disables_the_inherited_runtime_healthcheck() -> None:
