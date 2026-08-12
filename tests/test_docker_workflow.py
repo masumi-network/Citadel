@@ -59,6 +59,32 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
     assert "('1.4.1', '0.18.2', '1.19.0')" in dockerfile
 
 
+def test_runtime_bakes_the_ladybug_json_extension_under_home() -> None:
+    # Ladybug resolves its extension directory from $HOME when a Database
+    # opens, and it ignores LADYBUG_HOME_DIRECTORY: that name only reaches
+    # Ladybug as a connection-level `CALL home_directory`, which cannot run
+    # before the database is open. cognee_db_workers' OP_OPEN_DATABASE carries
+    # no home_directory field either. Caching the extension under
+    # /data/ladybug-home therefore left ladybug.Database() reading an empty
+    # $HOME/.lbdb, and graph projection froze at 54 of 289 searchable on
+    # 2026-08-12 with "Failed to load library ... libjson.lbug_extension".
+    # Executable lines of the runtime stage only, so a commented-out bake or
+    # one moved into the builder stage cannot satisfy this guard.
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    runtime_stage = dockerfile.split("FROM python", 2)[2].split("FROM runtime AS test", 1)[0]
+    executable = "\n".join(
+        line for line in runtime_stage.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "INSTALL JSON;" in executable
+    assert "/home/citadel/.lbdb" in executable
+    # LOAD EXTENSION never installs, so the proof fails the build when the bake
+    # is gone. Asserting the .so path keeps the proof from passing vacuously on
+    # an empty extension directory.
+    assert "libjson.lbug_extension" in executable
+    assert "LOAD EXTENSION JSON;" in executable
+    assert executable.index("INSTALL JSON;") < executable.index("LOAD EXTENSION JSON;")
+
+
 def test_ci_proves_the_baked_embedding_engine_offline() -> None:
     # Deleting the smoke step must fail a test, or the offline-bake policy is
     # unenforced (fresh-eyes R6, 2026-08-12).

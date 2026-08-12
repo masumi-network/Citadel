@@ -59,6 +59,26 @@ RUN HF_HUB_OFFLINE=1 python -c "from fastembed import TextEmbedding; v = list(Te
 # Offline may only be pinned together with BOTH bakes above; the tokenizer
 # cache alone froze vector and graph projection in production on 2026-08-12.
 ENV HF_HUB_OFFLINE=1
+# Bake the Ladybug json extension into $HOME/.lbdb. Ladybug resolves its
+# extension directory from $HOME when a Database opens, and it ignores
+# LADYBUG_HOME_DIRECTORY: that name is a Citadel convention which reaches
+# Ladybug only as a connection-level `CALL home_directory`, far too late for
+# ladybug.Database(). cognee_db_workers' OP_OPEN_DATABASE carries no
+# home_directory field either, so the open path can never be redirected off
+# $HOME. Caching the extension under /data/ladybug-home therefore leaves
+# Database() reading an empty $HOME/.lbdb, which is how graph projection froze
+# on 2026-08-12 ("Failed to load library ... libjson.lbug_extension: cannot
+# open shared object file"). Baking it here also removes the runtime download.
+RUN python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbbake')).execute('INSTALL JSON;')" \
+    && rm -rf /tmp/lbbake \
+    && chown -R 10001:10001 /home/citadel/.lbdb \
+    && chmod -R a+rX /home/citadel/.lbdb
+# Build-time proof the graph extension is present and loadable, mirroring the
+# embedding gate above. LOAD EXTENSION never installs, so this fails the build
+# when the bake is missing instead of failing cognify in production.
+RUN python -c "import glob; assert glob.glob('/home/citadel/.lbdb/extension/*/*/json/libjson.lbug_extension'), 'ladybug json extension is not baked'" \
+    && python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbproof')).execute('LOAD EXTENSION JSON;')" \
+    && rm -rf /tmp/lbproof
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway
