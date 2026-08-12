@@ -270,6 +270,13 @@ jobs:
       - name: Build Docker test target
         run: docker build --target test --tag citadel-archive:ci-test .
 
+
+      - name: Prove baked embedding engine works offline
+        run: |
+          docker run --rm --network none \
+            --env CITADEL_EMBEDDING_BAKE_SMOKE=1 \
+            citadel-archive:ci-test \
+            python -m pytest -q tests/test_embedding_bake_smoke.py
       - name: Run non-live and Qdrant contract suites with captured logs
         shell: bash
         run: |

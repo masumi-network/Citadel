@@ -431,6 +431,55 @@ def test_check_corpus_reports_bounded_probe_and_preserves_payload(monkeypatch) -
     assert check.data["corpus"]["relational_documents"] == 2867
 
 
+def test_check_corpus_names_the_failed_canary_over_a_complete_probe(monkeypatch) -> None:
+    # 2026-08-12: the row printed a red X while the detail read "corpus probe
+    # complete: 34/34 ... fully indexed"; the failing gate was the canary and
+    # the text never said so.
+    body = {
+        "ok": False,
+        "corpus": {
+            "ok": True,
+            "tracked_sources": 333,
+            "indexed_docs": 7656,
+            "relational_documents": 37,
+            "probe_documents": 34,
+            "probe_complete": True,
+            "probe_ok": True,
+            "probe_fully_indexed_documents": 34,
+        },
+        "canary": {"ok": False, "search_hit": False, "graph_grew": True},
+        "lifecycle": {"ok": True},
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    assert "search canary failed (search_hit=False)" in check.detail
+
+
+def test_check_corpus_folds_lifecycle_ok_and_shows_backend_split(monkeypatch) -> None:
+    # 2026-08-12: aggregate searchable kept rising on relational-only progress
+    # while graph and vector were frozen; the CLI stayed green over a 503 node.
+    body = {
+        "ok": False,
+        "corpus": {"ok": True, "tracked_sources": 333, "indexed_docs": 7656},
+        "canary": {"ok": True},
+        "lifecycle": {
+            "ok": False,
+            "current_generation": {
+                "current_searchable_by_backend": {"graph": 54, "relational": 115, "vector": 54}
+            },
+        },
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    assert "lifecycle invariants failing" in check.detail
+    assert "searchable by backend: graph 54, relational 115, vector 54" in check.detail
+    assert check.data["searchable_by_backend"] == {"graph": 54, "relational": 115, "vector": 54}
+
+
 def test_render_verdict_does_not_infer_empty_search_from_corpus_failure() -> None:
     report = StatusReport(
         node_url="https://node.example",

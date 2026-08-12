@@ -406,9 +406,15 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
     latency = int((time.monotonic() - started) * 1000)
     corpus = data.get("corpus") or {}
     canary = data.get("canary")
+    lifecycle = data.get("lifecycle") or {}
     indexed = corpus.get("indexed_docs")
     tracked = corpus.get("tracked_sources")
-    ok = bool(corpus.get("ok", True)) and (canary is None or bool(canary.get("ok", True)))
+    corpus_ok = bool(corpus.get("ok", True))
+    canary_ok = canary is None or bool(canary.get("ok", True))
+    # /readyz gates on lifecycle.ok too; ignoring it rendered a green Data
+    # plane over a 503 node (2026-08-12).
+    lifecycle_ok = bool(lifecycle.get("ok", True))
+    ok = corpus_ok and canary_ok and lifecycle_ok
     probe_documents = corpus.get("probe_documents")
     relational_documents = corpus.get("relational_documents")
     fully_indexed = corpus.get("probe_fully_indexed_documents")
@@ -431,12 +437,35 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
         detail = f"corpus probe unavailable: {corpus['degraded']}"
     else:
         detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
+    # Name the component that actually failed; the probe text alone read as a
+    # contradiction ("x Data plane ... complete: 34/34 fully indexed") while
+    # the canary was the failing gate.
+    if not canary_ok:
+        canary_error = (canary or {}).get("error")
+        canary_hit = (canary or {}).get("search_hit")
+        detail += f"; search canary failed (search_hit={canary_hit}"
+        detail += f", error={canary_error})" if canary_error else ")"
+    if not lifecycle_ok:
+        detail += "; lifecycle invariants failing"
+    by_backend = (lifecycle.get("current_generation") or {}).get(
+        "current_searchable_by_backend"
+    ) or {}
+    # An aggregate searchable count masked two frozen backends on 2026-08-12;
+    # show the split whenever the backends disagree.
+    if by_backend and len(set(by_backend.values())) > 1:
+        split = ", ".join(f"{name} {count}" for name, count in sorted(by_backend.items()))
+        detail += f"; searchable by backend: {split}"
     return Check(
         "corpus",
         ok=ok,
         detail=detail,
         latency_ms=latency,
-        data={"canary": canary, "corpus": dict(corpus)},
+        data={
+            "canary": canary,
+            "corpus": dict(corpus),
+            "lifecycle_ok": lifecycle_ok,
+            "searchable_by_backend": dict(by_backend),
+        },
     )
 
 

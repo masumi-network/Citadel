@@ -28,14 +28,20 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
         "ladybug==0.18.2",
         "qdrant-client==1.19.0",
         "transformers==5.15.0",
+        "huggingface-hub==1.27.0",
+        "tokenizers==0.22.2",
     }
 
     assert expected_pins <= set(server_dependencies)
     assert expected_pins <= requirements
-    # A global offline pin breaks fastembed's runtime ONNX weight download and
-    # froze vector/graph projection in production on 2026-08-12. Offline mode
-    # may only return together with baked fastembed weights.
-    assert "ENV HF_HUB_OFFLINE" not in dockerfile
+    # A global offline pin without the fastembed weight bake froze vector and
+    # graph projection in production on 2026-08-12. Offline mode is allowed
+    # only alongside BOTH bakes and the build-time offline embed proof.
+    if "ENV HF_HUB_OFFLINE=1" in dockerfile:
+        offline_prefix = dockerfile.split("ENV HF_HUB_OFFLINE=1", 1)[0]
+        assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in offline_prefix
+        assert "from fastembed import TextEmbedding" in offline_prefix
+        assert "HF_HUB_OFFLINE=1 python -c" in offline_prefix
 
     assert "(version('cognee'), version('ladybug'), version('qdrant-client'))" in dockerfile
     assert "('1.4.1', '0.18.2', '1.19.0')" in dockerfile

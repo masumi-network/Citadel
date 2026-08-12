@@ -28,7 +28,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
     CITADEL_BUILD_ID_PATH=/opt/citadel/build-id \
-    HF_HOME=/opt/hf-cache
+    HF_HOME=/opt/hf-cache \
+    FASTEMBED_CACHE_PATH=/opt/fastembed-cache
 
 RUN groupadd --gid 10001 citadel \
     && useradd --uid 10001 --gid 10001 --home-dir /home/citadel --create-home citadel \
@@ -45,12 +46,19 @@ RUN install -d /opt/citadel \
 # tokenizer under a read-only rootfs with no runtime network fetch.
 RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-small-en-v1.5')" \
     && chmod -R a+rX /opt/hf-cache
-# Do NOT set HF_HUB_OFFLINE here: the baked cache covers only the transformers
-# tokenizer, while fastembed downloads its ONNX embedding weights at runtime
-# into its own cache. Offline mode blocked that download in production on
-# 2026-08-12 ("Could not find model in cache_dir" every ~2.5s) and froze the
-# vector and graph projection backends. Offline hardening needs the fastembed
-# weights baked too; see issue #266.
+# Bake the fastembed ONNX embedding weights (HF repo
+# qdrant/bge-small-en-v1.5-onnx-q, ~64 MiB) so runtime embedding needs no
+# network. TextEmbedding() both downloads and writes fastembed's
+# files_metadata.json, which the offline load path verifies.
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" \
+    && chmod -R a+rX /opt/fastembed-cache
+# Build-time proof the image embeds offline before it ships. This is the gate
+# that would have caught the 2026-08-12 outage: HF_HUB_OFFLINE=1 with only the
+# tokenizer baked fails here, at build, not in production.
+RUN HF_HUB_OFFLINE=1 python -c "from fastembed import TextEmbedding; v = list(TextEmbedding(model_name='BAAI/bge-small-en-v1.5').embed(['smoke']))[0]; assert len(v) == 384"
+# Offline may only be pinned together with BOTH bakes above; the tokenizer
+# cache alone froze vector and graph projection in production on 2026-08-12.
+ENV HF_HUB_OFFLINE=1
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway

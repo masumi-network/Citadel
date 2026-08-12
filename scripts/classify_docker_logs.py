@@ -13,7 +13,15 @@ import sys
 
 _SEVERE = re.compile(
     r"\b(?:warn(?:ing)?|error|panic|fatal|oom|corrupt(?:ion)?|fail(?:ed|ure)?|"
-    r"degrad(?:ed|ation)|exception|traceback)\b",
+    r"degrad(?:ed|ation)|exception|traceback|died|critical)\b",
+    re.I,
+)
+# Fatal classes mirror the shell gates in .github/workflows/test.yml and can
+# never be excused by an expected-pattern match: a warning substring on the
+# same line must not hide a fatal condition (BLK-2026-08-12-01).
+_FATAL = re.compile(
+    r"\b(?:error|panic|fatal|oom|corrupt(?:ion)?|fail(?:ed|ure)?|"
+    r"exception|traceback|died|critical)\b",
     re.I,
 )
 _NON_2XX = re.compile(r"\b(?:1\d\d|3\d\d|4\d\d|5\d\d)\b")
@@ -34,13 +42,24 @@ def classify_logs(
     app_lines: list[str],
     qdrant_lines: list[str],
     expected_patterns: dict[str, list[str]] | None = None,
+    expected_fatal_patterns: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
-    """Return all severe/non-2xx lines. Only caller-declared regexes are allowed."""
+    """Return all severe/non-2xx lines. Only caller-declared regexes are allowed.
+
+    ``expected_patterns`` excuses warning-class lines only. A line carrying a
+    fatal-class token is excused solely by ``expected_fatal_patterns``, so a
+    warning allowlist can never hide a fatal condition on the same line
+    (BLK-2026-08-12-01).
+    """
     if not phase.strip():
         raise ValueError("phase must be non-empty")
     compiled = {
         source: [re.compile(pattern) for pattern in patterns]
         for source, patterns in (expected_patterns or {}).items()
+    }
+    compiled_fatal = {
+        source: [re.compile(pattern) for pattern in patterns]
+        for source, patterns in (expected_fatal_patterns or {}).items()
     }
     findings: list[Finding] = []
     for source, lines in (("app", app_lines), ("qdrant", qdrant_lines)):
@@ -52,7 +71,11 @@ def classify_logs(
             if _NON_2XX.search(text):
                 reasons.append("non_2xx")
             if reasons:
-                expected = any(pattern.search(text) for pattern in compiled.get(source, []))
+                if _FATAL.search(text):
+                    allowed = compiled_fatal.get(source, [])
+                else:
+                    allowed = compiled.get(source, [])
+                expected = any(pattern.search(text) for pattern in allowed)
                 findings.append(Finding(source, line_number, text, "+".join(reasons), expected))
     expected = [asdict(finding) for finding in findings if finding.expected]
     unexpected = [asdict(finding) for finding in findings if not finding.expected]
@@ -85,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-log", type=Path, required=True)
     parser.add_argument("--qdrant-log", type=Path, required=True)
     parser.add_argument("--expect", action="append", default=[])
+    parser.add_argument("--expect-fatal", action="append", default=[])
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -93,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             app_lines=_read_lines(args.app_log),
             qdrant_lines=_read_lines(args.qdrant_log),
             expected_patterns=_parse_expectation(args.expect),
+            expected_fatal_patterns=_parse_expectation(args.expect_fatal),
         )
     except (OSError, ValueError, re.error) as exc:
         print(f"log classification failed: {exc}", file=sys.stderr)

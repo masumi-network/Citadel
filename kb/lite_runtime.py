@@ -51,6 +51,9 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
         "SYSTEM_ROOT_DIRECTORY": str(root / "cognee-system"),
         "DATA_ROOT_DIRECTORY": str(root / "data-storage"),
         "CACHE_ROOT_DIRECTORY": str(root / "cache"),
+        # fastembed otherwise defaults to world-shared /tmp/fastembed_cache;
+        # inside the image the Dockerfile ENV (baked, read-only) wins over this.
+        "FASTEMBED_CACHE_PATH": str(root / "cache" / "fastembed"),
         "COGNEE_LOGS_DIR": str(root / "logs"),
         "CITADEL_STATE_DIRECTORY": str(root / "citadel-state"),
         "LADYBUG_HOME_DIRECTORY": str(root / "ladybug-home"),

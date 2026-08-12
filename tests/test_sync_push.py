@@ -412,3 +412,9 @@ def test_unreachable_node_still_exits_zero(monkeypatch: Any, tmp_path: Path) -> 
     receipt = _receipt_text()
     assert "not captured" in receipt
     assert "captured commit" not in receipt
+
+
+def test_receipt_summary_missing_accepted_is_unconfirmed_not_captured() -> None:
+    # A 2xx body without accepted: true must not read as "captured".
+    summary = sync_push.receipt_summary({"reason": "queued"}, short_sha="abc1234", branch="main")
+    assert summary == "commit abc1234 unconfirmed: server did not state accepted: true"
