@@ -12,16 +12,16 @@ import sys
 
 
 _SEVERE = re.compile(
-    r"\b(?:warn(?:ing)?|error|panic|fatal|oom|corrupt(?:ion)?|fail(?:ed|ure)?|"
-    r"degrad(?:ed|ation)|exception|traceback|died|critical)\b",
+    r"\b(?:warn(?:ing)?s?|errors?|panics?|fatal|oom|corrupt(?:ed|ion|s)?|"
+    r"fail(?:ed|ures?)?|degrad(?:ed|ation)|exceptions?|tracebacks?|died|critical)\b",
     re.I,
 )
 # Fatal classes mirror the shell gates in .github/workflows/test.yml and can
 # never be excused by an expected-pattern match: a warning substring on the
 # same line must not hide a fatal condition (BLK-2026-08-12-01).
 _FATAL = re.compile(
-    r"\b(?:error|panic|fatal|oom|corrupt(?:ion)?|fail(?:ed|ure)?|"
-    r"exception|traceback|died|critical)\b",
+    r"\b(?:errors?|panics?|fatal|oom|corrupt(?:ed|ion|s)?|fail(?:ed|ures?)?|"
+    r"exceptions?|tracebacks?|died|critical)\b",
     re.I,
 )
 _NON_2XX = re.compile(r"\b(?:1\d\d|3\d\d|4\d\d|5\d\d)\b")
@@ -54,11 +54,11 @@ def classify_logs(
     if not phase.strip():
         raise ValueError("phase must be non-empty")
     compiled = {
-        source: [re.compile(pattern) for pattern in patterns]
+        source: [re.compile(pattern, re.I) for pattern in patterns]
         for source, patterns in (expected_patterns or {}).items()
     }
     compiled_fatal = {
-        source: [re.compile(pattern) for pattern in patterns]
+        source: [re.compile(pattern, re.I) for pattern in patterns]
         for source, patterns in (expected_fatal_patterns or {}).items()
     }
     findings: list[Finding] = []
@@ -92,12 +92,12 @@ def _read_lines(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
-def _parse_expectation(values: list[str]) -> dict[str, list[str]]:
+def _parse_expectation(values: list[str], *, flag: str = "--expect") -> dict[str, list[str]]:
     grouped: dict[str, list[str]] = {}
     for value in values:
         source, separator, pattern = value.partition(":")
         if separator != ":" or source not in {"app", "qdrant"} or not pattern:
-            raise ValueError("--expect must be app:REGEX or qdrant:REGEX")
+            raise ValueError(f"{flag} must be app:REGEX or qdrant:REGEX")
         grouped.setdefault(source, []).append(pattern)
     return grouped
 
@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             app_lines=_read_lines(args.app_log),
             qdrant_lines=_read_lines(args.qdrant_log),
             expected_patterns=_parse_expectation(args.expect),
-            expected_fatal_patterns=_parse_expectation(args.expect_fatal),
+            expected_fatal_patterns=_parse_expectation(args.expect_fatal, flag="--expect-fatal"),
         )
     except (OSError, ValueError, re.error) as exc:
         print(f"log classification failed: {exc}", file=sys.stderr)

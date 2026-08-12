@@ -77,3 +77,14 @@ def test_plain_pattern_does_not_excuse_a_fatal_line() -> None:
     )
     assert result["ok"] is False
     assert result["unexpected"][0]["source"] == "app"
+
+
+def test_plural_fatal_tokens_are_detected() -> None:
+    # \berror\b missed "5 errors"; the shell gate caught it by substring.
+    result = classify_logs(
+        phase="plural",
+        app_lines=["5 errors during projection", "3 failures in receipts"],
+        qdrant_lines=["two exceptions raised", "corrupted segment"],
+    )
+    assert result["ok"] is False
+    assert len(result["unexpected"]) == 4

@@ -315,7 +315,7 @@ jobs:
               # Fatal classes cannot share the warning allowlist. Otherwise a
               # warning substring on the same line can hide a fatal condition.
               if grep -Eni \
-                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed' \
                 "$log_file"; then
                 echo "::error::Unexpected fatal container log in $log_file"
                 return 1
@@ -522,7 +522,7 @@ jobs:
               # Fatal classes cannot share the warning allowlist. Otherwise a
               # warning substring on the same line can hide a fatal condition.
               if grep -Eni \
-                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed' \
                 "$log_file"; then
                 echo "::error::Unexpected fatal runtime log in $log_file"
                 return 1

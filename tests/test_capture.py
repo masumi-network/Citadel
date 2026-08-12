@@ -365,16 +365,21 @@ def test_capture_json_preserves_returned_lifecycle_fields_per_root(
     assert "projection_state" not in out["results"][1]
 
 
-def test_capture_response_without_accepted_field_still_ok(
+def test_capture_response_without_accepted_field_is_unconfirmed(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    # Legacy shape: a 200 body with no explicit rejection reads as accepted.
+    # A 2xx body without accepted: true must not read as stored; the capture
+    # hooks and the CLI now hold the same contract
+    # (CITADEL-OBSERVED-OUTCOMES-01). The server always emits the boolean, so
+    # this fires only on a misbehaving or foreign node.
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_test")
     monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: {"status": "ok"})
     rc = asyncio.run(_capture(_configured_args(tmp_path, as_json=True)))
     out = json.loads(capsys.readouterr().out)
-    assert rc == 0
-    assert out["results"][0]["ok"] is True
+    assert rc != 0
+    entry = out["results"][0]
+    assert entry["ok"] is False
+    assert "unconfirmed" in entry["reason"]
 
 
 @pytest.mark.parametrize(

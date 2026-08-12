@@ -1322,9 +1322,18 @@ async def _capture(args: argparse.Namespace) -> int:
                     print(f"FAIL {root.path}: {exc}", file=sys.stderr)
             continue
         # HTTP 200 is not proof of storage: the server states its decision in
-        # `accepted`. Only an explicit false is a rejection (legacy bodies
-        # without the field keep the old 200-means-stored contract).
-        accepted = response.get("accepted") is not False
+        # `accepted`, and only an explicit true is a success. A 2xx body
+        # without the field is reported unconfirmed, matching the capture
+        # hooks (CITADEL-OBSERVED-OUTCOMES-01); the server always emits the
+        # boolean, so this fires only on a misbehaving or foreign node.
+        accepted = response.get("accepted") is True
+        if not accepted and response.get("accepted") is not False:
+            reason = "unconfirmed: server did not state accepted: true"
+            results.append({"root": root.path, "ok": False, "reason": reason})
+            failures += 1
+            if not as_json:
+                print(f"UNCONFIRMED {root.path}: {reason}", file=sys.stderr)
+            continue
         reason = response.get("reason")
         cognee_result = response.get("cognee_result")
         status = (

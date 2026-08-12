@@ -437,24 +437,43 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
         detail = f"corpus probe unavailable: {corpus['degraded']}"
     else:
         detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
-    # Name the component that actually failed; the probe text alone read as a
-    # contradiction ("x Data plane ... complete: 34/34 fully indexed") while
-    # the canary was the failing gate.
+    # Name the component that actually failed, PREPENDED: the row renderer
+    # truncates long details, and an appended clause vanished at 80 columns
+    # while the probe text alone read as a contradiction ("x Data plane ...
+    # complete: 34/34 fully indexed") with the canary as the failing gate.
+    failures: list[str] = []
     if not canary_ok:
         canary_error = (canary or {}).get("error")
         canary_hit = (canary or {}).get("search_hit")
-        detail += f"; search canary failed (search_hit={canary_hit}"
-        detail += f", error={canary_error})" if canary_error else ")"
+        clause = f"search canary failed (search_hit={canary_hit}"
+        clause += f", error={canary_error})" if canary_error else ")"
+        failures.append(clause)
     if not lifecycle_ok:
-        detail += "; lifecycle invariants failing"
-    by_backend = (lifecycle.get("current_generation") or {}).get(
-        "current_searchable_by_backend"
-    ) or {}
-    # An aggregate searchable count masked two frozen backends on 2026-08-12;
-    # show the split whenever the backends disagree.
-    if by_backend and len(set(by_backend.values())) > 1:
+        # /readyz carries the specifics; a generic sentence wasted them.
+        errors = lifecycle.get("invariant_errors") or []
+        if errors:
+            failures.append("lifecycle invariants failing: " + ", ".join(errors[:3]))
+        elif lifecycle.get("error_type"):
+            failures.append(f"lifecycle census error: {lifecycle['error_type']}")
+        else:
+            failures.append("lifecycle invariants failing")
+    generation = lifecycle.get("current_generation") or {}
+    # Zero-fill from the receipts universe: a backend with NOTHING searchable
+    # is absent from current_searchable_by_backend, and that absent backend is
+    # the worst form of the 2026-08-12 freeze, not a healthy one.
+    backends = generation.get("current_receipts_by_backend") or {}
+    searchable = generation.get("current_searchable_by_backend") or {}
+    by_backend = {name: int(searchable.get(name, 0)) for name in backends} or dict(searchable)
+    if by_backend and (not lifecycle_ok or len(set(by_backend.values())) > 1):
         split = ", ".join(f"{name} {count}" for name, count in sorted(by_backend.items()))
-        detail += f"; searchable by backend: {split}"
+        failures.append(f"searchable by backend: {split}")
+    if ok and data.get("ok") is False:
+        # The server's own gate is authoritative; if it refuses readiness for
+        # a reason this client does not model yet, say so instead of drifting.
+        failures.append("node reports not ready (server-side gate not modeled here)")
+        ok = False
+    if failures:
+        detail = "; ".join(failures) + f"; {detail}"
     return Check(
         "corpus",
         ok=ok,

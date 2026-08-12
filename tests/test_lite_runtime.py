@@ -272,3 +272,17 @@ def test_container_runtime_home_belongs_to_the_dropped_user() -> None:
     )
 
     assert "HOME=/home/citadel" in dockerfile
+
+
+def test_offline_rejects_a_model_that_is_not_baked(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
+    with pytest.raises(lite_runtime.LiteConfigurationError, match="baked into this image"):
+        lite_runtime.configure_lite_environment(tmp_path)
+
+
+def test_offline_accepts_the_baked_model(tmp_path, monkeypatch) -> None:
+    _configured_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("EMBEDDING_MODEL", lite_runtime.BAKED_EMBEDDING_MODEL)
+    assert lite_runtime.configure_lite_environment() == tmp_path.resolve()

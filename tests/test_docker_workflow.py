@@ -35,16 +35,33 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
     assert expected_pins <= set(server_dependencies)
     assert expected_pins <= requirements
     # A global offline pin without the fastembed weight bake froze vector and
-    # graph projection in production on 2026-08-12. Offline mode is allowed
-    # only alongside BOTH bakes and the build-time offline embed proof.
-    if "ENV HF_HUB_OFFLINE=1" in dockerfile:
-        offline_prefix = dockerfile.split("ENV HF_HUB_OFFLINE=1", 1)[0]
-        assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in offline_prefix
-        assert "from fastembed import TextEmbedding" in offline_prefix
-        assert "HF_HUB_OFFLINE=1 python -c" in offline_prefix
+    # graph projection in production on 2026-08-12. The bakes and the
+    # build-time offline embed proof are unconditional policy (a conditional
+    # guard passes vacuously when the ENV and the bake are removed together),
+    # and the offline pin must come after all of them.
+    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in dockerfile
+    assert "from fastembed import TextEmbedding" in dockerfile
+    assert "HF_HUB_OFFLINE=1 python -c" in dockerfile
+    assert "ENV HF_HUB_OFFLINE=1" in dockerfile
+    offline_prefix = dockerfile.split("ENV HF_HUB_OFFLINE=1", 1)[0]
+    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in offline_prefix
+    assert "from fastembed import TextEmbedding" in offline_prefix
+    assert "HF_HUB_OFFLINE=1 python -c" in offline_prefix
 
     assert "(version('cognee'), version('ladybug'), version('qdrant-client'))" in dockerfile
     assert "('1.4.1', '0.18.2', '1.19.0')" in dockerfile
+
+
+def test_ci_proves_the_baked_embedding_engine_offline() -> None:
+    # Deleting the smoke step must fail a test, or the offline-bake policy is
+    # unenforced (fresh-eyes R6, 2026-08-12).
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    assert "--network none" in container_tests
+    assert "CITADEL_EMBEDDING_BAKE_SMOKE=1" in container_tests
+    assert "tests/test_embedding_bake_smoke.py" in container_tests
 
 
 def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
@@ -213,7 +230,7 @@ def test_container_log_classifiers_use_portable_guarded_grep() -> None:
     tests_code = _executable_lines(container_tests)
     runtime_code = _executable_lines(container_runtime)
     hard_failure_pattern = (
-        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        "error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed"
     )
     for code in (tests_code, runtime_code):
         assert "command -v grep >/dev/null" in code
@@ -284,6 +301,8 @@ def test_container_log_classifiers_reject_fatal_tokens_before_exemptions(
         "WARNING TLS disabled; FATAL corruption\n",
         "WARNING TLS disabled; ERROR request rejected\n",
         "warning Cognee 1.0 changes: ERROR request rejected\n",
+        # 'corruption' alone missed the past-tense form until 2026-08-12.
+        "corrupted segment detected\n",
     )
 
     for job, function_name, label in classifiers:
@@ -424,7 +443,7 @@ def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines()
     assert code.count("onnxruntime cpuid_info warning: Unknown CPU vendor") == 1
     # Everything outside that list stays fail-closed.
     assert (
-        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        "error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed"
         in container_runtime
     )
     assert "warn(ing)?|recovery.*(shortfall|failed)" in container_runtime

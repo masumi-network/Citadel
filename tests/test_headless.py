@@ -217,7 +217,9 @@ def test_capture_json_real_post_shape(tmp_path: Path, monkeypatch, capsys) -> No
           "--root", f"{tmp_path}=personal", "--config", str(cfg)])
     capsys.readouterr()
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_headless_token")
-    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: {"status": "ok"})
+    # The real server always states its decision; a body without accepted: true
+    # now reads as unconfirmed, so the "real POST shape" fixture must carry it.
+    monkeypatch.setattr("kb.cli.post_capture", lambda *a, **k: {"accepted": True, "status": "ok"})
 
     rc = _run(["capture", "--json", "--config", str(cfg)])
     assert rc == 0
