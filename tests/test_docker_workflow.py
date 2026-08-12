@@ -27,6 +27,7 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
         "cognee[fastembed]==1.4.1",
         "ladybug==0.18.2",
         "qdrant-client==1.19.0",
+        "transformers==4.57.6",
     }
 
     assert expected_pins <= set(server_dependencies)
