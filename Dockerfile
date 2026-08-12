@@ -65,10 +65,14 @@ ENV HF_HUB_OFFLINE=1
 # Ladybug only as a connection-level `CALL home_directory`, far too late for
 # ladybug.Database(). cognee_db_workers' OP_OPEN_DATABASE carries no
 # home_directory field either, so the open path can never be redirected off
-# $HOME. Caching the extension under /data/ladybug-home therefore leaves
-# Database() reading an empty $HOME/.lbdb, which is how graph projection froze
-# on 2026-08-12 ("Failed to load library ... libjson.lbug_extension: cannot
-# open shared object file"). Baking it here also removes the runtime download.
+# $HOME. That open-time load is WAL-replay driven: a cleanly closed database
+# reopens fine with an empty home, but after an unclean shutdown the replay
+# needs the extension before any connection exists. Caching it only under
+# /data/ladybug-home therefore leaves Database() reading an empty $HOME/.lbdb,
+# which is how graph projection froze on 2026-08-12 ("Failed to load library
+# ... libjson.lbug_extension: cannot open shared object file"). This bake fixes
+# the open path only. The adapter still installs into /data/ladybug-home on a
+# fresh volume, which is unchanged behaviour.
 RUN python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbbake')).execute('INSTALL JSON;')" \
     && rm -rf /tmp/lbbake \
     && chown -R 10001:10001 /home/citadel/.lbdb \
