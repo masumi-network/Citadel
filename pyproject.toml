@@ -36,7 +36,7 @@ server = [
     "ladybug==0.18.2",
     # Real tokenizer for BGE chunk sizing; the resolver silently falls back to
     # approximate TikToken counts when transformers is missing.
-    "transformers==4.57.6",
+    "transformers==5.15.0",
     "cryptography==50.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
