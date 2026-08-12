@@ -79,10 +79,15 @@ RUN python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbbake'
     && chmod -R a+rX /home/citadel/.lbdb
 # Build-time proof the graph extension is present and loadable, mirroring the
 # embedding gate above. LOAD EXTENSION never installs, so this fails the build
-# when the bake is missing instead of failing cognify in production.
+# when the bake is missing instead of failing cognify in production. The proof
+# runs as the shipped user, not root: the bake chowns and chmods the tree, and
+# a root-only proof would still pass if a future change left it unreadable to
+# uid 10001, which is the only identity that ever opens the graph at runtime.
+USER 10001:10001
 RUN python -c "import glob; assert glob.glob('/home/citadel/.lbdb/extension/*/*/json/libjson.lbug_extension'), 'ladybug json extension is not baked'" \
     && python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbproof')).execute('LOAD EXTENSION JSON;')" \
     && rm -rf /tmp/lbproof
+USER root
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway

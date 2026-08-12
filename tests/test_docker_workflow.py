@@ -83,6 +83,10 @@ def test_runtime_bakes_the_ladybug_json_extension_under_home() -> None:
     assert "libjson.lbug_extension" in executable
     assert "LOAD EXTENSION JSON;" in executable
     assert executable.index("INSTALL JSON;") < executable.index("LOAD EXTENSION JSON;")
+    # The proof must run as the shipped user. Both adversarial reviewers noted
+    # that a root-only proof still passes when the tree is unreadable to uid
+    # 10001, which is the only identity that opens the graph at runtime.
+    assert executable.index("USER 10001:10001") < executable.index("LOAD EXTENSION JSON;")
 
 
 def test_ci_proves_the_baked_embedding_engine_offline() -> None:
