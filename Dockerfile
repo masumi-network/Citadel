@@ -27,7 +27,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PORT=8000 \
     HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
-    CITADEL_BUILD_ID_PATH=/opt/citadel/build-id
+    CITADEL_BUILD_ID_PATH=/opt/citadel/build-id \
+    HF_HOME=/opt/hf-cache
 
 RUN groupadd --gid 10001 citadel \
     && useradd --uid 10001 --gid 10001 --home-dir /home/citadel --create-home citadel \
@@ -40,6 +41,13 @@ RUN install -d /opt/citadel \
     && python -m pip check \
     && python -c "from importlib.metadata import version; assert (version('cognee'), version('ladybug'), version('qdrant-client')) == ('1.4.1', '0.18.2', '1.19.0')" \
     && rm -rf /wheels
+# Bake the BGE tokenizer into the image so chunk sizing uses the real
+# tokenizer under a read-only rootfs with no runtime network fetch.
+RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-small-en-v1.5')" \
+    && chmod -R a+rX /opt/hf-cache
+# Verified: with the cache populated, transformers loads the tokenizer under
+# HF_HUB_OFFLINE=1, so the runtime never reaches the network for it.
+ENV HF_HUB_OFFLINE=1
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway
