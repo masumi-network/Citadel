@@ -598,3 +598,67 @@ async def test_owner_ids_unresolvable_ids_return_none(real_graph: Any) -> None:
     # The synthetic id never touched the vector engine; the UUID ids paid at
     # most the two seed lookups each.
     assert all(len(ids) == 1 for _, ids in store.calls)
+
+
+# --------------------------------------------------------------------------
+# ?scope=chunk: the clicked chunk's own text, not the assembled parent.
+# --------------------------------------------------------------------------
+
+
+async def test_chunk_scope_returns_the_chunks_own_text(real_graph: Any) -> None:
+    """The graph inspector wants what is INSIDE the clicked node.
+
+    Without the flag a chunk id returns the whole assembled parent (verified
+    live: 23k-char daily digest for one passage). chunk_scope keeps the
+    chunk's own text, same envelope, and the parent still rides in
+    dataset_node_ids so the ADR-0009 gate decides exactly as before.
+    """
+    client = _client_over(real_graph)
+    _install_chunk_store(client, _empty_store())
+
+    scoped = await client.get_document(CHUNK_IDS[1], chunk_scope=True)
+    default = await client.get_document(CHUNK_IDS[1])
+
+    assert scoped is not None
+    assert scoped["body"] == "part one"  # the clicked passage only
+    assert default is not None
+    assert default["body"] == FULL_BODY  # absent flag: unchanged
+    assert scoped["metadata"]["chunk_id"] == CHUNK_IDS[1]
+    assert scoped["metadata"]["document_id"] == DOC_ID
+    assert scoped["metadata"]["chunk_index"] == 1
+    # ADR-0009 unchanged: the parent Data.id stays in the owner ids.
+    assert DOC_ID in scoped["dataset_node_ids"]
+    assert CHUNK_IDS[1] in scoped["dataset_node_ids"]
+
+
+async def test_chunk_scope_on_a_document_id_keeps_the_assembly(
+    real_graph: Any,
+) -> None:
+    """Non-chunk ids ignore the flag: a textless document still assembles."""
+    client = _client_over(real_graph)
+    _install_chunk_store(client, _empty_store())
+
+    document = await client.get_document(DOC_ID, chunk_scope=True)
+
+    assert document is not None
+    assert document["body"] == FULL_BODY
+    assert document["chunk_count"] == 3
+
+
+async def test_chunk_scope_orphan_chunk_serves_the_seed_row(real_graph: Any) -> None:
+    """Chunk-store fallback honors the scope too: the seed row IS the chunk."""
+    client = _client_over(real_graph)
+    _install_chunk_store(client, _orphan_store())
+
+    scoped = await client.get_document(ORPHAN_CHUNK_IDS[1], chunk_scope=True)
+    default = await client.get_document(ORPHAN_CHUNK_IDS[1])
+
+    assert scoped is not None
+    assert scoped["body"] == "orphan one"
+    assert default is not None
+    assert default["body"] == "orphan zero\n\norphan one\n\norphan two\n\norphan three"
+    assert scoped["metadata"]["chunk_id"] == ORPHAN_CHUNK_IDS[1]
+    assert scoped["metadata"]["document_id"] == ORPHAN_DOC_ID
+    assert scoped["metadata"]["chunk_index"] == 1
+    # Parent Data.id first, requested chunk id kept — gate inputs unchanged.
+    assert scoped["dataset_node_ids"] == [ORPHAN_DOC_ID, ORPHAN_CHUNK_IDS[1]]
