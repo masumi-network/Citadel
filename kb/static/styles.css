@@ -1058,12 +1058,22 @@ pre {
   display: grid;
   grid-template-rows: auto auto minmax(320px, 1fr) auto;
   min-height: 590px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .graph-toolbar {
   grid-row: 1;
+  position: relative;
+  z-index: 4;
+  display: grid;
+  grid-template-columns: minmax(150px, 0.65fr) minmax(280px, 1.45fr) auto;
+  align-items: center;
+  gap: 18px;
   padding: 16px 20px 14px;
+}
+
+.graph-toolbar-copy {
+  min-width: 0;
 }
 
 #meshAlert {
@@ -1096,11 +1106,234 @@ pre {
   padding: 0 10px;
 }
 
-.graph-toolbar .toolbar-actions {
+.graph-node-search {
+  position: relative;
+  min-width: 0;
+}
+
+.graph-node-search-icon {
+  position: absolute;
+  top: 50%;
+  left: 13px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  transform: translateY(-50%);
+  color: var(--quiet);
+  pointer-events: none;
+}
+
+.graph-node-search input {
+  width: 100%;
+  height: 42px;
+  padding: 0 14px 0 41px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  background: var(--field);
+  color: var(--text);
+  font: 500 13px/1 var(--sans);
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.graph-node-search input::placeholder {
+  color: var(--quiet);
+}
+
+.graph-node-search input:hover {
+  border-color: var(--border-strong);
+}
+
+.graph-node-search input:focus {
+  border-color: var(--primary);
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.graph-node-search:focus-within .graph-node-search-icon {
+  color: var(--primary-strong);
+}
+
+.graph-node-search-results {
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  left: 0;
+  z-index: 12;
+  max-height: 292px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.graph-node-search-result {
   display: flex;
-  flex-wrap: wrap;
+  width: 100%;
+  min-height: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border-quiet);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-node-search-result:last-child {
+  border-bottom: 0;
+}
+
+.graph-node-search-result:hover,
+.graph-node-search-result.active {
+  background: var(--primary-soft);
+}
+
+.graph-node-search-result strong {
+  width: 100%;
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-node-search-result span {
+  width: 100%;
+  overflow: hidden;
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-node-search-empty {
+  padding: 14px;
+  color: var(--quiet);
+  font-size: 12px;
+  text-align: center;
+}
+
+.graph-view-menu {
+  position: relative;
+  justify-self: end;
+}
+
+.graph-view-menu > summary {
+  display: inline-flex;
+  min-width: 162px;
+  height: 42px;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.graph-view-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.graph-view-icon {
+  width: 17px;
+  height: 17px;
+  color: var(--quiet);
+}
+
+.graph-view-menu-chevron {
+  width: 14px;
+  height: 14px;
+  transition: transform 150ms ease;
+}
+
+.graph-view-menu[open] .graph-view-menu-chevron {
+  transform: rotate(180deg);
+}
+
+.graph-view-menu[open] > summary {
+  border-color: var(--primary);
+  color: var(--text);
+}
+
+.graph-view-panel {
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  z-index: 12;
+  width: min(340px, calc(100vw - 48px));
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.graph-view-group {
+  display: block;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-quiet);
+}
+
+.graph-view-group:first-child {
+  padding-top: 0;
+}
+
+.graph-view-group:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.graph-view-group-label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.graph-view-panel .segmented-control {
+  width: 100%;
+}
+
+.graph-view-panel .segment-button {
+  flex: 1;
+}
+
+.graph-view-field select {
+  width: 100%;
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--field);
+  color: var(--text);
+  font: 500 12px/1 var(--sans);
+}
+
+.graph-view-field select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.graph-view-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.graph-view-actions button {
+  width: 100%;
+  min-width: 0;
+  padding-right: 8px;
+  padding-left: 8px;
+  white-space: normal;
 }
 
 #graphMeta {
@@ -1146,6 +1379,11 @@ pre {
   margin-top: 4px;
   color: var(--muted);
   font-size: 13px;
+}
+
+#realGraphEmpty {
+  inset: 16px 16px auto auto;
+  transform: none;
 }
 
 .selection {
@@ -2921,6 +3159,53 @@ textarea[aria-invalid="true"] {
   }
 
   .analytics-strip {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .graph-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .graph-node-search {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+  }
+
+  .graph-view-menu {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
+@media (max-width: 520px) {
+  .graph-toolbar {
+    padding: 14px;
+  }
+
+  .graph-view-menu > summary {
+    min-width: 0;
+    min-height: 44px;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .graph-node-search input,
+  .graph-view-panel .segment-button,
+  .graph-view-field select,
+  .graph-view-actions button {
+    min-height: 44px;
+  }
+
+  .graph-view-icon {
+    display: none;
+  }
+
+  .graph-view-actions {
     grid-template-columns: 1fr;
   }
 }

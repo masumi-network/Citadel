@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Citadel Archive</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=light-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=graph-search-1" />
   </head>
   <body>
     <div class="app-frame">
@@ -430,52 +430,103 @@
                  width here rather than inside .knowledge-grid, which is two-column. -->
               <section id="mesh" class="graph-panel window" aria-labelledby="graphTitle">
                 <div class="window-titlebar graph-toolbar">
-                  <div>
+                  <div class="graph-toolbar-copy">
                     <p class="eyebrow">Linked memory</p>
                     <h2 id="graphTitle">Vault graph</h2>
                     <p id="graphMeta">Waiting for snapshot</p>
                   </div>
-                  <div class="toolbar-actions">
-                    <div class="segmented-control graph-mode" role="group" aria-label="Graph data source">
-                      <button
-                        class="segment-button"
-                        type="button"
-                        data-graph-mode="live"
-                        aria-pressed="false"
-                        title="Vault Activity: what the vault is doing right now — syncs, searches, ingests"
-                      >
-                        Vault Activity
-                      </button>
-                      <button
-                        class="segment-button active"
-                        type="button"
-                        data-graph-mode="knowledge"
-                        aria-pressed="true"
-                        title="Knowledge Mesh: what the vault knows — documents, entities, and the seats they come from"
-                      >
-                        Knowledge Mesh
-                      </button>
-                    </div>
-                    <select
-                      id="graphDatasetFilter"
-                      class="secondary-button compact-button"
-                      aria-label="Filter Knowledge Mesh by dataset"
-                      title="Show only one dataset's nodes (server-filtered); All datasets restores the org view"
-                    >
-                      <option value="">All datasets</option>
-                    </select>
-                    <button
-                      id="graphAggregateButton"
-                      class="secondary-button compact-button active"
-                      type="button"
-                      aria-pressed="true"
-                      title="Concept map: documents and chunks fold into hub counts. Click for the raw graph."
-                    >
-                      Aggregate
-                    </button>
-                    <button id="fitButton" class="secondary-button compact-button" type="button">Fit</button>
-                    <button id="pauseButton" class="secondary-button compact-button" type="button">Pause</button>
+                  <div id="graphNodeSearch" class="graph-node-search" role="search">
+                    <svg class="graph-node-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="11" cy="11" r="6.5" />
+                      <path d="m16 16 4 4" />
+                    </svg>
+                    <input
+                      id="graphNodeSearchInput"
+                      type="search"
+                      autocomplete="off"
+                      spellcheck="false"
+                      placeholder="Find a node in this view"
+                      aria-label="Find a node in this graph"
+                      aria-controls="graphNodeSearchResults"
+                      aria-expanded="false"
+                      aria-autocomplete="list"
+                      role="combobox"
+                    />
+                    <div
+                      id="graphNodeSearchResults"
+                      class="graph-node-search-results"
+                      role="listbox"
+                      aria-label="Matching graph nodes"
+                      hidden
+                    ></div>
                   </div>
+                  <details id="graphViewMenu" class="graph-view-menu">
+                    <summary class="secondary-button compact-button">
+                      <svg class="graph-view-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+                        <path d="M4 7h10" />
+                        <path d="M18 7h2" />
+                        <path d="M4 17h2" />
+                        <path d="M10 17h10" />
+                        <circle cx="16" cy="7" r="2" />
+                        <circle cx="8" cy="17" r="2" />
+                      </svg>
+                      <span id="graphViewLabel">Knowledge Mesh</span>
+                      <svg class="graph-view-menu-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                        <path d="m4 6 4 4 4-4" />
+                      </svg>
+                    </summary>
+                    <div class="graph-view-panel">
+                      <div class="graph-view-group">
+                        <span class="graph-view-group-label">Source</span>
+                        <div class="segmented-control graph-mode" role="group" aria-label="Graph data source">
+                          <button
+                            class="segment-button"
+                            type="button"
+                            data-graph-mode="live"
+                            aria-pressed="false"
+                            title="Vault Activity: current syncs, searches, and ingests"
+                          >
+                            Vault Activity
+                          </button>
+                          <button
+                            class="segment-button active"
+                            type="button"
+                            data-graph-mode="knowledge"
+                            aria-pressed="true"
+                            title="Knowledge Mesh: documents, entities, and their source seats"
+                          >
+                            Knowledge Mesh
+                          </button>
+                        </div>
+                      </div>
+                      <label class="graph-view-group graph-view-field" for="graphDatasetFilter">
+                        <span class="graph-view-group-label">Dataset</span>
+                        <select
+                          id="graphDatasetFilter"
+                          aria-label="Filter Knowledge Mesh by dataset"
+                          title="Show one dataset or restore the organization view"
+                        >
+                          <option value="">All datasets</option>
+                        </select>
+                      </label>
+                      <div class="graph-view-group">
+                        <span class="graph-view-group-label">Canvas</span>
+                        <div class="graph-view-actions">
+                          <button
+                            id="graphAggregateButton"
+                            class="secondary-button compact-button active"
+                            type="button"
+                            aria-pressed="true"
+                            title="Concept map: documents and chunks fold into hub counts. Click for the raw graph."
+                          >
+                            Concept map
+                          </button>
+                          <button id="fitButton" class="secondary-button compact-button" type="button">Fit canvas</button>
+                          <button id="pauseButton" class="secondary-button compact-button" type="button">Pause motion</button>
+                        </div>
+                      </div>
+                    </div>
+                  </details>
                 </div>
                 <div id="meshAlert" class="inline-alert" hidden>
                   <div>
@@ -1539,6 +1590,6 @@ args = [
     <div id="toastStack" class="toast-stack" role="status" aria-live="polite"></div>
 
     <script src="/static/vendor/force-graph.min.js"></script>
-    <script src="/static/app.js?v=graph-nav-1"></script>
+    <script src="/static/app.js?v=graph-search-1"></script>
   </body>
 </html>
