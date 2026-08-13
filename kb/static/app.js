@@ -90,7 +90,6 @@ const state = {
   // Knowledge Mesh is the durable view; Vault Activity is restart-transient and
   // therefore empty on every fresh boot/redeploy — a bad first impression.
   graphMode: "knowledge",
-  graphDepth: 0,
   graphSpokes: true,
   // Knowledge-mode legend filter: node kinds hidden from the canvas. Chunks
   // start hidden — they dominate the node count and bury the entities.
@@ -196,7 +195,6 @@ const conflictsList = document.getElementById("conflictsList");
 const conflictNavBadge = document.getElementById("conflictNavBadge");
 const conflictFilterButtons = Array.from(document.querySelectorAll("[data-conflict-filter]"));
 const graphModeButtons = Array.from(document.querySelectorAll("[data-graph-mode]"));
-const graphDepthInput = document.getElementById("graphDepthInput");
 const graphAggregateButton = document.getElementById("graphAggregateButton");
 const graphDatasetFilter = document.getElementById("graphDatasetFilter");
 const realGraphEmpty = document.getElementById("realGraphEmpty");
@@ -383,34 +381,6 @@ function nodeValue(node) {
   return clamp(2 + degree * 1.4, 2, 9);
 }
 
-function applyGraphDepth(nodes, links, byId) {
-  const depth = Number(state.graphDepth) || 0;
-  if (depth <= 0) return { nodes, links };
-  const focusId = state.selectedId || graph.centralId;
-  if (!focusId || !byId.has(focusId)) return { nodes, links };
-  const keep = new Set([focusId]);
-  let frontier = [focusId];
-  for (let hop = 0; hop < depth; hop += 1) {
-    const next = [];
-    for (const nodeId of frontier) {
-      const node = byId.get(nodeId);
-      if (!node) continue;
-      for (const neighbor of node.neighbors || []) {
-        if (!keep.has(neighbor.id)) {
-          keep.add(neighbor.id);
-          next.push(neighbor.id);
-        }
-      }
-    }
-    frontier = next;
-    if (!frontier.length) break;
-  }
-  return {
-    nodes: nodes.filter((node) => keep.has(node.id)),
-    links: links.filter((link) => keep.has(link.source) && keep.has(link.target)),
-  };
-}
-
 function applyHubSpokes(nodes, links, byId) {
   // Spokes are decoration for the live dashboard projection only. Knowledge
   // mode renders real graph data (dataset attribution arrives as belongs_to
@@ -556,8 +526,6 @@ function buildForceGraphData() {
   // org Central hub (e.g. when github_sync_dataset is renamed).
   let byId = rebuildNeighborLinks(nodes, links);
   graph.centralId = resolveCentralId(nodes);
-  ({ nodes, links } = applyGraphDepth(nodes, links, byId));
-  byId = rebuildNeighborLinks(nodes, links);
   ({ nodes, links } = applyHubSpokes(nodes, links, byId));
   byId = rebuildNeighborLinks(nodes, links);
   return { nodes, links, byId };
@@ -2108,10 +2076,6 @@ function selectNode(node) {
     loadNodeDocument(node);
   }
   updateNodeSelection();
-  if (state.graphDepth > 0) {
-    buildGraphScene();
-    updateGraphMeta();
-  }
 }
 
 const MAX_INSPECTOR_NEIGHBORS = 8;
@@ -2401,8 +2365,8 @@ function updateGraphMeta(message) {
       const kind = nodeKind(node);
       if (state.graphHiddenKinds.has(kind)) hiddenPresent.add(kind);
     }
-    // Count through the same pipeline the renderer uses (kind filter + depth
-    // drill-down) so "Showing N" never overstates what is on the canvas.
+    // Count through the same pipeline the renderer uses (kind filter +
+    // aggregation) so "Showing N" never overstates what is on the canvas.
     // Content nodes only: synthetic dataset hubs are excluded so the units
     // match visible_nodes (a content count).
     const shown = buildForceGraphData().nodes.filter(
@@ -2424,7 +2388,7 @@ function updateGraphMeta(message) {
       } else {
         meta = `Showing ${shown} of ${visible} in your scope`;
         // The server caps the node list at mesh_graph_max_nodes; without this
-        // the cut reads as if the legend/depth filters hid the nodes.
+        // the cut reads as if the legend filter hid the nodes.
         if (payload.truncated && Number.isFinite(Number(payload.limit))) {
           meta += ` · capped at ${payload.limit}`;
         }
@@ -4261,15 +4225,6 @@ conflictFilterButtons.forEach((button) => {
 graphModeButtons.forEach((button) => {
   button.addEventListener("click", () => setGraphMode(button.dataset.graphMode || "live"));
 });
-
-if (graphDepthInput) {
-  graphDepthInput.addEventListener("input", (event) => {
-    state.graphDepth = Number(event.currentTarget.value) || 0;
-    buildGraphScene();
-    updateGraphMeta();
-    if (state.graphDepth > 0) resetGraphView();
-  });
-}
 
 if (graphAggregateButton) {
   graphAggregateButton.addEventListener("click", () => {
