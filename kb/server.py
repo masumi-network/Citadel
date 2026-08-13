@@ -5879,8 +5879,17 @@ async def cognee_document_visible(identity: AccessIdentity, node_ids: list[str])
 
 
 @app.get("/api/documents/{document_id}")
-async def source_document(document_id: str, request: Request) -> Any:
+async def source_document(
+    document_id: str, request: Request, scope: str | None = None
+) -> Any:
     identity = require_access(request, "reader", "kb:read")
+    # ?scope=chunk (graph inspector contract): a DocumentChunk id returns the
+    # chunk's OWN text instead of the assembled parent, same envelope, same
+    # ADR-0009 gate. Non-chunk ids and absent scope keep today's behavior.
+    if scope not in {None, "chunk"}:
+        raise HTTPException(
+            status_code=422, detail="Unsupported document scope (use 'chunk')."
+        )
     if document_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
         github_document = github_section_document(document_id, get_citadel().config)
         if github_document is None:
@@ -5895,8 +5904,14 @@ async def source_document(document_id: str, request: Request) -> Any:
         assert_obsidian_vault_owned(identity, obsidian.document_vault_id(document_id) or "")
     except KeyError:
         # Not a github/obsidian doc — fall back to resolving a native cognee
-        # search-hit id against the graph store (#28).
-        cognee_document = await get_citadel().get_document(document_id)
+        # search-hit id against the graph store (#28). chunk_scope is passed
+        # only when requested so fakes with the plain signature keep working.
+        if scope == "chunk":
+            cognee_document = await get_citadel().get_document(
+                document_id, chunk_scope=True
+            )
+        else:
+            cognee_document = await get_citadel().get_document(document_id)
         if cognee_document is None:
             raise HTTPException(status_code=404, detail="Document not found.") from None
         # dataset_node_ids is internal plumbing (ADR-0009 scope check), never

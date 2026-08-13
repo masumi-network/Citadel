@@ -11,10 +11,12 @@ ported pages already read must not move.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+import kb.server as server_module
 from kb.access import AccessStore, now_iso
 from kb.mesh import MeshState
 from kb.promotion_queue import build_pending_item, scan_candidate
@@ -22,6 +24,10 @@ from kb.promotion_refs import ReferenceAssessment
 from kb.server import app
 
 from test_server import authed_client
+
+# One repo root for every static-asset pin below, the same way
+# tests/test_mesh_stats_readers.py locates kb/static.
+REPO = Path(server_module.__file__).resolve().parent.parent
 
 # Split so this file cannot be flagged by its own secret scanner in CI.
 FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -536,13 +542,9 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     never `0`, matching web/src/pages/app/index.tsx.
     """
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     body = re.search(r"function homeReadableCount\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
     assert body, "homeReadableCount() not found in kb/static/app.js"
@@ -578,11 +580,8 @@ def test_event_graph_focus_matches_exact_source_identity() -> None:
     """
     import re
     import subprocess
-    from pathlib import Path
 
-    app_js = (Path(__file__).resolve().parents[1] / "kb" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
     resolver = re.search(
         r"function relatedNodeForEvent\(event\) \{.*?\n\}\n\nfunction findGraphNode",
         app_js,
@@ -624,12 +623,8 @@ def test_graph_inspector_walks_payload_edges_to_nearest_document() -> None:
     and that a node with no reachable document gets a typed empty state
     instead of a silent dead-end."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
     walk = re.search(
         r"function nearestDocumentThroughEdges\(node\)\s*\{(.*?)\n\}",
@@ -665,13 +660,9 @@ def test_graph_aggregate_toggle_writes_state() -> None:
     end to end: a control exists, it writes the flag, and the flag still
     gates aggregation."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert 'id="graphAggregateButton"' in index_html, (
         "no toolbar control for Knowledge Mesh aggregation"
@@ -696,13 +687,9 @@ def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
     the backend has not landed) degrades to the unfiltered view with a
     visible notice instead of a broken graph page."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert 'id="graphDatasetFilter"' in index_html, (
         "no dataset filter control on the graph toolbar"
@@ -728,12 +715,7 @@ def test_graph_pointer_area_floors_small_node_hit_radius() -> None:
     for low-degree entities at the fit-out zoom of a ~1000-node mesh —
     visible but effectively unclickable. Pin the shadow-canvas pointer paint
     and its zoom-compensated screen-space floor."""
-    from pathlib import Path
-
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
     assert "nodePointerAreaPaint" in app_js, (
         "no pointer-area override; tiny nodes stay unclickable at fit-out zoom"
@@ -753,14 +735,9 @@ def test_graph_depth_control_is_gone() -> None:
     the focus node that manufactured confusion while the user always wants
     full connectivity. Pin its absence end to end (markup, styles, state,
     hop filter) so it cannot quietly return."""
-    from pathlib import Path
-
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    styles_css = (repo / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
 
     assert "graphDepthInput" not in index_html, (
         "the depth control markup is back on the graph toolbar"
@@ -777,4 +754,64 @@ def test_graph_depth_control_is_gone() -> None:
     )
     assert "graph-depth-control" not in index_html and "graph-depth-control" not in styles_css, (
         "dead depth-control markup or styles are back"
+    )
+
+
+def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None:
+    """Live user report on 13c1586: clicking a person entity (then a related
+    entity) showed an arbitrary daily-update digest. Entities carry no
+    is_part_of/made_from edges, so the nearest-document walk returns null for
+    EVERY entity, and the one-hop fallback picked the first document-bearing
+    neighbor in payload edge order — degree-biased toward digests that
+    name-drop dozens of entities (live 2026-08-13: entities 'patricktobler'
+    and its committed-neighbor both resolved to '# masumi-network GitHub
+    daily update'). Chunks name the entities they mention through `contains`
+    edges (868 of the payload's 900 contains edges are chunk->entity), so the
+    inspector now tries sourcing chunks first — resolved to their parent
+    documents and ranked by how many chunks mention the node — and the
+    nearest-walk fallback says out loud that it is not provenance."""
+    import re
+    from pathlib import Path
+
+    import kb.server as server_module
+
+    repo = Path(server_module.__file__).resolve().parent.parent
+    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'SOURCING_RELATIONSHIP = "contains"' in app_js, (
+        "the sourcing edge type (chunk->entity contains) is not pinned"
+    )
+    sourcing = re.search(
+        r"function sourcingDocumentCandidates\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert sourcing, "sourcingDocumentCandidates() not found in kb/static/app.js"
+    assert "parentDocumentInView" in sourcing.group(1), (
+        "sourcing chunks must resolve to their parent documents when in view"
+    )
+    # Structural pins on the two load-bearing lines (logic verified by review,
+    # 2026-08-13): gutting either must fail here, not only deleting the function.
+    assert 'nodeKind(chunk) !== "chunk"' in sourcing.group(1), (
+        "the other-endpoint kind filter is gone; Entity->Entity contains edges "
+        "(32 in the live payload) would count as sourcing chunks"
+    )
+    assert ".sort((a, b) => b.count - a.count)" in sourcing.group(1), (
+        "the sourcing-count ranking is gone; the digest that name-drops a node "
+        "once would tie with the document actually about it"
+    )
+    assert '"Sources this node"' in sourcing.group(1), (
+        "sourcing candidates lost their provenance label"
+    )
+    candidates = re.search(
+        r"function documentCandidates\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert candidates, "documentCandidates() not found in kb/static/app.js"
+    body = candidates.group(1)
+    assert "sourcingDocumentCandidates(node)" in body, (
+        "the inspector does not consult sourcing chunks at all"
+    )
+    assert body.index("sourcingDocumentCandidates(node)") < body.index(
+        "nearestDocumentThroughEdges(node)"
+    ), "sourcing candidates must be tried before the nearest-document walk"
+    assert "Nearest document in view — not a direct source" in app_js, (
+        "the nearest-walk fallback must label itself as not being provenance"
     )

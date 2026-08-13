@@ -8567,3 +8567,65 @@ def test_mesh_graph_orders_callers_seat_content_into_the_default_view(
     content = [node["id"] for node in seated["nodes"] if node["type"] != "dataset"]
     assert content[0] == "doc-alice"
     assert len(content) == 2
+
+
+def test_source_document_scope_chunk_wiring_and_gate(tmp_path: Any) -> None:
+    # Contract (graph inspector): GET /api/documents/{id}?scope=chunk serves
+    # the chunk's own text in the same envelope. The endpoint's job: pass
+    # chunk_scope through, keep the ADR-0009 gate identical, 422 unknown
+    # scopes, and leave the absent-param path byte-for-byte alone.
+    calls: dict[str, list[bool]] = {}
+
+    class ChunkScopeCitadel(DrilldownIsolationCitadel):
+        cognee_documents = {
+            **DrilldownIsolationCitadel.cognee_documents,
+            "chunk-a": {
+                "id": "chunk-a",
+                "source_type": "cognee",
+                "title": None,
+                "body": "alice chunk text",
+                "metadata": {"chunk_id": "chunk-a", "document_id": "doc-a"},
+                "dataset_node_ids": ["chunk-a", "doc-a"],
+            },
+        }
+
+        async def get_document(
+            self, document_id: str, *, chunk_scope: bool = False
+        ) -> dict[str, Any] | None:
+            calls.setdefault(document_id, []).append(chunk_scope)
+            return self.cognee_documents.get(document_id)
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = ChunkScopeCitadel()  # authed_client resets citadel
+    app.state.knowledge_mesh = KnowledgeMesh(IsolationDatasetGateway())
+    api = TestClient(app, base_url="https://testserver")
+    bob = {"Authorization": f"Bearer {bob_token}"}
+    try:
+        scoped = api.get("/api/documents/chunk-b?scope=chunk", headers=bob)
+        default = api.get("/api/documents/chunk-b", headers=bob)
+        foreign = api.get("/api/documents/chunk-a?scope=chunk", headers=bob)
+        missing = api.get("/api/documents/does-not-exist?scope=chunk", headers=bob)
+        invalid = api.get("/api/documents/chunk-b?scope=banana", headers=bob)
+    finally:
+        app.state.knowledge_mesh = None
+
+    # scope=chunk reaches the service as chunk_scope=True; absent stays False.
+    assert calls["chunk-b"] == [True, False]
+    assert scoped.status_code == 200
+    assert scoped.json()["document"]["body"] == "bob chunk text"
+    assert "dataset_node_ids" not in scoped.json()["document"]
+    assert default.status_code == 200
+
+    # The ADR-0009 gate decides identically under scope=chunk: a foreign
+    # seat's chunk is byte-identical to a nonexistent id (no oracle).
+    assert foreign.status_code == 404
+    assert missing.status_code == 404
+    assert foreign.content == missing.content
+
+    # Unknown scope values are a clean 422.
+    assert invalid.status_code == 422

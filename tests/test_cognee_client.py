@@ -4764,3 +4764,40 @@ async def test_get_document_summary_carries_mappable_owner_ids(
     assert document["body"] == "a summary"
     assert "chunk-1" in document["dataset_node_ids"]
     assert "doc-1" in document["dataset_node_ids"]
+
+
+@pytest.mark.asyncio
+async def test_get_document_summary_chunk_scope_serves_summary_text(
+    monkeypatch: Any,
+) -> None:
+    """?scope=chunk on a TextSummary id: its own text is the trivially
+    available result of the same read (summaries never assemble a parent), so
+    body and owner ids match the default scope instead of erroring."""
+    client = CogneePublicClient()
+    graphs: dict[str, tuple[list[Any], list[Any]]] = {
+        "summary-1": (
+            [
+                ("summary-1", {"type": "TextSummary", "text": "a summary"}),
+                ("chunk-1", {"type": "DocumentChunk", "text": "chunk text"}),
+            ],
+            [("summary-1", "chunk-1", "made_from", {})],
+        ),
+        "chunk-1": (
+            [
+                ("chunk-1", {"type": "DocumentChunk", "text": "chunk text"}),
+                ("doc-1", {"type": "TextDocument", "name": "parent doc"}),
+            ],
+            [("chunk-1", "doc-1", "is_part_of", {})],
+        ),
+    }
+
+    async def fake_graph(document_id: str) -> tuple[list[Any], list[Any]]:
+        return graphs.get(str(document_id), ([], []))
+
+    monkeypatch.setattr(client, "_document_graph", fake_graph)
+
+    document = await client.get_document("summary-1", chunk_scope=True)
+
+    assert document is not None
+    assert document["body"] == "a summary"
+    assert "doc-1" in document["dataset_node_ids"]

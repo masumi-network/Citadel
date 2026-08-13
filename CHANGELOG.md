@@ -8,6 +8,16 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Added
 
+- **`/api/documents/{id}` takes `?scope=chunk`.** A DocumentChunk id used to
+  return the whole assembled parent (a 23k-char daily digest for one clicked
+  passage); with `scope=chunk` the response body is the chunk's OWN text, in
+  the same envelope, with `chunk_id` / `document_id` / `chunk_index` in
+  `metadata`. ADR-0009 visibility is unchanged (the parent still drives the
+  gate). A TextSummary id under `scope=chunk` serves the summary's own text.
+  Absent param and non-chunk ids behave exactly as before; an unknown scope
+  value is a clean 422. The graph inspector consumes this to show what is
+  inside the clicked node.
+
 - **`/api/mesh/graph` takes a `dataset` query parameter and orders the
   caller's seat content into the default view.** The endpoint sampled the
   first nodes of raw enumeration (16,154 live against a 1,000-node cap), so a
