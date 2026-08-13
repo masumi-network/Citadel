@@ -3069,8 +3069,43 @@ def test_readyz_reports_503_when_corpus_measurement_fails() -> None:
         "tracked_sources": None,
         "indexed_docs": None,
         "indexed_edges": None,
-        "degraded": "graph unavailable",
+        "degraded": "RuntimeError",
     }
+
+
+def test_readyz_degraded_field_never_carries_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """/readyz is reader-scoped and embeds the corpus dict verbatim, and a
+    failing store's exception text can quote connection strings — the
+    ``dataset_database`` rows carry plaintext store credentials in their URL
+    columns. The degraded corpus payload and the warning log therefore carry
+    the exception CLASS NAME only, never ``str(exc)``.
+    """
+    sentinel = "postgresql://user:SECRET@host"
+
+    class LeakyGraphCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            raise RuntimeError(f"could not connect to {sentinel}")
+
+    class HealthySyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 50, "tracked_files": 0, "issue_count": 0}
+
+    client = authed_client("test-reader")
+    app.state.citadel = LeakyGraphCitadel()
+    app.state.github_syncer = HealthySyncer()
+    app.state.repo_content_syncer = HealthySyncer()
+    app.state.linear_syncer = HealthySyncer()
+
+    with caplog.at_level(logging.WARNING):
+        ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"]["degraded"] == "RuntimeError"
+    assert sentinel not in ready.text
+    assert sentinel not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_readyz_does_not_use_graph_nodes_as_projection_health(
@@ -3233,7 +3268,7 @@ def test_readyz_rejects_inconsistent_complete_corpus_probe(
         "tracked_sources": None,
         "indexed_docs": None,
         "indexed_edges": None,
-        "degraded": "complete bounded corpus probe does not cover the relational document total",
+        "degraded": "RuntimeError",
     }
 
 

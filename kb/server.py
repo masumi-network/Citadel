@@ -4754,13 +4754,19 @@ async def _corpus_health_impl() -> dict[str, Any]:
             return _cache_corpus_health_result(cache_key, result)
         return result
     except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
-        logger.warning("corpus health check degraded: %s", exc)
+        # Class name only, in the log and in the payload: /readyz embeds this
+        # dict verbatim for any reader-scoped caller, and exception text can
+        # quote connection strings (dataset_database rows carry plaintext
+        # store credentials in their URL columns).
+        logger.warning(
+            "corpus health check degraded: %s", exc.__class__.__name__
+        )
         result = {
             "ok": False,
             "tracked_sources": None,
             "indexed_docs": None,
             "indexed_edges": None,
-            "degraded": str(exc),
+            "degraded": exc.__class__.__name__,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
             return _cache_corpus_health_result(cache_key, result)
