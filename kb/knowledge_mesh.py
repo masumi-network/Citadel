@@ -741,6 +741,8 @@ class KnowledgeMesh:
         *,
         limit: int = DEFAULT_MAX_NODES,
         dataset_visible: Callable[[str], bool] | None = None,
+        dataset: str | None = None,
+        seat_first: str | None = None,
         presence: list[dict[str, Any]] | None = None,
         collapse_orphans: bool = False,
     ) -> dict[str, Any]:
@@ -756,6 +758,21 @@ class KnowledgeMesh:
         ``visible_nodes`` reports the caller-scoped count so the UI can be
         honest. ``None`` applies no filtering (bypass/admin callers) and keeps
         the exact unfiltered behavior.
+
+        ``dataset`` narrows the view to one dataset's subgraph using the SAME
+        layered inclusion the visibility pass runs (documents, their chunks,
+        adjacent entities), applied AFTER caller scoping — it can only narrow
+        what ADR-0009 already allows, never widen. Presence hubs still render
+        for every caller, so a non-member naming a foreign dataset sees
+        presence and zero content, exactly the unfiltered isolation contract.
+        ``None`` (absent query param) keeps today's behavior unchanged.
+
+        ``seat_first`` (a ``seat:<slug>`` dataset name) orders that dataset's
+        layered subgraph ahead of the node cap cut, so the caller's own
+        content always makes the default sample (16k raw nodes against a
+        1000-node cap starved every seat's content before). Ordering stays
+        deterministic: the seat cluster, then the rest, both in enumeration
+        order.
 
         ``presence`` appends universal Seat Presence hubs for every caller;
         entry ``documents`` counts are filled from the RAW dataset map —
@@ -832,6 +849,45 @@ class KnowledgeMesh:
                 if kept:
                     filtered[node_id] = kept
             dataset_map = filtered
+        if dataset is not None:
+            # Single-dataset narrowing: reuse the layered visibility pass with
+            # the predicate "is this the named dataset" so inclusion semantics
+            # (docs -> chunks -> adjacent entities) cannot drift from the
+            # ADR-0009 pass above. Runs on the ALREADY caller-scoped rows, so
+            # it only narrows. Attribution names on kept nodes are left alone —
+            # trust_tier and multi-dataset tags keep today's shaping.
+            narrowed_ids = await asyncio.to_thread(
+                _content_visible_ids,
+                raw_nodes,
+                raw_edges,
+                dataset_map,
+                lambda name: name == dataset,
+            )
+            raw_nodes = [raw for raw in raw_nodes if _raw_id(raw) in narrowed_ids]
+            raw_edges = [
+                raw
+                for raw in raw_edges
+                if (endpoints := _raw_endpoints(raw)) is not None
+                and endpoints[0] in narrowed_ids
+                and endpoints[1] in narrowed_ids
+            ]
+            if visible_nodes is not None:
+                visible_nodes = len(raw_nodes)
+        if seat_first:
+            # Seat-first ordering pre-cap: the caller's own cluster (same
+            # layered inclusion) moves ahead of the enumeration tail. Pure
+            # reorder — nothing is added or dropped, so counts are untouched.
+            priority_ids = await asyncio.to_thread(
+                _content_visible_ids,
+                raw_nodes,
+                raw_edges,
+                dataset_map,
+                lambda name: name == seat_first,
+            )
+            if priority_ids:
+                raw_nodes = [
+                    raw for raw in raw_nodes if _raw_id(raw) in priority_ids
+                ] + [raw for raw in raw_nodes if _raw_id(raw) not in priority_ids]
         # build_graph_payload is likewise pure Python over plain tuples/dicts —
         # shape it off the loop too (#50).
         payload = await asyncio.to_thread(

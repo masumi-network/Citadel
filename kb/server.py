@@ -5007,15 +5007,30 @@ def mesh_presence_hubs() -> list[dict[str, str]]:
 
 
 @app.get("/api/mesh/graph")
-async def mesh_graph(request: Request, limit: int | None = None) -> Any:
+async def mesh_graph(
+    request: Request, limit: int | None = None, dataset: str | None = None
+) -> Any:
     """The real Knowledge Mesh graph from Cognee (not the dashboard projection).
 
     Never fails hard: returns an empty graph with ``fallback: true`` when
     Cognee has no data or graph access is unavailable.
+
+    ``dataset`` narrows the view to one dataset's subgraph BEFORE the node
+    cap, shaped by the same ADR-0009 isolation as the unfiltered view — a
+    caller naming a dataset it may not read sees presence hubs and zero
+    content, never more. Absent, behavior is unchanged. The caller's own seat
+    content is ordered ahead of the cap cut so the default view includes it.
     """
     identity = require_access(request, "reader", "kb:search")
     if limit is not None and not 1 <= limit <= 1000:
         raise HTTPException(status_code=422, detail="Graph limit must be between 1 and 1000.")
+    dataset_filter: str | None = None
+    if dataset is not None:
+        dataset_filter = dataset.strip()
+        # Mirror SearchBody's bounds spirit (repo 200 chars): a dataset name is
+        # short; anything empty or absurdly long is a caller bug, said plainly.
+        if not dataset_filter or len(dataset_filter) > 200:
+            raise HTTPException(status_code=400, detail="Invalid dataset name.")
     effective_limit = limit or get_citadel().config.mesh_graph_max_nodes
     # ADR-0009 read isolation: content follows the caller's search scope (own
     # Node + Central + non-seat datasets), while every seat always appears as
@@ -5038,6 +5053,10 @@ async def mesh_graph(request: Request, limit: int | None = None) -> Any:
                 None
                 if can_bypass_dataset_allowlist(identity)
                 else lambda name: dataset_visible_to(identity, name)
+            ),
+            dataset=dataset_filter,
+            seat_first=(
+                f"seat:{identity.seat_slug}" if identity.seat_slug else None
             ),
             presence=mesh_presence_hubs(),
             collapse_orphans=True,
