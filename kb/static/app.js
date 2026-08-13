@@ -95,6 +95,14 @@ const state = {
   // Knowledge-mode legend filter: node kinds hidden from the canvas. Chunks
   // start hidden — they dominate the node count and bury the entities.
   graphHiddenKinds: new Set(["chunk"]),
+  // Knowledge Mesh overview folds documents/chunks into a concept map by
+  // default. Off shows the raw graph so the legend chips can actually restore
+  // Documents/Chunks — before this was wired, aggregation was permanently on
+  // (nothing ever wrote the flag) and those chips were dead controls.
+  graphAggregate: true,
+  // Dataset filter for /api/mesh/graph ("" = org-wide view). Session-scoped
+  // like the other graph toggles; nothing persists across reloads.
+  graphDataset: "",
   realGraph: null,
   realGraphLoading: false,
   conflicts: [],
@@ -189,6 +197,8 @@ const conflictNavBadge = document.getElementById("conflictNavBadge");
 const conflictFilterButtons = Array.from(document.querySelectorAll("[data-conflict-filter]"));
 const graphModeButtons = Array.from(document.querySelectorAll("[data-graph-mode]"));
 const graphDepthInput = document.getElementById("graphDepthInput");
+const graphAggregateButton = document.getElementById("graphAggregateButton");
+const graphDatasetFilter = document.getElementById("graphDatasetFilter");
 const realGraphEmpty = document.getElementById("realGraphEmpty");
 const graphLegend = document.getElementById("graphLegend");
 const toastStack = document.getElementById("toastStack");
@@ -722,6 +732,8 @@ async function loadSession() {
     state.searchDatasets = session.search_datasets || null;
     state.capabilities = session.capabilities || null;
     applyAccessControls();
+    // The dataset filter's options come from the session scope.
+    updateGraphDatasetFilter();
   } catch {
     window.location.assign("/login");
     throw new Error("Session required");
@@ -1846,6 +1858,14 @@ function formatBytes(value) {
 // labelled). Keeps the canvas readable at the default fit-out zoom.
 const LABEL_ZOOM_THRESHOLD = 1.6;
 
+// Painted radius in graph units is NODE_REL_SIZE * sqrt(nodeVal); at the
+// fit-out zoom of a ~1000-node mesh that is 1-3 screen px for low-degree
+// entities — visible but effectively unclickable. The pointer hit area is
+// floored to this many SCREEN px (divided by globalScale, the same zoom
+// compensation drawNodeLabel uses) without changing the painted size.
+const NODE_REL_SIZE = 4;
+const MIN_NODE_HIT_RADIUS_PX = 6;
+
 function initializeGraph() {
   if (!window.ForceGraph) {
     console.error("force-graph library failed to load");
@@ -1861,7 +1881,7 @@ function initializeGraph() {
     .height(graph.height)
     .backgroundColor("rgba(0,0,0,0)")
     .nodeId("id")
-    .nodeRelSize(4)
+    .nodeRelSize(NODE_REL_SIZE)
     .nodeVal(nodeValue)
     .nodeColor(nodeColor)
     .nodeLabel((node) => escapeHtml(String(node.label || node.id)))
@@ -1870,6 +1890,16 @@ function initializeGraph() {
     .linkLabel((link) => escapeHtml(String(link.relationship || link.label || "")))
     .nodeCanvasObjectMode(() => "after")
     .nodeCanvasObject(drawNodeLabel)
+    // Hover/click detection paints into a hidden hit canvas; floor its radius
+    // so small entities stay clickable at fit-out zoom (see MIN_NODE_HIT_RADIUS_PX).
+    .nodePointerAreaPaint((node, color, ctx, globalScale) => {
+      const painted = NODE_REL_SIZE * Math.sqrt(Math.max(nodeValue(node), 0));
+      const radius = Math.max(painted, MIN_NODE_HIT_RADIUS_PX / (globalScale || 1));
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
+      ctx.fill();
+    })
     .linkColor(linkColor)
     .linkWidth(linkWidth)
     .linkDirectionalParticles(0)
@@ -2184,6 +2214,52 @@ function isDocumentBearingNode(node) {
   );
 }
 
+// Structural edges that lead from any rendered node back to the TextDocument
+// it came from: chunks/summaries hang off documents via is_part_of, and
+// summaries point at their source via made_from.
+const DOCUMENT_WALK_RELATIONSHIPS = new Set(["is_part_of", "made_from"]);
+const DOCUMENT_WALK_MAX_HOPS = 3;
+
+// BFS the LOADED payload's is_part_of/made_from edges from a clicked node to
+// the nearest document-kind node (TextDocument — the id class /api/documents
+// can actually resolve). The prior candidates were the node itself and its
+// one-hop document-bearing neighbors, which for most rendered nodes are
+// chunk/summary ids that 404 — measured live: nearly every inspector click
+// dead-ended while a real document sat 2-3 hops away in the same payload.
+function nearestDocumentThroughEdges(node) {
+  const real = state.realGraph;
+  if (!real || !node?.id) return null;
+  if (nodeKind(node) === "document") return { node, hops: 0 };
+  const adjacency = new Map();
+  for (const edge of real.edges) {
+    const relationship = String(edge.relationship || edge.label || "");
+    if (!DOCUMENT_WALK_RELATIONSHIPS.has(relationship)) continue;
+    if (!adjacency.has(edge.source)) adjacency.set(edge.source, []);
+    if (!adjacency.has(edge.target)) adjacency.set(edge.target, []);
+    adjacency.get(edge.source).push(edge.target);
+    adjacency.get(edge.target).push(edge.source);
+  }
+  const visited = new Set([node.id]);
+  let frontier = [node.id];
+  for (let hops = 1; hops <= DOCUMENT_WALK_MAX_HOPS; hops += 1) {
+    const next = [];
+    for (const nodeId of frontier) {
+      for (const otherId of adjacency.get(nodeId) || []) {
+        if (visited.has(otherId)) continue;
+        visited.add(otherId);
+        const other = real.nodes.get(otherId);
+        if (other && nodeKind(other) === "document") {
+          return { node: other, hops };
+        }
+        next.push(otherId);
+      }
+    }
+    frontier = next;
+    if (!frontier.length) break;
+  }
+  return null;
+}
+
 function documentCandidates(node) {
   const candidates = [];
   const seen = new Set();
@@ -2194,6 +2270,13 @@ function documentCandidates(node) {
     candidates.push({ node: candidate, relationship });
   };
 
+  // Nearest reachable document first: it is the candidate /api/documents can
+  // resolve. The old chain (self, then one-hop document-bearing neighbors)
+  // stays as the fallback for payloads whose structural edges were capped away.
+  const nearest = nearestDocumentThroughEdges(node);
+  if (nearest) {
+    add(nearest.node, nearest.hops === 0 ? null : "nearest document");
+  }
   add(node);
   for (const item of knowledgeNeighbors(node.id)) {
     add(item.node, item.relationship);
@@ -2250,8 +2333,14 @@ async function loadNodeDocument(node) {
     }
   }
 
+  // Typed empty states, never a silent dead-end: say whether the loaded graph
+  // simply has no document to walk to, or candidates existed and none resolved.
+  container.classList.add("node-document-empty");
   if (firstError) {
     container.innerHTML = `<p>Could not load document text: ${escapeHtml(firstError)}</p>`;
+  } else if (!candidates.length) {
+    container.innerHTML =
+      "<p>No document reachable from this node in the loaded graph.</p>";
   } else {
     container.innerHTML = "<p>No document text stored for this node.</p>";
   }
@@ -2447,6 +2536,62 @@ function toggleGraphKind(kind) {
   updateGraphMeta();
 }
 
+function setGraphAggregate(enabled) {
+  state.graphAggregate = Boolean(enabled);
+  if (graphAggregateButton) {
+    graphAggregateButton.classList.toggle("active", state.graphAggregate);
+    graphAggregateButton.setAttribute(
+      "aria-pressed",
+      state.graphAggregate ? "true" : "false",
+    );
+    graphAggregateButton.title = state.graphAggregate
+      ? "Concept map: documents and chunks fold into hub counts. Click for the raw graph."
+      : "Raw graph: every payload node renders (legend chips filter kinds). Click to aggregate.";
+  }
+  buildGraphScene();
+  resetGraphView();
+  updateGraphMeta();
+}
+
+// Dataset filter options: the org-wide view, the caller's own Node first, then
+// the rest of the caller's searchable datasets (ADR-0009: dataset NAMES are
+// presence-class and org-visible; content stays scoped server-side).
+function updateGraphDatasetFilter() {
+  if (!graphDatasetFilter) return;
+  const previous = String(state.graphDataset || "");
+  const names = [];
+  const seen = new Set();
+  const push = (name) => {
+    const value = String(name || "").trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    names.push(value);
+  };
+  push(state.defaultDataset);
+  for (const name of Array.isArray(state.searchDatasets) ? state.searchDatasets : []) {
+    push(name);
+  }
+  graphDatasetFilter.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "All datasets";
+  graphDatasetFilter.append(all);
+  for (const name of names) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name === state.defaultDataset ? `My seat (${name})` : name;
+    graphDatasetFilter.append(option);
+  }
+  // Keep a selection alive across option rebuilds; an option that vanished
+  // falls back to the org-wide view rather than silently filtering on it.
+  if (previous && seen.has(previous)) {
+    graphDatasetFilter.value = previous;
+  } else {
+    graphDatasetFilter.value = "";
+    state.graphDataset = "";
+  }
+}
+
 function shapeRealGraph(payload) {
   const degree = new Map();
   const rawEdges = Array.isArray(payload.edges) ? payload.edges : [];
@@ -2500,13 +2645,21 @@ function meshGraphRetryDelay(index) {
   return Math.round(base + Math.random() * (base / 2));
 }
 
+// Pull the fuller graph (server caps at 1000): the overview aggregates it
+// down to a concept map, and the raw 200-node slice leaves too few entity
+// types/hubs once documents are folded away. An active dataset filter rides
+// along as `dataset=<name>` (server filters pre-cap, same response shape);
+// no filter = the exact org-wide request this has always sent.
+function meshGraphUrl() {
+  const base = "/api/mesh/graph?limit=1000";
+  const dataset = String(state.graphDataset || "");
+  return dataset ? `${base}&dataset=${encodeURIComponent(dataset)}` : base;
+}
+
 async function fetchMeshGraphWithBackoff() {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      // Pull the fuller graph (server caps at 1000): the overview aggregates it
-      // down to a concept map, and the raw 200-node slice leaves too few entity
-      // types/hubs once documents are folded away.
-      return await api("/api/mesh/graph?limit=1000");
+      return await api(meshGraphUrl());
     } catch (error) {
       const retriable =
         error && error.status === 429 && attempt < MESH_GRAPH_RETRY_BASES_MS.length;
@@ -2534,8 +2687,23 @@ async function loadKnowledgeGraph(force = false) {
   state.realGraphLoading = true;
   updateGraphMeta("Loading Knowledge Mesh");
   try {
-    const payload = await fetchMeshGraphWithBackoff();
+    let payload;
+    try {
+      payload = await fetchMeshGraphWithBackoff();
+    } catch (error) {
+      // Contract degrade: a node that rejects (or predates) the dataset param
+      // must not brick the whole view. Drop the filter, say so visibly, and
+      // load the org-wide graph this view has always shown.
+      const rejected =
+        state.graphDataset && [400, 404, 422].includes(Number(error?.status));
+      if (!rejected) throw error;
+      showToast("Dataset filter unavailable on this node — showing all datasets", "info");
+      state.graphDataset = "";
+      if (graphDatasetFilter) graphDatasetFilter.value = "";
+      payload = await fetchMeshGraphWithBackoff();
+    }
     state.realGraph = shapeRealGraph(payload);
+    updateGraphDatasetFilter();
     if (state.graphMode === "knowledge") {
       buildGraphScene();
       resetGraphView();
@@ -2572,6 +2740,10 @@ function setGraphMode(mode) {
   });
   state.selectedId = null;
   selectedNode.textContent = "Select a note or node to inspect its links.";
+  // Aggregate + dataset filter act on the Knowledge Mesh only; hide them in
+  // live mode so they never sit on the toolbar as dead controls.
+  if (graphAggregateButton) graphAggregateButton.hidden = mode !== "knowledge";
+  if (graphDatasetFilter) graphDatasetFilter.hidden = mode !== "knowledge";
   if (mode === "knowledge") {
     canvasEmpty.hidden = true;
     buildGraphScene();
@@ -4096,6 +4268,21 @@ if (graphDepthInput) {
     buildGraphScene();
     updateGraphMeta();
     if (state.graphDepth > 0) resetGraphView();
+  });
+}
+
+if (graphAggregateButton) {
+  graphAggregateButton.addEventListener("click", () => {
+    setGraphAggregate(!state.graphAggregate);
+  });
+}
+
+if (graphDatasetFilter) {
+  graphDatasetFilter.addEventListener("change", (event) => {
+    state.graphDataset = String(event.currentTarget.value || "");
+    // The filter changes what the SERVER returns, so refetch rather than
+    // re-shape the cached org-wide payload.
+    loadKnowledgeGraph(true);
   });
 }
 

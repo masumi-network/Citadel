@@ -460,6 +460,23 @@
                       <span>Depth</span>
                       <input id="graphDepthInput" type="range" min="0" max="3" step="1" value="0" />
                     </label>
+                    <select
+                      id="graphDatasetFilter"
+                      class="secondary-button compact-button"
+                      aria-label="Filter Knowledge Mesh by dataset"
+                      title="Show only one dataset's nodes (server-filtered); All datasets restores the org view"
+                    >
+                      <option value="">All datasets</option>
+                    </select>
+                    <button
+                      id="graphAggregateButton"
+                      class="secondary-button compact-button active"
+                      type="button"
+                      aria-pressed="true"
+                      title="Concept map: documents and chunks fold into hub counts. Click for the raw graph."
+                    >
+                      Aggregate
+                    </button>
                     <button id="fitButton" class="secondary-button compact-button" type="button">Fit</button>
                     <button id="pauseButton" class="secondary-button compact-button" type="button">Pause</button>
                   </div>
