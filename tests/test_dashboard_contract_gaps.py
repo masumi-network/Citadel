@@ -755,3 +755,63 @@ def test_graph_depth_control_is_gone() -> None:
     assert "graph-depth-control" not in index_html and "graph-depth-control" not in styles_css, (
         "dead depth-control markup or styles are back"
     )
+
+
+def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None:
+    """Live user report on 13c1586: clicking a person entity (then a related
+    entity) showed an arbitrary daily-update digest. Entities carry no
+    is_part_of/made_from edges, so the nearest-document walk returns null for
+    EVERY entity, and the one-hop fallback picked the first document-bearing
+    neighbor in payload edge order — degree-biased toward digests that
+    name-drop dozens of entities (live 2026-08-13: entities 'patricktobler'
+    and its committed-neighbor both resolved to '# masumi-network GitHub
+    daily update'). Chunks name the entities they mention through `contains`
+    edges (868 of the payload's 900 contains edges are chunk->entity), so the
+    inspector now tries sourcing chunks first — resolved to their parent
+    documents and ranked by how many chunks mention the node — and the
+    nearest-walk fallback says out loud that it is not provenance."""
+    import re
+    from pathlib import Path
+
+    import kb.server as server_module
+
+    repo = Path(server_module.__file__).resolve().parent.parent
+    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'SOURCING_RELATIONSHIP = "contains"' in app_js, (
+        "the sourcing edge type (chunk->entity contains) is not pinned"
+    )
+    sourcing = re.search(
+        r"function sourcingDocumentCandidates\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert sourcing, "sourcingDocumentCandidates() not found in kb/static/app.js"
+    assert "parentDocumentInView" in sourcing.group(1), (
+        "sourcing chunks must resolve to their parent documents when in view"
+    )
+    # Structural pins on the two load-bearing lines (logic verified by review,
+    # 2026-08-13): gutting either must fail here, not only deleting the function.
+    assert 'nodeKind(chunk) !== "chunk"' in sourcing.group(1), (
+        "the other-endpoint kind filter is gone; Entity->Entity contains edges "
+        "(32 in the live payload) would count as sourcing chunks"
+    )
+    assert ".sort((a, b) => b.count - a.count)" in sourcing.group(1), (
+        "the sourcing-count ranking is gone; the digest that name-drops a node "
+        "once would tie with the document actually about it"
+    )
+    assert '"Sources this node"' in sourcing.group(1), (
+        "sourcing candidates lost their provenance label"
+    )
+    candidates = re.search(
+        r"function documentCandidates\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert candidates, "documentCandidates() not found in kb/static/app.js"
+    body = candidates.group(1)
+    assert "sourcingDocumentCandidates(node)" in body, (
+        "the inspector does not consult sourcing chunks at all"
+    )
+    assert body.index("sourcingDocumentCandidates(node)") < body.index(
+        "nearestDocumentThroughEdges(node)"
+    ), "sourcing candidates must be tried before the nearest-document walk"
+    assert "Nearest document in view — not a direct source" in app_js, (
+        "the nearest-walk fallback must label itself as not being provenance"
+    )
