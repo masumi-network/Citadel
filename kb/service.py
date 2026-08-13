@@ -1497,8 +1497,17 @@ class Citadel:
             "after": None,
         }
 
-    async def get_document(self, document_id: str) -> dict[str, Any] | None:
-        """Resolve a cognee search-hit id to its document/chunk (#28)."""
+    async def get_document(
+        self, document_id: str, *, chunk_scope: bool = False
+    ) -> dict[str, Any] | None:
+        """Resolve a cognee search-hit id to its document/chunk (#28).
+
+        ``chunk_scope=True`` (?scope=chunk) serves a chunk id's own text
+        instead of the assembled parent. Passed through only when set so
+        clients implementing the plain signature keep working.
+        """
+        if chunk_scope:
+            return await self.cognee.get_document(document_id, chunk_scope=True)
         return await self.cognee.get_document(document_id)
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:

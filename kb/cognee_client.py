@@ -420,7 +420,9 @@ class CogneeGateway(Protocol):
     def maintenance(self) -> AsyncIterator[None]:
         raise NotImplementedError
 
-    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+    async def get_document(
+        self, document_id: str, *, chunk_scope: bool = False
+    ) -> dict[str, Any] | None:
         raise NotImplementedError
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
@@ -3839,7 +3841,9 @@ class CogneePublicClient:
             )
             return await self.graph_data()
 
-    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+    async def get_document(
+        self, document_id: str, *, chunk_scope: bool = False
+    ) -> dict[str, Any] | None:
         """Resolve a search-hit node id back to its stored text (#28).
 
         cognee search hits carry a graph node/chunk id with no backing document
@@ -3857,12 +3861,22 @@ class CogneePublicClient:
         retrieve must stay reachable through drill-down. ``None`` only when no
         text exists in either store (textless entities keep resolving to
         None/404).
+
+        ``chunk_scope=True`` (the /api/documents ``?scope=chunk`` contract)
+        keeps a chunk id's OWN text instead of assembling the parent: the
+        graph inspector wants the clicked passage, not the whole document.
+        Ownership is unchanged — the ``is_part_of`` parent still rides in
+        ``dataset_node_ids``, so the ADR-0009 gate decides exactly as it does
+        for the default read. Non-chunk ids (documents, summaries, textless
+        entities) behave as without the flag.
         """
         doc_id = str(document_id)
-        document = await self._document_from_graph(doc_id, follow_parent=True)
+        document = await self._document_from_graph(
+            doc_id, follow_parent=True, chunk_scope=chunk_scope
+        )
         if document is not None:
             return document
-        return await self._document_from_chunk_store(doc_id)
+        return await self._document_from_chunk_store(doc_id, chunk_scope=chunk_scope)
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
         """Owner node ids for the ADR-0009 drill-down visibility rule — WITHOUT
@@ -4088,7 +4102,7 @@ class CogneePublicClient:
         return [chunk_id, parent_id]
 
     async def _document_from_graph(
-        self, doc_id: str, *, follow_parent: bool
+        self, doc_id: str, *, follow_parent: bool, chunk_scope: bool = False
     ) -> dict[str, Any] | None:
         """Resolve ``doc_id`` against the graph store (targeted read).
 
@@ -4096,6 +4110,9 @@ class CogneePublicClient:
         text-bearing chunk's ``is_part_of`` parent document and returns the
         parent's FULL assembled body; the recursive parent call passes
         ``follow_parent=False`` so resolution is bounded at one hop.
+        ``chunk_scope=True`` keeps the chunk's own text instead: no parent
+        assembly read, the parent id recorded in ``metadata`` and (via
+        ``part_neighbor_ids``) in ``dataset_node_ids`` as before.
         """
         try:
             nodes, edges = await self._document_graph(doc_id)
@@ -4112,40 +4129,55 @@ class CogneePublicClient:
         text, text_key = self._extract_text(props)
         if text is not None:
             summary_owner_ids: list[str] = []
+            chunk_metadata: dict[str, Any] = {}
             if follow_parent:
-                # A text-bearing node with a TEXTLESS ``is_part_of`` neighbor is
-                # a DocumentChunk next to its parent document (chunks carry the
-                # text; TextDocument nodes carry none). Search hands out CHUNK
-                # ids, so resolving the id to just this chunk's text re-serves
-                # the same fragment the search snippet already showed. Resolve
-                # the PARENT instead so drill-down returns the whole document;
-                # the chunk's own text stays the fallback when the parent
-                # cannot be assembled (never worse than before).
                 parent_id = self._textless_neighbor_id(props_by_id, part_neighbor_ids)
-                if parent_id is not None:
-                    parent = await self._document_from_graph(
-                        parent_id, follow_parent=False
+                if parent_id is not None and chunk_scope:
+                    # ?scope=chunk: the caller wants the clicked passage, not
+                    # the assembled parent — keep the chunk's own text and skip
+                    # the parent assembly read. The parent still rides in
+                    # part_neighbor_ids, so the ADR-0009 gate is unchanged.
+                    chunk_metadata = {"chunk_id": doc_id, "document_id": parent_id}
+                else:
+                    # A text-bearing node with a TEXTLESS ``is_part_of``
+                    # neighbor is a DocumentChunk next to its parent document
+                    # (chunks carry the text; TextDocument nodes carry none).
+                    # Search hands out CHUNK ids, so resolving the id to just
+                    # this chunk's text re-serves the same fragment the search
+                    # snippet already showed. Resolve the PARENT instead so
+                    # drill-down returns the whole document; the chunk's own
+                    # text stays the fallback when the parent cannot be
+                    # assembled (never worse than before).
+                    if parent_id is not None:
+                        parent = await self._document_from_graph(
+                            parent_id, follow_parent=False
+                        )
+                        if parent is not None and parent.get("body"):
+                            owner_ids = list(
+                                parent.get("dataset_node_ids") or [parent_id]
+                            )
+                            if doc_id not in owner_ids:
+                                owner_ids.append(doc_id)
+                            parent["dataset_node_ids"] = owner_ids
+                            return parent
+                    # No is_part_of parent: a TextSummary carries its own text
+                    # but hangs off the content it summarizes via ``made_from``.
+                    # Its id has no relational Data row, so owner ids of just
+                    # [doc_id] fail-close the ADR-0009 drill-down gate on
+                    # content the caller may read — chase the summarized
+                    # chunk's parent document id.
+                    summary_owner_ids = await self._summary_owner_ids(
+                        doc_id, edges, props_by_id
                     )
-                    if parent is not None and parent.get("body"):
-                        owner_ids = list(parent.get("dataset_node_ids") or [parent_id])
-                        if doc_id not in owner_ids:
-                            owner_ids.append(doc_id)
-                        parent["dataset_node_ids"] = owner_ids
-                        return parent
-                # No is_part_of parent: a TextSummary carries its own text but
-                # hangs off the content it summarizes via ``made_from``. Its id
-                # has no relational Data row, so owner ids of just [doc_id]
-                # fail-close the ADR-0009 drill-down gate on content the caller
-                # may read — chase the summarized chunk's parent document id.
-                summary_owner_ids = await self._summary_owner_ids(
-                    doc_id, edges, props_by_id
-                )
             return {
                 "id": doc_id,
                 "source_type": "cognee",
                 "title": props.get("title") or None,
                 "body": text,
-                "metadata": {k: v for k, v in props.items() if k != text_key},
+                "metadata": {
+                    **{k: v for k, v in props.items() if k != text_key},
+                    **chunk_metadata,
+                },
                 "dataset_node_ids": [doc_id, *part_neighbor_ids, *summary_owner_ids],
             }
         # Textless document node: its text lives on DocumentChunk neighbors
@@ -4322,7 +4354,9 @@ class CogneePublicClient:
         retrieve = getattr(engine, "retrieve", None)
         return retrieve if callable(retrieve) else None
 
-    async def _document_from_chunk_store(self, doc_id: str) -> dict[str, Any] | None:
+    async def _document_from_chunk_store(
+        self, doc_id: str, *, chunk_scope: bool = False
+    ) -> dict[str, Any] | None:
         """Assemble a document from the durable chunk store when the graph can't.
 
         Accepts either a chunk id (resolved to its parent via the payload's
@@ -4332,6 +4366,8 @@ class CogneePublicClient:
         shape as the graph assembly; ``dataset_node_ids`` carries the parent
         document id, which is the relational ``Data.id`` the read-scope map
         keys on (ADR-0009), so the drill-down isolation gate is unchanged.
+        ``chunk_scope=True`` with a chunk id serves the seed row's own text
+        (no sibling probe); a non-chunk id ignores the flag.
         """
         try:
             # STRING ids, never uuid.UUID objects — cognee's own retrieve()
@@ -4372,6 +4408,34 @@ class CogneePublicClient:
                     document_id = str(UUID(document_id))
                 except (TypeError, ValueError):
                     document_id = None
+            if chunk_scope and seed_payload is not None:
+                seed_text, _ = self._extract_text(seed_payload)
+                if seed_text is not None:
+                    # ?scope=chunk on a graph-missing chunk: the seed row IS
+                    # the clicked chunk — serve its own text, skip the sibling
+                    # probe. Owner ids keep the parent Data.id first, exactly
+                    # like the assembled shape, so the gate is unchanged.
+                    owner_ids = [document_id] if document_id is not None else []
+                    if requested not in owner_ids:
+                        owner_ids.append(requested)
+                    seed_metadata: dict[str, Any] = {
+                        "assembled_from": "chunk_store",
+                        "chunk_id": requested,
+                    }
+                    if document_id is not None:
+                        seed_metadata["document_id"] = document_id
+                    if seed_payload.get("document_name"):
+                        seed_metadata["document_name"] = seed_payload["document_name"]
+                    if isinstance(seed_payload.get("chunk_index"), (int, float)):
+                        seed_metadata["chunk_index"] = seed_payload["chunk_index"]
+                    return {
+                        "id": requested,
+                        "source_type": "cognee",
+                        "title": seed_payload.get("document_name") or None,
+                        "body": seed_text,
+                        "metadata": seed_metadata,
+                        "dataset_node_ids": owner_ids,
+                    }
             if document_id is not None:
                 sibling_ids = [
                     str(uuid5(NAMESPACE_OID, f"{document_id}-{index}"))
