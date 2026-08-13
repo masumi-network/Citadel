@@ -97,6 +97,28 @@ class Citadel:
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
+            # Let the post-cognify stored check distinguish active projections,
+            # completed-searchable projections, and real gaps (#286). Scope the
+            # state snapshot to the same generation and projection contract.
+            def lifecycle_projection_state_lookup(
+                source_revision_ids: list[str],
+            ) -> tuple[set[str], set[str]]:
+                assert self.lifecycle_store is not None
+                return self.lifecycle_store.projection_source_revision_states(
+                    source_revision_ids,
+                    generation_id=lifecycle_projection.generation_id,
+                    projection_version=lifecycle_projection.projection_version,
+                    config_digest=lifecycle_projection.config_digest,
+                )
+
+            try:
+                self.cognee.lifecycle_projection_state_lookup = (
+                    lifecycle_projection_state_lookup
+                )
+            except AttributeError:
+                # A gateway that rejects attribute injection (bare/slotted test
+                # doubles) simply keeps the fully fail-closed check.
+                pass
             self.lifecycle_worker = LifecycleProjectionWorker(
                 self.lifecycle_store,
                 self.cognee,

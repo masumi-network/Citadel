@@ -1090,3 +1090,72 @@ def test_requeue_failed_projections_ignores_healthy_jobs(tmp_path: Path) -> None
     )
     store.accept_source(b"leave me queued", capture=capture, projection=projection, now=T0)
     assert store.requeue_failed_projections(now=T0) == 0
+
+
+def test_projection_source_revision_states_tracks_active_and_completed_jobs(
+    tmp_path: Path,
+) -> None:
+    # The stored-chunk census resolves missing cognee document ids against
+    # this read (#286): a pending/running projection means "not written YET";
+    # a completed-searchable one gets one exact census recheck before failure.
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="cognee-1.4.1-qdrant-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted = store.accept_source(
+        b"in-flight lookup",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:in-flight",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-in-flight",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    revision_id = accepted.source_revision_id
+
+    # Pending job: in flight. Unknown ids and empty input never match.
+    lookup_kwargs = {
+        "generation_id": projection.generation_id,
+        "projection_version": projection.projection_version,
+        "config_digest": projection.config_digest,
+    }
+    assert store.projection_source_revision_states(
+        [revision_id], **lookup_kwargs
+    ) == ({revision_id}, set())
+    assert store.projection_source_revision_states(
+        ["no-such-id"], **lookup_kwargs
+    ) == (set(), set())
+    assert store.projection_source_revision_states([], **lookup_kwargs) == (
+        set(),
+        set(),
+    )
+    assert store.projection_source_revision_states(
+        [revision_id],
+        generation_id="other-generation",
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    ) == (set(), set())
+
+    # Drive the job to completed-searchable through the real choreography.
+    # The caller may recheck a stale census once; a still-missing id is fatal.
+    lease = store.claim_next_job(worker_id="worker-1", now=T0, lease_seconds=30)
+    assert lease is not None
+    for backend in ("relational", "vector", "graph"):
+        store.begin_backend(lease, backend, now=T0)
+        store.complete_backend(lease, backend, affected_count=1, now=T0)
+        store.mark_backend_searchable(lease, backend, now=T0)
+    assert store.projection_source_revision_states(
+        [revision_id], **lookup_kwargs
+    ) == (set(), {revision_id})

@@ -44,6 +44,20 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Fixed
 
+- **The post-cognify stored-chunk check no longer fails on documents the
+  lifecycle drain is still projecting (#286).** Phase-2 incremental cognify
+  sweeps in-flight documents into its receipt while the drain still owns
+  their chunk writes, so the census counted the not-yet-written chunks as
+  missing and failed the whole pass with zero violations (live 18:02Z canary;
+  same design family as #273, one layer deeper). Missing document ids are now
+  partitioned by projection-job state through a narrow lifecycle-store read
+  (a drain-projected document's cognee `Data.id` is its
+  `source_revision_id`): pending/running ids are logged by id and skipped;
+  a missing id with no active job stays fatal, and budget violations stay
+  fatal regardless, so the check keeps its fail-closed property for real
+  gaps. Deployments without a lifecycle store keep the old fully fail-closed
+  behavior.
+
 - **`/api/documents/{id}` 404'd every DocumentChunk and TextSummary id.**
   Under access control each dataset lives in its own graph database
   (ADR-0020), and the targeted drill-down read used the ambient engine

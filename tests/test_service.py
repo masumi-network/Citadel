@@ -2995,3 +2995,47 @@ async def test_every_rejection_line_in_ingest_escapes_the_dataset_name(
     for message in messages:
         assert "\n" not in message, "a caller-supplied value opened a new log line"
         assert "\\n" in message, "the value must survive the escaping, not be deleted"
+
+
+def test_lifecycle_wires_projection_state_lookup_into_cognee(
+    tmp_path, monkeypatch
+) -> None:
+    # The post-cognify stored check partitions missing document ids by
+    # projection state through this hook (#286). The closure must preserve the
+    # configured generation and projection contract. Unwired (lifecycle off)
+    # it stays None and the check remains fully fail-closed.
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    assert kb.lifecycle_store is not None
+    captured: dict[str, Any] = {}
+
+    def state_lookup(
+        source_revision_ids: list[str], **scope: str
+    ) -> tuple[set[str], set[str]]:
+        captured.update(scope)
+        return set(source_revision_ids), set()
+
+    monkeypatch.setattr(
+        kb.lifecycle_store,
+        "projection_source_revision_states",
+        state_lookup,
+    )
+    projection = kb._lifecycle_projection_request()
+    assert fake.lifecycle_projection_state_lookup(["revision-1"]) == (
+        {"revision-1"},
+        set(),
+    )
+    assert captured == {
+        "generation_id": projection.generation_id,
+        "projection_version": projection.projection_version,
+        "config_digest": projection.config_digest,
+    }
+
+    unwired = Citadel(CitadelConfig(lifecycle_enabled=False), cognee=FakeCognee())
+    assert getattr(unwired.cognee, "lifecycle_projection_state_lookup", None) is None

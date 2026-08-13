@@ -1486,6 +1486,45 @@ class LifecycleStore:
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
+    def projection_source_revision_states(
+        self,
+        source_revision_ids: list[str],
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+    ) -> tuple[set[str], set[str]]:
+        """Partition revisions into active and completed-searchable projections."""
+        candidates = sorted({str(value) for value in source_revision_ids if value})
+        if not candidates:
+            return set(), set()
+        placeholders = ",".join("?" for _ in candidates)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT job.source_revision_id, job.state, "
+                "MAX(CASE WHEN receipt.backend = 'vector' "
+                "AND receipt.state = 'searchable' THEN 1 ELSE 0 END) "
+                "AS vector_searchable "
+                "FROM projection_jobs AS job "
+                "LEFT JOIN projection_receipts AS receipt "
+                "ON receipt.projection_job_id = job.projection_job_id "
+                "WHERE job.generation_id = ? "
+                "AND job.projection_version = ? "
+                "AND job.config_digest = ? "
+                f"AND job.source_revision_id IN ({placeholders}) "
+                "GROUP BY job.source_revision_id, job.state",
+                (generation_id, projection_version, config_digest, *candidates),
+            ).fetchall()
+        active: set[str] = set()
+        completed_searchable: set[str] = set()
+        for row in rows:
+            source_revision_id = str(row["source_revision_id"])
+            if row["state"] in {"pending", "running"}:
+                active.add(source_revision_id)
+            elif row["state"] == "completed" and bool(row["vector_searchable"]):
+                completed_searchable.add(source_revision_id)
+        return active, completed_searchable
+
     def claim_next_job(
         self,
         *,
