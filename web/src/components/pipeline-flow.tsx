@@ -27,97 +27,9 @@ import {
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { HEADERS, LINKS, STAGES } from "@/components/pipeline-data";
+
 import "@xyflow/react/dist/style.css";
-
-const COL = { src: 0, node: 300, gate: 600, central: 900, read: 1200, out: 1500 };
-
-/* Column captions. Rendered as nodes so they pan and zoom with the diagram
-   rather than floating over it.
-
-   They deliberately do not repeat the label of the node beneath them. "Your
-   Node" and "Central" are the two nodes that carry the argument; a caption
-   saying the same words directly above one reads as a duplicate, not a lane. */
-const HEADERS: Array<[string, number, string]> = [
-  ["h-src", COL.src, "Sources"],
-  ["h-node", COL.node, "Personal"],
-  ["h-gate", COL.gate, "Promotion gate"],
-  ["h-central", COL.central, "Organization"],
-  ["h-read", COL.read, "Read scope"],
-  ["h-out", COL.out, "Where you read it"],
-];
-
-type StageRow = [string, number, number, string, string, string, string];
-
-const STAGES: StageRow[] = [
-  ["src-prepush", COL.src, 0, "source", "git pre-push", "capture",
-    "A pre-push hook sends the commits you are about to push into your Node. It fails silently, so a vault problem never blocks a push."],
-  ["src-session", COL.src, 66, "source", "SessionEnd hook", "capture",
-    "Your coding agent writes each finished session to your Node when it ends. Nothing to file, nothing to remember to save."],
-  ["src-capture", COL.src, 132, "source", "citadel capture", "manual",
-    "The deliberate route. One command puts a note, a file, or a decision into your Node when you want it there on purpose."],
-  ["src-obsidian", COL.src, 198, "source", "Obsidian sync", "mirror",
-    "A linked Obsidian vault mirrors into your Node, so markdown notes you already keep are searchable alongside everything else."],
-
-  ["src-github", COL.src, 320, "source", "GitHub org", "hourly",
-    "The organization's repositories sync on a schedule: commits, pull requests, and issues, held as org knowledge rather than as yours."],
-  ["src-linear", COL.src, 386, "source", "Linear workspace", "hourly",
-    "Linear issues mirror in seat scoped, so your own work stays yours and the org sees what was already shared."],
-  ["src-repo", COL.src, 452, "source", "Repo content", "hourly",
-    "Readmes, architecture decision records, and docs from org repositories are ingested as content, not just as filenames."],
-
-  ["node", COL.node, 99, "store-node", "Your Node", "personal by default",
-    "Your own memory, one per seat. Everything you capture lands here first, and no other seat can read it."],
-
-  ["gate-scan", COL.gate, 33, "gate", "Secret scan", "1",
-    "Every promotion is scanned first. A candidate carrying a key or a token is rejected before a person ever sees it."],
-  ["gate-review", COL.gate, 99, "gate", "Automated review", "2",
-    "A review pass summarises the candidate and checks it against what Central already holds, so promotion does not duplicate or contradict."],
-  ["gate-approve", COL.gate, 165, "gate", "Human approval", "3",
-    "Known work promotes automatically once it passes. Anything new waits for a person to approve it, from the dashboard, MCP, or the CLI."],
-
-  ["central", COL.central, 320, "store-central", "Central", "org, curated",
-    "The organization's shared memory. It only ever holds what was promoted into it, which is what keeps it small enough to trust."],
-
-  ["read", COL.read, 210, "read", "Caller-scoped read", "your Node plus Central",
-    "One query reads your Node and Central together and tells you which one answered. Another seat's content is never in the result, and drilling into it returns 404 rather than 403, so there is no existence oracle."],
-
-  ["out-cli", COL.out, 110, "out", "citadel search", "CLI",
-    "The terminal route. You search from the command line under your own seat token."],
-  ["out-mcp", COL.out, 176, "out", "MCP clients", "agents",
-    "Claude Code, Cursor, or an agent you wrote yourself, over MCP, under the same seat and the same read scope you have."],
-  ["out-web", COL.out, 242, "out", "Web workspace", "signed in",
-    "The signed-in dashboard: search, the knowledge graph, connected sources, and the promotion queue."],
-
-  ["audit", COL.out, 360, "audit", "Audit log", "every call",
-    "Every read and every write is recorded, including which tool asked and under which seat."],
-];
-
-const LINKS: Array<[string, string, string]> = [
-  ["src-prepush", "node", "capture"],
-  ["src-session", "node", "capture"],
-  ["src-capture", "node", "capture"],
-  ["src-obsidian", "node", "capture"],
-
-  ["node", "gate-scan", "promote"],
-  ["gate-scan", "gate-review", ""],
-  ["gate-review", "gate-approve", ""],
-  ["gate-approve", "central", "approved"],
-
-  ["src-github", "central", "evolve"],
-  ["src-linear", "central", "evolve"],
-  ["src-repo", "central", "evolve"],
-
-  ["node", "read", ""],
-  ["central", "read", ""],
-
-  ["read", "out-cli", ""],
-  ["read", "out-mcp", ""],
-  ["read", "out-web", ""],
-
-  ["out-cli", "audit", ""],
-  ["out-mcp", "audit", ""],
-  ["out-web", "audit", ""],
-];
 
 /* Adjacency, both directions, so hovering a node can light the whole path it
    sits on rather than only its immediate neighbours. */

@@ -69,9 +69,7 @@ def test_every_preview_route_is_served_under_the_strict_policy() -> None:
     # No preview path is in the one opt-in list that can relax the policy, and
     # none may join it. The list is empty today; while / held the opt-in, this
     # is exactly where it would have been copied across by reflex.
-    assert not any(
-        path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS
-    )
+    assert not any(path.startswith("/next") for path in server_module.CSP_INLINE_STYLE_PATHS)
 
 
 def test_the_preview_route_set_is_closed() -> None:
@@ -122,6 +120,49 @@ def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
     for step in ("Capture", "Your Node", "Promotion", "Central"):
         assert step in body
     assert "xyflow" not in body
+
+
+def test_the_landing_architecture_reaches_phones_and_names_what_runs() -> None:
+    """Two regressions pinned at once.
+
+    Mobile: pipeline-diagram.tsx never mounts React Flow under 620px (fitView
+    cannot fit the topology there), and the static spine was all a phone got:
+    four step names, no architecture. The stacked lanes are exported markup,
+    shown by CSS exactly where that gate keeps the diagram off, so a phone
+    reads the whole architecture with no JavaScript.
+
+    Content: the stages name what actually runs at head, the stores
+    kb/lite_runtime.py configures and the lifecycle wording of kb/lifecycle.py,
+    and carry no cadence figure. "hourly" sat on the org sources while the
+    shipped default interval was six hours (kb/config.py
+    evolve_interval_seconds), so its absence is pinned the way the other
+    unrecomputable figures are.
+    """
+    body = _client().get("/next").text
+
+    lanes = re.search(r'<div[^>]*aria-label="The architecture, lane by lane"[^>]*>', body)
+    assert lanes is not None, "the stacked architecture block is not in the export"
+    assert "max-[620px]:block" in lanes.group(0), "the lanes are not the below-620px rendering"
+
+    spine = re.search(r'<div[^>]*aria-label="How work reaches the vault"[^>]*>', body)
+    assert spine is not None
+    assert "max-[620px]:hidden" in spine.group(0), "the spine does not yield to the lanes"
+
+    for fact in (
+        "Lifecycle ledger",
+        "SQLite · Qdrant · Ladybug",
+        "BAAI/bge-small-en-v1.5",
+        "evolve pass",
+    ):
+        assert fact in body, f"the exported architecture no longer names: {fact}"
+
+    # In the source too, not only the last rebuild, mirroring how
+    # test_public_page_claims.py treats the other dead figures.
+    data = (
+        server_module.WEBUI_DIR.parent.parent / "web" / "src" / "components" / "pipeline-data.ts"
+    ).read_text(encoding="utf-8")
+    for surface in (body, data):
+        assert "hourly" not in surface
 
 
 def test_the_export_carries_no_inline_script_and_no_inline_style() -> None:
@@ -201,12 +242,27 @@ def test_dashboard_views_are_role_gated_at_the_route() -> None:
     the server.
     """
     expected = {
-        "test-reader": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 403,
-                        "/next/app/admin": 403},
-        "test-writer": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
-                        "/next/app/admin": 403},
-        "test-admin": {"/next/app": 200, "/next/app/search": 200, "/next/app/sources": 200, "/next/app/review": 200,
-                       "/next/app/admin": 200},
+        "test-reader": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 403,
+            "/next/app/admin": 403,
+        },
+        "test-writer": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 200,
+            "/next/app/admin": 403,
+        },
+        "test-admin": {
+            "/next/app": 200,
+            "/next/app/search": 200,
+            "/next/app/sources": 200,
+            "/next/app/review": 200,
+            "/next/app/admin": 200,
+        },
     }
 
     for access_key, paths in expected.items():
@@ -261,9 +317,7 @@ def test_graph_view_is_a_real_next_dashboard_route() -> None:
 
     compiled = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob(
-            "graph-*.js"
-        )
+        for path in (server_module.WEBUI_DIR / "_next/static/chunks/pages/app").glob("graph-*.js")
     )
     assert "visible_nodes" in compiled
     assert "Presence-only view. No content nodes are visible for this scope." in compiled

@@ -247,8 +247,9 @@ export default function Home() {
             <div>
               <h3 className={ROW_H3}>It runs without you.</h3>
               <p className={CARD_P}>
-                A session hook, a GitHub sync, and a Linear mirror feed your Node while you work.
-                Nothing to file, nothing to remember to save.
+                A session hook and a git pre-push hook feed your Node while you work, and the
+                evolve pass syncs the org&apos;s GitHub and Linear. Nothing to file, nothing to
+                remember to save.
               </p>
             </div>
           </div>
