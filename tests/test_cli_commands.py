@@ -853,6 +853,68 @@ def test_ingest_oversized_payload_errors_client_side(
     assert out["code"] == "PAYLOAD_TOO_LARGE"
 
 
+def test_ingest_directory_argument_is_rejected(tmp_path: Path, monkeypatch, capsys) -> None:
+    # A directory used to fall through to literal text and ship the path string
+    # as the note body — the exact defect class the file fix closed.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"accepted": True},
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data=str(tmp_path))))
+    assert rc == 1
+    assert called["n"] == 0  # never shipped
+    assert json.loads(capsys.readouterr().out)["code"] == "FILE_IS_DIRECTORY"
+
+
+def test_ingest_oversized_file_rejected_before_reading(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # The size pre-check must fire on stat() alone: a huge file must not be
+    # pulled into memory just to be refused.
+    monkeypatch.setenv("CITADEL_MCP_MAX_INGEST_BYTES", "8")
+    big = tmp_path / "big.txt"
+    big.write_text("0123456789abcdef", encoding="utf-8")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+
+    def forbidden_read(self, *a, **k):
+        raise AssertionError("read_text must not be called for an oversized file")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read)
+    rc = asyncio.run(_ingest(_ingest_args(data=str(big))))
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["code"] == "PAYLOAD_TOO_LARGE"
+
+
+def test_ingest_json_receipt_reports_file_source(tmp_path: Path, monkeypatch, capsys) -> None:
+    # In --json mode the dim "reading …" line is suppressed for output purity,
+    # so the receipt itself must carry the file-vs-literal signal.
+    note = tmp_path / "NOTES.md"
+    note.write_text("the actual note body", encoding="utf-8")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.ingest_node", lambda *a, **k: {"accepted": True, "dataset": "seat:alice"}
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data=str(note))))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ingest_source"] == "file"
+    assert out["ingest_path"] == str(note)
+
+
+def test_ingest_json_receipt_reports_text_source(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.ingest_node", lambda *a, **k: {"accepted": True, "dataset": "seat:alice"}
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data="a plain literal note")))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ingest_source"] == "text"
+    assert "ingest_path" not in out
+
+
 def test_ingest_empty_file_is_a_clean_error(tmp_path: Path, monkeypatch, capsys) -> None:
     empty = tmp_path / "empty.md"
     empty.write_text("   \n", encoding="utf-8")

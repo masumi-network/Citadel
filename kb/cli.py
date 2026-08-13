@@ -424,21 +424,53 @@ def _resolve_ingest_data(args: argparse.Namespace) -> int | None:
 
     `citadel ingest NOTES.md` used to ship the literal string "NOTES.md" as the
     note body — the file was never read, and the projection later died on the
-    path-string note. Only a single existing regular file is read (UTF-8); an
-    argument that is not an existing file stays literal text, since a sentence
-    may legitimately contain a slash. Mutates ``args.data`` and returns None to
-    proceed, or an exit code after a clean client-side error (unreadable or
-    non-text file, payload over the Node's ingest byte cap).
+    path-string note. Only a single existing regular file is read (UTF-8); a
+    directory is rejected outright (same defect class: its path string would
+    ship as the note), and an argument that names nothing on disk stays literal
+    text, since a sentence may legitimately contain a slash. Mutates
+    ``args.data``, records ``args.ingest_source`` / ``args.ingest_path`` for
+    the JSON receipt, and returns None to proceed, or an exit code after a
+    clean client-side error (directory, unreadable, non-text or empty file,
+    payload over the Node's ingest byte cap).
     """
     as_json = getattr(args, "json", False)
     raw = args.data
+    args.ingest_source = "text"
+    args.ingest_path = None
     try:
-        is_file = Path(raw).is_file()
+        target = Path(raw)
+        is_dir = target.is_dir()
+        is_file = target.is_file()
     except (OSError, ValueError):  # literal text can exceed name limits or hold NULs
+        is_dir = False
         is_file = False
+    if is_dir:
+        return _emit_error(
+            "ingest",
+            f"{raw} is a directory — ingest a single file (directories and globs "
+            "are not supported)",
+            as_json=as_json,
+            code="FILE_IS_DIRECTORY",
+        )
+    max_bytes = _max_ingest_bytes()
     if is_file:
+        # Refuse on stat() alone so an oversized file is never pulled into
+        # memory just to be rejected; the post-read check below stays the
+        # authoritative gate for the encoded size.
         try:
-            content = Path(raw).read_text(encoding="utf-8")
+            file_size = target.stat().st_size
+        except OSError:
+            file_size = 0  # stat raced with deletion; read_text surfaces the error
+        if file_size > max_bytes:
+            return _emit_error(
+                "ingest",
+                f"{raw} is {file_size} bytes; the Node's ingest limit is "
+                f"{max_bytes} bytes (CITADEL_MCP_MAX_INGEST_BYTES) — trim or split it",
+                as_json=as_json,
+                code="PAYLOAD_TOO_LARGE",
+            )
+        try:
+            content = target.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return _emit_error(
                 "ingest",
@@ -461,6 +493,8 @@ def _resolve_ingest_data(args: argparse.Namespace) -> int | None:
                 code="FILE_EMPTY",
             )
         args.data = content
+        args.ingest_source = "file"
+        args.ingest_path = raw
         if not as_json and not getattr(args, "local", False):
             print(
                 paint(
@@ -470,7 +504,6 @@ def _resolve_ingest_data(args: argparse.Namespace) -> int | None:
                 )
             )
     byte_count = len(args.data.encode("utf-8"))
-    max_bytes = _max_ingest_bytes()
     if byte_count > max_bytes:
         return _emit_error(
             "ingest",
@@ -560,6 +593,13 @@ async def _ingest(args: argparse.Namespace) -> int:
     scope = "your private seat" if str(dataset).startswith("seat:") else "shared org vault"
 
     if as_json:
+        # Client-side provenance for scripted callers: whether the argument was
+        # read as a file (and which one) or shipped as literal text — the same
+        # signal the human gets from the dim "reading …" line. setdefault so a
+        # future server-emitted key of the same name would win.
+        result.setdefault("ingest_source", args.ingest_source)
+        if args.ingest_path:
+            result.setdefault("ingest_path", args.ingest_path)
         _print_json(result)
         return 0 if (accepted or duplicate) else 1
 

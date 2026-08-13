@@ -26,9 +26,14 @@ All notable changes to `citadel-archive` are documented here. Format follows
   133-byte path-string note whose projection then died on FileNotFoundError.
   An argument naming an existing regular file now ingests the file's UTF-8
   content, with clear client-side errors for binary, unreadable, and empty
-  files. Anything that is not an existing file stays literal text. Payloads
-  are also checked against the Node's ingest byte cap before the POST, so an
-  oversized note fails with a clear local error instead of an HTTP 413.
+  files. A directory argument is rejected outright (same defect class: its
+  path string would ship as the note); anything else that names nothing on
+  disk stays literal text. Payloads are also checked against the Node's
+  ingest byte cap before the POST (an oversized file is refused on `stat()`
+  alone, without being read into memory), so an oversized note fails with a
+  clear local error instead of an HTTP 413. The `--json` receipt carries
+  `ingest_source: "file"|"text"` (plus `ingest_path` for files) so scripted
+  callers can tell which way the argument was resolved.
 
 ## [0.4.1] (2026-08-06)
 

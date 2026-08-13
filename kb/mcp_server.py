@@ -461,6 +461,8 @@ def _validate_base_url(base_url: str) -> str:
 
 
 def _max_ingest_bytes() -> int:
+    # Keep in sync with the zero-dep CLI mirror (kb.cli._max_ingest_bytes),
+    # which cannot import this module (the mcp extra).
     raw_value = os.getenv("CITADEL_MCP_MAX_INGEST_BYTES")
     if not raw_value:
         return DEFAULT_MAX_INGEST_BYTES
