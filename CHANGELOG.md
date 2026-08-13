@@ -6,6 +6,19 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`/api/mesh/graph` takes a `dataset` query parameter and orders the
+  caller's seat content into the default view.** The endpoint sampled the
+  first nodes of raw enumeration (16,154 live against a 1,000-node cap), so a
+  seat's own content never made the default graph and no caller could scope
+  the view to one dataset. `?dataset=<name>` narrows to that dataset's
+  subgraph before the cap, shaped by the same ADR-0009 isolation as the
+  unfiltered view: a non-member naming a foreign dataset sees presence hubs
+  and zero content. Absent, behavior is unchanged; an empty or over-long name
+  is a clean 400. When the caller has a seat, its cluster now orders ahead of
+  the cap cut, so the default view includes the caller's content.
+
 ### Changed
 
 - **`citadel ingest` and MCP `citadel_ingest` now default to async.** The old
@@ -20,6 +33,20 @@ All notable changes to `citadel-archive` are documented here. Format follows
   `--no-cognify` still parses and now names the default.
 
 ### Fixed
+
+- **`/api/documents/{id}` 404'd every DocumentChunk and TextSummary id.**
+  Under access control each dataset lives in its own graph database
+  (ADR-0020), and the targeted drill-down read used the ambient engine
+  context, so `get_node` missed ids the mesh itself was displaying; the
+  chunk-store fallback then failed too, because a chunk id has no dataset
+  membership row and the unbound reader refuses unscoped operations
+  (`QdrantScopeError`, caught in the deploy log). The targeted read now
+  probes each provisioned dataset store in the same deterministic order the
+  org-wide mesh read sweeps, the chunk-store fallback probes provisioned
+  stores for membership-less ids, and TextSummary responses carry the
+  summarized document's id in `dataset_node_ids` so the ADR-0009 drill-down
+  gate can see content the caller may read. This also un-breaks search
+  drill-down, which resolves the same ids.
 
 - **`citadel ingest <path>` ingested the literal path string.** The help
   promised "Text (or a path)", but the file was never read: production got a
