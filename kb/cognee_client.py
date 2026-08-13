@@ -1175,12 +1175,20 @@ class CogneePublicClient:
         ``(source_id, target_id, relationship_name, properties)`` tuples, per
         ``cognee.infrastructure.databases.graph.graph_db_interface``.
 
-        The read scans the ENTIRE graph — every provisioned dataset store, see
-        ``_read_graph_data`` — (~0.3s+ on the prod node) and is front-loaded on
-        every dashboard open, so the result is cached for
-        ``GRAPH_DATA_CACHE_TTL_SECONDS`` behind a single-flight lock: a burst of
-        concurrent /api/mesh/graph opens collapses to one store sweep instead of
-        one per caller (#28/#50). Per-caller shaping still runs per request.
+        The refill is one full ``get_graph_data()`` per provisioned dataset
+        store (see ``_read_graph_data``), sequential, each store entered
+        through cognee's semaphore-backed DatasetQueue
+        (``DATASET_QUEUE_MAX_CONCURRENT``, defaulting to
+        ``DATABASE_MAX_LRU_CACHE_SIZE`` = 6), the whole sweep under
+        ``_graph_data_lock``. Cost scales with the store count, and
+        provisioned datasets beyond the engine LRU cap churn the cached
+        engines — raise ``DATABASE_MAX_LRU_CACHE_SIZE`` in the deploy
+        environment when stores exceed 6 (ADR-0020). The sweep is
+        front-loaded on every dashboard open, so the result is cached for
+        ``GRAPH_DATA_CACHE_TTL_SECONDS`` behind that single-flight lock: a
+        burst of concurrent /api/mesh/graph opens collapses to one store
+        sweep instead of one per caller (#28/#50). Per-caller shaping still
+        runs per request.
         """
         cached = self._graph_data_cache
         if cached is not None and monotonic() - cached[0] < GRAPH_DATA_CACHE_TTL_SECONDS:
@@ -1223,6 +1231,13 @@ class CogneePublicClient:
         stores only, so a read never creates databases — and a node with no
         provisioned store keeps the single ambient-context read (access
         control off, single-store deployments, local fakes).
+
+        A store that fails to open or read is skipped — logged by dataset id
+        and exception class only, never row contents — and the healthy stores
+        still merge, so one Kuzu lock timeout does not blank the mesh for
+        every caller. When EVERY provisioned store fails the read raises:
+        /api/mesh/graph keeps its honest fallback and corpus health degrades,
+        instead of a dead graph layer presenting as an empty vault (ADR-0020).
         """
         self._prepare_cognee_environment()
         import cognee
@@ -1235,10 +1250,25 @@ class CogneePublicClient:
         edges: list[Any] = []
         seen_nodes: set[str] = set()
         seen_edges: set[tuple[str, str, str]] = set()
+        failures = 0
+        last_failure: Exception | None = None
         for dataset_id, owner_id in provisioned:
-            scoped_nodes, scoped_edges = await self._read_graph_data_for_dataset(
-                dataset_id, owner_id
-            )
+            try:
+                scoped_nodes, scoped_edges = await self._read_graph_data_for_dataset(
+                    dataset_id, owner_id
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad store must not blank the mesh
+                # Dataset id + exception class only: dataset_database rows
+                # carry store credentials in other columns, and exception
+                # text can quote connection strings.
+                failures += 1
+                last_failure = exc
+                logger.warning(
+                    "org-wide graph read skipped dataset %s: %s",
+                    dataset_id,
+                    exc.__class__.__name__,
+                )
+                continue
             for raw in scoped_nodes:
                 try:
                     node_id = str(raw[0])
@@ -1259,6 +1289,8 @@ class CogneePublicClient:
                     continue
                 seen_edges.add(edge_key)
                 edges.append(raw)
+        if last_failure is not None and failures == len(provisioned):
+            raise last_failure
         return nodes, edges
 
     async def _provisioned_dataset_databases(self) -> list[tuple[UUID, UUID]]:

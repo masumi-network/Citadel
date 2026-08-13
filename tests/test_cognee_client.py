@@ -397,6 +397,67 @@ async def test_graph_data_without_provisioned_stores_reads_current_context(
 
 
 @pytest.mark.asyncio
+async def test_graph_data_skips_failing_store_and_keeps_healthy_totals(
+    monkeypatch: Any,
+) -> None:
+    """One broken store must not blank the org-wide mesh graph.
+
+    A Kuzu lock timeout (or a store read racing a dataset delete) on ONE
+    dataset previously propagated out of the merge loop, so knowledge_mesh
+    served ``fallback: true`` — an empty canvas for every caller on every
+    cache refill. The loop skips the failing store (logging dataset id and
+    exception class only; ``dataset_database`` rows carry store credentials
+    in other columns) and merges the healthy ones. Only when EVERY
+    provisioned store fails does the read raise, keeping the honest fallback
+    instead of presenting a dead graph layer as an empty vault (ADR-0020).
+    """
+    client = CogneePublicClient()
+    owner = uuid4()
+    dataset_a, dataset_b, dataset_c = sorted((uuid4(), uuid4(), uuid4()), key=str)
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return [(dataset_a, owner), (dataset_b, owner), (dataset_c, owner)]
+
+    async def read_for_dataset(
+        dataset_id: UUID, owner_id: UUID
+    ) -> tuple[list[Any], list[Any]]:
+        if dataset_id == dataset_b:
+            raise RuntimeError("store lock timeout")
+        marker = "a" if dataset_id == dataset_a else "c"
+        return (
+            [(f"doc-{marker}", {})],
+            [(f"doc-{marker}", "hub", "is_part_of", {})],
+        )
+
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_read_graph_data_for_dataset", read_for_dataset)
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+
+    nodes, edges = await client.graph_data()
+
+    assert sorted(str(node_id) for node_id, _ in nodes) == ["doc-a", "doc-c"]
+    assert sorted((str(s), str(t)) for s, t, *_ in edges) == [
+        ("doc-a", "hub"),
+        ("doc-c", "hub"),
+    ]
+
+    async def every_store_fails(
+        dataset_id: UUID, owner_id: UUID
+    ) -> tuple[list[Any], list[Any]]:
+        raise RuntimeError("all stores down")
+
+    monkeypatch.setattr(client, "_read_graph_data_for_dataset", every_store_fails)
+    client._graph_data_cache = None
+    with pytest.raises(RuntimeError, match="all stores down"):
+        await client.graph_data()
+
+
+@pytest.mark.asyncio
 async def test_per_dataset_graph_read_restores_ambient_context(
     monkeypatch: Any,
 ) -> None:
