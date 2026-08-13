@@ -1296,7 +1296,7 @@ def create_mcp_server(
         dataset: str | None = None,
         tags: list[str] | None = None,
         session_id: str | None = None,
-        cognify: bool = True,
+        cognify: bool = False,
     ) -> dict[str, Any]:
         """Stage durable context in the caller's personal seat node. Requires writer access.
 
@@ -1307,9 +1307,11 @@ def create_mcp_server(
         Never ingest secrets, tokens, passwords, keys, seed phrases, PII, or raw logs.
         Summarize and curate first; keep payloads small (cap ~200 KB).
 
-        By default the note is cognified inline so it is searchable immediately (parity
-        with the `citadel ingest` CLI). Pass `cognify=false` to stage without the
-        blocking cognify when you will batch-cognify later.
+        By default the note is accepted immediately and becomes searchable within
+        minutes (the receipt says `queued_not_confirmed` until then; parity with the
+        `citadel ingest` CLI). Pass `cognify=true` to block until the graph is built —
+        that single request can exceed MCP client/proxy timeouts, and a timeout does
+        NOT mean the write failed.
 
         Shared Central is read-only from MCP. Org-wide memory updates via scheduled
         GitHub/Linear sync and selective promotion — not direct MCP ingest.

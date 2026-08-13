@@ -28,7 +28,7 @@ from kb.status import Check, StatusReport
 
 def _ingest_args(**kw):
     base = dict(data="a note", tag=[], json=True, node_url="https://node.example",
-                local=False, dataset=None, session=None, no_cognify=True)
+                local=False, dataset=None, session=None, cognify=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -699,7 +699,46 @@ def test_ingest_no_token_exits_one(monkeypatch, capsys) -> None:
     assert "no token" in capsys.readouterr().err
 
 
-def test_ingest_cognifies_by_default(monkeypatch, capsys) -> None:
+def test_ingest_default_is_async(monkeypatch, capsys) -> None:
+    # The old default (inline cognify) blocked one request until the proxy edge
+    # 502'd it while the Node accepted the write twice (edge retry). The parser
+    # default must therefore be async: cognify only on explicit opt-in.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
+        seen["cognify"] = cognify
+        return {"accepted": True, "dataset": "seat:alice", "reason": "queued_not_confirmed"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    args = build_parser().parse_args(
+        ["ingest", "a durable note", "--json", "--node-url", "https://node.example"]
+    )
+    rc = asyncio.run(_ingest(args))
+    assert rc == 0
+    assert seen["cognify"] is False
+
+
+def test_ingest_no_cognify_flag_still_parses(monkeypatch, capsys) -> None:
+    # --no-cognify used to be the only way to skip inline cognify; it now names
+    # the default and must keep working for existing scripts.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
+        seen["cognify"] = cognify
+        return {"accepted": True, "dataset": "seat:alice"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    args = build_parser().parse_args(
+        ["ingest", "a durable note", "--no-cognify", "--json", "--node-url", "https://node.example"]
+    )
+    rc = asyncio.run(_ingest(args))
+    assert rc == 0
+    assert seen["cognify"] is False
+
+
+def test_ingest_cognify_flag_opts_in(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
 
@@ -708,10 +747,125 @@ def test_ingest_cognifies_by_default(monkeypatch, capsys) -> None:
         return {"accepted": True, "dataset": "seat:alice", "cognified": True}
 
     monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
-    rc = asyncio.run(_ingest(_ingest_args(no_cognify=False)))
+    args = build_parser().parse_args(
+        ["ingest", "a durable note", "--cognify", "--json", "--node-url", "https://node.example"]
+    )
+    rc = asyncio.run(_ingest(args))
     assert rc == 0
     assert seen["cognify"] is True
     assert json.loads(capsys.readouterr().out)["cognified"] is True
+
+
+def test_ingest_async_receipt_says_when_searchable(monkeypatch, capsys) -> None:
+    # The async default must not leave the user guessing: surface the Node's
+    # queued_not_confirmed receipt as "searchable within minutes" plus the
+    # projection-job handle to track it.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: {
+            "accepted": True,
+            "dataset": "seat:alice",
+            "reason": "queued_not_confirmed",
+            "projection_job_id": "job-7",
+        },
+    )
+    rc = asyncio.run(_ingest(_ingest_args(json=False)))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "within minutes" in out
+    assert "citadel operation job-7" in out
+
+
+# ---- citadel ingest <path> reads the file -------------------------------------
+
+
+def test_ingest_path_argument_reads_file_content(tmp_path: Path, monkeypatch, capsys) -> None:
+    # `citadel ingest NOTES.md` used to ship the literal string "NOTES.md" as
+    # the note body — the file was never read, and production projected a
+    # path-string note that later died on FileNotFoundError.
+    note = tmp_path / "NOTES.md"
+    note.write_text("the actual note body", encoding="utf-8")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
+        seen["data"] = data
+        return {"accepted": True, "dataset": "seat:alice"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    rc = asyncio.run(_ingest(_ingest_args(data=str(note))))
+    assert rc == 0
+    assert seen["data"] == "the actual note body"
+
+
+def test_ingest_missing_path_stays_literal_text(monkeypatch, capsys) -> None:
+    # A sentence may legitimately contain a slash; only an EXISTING file is read.
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    seen: dict = {}
+
+    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
+        seen["data"] = data
+        return {"accepted": True, "dataset": "seat:alice"}
+
+    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
+    literal = "see docs/no-such-file.md for the full write-up"
+    rc = asyncio.run(_ingest(_ingest_args(data=literal)))
+    assert rc == 0
+    assert seen["data"] == literal
+
+
+def test_ingest_binary_file_is_a_clean_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    blob = tmp_path / "image.png"
+    blob.write_bytes(b"\x89PNG\x00\xff\xfe")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"accepted": True},
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data=str(blob))))
+    assert rc == 1
+    assert called["n"] == 0  # never shipped
+    out = json.loads(capsys.readouterr().out)
+    assert out["code"] == "FILE_NOT_TEXT"
+
+
+def test_ingest_oversized_payload_errors_client_side(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # The Node rejects oversized bodies with HTTP 413; the CLI must catch the
+    # overrun locally (same limit + env as kb.mcp_server._max_ingest_bytes)
+    # instead of shipping a payload the server refuses.
+    monkeypatch.setenv("CITADEL_MCP_MAX_INGEST_BYTES", "8")
+    big = tmp_path / "big.txt"
+    big.write_text("0123456789abcdef", encoding="utf-8")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"accepted": True},
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data=str(big))))
+    assert rc == 1
+    assert called["n"] == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["code"] == "PAYLOAD_TOO_LARGE"
+
+
+def test_ingest_empty_file_is_a_clean_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "kb.status.ingest_node",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"accepted": True},
+    )
+    rc = asyncio.run(_ingest(_ingest_args(data=str(empty))))
+    assert rc == 1
+    assert called["n"] == 0
+    assert json.loads(capsys.readouterr().out)["code"] == "FILE_EMPTY"
 
 
 # ---- citadel token set --------------------------------------------------------

@@ -649,9 +649,11 @@ def test_write_tools_reject_empty_or_oversized_payloads(monkeypatch: pytest.Monk
     assert feedback_post["payload"]["correct"] is True
 
 
-def test_ingest_tool_requests_inline_cognify_by_default() -> None:
-    # #53: the MCP ingest tool must send cognify=true (parity with the CLI) so an
-    # agent-ingested note is searchable immediately, not stuck on background cognify.
+def test_ingest_tool_defaults_to_async() -> None:
+    # The inline-cognify default (#53) blocked one request until the proxy edge
+    # 502'd it while the Node accepted the write twice (edge retry). Default is
+    # async now (parity with the CLI): the note lands immediately and the
+    # lifecycle drain makes it searchable within minutes.
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
@@ -660,21 +662,21 @@ def test_ingest_tool_requests_inline_cognify_by_default() -> None:
     assert len(client.posts) == 1
     post = client.posts[0]
     assert post["path"] == "/ingest"
-    assert post["payload"]["cognify"] is True
-    # Inline cognify can exceed the default 30s budget, so the tool extends the timeout.
-    assert post["timeout"] == mcp_server._INGEST_COGNIFY_TIMEOUT
-
-
-def test_ingest_tool_honors_cognify_opt_out() -> None:
-    client = FakeHttpClient()
-    server = create_mcp_server(client)
-
-    run_tool(server, "citadel_ingest", "a durable note", None, cognify=False)
-
-    post = client.posts[0]
     assert post["payload"]["cognify"] is False
     # No extended budget when not blocking on cognify.
     assert post["timeout"] is None
+
+
+def test_ingest_tool_cognify_opt_in_extends_budget() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    run_tool(server, "citadel_ingest", "a durable note", None, cognify=True)
+
+    post = client.posts[0]
+    assert post["payload"]["cognify"] is True
+    # Inline cognify can exceed the default 30s budget, so the tool extends the timeout.
+    assert post["timeout"] == mcp_server._INGEST_COGNIFY_TIMEOUT
 
 
 def test_share_session_tool_preserves_server_lifecycle_operations() -> None:
@@ -773,7 +775,8 @@ def test_ingest_timeout_budget_is_configurable(monkeypatch: pytest.MonkeyPatch) 
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    run_tool(server, "citadel_ingest", "a durable note", None)
+    # The extended budget only applies to the blocking cognify opt-in.
+    run_tool(server, "citadel_ingest", "a durable note", None, cognify=True)
 
     assert client.posts[0]["timeout"] == 45.0
 

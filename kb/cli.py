@@ -402,9 +402,92 @@ def _result_exit(value: Any) -> int:
     return 0
 
 
+# Client-side mirror of the Node's ingest byte cap. The authority is
+# kb.mcp_server._max_ingest_bytes (not importable here — the mcp extra);
+# same env + default so the two surfaces agree. Keep the two in sync.
+_DEFAULT_MAX_INGEST_BYTES = 200_000
+
+
+def _max_ingest_bytes() -> int:
+    raw_value = os.getenv("CITADEL_MCP_MAX_INGEST_BYTES")
+    if not raw_value:
+        return _DEFAULT_MAX_INGEST_BYTES
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return _DEFAULT_MAX_INGEST_BYTES
+    return max(1, value)
+
+
+def _resolve_ingest_data(args: argparse.Namespace) -> int | None:
+    """Turn a file-path argument into the file's CONTENT; leave other text alone.
+
+    `citadel ingest NOTES.md` used to ship the literal string "NOTES.md" as the
+    note body — the file was never read, and the projection later died on the
+    path-string note. Only a single existing regular file is read (UTF-8); an
+    argument that is not an existing file stays literal text, since a sentence
+    may legitimately contain a slash. Mutates ``args.data`` and returns None to
+    proceed, or an exit code after a clean client-side error (unreadable or
+    non-text file, payload over the Node's ingest byte cap).
+    """
+    as_json = getattr(args, "json", False)
+    raw = args.data
+    try:
+        is_file = Path(raw).is_file()
+    except (OSError, ValueError):  # literal text can exceed name limits or hold NULs
+        is_file = False
+    if is_file:
+        try:
+            content = Path(raw).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return _emit_error(
+                "ingest",
+                f"{raw} is not UTF-8 text — only text files can be ingested",
+                as_json=as_json,
+                code="FILE_NOT_TEXT",
+            )
+        except OSError as exc:
+            return _emit_error(
+                "ingest",
+                f"cannot read {raw}: {exc}",
+                as_json=as_json,
+                code="FILE_UNREADABLE",
+            )
+        if not content.strip():
+            return _emit_error(
+                "ingest",
+                f"{raw} is empty — nothing to ingest",
+                as_json=as_json,
+                code="FILE_EMPTY",
+            )
+        args.data = content
+        if not as_json and not getattr(args, "local", False):
+            print(
+                paint(
+                    f"  reading {raw} ({len(content.encode('utf-8'))} bytes)",
+                    "dim",
+                    enable=supports_color(),
+                )
+            )
+    byte_count = len(args.data.encode("utf-8"))
+    max_bytes = _max_ingest_bytes()
+    if byte_count > max_bytes:
+        return _emit_error(
+            "ingest",
+            f"payload is {byte_count} bytes; the Node's ingest limit is {max_bytes} "
+            "bytes (CITADEL_MCP_MAX_INGEST_BYTES) — trim or split it",
+            as_json=as_json,
+            code="PAYLOAD_TOO_LARGE",
+        )
+    return None
+
+
 async def _ingest(args: argparse.Namespace) -> int:
     """Add a note to your Node over HTTP (like MCP citadel_ingest). `--local`
     runs the in-process server stack (needs the [server] extra)."""
+    early_exit = _resolve_ingest_data(args)
+    if early_exit is not None:
+        return early_exit
     if getattr(args, "local", False):
         return await _ingest_local(args)
     _reject_local_only_flags(args, "ingest")
@@ -414,9 +497,11 @@ async def _ingest(args: argparse.Namespace) -> int:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
     from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
 
-    # Cognify inline (server-side) by default so the note is immediately
-    # searchable; the one request blocks until cognify finishes (--no-cognify skips).
-    cognify = not getattr(args, "no_cognify", False)
+    # Async by default: the Node accepts the note and the lifecycle drain makes
+    # it searchable within minutes. Inline cognify (--cognify) blocks the one
+    # request until the graph is built — long enough (~2 min on cold nodes) that
+    # proxy edges kill it with a 502 while the server still accepts the write.
+    cognify = bool(getattr(args, "cognify", False))
     as_json = getattr(args, "json", False)
     timeout_arg = getattr(args, "timeout", None)
     if timeout_arg is not None:
@@ -490,6 +575,28 @@ async def _ingest(args: argparse.Namespace) -> int:
         elif cognify:
             # Requested cognify but the Node didn't report it (older Node, pre inline-cognify).
             print(paint("  (graph update will happen on the next Node sync)", "dim", enable=color))
+        else:
+            # Async default. "queued_not_confirmed" is the Node's honest receipt:
+            # the note is stored durably and not yet searchable.
+            job_id = result.get("projection_job_id")
+            track = f" — track: citadel operation {job_id}" if job_id else ""
+            if str(result.get("reason") or "") == "queued_not_confirmed":
+                print(
+                    paint(
+                        f"  queued (not yet searchable) — the Node projects it "
+                        f"within minutes{track}",
+                        "dim",
+                        enable=color,
+                    )
+                )
+            else:
+                print(
+                    paint(
+                        "  queued — data appears in search after the next Node sync",
+                        "dim",
+                        enable=color,
+                    )
+                )
     elif duplicate:
         print(
             f"  {paint(SKIP, 'yellow', enable=color)} already in your vault (duplicate) — nothing new to add"
@@ -3323,18 +3430,28 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = subcommands.add_parser(
         "ingest", help="Add a durable note to your Node (HTTP; --local for the server stack)"
     )
-    ingest.add_argument("data", help="Text (or a path) to ingest")
-    ingest.add_argument("--tag", action="append", default=[], help="Tag to attach (repeatable)")
     ingest.add_argument(
+        "data", help="Text to ingest, or a path to an existing file (its content is ingested)"
+    )
+    ingest.add_argument("--tag", action="append", default=[], help="Tag to attach (repeatable)")
+    cognify_group = ingest.add_mutually_exclusive_group()
+    cognify_group.add_argument(
+        "--cognify",
+        action="store_true",
+        help="Build the graph inline before returning (immediately searchable, but the "
+        "single blocking request can exceed proxy timeouts — a 502 does not mean the "
+        "write failed). Default: async, searchable within minutes",
+    )
+    cognify_group.add_argument(
         "--no-cognify",
         action="store_true",
-        help="Skip the post-ingest cognify (faster; data appears in search later)",
+        help="Skip inline cognify (the default; kept for compatibility)",
     )
     ingest.add_argument(
         "--timeout",
         type=float,
         metavar="SECONDS",
-        help="Max seconds to wait for the Node (default: 180 while cognifying, 60 with --no-cognify)",
+        help="Max seconds to wait for the Node (default: 60, or 180 with --cognify)",
     )
     ingest.add_argument("--json", action="store_true", help="Machine-readable output")
     ingest.add_argument("--node-url", help="Override Node URL")
