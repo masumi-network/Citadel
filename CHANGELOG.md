@@ -6,6 +6,35 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`citadel ingest` and MCP `citadel_ingest` now default to async.** The old
+  default ran inline cognify: one blocking request held open for around two
+  minutes until the proxy edge killed it with a 502, so the caller was told
+  failure while the Node accepted the write twice (edge retry). Ingest now
+  returns as soon as the Node stores the note (`queued_not_confirmed`), the
+  lifecycle drain makes it searchable within minutes, and the receipt says so
+  (with the `citadel operation <job-id>` handle when the Node returns one).
+  Inline cognify stays as an explicit opt-in (`--cognify` on the CLI,
+  `cognify=true` on MCP) whose help warns it can exceed proxy timeouts.
+  `--no-cognify` still parses and now names the default.
+
+### Fixed
+
+- **`citadel ingest <path>` ingested the literal path string.** The help
+  promised "Text (or a path)", but the file was never read: production got a
+  133-byte path-string note whose projection then died on FileNotFoundError.
+  An argument naming an existing regular file now ingests the file's UTF-8
+  content, with clear client-side errors for binary, unreadable, and empty
+  files. A directory argument is rejected outright (same defect class: its
+  path string would ship as the note); anything else that names nothing on
+  disk stays literal text. Payloads are also checked against the Node's
+  ingest byte cap before the POST (an oversized file is refused on `stat()`
+  alone, without being read into memory), so an oversized note fails with a
+  clear local error instead of an HTTP 413. The `--json` receipt carries
+  `ingest_source: "file"|"text"` (plus `ingest_path` for files) so scripted
+  callers can tell which way the argument was resolved.
+
 ## [0.4.1] (2026-08-06)
 
 ### Added
