@@ -197,6 +197,11 @@ const conflictFilterButtons = Array.from(document.querySelectorAll("[data-confli
 const graphModeButtons = Array.from(document.querySelectorAll("[data-graph-mode]"));
 const graphAggregateButton = document.getElementById("graphAggregateButton");
 const graphDatasetFilter = document.getElementById("graphDatasetFilter");
+const graphNodeSearch = document.getElementById("graphNodeSearch");
+const graphNodeSearchInput = document.getElementById("graphNodeSearchInput");
+const graphNodeSearchResults = document.getElementById("graphNodeSearchResults");
+const graphViewMenu = document.getElementById("graphViewMenu");
+const graphViewLabel = document.getElementById("graphViewLabel");
 const realGraphEmpty = document.getElementById("realGraphEmpty");
 const graphLegend = document.getElementById("graphLegend");
 const toastStack = document.getElementById("toastStack");
@@ -275,6 +280,8 @@ const graph = {
   highlightLinks: new Set(),
   hoverId: null,
 };
+let graphNodeMatches = [];
+let graphNodeMatchIndex = -1;
 
 // Shared Central dataset (config.github_sync_dataset / access.CENTRAL_DATASET).
 const CENTRAL_DATASET = "masumi-network";
@@ -1977,6 +1984,7 @@ function renderGraph() {
   });
 
   graph.instance.graphData({ nodes: data.nodes, links: data.links });
+  renderGraphNodeSearchResults();
   graph.instance.centerAt(0, 0);
   // Arm a settle-fit for this data set (handled by onEngineStop); keep a single
   // coarse early fit on first paint as a fallback if the engine never stops.
@@ -2325,6 +2333,164 @@ function focusGraphNode(nodeId) {
   }
 }
 
+function renderedGraphNodes() {
+  if (!graph.instance || typeof graph.instance.graphData !== "function") return [];
+  const nodes = graph.instance.graphData()?.nodes;
+  return Array.isArray(nodes) ? nodes : [];
+}
+
+function matchingGraphNodes(query) {
+  const normalized = String(query || "").trim().toLowerCase();
+  if (!normalized) return [];
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  return renderedGraphNodes()
+    .map((node) => {
+      const label = String(node.label || node.id || "");
+      const id = String(node.id || "");
+      const type = String(node.type || "");
+      const dataset = String(node.metadata?.dataset || "");
+      const searchable = `${label} ${id} ${type} ${dataset}`.toLowerCase();
+      if (!tokens.every((token) => searchable.includes(token))) return null;
+      const lowerLabel = label.toLowerCase();
+      const rank =
+        lowerLabel === normalized
+          ? 0
+          : lowerLabel.startsWith(normalized)
+            ? 1
+            : lowerLabel.includes(normalized)
+              ? 2
+              : 3;
+      return { node, label, rank };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.rank - right.rank || left.label.localeCompare(right.label))
+    .slice(0, 8)
+    .map((match) => match.node);
+}
+
+function closeGraphNodeSearchResults() {
+  if (!graphNodeSearchInput || !graphNodeSearchResults) return;
+  graphNodeSearchResults.hidden = true;
+  graphNodeSearchInput.setAttribute("aria-expanded", "false");
+  graphNodeSearchInput.removeAttribute("aria-activedescendant");
+  graphNodeMatchIndex = -1;
+}
+
+function setGraphNodeMatchIndex(index) {
+  if (!graphNodeSearchInput || !graphNodeSearchResults || !graphNodeMatches.length) return;
+  graphNodeMatchIndex = (index + graphNodeMatches.length) % graphNodeMatches.length;
+  const options = Array.from(graphNodeSearchResults.querySelectorAll("[role='option']"));
+  options.forEach((option, optionIndex) => {
+    const active = optionIndex === graphNodeMatchIndex;
+    option.classList.toggle("active", active);
+    option.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const activeOption = options[graphNodeMatchIndex];
+  if (!activeOption) return;
+  graphNodeSearchInput.setAttribute("aria-activedescendant", activeOption.id);
+  activeOption.scrollIntoView({ block: "nearest" });
+}
+
+function chooseGraphNodeMatch(node) {
+  if (!node || !graphNodeSearchInput) return;
+  graphNodeSearchInput.value = String(node.label || node.id || "");
+  closeGraphNodeSearchResults();
+  handleNodeHover(null);
+  handleNodeClick(node);
+}
+
+function renderGraphNodeSearchResults() {
+  if (!graphNodeSearchInput || !graphNodeSearchResults) return;
+  const query = graphNodeSearchInput.value.trim();
+  graphNodeSearchResults.innerHTML = "";
+  if (!query) {
+    graphNodeMatches = [];
+    closeGraphNodeSearchResults();
+    return;
+  }
+
+  graphNodeMatches = matchingGraphNodes(query);
+  graphNodeMatchIndex = graphNodeMatches.length ? 0 : -1;
+  if (!graphNodeMatches.length) {
+    const empty = document.createElement("div");
+    empty.className = "graph-node-search-empty";
+    empty.setAttribute("role", "option");
+    empty.setAttribute("aria-disabled", "true");
+    empty.textContent = "No nodes match this view.";
+    graphNodeSearchResults.append(empty);
+  } else {
+    graphNodeMatches.forEach((node, index) => {
+      const option = document.createElement("button");
+      option.id = `graph-node-search-result-${index}`;
+      option.type = "button";
+      option.className = `graph-node-search-result${index === 0 ? " active" : ""}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", index === 0 ? "true" : "false");
+      option.title = String(node.id || "");
+      const label = document.createElement("strong");
+      label.textContent = String(node.label || node.id || "Unnamed node");
+      const meta = document.createElement("span");
+      const kind = nodeKind(node);
+      const dataset = String(node.metadata?.dataset || "");
+      meta.textContent = dataset ? `${kind} / ${dataset}` : kind;
+      option.append(label, meta);
+      option.addEventListener("click", () => chooseGraphNodeMatch(node));
+      graphNodeSearchResults.append(option);
+    });
+  }
+  graphNodeSearchResults.hidden = false;
+  graphNodeSearchInput.setAttribute("aria-expanded", "true");
+  if (graphNodeMatches.length) {
+    graphNodeSearchInput.setAttribute("aria-activedescendant", "graph-node-search-result-0");
+  }
+}
+
+function clearGraphNodeSearch() {
+  if (!graphNodeSearchInput) return;
+  graphNodeSearchInput.value = "";
+  graphNodeMatches = [];
+  closeGraphNodeSearchResults();
+}
+
+function closeGraphViewMenu() {
+  if (graphViewMenu) graphViewMenu.open = false;
+}
+
+function initializeGraphNodeSearch() {
+  if (!graphNodeSearch || !graphNodeSearchInput || !graphNodeSearchResults) return;
+  graphNodeSearchInput.addEventListener("input", renderGraphNodeSearchResults);
+  graphNodeSearchInput.addEventListener("focus", () => {
+    if (graphNodeSearchInput.value.trim()) renderGraphNodeSearchResults();
+  });
+  graphNodeSearchInput.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" && graphNodeMatches.length) {
+      event.preventDefault();
+      setGraphNodeMatchIndex(graphNodeMatchIndex + 1);
+    } else if (event.key === "ArrowUp" && graphNodeMatches.length) {
+      event.preventDefault();
+      setGraphNodeMatchIndex(graphNodeMatchIndex - 1);
+    } else if (event.key === "Enter" && graphNodeMatchIndex >= 0) {
+      event.preventDefault();
+      chooseGraphNodeMatch(graphNodeMatches[graphNodeMatchIndex]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeGraphNodeSearchResults();
+    }
+  });
+  graphNodeSearch.addEventListener("focusout", (event) => {
+    if (!graphNodeSearch.contains(event.relatedTarget)) closeGraphNodeSearchResults();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!graphNodeSearch.contains(event.target)) closeGraphNodeSearchResults();
+    if (graphViewMenu?.open && !graphViewMenu.contains(event.target)) closeGraphViewMenu();
+  });
+  graphViewMenu?.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    closeGraphViewMenu();
+    graphViewMenu.querySelector("summary")?.focus();
+  });
+}
+
 // Fetch and render stored document text for a knowledge-graph node into the
 // inspector panel. Entity nodes fall through to one-hop document-bearing
 // neighbors, while a 404 remains a quiet empty state.
@@ -2575,6 +2741,7 @@ function toggleGraphKind(kind) {
 
 function setGraphAggregate(enabled) {
   state.graphAggregate = Boolean(enabled);
+  clearGraphNodeSearch();
   if (graphAggregateButton) {
     graphAggregateButton.classList.toggle("active", state.graphAggregate);
     graphAggregateButton.setAttribute(
@@ -2769,6 +2936,10 @@ async function loadKnowledgeGraph(force = false) {
 function setGraphMode(mode) {
   if (state.graphMode === mode) return;
   state.graphMode = mode;
+  clearGraphNodeSearch();
+  if (graphViewLabel) {
+    graphViewLabel.textContent = mode === "knowledge" ? "Knowledge Mesh" : "Vault Activity";
+  }
   graph.viewInitialized = false;
   graphModeButtons.forEach((button) => {
     const active = button.dataset.graphMode === mode;
@@ -4273,12 +4444,14 @@ document.getElementById("logoutButton").addEventListener("click", async () => {
 document.getElementById("meshRetryButton").addEventListener("click", () => loadMesh());
 document.getElementById("fitButton").addEventListener("click", () => {
   resetGraphView();
+  closeGraphViewMenu();
 });
 document.getElementById("pauseButton").addEventListener("click", (event) => {
   state.paused = !state.paused;
-  event.currentTarget.textContent = state.paused ? "Resume" : "Pause";
+  event.currentTarget.textContent = state.paused ? "Resume motion" : "Pause motion";
   canvas.classList.toggle("is-paused", state.paused);
   setGraphPaused(state.paused);
+  closeGraphViewMenu();
 });
 
 auditFilterButtons.forEach((button) => {
@@ -4296,21 +4469,27 @@ conflictFilterButtons.forEach((button) => {
 });
 
 graphModeButtons.forEach((button) => {
-  button.addEventListener("click", () => setGraphMode(button.dataset.graphMode || "live"));
+  button.addEventListener("click", () => {
+    setGraphMode(button.dataset.graphMode || "live");
+    closeGraphViewMenu();
+  });
 });
 
 if (graphAggregateButton) {
   graphAggregateButton.addEventListener("click", () => {
     setGraphAggregate(!state.graphAggregate);
+    closeGraphViewMenu();
   });
 }
 
 if (graphDatasetFilter) {
   graphDatasetFilter.addEventListener("change", (event) => {
     state.graphDataset = String(event.currentTarget.value || "");
+    clearGraphNodeSearch();
     // The filter changes what the SERVER returns, so refetch rather than
     // re-shape the cached org-wide payload.
     loadKnowledgeGraph(true);
+    closeGraphViewMenu();
   });
 }
 
@@ -5103,6 +5282,7 @@ function initializeReviewControls() {
 initializeGraph();
 resizeCanvas();
 initializeThemeToggle();
+initializeGraphNodeSearch();
 initializeSearchFilters();
 initializeHomeSearch();
 initializeReviewControls();
