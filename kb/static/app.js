@@ -2224,26 +2224,93 @@ function nearestDocumentThroughEdges(node) {
   return null;
 }
 
+// Chunks name the entities they mention through `contains` edges
+// (DocumentChunk -> Entity in cognee's extraction; enumerated live 2026-08-13:
+// 868 of the payload's 900 contains edges are chunk->entity). Those chunks —
+// not whichever document happens to sit nearest — are what SOURCES an entity.
+const SOURCING_RELATIONSHIP = "contains";
+
+// The in-view parent document of a chunk, through its is_part_of edge.
+function parentDocumentInView(chunkId) {
+  const real = state.realGraph;
+  if (!real) return null;
+  for (const edge of real.edges) {
+    if (String(edge.relationship || edge.label || "") !== "is_part_of") continue;
+    const otherId =
+      edge.source === chunkId ? edge.target : edge.target === chunkId ? edge.source : null;
+    if (!otherId) continue;
+    const other = real.nodes.get(otherId);
+    if (other && nodeKind(other) === "document") return other;
+  }
+  return null;
+}
+
+// Documents that SOURCE the clicked node: the parents of every chunk that
+// `contains` it, ranked by how many of their chunks mention it — the document
+// most about the node outranks a daily-update digest that name-drops it once
+// (which is exactly the wrong document the unranked one-hop chain used to
+// surface for person entities). A parent outside the truncated payload keeps
+// the chunk itself as the candidate; /api/documents resolves chunk ids to
+// their parent server-side.
+function sourcingDocumentCandidates(node) {
+  const real = state.realGraph;
+  if (!real || !node?.id) return [];
+  const byTarget = new Map();
+  const seenChunks = new Set();
+  for (const edge of real.edges) {
+    if (String(edge.relationship || edge.label || "") !== SOURCING_RELATIONSHIP) continue;
+    const otherId =
+      edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null;
+    if (!otherId || seenChunks.has(otherId)) continue;
+    seenChunks.add(otherId);
+    const chunk = real.nodes.get(otherId);
+    if (!chunk || nodeKind(chunk) !== "chunk") continue;
+    const target = parentDocumentInView(otherId) || chunk;
+    const entry = byTarget.get(target.id);
+    if (entry) {
+      entry.count += 1;
+    } else {
+      byTarget.set(target.id, { node: target, count: 1 });
+    }
+  }
+  // Stable sort: ties keep payload order.
+  return Array.from(byTarget.values())
+    .sort((a, b) => b.count - a.count)
+    .map((entry) => ({
+      node: entry.node,
+      relationship: SOURCING_RELATIONSHIP,
+      note: "Sources this node",
+    }));
+}
+
 function documentCandidates(node) {
   const candidates = [];
   const seen = new Set();
-  const add = (candidate, relationship = null) => {
+  const add = (candidate, relationship = null, note = null) => {
     const id = candidate?.id;
     if (!id || seen.has(id) || !isDocumentBearingNode(candidate)) return;
     seen.add(id);
-    candidates.push({ node: candidate, relationship });
+    candidates.push({ node: candidate, relationship, note });
   };
 
-  // Nearest reachable document first: it is the candidate /api/documents can
-  // resolve. The old chain (self, then one-hop document-bearing neighbors)
-  // stays as the fallback for payloads whose structural edges were capped away.
-  const nearest = nearestDocumentThroughEdges(node);
-  if (nearest) {
-    add(nearest.node, nearest.hops === 0 ? null : "nearest document");
+  // 1) Real provenance first: documents whose chunks mention the node,
+  //    strongest source on top.
+  for (const item of sourcingDocumentCandidates(node)) {
+    add(item.node, item.relationship, item.note);
   }
+  // 2) The node itself and its one-hop document-bearing neighbors: a clicked
+  //    chunk, summary, or document resolves through its own id (the backend
+  //    resolves chunk ids to their parent), with the real edge label shown.
   add(node);
   for (const item of knowledgeNeighbors(node.id)) {
     add(item.node, item.relationship);
+  }
+  // 3) Last resort, and said out loud: the nearest document by structural
+  //    edges is reachable content, but nothing ties it to the node as a
+  //    source.
+  const nearest = nearestDocumentThroughEdges(node);
+  if (nearest && nearest.hops > 0) {
+    add(nearest.node, null, "Nearest document in view — not a direct source");
   }
   return candidates;
 }
@@ -2280,8 +2347,14 @@ async function loadNodeDocument(node) {
         doc.title && doc.title !== candidate.node.label
           ? `<strong>${escapeHtml(doc.title)}</strong>`
           : "";
-      const source =
-        candidate.node.id !== node.id
+      // Provenance line: a sourcing/nearest candidate says WHY this document
+      // is shown; other candidates keep the raw edge label; the node's own
+      // document needs no line.
+      const source = candidate.note
+        ? `<p class="node-document-source">${escapeHtml(candidate.note)} · ${escapeHtml(
+            candidate.node.label || candidate.node.id
+          )}</p>`
+        : candidate.node.id !== node.id
           ? `<p class="node-document-source">From ${escapeHtml(
               candidate.relationship || "related"
             )} · ${escapeHtml(candidate.node.label || candidate.node.id)}</p>`
