@@ -11,10 +11,12 @@ ported pages already read must not move.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+import kb.server as server_module
 from kb.access import AccessStore, now_iso
 from kb.mesh import MeshState
 from kb.promotion_queue import build_pending_item, scan_candidate
@@ -22,6 +24,10 @@ from kb.promotion_refs import ReferenceAssessment
 from kb.server import app
 
 from test_server import authed_client
+
+# One repo root for every static-asset pin below, the same way
+# tests/test_mesh_stats_readers.py locates kb/static.
+REPO = Path(server_module.__file__).resolve().parent.parent
 
 # Split so this file cannot be flagged by its own secret scanner in CI.
 FAKE_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -536,13 +542,9 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     never `0`, matching web/src/pages/app/index.tsx.
     """
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     body = re.search(r"function homeReadableCount\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
     assert body, "homeReadableCount() not found in kb/static/app.js"
@@ -578,11 +580,8 @@ def test_event_graph_focus_matches_exact_source_identity() -> None:
     """
     import re
     import subprocess
-    from pathlib import Path
 
-    app_js = (Path(__file__).resolve().parents[1] / "kb" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
     resolver = re.search(
         r"function relatedNodeForEvent\(event\) \{.*?\n\}\n\nfunction findGraphNode",
         app_js,
@@ -624,12 +623,8 @@ def test_graph_inspector_walks_payload_edges_to_nearest_document() -> None:
     and that a node with no reachable document gets a typed empty state
     instead of a silent dead-end."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
     walk = re.search(
         r"function nearestDocumentThroughEdges\(node\)\s*\{(.*?)\n\}",
@@ -665,13 +660,9 @@ def test_graph_aggregate_toggle_writes_state() -> None:
     end to end: a control exists, it writes the flag, and the flag still
     gates aggregation."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert 'id="graphAggregateButton"' in index_html, (
         "no toolbar control for Knowledge Mesh aggregation"
@@ -696,13 +687,9 @@ def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
     the backend has not landed) degrades to the unfiltered view with a
     visible notice instead of a broken graph page."""
     import re
-    from pathlib import Path
 
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert 'id="graphDatasetFilter"' in index_html, (
         "no dataset filter control on the graph toolbar"
@@ -728,12 +715,7 @@ def test_graph_pointer_area_floors_small_node_hit_radius() -> None:
     for low-degree entities at the fit-out zoom of a ~1000-node mesh —
     visible but effectively unclickable. Pin the shadow-canvas pointer paint
     and its zoom-compensated screen-space floor."""
-    from pathlib import Path
-
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
     assert "nodePointerAreaPaint" in app_js, (
         "no pointer-area override; tiny nodes stay unclickable at fit-out zoom"
@@ -753,14 +735,9 @@ def test_graph_depth_control_is_gone() -> None:
     the focus node that manufactured confusion while the user always wants
     full connectivity. Pin its absence end to end (markup, styles, state,
     hop filter) so it cannot quietly return."""
-    from pathlib import Path
-
-    import kb.server as server_module
-
-    repo = Path(server_module.__file__).resolve().parent.parent
-    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    styles_css = (repo / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
 
     assert "graphDepthInput" not in index_html, (
         "the depth control markup is back on the graph toolbar"
