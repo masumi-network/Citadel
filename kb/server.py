@@ -407,6 +407,19 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             # make a node with one broken stage restart its clock forever, which
             # is the bug this fixes (#153).
             record_completed(state_path)
+            # Drain whatever the pass deferred. Projection starts are
+            # suppressed while Phase 1 holds the writer lock, and Phase 2
+            # cognifies directly without touching the lifecycle queue, so
+            # without this kick a job accepted mid-pass waits for the next
+            # external ingest or the next pass. The lock is free and the
+            # suppression scope has ended by this point, and the call is a
+            # no-op when a drain is already running.
+            resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
+            if callable(resume):
+                try:
+                    resume()
+                except Exception:
+                    logger.exception("Evolve scheduler: post-pass projection resume failed")
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":

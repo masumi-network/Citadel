@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import quote
 
 from kb import chunk_window
+from kb.cognee_client import _suppress_inline_cognify
 from kb.github_sync import GitHubAPIError, GitHubOrgClient, utc_now
 from kb.learning import LearningProcess
 from kb.security_scan import SecurityScanEntry, scan_text_entries
@@ -897,7 +898,13 @@ class RepoContentSyncer:
                             _checkpoint(tracked)
                         elif operations and states <= {"pending", "running", "completed"}:
                             resume = getattr(self.citadel, "resume_lifecycle_queue", None)
-                            if callable(resume):
+                            # Not during evolve Phase 1. This walks nearly the
+                            # whole tracked corpus every pass, and an
+                            # unconditional resume here started a drain that
+                            # parked on the writer lock Phase 1 holds (the
+                            # 2026-08-13 stall). The scheduler resumes the
+                            # queue itself once the pass ends.
+                            if callable(resume) and not _suppress_inline_cognify():
                                 resume()
                             _record_skip(repo_result, "projection_pending")
                             continue

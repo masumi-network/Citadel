@@ -1039,13 +1039,24 @@ async def test_lifecycle_projection_checkpoint_polls_without_duplicate_ingest(
 
     first = await syncer.run()
     second = await syncer.run()
+    # Under evolve Phase 1 the resume must NOT fire: this branch walks nearly
+    # the whole tracked corpus every pass, and an unconditional resume started
+    # a drain that parked on the writer lock Phase 1 holds (2026-08-13). The
+    # scheduler resumes the queue itself once the pass ends.
+    from kb.cognee_client import suppress_inline_cognify
+
+    with suppress_inline_cognify():
+        suppressed_pass = await syncer.run()
     citadel.operation_state = "searchable"
     third = await syncer.run()
 
     assert first["files_ingested"] == 1
     assert second["files_skipped_by_reason"] == {"projection_pending": 1}
+    assert suppressed_pass["files_skipped_by_reason"] == {"projection_pending": 1}
     assert third["files_skipped_by_reason"] == {"unchanged": 1}
     assert len(learning.calls) == 1
+    # Exactly one resume: the unsuppressed second run. The suppressed run
+    # recorded the same skip without kicking the drain.
     assert citadel.resume_calls == 1
 
 

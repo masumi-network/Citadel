@@ -78,6 +78,14 @@ async def test_stop_evolve_scheduler_handles_none() -> None:
 class _FakeCitadel:
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
+        self.resume_calls: list[bool] = []
+
+    def resume_lifecycle_queue(self) -> bool:
+        # The scheduler kicks the projection drain after every pass, because
+        # starts are suppressed while Phase 1 holds the writer lock and Phase 2
+        # never drains the lifecycle queue itself.
+        self.resume_calls.append(True)
+        return True
 
     async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
         self._cognify_calls.append(force)
@@ -134,7 +142,8 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
         raise AssertionError("the evolve scheduler must not spawn a subprocess")
 
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", forbidden_exec)
-    monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
+    fake_citadel = _FakeCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
 
     task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
     try:
@@ -155,6 +164,11 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     assert len(cognify_calls) >= 2
     # The verify canary verdict is recorded for /readyz (#27).
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
+    # Every pass ends by kicking the projection drain: starts are suppressed
+    # while Phase 1 holds the writer lock, and Phase 2 cognifies directly
+    # without draining the lifecycle queue, so a job accepted mid-pass would
+    # otherwise wait for the next external ingest or the next pass.
+    assert len(fake_citadel.resume_calls) >= 1
 
 
 class _RaisingCitadel:
