@@ -320,6 +320,9 @@
 .fnode-gate { border-style: dashed; }
 .fnode-read { border-color: var(--accent); }
 .fnode-audit { background: var(--surface-2); border-style: dotted; }
+/* The physical stores (lifecycle ledger, the three backends), as opposed to
+   the two memories above: infrastructure, so they stay quieter than either. */
+.fnode-store { background: var(--surface-2); border-color: var(--border-2); }
 
 .fhead { font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
 

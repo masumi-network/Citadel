@@ -9,6 +9,8 @@ import {
   type ReactNode,
 } from "react";
 
+import { HEADERS, STAGES } from "@/components/pipeline-data";
+
 /* React, React DOM and React Flow are a few hundred kilobytes, on a page that
    otherwise ships almost nothing. So the four-step spine below is the real
    diagram: plain markup, in the exported HTML, no download. This upgrades it in
@@ -27,6 +29,14 @@ const STEPS: Array<{ title: string; sub: string; highlight?: boolean }> = [
   { title: "Promotion", sub: "scan · approve" },
   { title: "Central", sub: "shared" },
 ];
+
+/* The same stages the flow draws, grouped into their columns, for the stacked
+   rendering below 620px. Grouping is by x position, so a stage added to the
+   data shows up in its lane here without a second edit. */
+const LANES = HEADERS.map(([, x, label]) => ({
+  label,
+  stages: STAGES.filter((stage) => stage[1] === x),
+}));
 
 /* A chunk that fails to load, or a diagram that throws while rendering, must
    not take the section with it. The spine is already on screen and already
@@ -56,13 +66,13 @@ export function PipelineDiagram() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        // Below 620px React Flow cannot fit the ~1680px-wide topology:
+        // Below 620px React Flow cannot fit the ~2000px-wide topology:
         // fitView clamps at minZoom, both sides are clipped, and with
         // panning off for coarse pointers the clipped columns are
-        // unreachable. The static spine is the honest rendering there, so
-        // phones keep it. Not disconnecting means a viewport that later
-        // widens past the gate (rotation, window resize) upgrades on the
-        // next intersection instead of being locked out.
+        // unreachable. The stacked lanes are the honest rendering there,
+        // so phones keep them. Not disconnecting means a viewport that
+        // later widens past the gate (rotation, window resize) upgrades on
+        // the next intersection instead of being locked out.
         if (!window.matchMedia("(min-width: 620px)").matches) return;
         observer.disconnect();
         setWanted(true);
@@ -89,15 +99,12 @@ export function PipelineDiagram() {
         <div
           ref={spine}
           aria-label="How work reaches the vault"
-          className="mt-[26px] flex items-center justify-between gap-2.5 max-[620px]:flex-col max-[620px]:gap-1.5"
+          className="mt-[26px] flex items-center justify-between gap-2.5 max-[620px]:hidden"
         >
           {STEPS.map((step, i) => (
             <Fragment key={step.title}>
               {i > 0 ? (
-                <span
-                  aria-hidden="true"
-                  className="flex-none text-[18px] text-border-2 max-[620px]:rotate-90"
-                >
+                <span aria-hidden="true" className="flex-none text-[18px] text-border-2">
                   →
                 </span>
               ) : null}
@@ -116,6 +123,43 @@ export function PipelineDiagram() {
         </div>
       )}
 
+      {/* The stacked lanes: every stage of the diagram, one lane per column,
+          served in the document and shown exactly where the gate above keeps
+          React Flow off. A phone reads the whole architecture with no
+          JavaScript at all; each stage opens to the same detail text the
+          interactive diagram shows on select. */}
+      <div aria-label="The architecture, lane by lane" className="mt-[26px] hidden max-[620px]:block">
+        {LANES.map((lane, i) => (
+          <Fragment key={lane.label}>
+            {i > 0 ? (
+              <div aria-hidden="true" className="my-1.5 text-center text-[16px] leading-none text-border-2">
+                ↓
+              </div>
+            ) : null}
+            <p className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-[.14em] text-ink-3">
+              {lane.label}
+            </p>
+            {lane.stages.map(([id, , , kind, label, sub, detail]) => (
+              <details key={id} className="mb-1.5 border border-border bg-surface">
+                <summary className="cursor-pointer px-3 py-2">
+                  <span
+                    className={`text-[13.5px] font-semibold tracking-[-.01em] ${
+                      kind === "store-node" ? "text-accent-ink" : ""
+                    }`}
+                  >
+                    {label}
+                  </span>{" "}
+                  <span className="font-mono text-[9.5px] tracking-[.02em] text-ink-3">{sub}</span>
+                </summary>
+                <p className="border-t border-border px-3 py-2 text-[12.5px] leading-[1.55] text-ink-2">
+                  {detail}
+                </p>
+              </details>
+            ))}
+          </Fragment>
+        ))}
+      </div>
+
       {/* The read line is the guarantee, and the interactive diagram does not
           restate it, so it stays on screen either way. */}
       <p className="mb-[30px] mt-[18px] border-t border-border pt-3.5 text-center text-[14.5px] text-ink-2">
@@ -129,11 +173,14 @@ export function PipelineDiagram() {
               to a container it can measure and a hidden container measures
               zero. The 300px of lead time above is what keeps that from being
               something the reader sees. */}
-          <div className="mb-3.5 h-[520px] border border-border bg-surface max-[620px]:h-[400px]">
+          {/* Hidden rather than unmounted below 620px, for the one path that
+              gets here that small: an upgrade at a wide width followed by the
+              window shrinking. The stacked lanes take over there. */}
+          <div className="mb-3.5 h-[520px] border border-border bg-surface max-[620px]:hidden">
             <PipelineFlow onReady={onReady} />
           </div>
           {ready ? (
-            <p className="mb-[30px] text-[12.5px] leading-[1.6] text-ink-3">
+            <p className="mb-[30px] text-[12.5px] leading-[1.6] text-ink-3 max-[620px]:hidden">
               Capture to promotion to read, end to end. Hover a step to follow its path, and select
               one to read what it does.
             </p>
