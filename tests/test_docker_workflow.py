@@ -28,17 +28,90 @@ def test_runtime_dependency_pins_match_the_production_assertion() -> None:
         "ladybug==0.18.2",
         "qdrant-client==1.19.0",
         "transformers==5.15.0",
+        "huggingface-hub==1.27.0",
+        "tokenizers==0.22.2",
     }
 
     assert expected_pins <= set(server_dependencies)
     assert expected_pins <= requirements
-    # A global offline pin breaks fastembed's runtime ONNX weight download and
-    # froze vector/graph projection in production on 2026-08-12. Offline mode
-    # may only return together with baked fastembed weights.
-    assert "ENV HF_HUB_OFFLINE" not in dockerfile
+    # A global offline pin without the fastembed weight bake froze vector and
+    # graph projection in production on 2026-08-12. The bakes and the
+    # build-time offline embed proof are unconditional policy (a conditional
+    # guard passes vacuously when the ENV and the bake are removed together),
+    # and the offline pin must come after all of them.
+    # Executable lines of the runtime stage only: a commented-out bake, or a
+    # bake moved into the builder stage where it never reaches the image, must
+    # not satisfy this guard.
+    runtime_stage = dockerfile.split("FROM python", 2)[2].split("FROM runtime AS test", 1)[0]
+    executable = "\n".join(
+        line for line in runtime_stage.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in executable
+    assert "from fastembed import TextEmbedding" in executable
+    assert "HF_HUB_OFFLINE=1 python -c" in executable
+    assert "ENV HF_HUB_OFFLINE=1" in executable
+    offline_prefix = executable.split("ENV HF_HUB_OFFLINE=1", 1)[0]
+    assert "FASTEMBED_CACHE_PATH=/opt/fastembed-cache" in offline_prefix
+    assert "from fastembed import TextEmbedding" in offline_prefix
+    assert "HF_HUB_OFFLINE=1 python -c" in offline_prefix
 
     assert "(version('cognee'), version('ladybug'), version('qdrant-client'))" in dockerfile
     assert "('1.4.1', '0.18.2', '1.19.0')" in dockerfile
+
+
+def test_runtime_bakes_the_ladybug_json_extension_under_home() -> None:
+    # Ladybug resolves its extension directory from $HOME when a Database
+    # opens, and it ignores LADYBUG_HOME_DIRECTORY: that name only reaches
+    # Ladybug as a connection-level `CALL home_directory`, which cannot run
+    # before the database is open. cognee_db_workers' OP_OPEN_DATABASE carries
+    # no home_directory field either. Caching the extension under
+    # /data/ladybug-home therefore left ladybug.Database() reading an empty
+    # $HOME/.lbdb, and graph projection froze at 54 of 289 searchable on
+    # 2026-08-12 with "Failed to load library ... libjson.lbug_extension".
+    # Executable lines of the runtime stage only, so a commented-out bake or
+    # one moved into the builder stage cannot satisfy this guard.
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    runtime_stage = dockerfile.split("FROM python", 2)[2].split("FROM runtime AS test", 1)[0]
+    executable = "\n".join(
+        line for line in runtime_stage.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "INSTALL JSON;" in executable
+    assert "/home/citadel/.lbdb" in executable
+    # LOAD EXTENSION never installs, so the proof fails the build when the bake
+    # is gone. Asserting the .so path keeps the proof from passing vacuously on
+    # an empty extension directory.
+    assert "libjson.lbug_extension" in executable
+    assert "LOAD EXTENSION JSON;" in executable
+    assert executable.index("INSTALL JSON;") < executable.index("LOAD EXTENSION JSON;")
+    # The proof must run as the shipped user. Both adversarial reviewers noted
+    # that a root-only proof still passes when the tree is unreadable to uid
+    # 10001, which is the only identity that opens the graph at runtime.
+    assert executable.index("USER 10001:10001") < executable.index("LOAD EXTENSION JSON;")
+
+
+def test_ci_proves_the_baked_embedding_engine_offline() -> None:
+    # Deleting the smoke step must fail a test, or the offline-bake policy is
+    # unenforced (fresh-eyes R6, 2026-08-12).
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    container_tests = workflow.split("  container-tests:\n", 1)[1].split(
+        "\n  container-runtime:\n", 1
+    )[0]
+    assert "--network none" in container_tests
+    assert "CITADEL_EMBEDDING_BAKE_SMOKE=1" in container_tests
+    assert "tests/test_embedding_bake_smoke.py" in container_tests
+    smoke_step = container_tests.split("Prove baked embedding engine works offline", 1)[1]
+    assert "citadel-archive:ci-test" in smoke_step.split("- name:", 1)[0]
+
+
+def test_compose_does_not_override_the_baked_hf_home() -> None:
+    # HF_HOME pointed at the volume made the baked tokenizer unreachable under
+    # the offline pin and silently degraded chunk sizing (2026-08-12).
+    for name in ("docker-compose.yml", "kb/deploy_assets/docker-compose.yml"):
+        compose = (Path(__file__).resolve().parents[1] / name).read_text(encoding="utf-8")
+        executable = "\n".join(
+            line for line in compose.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "HF_HOME" not in executable, name
 
 
 def test_ci_uses_a_dedicated_docker_test_target_for_qdrant_contracts() -> None:
@@ -207,7 +280,7 @@ def test_container_log_classifiers_use_portable_guarded_grep() -> None:
     tests_code = _executable_lines(container_tests)
     runtime_code = _executable_lines(container_runtime)
     hard_failure_pattern = (
-        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        "error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed"
     )
     for code in (tests_code, runtime_code):
         assert "command -v grep >/dev/null" in code
@@ -278,6 +351,8 @@ def test_container_log_classifiers_reject_fatal_tokens_before_exemptions(
         "WARNING TLS disabled; FATAL corruption\n",
         "WARNING TLS disabled; ERROR request rejected\n",
         "warning Cognee 1.0 changes: ERROR request rejected\n",
+        # 'corruption' alone missed the past-tense form until 2026-08-12.
+        "corrupted segment detected\n",
     )
 
     for job, function_name, label in classifiers:
@@ -418,7 +493,7 @@ def test_runtime_log_classifier_exempts_only_the_measured_benign_citadel_lines()
     assert code.count("onnxruntime cpuid_info warning: Unknown CPU vendor") == 1
     # Everything outside that list stays fail-closed.
     assert (
-        "error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed"
+        "error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed"
         in container_runtime
     )
     assert "warn(ing)?|recovery.*(shortfall|failed)" in container_runtime

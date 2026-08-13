@@ -260,9 +260,10 @@ jobs:
   container-tests:
     name: Docker test target
     runs-on: ubuntu-latest
-    # Roughly a minute to build and a few more to run the suites, so this is
-    # several times the working duration. It exists to cap a hang, not to pace
-    # the job: without it a stuck step burns the 360-minute default.
+    # A few minutes to build (including ~64 MiB of baked ONNX weights) and a
+    # few more to run the suites, so this is several times the working
+    # duration. It exists to cap a hang, not to pace the job: without it a
+    # stuck step burns the 360-minute default.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -270,6 +271,12 @@ jobs:
       - name: Build Docker test target
         run: docker build --target test --tag citadel-archive:ci-test .
 
+      - name: Prove baked embedding engine works offline
+        run: |
+          docker run --rm --network none \
+            --env CITADEL_EMBEDDING_BAKE_SMOKE=1 \
+            citadel-archive:ci-test \
+            python -m pytest -q tests/test_embedding_bake_smoke.py
       - name: Run non-live and Qdrant contract suites with captured logs
         shell: bash
         run: |
@@ -308,7 +315,7 @@ jobs:
               # Fatal classes cannot share the warning allowlist. Otherwise a
               # warning substring on the same line can hide a fatal condition.
               if grep -Eni \
-                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed' \
                 "$log_file"; then
                 echo "::error::Unexpected fatal container log in $log_file"
                 return 1
@@ -515,7 +522,7 @@ jobs:
               # Fatal classes cannot share the warning allowlist. Otherwise a
               # warning substring on the same line can hide a fatal condition.
               if grep -Eni \
-                'error|traceback|exception|died|critical|panic|fatal|oom|corruption|failure|failed' \
+                'error|traceback|exception|died|critical|panic|fatal|oom|corrupt|failure|failed' \
                 "$log_file"; then
                 echo "::error::Unexpected fatal runtime log in $log_file"
                 return 1

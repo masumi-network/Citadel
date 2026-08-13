@@ -431,6 +431,99 @@ def test_check_corpus_reports_bounded_probe_and_preserves_payload(monkeypatch) -
     assert check.data["corpus"]["relational_documents"] == 2867
 
 
+def test_check_corpus_names_the_failed_canary_over_a_complete_probe(monkeypatch) -> None:
+    # 2026-08-12: the row printed a red X while the detail read "corpus probe
+    # complete: 34/34 ... fully indexed"; the failing gate was the canary and
+    # the text never said so.
+    body = {
+        "ok": False,
+        "corpus": {
+            "ok": True,
+            "tracked_sources": 333,
+            "indexed_docs": 7656,
+            "relational_documents": 37,
+            "probe_documents": 34,
+            "probe_complete": True,
+            "probe_ok": True,
+            "probe_fully_indexed_documents": 34,
+        },
+        "canary": {"ok": False, "search_hit": False, "graph_grew": True},
+        "lifecycle": {"ok": True},
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    # Prepended so the row renderer's truncation cannot hide it.
+    assert check.detail.startswith("search canary failed (search_hit=False)")
+
+
+def test_check_corpus_folds_lifecycle_ok_and_shows_backend_split(monkeypatch) -> None:
+    # 2026-08-12: aggregate searchable kept rising on relational-only progress
+    # while graph and vector were frozen; the CLI stayed green over a 503 node.
+    body = {
+        "ok": False,
+        "corpus": {"ok": True, "tracked_sources": 333, "indexed_docs": 7656},
+        "canary": {"ok": True},
+        "lifecycle": {
+            "ok": False,
+            "current_generation": {
+                "current_searchable_by_backend": {"graph": 54, "relational": 115, "vector": 54}
+            },
+        },
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    assert check.detail.startswith("lifecycle invariants failing")
+    assert "searchable by backend: graph 54, relational 115, vector 54" in check.detail
+    assert check.data["searchable_by_backend"] == {"graph": 54, "relational": 115, "vector": 54}
+
+
+def test_check_corpus_zero_fills_backends_absent_from_searchable(monkeypatch) -> None:
+    # A backend with NOTHING searchable is absent from
+    # current_searchable_by_backend; rendering it as 0 (from the receipts
+    # universe) is the whole point, since an absent backend is the worst form
+    # of the 2026-08-12 freeze.
+    body = {
+        "ok": False,
+        "corpus": {"ok": True, "tracked_sources": 333, "indexed_docs": 7656},
+        "canary": {"ok": True},
+        "lifecycle": {
+            "ok": False,
+            "invariant_errors": ["failed_projection"],
+            "current_generation": {
+                "current_receipts_by_backend": {"graph": 289, "relational": 289, "vector": 289},
+                "current_searchable_by_backend": {"relational": 115},
+            },
+        },
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    assert "lifecycle invariants failing: failed_projection" in check.detail
+    assert "searchable by backend: graph 0, relational 115, vector 0" in check.detail
+    assert check.data["searchable_by_backend"] == {"graph": 0, "relational": 115, "vector": 0}
+
+
+def test_check_corpus_defers_to_an_unmodeled_server_gate(monkeypatch) -> None:
+    # The server's own ok is authoritative: a future gate this client does not
+    # model must not render green (the 2026-08-12 drift class).
+    body = {
+        "ok": False,
+        "corpus": {"ok": True, "tracked_sources": 1, "indexed_docs": 1},
+        "canary": {"ok": True},
+        "lifecycle": {"ok": True},
+    }
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/readyz": body}))
+    check = status_mod.check_corpus("https://node.example", "ctdl_tok")
+    assert check is not None
+    assert check.ok is False
+    assert check.detail.startswith("node reports not ready")
+
+
 def test_render_verdict_does_not_infer_empty_search_from_corpus_failure() -> None:
     report = StatusReport(
         node_url="https://node.example",

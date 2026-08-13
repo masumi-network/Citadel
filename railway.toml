@@ -1,5 +1,8 @@
 [build]
-builder = "RAILPACK"
+# Railway builds the repo Dockerfile (VERIFIED from the 2026-08-12 build logs,
+# which show the multi-stage [runtime] layers); RAILPACK here contradicted that
+# record. The image bakes the embedding tokenizer and ONNX weights.
+builder = "DOCKERFILE"
 
 [deploy]
 # The published image vendors scripts/ for scheduler and dispatcher imports.
@@ -9,8 +12,9 @@ builder = "RAILPACK"
 # modes such as github-sync, backup-mirror, and pipeline in their own config.
 startCommand = "python -m kb.lite_runtime"
 healthcheckPath = "/healthz"
-# Cold boot downloads the fastembed embedding model and initialises cognee +
-# Ladybug before /healthz answers, which can exceed 30s on a fresh volume.
+# Cold boot initialises cognee + Ladybug before /healthz answers, which can
+# exceed 30s on a fresh volume. The embedding model is baked into the image
+# since 2026-08-12, so no model download happens at boot any more.
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3

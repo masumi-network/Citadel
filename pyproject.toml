@@ -37,6 +37,8 @@ server = [
     # Real tokenizer for BGE chunk sizing; the resolver silently falls back to
     # approximate TikToken counts when transformers is missing.
     "transformers==5.15.0",
+    "huggingface-hub==1.27.0",
+    "tokenizers==0.22.2",
     "cryptography==50.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",

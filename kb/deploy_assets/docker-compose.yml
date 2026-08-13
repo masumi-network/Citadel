@@ -54,7 +54,9 @@ services:
       TELEMETRY_DISABLED: "true"
       AUTO_FEEDBACK: "false"
       XDG_CACHE_HOME: /data/model-cache
-      HF_HOME: /data/model-cache/huggingface
+      # No HF_HOME override: the image bakes the tokenizer at /opt/hf-cache and
+      # pins HF_HUB_OFFLINE=1; pointing HF_HOME at the volume made the bake
+      # unreachable and silently degraded chunk sizing to TikToken (2026-08-12).
     volumes:
       - citadel-data:/data
     tmpfs:

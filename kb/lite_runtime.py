@@ -45,12 +45,32 @@ def _build_id() -> str:
     return value
 
 
+# Must match the model the Dockerfile bakes into /opt/fastembed-cache and
+# /opt/hf-cache; under HF_HUB_OFFLINE=1 nothing else can load.
+BAKED_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
+
 def configure_lite_environment(data_root: Path | None = None) -> Path:
     root = (data_root or Path(os.getenv("CITADEL_LITE_DATA_ROOT", "/data"))).resolve()
+    # fastembed treats any of {1, true, yes, on} as offline; matching only "1"
+    # let HF_HUB_OFFLINE=true bypass this guard while still blocking downloads.
+    if (os.getenv("HF_HUB_OFFLINE") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        model = os.getenv("EMBEDDING_MODEL", BAKED_EMBEDDING_MODEL)
+        if model != BAKED_EMBEDDING_MODEL:
+            # Without this, the drift surfaces later as fastembed's buried
+            # "Could not load model ... from any source" loop (2026-08-12).
+            raise LiteConfigurationError(
+                f"EMBEDDING_MODEL={model!r} cannot load under HF_HUB_OFFLINE=1: "
+                f"only {BAKED_EMBEDDING_MODEL!r} is baked into this image. "
+                "Rebake the image with the new model or unset HF_HUB_OFFLINE."
+            )
     defaults = {
         "SYSTEM_ROOT_DIRECTORY": str(root / "cognee-system"),
         "DATA_ROOT_DIRECTORY": str(root / "data-storage"),
         "CACHE_ROOT_DIRECTORY": str(root / "cache"),
+        # fastembed otherwise defaults to world-shared /tmp/fastembed_cache;
+        # inside the image the Dockerfile ENV (baked, read-only) wins over this.
+        "FASTEMBED_CACHE_PATH": str(root / "cache" / "fastembed"),
         "COGNEE_LOGS_DIR": str(root / "logs"),
         "CITADEL_STATE_DIRECTORY": str(root / "citadel-state"),
         "LADYBUG_HOME_DIRECTORY": str(root / "ladybug-home"),

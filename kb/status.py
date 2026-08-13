@@ -406,9 +406,15 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
     latency = int((time.monotonic() - started) * 1000)
     corpus = data.get("corpus") or {}
     canary = data.get("canary")
+    lifecycle = data.get("lifecycle") or {}
     indexed = corpus.get("indexed_docs")
     tracked = corpus.get("tracked_sources")
-    ok = bool(corpus.get("ok", True)) and (canary is None or bool(canary.get("ok", True)))
+    corpus_ok = bool(corpus.get("ok", True))
+    canary_ok = canary is None or bool(canary.get("ok", True))
+    # /readyz gates on lifecycle.ok too; ignoring it rendered a green Data
+    # plane over a 503 node (2026-08-12).
+    lifecycle_ok = bool(lifecycle.get("ok", True))
+    ok = corpus_ok and canary_ok and lifecycle_ok
     probe_documents = corpus.get("probe_documents")
     relational_documents = corpus.get("relational_documents")
     fully_indexed = corpus.get("probe_fully_indexed_documents")
@@ -431,12 +437,54 @@ def check_corpus(base_url: str, token: str | None, *, timeout: float = _TIMEOUT)
         detail = f"corpus probe unavailable: {corpus['degraded']}"
     else:
         detail = "ok" if indexed is None else f"{indexed} indexed / {tracked} tracked"
+    # Name the component that actually failed, PREPENDED: the row renderer
+    # truncates long details, and an appended clause vanished at 80 columns
+    # while the probe text alone read as a contradiction ("x Data plane ...
+    # complete: 34/34 fully indexed") with the canary as the failing gate.
+    failures: list[str] = []
+    if not canary_ok:
+        canary_error = (canary or {}).get("error")
+        canary_hit = (canary or {}).get("search_hit")
+        clause = f"search canary failed (search_hit={canary_hit}"
+        clause += f", error={canary_error})" if canary_error else ")"
+        failures.append(clause)
+    if not lifecycle_ok:
+        # /readyz carries the specifics; a generic sentence wasted them.
+        errors = lifecycle.get("invariant_errors") or []
+        if errors:
+            failures.append("lifecycle invariants failing: " + ", ".join(errors[:3]))
+        elif lifecycle.get("error_type"):
+            failures.append(f"lifecycle census error: {lifecycle['error_type']}")
+        else:
+            failures.append("lifecycle invariants failing")
+    generation = lifecycle.get("current_generation") or {}
+    # Zero-fill from the receipts universe: a backend with NOTHING searchable
+    # is absent from current_searchable_by_backend, and that absent backend is
+    # the worst form of the 2026-08-12 freeze, not a healthy one.
+    backends = generation.get("current_receipts_by_backend") or {}
+    searchable = generation.get("current_searchable_by_backend") or {}
+    by_backend = {name: int(searchable.get(name, 0)) for name in backends} or dict(searchable)
+    if by_backend and (not lifecycle_ok or len(set(by_backend.values())) > 1):
+        split = ", ".join(f"{name} {count}" for name, count in sorted(by_backend.items()))
+        failures.append(f"searchable by backend: {split}")
+    if ok and data.get("ok") is False:
+        # The server's own gate is authoritative; if it refuses readiness for
+        # a reason this client does not model yet, say so instead of drifting.
+        failures.append("node reports not ready (server-side gate not modeled here)")
+        ok = False
+    if failures:
+        detail = "; ".join(failures) + f"; {detail}"
     return Check(
         "corpus",
         ok=ok,
         detail=detail,
         latency_ms=latency,
-        data={"canary": canary, "corpus": dict(corpus)},
+        data={
+            "canary": canary,
+            "corpus": dict(corpus),
+            "lifecycle_ok": lifecycle_ok,
+            "searchable_by_backend": dict(by_backend),
+        },
     )
 
 

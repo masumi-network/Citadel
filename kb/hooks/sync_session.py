@@ -253,10 +253,14 @@ def receipt_summary(response: dict[str, Any] | None) -> str:
     """Receipt line for a completed POST, mirroring the server's decision."""
     if response is None:
         return "session sent: server replied 2xx but the response body was unreadable"
-    if response.get("accepted") is not False:
+    if response.get("accepted") is True:
         return "session captured → your Node"
-    reason = response.get("reason") or "rejected"
-    return f"session not stored: server rejected the write ({reason})"
+    if response.get("accepted") is False:
+        reason = response.get("reason") or "rejected"
+        return f"session not stored: server rejected the write ({reason})"
+    # A 2xx without accepted: true is not a success; claiming "captured" here
+    # hid real failures (CITADEL-OBSERVED-OUTCOMES-01, capture truthfulness).
+    return "session unconfirmed: server did not state accepted: true"
 
 
 def _send_failure_summary(exc: BaseException) -> str:

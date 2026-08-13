@@ -28,7 +28,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
     CITADEL_BUILD_ID_PATH=/opt/citadel/build-id \
-    HF_HOME=/opt/hf-cache
+    HF_HOME=/opt/hf-cache \
+    FASTEMBED_CACHE_PATH=/opt/fastembed-cache
 
 RUN groupadd --gid 10001 citadel \
     && useradd --uid 10001 --gid 10001 --home-dir /home/citadel --create-home citadel \
@@ -45,12 +46,48 @@ RUN install -d /opt/citadel \
 # tokenizer under a read-only rootfs with no runtime network fetch.
 RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-small-en-v1.5')" \
     && chmod -R a+rX /opt/hf-cache
-# Do NOT set HF_HUB_OFFLINE here: the baked cache covers only the transformers
-# tokenizer, while fastembed downloads its ONNX embedding weights at runtime
-# into its own cache. Offline mode blocked that download in production on
-# 2026-08-12 ("Could not find model in cache_dir" every ~2.5s) and froze the
-# vector and graph projection backends. Offline hardening needs the fastembed
-# weights baked too; see issue #266.
+# Bake the fastembed ONNX embedding weights (HF repo
+# qdrant/bge-small-en-v1.5-onnx-q, ~64 MiB) so runtime embedding needs no
+# network. TextEmbedding() both downloads and writes fastembed's
+# files_metadata.json, which the offline load path verifies.
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" \
+    && chmod -R a+rX /opt/fastembed-cache
+# Build-time proof the image embeds offline before it ships. This is the gate
+# that would have caught the 2026-08-12 outage: HF_HUB_OFFLINE=1 with only the
+# tokenizer baked fails here, at build, not in production.
+RUN HF_HUB_OFFLINE=1 python -c "from fastembed import TextEmbedding; v = list(TextEmbedding(model_name='BAAI/bge-small-en-v1.5').embed(['smoke']))[0]; assert len(v) == 384"
+# Offline may only be pinned together with BOTH bakes above; the tokenizer
+# cache alone froze vector and graph projection in production on 2026-08-12.
+ENV HF_HUB_OFFLINE=1
+# Bake the Ladybug json extension into $HOME/.lbdb. Ladybug resolves its
+# extension directory from $HOME when a Database opens, and it ignores
+# LADYBUG_HOME_DIRECTORY: that name is a Citadel convention which reaches
+# Ladybug only as a connection-level `CALL home_directory`, far too late for
+# ladybug.Database(). cognee_db_workers' OP_OPEN_DATABASE carries no
+# home_directory field either, so the open path can never be redirected off
+# $HOME. That open-time load is WAL-replay driven: a cleanly closed database
+# reopens fine with an empty home, but after an unclean shutdown the replay
+# needs the extension before any connection exists. Caching it only under
+# /data/ladybug-home therefore leaves Database() reading an empty $HOME/.lbdb,
+# which is how graph projection froze on 2026-08-12 ("Failed to load library
+# ... libjson.lbug_extension: cannot open shared object file"). This bake fixes
+# the open path only. The adapter still installs into /data/ladybug-home on a
+# fresh volume, which is unchanged behaviour.
+RUN python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbbake')).execute('INSTALL JSON;')" \
+    && rm -rf /tmp/lbbake \
+    && chown -R 10001:10001 /home/citadel/.lbdb \
+    && chmod -R a+rX /home/citadel/.lbdb
+# Build-time proof the graph extension is present and loadable, mirroring the
+# embedding gate above. LOAD EXTENSION never installs, so this fails the build
+# when the bake is missing instead of failing cognify in production. The proof
+# runs as the shipped user, not root: the bake chowns and chmods the tree, and
+# a root-only proof would still pass if a future change left it unreadable to
+# uid 10001, which is the only identity that ever opens the graph at runtime.
+USER 10001:10001
+RUN python -c "import glob; assert glob.glob('/home/citadel/.lbdb/extension/*/*/json/libjson.lbug_extension'), 'ladybug json extension is not baked'" \
+    && python -c "import ladybug; ladybug.Connection(ladybug.Database('/tmp/lbproof')).execute('LOAD EXTENSION JSON;')" \
+    && rm -rf /tmp/lbproof
+USER root
 
 EXPOSE 8000
 # No VOLUME instruction: Railway rejects `docker VOLUME` (it uses Railway

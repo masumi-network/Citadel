@@ -16,6 +16,10 @@ starlette>=1.3.1,<2.0.0
 # Real tokenizer for BGE chunk sizing; without it cognee's resolver falls back
 # to approximate TikToken counts and mis-sizes every chunk.
 transformers==5.15.0
+# Freeze the verified companion set: hub 1.x and tokenizers<=0.23.0 are what
+# transformers 5.15.0 resolves and what fastembed 0.8.0 was verified against.
+huggingface-hub==1.27.0
+tokenizers==0.22.2
 tiktoken==0.13.0
 uvicorn[standard]>=0.34.0,<1.0.0
 

@@ -965,6 +965,57 @@ class LifecycleStore:
                 raise
         return tuple(self.get_operation(job_id) for job_id in job_ids)
 
+    def requeue_failed_projections(self, *, now: datetime | None = None) -> int:
+        """Reset every failed projection job (and its receipts) to pending.
+
+        The heal-on-recapture path in accept_source only fires when the same
+        bytes are re-submitted, and the sync layer skips unchanged content
+        before submitting, so a failed job for content that never changes
+        again stays failed forever (2026-08-12: 235 jobs failed while the
+        embedding engine was down, with no path back). This is the manual
+        path: the same reset accept_source applies, over all failed jobs.
+        The worker then drains them via claim_next_job.
+        """
+        changed_text = _utc_text(now or datetime.now(UTC))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                failed_jobs = [
+                    str(row["projection_job_id"])
+                    for row in connection.execute(
+                        "SELECT projection_job_id FROM projection_jobs WHERE state = 'failed'"
+                    ).fetchall()
+                ]
+                for job_id in failed_jobs:
+                    connection.execute(
+                        """
+                        UPDATE projection_jobs
+                        SET state = 'pending', attempt = 0, lease_id = NULL,
+                            lease_owner = NULL, leased_until = NULL,
+                            available_at = ?, updated_at = ?, last_error_code = NULL,
+                            last_error_message = NULL
+                        WHERE projection_job_id = ?
+                        """,
+                        (changed_text, changed_text, job_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE projection_receipts
+                        SET state = 'pending', attempt = 0,
+                            provider_operation_id = NULL, affected_ids_json = '[]',
+                            affected_count = NULL, model = NULL, dimensions = NULL,
+                            metadata_json = '{}', updated_at = ?, completed_at = NULL,
+                            searchable_at = NULL, error_code = NULL, error_message = NULL
+                        WHERE projection_job_id = ?
+                        """,
+                        (changed_text, job_id),
+                    )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return len(failed_jobs)
+
     def read_retained_content(self, source_revision_id: str) -> bytes:
         with self._connect() as connection:
             row = connection.execute(

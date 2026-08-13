@@ -395,3 +395,9 @@ def test_empty_session_is_not_sent(monkeypatch: Any, tmp_path: Path) -> None:
     receipt = _receipt_text()
     assert "skipped" in receipt
     assert "captured" not in receipt
+
+
+def test_receipt_summary_missing_accepted_is_unconfirmed_not_captured() -> None:
+    # A 2xx body without accepted: true must not read as "captured".
+    summary = sync_session.receipt_summary({"reason": "queued"})
+    assert summary == "session unconfirmed: server did not state accepted: true"

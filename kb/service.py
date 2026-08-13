@@ -547,6 +547,12 @@ class Citadel:
             ],
         }
 
+    def lifecycle_requeue_failed(self) -> int:
+        """Reset all failed projection jobs to pending; returns the count."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        return self.lifecycle_store.requeue_failed_projections()
+
     def lifecycle_census(self) -> dict[str, Any]:
         """Return exact SQLite lifecycle counts and state buckets."""
         if self.lifecycle_store is None:

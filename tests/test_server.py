@@ -1325,6 +1325,46 @@ def test_cognify_run_requires_admin() -> None:
     assert response.status_code == 403
 
 
+def test_lifecycle_requeue_failed_requires_admin() -> None:
+    client = authed_client("test-writer")
+    assert client.post("/api/lifecycle/requeue-failed").status_code == 403
+
+
+def test_lifecycle_requeue_failed_returns_the_reset_count(monkeypatch) -> None:
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+    monkeypatch.setattr(type(citadel), "lifecycle_requeue_failed", lambda self: 7, raising=False)
+    response = client.post("/api/lifecycle/requeue-failed")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "requeued": 7}
+
+
+def test_lifecycle_requeue_failed_restarts_the_drain(monkeypatch) -> None:
+    # Resetting rows to pending is inert on its own. next_wakeup_delay counts
+    # only 'pending' and 'running' jobs, so while every job sat in 'failed' the
+    # drain task had already returned and nothing was polling. Without this
+    # kick the route answers 200 while the corpus stays frozen until the hourly
+    # evolve pass happens to call resume_lifecycle_queue (2026-08-12).
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+    resumed: list[bool] = []
+    monkeypatch.setattr(type(citadel), "lifecycle_requeue_failed", lambda self: 3, raising=False)
+    monkeypatch.setattr(
+        type(citadel),
+        "resume_lifecycle_queue",
+        lambda self: resumed.append(True),
+        raising=False,
+    )
+    response = client.post("/api/lifecycle/requeue-failed")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "requeued": 3}
+    assert resumed == [True], "requeue must restart the projection drain"
+
+
 def test_admin_can_audit_combined_reconciliation_and_writer_cannot() -> None:
     admin = authed_client()
 
