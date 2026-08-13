@@ -994,3 +994,124 @@ def test_named_document_is_never_collapsed() -> None:
 
     ids = {node["id"] for node in payload["nodes"]}
     assert ids == {"doc-1", "set-1"}
+
+
+# ---- dataset narrowing + seat-first ordering (/api/mesh/graph?dataset=) -------
+
+
+class FakeDatasetMapGateway(FakeGraphGateway):
+    def __init__(
+        self,
+        nodes: list[Any],
+        edges: list[Any],
+        mapping: dict[str, list[str]],
+    ) -> None:
+        super().__init__(nodes, edges)
+        self.mapping = mapping
+
+    async def node_dataset_map(self) -> dict[str, list[str]]:
+        return self.mapping
+
+
+def _content_ids(graph: dict[str, Any]) -> list[str]:
+    return [node["id"] for node in graph["nodes"] if node["type"] != "dataset"]
+
+
+async def test_graph_dataset_param_narrows_to_one_datasets_subgraph() -> None:
+    gateway = FakeDatasetMapGateway(
+        [
+            ("doc-central", {"type": "TextDocument", "name": "central doc"}),
+            ("doc-seat", {"type": "TextDocument", "name": "seat doc"}),
+            ("chunk-seat", {"type": "DocumentChunk", "text": "seat chunk text"}),
+        ],
+        [("chunk-seat", "doc-seat", "is_part_of", {})],
+        {"doc-central": ["masumi-network"], "doc-seat": ["seat:alice"]},
+    )
+    mesh = KnowledgeMesh(gateway)
+
+    graph = await mesh.graph(dataset="seat:alice")
+
+    # The dataset's document AND its layered inclusions (chunks) survive;
+    # everything else is gone.
+    assert _content_ids(graph) == ["doc-seat", "chunk-seat"]
+
+
+async def test_graph_dataset_filter_applies_before_the_node_cap() -> None:
+    # 16k raw nodes against a 1000 cap meant a dataset's content never made
+    # the sample: the filter must run BEFORE the cap cut, not on the sample.
+    nodes = [(f"doc-c{i}", {"type": "TextDocument"}) for i in range(3)]
+    nodes.append(("doc-seat", {"type": "TextDocument"}))
+    mapping: dict[str, list[str]] = {f"doc-c{i}": ["masumi-network"] for i in range(3)}
+    mapping["doc-seat"] = ["seat:alice"]
+    mesh = KnowledgeMesh(FakeDatasetMapGateway(nodes, [], mapping))
+
+    unfiltered = await mesh.graph(limit=1)
+    narrowed = await mesh.graph(limit=1, dataset="seat:alice")
+
+    assert _content_ids(unfiltered) == ["doc-c0"]  # enumeration head only
+    assert _content_ids(narrowed) == ["doc-seat"]  # pre-cap filter reaches it
+
+
+async def test_graph_dataset_none_keeps_todays_payload() -> None:
+    mesh = KnowledgeMesh(
+        FakeDatasetMapGateway(
+            [("doc-1", {"type": "TextDocument"})], [], {"doc-1": ["masumi-network"]}
+        )
+    )
+
+    assert await mesh.graph() == await mesh.graph(dataset=None)
+
+
+async def test_graph_dataset_filter_cannot_widen_caller_scope() -> None:
+    # A non-member naming a foreign seat sees what ADR-0009 already allows:
+    # presence hubs, zero content, no attribution — the filter never widens.
+    gateway = FakeDatasetMapGateway(
+        [
+            ("doc-org", {"type": "TextDocument", "name": "org doc"}),
+            ("doc-bob", {"type": "TextDocument", "name": "bob private"}),
+        ],
+        [],
+        {"doc-org": ["masumi-network"], "doc-bob": ["seat:bob"]},
+    )
+    mesh = KnowledgeMesh(gateway)
+
+    graph = await mesh.graph(
+        dataset="seat:bob",
+        dataset_visible=lambda name: not name.startswith("seat:"),
+        presence=[
+            {"dataset": "masumi-network", "label": "Central"},
+            {"dataset": "seat:bob", "label": "Bob"},
+        ],
+    )
+
+    assert _content_ids(graph) == []
+    # Presence stays universal (ADR-0009): the hub renders, content does not.
+    hub_ids = {node["id"] for node in graph["nodes"] if node["type"] == "dataset"}
+    assert "dataset:seat:bob" in hub_ids
+    assert "bob private" not in json.dumps(graph)
+
+
+async def test_graph_seat_first_orders_callers_content_before_the_cap() -> None:
+    nodes = [(f"doc-c{i}", {"type": "TextDocument"}) for i in range(3)]
+    nodes.append(("doc-seat", {"type": "TextDocument"}))
+    mapping: dict[str, list[str]] = {f"doc-c{i}": ["masumi-network"] for i in range(3)}
+    mapping["doc-seat"] = ["seat:alice"]
+    mesh = KnowledgeMesh(FakeDatasetMapGateway(nodes, [], mapping))
+
+    default_view = await mesh.graph(limit=2)
+    seated = await mesh.graph(limit=2, seat_first="seat:alice")
+
+    # Without seat_first the enumeration head wins and the seat doc misses
+    # the cap; with it the caller's content comes first, tail deterministic.
+    assert _content_ids(default_view) == ["doc-c0", "doc-c1"]
+    assert _content_ids(seated) == ["doc-seat", "doc-c0"]
+
+
+async def test_graph_seat_first_without_matching_content_changes_nothing() -> None:
+    mesh = KnowledgeMesh(
+        FakeDatasetMapGateway(
+            [("doc-1", {"type": "TextDocument"})], [], {"doc-1": ["masumi-network"]}
+        )
+    )
+
+    assert await mesh.graph(seat_first="seat:ghost") == await mesh.graph()

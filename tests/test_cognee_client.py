@@ -4607,3 +4607,160 @@ async def test_corpus_graph_presence_without_query_is_unmeasured(
     monkeypatch.setattr(client, "_graph_engine", graph_engine)
 
     assert await client.corpus_graph_presence(["doc-a"]) is None
+
+
+# ---- drill-down under per-dataset stores (ADR-0020) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_document_graph_probes_each_provisioned_store(monkeypatch: Any) -> None:
+    """The ambient-context targeted read misses ids living in other stores.
+
+    Under ENABLE_BACKEND_ACCESS_CONTROL each dataset has its own graph
+    database and ``get_node`` against whatever store the task last touched
+    returned None — no error, no fallback — so /api/documents 404'd
+    DocumentChunk and TextSummary ids the mesh itself displayed (verified
+    live 2026-08-13, QdrantScopeError in the deploy log once the chunk-store
+    fallback also failed). The targeted read must probe each provisioned
+    store, first hit wins.
+    """
+    client = CogneePublicClient()
+    owner = uuid4()
+    dataset_a, dataset_b = sorted((uuid4(), uuid4()), key=str)
+    probe_order: list[UUID] = []
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return [(dataset_a, owner), (dataset_b, owner)]
+
+    async def targeted(
+        dataset_id: UUID, owner_id: UUID, document_id: str
+    ) -> tuple[list[Any], list[Any]]:
+        assert owner_id == owner
+        assert document_id == "chunk-1"
+        probe_order.append(dataset_id)
+        if dataset_id == dataset_b:
+            return (
+                [("chunk-1", {"text": "chunk text", "type": "DocumentChunk"})],
+                [("chunk-1", "doc-1", "is_part_of", {})],
+            )
+        return ([], [])
+
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_targeted_read_for_dataset", targeted, raising=False)
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+
+    nodes, edges = await client._document_graph("chunk-1")
+
+    assert probe_order == [dataset_a, dataset_b]
+    assert [str(node_id) for node_id, _ in nodes] == ["chunk-1"]
+    assert edges == [("chunk-1", "doc-1", "is_part_of", {})]
+
+
+@pytest.mark.asyncio
+async def test_document_graph_store_miss_is_not_a_fallback(monkeypatch: Any) -> None:
+    """An id no store resolves returns empty WITHOUT the full graph read — a
+    full read cannot contain a node the stores lack; the chunk-store fallback
+    owns what happens next."""
+    client = CogneePublicClient()
+    owner = uuid4()
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return [(uuid4(), owner)]
+
+    async def targeted(
+        dataset_id: UUID, owner_id: UUID, document_id: str
+    ) -> tuple[list[Any], list[Any]]:
+        return ([], [])
+
+    async def forbidden_graph_data() -> tuple[list[Any], list[Any]]:
+        raise AssertionError("full graph read must not run on a store miss")
+
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_targeted_read_for_dataset", targeted, raising=False)
+    monkeypatch.setattr(client, "graph_data", forbidden_graph_data)
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+
+    assert await client._document_graph("ghost-id") == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_chunk_store_reader_probes_provisioned_stores_for_membershipless_ids(
+    monkeypatch: Any,
+) -> None:
+    """A chunk id has no DatasetData row, so the reader fell through to the
+    unbound engine — which refuses every unscoped operation under the qdrant
+    provider (QdrantScopeError, the measured drill-down 404). With no
+    membership rows the reader must probe the provisioned dataset stores
+    instead of giving up."""
+    client = CogneePublicClient()
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    unbound_sentinel = object()
+
+    async def owning(doc_id: str) -> list[tuple[Any, Any]]:
+        return []
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return [(uuid4(), uuid4())]
+
+    async def unbound() -> Any:
+        return unbound_sentinel
+
+    monkeypatch.setattr(client, "_owning_datasets", owning)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_unbound_chunk_store_reader", unbound)
+
+    reader = await client._chunk_store_reader(
+        "6ffe277d-be23-5ad3-8c09-045f9fce20cf"
+    )
+
+    assert reader is not unbound_sentinel
+    assert callable(reader)
+
+
+@pytest.mark.asyncio
+async def test_get_document_summary_carries_mappable_owner_ids(
+    monkeypatch: Any,
+) -> None:
+    """TextSummary -[made_from]-> chunk -[is_part_of]-> document: only the
+    document id is a relational Data.id the read-scope map keys on. Without
+    it in dataset_node_ids the ADR-0009 gate fail-closed on summaries the
+    caller may read (the measured TextSummary 404)."""
+    client = CogneePublicClient()
+    graphs: dict[str, tuple[list[Any], list[Any]]] = {
+        "summary-1": (
+            [
+                ("summary-1", {"type": "TextSummary", "text": "a summary"}),
+                ("chunk-1", {"type": "DocumentChunk", "text": "chunk text"}),
+            ],
+            [("summary-1", "chunk-1", "made_from", {})],
+        ),
+        "chunk-1": (
+            [
+                ("chunk-1", {"type": "DocumentChunk", "text": "chunk text"}),
+                ("doc-1", {"type": "TextDocument", "name": "parent doc"}),
+            ],
+            [("chunk-1", "doc-1", "is_part_of", {})],
+        ),
+    }
+
+    async def fake_graph(document_id: str) -> tuple[list[Any], list[Any]]:
+        return graphs.get(str(document_id), ([], []))
+
+    monkeypatch.setattr(client, "_document_graph", fake_graph)
+
+    document = await client.get_document("summary-1")
+
+    assert document is not None
+    assert document["body"] == "a summary"
+    assert "chunk-1" in document["dataset_node_ids"]
+    assert "doc-1" in document["dataset_node_ids"]

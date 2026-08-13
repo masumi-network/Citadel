@@ -1988,7 +1988,8 @@ def test_knowledge_mesh_canvas_is_reachable_from_the_knowledge_page() -> None:
         "selectedNode",
         "fitButton",
         "pauseButton",
-        "graphDepthInput",
+        "graphAggregateButton",
+        "graphDatasetFilter",
         "canvasEmpty",
         "realGraphEmpty",
         "graphMeta",
@@ -8440,3 +8441,129 @@ def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
         "a skipped pass was recorded to the mesh, stamping the source 'synced' "
         f"with no checked_at and no counts: {recorded[1:]}"
     )
+
+
+def test_mesh_graph_dataset_param_filters_and_validates(tmp_path: Any) -> None:
+    # Contract with the frontend: GET /api/mesh/graph?limit=N&dataset=<name>,
+    # response shape unchanged; the filter narrows PRE-cap; an invalid name is
+    # a clean 400; absent param stays today's behavior (pinned by the other
+    # mesh-graph tests).
+    class FakeDatasetGateway:
+        async def graph_data(self) -> tuple[list[Any], list[Any]]:
+            return (
+                [
+                    ("doc-1", {"name": "Org doc", "type": "TextDocument"}),
+                    ("doc-2", {"name": "Obsidian doc", "type": "TextDocument"}),
+                ],
+                [],
+            )
+
+        async def node_dataset_map(self) -> dict[str, list[str]]:
+            return {"doc-1": ["masumi-network"], "doc-2": ["obsidian"]}
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    client = authed_client("test-reader")
+    app.state.knowledge_mesh = KnowledgeMesh(FakeDatasetGateway())
+    try:
+        narrowed = client.get("/api/mesh/graph?dataset=masumi-network")
+        blank = client.get("/api/mesh/graph?dataset=%20%20")
+        too_long = client.get("/api/mesh/graph?dataset=" + "x" * 201)
+    finally:
+        app.state.knowledge_mesh = None
+
+    assert narrowed.status_code == 200
+    body = narrowed.json()
+    content = [node for node in body["nodes"] if node["type"] != "dataset"]
+    assert [node["id"] for node in content] == ["doc-1"]
+    # Shape unchanged: same keys the unfiltered payload carries.
+    assert {"ok", "fallback", "nodes", "edges", "total_nodes", "limit"} <= set(body)
+    assert blank.status_code == 400
+    assert too_long.status_code == 400
+
+
+def test_mesh_graph_dataset_param_cannot_widen_reader_scope(tmp_path: Any) -> None:
+    # A plain reader naming a foreign seat dataset gets presence-shaped
+    # nothing: 200, zero content nodes, and the seat name nowhere in the
+    # payload — exactly what the unfiltered view already allows (ADR-0009).
+    class FakeDatasetGateway:
+        async def graph_data(self) -> tuple[list[Any], list[Any]]:
+            return (
+                [
+                    ("doc-1", {"name": "Seat doc", "type": "TextDocument"}),
+                    ("doc-2", {"name": "Org doc", "type": "TextDocument"}),
+                ],
+                [],
+            )
+
+        async def node_dataset_map(self) -> dict[str, list[str]]:
+            return {"doc-1": ["seat:alice"], "doc-2": ["masumi-network"]}
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    app.state.knowledge_mesh = KnowledgeMesh(FakeDatasetGateway())
+    token = admin.post(
+        "/api/access/tokens",
+        json={"name": "plain-reader", "role": "reader", "kind": "service_account"},
+    ).json()["token"]
+    try:
+        foreign = (
+            TestClient(app, base_url="https://testserver")
+            .get(
+                "/api/mesh/graph?dataset=seat:alice",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            .json()
+        )
+    finally:
+        app.state.knowledge_mesh = None
+
+    assert [node for node in foreign["nodes"] if node["type"] != "dataset"] == []
+    assert "seat:alice" not in json.dumps(foreign)
+
+
+def test_mesh_graph_orders_callers_seat_content_into_the_default_view(
+    tmp_path: Any,
+) -> None:
+    # 16,154 raw nodes against a <=1000 cap meant seat content NEVER made the
+    # default sample (verified live 2026-08-13: 1 seat node in a 302-node
+    # sample). The caller's seat cluster must order ahead of the cap cut.
+    class FakeDatasetGateway:
+        async def graph_data(self) -> tuple[list[Any], list[Any]]:
+            return (
+                [
+                    ("doc-c0", {"name": "Org 0", "type": "TextDocument"}),
+                    ("doc-c1", {"name": "Org 1", "type": "TextDocument"}),
+                    ("doc-alice", {"name": "Alice note", "type": "TextDocument"}),
+                ],
+                [],
+            )
+
+        async def node_dataset_map(self) -> dict[str, list[str]]:
+            return {
+                "doc-c0": ["masumi-network"],
+                "doc-c1": ["masumi-network"],
+                "doc-alice": ["seat:alice"],
+            }
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice_token = admin.post(
+        "/api/access/seats",
+        json={"name": "Alice Example", "slug": "alice", "email": "alice@example.com"},
+    ).json()["token"]
+    app.state.knowledge_mesh = KnowledgeMesh(FakeDatasetGateway())
+    try:
+        seated = (
+            TestClient(app, base_url="https://testserver")
+            .get(
+                "/api/mesh/graph?limit=2",
+                headers={"Authorization": f"Bearer {alice_token}"},
+            )
+            .json()
+        )
+    finally:
+        app.state.knowledge_mesh = None
+
+    content = [node["id"] for node in seated["nodes"] if node["type"] != "dataset"]
+    assert content[0] == "doc-alice"
+    assert len(content) == 2

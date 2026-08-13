@@ -3723,14 +3723,82 @@ class CogneePublicClient:
         node (``get_node``) and its incident edges (``get_connections``) through
         the graph engine, returning the same ``(nodes, edges)`` tuple shape
         ``graph_data`` yields so the assembly logic in ``get_document`` is
-        unchanged. Falls back to the full ``graph_data()`` read when the engine
-        lacks these primitives or the targeted read raises — a shape surprise
-        degrades to correct-but-slow, never a spurious 404. A node missing from
-        the graph returns an empty targeted result (``get_node`` -> None,
-        ``get_connections`` -> []) WITHOUT triggering that fallback: a full
-        graph read cannot contain a node the graph lacks. Ids the graph cannot
-        resolve are instead retried against the durable chunk store by
-        ``get_document`` (``_document_from_chunk_store``).
+        unchanged.
+
+        Under ENABLE_BACKEND_ACCESS_CONTROL each dataset lives in its own graph
+        database (ADR-0020) and ``get_graph_engine()`` resolves whichever
+        per-dataset context the task last touched. ``get_node`` against that
+        ambient store returned None for any id living in another store — no
+        error, no fallback — which 404'd drill-down for ids the mesh itself was
+        displaying (the measured DocumentChunk/TextSummary 404s). Mirror
+        ``_read_graph_data``: probe each provisioned dataset store in the same
+        deterministic order, first store that knows the id wins, ambient
+        context restored afterwards. No provisioned stores (access control
+        off, single-store deployments, local fakes) keeps the single
+        ambient-context read unchanged.
+        """
+        try:
+            self._prepare_cognee_environment()
+            import cognee
+
+            await self._ensure_cognee_ready(cognee)
+            provisioned = await self._provisioned_dataset_databases()
+        except Exception:  # noqa: BLE001 - relational read down -> ambient read
+            provisioned = []
+        if not provisioned:
+            return await self._document_graph_current_context(document_id)
+        for dataset_id, owner_id in provisioned:
+            try:
+                nodes, edges = await self._targeted_read_for_dataset(
+                    dataset_id, owner_id, document_id
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad store must not 404 the rest
+                logger.warning(
+                    "targeted document read skipped dataset %s: %s",
+                    dataset_id,
+                    exc.__class__.__name__,
+                )
+                continue
+            if nodes:
+                return nodes, edges
+        return [], []
+
+    async def _targeted_read_for_dataset(
+        self, dataset_id: UUID, owner_id: UUID, document_id: str
+    ) -> tuple[list[Any], list[Any]]:
+        """One store's targeted read, ambient context restored afterwards
+        (same context contract as ``_read_graph_data_for_dataset``)."""
+        from cognee.context_global_variables import (
+            graph_db_config,
+            set_database_global_context_variables,
+            vector_db_config,
+        )
+        from cognee.infrastructure.files.storage.config import file_storage_config
+
+        prior = [
+            (variable, variable.get(None))
+            for variable in (graph_db_config, vector_db_config, file_storage_config)
+        ]
+        try:
+            async with set_database_global_context_variables(dataset_id, owner_id):
+                return await self._document_graph_current_context(document_id)
+        finally:
+            for variable, value in prior:
+                variable.set(value)
+
+    async def _document_graph_current_context(
+        self, document_id: str
+    ) -> tuple[list[Any], list[Any]]:
+        """One store's targeted read via the engine the active context resolves.
+
+        Falls back to the full ``graph_data()`` read when the engine lacks the
+        targeted primitives or the read raises — a shape surprise degrades to
+        correct-but-slow, never a spurious 404. A node missing from this store
+        returns an empty result (``get_node`` -> None, ``get_connections`` ->
+        []) WITHOUT triggering that fallback: a full graph read cannot contain
+        a node the graph lacks. Ids no store resolves are instead retried
+        against the durable chunk store by ``get_document``
+        (``_document_from_chunk_store``).
         """
         try:
             engine = await self._graph_engine()
@@ -3972,6 +4040,53 @@ class CogneePublicClient:
             None,
         )
 
+    async def _summary_owner_ids(
+        self,
+        doc_id: str,
+        edges: list[Any],
+        props_by_id: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        """Mappable owner ids for a text-bearing node with no ``is_part_of`` parent.
+
+        TextSummary -[made_from]-> DocumentChunk -[is_part_of]-> TextDocument:
+        only the last id is a relational ``Data.id`` the read-scope map keys
+        on. One extra targeted read (the chunk's connections) recovers it.
+        Best-effort: a node with no text-bearing ``made_from`` neighbor
+        (ordinary documents) returns [] and changes nothing; a failed chase
+        still returns the chunk id it found.
+        """
+        chunk_id: str | None = None
+        for raw in edges:
+            try:
+                source, target, relationship = str(raw[0]), str(raw[1]), str(raw[2])
+            except (TypeError, IndexError, KeyError):
+                continue
+            if relationship != "made_from":
+                continue
+            if source == doc_id:
+                other = target
+            elif target == doc_id:
+                other = source
+            else:
+                continue
+            neighbor = props_by_id.get(other)
+            if neighbor is not None and self._extract_text(neighbor)[0] is not None:
+                chunk_id = other
+                break
+        if chunk_id is None:
+            return []
+        try:
+            chunk_nodes, chunk_edges = await self._document_graph(chunk_id)
+        except Exception:  # noqa: BLE001 - owner chase is best-effort
+            return [chunk_id]
+        _, chunk_props_by_id, chunk_part_ids = self._graph_projection(
+            chunk_id, chunk_nodes, chunk_edges
+        )
+        parent_id = self._textless_neighbor_id(chunk_props_by_id, chunk_part_ids)
+        if parent_id is None:
+            return [chunk_id]
+        return [chunk_id, parent_id]
+
     async def _document_from_graph(
         self, doc_id: str, *, follow_parent: bool
     ) -> dict[str, Any] | None:
@@ -3996,6 +4111,7 @@ class CogneePublicClient:
             return None
         text, text_key = self._extract_text(props)
         if text is not None:
+            summary_owner_ids: list[str] = []
             if follow_parent:
                 # A text-bearing node with a TEXTLESS ``is_part_of`` neighbor is
                 # a DocumentChunk next to its parent document (chunks carry the
@@ -4016,13 +4132,21 @@ class CogneePublicClient:
                             owner_ids.append(doc_id)
                         parent["dataset_node_ids"] = owner_ids
                         return parent
+                # No is_part_of parent: a TextSummary carries its own text but
+                # hangs off the content it summarizes via ``made_from``. Its id
+                # has no relational Data row, so owner ids of just [doc_id]
+                # fail-close the ADR-0009 drill-down gate on content the caller
+                # may read — chase the summarized chunk's parent document id.
+                summary_owner_ids = await self._summary_owner_ids(
+                    doc_id, edges, props_by_id
+                )
             return {
                 "id": doc_id,
                 "source_type": "cognee",
                 "title": props.get("title") or None,
                 "body": text,
                 "metadata": {k: v for k, v in props.items() if k != text_key},
-                "dataset_node_ids": [doc_id, *part_neighbor_ids],
+                "dataset_node_ids": [doc_id, *part_neighbor_ids, *summary_owner_ids],
             }
         # Textless document node: its text lives on DocumentChunk neighbors
         # linked via ``is_part_of`` (chunk --is_part_of--> doc; stay
@@ -4153,6 +4277,18 @@ class CogneePublicClient:
         if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
             return await self._unbound_chunk_store_reader()
         datasets = await self._owning_datasets(doc_id)
+        if not datasets:
+            # A CHUNK id has no DatasetData row (membership keys on the parent
+            # Data.id), so the unbound engine was the only reader left — and
+            # under this provider it refuses every unscoped operation
+            # (QdrantScopeError, the measured drill-down 404). Probe every
+            # provisioned dataset store instead, the same rows the org-wide
+            # graph read sweeps. Not a new privilege: the assembled body still
+            # passes the caller's ADR-0009 gate over ``dataset_node_ids``.
+            try:
+                datasets = await self._provisioned_dataset_databases()
+            except Exception:  # noqa: BLE001 - relational read down -> unbound reader
+                datasets = []
         if not datasets:
             return await self._unbound_chunk_store_reader()
         from cognee.context_global_variables import (

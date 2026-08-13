@@ -1103,18 +1103,6 @@ pre {
   gap: 8px;
 }
 
-.graph-depth-control {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--quiet);
-  font-size: 11px;
-}
-
-.graph-depth-control input[type="range"] {
-  width: 72px;
-}
-
 #graphMeta {
   color: var(--quiet);
   font-family: var(--mono);
