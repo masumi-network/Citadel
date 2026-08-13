@@ -13,7 +13,11 @@ from uuid import uuid4
 from typing import Any
 
 from kb import chunk_window
-from kb.cognee_client import CogneeGateway, CogneePublicClient
+from kb.cognee_client import (
+    CogneeGateway,
+    CogneePublicClient,
+    _suppress_inline_cognify,
+)
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
@@ -377,12 +381,16 @@ class Citadel:
 
     @staticmethod
     def _inline_projection_suppressed() -> bool:
-        return os.getenv("CITADEL_SUPPRESS_INLINE_COGNIFY", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        # Delegate rather than re-read the environment. Evolve Phase 1 moved
+        # into the web process (#88) and now marks itself with the
+        # _SUPPRESS_INLINE_COGNIFY context variable, not the environment
+        # variable, precisely because the env var is process-wide and would
+        # silence a teammate's ingest too. This checker only read os.getenv, so
+        # it returned False for the whole of Phase 1 and started the drain while
+        # Phase 1 held the graph writer lock. On 2026-08-13 that parked a
+        # projection job on writer_lock.acquire() for 66 minutes, and the lease
+        # heartbeat renewed it throughout, so nothing reclaimed it.
+        return _suppress_inline_cognify()
 
     def _start_lifecycle_projection(self) -> bool:
         if self.lifecycle_worker is None:

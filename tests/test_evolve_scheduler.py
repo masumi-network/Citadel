@@ -227,6 +227,26 @@ async def test_add_only_mode_does_not_leak_outside_the_pass(tmp_path: Path) -> N
     assert await asyncio.create_task(observer()) is False
 
 
+async def test_inline_projection_suppression_honours_the_context_variable() -> None:
+    """The service-side checker must read the same flag Phase 1 actually sets.
+
+    Phase 1 moved into the web process (#88) and marks itself with the
+    _SUPPRESS_INLINE_COGNIFY context variable, deliberately NOT the environment
+    variable, which is process-wide. `Citadel._inline_projection_suppressed`
+    read only os.getenv, so it answered False for the whole of Phase 1 and let
+    accept_source start the projection drain while Phase 1 held the graph
+    writer lock. On 2026-08-13 that parked a job on writer_lock.acquire() for
+    66 minutes while the lease heartbeat renewed it, so nothing reclaimed it.
+    """
+    from kb.cognee_client import suppress_inline_cognify
+    from kb.service import Citadel
+
+    assert Citadel._inline_projection_suppressed() is False
+    with suppress_inline_cognify():
+        assert Citadel._inline_projection_suppressed() is True
+    assert Citadel._inline_projection_suppressed() is False
+
+
 async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
