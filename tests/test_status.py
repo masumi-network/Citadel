@@ -687,7 +687,7 @@ def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> No
     monkeypatch.setattr(
         status_mod._OPENER,
         "open",
-        _route({"/healthz": {"ok": True}, "/api/session": {"ok": True, "role": "writer", "seat_slug": "s"}, "/search": {"results": []}, "/api/contributions/recent": {"contributions": []}}),
+        _route({"/healthz": {"ok": True}, "/api/session": {"ok": True, "role": "writer", "seat_slug": "s", "default_dataset": "seat:s"}, "/search": {"results": []}, "/api/contributions/recent": {"contributions": []}}),
     )
     monkeypatch.setenv("CITADEL_MCP_ACCESS_TOKEN", "ctdl_tok")
     args = argparse.Namespace(
@@ -704,6 +704,7 @@ def test_status_command_json_and_exit(tmp_path: Path, monkeypatch, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload["healthy"] is True
     assert payload["identity"]["seat_slug"] == "s"
+    assert payload["identity"]["default_dataset"] == "seat:s"
 
 
 def test_status_transport_allows_loopback_http(monkeypatch) -> None:

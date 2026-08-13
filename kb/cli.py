@@ -3254,7 +3254,10 @@ def build_parser() -> argparse.ArgumentParser:
         "onboard",
         help="One-shot teammate setup: token + hooks + MCP + capture roots",
     )
-    onboard.add_argument("--token", help="Seat token (else prompt, or use env)")
+    onboard.add_argument(
+        "--token",
+        help="Seat token override (headless: prefer CITADEL_MCP_ACCESS_TOKEN)",
+    )
     onboard.add_argument("--repo", help="Repo root (default: git toplevel or cwd)")
     onboard.add_argument("--shell-rc", help="Shell rc file for the token export")
     onboard.add_argument(
@@ -3269,7 +3272,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tools", action="store_true", help="Skip detecting/adding MCP to other coding tools"
     )
     onboard.add_argument(
-        "--non-interactive", action="store_true", help="No prompts; requires --token"
+        "--non-interactive",
+        action="store_true",
+        help="No prompts; uses CITADEL_MCP_ACCESS_TOKEN or --token",
     )
     onboard.add_argument(
         "--json", action="store_true", help="Machine-readable output (implies no prompts)"

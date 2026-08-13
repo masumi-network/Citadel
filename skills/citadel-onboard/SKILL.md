@@ -10,6 +10,7 @@ command**. Install the CLI and run it from your repo — the autosync hooks are
 **bundled in the package** (`kb.hooks.*`), so no vendored skill directory is needed.
 
 ```bash
+npx skills add masumi-network/citadel --skill citadel
 pipx install citadel-archive    # the zero-dep `citadel` base client
 # upgrade: pipx install --force citadel-archive --pip-args=--no-cache-dir
 #          (plain `pipx upgrade` can land a stale cached build)
@@ -33,12 +34,21 @@ existing config (never clobbering) and safe to re-run:
 
 ## Where to get the token
 
-A Citadel admin mints a **seat-writer** token — from the connect wizard
-(`https://citadel-archive-production.up.railway.app/skills/connect` → Create
-seat → role: writer) or from the terminal with `citadel seat create` (admin,
-needs `CITADEL_ADMIN_KEY`). This one `ctdl_` seat token is the teammate's API
-key. Paste it when `citadel onboard` asks. It is a secret — share it over a
-private channel only.
+A Citadel admin creates one seat for the human. The CLI requires both the
+human name and slug:
+
+```bash
+citadel seat create "Alice Smith" alice --role writer
+```
+
+The initial `ctdl_` token is shown once. The human can use it at `/login`, then
+open Access to mint a distinct seat-bound token for each agent process. A
+writer seat can mint reader or writer tokens. A reader seat can mint reader
+tokens. Use reader tokens for search-only processes. Never share one token
+between agent processes.
+
+Use a standalone service-account token only for an explicit non-human service
+with an intentional dataset and role. Do not use one for teammate onboarding.
 
 ## Security
 
@@ -60,8 +70,10 @@ private channel only.
 
 - **Autonomous background sync** (git push, session close) is plain HTTPS +
   token — it does **not** need MCP.
-- **In-session vault search and proactive ingest** (`citadel_search`,
-  `citadel_ingest`, `citadel_share_session`) are MCP tools. Enable MCP (default)
+- **In-session vault search and explicit ingest** (`citadel_search`,
+  `citadel_ingest`, `citadel_share_session`) are MCP tools. Search first with
+  `citadel_search`. Call ingest or share only after explicit user approval.
+  Enable MCP (default)
   if you want your IDE agent to ground answers in the vault and volunteer Shared
   Session Traces after user approval; skip with `--no-mcp` for capture-only.
 - Manual ingest/search always works via the CLI (`citadel ingest`,
@@ -75,12 +87,14 @@ private channel only.
 ## Non-interactive / scripted
 
 ```bash
-citadel onboard --non-interactive --token "ctdl_…" \
+export CITADEL_MCP_ACCESS_TOKEN="ctdl_…"
+citadel onboard --non-interactive --json \
   --repo /path/to/repo --shell-rc ~/.zshrc --no-capture
 ```
 
 Flags: `--token`, `--node-url`, `--repo`, `--shell-rc`, `--no-mcp`,
-`--no-capture`, `--non-interactive`. Exits non-zero if no token is available.
+`--no-capture`, `--non-interactive`. Prefer `CITADEL_MCP_ACCESS_TOKEN` so the
+secret does not appear in `argv`. Exits non-zero if no token is available.
 
 ## Check status (the dashboard replacement)
 
@@ -89,7 +103,7 @@ into Citadel. Optionally open `/login` with your seat token for **My Node**.
 
 ```bash
 citadel status      # one-shot: connection, identity (seat/role), local setup, recent activity, knowledge-mesh stats
-citadel status --check-search  # also smoke-test /search (opt-in; short timeout; never gates health)
+citadel status --json --check-search  # verify seat_slug, default_dataset, and /search access
 citadel doctor      # diagnose setup; `citadel doctor --fix` repairs common issues
 ```
 
@@ -108,14 +122,16 @@ in `argv`/process lists.
 
 | Command | JSON shape | Use |
 |---|---|---|
-| `citadel status --json` | `{healthy, identity{seat_slug,role,…}, checks[…], recent[…]}` | verify connectivity / discover the seat / diagnose |
+| `citadel status --json --check-search` | `{healthy, identity{seat_slug,default_dataset,role,…}, checks[…], recent[…]}` | verify the seat, private dataset, and search access |
 | `citadel onboard --non-interactive --json` | `{ok, repo, steps[{name,status}], token_masked}` | set a machine up (token from env) |
 | `citadel setup --non-interactive --json --root PATH=tag` | the saved `capture.json` | declare Approved Capture Roots |
 | `citadel capture --json` (`--dry-run` to preview) | `{ok, results[…]}` / `[…]` | push summaries to the Node |
 
 `citadel status` additionally sees **local** hook/config state the server can't
-(the MCP `citadel_session` tool is the in-session whoami). For in-session reads
-and writes, prefer the `citadel_search` / `citadel_ingest` MCP tools.
+ (the MCP `citadel_session` tool is the in-session whoami). For in-session reads,
+prefer the `citadel_search` MCP tool. MCP does not ingest automatically. Use
+`citadel_ingest` only after explicit approval. Capture hooks run only after the
+user explicitly installs them through onboard and approves capture roots.
 
 ## Proactive agent policy (after onboard)
 

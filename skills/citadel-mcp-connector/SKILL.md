@@ -38,7 +38,7 @@ Boundary detail: `https://citadel-archive-production.up.railway.app/skills/bound
 - After MCP works: `https://citadel-archive-production.up.railway.app/skills/vault`
 - Full repo skill install: `npx skills add masumi-network/citadel --skill citadel`
 
-If the user shares the `npx skills add` command, install the `citadel-archive`
+If the user shares the `npx skills add` command, install the `citadel`
 skill first (optionally `--skill '*'` for all bundled skills), then continue
 this connector workflow.
 
@@ -49,14 +49,15 @@ explaining**. Execute the steps below unless the user only asked for docs.
 
 ### 1. Collect the one required secret
 
-Ask for the **Citadel access token** if it is not already in the environment or
-client config:
+Use `CITADEL_MCP_ACCESS_TOKEN` if it is already in the process environment.
+Otherwise, ask for the **Citadel access token** once:
 
 - Must start with `ctdl_`.
 - Create one in the Citadel UI → **Access** → **Create Token** (reader is enough
   for search; writer for ingest; admin for ops), or from the terminal with
-  `citadel seat create` (admin, needs `CITADEL_ADMIN_KEY`). This `ctdl_` seat
-  token is the teammate's API key.
+  `citadel seat create "Alice Smith" alice --role writer` (admin, needs
+  `CITADEL_ADMIN_KEY`). The human can then sign in with the initial token and
+  mint process-specific tokens from the Access page.
 - The user pastes it once. **Never echo it back** in chat, logs, or commits.
 
 That is the only secret. Do **not** ask for clone paths, `uv`, seed phrases,
@@ -68,7 +69,7 @@ Defaults (override only if the user does):
 |---|---|
 | MCP endpoint | `https://citadel-archive-production.up.railway.app/mcp/` |
 | Token env name | `CITADEL_MCP_ACCESS_TOKEN` |
-| Search dataset | `masumi-network` (the server defaults this too) |
+| Search dataset | Omit it; the seat token controls its allowed and default datasets |
 
 ### 2. Write the remote MCP config
 
@@ -161,7 +162,16 @@ bridge above.
 
 ### 3. Verify (before claiming success)
 
-**A. HTTP reachability (works immediately):**
+**A. Headless identity and search check:**
+
+```bash
+citadel status --json --check-search
+```
+
+Confirm the output reports the expected `seat_slug` and
+`default_dataset: seat:<slug>`. A teammate process must use a seat-bound token.
+
+**B. HTTP reachability (works immediately):**
 
 ```bash
 curl -fsS "https://citadel-archive-production.up.railway.app/healthz"
@@ -172,7 +182,7 @@ curl -fsS -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \
 Expect HTTP 200 and JSON with `role` / `actor`. On 401 the token is missing,
 wrong, or revoked. Never print the token in errors.
 
-**B. MCP (after the user restarts the client):**
+**C. MCP (after the user restarts the client):**
 
 Ask the user to **restart** the client so the new server loads, then call tools:
 
@@ -198,6 +208,9 @@ Production smoke status, last verified 2026-06-02 at commit `7a4a1d9`:
   when `_citadel.retrieval.document_drilldown_available` is true.
 - **When** the user asks to remember something durable → `citadel_contribute`
   for titled notes or `citadel_ingest` for raw context (writer token + approval).
+  MCP ingest returns after durable source storage and uses asynchronous graph
+  projection by default. CLI ingest is also asynchronous by default. For an
+  explicit inline graph build, use CLI `--cognify` or MCP `cognify=true`.
 - **When** the user asks "what do I need to do?" → `citadel_linear_my_issues`
   (reads the **Seat-Scoped Mirror** from the latest Linear cron sync).
 - Follow the **citadel-vault** skill for read/write/admin rules.
@@ -208,10 +221,15 @@ Production smoke status, last verified 2026-06-02 at commit `7a4a1d9`:
 
 ### Seat-writer tokens (recommended for devs)
 
-Mint a **seat-writer** token from the connect wizard. It carries
-`default_dataset=seat:{slug}` so writes with no `dataset` field land in the
-dev's private **Node**. One token powers MCP search, ingest, and background
-hooks (`CITADEL_MCP_ACCESS_TOKEN`). Never share tokens between seats.
+Create one seat per human. It carries `default_dataset=seat:{slug}` so writes
+with no `dataset` field land in the human's private **Node**. After personal
+seat-token login, use the Access page to mint one distinct token for each agent
+process. A writer seat can mint reader or writer tokens. A reader seat can mint
+reader tokens. Never share a token between processes. The CLI `seat token`
+command issues the seat's current role; it does not select a narrower role.
+
+Use standalone service-account tokens only for explicit non-human services
+with an intentionally configured dataset and role.
 
 **Security model for seat MCP:**
 
@@ -238,7 +256,7 @@ write tools. The server also runs a secret/sensitivity scan on every write.
 | `citadel_linear_my_issues` | reader | Your assigned Linear tasks (**Seat-Scoped Mirror** in your **Node**) |
 | `citadel_linear_search` | reader | Org-wide Linear context in **Central** |
 | `citadel_recent_contributions` | reader | Recent vault contributions (`mine=true` for yours) |
-| `citadel_ingest` | writer | Add durable context |
+| `citadel_ingest` | writer | Store durable context and queue asynchronous graph projection |
 | `citadel_contribute` | writer | Add a titled Vault Contribution (enrichment + conflict detection) |
 | `citadel_record_feedback` | writer | Record feedback on a search hit or QA result (pass `qa_id` **or** `result_id`) |
 | `citadel_share_session` | writer | Volunteer a Shared Session Trace (dead ends) — **explicit user approval only** |

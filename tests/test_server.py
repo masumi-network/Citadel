@@ -1772,7 +1772,7 @@ STATIC_DIR = Path(server_module.__file__).resolve().parent / "static"
 
 
 def test_app_nav_has_five_primary_entries() -> None:
-    """Home, Search, Graph, Review, Admin. Nothing else is a primary nav entry.
+    """Six role-gated DOM entries produce five visible entries per role.
 
     Seven entries were the problem the redesign exists to fix: two of them
     nobody could tell apart, and the promotion queue that people actually needed
@@ -1785,8 +1785,8 @@ def test_app_nav_has_five_primary_entries() -> None:
     and to every user it simply did not exist, while /api/mesh/graph was serving
     932 nodes in ~300ms. Graph is now resident, at the owner's request.
 
-    Five is still a cap, not an invitation. The lesson of the seven-entry
-    version stands: anything added here has to earn residency, and a page that
+    Five visible entries is still a cap, not an invitation. The lesson of the
+    seven-entry version stands: anything added here has to earn residency, and a page that
     cannot must at least be reachable from somewhere, which
     test_every_dashboard_page_is_reachable_from_the_ui now enforces.
     """
@@ -1798,12 +1798,15 @@ def test_app_nav_has_five_primary_entries() -> None:
     assert nav, "the /app shell no longer renders a <nav class=\"side-nav\">"
     labels = re.findall(r'<span class="nav-label">([^<]+)</span>', nav.group(0))
 
-    assert labels == ["Home", "Search", "Graph", "Review", "Admin"], labels
+    assert labels == ["Home", "Search", "Graph", "Review", "Access", "Admin"], labels
     assert 'class="nav-link" data-page-target="overview"' not in page
     assert 'class="nav-link" data-page-target="ingest"' not in page
-    # Review is writer-gated; Admin stays admin-gated.
+    # Access is reader-gated; Admin stays admin-gated. The client hides the
+    # entry a session cannot use, keeping five visible primary entries.
+    assert 'data-page-target="access" aria-label="Access" data-min-role="reader"' in nav.group(0)
     assert 'data-page-target="review" aria-label="Review" data-min-role="writer"' in nav.group(0)
     assert 'data-page-target="agents" aria-label="Admin" data-min-role="admin"' in nav.group(0)
+    assert "element.hidden = !allowed;" in (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
 
 def test_app_defaults_to_light() -> None:
@@ -1901,7 +1904,15 @@ def test_search_view_groups_central_before_node() -> None:
     assert web.index("central") < web.index("node")
     assert "isSingleLiteralQuery(query)" in app_js
     assert "renderSearchResults(returned, response, query)" in app_js
-    assert "Search results" in authed_client().get("/app").text
+    app_page = authed_client().get("/app").text
+    login_page = Path(__file__).resolve().parents[1] / "web/src/pages/login.tsx"
+    login_source = login_page.read_text(encoding="utf-8")
+    assert "session.seat_slug" in login_source
+    assert 'window.location.assign(hasSeat || session.role !== "reader" ? "/app" : "/next/app")' in login_source
+    assert '"/api/access/self"' in app_js
+    assert '"/api/access/self/tokens"' in app_js
+    assert "/api/access/self/tokens/${encodeURIComponent(tokenId)}/revoke" in app_js
+    assert "Search results" in app_page
 
 
 def test_review_is_the_only_place_with_approve_and_reject() -> None:
@@ -5966,6 +5977,140 @@ def test_list_seats_requires_admin(tmp_path: Any) -> None:
     )
 
     assert forbidden.status_code == 403
+
+
+def test_self_seat_tokens_use_cookie_scope_and_revoke_invalidates_session(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    created = admin.post(
+        "/api/access/seats",
+        json={"name": "Alice", "slug": "alice"},
+    ).json()
+    current_token = created["token"]
+    current_token_id = created["api_token"]["id"]
+
+    seat = TestClient(app, base_url="https://testserver")
+    login = seat.post("/admin/session", json={"access_key": current_token})
+    assert login.status_code == 200
+    assert login.json()["seat_slug"] == "alice"
+
+    own = seat.get("/api/access/self")
+    assert own.status_code == 200
+    own_payload = own.json()
+    assert own_payload["current_token_id"] == current_token_id
+    assert own_payload["seat"]["seat_slug"] == "alice"
+    assert len(own_payload["principals"]) == 1
+    renderer_principal = own_payload["principals"][0]
+    assert set(renderer_principal) == {
+        "id",
+        "kind",
+        "name",
+        "role",
+        "scopes",
+        "team_id",
+        "seat_slug",
+        "default_dataset",
+    }
+    assert renderer_principal["id"] == own_payload["seat"]["principal_id"]
+    assert renderer_principal["seat_slug"] == "alice"
+    assert renderer_principal["default_dataset"] == "seat:alice"
+    assert len(own_payload["tokens"]) == 1
+    assert own_payload["tokens"][0]["id"] == current_token_id
+    assert all("token_hash" not in token for token in own_payload["tokens"])
+
+    reader = seat.post(
+        "/api/access/self/tokens",
+        json={"token_name": "read-only", "role": "reader"},
+    )
+    assert reader.status_code == 200
+    reader_payload = reader.json()
+    assert reader_payload["api_token"]["role"] == "reader"
+    assert reader_payload["api_token"]["default_dataset"] == "seat:alice"
+    assert "token_hash" not in reader_payload["api_token"]
+
+    revoked = seat.post(
+        f"/api/access/self/tokens/{reader_payload['api_token']['id']}/revoke"
+    )
+    assert revoked.status_code == 200
+    assert "token_hash" not in revoked.json()["api_token"]
+
+    current_revoke = seat.post(
+        f"/api/access/self/tokens/{current_token_id}/revoke"
+    )
+    assert current_revoke.status_code == 409
+
+    admin_revoke = admin.post(f"/api/access/tokens/{current_token_id}/revoke")
+    assert admin_revoke.status_code == 200
+    assert seat.get("/api/session").status_code == 401
+
+    events = app.state.access_store.snapshot()["audit_events"]
+    self_events = [event for event in events if event["detail"].get("self_service")]
+    assert {event["action"] for event in self_events} == {
+        "access.seat.token.create",
+        "access.seat.token.revoke",
+    }
+    assert all("token" not in event["detail"] for event in self_events)
+    assert all("token_hash" not in event["detail"] for event in self_events)
+
+
+def test_self_seat_tokens_enforce_identity_role_and_boundaries(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    alice = admin.post(
+        "/api/access/seats",
+        json={"name": "Alice", "slug": "alice"},
+    ).json()
+    bob = admin.post(
+        "/api/access/seats",
+        json={"name": "Bob", "slug": "bob"},
+    ).json()
+    alice_client = TestClient(app, base_url="https://testserver")
+    assert alice_client.post(
+        "/admin/session", json={"access_key": alice["token"]}
+    ).status_code == 200
+
+    writer = alice_client.post(
+        "/api/access/self/tokens", json={"role": "writer"}
+    ).json()
+    reader = alice_client.post(
+        "/api/access/self/tokens", json={"role": "reader"}
+    ).json()
+    reader_client = TestClient(app, base_url="https://testserver")
+    assert reader_client.post(
+        "/admin/session", json={"access_key": reader["token"]}
+    ).status_code == 200
+
+    limited = reader_client.get("/api/access/self")
+    assert limited.status_code == 200
+    assert all(token["role"] == "reader" for token in limited.json()["tokens"])
+    assert reader_client.post(
+        "/api/access/self/tokens", json={"role": "writer"}
+    ).status_code == 403
+    assert reader_client.post(
+        f"/api/access/self/tokens/{writer['api_token']['id']}/revoke"
+    ).status_code == 403
+
+    assert alice_client.post(
+        "/api/access/self/tokens",
+        json={"role": "reader", "seat_slug": "bob"},
+    ).status_code == 422
+    assert alice_client.post(
+        "/api/access/self/tokens", json={"role": "admin"}
+    ).status_code == 422
+    assert alice_client.post(
+        f"/api/access/self/tokens/{bob['api_token']['id']}/revoke"
+    ).status_code == 404
+
+    service = admin.post(
+        "/api/access/tokens",
+        json={"name": "service", "role": "admin", "kind": "service_account"},
+    ).json()
+    service_client = TestClient(app, base_url="https://testserver")
+    assert service_client.post(
+        "/admin/session", json={"access_key": service["token"]}
+    ).status_code == 200
+    assert service_client.get("/api/access/self").status_code == 403
+    assert admin.get("/api/access/self").status_code == 403
 
 
 def test_admin_scope_override_is_audited(tmp_path: Any) -> None:

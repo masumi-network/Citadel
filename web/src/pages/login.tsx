@@ -37,9 +37,10 @@ export default function Login() {
         throw new Error(body.detail || REJECTED);
       }
       const session = await response.json().catch(() => ({}));
-      // Readers have parity on the Next read-only dashboard. Keep writers and
-      // admins on the legacy surface until privileged workflows are migrated.
-      window.location.assign(session.role === "reader" ? "/next/app" : "/app");
+      // Seat readers and writers need the legacy Access panel. Keep env and
+      // seat-less readers on the Next read-only dashboard.
+      const hasSeat = typeof session.seat_slug === "string" && Boolean(session.seat_slug.trim());
+      window.location.assign(hasSeat || session.role !== "reader" ? "/app" : "/next/app");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : REJECTED);
     } finally {

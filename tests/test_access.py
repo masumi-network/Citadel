@@ -586,6 +586,23 @@ def test_issue_seat_token_unknown_seat_raises(tmp_path: Path) -> None:
         store(tmp_path).issue_seat_token(slug="ghost")
 
 
+def test_issue_seat_token_role_cannot_exceed_principal(tmp_path: Path) -> None:
+    access_store = store(tmp_path)
+    access_store.create_seat(name="Writer", slug="writer")
+
+    reader = access_store.issue_seat_token(slug="writer", role="reader")
+    writer = access_store.issue_seat_token(slug="writer", role="writer")
+
+    assert reader.api_token.role == "reader"
+    assert writer.api_token.role == "writer"
+    with pytest.raises(ValueError, match="cannot exceed"):
+        access_store.issue_seat_token(slug="writer", role="admin")
+
+    access_store.create_seat(name="Reader", slug="reader", role="reader")
+    with pytest.raises(ValueError, match="cannot exceed"):
+        access_store.issue_seat_token(slug="reader", role="writer")
+
+
 def test_validate_seat_slug_rejects_invalid_values() -> None:
     from kb.access import validate_seat_slug
 
