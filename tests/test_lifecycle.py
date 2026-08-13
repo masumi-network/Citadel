@@ -1090,3 +1090,51 @@ def test_requeue_failed_projections_ignores_healthy_jobs(tmp_path: Path) -> None
     )
     store.accept_source(b"leave me queued", capture=capture, projection=projection, now=T0)
     assert store.requeue_failed_projections(now=T0) == 0
+
+
+def test_active_projection_source_revision_ids_tracks_in_flight_jobs(
+    tmp_path: Path,
+) -> None:
+    # The stored-chunk census resolves missing cognee document ids against
+    # this read (#286): a pending/running projection means "not written YET",
+    # a completed one means a real gap.
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = store.accept_source(
+        b"in-flight lookup",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:in-flight",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-in-flight",
+            captured_at=T0,
+        ),
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="cognee-1.4.1-qdrant-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+        now=T0,
+    )
+    revision_id = accepted.source_revision_id
+
+    # Pending job: in flight. Unknown ids and empty input never match.
+    assert store.active_projection_source_revision_ids([revision_id]) == {revision_id}
+    assert store.active_projection_source_revision_ids(["no-such-id"]) == set()
+    assert store.active_projection_source_revision_ids([]) == set()
+
+    # Drive the job to completed through the real choreography: no longer
+    # in flight — absent chunks for it are a real gap again (fail-closed).
+    lease = store.claim_next_job(worker_id="worker-1", now=T0, lease_seconds=30)
+    assert lease is not None
+    for backend in ("relational", "vector", "graph"):
+        store.begin_backend(lease, backend, now=T0)
+        store.complete_backend(lease, backend, affected_count=1, now=T0)
+        store.mark_backend_searchable(lease, backend, now=T0)
+    assert store.active_projection_source_revision_ids([revision_id]) == set()

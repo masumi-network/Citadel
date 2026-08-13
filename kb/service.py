@@ -97,6 +97,18 @@ class Citadel:
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
+            # Let the post-cognify stored check distinguish "chunks not written
+            # YET" (projection pending/running) from a real gap (#286) — the
+            # drain-projected document's cognee Data.id is its
+            # source_revision_id, so the store can answer by id.
+            try:
+                self.cognee.lifecycle_active_projection_lookup = (
+                    self.lifecycle_store.active_projection_source_revision_ids
+                )
+            except AttributeError:
+                # A gateway that rejects attribute injection (bare/slotted test
+                # doubles) simply keeps the fully fail-closed check.
+                pass
             self.lifecycle_worker = LifecycleProjectionWorker(
                 self.lifecycle_store,
                 self.cognee,

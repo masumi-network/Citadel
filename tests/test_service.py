@@ -2995,3 +2995,25 @@ async def test_every_rejection_line_in_ingest_escapes_the_dataset_name(
     for message in messages:
         assert "\n" not in message, "a caller-supplied value opened a new log line"
         assert "\\n" in message, "the value must survive the escaping, not be deleted"
+
+
+def test_lifecycle_wires_the_in_flight_lookup_into_cognee(tmp_path) -> None:
+    # The post-cognify stored check partitions missing document ids by
+    # projection state through this hook (#286). Unwired (lifecycle off) it
+    # stays None and the check remains fully fail-closed.
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    assert kb.lifecycle_store is not None
+    assert (
+        fake.lifecycle_active_projection_lookup
+        == kb.lifecycle_store.active_projection_source_revision_ids
+    )
+
+    unwired = Citadel(CitadelConfig(lifecycle_enabled=False), cognee=FakeCognee())
+    assert getattr(unwired.cognee, "lifecycle_active_projection_lookup", None) is None

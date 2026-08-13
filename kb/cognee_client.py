@@ -502,6 +502,15 @@ class CogneePublicClient:
         retry_queue: CognifyRetryQueue | None = None,
     ) -> None:
         self._startup_migrations_done = False
+        # Wired by the service layer when a lifecycle store exists: maps a list
+        # of cognee document ids (== lifecycle source_revision_ids for drain-
+        # projected docs) to the subset whose projection is still in flight, so
+        # the post-cognify stored check does not fail on chunks the drain has
+        # not written yet (#286). None (no lifecycle) keeps the check fully
+        # fail-closed.
+        self.lifecycle_active_projection_lookup: (
+            Callable[[list[str]], set[str]] | None
+        ) = None
         configured_queue_path = queue_path or os.getenv("CITADEL_COGNIFY_QUEUE_PATH")
         self.cognify_queue = retry_queue or CognifyRetryQueue(
             configured_queue_path or DEFAULT_COGNIFY_QUEUE_PATH
@@ -4577,33 +4586,77 @@ class CogneePublicClient:
                     "VECTOR_DB_PROVIDER does not support exact enumeration"
                 )
             elif not stored_check["ok"]:
-                # Name the violators. The check already collects chunk_id and
-                # document_id per violation, but this site used to drop them and
-                # raise a bare count, so the 2026-08-13 canary failed for hours
-                # on one unidentifiable chunk out of ~1951 with no surface
-                # anywhere naming the offending document.
-                named = "; ".join(
-                    f"document {violation.get('document_id') or 'unknown'} "
-                    f"chunk {violation.get('chunk_id') or 'unknown'} "
-                    f"({violation.get('measured_tokens') or violation.get('configured_size')}"
-                    f" tokens > budget {stored_check.get('budget')})"
-                    for violation in (stored_check.get("violations") or [])[:3]
-                ) or "no violation rows"
-                missing = stored_check.get("missing_document_ids") or []
-                if missing:
-                    named += f"; missing document ids {missing[:3]}"
-                logger.error(
-                    "stored chunk budget check failed after cognify: "
-                    "%d violation(s) across %d chunk(s): %s",
-                    stored_check["violation_count"],
-                    stored_check["chunks_scanned"],
-                    named,
-                )
-                raise RuntimeError(
-                    "stored chunk budget check failed: "
-                    f"{stored_check['violation_count']} violation(s) across "
-                    f"{stored_check['chunks_scanned']} persisted chunk(s): {named}"
-                )
+                missing = list(stored_check.get("missing_document_ids") or [])
+                # Phase-2 incremental cognify sweeps docs the lifecycle drain
+                # is still projecting into its receipt, so the census counts
+                # their not-yet-written chunks as missing (#286, the 18:02Z
+                # canary; same design family as #273, one layer deeper — the
+                # check raced the drain). Partition the missing ids by job
+                # state: a missing id WITH a pending/running projection is
+                # in-flight, not a gap — the drain's own post-projection check
+                # gates those chunks when they land. A missing id with NO
+                # active job stays fatal (fail-closed), and violations are
+                # fatal regardless.
+                in_flight: set[str] = set()
+                lookup = self.lifecycle_active_projection_lookup
+                if missing and lookup is not None:
+                    try:
+                        in_flight = await asyncio.to_thread(lookup, list(missing))
+                    except Exception:  # noqa: BLE001 - advisory read; absence fails closed
+                        logger.warning(
+                            "lifecycle in-flight lookup failed; treating all "
+                            "missing document ids as fatal",
+                            exc_info=True,
+                        )
+                        in_flight = set()
+                fatal_missing = [
+                    document_id
+                    for document_id in missing
+                    if document_id not in in_flight
+                ]
+                if (
+                    stored_check["violation_count"] == 0
+                    and missing
+                    and not fatal_missing
+                ):
+                    logger.warning(
+                        "stored chunk budget check: %d document id(s) missing "
+                        "only because their lifecycle projection is still in "
+                        "flight, not failing: %s",
+                        len(missing),
+                        missing[:10],
+                    )
+                else:
+                    # Name the violators. The check already collects chunk_id
+                    # and document_id per violation, but this site used to drop
+                    # them and raise a bare count, so the 2026-08-13 canary
+                    # failed for hours on one unidentifiable chunk out of ~1951
+                    # with no surface anywhere naming the offending document.
+                    named = "; ".join(
+                        f"document {violation.get('document_id') or 'unknown'} "
+                        f"chunk {violation.get('chunk_id') or 'unknown'} "
+                        f"({violation.get('measured_tokens') or violation.get('configured_size')}"
+                        f" tokens > budget {stored_check.get('budget')})"
+                        for violation in (stored_check.get("violations") or [])[:3]
+                    ) or "no violation rows"
+                    if fatal_missing:
+                        named += f"; missing document ids {fatal_missing[:3]}"
+                    if in_flight:
+                        named += (
+                            f"; {len(in_flight)} more still in lifecycle projection"
+                        )
+                    logger.error(
+                        "stored chunk budget check failed after cognify: "
+                        "%d violation(s) across %d chunk(s): %s",
+                        stored_check["violation_count"],
+                        stored_check["chunks_scanned"],
+                        named,
+                    )
+                    raise RuntimeError(
+                        "stored chunk budget check failed: "
+                        f"{stored_check['violation_count']} violation(s) across "
+                        f"{stored_check['chunks_scanned']} persisted chunk(s): {named}"
+                    )
         return result
 
     async def add_feedback(

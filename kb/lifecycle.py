@@ -1486,6 +1486,33 @@ class LifecycleStore:
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
+    def active_projection_source_revision_ids(
+        self, source_revision_ids: list[str]
+    ) -> set[str]:
+        """Which of these revision ids still have a projection in flight.
+
+        A drain-projected document's cognee ``Data.id`` IS its lifecycle
+        ``source_revision_id`` (the projection worker passes it as
+        ``data_id``), so the stored-chunk census can ask directly whether a
+        document whose chunks it could not find is simply not projected yet
+        (#286). In flight means job state 'pending' or 'running' — a retrying
+        job is a 'pending' row with attempt > 0. 'failed', 'stale', and
+        'completed' rows are NOT in flight: chunks absent for those are a real
+        gap and must stay fatal.
+        """
+        candidates = sorted({str(value) for value in source_revision_ids if value})
+        if not candidates:
+            return set()
+        placeholders = ",".join("?" for _ in candidates)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT source_revision_id FROM projection_jobs "
+                "WHERE state IN ('pending', 'running') "
+                f"AND source_revision_id IN ({placeholders})",
+                candidates,
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def claim_next_job(
         self,
         *,
