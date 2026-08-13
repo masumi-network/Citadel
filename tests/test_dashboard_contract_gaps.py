@@ -745,3 +745,36 @@ def test_graph_pointer_area_floors_small_node_hit_radius() -> None:
         "the hit-radius floor must be screen-space (divided by the zoom scale), "
         "or it shrinks with the same fit-out zoom that caused the defect"
     )
+
+
+def test_graph_depth_control_is_gone() -> None:
+    """User decision on FE-01: the depth slider was a third hiding mechanism
+    stacked on aggregation and the server cap — a client-side hop-limit from
+    the focus node that manufactured confusion while the user always wants
+    full connectivity. Pin its absence end to end (markup, styles, state,
+    hop filter) so it cannot quietly return."""
+    from pathlib import Path
+
+    import kb.server as server_module
+
+    repo = Path(server_module.__file__).resolve().parent.parent
+    app_js = (repo / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (repo / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    styles_css = (repo / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert "graphDepthInput" not in index_html, (
+        "the depth control markup is back on the graph toolbar"
+    )
+    assert "graphDepthInput" not in app_js, (
+        "app.js still wires the deleted depth control"
+    )
+    assert "applyGraphDepth" not in app_js, (
+        "the hop-limit filter is back; rendering must always use the full "
+        "loaded payload"
+    )
+    assert "state.graphDepth" not in app_js, (
+        "the depth state plumbing is back"
+    )
+    assert "graph-depth-control" not in index_html and "graph-depth-control" not in styles_css, (
+        "dead depth-control markup or styles are back"
+    )
