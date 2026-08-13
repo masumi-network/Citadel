@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 import json
 import logging
+import math
 import os
 import re
 from uuid import uuid4
@@ -73,7 +74,11 @@ def _canary_timeout_seconds() -> float:
         value = float(raw)
     except ValueError:
         return DEFAULT_CANARY_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_CANARY_TIMEOUT_SECONDS
+    # isfinite: float() parses "inf", which passes a > 0 check and would make
+    # the canary wait poll forever — a silent permanent scheduler hang.
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_CANARY_TIMEOUT_SECONDS
+    return value
 
 
 class Citadel:

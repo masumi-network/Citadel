@@ -798,6 +798,78 @@ async def test_lifecycle_cognify_canary_times_out_red_and_tombstones(
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_cognify_canary_flags_miss_after_searchable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A searchable operation whose confirming search still misses is red.
+
+    This is the outcome the confirming search exists to catch: every receipt
+    says searchable, yet retrieval does not return the marker — a real
+    end-to-end recall failure that receipt bookkeeping alone would report
+    green. Its distinct reason string separates it from a drain that never
+    finished."""
+
+    class SearchableButUnfindableCognee(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recall_calls = 0
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_calls += 1
+            return []
+
+    monkeypatch.setattr(service, "CANARY_SEARCH_BACKOFF_SECONDS", 0)
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("DB_PROVIDER", "sqlite")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("GRAPH_DATABASE_PROVIDER", "ladybug")
+    fake = SearchableButUnfindableCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+
+    result = await kb.cognify_dataset(verify=True)
+    await kb.wait_for_lifecycle_idle()
+
+    verification = result["verification"]
+    assert verification["search_hit"] is False
+    assert verification["ok"] is False
+    assert result["ok"] is False
+    assert verification["reason"] == "search_miss_after_searchable"
+    # The wait succeeded, so exactly one confirming search ran and missed.
+    assert verification["search_attempts"] == 1
+    assert fake.recall_calls == 1
+    operation = kb.lifecycle_operation(verification["projection_job_id"])
+    source_key = operation["source_revision"]["source_key"]
+    assert (
+        kb.lifecycle_source_keys(dataset="masumi-network", source_key=source_key)
+        == ()
+    )
+
+
+def test_canary_timeout_rejects_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """float() parses "inf", which passes a > 0 check — and an infinite
+    timeout makes the canary wait poll forever, a silent permanent scheduler
+    hang. Non-finite and non-positive values fall back to the default."""
+    for raw in ("inf", "+inf", "-inf", "nan", "0", "-5", "bogus", ""):
+        monkeypatch.setenv("CITADEL_CANARY_TIMEOUT_SECONDS", raw)
+        assert (
+            service._canary_timeout_seconds()
+            == service.DEFAULT_CANARY_TIMEOUT_SECONDS
+        ), raw
+    monkeypatch.setenv("CITADEL_CANARY_TIMEOUT_SECONDS", "45.5")
+    assert service._canary_timeout_seconds() == 45.5
+
+
+@pytest.mark.asyncio
 async def test_search_clamps_top_k_to_safe_bounds() -> None:
     fake = FakeCognee()
     kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
