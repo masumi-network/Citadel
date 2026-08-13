@@ -502,14 +502,14 @@ class CogneePublicClient:
         retry_queue: CognifyRetryQueue | None = None,
     ) -> None:
         self._startup_migrations_done = False
-        # Wired by the service layer when a lifecycle store exists: maps a list
-        # of cognee document ids (== lifecycle source_revision_ids for drain-
-        # projected docs) to the subset whose projection is still in flight, so
-        # the post-cognify stored check does not fail on chunks the drain has
-        # not written yet (#286). None (no lifecycle) keeps the check fully
-        # fail-closed.
-        self.lifecycle_active_projection_lookup: (
-            Callable[[list[str]], set[str]] | None
+        # Wired by the service layer when a lifecycle store exists: partitions
+        # cognee document ids (== lifecycle source_revision_ids for drain-
+        # projected docs) into active and completed-searchable projections. The
+        # post-cognify stored check can then distinguish chunks not written yet
+        # from a stale census after completion (#286). None (no lifecycle) keeps
+        # the check fully fail-closed.
+        self.lifecycle_projection_state_lookup: (
+            Callable[[list[str]], tuple[set[str], set[str]]] | None
         ) = None
         configured_queue_path = queue_path or os.getenv("CITADEL_COGNIFY_QUEUE_PATH")
         self.cognify_queue = retry_queue or CognifyRetryQueue(
@@ -4598,34 +4598,102 @@ class CogneePublicClient:
                 # active job stays fatal (fail-closed), and violations are
                 # fatal regardless.
                 in_flight: set[str] = set()
-                lookup = self.lifecycle_active_projection_lookup
+                completed_searchable: set[str] = set()
+                lookup = self.lifecycle_projection_state_lookup
                 if missing and lookup is not None:
                     try:
-                        in_flight = await asyncio.to_thread(lookup, list(missing))
+                        in_flight, completed_searchable = await asyncio.to_thread(
+                            lookup, list(missing)
+                        )
                     except Exception:  # noqa: BLE001 - advisory read; absence fails closed
                         logger.warning(
-                            "lifecycle in-flight lookup failed; treating all "
+                            "lifecycle projection-state lookup failed; treating all "
                             "missing document ids as fatal",
                             exc_info=True,
                         )
                         in_flight = set()
+                        completed_searchable = set()
                 fatal_missing = [
                     document_id
                     for document_id in missing
                     if document_id not in in_flight
+                    and document_id not in completed_searchable
                 ]
+                recheck_ids = [
+                    document_id
+                    for document_id in missing
+                    if document_id in completed_searchable
+                    and document_id not in in_flight
+                ]
+                stale_missing_cleared: list[str] = []
                 if (
                     stored_check["violation_count"] == 0
-                    and missing
+                    and recheck_ids
+                ):
+                    # The projection can finish after the census reports a
+                    # missing id but before the lifecycle lookup runs. A
+                    # completed-searchable job is correctly absent from
+                    # ``in_flight``, but its earlier census result is stale.
+                    # Recheck only ids with positive completion evidence.
+                    # Failed, stale, absent, and unscoped ids remain fatal.
+                    requested_recheck_ids = set(recheck_ids)
+                    recheck_ids_by_dataset: dict[str, list[str]] = {}
+                    for dataset, document_ids in processed_ids_by_dataset.items():
+                        scoped_ids = [
+                            document_id
+                            for document_id in document_ids
+                            if document_id in requested_recheck_ids
+                        ]
+                        if scoped_ids:
+                            recheck_ids_by_dataset[dataset] = scoped_ids
+                    mapped_recheck_ids = {
+                        document_id
+                        for document_ids in recheck_ids_by_dataset.values()
+                        for document_id in document_ids
+                    }
+                    for document_id in recheck_ids:
+                        if document_id not in mapped_recheck_ids:
+                            fatal_missing.append(document_id)
+                    scoped_recheck_ids = [
+                        document_id
+                        for document_id in recheck_ids
+                        if document_id in mapped_recheck_ids
+                    ]
+                    if scoped_recheck_ids:
+                        refreshed_check = await self.stored_chunk_budget_check(
+                            document_ids=scoped_recheck_ids,
+                            datasets=list(recheck_ids_by_dataset),
+                            document_ids_by_dataset=recheck_ids_by_dataset,
+                        )
+                        if refreshed_check is None:
+                            fatal_missing.extend(scoped_recheck_ids)
+                        elif refreshed_check["ok"]:
+                            stale_missing_cleared = scoped_recheck_ids
+                        else:
+                            stored_check = refreshed_check
+                            for document_id in list(
+                                refreshed_check.get("missing_document_ids") or []
+                            ):
+                                if document_id not in fatal_missing:
+                                    fatal_missing.append(document_id)
+                if (
+                    stored_check["violation_count"] == 0
                     and not fatal_missing
                 ):
-                    logger.warning(
-                        "stored chunk budget check: %d document id(s) missing "
-                        "only because their lifecycle projection is still in "
-                        "flight, not failing: %s",
-                        len(missing),
-                        missing[:10],
-                    )
+                    if in_flight:
+                        logger.warning(
+                            "stored chunk budget check: %d document id(s) missing "
+                            "only because their lifecycle projection is still in "
+                            "flight, not failing: %s",
+                            len(in_flight),
+                            sorted(in_flight)[:10],
+                        )
+                    if stale_missing_cleared:
+                        logger.warning(
+                            "stored chunk budget check: stale missing document ids "
+                            "cleared after lifecycle projection completion: %s",
+                            stale_missing_cleared[:10],
+                        )
                 else:
                     # Name the violators. The check already collects chunk_id
                     # and document_id per violation, but this site used to drop

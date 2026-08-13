@@ -4806,16 +4806,27 @@ async def test_get_document_summary_chunk_scope_serves_summary_text(
 # ---- stored check vs the lifecycle drain (#286) -------------------------------
 
 
-def _cognify_fakes(monkeypatch: Any, *, missing: list[str], violations: int) -> Any:
+def _cognify_fakes(
+    monkeypatch: Any,
+    *,
+    missing: list[str],
+    violations: int,
+    processed_by_dataset: dict[str, list[str]] | None = None,
+) -> Any:
     """Client whose cognify receipt swept one doc and whose census reports it."""
     monkeypatch.setenv("LLM_API_KEY", "test-key")
-    run = SimpleNamespace(data_ingestion_info=[{"data_id": doc} for doc in missing])
+    processed = processed_by_dataset or {"dataset-id": missing}
 
     async def run_migrations() -> None:
         return None
 
     async def cognify(**_: Any) -> dict[str, Any]:
-        return {"dataset-id": run}
+        return {
+            dataset: SimpleNamespace(
+                data_ingestion_info=[{"data_id": doc} for doc in document_ids]
+            )
+            for dataset, document_ids in processed.items()
+        }
 
     monkeypatch.setitem(
         sys.modules,
@@ -4861,11 +4872,11 @@ async def test_cognify_missing_docs_with_active_projection_do_not_fail(
     client = _cognify_fakes(monkeypatch, missing=[live_id], violations=0)
     looked_up: list[list[str]] = []
 
-    def lookup(document_ids: list[str]) -> set[str]:
+    def lookup(document_ids: list[str]) -> tuple[set[str], set[str]]:
         looked_up.append(list(document_ids))
-        return {live_id}
+        return {live_id}, set()
 
-    client.lifecycle_active_projection_lookup = lookup
+    client.lifecycle_projection_state_lookup = lookup
 
     with caplog.at_level("WARNING"):
         await client.cognify(datasets=["notes"])  # must not raise
@@ -4886,12 +4897,58 @@ async def test_cognify_missing_docs_without_active_job_still_fail(
     """Fail-closed for real gaps: a missing id with NO pending/running job is
     exactly as fatal as before the partition existed."""
     client = _cognify_fakes(monkeypatch, missing=["doc-gone"], violations=0)
-    client.lifecycle_active_projection_lookup = lambda document_ids: set()
+    client.lifecycle_projection_state_lookup = lambda document_ids: (set(), set())
 
     with pytest.raises(RuntimeError) as excinfo:
         await client.cognify(datasets=["notes"])
 
     assert "doc-gone" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_cognify_rechecks_missing_doc_after_projection_completes(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """A completed job can make the first census stale before its state lookup."""
+    live_id = "4552e276-e329-5dbf-9d45-d029160d82f4"
+    client = _cognify_fakes(
+        monkeypatch,
+        missing=[live_id],
+        violations=0,
+        processed_by_dataset={"notes": [live_id], "other": ["other-id"]},
+    )
+    first_check = client.stored_chunk_budget_check
+    checks: list[dict[str, Any]] = []
+
+    async def completing_check(**kwargs: Any) -> dict[str, Any]:
+        checks.append(kwargs)
+        result = await first_check(**kwargs)
+        if len(checks) == 2:
+            return {
+                **result,
+                "ok": True,
+                "chunks_scanned": 1,
+                "missing_document_ids": [],
+            }
+        return result
+
+    monkeypatch.setattr(client, "stored_chunk_budget_check", completing_check)
+    client.lifecycle_projection_state_lookup = lambda document_ids: (
+        set(),
+        {live_id},
+    )
+
+    with caplog.at_level("WARNING"):
+        await client.cognify(datasets=["notes", "other"])
+
+    assert len(checks) == 2
+    assert checks[1]["document_ids"] == [live_id]
+    assert checks[1]["datasets"] == ["notes"]
+    assert checks[1]["document_ids_by_dataset"] == {"notes": [live_id]}
+    assert any(
+        "cleared after lifecycle projection completion" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -4901,7 +4958,10 @@ async def test_cognify_violations_fail_even_when_missing_ids_are_in_flight(
     """A budget violation is fatal regardless of drain state; the message
     still notes the in-flight ids so the operator sees both facts."""
     client = _cognify_fakes(monkeypatch, missing=["doc-pending"], violations=1)
-    client.lifecycle_active_projection_lookup = lambda document_ids: {"doc-pending"}
+    client.lifecycle_projection_state_lookup = lambda document_ids: (
+        {"doc-pending"},
+        set(),
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         await client.cognify(datasets=["notes"])
