@@ -28,4 +28,4 @@ uvicorn[standard]>=0.34.0,<1.0.0
 # keeps the Railway install matching what CI audits, since this file is the
 # deploy path and uv.lock is not. No conflict is possible: cognee sets no upper
 # bound.
-datamodel-code-generator>=0.64.0
+datamodel-code-generator>=0.72.2
