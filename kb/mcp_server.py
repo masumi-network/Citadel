@@ -21,6 +21,7 @@ from kb.access import ROLE_ORDER
 from kb.build_identity import SERVICE_BUILD_IDENTITY
 from kb.capture_config import load_capture_config
 from kb.retry import run_with_retries
+from kb.search_format import is_search_content_hit, shape_public_search_hit
 from kb.security_scan import redact_secrets
 from kb.session_trace_distill import (
     distill_trace,
@@ -672,7 +673,11 @@ def _compact_search_for_agent(payload: Any) -> Any:
     sections = payload.get("sections")
     if isinstance(sections, dict):
         compacted["section_counts"] = {
-            str(name): len(items) if isinstance(items, list) else 0
+            str(name): (
+                sum(1 for item in items if is_search_content_hit(item))
+                if isinstance(items, list)
+                else 0
+            )
             for name, items in sections.items()
         }
         compacted.pop("sections", None)
@@ -682,8 +687,17 @@ def _compact_search_for_agent(payload: Any) -> Any:
     # its own.
     limit = _max_hit_text_chars()
     results = payload.get("results")
-    if isinstance(results, list) and limit > 0:
-        compacted["results"] = [_truncate_hit_text(hit, limit) for hit in results]
+    if isinstance(results, list):
+        public_results = [
+            shape_public_search_hit(hit, index=index)
+            for index, hit in enumerate(results)
+            if is_search_content_hit(hit)
+        ]
+        compacted["results"] = (
+            [_truncate_hit_text(hit, limit) for hit in public_results]
+            if limit > 0
+            else public_results
+        )
     return compacted
 
 

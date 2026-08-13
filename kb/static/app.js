@@ -5259,6 +5259,14 @@ function isSingleLiteralQuery(query) {
   return String(query || "").trim().split(/\s+/).filter(Boolean).length === 1;
 }
 
+function searchResultKey(result) {
+  const envelope = resultEnvelope(result);
+  const dataset = envelope.dataset || result?.dataset || "";
+  const identity = envelope.result_id || result?.id || result?.document_id || "";
+  const text = result?.text || result?.content || "";
+  return `${dataset}\u0000${identity}\u0000${text}`;
+}
+
 function renderSearchResults(results, response = {}, query = "") {
   const container = document.getElementById("searchResults");
   container.innerHTML = "";
@@ -5307,8 +5315,10 @@ function renderSearchResults(results, response = {}, query = "") {
   // Anything the server could not place in a section still has to be shown; a
   // silently dropped hit is worse than an extra group.
   const placed = new Set();
-  grouped.forEach((key) => sections[key].forEach((hit) => placed.add(hit)));
-  const rest = results.filter((hit) => !placed.has(hit));
+  grouped.forEach((key) =>
+    sections[key].forEach((hit) => placed.add(searchResultKey(hit)))
+  );
+  const rest = results.filter((hit) => !placed.has(searchResultKey(hit)));
   if (rest.length) {
     const group = document.createElement("section");
     group.className = "result-group";

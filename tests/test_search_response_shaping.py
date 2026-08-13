@@ -20,8 +20,10 @@ from kb.mesh import MeshState
 from kb.search_format import (
     apply_query_ranking,
     filter_hits,
+    is_search_content_hit,
     normalize_search_hit,
     parse_content_header,
+    shape_public_search_hit,
 )
 from kb.server import app, result_provenance, with_result_metadata
 
@@ -89,6 +91,93 @@ def shaped_client(citadel: Any) -> TestClient:
     response = client.post("/admin/session", json={"access_key": "test-admin"})
     assert response.status_code == 200
     return client
+
+
+def test_public_search_hit_drops_engine_fields_and_keeps_drilldown() -> None:
+    raw = {
+        "id": "chunk-1",
+        "document_id": "document-1",
+        "type": "IndexSchema",
+        "text": "Rotate keys quarterly.",
+        "source_url": "https://example.com/runbook",
+        "source_pipeline": "internal-pipeline",
+        "source_task": "internal-task",
+        "source_node_set": "internal-node-set",
+        "source_user": "default-user@example.invalid",
+        "metadata": {"citadel_tags": ["ops"], "private": "internal"},
+        "_citadel": {
+            "rank": 1,
+            "dataset": "masumi-network",
+            "result_id": "chunk-1",
+            "document_endpoint": "/api/documents/document-1",
+            "retrieval": {"document_drilldown_available": True},
+            "unexpected_internal": "drop-me",
+        },
+    }
+
+    shaped = shape_public_search_hit(raw)
+
+    assert shaped["id"] == "chunk-1"
+    assert shaped["document_id"] == "document-1"
+    assert shaped["qa_id"] == "chunk-1"
+    assert shaped["text"] == "Rotate keys quarterly."
+    assert shaped["source"] == "https://example.com/runbook"
+    assert shaped["tags"] == ["ops"]
+    assert shaped["dataset"] == "masumi-network"
+    assert shaped["_citadel"]["document_endpoint"] == "/api/documents/document-1"
+    forbidden = {
+        "type",
+        "metadata",
+        "source_pipeline",
+        "source_task",
+        "source_node_set",
+        "source_user",
+    }
+    assert forbidden.isdisjoint(shaped)
+    assert "unexpected_internal" not in shaped["_citadel"]
+    assert "projection" not in shaped["_citadel"]
+
+
+def test_index_schema_content_requires_a_document_identity() -> None:
+    valid = {
+        "type": "IndexSchema",
+        "document_id": "document-1",
+        "text": "A source-backed chunk.",
+    }
+    engine_row = {
+        "type": "IndexSchema",
+        "text": "Internal index schema row",
+        "source_user": "default-user@example.invalid",
+    }
+    other_typed_row = {
+        "type": "TextDocument",
+        "document_id": "document-1",
+        "text": "Internal document node",
+    }
+
+    assert is_search_content_hit(valid) is True
+    assert is_search_content_hit(engine_row) is False
+    assert is_search_content_hit(other_typed_row) is False
+    assert is_search_content_hit({"type": "IndexSchema", "document_id": "document-1"}) is False
+
+
+def test_public_search_shape_rejects_malformed_engine_values() -> None:
+    for value in (None, 7, ["internal"], {"type": ["IndexSchema"], "text": "internal"}):
+        assert is_search_content_hit(value) is False
+
+    malformed = shape_public_search_hit(
+        {
+            "id": {"private": "value"},
+            "document_id": ["private"],
+            "text": "public content",
+            "_citadel": {"rank": "first", "dataset": ["private"]},
+        },
+        index=2,
+    )
+    assert malformed["id"] is None
+    assert malformed["document_id"] is None
+    assert malformed["rank"] == 3
+    assert malformed["dataset"] is None
 
 
 # --- defect 1: provenance was empty on 117 of 117 hits ----------------------

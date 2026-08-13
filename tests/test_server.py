@@ -76,7 +76,14 @@ class FakeCitadel:
         }
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
-        return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
+        return [
+            {
+                "query": query,
+                "dataset": kwargs["dataset"],
+                "top_k": kwargs["top_k"],
+                "text": f"{query} result",
+            }
+        ]
 
     documents: dict[str, dict[str, Any]] = {}
 
@@ -1177,7 +1184,9 @@ def test_api_uses_configured_citadel_service() -> None:
     assert ingest.json()["tags"] == ["research"]
     assert search.status_code == 200
     search_hit = search.json()["results"][0]
-    assert search_hit["top_k"] == 3
+    assert search_hit["text"] == "useful result"
+    assert "query" not in search_hit
+    assert "top_k" not in search_hit
     assert search_hit["id"].startswith("chunk:")
     assert search_hit["_citadel"]["rank"] == 1
     assert search_hit["_citadel"]["dataset"] == "notes"
@@ -1912,6 +1921,8 @@ def test_search_view_groups_central_before_node() -> None:
     assert '"/api/access/self"' in app_js
     assert '"/api/access/self/tokens"' in app_js
     assert "/api/access/self/tokens/${encodeURIComponent(tokenId)}/revoke" in app_js
+    assert "placed.add(searchResultKey(hit))" in app_js
+    assert "!placed.has(searchResultKey(hit))" in app_js
     assert "Search results" in app_page
 
 
@@ -4748,10 +4759,21 @@ class KnowledgeCitadel(FakeCitadel):
     async def search(self, query: str, **kwargs: Any) -> list[Any]:
         return [
             {
+                "id": "rotate-keys-chunk",
+                "document_id": "rotate-keys-document",
                 "text": "Rotate keys quarterly",
                 "source_url": "https://example.com/runbook",
                 "score": 0.92,
-                "metadata": {"citadel_tags": ["ops"]},
+                "metadata": {"citadel_tags": ["ops"], "private": "internal"},
+                "source_pipeline": "internal-pipeline",
+                "source_task": "internal-task",
+                "source_node_set": "internal-node-set",
+                "source_user": "default-user@example.invalid",
+            },
+            {
+                "type": "IndexSchema",
+                "text": "Internal index schema row",
+                "source_user": "default-user@example.invalid",
             },
             "bare string result",
         ]
@@ -4933,17 +4955,24 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     app.state.citadel = KnowledgeCitadel()
 
     response = client.get("/api/knowledge", params={"q": "rotate keys", "limit": 5})
+    search = client.post("/search", json={"query": "rotate keys", "top_k": 5})
 
     assert response.status_code == 200
+    assert search.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
     assert payload["query"] == "rotate keys"
-    assert payload["results"][0] == {
-        "text": "Rotate keys quarterly",
-        "source": "https://example.com/runbook",
-        "score": 0.92,
-        "tags": ["ops"],
-    }
+    assert [set(result) for result in payload["results"]] == [
+        set(result) for result in search.json()["results"]
+    ]
+    assert len(payload["results"]) == 2
+    assert payload["results"][0]["text"] == "Rotate keys quarterly"
+    assert payload["results"][0]["source"] == "https://example.com/runbook"
+    assert payload["results"][0]["score"] == 0.92
+    assert payload["results"][0]["tags"] == ["ops"]
+    assert payload["results"][0]["document_id"] == "rotate-keys-document"
+    assert "metadata" not in payload["results"][0]
+    assert "source_user" not in payload["results"][0]
     assert payload["results"][1]["text"] == "bare string result"
     assert payload["results"][1]["source"] is None
 
@@ -5375,7 +5404,7 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     )
     knowledge = api_client.get(
         "/api/knowledge",
-        params={"q": "architecture", "limit": 5},
+        params={"q": "architecture", "limit": 2},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -5401,6 +5430,8 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     }
 
     assert knowledge.status_code == 200
+    assert len(knowledge.json()["results"]) == 2
+    assert [result["rank"] for result in knowledge.json()["results"]] == [1, 2]
     assert knowledge.json()["datasets"] == [
         "seat:bob",
         "masumi-network",

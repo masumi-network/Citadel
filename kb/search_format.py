@@ -621,6 +621,239 @@ def _hit_chunk_index(hit: dict[str, Any]) -> Any:
 
 SNIPPET_CHARS = 500
 
+_PUBLIC_PROVENANCE_KEYS = frozenset(
+    {
+        "source",
+        "source_url",
+        "source_type",
+        "path",
+        "repo",
+        "commit",
+        "blob",
+        "issue",
+        "title",
+        "basis",
+        "session_id",
+    }
+)
+
+
+def is_search_content_hit(item: Any) -> bool:
+    """True when a retrieved row carries user-facing content.
+
+    Qdrant content chunks use ``IndexSchema`` too, so that type alone cannot
+    distinguish a document from an engine row. A valid IndexSchema hit needs
+    both text and its parent document id. Other retrieval paths, including the
+    GitHub digest fallback, may carry text without a document id.
+    """
+    if isinstance(item, str):
+        return bool(item.strip())
+    if not isinstance(item, dict):
+        return False
+    raw_type = item.get("type")
+    if raw_type is not None and not isinstance(raw_type, str):
+        return False
+    if raw_type is not None and raw_type.strip().lower() != "indexschema":
+        return False
+    text = _first_str(
+        item.get("text"),
+        item.get("content"),
+        item.get("chunk"),
+        item.get("body"),
+        item.get("summary"),
+        item.get("title"),
+        item.get("answer"),
+        item.get("result"),
+    )
+    if not text:
+        return False
+    if isinstance(raw_type, str) and raw_type.strip().lower() == "indexschema":
+        return bool(_first_str(item.get("document_id")))
+    return True
+
+
+def _public_search_envelope(envelope: Any) -> dict[str, Any]:
+    """Copy only documented scalar and nested Citadel search metadata."""
+    if not isinstance(envelope, dict):
+        return {}
+    public: dict[str, Any] = {}
+    rank = envelope.get("rank")
+    if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+        public["rank"] = rank
+    for key in (
+        "dataset",
+        "result_id",
+        "content_sha256",
+        "trust",
+        "author_seat",
+        "created_at",
+        "doc_type",
+        "content_hint",
+        "trust_tier",
+    ):
+        value = envelope.get(key)
+        if isinstance(value, str) and value:
+            public[key] = value
+    endpoint = envelope.get("document_endpoint")
+    if isinstance(endpoint, str) and endpoint.startswith("/api/documents/"):
+        public["document_endpoint"] = endpoint
+
+    provenance = envelope.get("provenance")
+    if isinstance(provenance, dict):
+        clean_provenance = {
+            key: value
+            for key, value in provenance.items()
+            if key in _PUBLIC_PROVENANCE_KEYS and isinstance(value, str) and value
+        }
+        public["provenance"] = clean_provenance
+
+    retrieval = envelope.get("retrieval")
+    if isinstance(retrieval, dict):
+        public["retrieval"] = {
+            key: retrieval[key]
+            for key in (
+                "untrusted_context",
+                "citation_required",
+                "document_drilldown_available",
+            )
+            if isinstance(retrieval.get(key), bool)
+        }
+
+    relevance = envelope.get("relevance")
+    if isinstance(relevance, dict):
+        clean_relevance: dict[str, Any] = {}
+        for key in ("term_coverage", "retriever_score"):
+            value = relevance.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                clean_relevance[key] = value
+        matched_terms = relevance.get("matched_terms")
+        if isinstance(matched_terms, list):
+            clean_relevance["matched_terms"] = [
+                term for term in matched_terms if isinstance(term, str)
+            ]
+        match_context = relevance.get("match_context")
+        if isinstance(match_context, dict):
+            offset = match_context.get("offset")
+            text = match_context.get("text")
+            if (
+                isinstance(offset, int)
+                and not isinstance(offset, bool)
+                and offset >= 0
+                and isinstance(text, str)
+            ):
+                clean_relevance["match_context"] = {"offset": offset, "text": text}
+        public["relevance"] = clean_relevance
+    return public
+
+
+def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
+    """Return one explicit public search-result shape.
+
+    Retrieval engines may attach storage and pipeline fields to their rows.
+    This allowlist keeps the content, source links, drill-down identity, and
+    Citadel metadata while preventing those engine fields from crossing the
+    HTTP or MCP boundary.
+    """
+    raw = item if isinstance(item, dict) else {"text": str(item)}
+    envelope = raw.get("_citadel") if isinstance(raw.get("_citadel"), dict) else {}
+    public_envelope = _public_search_envelope(envelope)
+    provenance = (
+        public_envelope.get("provenance")
+        if isinstance(public_envelope.get("provenance"), dict)
+        else {}
+    )
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    text = _first_str(
+        raw.get("text"),
+        raw.get("content"),
+        raw.get("chunk"),
+        raw.get("body"),
+        raw.get("summary"),
+        raw.get("answer"),
+        raw.get("result"),
+        raw.get("title"),
+    ) or ""
+    title = _first_str(
+        raw.get("title"),
+        provenance.get("title"),
+        metadata.get("title"),
+    )
+    if not title:
+        title = text.split("\n", 1)[0][:120] if text else "Untitled result"
+    source_url = _first_str(
+        raw.get("url"),
+        raw.get("source_url"),
+        provenance.get("source_url"),
+    )
+    source = _first_str(
+        source_url,
+        raw.get("source"),
+        provenance.get("source"),
+        provenance.get("path"),
+    )
+    tags_value = raw.get("tags") or metadata.get("citadel_tags") or metadata.get("tags")
+    tags = (
+        [str(tag) for tag in tags_value if isinstance(tag, (str, int, float))]
+        if isinstance(tags_value, list)
+        else []
+    )
+    score = raw.get("score")
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        score = None
+    chunk_index = _hit_chunk_index(raw)
+    if not isinstance(chunk_index, int) or isinstance(chunk_index, bool):
+        chunk_index = None
+    result_id = _first_str(raw.get("id"), public_envelope.get("result_id"))
+    document_id = _first_str(raw.get("document_id"))
+    qa_id = _first_str(
+        raw.get("qa_id"),
+        raw.get("qaId"),
+        raw.get("answer_id"),
+        metadata.get("qa_id"),
+        metadata.get("qaId"),
+        metadata.get("answer_id"),
+        result_id,
+    )
+    rank = public_envelope.get("rank")
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank < 1:
+        rank = index + 1
+    dataset = _first_str(public_envelope.get("dataset"), raw.get("dataset"))
+    doc_type = _first_str(public_envelope.get("doc_type")) or infer_doc_type(raw)
+    content_hint = (
+        _first_str(public_envelope.get("content_hint"))
+        or infer_content_hint(raw, doc_type)
+    )
+    trust_tier = (
+        _first_str(public_envelope.get("trust_tier"), public_envelope.get("trust"))
+        or infer_trust_tier(raw, doc_type)
+    )
+    return {
+        "id": result_id,
+        "document_id": document_id,
+        "qa_id": qa_id,
+        "title": title,
+        "text": text,
+        "source": source,
+        "source_url": source_url,
+        "url": source_url,
+        "repo": _first_str(raw.get("repo"), provenance.get("repo"), metadata.get("repo")),
+        "path": _first_str(raw.get("path"), provenance.get("path"), metadata.get("path")),
+        "tags": tags,
+        "score": score,
+        "chunk_index": chunk_index,
+        "doc_type": doc_type,
+        "content_hint": content_hint,
+        "trust_tier": trust_tier,
+        "updated_at": _first_timestamp(
+            raw.get("updated_at"),
+            public_envelope.get("created_at"),
+            metadata.get("updated_at"),
+        ),
+        "rank": rank,
+        "dataset": dataset,
+        "_citadel": public_envelope,
+    }
+
 
 def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None) -> dict[str, Any]:
     """Stable agent hit schema for CLI --json output.

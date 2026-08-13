@@ -95,11 +95,13 @@ from kb.search_format import (
     infer_content_hint,
     infer_doc_type,
     infer_trust_tier,
+    is_search_content_hit,
     is_docs_mode_query,
     is_spec_mode_query,
     lexical_relevance_summary,
     parse_content_header,
     query_terms,
+    shape_public_search_hit,
     token_asset_authority_warning,
 )
 from kb.security_scan import (
@@ -2973,6 +2975,28 @@ def with_result_metadata(
     metadata["content_hint"] = infer_content_hint(preview, doc_type)
     metadata["trust_tier"] = infer_trust_tier(preview, doc_type)
     return {**normalized, "_citadel": metadata}
+
+
+def public_search_result(
+    result: Any,
+    index: int,
+    dataset: str,
+    *,
+    drilldown_predicate: Callable[[str], bool] | None = None,
+    query: str | None = None,
+) -> dict[str, Any] | None:
+    """Reject non-content rows and return the shared public result DTO."""
+    if not is_search_content_hit(result):
+        return None
+    candidate = result if isinstance(result, dict) else {"text": result}
+    enriched = with_result_metadata(
+        candidate,
+        index,
+        dataset,
+        drilldown_predicate=drilldown_predicate,
+        query=query,
+    )
+    return shape_public_search_hit(enriched, index=index)
 
 
 def _trace_author_seat(result: dict[str, Any]) -> str | None:
@@ -7253,41 +7277,6 @@ async def contribute(body: ContributeBody, request: Request) -> Any:
     )
 
 
-def flat_knowledge_result(result: Any) -> dict[str, Any]:
-    """Flatten one search hit into the agent-friendly knowledge shape."""
-    if not isinstance(result, dict):
-        return {"text": str(result), "source": None}
-    provenance = result_provenance(result)
-    text = first_string(
-        result.get("text"),
-        result.get("content"),
-        result.get("chunk"),
-        result.get("body"),
-        result.get("summary"),
-        result.get("title"),
-    )
-    if not text:
-        text = json.dumps(
-            {key: value for key, value in result.items() if key != "_citadel"},
-            sort_keys=True,
-            default=str,
-        )[:500]
-    payload: dict[str, Any] = {
-        "text": text,
-        "source": provenance.get("source_url")
-        or provenance.get("source")
-        or provenance.get("path"),
-    }
-    score = result.get("score")
-    if isinstance(score, (int, float)) and not isinstance(score, bool):
-        payload["score"] = score
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    tags = result.get("tags") or metadata.get("citadel_tags") or metadata.get("tags")
-    if isinstance(tags, list):
-        payload["tags"] = [str(tag) for tag in tags if isinstance(tag, (str, int, float))]
-    return payload
-
-
 @app.get("/api/knowledge")
 async def knowledge(
     request: Request,
@@ -7307,6 +7296,7 @@ async def knowledge(
     mesh_state = get_mesh()
     search_datasets = resolve_search_datasets(identity, dataset, citadel.config)
     search_sessions = resolve_search_sessions(identity, None, search_datasets)
+    fetch_k = min(max(limit * 3, limit + 10), 100)
     max_concurrency = citadel.config.search_max_concurrency
     timed_out = False
     started = time.perf_counter()
@@ -7319,7 +7309,7 @@ async def knowledge(
                 query=query,
                 datasets=search_datasets,
                 sessions=search_sessions,
-                top_k=limit,
+                top_k=fetch_k,
             )
         except QdrantProviderError as exc:
             await mesh_state.record_error(
@@ -7351,23 +7341,41 @@ async def knowledge(
                 "message": "Search exceeded the configured server budget.",
             },
         )
+    public_pairs: list[tuple[str, dict[str, Any]]] = []
+    for index, (search_dataset, result) in enumerate(merged):
+        shaped = public_search_result(
+            result,
+            index,
+            search_dataset,
+            # The compatibility alias has never advertised document previews.
+            # Keep the safe under-promise for every role instead of claiming a
+            # scoped document is reachable without running the ownership pass.
+            drilldown_predicate=lambda _result_id: False,
+            query=query,
+        )
+        if shaped is not None:
+            public_pairs.append((search_dataset, shaped))
+    public_pairs = public_pairs[:limit]
+    for rank, (_, result) in enumerate(public_pairs, start=1):
+        result["rank"] = rank
+        result["_citadel"]["rank"] = rank
     latency_ms = (time.perf_counter() - started) * 1000.0
-    for search_dataset, _ in merged:
+    for search_dataset in search_datasets:
         await mesh_state.record_search(
             citadel.config,
             query=query,
             dataset=search_dataset,
-            result_count=sum(1 for ds, _ in merged if ds == search_dataset),
+            result_count=sum(1 for ds, _ in public_pairs if ds == search_dataset),
         )
     primary_dataset = search_datasets[0]
-    flat_results = [flat_knowledge_result(result) for _, result in merged]
+    public_results = [result for _, result in public_pairs]
     telemetry = await capture_search_feedback(
         mesh_state=mesh_state,
         config=citadel.config,
         request=request,
         actor=identity,
         query=query,
-        results=flat_results,
+        results=public_results,
         search_datasets=search_datasets,
         primary_dataset=primary_dataset,
         top_k=limit,
@@ -7380,7 +7388,7 @@ async def knowledge(
         "query": query,
         "dataset": primary_dataset,
         "datasets": search_datasets if len(search_datasets) > 1 else None,
-        "results": flat_results,
+        "results": public_results,
     }
     if telemetry:
         payload["search_id"] = telemetry.get("search_id")
@@ -7448,7 +7456,9 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     # candidates when filters are active and trim back to top_k after
     # filtering; 100 is SearchBody's own top_k ceiling, so a filtered call can
     # never fetch more than an unfiltered one is allowed to ask for.
-    fetch_k = min(max(body.top_k * 3, body.top_k + 10), 100) if filters_active else body.top_k
+    # The public boundary drops non-content engine rows. Over-fetch even when
+    # request filters are absent so those rows cannot consume the whole page.
+    fetch_k = min(max(body.top_k * 3, body.top_k + 10), 100)
     limit = citadel.config.search_max_concurrency
     timed_out = False
     started = time.perf_counter()
@@ -7541,8 +7551,9 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     # each scoped resolution costs a get_document call and over-fetching for
     # filters would otherwise triple that cost for hits the caller never sees.
     bypass_drilldown = can_bypass_dataset_allowlist(actor)
-    normalized = [
-        with_result_metadata(
+    normalized: list[dict[str, Any]] = []
+    for index, (dataset, result) in enumerate(merged):
+        shaped = public_search_result(
             result,
             index,
             dataset,
@@ -7553,8 +7564,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             drilldown_predicate=None if bypass_drilldown else (lambda _result_id: False),
             query=body.query,
         )
-        for index, (dataset, result) in enumerate(merged)
-    ]
+        if shaped is not None:
+            normalized.append(shaped)
     cleaned_mode = body.cleaned_mode()
     docs_mode = is_docs_mode_query(body.query, mode=cleaned_mode)
     if docs_mode or is_spec_mode_query(body.query) or len(query_terms(body.query)) == 1:
@@ -7572,6 +7583,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     for index, item in enumerate(normalized):
         if isinstance(item, dict) and isinstance(item.get("_citadel"), dict):
             item["_citadel"]["rank"] = index + 1
+            item["rank"] = index + 1
 
     # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
     # (and the document_endpoint URL) must be TRUE only when /api/documents would
