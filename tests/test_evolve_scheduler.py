@@ -78,6 +78,14 @@ async def test_stop_evolve_scheduler_handles_none() -> None:
 class _FakeCitadel:
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
+        self.resume_calls: list[bool] = []
+
+    def resume_lifecycle_queue(self) -> bool:
+        # The scheduler kicks the projection drain after every pass, because
+        # starts are suppressed while Phase 1 holds the writer lock and Phase 2
+        # never drains the lifecycle queue itself.
+        self.resume_calls.append(True)
+        return True
 
     async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
         self._cognify_calls.append(force)
@@ -134,7 +142,8 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
         raise AssertionError("the evolve scheduler must not spawn a subprocess")
 
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", forbidden_exec)
-    monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
+    fake_citadel = _FakeCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
 
     task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
     try:
@@ -155,6 +164,11 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     assert len(cognify_calls) >= 2
     # The verify canary verdict is recorded for /readyz (#27).
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
+    # Every pass ends by kicking the projection drain: starts are suppressed
+    # while Phase 1 holds the writer lock, and Phase 2 cognifies directly
+    # without draining the lifecycle queue, so a job accepted mid-pass would
+    # otherwise wait for the next external ingest or the next pass.
+    assert len(fake_citadel.resume_calls) >= 1
 
 
 class _RaisingCitadel:
@@ -225,6 +239,26 @@ async def test_add_only_mode_does_not_leak_outside_the_pass(tmp_path: Path) -> N
     assert _suppress_inline_cognify() is False
     # ...and a task created outside it never sees it.
     assert await asyncio.create_task(observer()) is False
+
+
+async def test_inline_projection_suppression_honours_the_context_variable() -> None:
+    """The service-side checker must read the same flag Phase 1 actually sets.
+
+    Phase 1 moved into the web process (#88) and marks itself with the
+    _SUPPRESS_INLINE_COGNIFY context variable, deliberately NOT the environment
+    variable, which is process-wide. `Citadel._inline_projection_suppressed`
+    read only os.getenv, so it answered False for the whole of Phase 1 and let
+    accept_source start the projection drain while Phase 1 held the graph
+    writer lock. On 2026-08-13 that parked a job on writer_lock.acquire() for
+    66 minutes while the lease heartbeat renewed it, so nothing reclaimed it.
+    """
+    from kb.cognee_client import suppress_inline_cognify
+    from kb.service import Citadel
+
+    assert Citadel._inline_projection_suppressed() is False
+    with suppress_inline_cognify():
+        assert Citadel._inline_projection_suppressed() is True
+    assert Citadel._inline_projection_suppressed() is False
 
 
 async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(
