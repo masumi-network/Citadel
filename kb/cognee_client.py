@@ -1175,10 +1175,11 @@ class CogneePublicClient:
         ``(source_id, target_id, relationship_name, properties)`` tuples, per
         ``cognee.infrastructure.databases.graph.graph_db_interface``.
 
-        The read scans the ENTIRE graph (~0.3s+ on the prod node) and is now
-        front-loaded on every dashboard open, so the result is cached for
+        The read scans the ENTIRE graph — every provisioned dataset store, see
+        ``_read_graph_data`` — (~0.3s+ on the prod node) and is front-loaded on
+        every dashboard open, so the result is cached for
         ``GRAPH_DATA_CACHE_TTL_SECONDS`` behind a single-flight lock: a burst of
-        concurrent /api/mesh/graph opens collapses to one Kuzu read instead of
+        concurrent /api/mesh/graph opens collapses to one store sweep instead of
         one per caller (#28/#50). Per-caller shaping still runs per request.
         """
         cached = self._graph_data_cache
@@ -1200,10 +1201,123 @@ class CogneePublicClient:
         self._graph_data_cache = None
 
     async def _read_graph_data(self) -> tuple[list[Any], list[Any]]:
+        """Merge every provisioned dataset store into one org-wide graph read.
+
+        Under ENABLE_BACKEND_ACCESS_CONTROL each dataset lives in its own graph
+        database, and ``get_graph_engine()`` resolves whichever per-dataset
+        config the cognee ``graph_db_config`` ContextVar carries — cognee
+        deliberately leaves the LAST entered dataset context in place after an
+        ``async with set_database_global_context_variables(...)`` block exits.
+        Trusting that ambient context made this read return whichever single
+        store the current task last touched: refilled after a cognify it was
+        the content dataset's store (43,732 total nodes live on 2026-08-13),
+        refilled right after the corpus-health census — whose per-dataset loop
+        ends on the alphabetically last probed dataset — it was that store (21
+        total nodes, same day), and /api/mesh/graph plus the corpus-health
+        ``indexed_docs``/``indexed_edges`` flapped between the two. ADR-0020
+        names the org-wide read: one ``get_graph_data()`` per dataset, merged
+        with node-id deduplication. Edges dedupe on (source, target,
+        relationship), the triple cognee's adapters MERGE on within a store,
+        so a document mirrored into two datasets returns once. Datasets come
+        from the relational ``dataset_database`` rows — already-provisioned
+        stores only, so a read never creates databases — and a node with no
+        provisioned store keeps the single ambient-context read (access
+        control off, single-store deployments, local fakes).
+        """
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
+        provisioned = await self._provisioned_dataset_databases()
+        if not provisioned:
+            return await self._read_graph_data_current_context()
+        nodes: list[Any] = []
+        edges: list[Any] = []
+        seen_nodes: set[str] = set()
+        seen_edges: set[tuple[str, str, str]] = set()
+        for dataset_id, owner_id in provisioned:
+            scoped_nodes, scoped_edges = await self._read_graph_data_for_dataset(
+                dataset_id, owner_id
+            )
+            for raw in scoped_nodes:
+                try:
+                    node_id = str(raw[0])
+                except (TypeError, IndexError, KeyError):
+                    nodes.append(raw)
+                    continue
+                if node_id in seen_nodes:
+                    continue
+                seen_nodes.add(node_id)
+                nodes.append(raw)
+            for raw in scoped_edges:
+                try:
+                    edge_key = (str(raw[0]), str(raw[1]), str(raw[2]))
+                except (TypeError, IndexError, KeyError):
+                    edges.append(raw)
+                    continue
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edges.append(raw)
+        return nodes, edges
+
+    async def _provisioned_dataset_databases(self) -> list[tuple[UUID, UUID]]:
+        """(dataset_id, owner_id) for every dataset with a provisioned database.
+
+        Read straight from the relational ``dataset_database`` rows so the
+        org-wide loop only ever opens stores that already exist:
+        ``set_database_global_context_variables`` provisions a database for a
+        dataset that lacks one, and a read path must not create databases.
+        Sorted by dataset id for a deterministic merge order.
+        """
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.users.models import DatasetDatabase
+        from sqlalchemy import select
+
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(DatasetDatabase.dataset_id, DatasetDatabase.owner_id)
+            )
+            pairs = rows.all()
+        return sorted(
+            ((dataset_id, owner_id) for dataset_id, owner_id in pairs),
+            key=lambda pair: str(pair[0]),
+        )
+
+    async def _read_graph_data_for_dataset(
+        self, dataset_id: UUID, owner_id: UUID
+    ) -> tuple[list[Any], list[Any]]:
+        """One dataset store's raw graph, with the ambient context restored.
+
+        cognee keeps the per-dataset graph/vector/file-storage configs set
+        after the ``async with`` block exits, on purpose, so callers can keep
+        reading the dataset databases they just wrote. This read must not
+        repoint the surrounding task at whichever dataset merged last:
+        ``cognify_dataset`` deletes its verify marker through the engine the
+        ambient context resolves, and that marker lives in the just-cognified
+        dataset's store. The prior values go back once the store is read.
+        """
+        from cognee.context_global_variables import (
+            graph_db_config,
+            set_database_global_context_variables,
+            vector_db_config,
+        )
+        from cognee.infrastructure.files.storage.config import file_storage_config
+
+        prior = [
+            (variable, variable.get(None))
+            for variable in (graph_db_config, vector_db_config, file_storage_config)
+        ]
+        try:
+            async with set_database_global_context_variables(dataset_id, owner_id):
+                return await self._read_graph_data_current_context()
+        finally:
+            for variable, value in prior:
+                variable.set(value)
+
+    async def _read_graph_data_current_context(self) -> tuple[list[Any], list[Any]]:
+        """Raw nodes and edges from the engine the active context resolves."""
         from cognee.infrastructure.databases.graph import get_graph_engine
 
         engine = await get_graph_engine()

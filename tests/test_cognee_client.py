@@ -7,7 +7,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Mapping
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -298,6 +298,152 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
     await client.graph_data()
 
     assert reads == 2
+
+
+@pytest.mark.asyncio
+async def test_graph_data_merges_every_provisioned_dataset_store(
+    monkeypatch: Any,
+) -> None:
+    """Org-wide totals come from the per-dataset loop, never one ambient store.
+
+    Under backend access control each dataset lives in its own graph database
+    and cognee leaves the LAST entered dataset context set after use. Pre-fix,
+    ``_read_graph_data`` resolved that ambient engine, so /api/mesh/graph
+    ``total_nodes``/``total_edges`` and the corpus-health ``indexed_docs``/
+    ``indexed_edges`` published whichever store a prior operation leaked into
+    the refilling task: 43,732 total nodes after a cognify refill vs 21 after a
+    corpus-health census refill, live on 2026-08-13, on the endpoint the app
+    graph page renders (kb/static/app.js /api/mesh/graph). ADR-0020: the
+    org-wide read loops the provisioned dataset stores and merges, deduping
+    nodes by id and edges by (source, target, relationship).
+    """
+    client = CogneePublicClient()
+    owner = uuid4()
+    dataset_a, dataset_b = sorted((uuid4(), uuid4()), key=str)
+    stores: dict[UUID, tuple[list[Any], list[Any]]] = {
+        dataset_a: (
+            [("doc-a", {"name": "a"}), ("shared", {"name": "s"})],
+            [("doc-a", "shared", "is_part_of", {})],
+        ),
+        dataset_b: (
+            [("doc-b", {"name": "b"}), ("shared", {"name": "s"})],
+            [
+                ("doc-b", "shared", "is_part_of", {}),
+                ("doc-a", "shared", "is_part_of", {}),
+            ],
+        ),
+    }
+    read_order: list[UUID] = []
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return [(dataset_a, owner), (dataset_b, owner)]
+
+    async def read_for_dataset(
+        dataset_id: UUID, owner_id: UUID
+    ) -> tuple[list[Any], list[Any]]:
+        assert owner_id == owner
+        read_order.append(dataset_id)
+        scoped_nodes, scoped_edges = stores[dataset_id]
+        return list(scoped_nodes), list(scoped_edges)
+
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_read_graph_data_for_dataset", read_for_dataset)
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+
+    nodes, edges = await client.graph_data()
+
+    assert read_order == [dataset_a, dataset_b]
+    # The mirrored "shared" node dedupes by id; the cross-store duplicate edge
+    # dedupes by (source, target, relationship).
+    assert sorted(str(node_id) for node_id, _ in nodes) == ["doc-a", "doc-b", "shared"]
+    assert sorted((str(s), str(t)) for s, t, *_ in edges) == [
+        ("doc-a", "shared"),
+        ("doc-b", "shared"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graph_data_without_provisioned_stores_reads_current_context(
+    monkeypatch: Any,
+) -> None:
+    """No dataset_database rows (access control off, local fakes): the single
+    ambient-context read stands, byte-for-byte."""
+    client = CogneePublicClient()
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    async def provisioned() -> list[tuple[UUID, UUID]]:
+        return []
+
+    async def current_context() -> tuple[list[Any], list[Any]]:
+        return ([("only", {})], [])
+
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_provisioned_dataset_databases", provisioned)
+    monkeypatch.setattr(client, "_read_graph_data_current_context", current_context)
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
+
+    nodes, edges = await client.graph_data()
+
+    assert nodes == [("only", {})]
+    assert edges == []
+
+
+@pytest.mark.asyncio
+async def test_per_dataset_graph_read_restores_ambient_context(
+    monkeypatch: Any,
+) -> None:
+    """The org-wide loop must not leave the task pointed at the last store.
+
+    cognee intentionally persists a dataset context after ``async with`` exit;
+    ``cognify_dataset`` relies on that to delete its verify marker from the
+    just-cognified store. The per-dataset read therefore puts the prior
+    graph/vector/file-storage configs back after reading.
+    """
+    from cognee import context_global_variables as context_module
+
+    client = CogneePublicClient()
+    sentinel = {"graph": "prior"}
+    prior_vector = context_module.vector_db_config.get(None)
+    token = context_module.graph_db_config.set(sentinel)
+    try:
+
+        class FakeContext:
+            def __init__(self, dataset_id: UUID, owner_id: UUID) -> None:
+                pass
+
+            async def __aenter__(self) -> "FakeContext":
+                # Mimic cognee: the entered configs persist past __aexit__.
+                context_module.graph_db_config.set({"graph": "leaked"})
+                context_module.vector_db_config.set({"vector": "leaked"})
+                return self
+
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+
+        async def current_context() -> tuple[list[Any], list[Any]]:
+            return ([], [])
+
+        monkeypatch.setattr(
+            context_module, "set_database_global_context_variables", FakeContext
+        )
+        monkeypatch.setattr(
+            client, "_read_graph_data_current_context", current_context
+        )
+
+        await client._read_graph_data_for_dataset(uuid4(), uuid4())
+
+        assert context_module.graph_db_config.get(None) is sentinel
+        assert context_module.vector_db_config.get(None) is prior_vector
+    finally:
+        context_module.graph_db_config.reset(token)
 
 
 class _FakeGraphEngine:
