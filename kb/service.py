@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 import json
 import logging
+import math
 import os
 import re
 from uuid import uuid4
@@ -52,9 +53,32 @@ MAX_SEARCH_TOP_K = 100
 
 # The cognify verify canary re-searches for its marker, because cognify can be
 # settling when the first search runs. Module-level so a test can shrink them
-# instead of sleeping through the real backoff.
+# instead of sleeping through the real backoff. Non-lifecycle deployments only:
+# under lifecycle v1 the canary waits on the marker's projection operation
+# instead (see ``_canary_timeout_seconds``).
 CANARY_SEARCH_ATTEMPTS = 3
 CANARY_SEARCH_BACKOFF_SECONDS = 2.0
+
+# Ceiling for the lifecycle canary's wait on its marker's projection operation.
+# The drain runs minutes behind the accept under normal load, and a held writer
+# lock can park a job far longer, so the default is generous. Env-tunable for
+# operators; tests park the drain instead of shrinking this.
+DEFAULT_CANARY_TIMEOUT_SECONDS = 600.0
+
+
+def _canary_timeout_seconds() -> float:
+    raw = os.getenv("CITADEL_CANARY_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_CANARY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_CANARY_TIMEOUT_SECONDS
+    # isfinite: float() parses "inf", which passes a > 0 check and would make
+    # the canary wait poll forever — a silent permanent scheduler hang.
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_CANARY_TIMEOUT_SECONDS
+    return value
 
 
 class Citadel:
@@ -1518,30 +1542,76 @@ class Citadel:
         verification: dict[str, Any] | None = None
         if verify:
             marker = f"COGNIFY_TEST_MARKER_{uuid4().hex}"
-            await self.ingest(marker, dataset=target_dataset)
+            marker_ingest = await self.ingest(marker, dataset=target_dataset)
             await self.cognee.cognify(datasets=[target_dataset], force=force)
-            # Cognify can still be settling, so re-search a bounded number of
-            # times before calling it a miss (#114). Without this, requiring a
-            # real search hit would flag a slow-but-healthy node as broken.
             search_hit = False
             attempts = 0
-            for attempt in range(CANARY_SEARCH_ATTEMPTS):
-                attempts = attempt + 1
-                matches = await self.search(marker, dataset=target_dataset, top_k=10)
-                if _marker_in_results(marker, matches):
-                    search_hit = True
-                    break
-                if attempts < CANARY_SEARCH_ATTEMPTS:
-                    await asyncio.sleep(CANARY_SEARCH_BACKOFF_SECONDS)
+            failure_reason: str | None = None
+            if (
+                self.lifecycle_store is not None
+                and marker_ingest.projection_job_id is not None
+            ):
+                # Lifecycle v1: the marker ingest queues an async projection
+                # JOB and returns before cognee sees the content, and search
+                # excludes revisions without a searchable receipt before it
+                # consults any backend — so a seconds-scale re-search loop can
+                # never bridge a minutes-scale drain and the canary was a
+                # deterministic miss (#114's loop predates lifecycle v1). Wait
+                # on the operation record instead (the wait kicks the drain
+                # itself), then run ONE confirming search so a green canary
+                # still proves end-to-end recall, not receipt bookkeeping.
+                try:
+                    await self.wait_for_lifecycle_operation(
+                        marker_ingest.projection_job_id,
+                        timeout_seconds=_canary_timeout_seconds(),
+                    )
+                except TimeoutError:
+                    failure_reason = "projection_timeout"
+                except RuntimeError:
+                    failure_reason = "projection_failed"
+                else:
+                    attempts = 1
+                    matches = await self.search(
+                        marker, dataset=target_dataset, top_k=10
+                    )
+                    search_hit = _marker_in_results(marker, matches)
+                    if not search_hit:
+                        failure_reason = "search_miss_after_searchable"
+            else:
+                # Cognify can still be settling, so re-search a bounded number
+                # of times before calling it a miss (#114). Without this,
+                # requiring a real search hit would flag a slow-but-healthy
+                # node as broken.
+                for attempt in range(CANARY_SEARCH_ATTEMPTS):
+                    attempts = attempt + 1
+                    matches = await self.search(
+                        marker, dataset=target_dataset, top_k=10
+                    )
+                    if _marker_in_results(marker, matches):
+                        search_hit = True
+                        break
+                    if attempts < CANARY_SEARCH_ATTEMPTS:
+                        await asyncio.sleep(CANARY_SEARCH_BACKOFF_SECONDS)
             verification = {
                 "marker": marker,
                 "search_hit": search_hit,
                 "search_attempts": attempts,
             }
+            if marker_ingest.projection_job_id is not None:
+                verification["projection_job_id"] = marker_ingest.projection_job_id
+            if failure_reason is not None:
+                verification["reason"] = failure_reason
             # Backprop (#15): the canary marker used to persist forever, surfacing in
             # search/linear_search results. Delete its node now so verify leaves no
             # trace. Best-effort — never fail the cognify on a cleanup hiccup.
             await self._delete_marker_node(marker)
+            if (
+                self.lifecycle_store is not None
+                and marker_ingest.projection_job_id is not None
+            ):
+                await self._tombstone_marker_source(
+                    marker_ingest.projection_job_id, marker=marker
+                )
 
         after = await self._graph_counts()
         graph_grew = (
@@ -3031,6 +3101,35 @@ class Citadel:
                 await self.cognee.delete_graph_nodes(ids)
         except Exception:  # noqa: BLE001 - cleanup must never fail the cognify
             logger.warning("could not delete cognify verify marker %s", marker, exc_info=True)
+
+    async def _tombstone_marker_source(
+        self, projection_job_id: str, *, marker: str
+    ) -> None:
+        """Best-effort durable cleanup of a verify marker's source revision.
+
+        ``_delete_marker_node`` removes the already-projected graph node, but
+        under lifecycle v1 the marker is also a durable source revision whose
+        current head would otherwise stay searchable forever — one accreted
+        marker document per verify pass. Tombstoning supersedes the head, so
+        the search filters exclude the marker durably whether or not its
+        projection ever drained. The tombstone projection writes current-head
+        exclusion receipts and deletes no provider content
+        (``kb/lifecycle_worker.py`` ``_project_tombstone``), so the vector
+        chunk becomes an excluded orphan rather than disappearing; the graph
+        node is the ``_delete_marker_node`` call above. Never fails the
+        cognify on a cleanup hiccup.
+        """
+        try:
+            operation = self.lifecycle_operation(projection_job_id)
+            await self.tombstone_source(
+                dataset=str(operation["dataset"]),
+                source_key=str(operation["source_revision"]["source_key"]),
+                reason="cognify_verify_marker_cleanup",
+            )
+        except Exception:  # noqa: BLE001 - cleanup must never fail the cognify
+            logger.warning(
+                "could not tombstone cognify verify marker %s", marker, exc_info=True
+            )
 
     async def cleanup_legacy_nodes(self, *, dry_run: bool = True) -> dict[str, Any]:
         """Find (and, when dry_run is False, delete) legacy garbage nodes (#15).

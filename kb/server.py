@@ -366,6 +366,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             "yes",
             "on",
         }
+        cancelled = False
         try:
             # verify=True runs the end-to-end ingest+cognify+search canary and
             # records its verdict for /readyz (#27).
@@ -385,6 +386,12 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 _LAST_CANARY["ok"],
             )
         except asyncio.CancelledError:
+            # Teardown landing mid-Phase-2 (the canary can now wait minutes on
+            # its marker's projection, so this window is wide): the pass did
+            # NOT run to completion, so stamping it would make the next boot
+            # wait a full interval instead of re-running the interrupted pass,
+            # and kicking a drain task on a loop being torn down helps nobody.
+            cancelled = True
             raise
         except Exception as exc:
             logger.exception("Evolve scheduler: cognify failed")
@@ -400,26 +407,31 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 "error": exc.__class__.__name__,
             }
         finally:
-            # Stamp the pass even when a stage failed. This records that the
-            # cycle RAN, which is what the next boot needs to resume the
-            # interval; whether the stages succeeded is already on the "Evolve
-            # finished" line and in /readyz. Recording only clean passes would
-            # make a node with one broken stage restart its clock forever, which
-            # is the bug this fixes (#153).
-            record_completed(state_path)
-            # Drain whatever the pass deferred. Projection starts are
-            # suppressed while Phase 1 holds the writer lock, and Phase 2
-            # cognifies directly without touching the lifecycle queue, so
-            # without this kick a job accepted mid-pass waits for the next
-            # external ingest or the next pass. The lock is free and the
-            # suppression scope has ended by this point, and the call is a
-            # no-op when a drain is already running.
-            resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
-            if callable(resume):
-                try:
-                    resume()
-                except Exception:
-                    logger.exception("Evolve scheduler: post-pass projection resume failed")
+            if not cancelled:
+                # Stamp the pass even when a stage failed. This records that the
+                # cycle RAN, which is what the next boot needs to resume the
+                # interval; whether the stages succeeded is already on the
+                # "Evolve finished" line and in /readyz. Recording only clean
+                # passes would make a node with one broken stage restart its
+                # clock forever, which is the bug this fixes (#153). A CANCELLED
+                # pass is the one exception: it did not run, so it must not
+                # stamp (see the CancelledError branch above).
+                record_completed(state_path)
+                # Drain whatever the pass deferred. Projection starts are
+                # suppressed while Phase 1 holds the writer lock, and Phase 2
+                # cognifies directly without touching the lifecycle queue, so
+                # without this kick a job accepted mid-pass waits for the next
+                # external ingest or the next pass. The lock is free and the
+                # suppression scope has ended by this point, and the call is a
+                # no-op when a drain is already running.
+                resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
+                if callable(resume):
+                    try:
+                        resume()
+                    except Exception:
+                        logger.exception(
+                            "Evolve scheduler: post-pass projection resume failed"
+                        )
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
