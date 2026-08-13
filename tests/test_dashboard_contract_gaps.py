@@ -811,6 +811,19 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
     assert "parentDocumentInView" in sourcing.group(1), (
         "sourcing chunks must resolve to their parent documents when in view"
     )
+    # Structural pins on the two load-bearing lines (logic verified by review,
+    # 2026-08-13): gutting either must fail here, not only deleting the function.
+    assert 'nodeKind(chunk) !== "chunk"' in sourcing.group(1), (
+        "the other-endpoint kind filter is gone; Entity->Entity contains edges "
+        "(32 in the live payload) would count as sourcing chunks"
+    )
+    assert ".sort((a, b) => b.count - a.count)" in sourcing.group(1), (
+        "the sourcing-count ranking is gone; the digest that name-drops a node "
+        "once would tie with the document actually about it"
+    )
+    assert '"Sources this node"' in sourcing.group(1), (
+        "sourcing candidates lost their provenance label"
+    )
     candidates = re.search(
         r"function documentCandidates\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
     )
