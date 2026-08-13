@@ -4231,16 +4231,32 @@ class CogneePublicClient:
                     "VECTOR_DB_PROVIDER does not support exact enumeration"
                 )
             elif not stored_check["ok"]:
+                # Name the violators. The check already collects chunk_id and
+                # document_id per violation, but this site used to drop them and
+                # raise a bare count, so the 2026-08-13 canary failed for hours
+                # on one unidentifiable chunk out of ~1951 with no surface
+                # anywhere naming the offending document.
+                named = "; ".join(
+                    f"document {violation.get('document_id') or 'unknown'} "
+                    f"chunk {violation.get('chunk_id') or 'unknown'} "
+                    f"({violation.get('measured_tokens') or violation.get('configured_size')}"
+                    f" tokens > budget {stored_check.get('budget')})"
+                    for violation in (stored_check.get("violations") or [])[:3]
+                ) or "no violation rows"
+                missing = stored_check.get("missing_document_ids") or []
+                if missing:
+                    named += f"; missing document ids {missing[:3]}"
                 logger.error(
                     "stored chunk budget check failed after cognify: "
-                    "%d violation(s) across %d chunk(s)",
+                    "%d violation(s) across %d chunk(s): %s",
                     stored_check["violation_count"],
                     stored_check["chunks_scanned"],
+                    named,
                 )
                 raise RuntimeError(
                     "stored chunk budget check failed: "
                     f"{stored_check['violation_count']} violation(s) across "
-                    f"{stored_check['chunks_scanned']} persisted chunk(s)"
+                    f"{stored_check['chunks_scanned']} persisted chunk(s): {named}"
                 )
         return result
 

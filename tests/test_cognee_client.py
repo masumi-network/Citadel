@@ -2680,6 +2680,57 @@ async def test_cognify_fails_when_stored_chunk_check_is_red(monkeypatch: Any) ->
 
 
 @pytest.mark.asyncio
+async def test_cognify_budget_failure_names_the_violating_chunk(monkeypatch: Any) -> None:
+    """The raise must carry the violator's identity, not a bare count.
+
+    The check collects chunk_id and document_id per violation, but the raise
+    site used to drop them, so the 2026-08-13 readiness canary failed for hours
+    on "1 violation(s) across 1951 persisted chunk(s)" with no surface anywhere
+    naming the offending document.
+    """
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    run = SimpleNamespace(data_ingestion_info=[{"data_id": "doc-a"}])
+
+    async def run_migrations() -> None:
+        return None
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        return {"dataset-id": run}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
+    )
+    client = CogneePublicClient()
+
+    async def stored_chunk_budget_check(**_: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "violation_count": 1,
+            "chunks_scanned": 1951,
+            "budget": 256,
+            "violations": [
+                {
+                    "reason": "chunk_over_budget",
+                    "chunk_id": "chunk-9f1e",
+                    "document_id": "doc-minified-js",
+                    "measured_tokens": 1710,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await client.cognify(datasets=["notes"])
+    message = str(excinfo.value)
+    assert "document doc-minified-js" in message
+    assert "chunk chunk-9f1e" in message
+    assert "1710 tokens > budget 256" in message
+
+
+@pytest.mark.asyncio
 async def test_stored_chunk_budget_check_scans_exact_pgvector_payloads(
     monkeypatch: Any,
 ) -> None:
