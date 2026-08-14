@@ -9,6 +9,7 @@ import re
 import secrets
 import logging
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -3253,6 +3254,80 @@ def test_readyz_accepts_a_complete_multi_page_corpus_probe(
 
     assert ready.status_code == 200
     assert ready.json()["corpus"]["probe_documents"] == 65
+
+
+def test_readyz_bounds_a_slow_corpus_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(0.2)
+            return {"nodes": 65, "edges": 64}
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["corpus"]["degraded"] == (
+        "corpus health timed out after 0.01s"
+    )
+
+
+def test_readyz_fails_closed_when_timeout_uses_cached_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowCitadel(FakeCitadel):
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(0.2)
+            return {"nodes": 65, "edges": 64}
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    monkeypatch.setattr(
+        server_module,
+        "_CORPUS_HEALTH_CACHE",
+        (
+            time.monotonic(),
+            (1,),
+            {
+                "ok": True,
+                "tracked_sources": 50,
+                "indexed_docs": 65,
+                "indexed_edges": 64,
+            },
+        ),
+    )
+    client = authed_client("test-reader")
+    app.state.citadel = SlowCitadel()
+    app.state.github_syncer = Syncer()
+    app.state.repo_content_syncer = Syncer()
+    app.state.linear_syncer = Syncer()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["corpus"]["ok"] is False
+    assert ready.json()["corpus"]["indexed_docs"] == 65
+    assert ready.json()["corpus"]["degraded"] == (
+        "corpus health timed out after 0.01s; serving cached result"
+    )
 
 
 def test_readyz_rejects_inconsistent_complete_corpus_probe(

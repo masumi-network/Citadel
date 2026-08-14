@@ -5018,8 +5018,8 @@ async def _bounded_corpus_health() -> dict[str, Any]:
     A zero timeout keeps the previous unbounded behavior for operators that need
     the full measurement. The normal setting is finite. A timed-out probe is
     shielded so it can finish and populate the shared cache after the request
-    returns; callers use the last cached result when one exists, otherwise the
-    existing uptime-counter fallback.
+    returns; callers retain cached measurements for diagnostics, but timeout
+    results remain explicitly not ready.
     """
     try:
         if _CORPUS_HEALTH_TIMEOUT_SECONDS <= 0:
@@ -5034,6 +5034,7 @@ async def _bounded_corpus_health() -> dict[str, Any]:
         cached = _CORPUS_HEALTH_CACHE
         if cached is not None:
             result = dict(cached[2])
+            result["ok"] = False
             result["degraded"] = (
                 f"corpus health timed out after {timeout:g}s; serving cached result"
             )
@@ -5051,7 +5052,7 @@ async def _bounded_corpus_health() -> dict[str, Any]:
 async def readyz(request: Request) -> Any:
     require_access(request, "reader", "kb:read")
     config = get_citadel().config
-    corpus = await _corpus_health()
+    corpus = await _bounded_corpus_health()
     canary = _LAST_CANARY
     lifecycle = lifecycle_health(get_citadel())
     # RED when the corpus gate trips or the last end-to-end canary failed.
