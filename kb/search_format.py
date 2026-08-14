@@ -688,18 +688,31 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
         "dataset",
         "result_id",
         "content_sha256",
-        "trust",
         "author_seat",
         "created_at",
         "doc_type",
         "content_hint",
-        "trust_tier",
         "source_revision_id",
         "projection_receipt_id",
     ):
         value = envelope.get(key)
         if isinstance(value, str) and value:
             public[key] = value
+
+    # Trust is a closed public contract, not an arbitrary provider string.
+    # ``reference-only`` is a safe downgrade and is also how the server marks
+    # the Node-side copy of a shared trace. Unknown legacy claims such as
+    # ``canonical`` or ``verified`` must not cross the public boundary.
+    if envelope.get("trust") == TRUST_REFERENCE:
+        public["trust"] = TRUST_REFERENCE
+    if envelope.get("trust_tier") == TRUST_REFERENCE:
+        public["trust_tier"] = TRUST_REFERENCE
+    else:
+        # Re-derive from the sanitized envelope. This preserves an attested
+        # session-traces dataset and the safe trust downgrade above; every other
+        # missing, invalid, or unknown claim resolves to ``unattested``.
+        public["trust_tier"] = infer_trust_tier({"_citadel": public})
+
     endpoint = envelope.get("document_endpoint")
     if isinstance(endpoint, str) and endpoint.startswith("/api/documents/"):
         public["document_endpoint"] = endpoint
