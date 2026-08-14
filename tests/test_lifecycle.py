@@ -14,6 +14,7 @@ from kb.lifecycle import (
     CaptureContext,
     LifecycleConflictError,
     LifecycleNotFoundError,
+    LifecycleRequeueDriftError,
     LifecycleSchemaError,
     LifecycleStore,
     ProjectionLeaseError,
@@ -1032,7 +1033,7 @@ def test_generation_rebuild_rolls_back_every_precommit_fault(
     assert target_census.current_projection_receipts == 0
 
 
-def test_requeue_failed_projections_resets_jobs_and_receipts(tmp_path: Path) -> None:
+def test_requeue_failed_projections_resets_only_active_current_heads(tmp_path: Path) -> None:
     # 2026-08-12: 235 jobs failed while the embedding engine was down. The
     # heal-on-recapture path never fires for unchanged content, so this manual
     # requeue is the only way back for stable sources.
@@ -1052,23 +1053,69 @@ def test_requeue_failed_projections_resets_jobs_and_receipts(tmp_path: Path) -> 
         config_digest="sha256:config-1",
         providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
     )
-    accepted = store.accept_source(b"requeue me", capture=capture, projection=projection, now=T0)
-    lease = store.claim_next_job(worker_id="worker-1", now=T0, lease_seconds=30)
-    assert lease is not None
-    store.fail_job(lease, error_code="model_load", error_message="engine down", now=T0)
-    operation = store.get_operation(accepted.projection_job_id)
-    assert operation.job.state == "failed"
+    accepted = store.accept_source(
+        b"requeue me", capture=capture, projection=projection, now=T0
+    )
+    active = ProjectionRequest(
+        generation_id="generation-2",
+        projection_version="projection-v1",
+        config_digest="sha256:config-2",
+        providers=projection.providers,
+    )
+    rebuilt = store.queue_generation_rebuild(active, now=T0)
+    historical_active_job_id = rebuilt[0].job.projection_job_id
+    current = store.accept_source(
+        b"current revision", capture=capture, projection=active, now=T0
+    )
+    current_active_job_id = current.projection_job_id
+    foreign = ProjectionRequest(
+        generation_id="generation-foreign",
+        projection_version=active.projection_version,
+        config_digest=active.config_digest,
+        providers=active.providers,
+    )
+    foreign_job_id = store.queue_generation_rebuild(foreign, now=T0)[
+        0
+    ].job.projection_job_id
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE projection_jobs SET state = 'failed'")
+        connection.execute("UPDATE projection_receipts SET state = 'failed'")
 
-    assert store.requeue_failed_projections(now=T0) == 1
+    preview = store.failed_projection_candidates(active)
+    assert preview == (current_active_job_id,)
+    assert store.census().job_states["failed"] == 4
+    active_census = store.generation_census(
+        generation_id=active.generation_id,
+        projection_version=active.projection_version,
+        config_digest=active.config_digest,
+    )
+    assert active_census.current_job_states == {"failed": 1}
+    assert active_census.current_receipt_states == {"failed": 3}
 
-    operation = store.get_operation(accepted.projection_job_id)
+    assert store.requeue_failed_projections(
+        active,
+        expected_count=1,
+        candidate_ids=preview,
+        now=T0,
+    ) == preview
+
+    assert store.get_operation(accepted.projection_job_id).job.state == "failed"
+    assert store.get_operation(historical_active_job_id).job.state == "failed"
+    assert store.get_operation(foreign_job_id).job.state == "failed"
+    operation = store.get_operation(current_active_job_id)
     assert operation.job.state == "pending"
     assert operation.job.attempt == 0
     assert {receipt.state for receipt in operation.receipts} == {"pending"}
-    # The worker can claim it again: the reset is not cosmetic.
-    release = store.claim_next_job(worker_id="worker-2", now=T0, lease_seconds=30)
+    release = store.claim_next_job(
+        worker_id="worker-2",
+        generation_id=active.generation_id,
+        projection_version=active.projection_version,
+        config_digest=active.config_digest,
+        now=T0,
+        lease_seconds=30,
+    )
     assert release is not None
-    assert release.projection_job_id == accepted.projection_job_id
+    assert release.projection_job_id == current_active_job_id
 
 
 def test_requeue_failed_projections_ignores_healthy_jobs(tmp_path: Path) -> None:
@@ -1089,7 +1136,228 @@ def test_requeue_failed_projections_ignores_healthy_jobs(tmp_path: Path) -> None
         providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
     )
     store.accept_source(b"leave me queued", capture=capture, projection=projection, now=T0)
-    assert store.requeue_failed_projections(now=T0) == 0
+    assert store.failed_projection_candidates(projection) == ()
+    assert store.requeue_failed_projections(
+        projection,
+        expected_count=0,
+        candidate_ids=(),
+        now=T0,
+    ) == ()
+
+
+def test_requeue_failed_projections_rejects_preview_drift(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+
+    def accept_failed(source_key: str) -> str:
+        accepted = store.accept_source(
+            source_key.encode(),
+            capture=CaptureContext(
+                dataset="central",
+                source_key=source_key,
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="test",
+                capture_run_id=source_key,
+                captured_at=T0,
+            ),
+            projection=projection,
+            now=T0,
+        )
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                "UPDATE projection_jobs SET state = 'failed' WHERE projection_job_id = ?",
+                (accepted.projection_job_id,),
+            )
+            connection.execute(
+                "UPDATE projection_receipts SET state = 'failed' WHERE projection_job_id = ?",
+                (accepted.projection_job_id,),
+            )
+        return accepted.projection_job_id
+
+    first_job_id = accept_failed("manual:first")
+    preview = store.failed_projection_candidates(projection)
+    assert preview == (first_job_id,)
+    second_job_id = accept_failed("manual:second")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE projection_jobs SET state = 'pending' WHERE projection_job_id = ?",
+            (first_job_id,),
+        )
+        connection.execute(
+            "UPDATE projection_receipts SET state = 'pending' WHERE projection_job_id = ?",
+            (first_job_id,),
+        )
+    assert store.failed_projection_candidates(projection) == (second_job_id,)
+
+    with pytest.raises(LifecycleRequeueDriftError):
+        store.requeue_failed_projections(
+            projection,
+            expected_count=1,
+            candidate_ids=preview,
+            now=T0,
+        )
+    assert store.get_operation(first_job_id).job.state == "pending"
+    assert store.get_operation(second_job_id).job.state == "failed"
+
+
+def test_requeue_failed_projections_compares_inside_immediate_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    original_candidates = store._failed_projection_candidates
+    transaction_states: list[bool] = []
+
+    def observed_candidates(
+        connection: sqlite3.Connection,
+        requested: ProjectionRequest,
+    ) -> tuple[str, ...]:
+        transaction_states.append(connection.in_transaction)
+        return original_candidates(connection, requested)
+
+    monkeypatch.setattr(store, "_failed_projection_candidates", observed_candidates)
+
+    assert store.requeue_failed_projections(
+        projection,
+        expected_count=0,
+        candidate_ids=(),
+        now=T0,
+    ) == ()
+    assert transaction_states == [True]
+
+
+def test_requeue_failed_projections_rolls_back_precommit_fault(tmp_path: Path) -> None:
+    path = tmp_path / "lifecycle.sqlite3"
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    store = LifecycleStore(path)
+    accepted = store.accept_source(
+        b"rollback recovery",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="manual:rollback",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="rollback",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE projection_jobs SET state = 'failed'")
+        connection.execute("UPDATE projection_receipts SET state = 'failed'")
+
+    def fail_before_commit(stage: str) -> None:
+        if stage == "before_requeue_commit":
+            raise RuntimeError(stage)
+
+    recovery = LifecycleStore(path, fault_injector=fail_before_commit)
+    preview = recovery.failed_projection_candidates(projection)
+    with pytest.raises(RuntimeError, match="before_requeue_commit"):
+        recovery.requeue_failed_projections(
+            projection,
+            expected_count=1,
+            candidate_ids=preview,
+            now=T0,
+        )
+    operation = LifecycleStore(path).get_operation(accepted.projection_job_id)
+    assert operation.job.state == "failed"
+    assert {receipt.state for receipt in operation.receipts} == {"failed"}
+
+
+def test_requeue_failed_projections_explicitly_rolls_back_on_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "lifecycle.sqlite3"
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    store = LifecycleStore(path)
+    accepted = store.accept_source(
+        b"explicit rollback",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="manual:explicit-rollback",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="explicit-rollback",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE projection_jobs SET state = 'failed'")
+        connection.execute("UPDATE projection_receipts SET state = 'failed'")
+
+    def fail_before_commit(stage: str) -> None:
+        if stage == "before_requeue_commit":
+            raise RuntimeError(stage)
+
+    recovery = LifecycleStore(path, fault_injector=fail_before_commit)
+    preview = recovery.failed_projection_candidates(projection)
+    raw_connection = sqlite3.connect(path, isolation_level=None)
+    raw_connection.row_factory = sqlite3.Row
+
+    class NoImplicitRollbackConnection:
+        @property
+        def in_transaction(self) -> bool:
+            return raw_connection.in_transaction
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> bool:
+            return False
+
+        def execute(self, *args, **kwargs):
+            return raw_connection.execute(*args, **kwargs)
+
+    monkeypatch.setattr(
+        recovery,
+        "_connect",
+        lambda: NoImplicitRollbackConnection(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="before_requeue_commit"):
+            recovery.requeue_failed_projections(
+                projection,
+                expected_count=1,
+                candidate_ids=preview,
+                now=T0,
+            )
+        assert raw_connection.in_transaction is False
+    finally:
+        if raw_connection.in_transaction:
+            raw_connection.execute("ROLLBACK")
+        raw_connection.close()
+
+    operation = LifecycleStore(path).get_operation(accepted.projection_job_id)
+    assert operation.job.state == "failed"
+    assert {receipt.state for receipt in operation.receipts} == {"failed"}
 
 
 def test_projection_source_revision_states_tracks_active_and_completed_jobs(

@@ -36,6 +36,30 @@ class LifecycleConflictError(LifecycleError):
     """Raised when one deterministic operation ID has conflicting inputs."""
 
 
+class LifecycleRequeueIdentityMismatchError(LifecycleConflictError):
+    """Raised when a recovery request does not match the active worker."""
+
+    def __init__(self, projection: ProjectionRequest) -> None:
+        self.generation_id = projection.generation_id
+        self.projection_version = projection.projection_version
+        self.config_digest = projection.config_digest
+        super().__init__("recovery identity does not match the active lifecycle worker")
+
+
+class LifecycleRequeueDriftError(LifecycleConflictError):
+    """Raised when failed jobs changed after the recovery preview."""
+
+    def __init__(
+        self,
+        *,
+        expected_count: int,
+        actual_candidate_ids: tuple[str, ...],
+    ) -> None:
+        self.expected_count = expected_count
+        self.actual_candidate_ids = actual_candidate_ids
+        super().__init__("failed projection candidates changed after preview")
+
+
 class LifecycleNotFoundError(LifecycleError):
     """Raised when a requested lifecycle record does not exist."""
 
@@ -169,6 +193,8 @@ class GenerationCensus:
     current_sources: int
     current_projection_jobs: int
     current_projection_receipts: int
+    current_job_states: Mapping[str, int]
+    current_receipt_states: Mapping[str, int]
     current_receipts_by_backend: Mapping[str, int]
     current_searchable_by_backend: Mapping[str, int]
 
@@ -965,27 +991,64 @@ class LifecycleStore:
                 raise
         return tuple(self.get_operation(job_id) for job_id in job_ids)
 
-    def requeue_failed_projections(self, *, now: datetime | None = None) -> int:
-        """Reset every failed projection job (and its receipts) to pending.
+    @staticmethod
+    def _failed_projection_candidates(
+        connection: sqlite3.Connection,
+        projection: ProjectionRequest,
+    ) -> tuple[str, ...]:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT job.projection_job_id
+            FROM source_heads AS head
+            JOIN projection_jobs AS job
+              ON job.source_revision_id = head.source_revision_id
+            WHERE job.state = 'failed'
+              AND job.generation_id = ?
+              AND job.projection_version = ?
+              AND job.config_digest = ?
+            ORDER BY job.projection_job_id
+            """,
+            (
+                projection.generation_id,
+                projection.projection_version,
+                projection.config_digest,
+            ),
+        ).fetchall()
+        return tuple(str(row["projection_job_id"]) for row in rows)
 
-        The heal-on-recapture path in accept_source only fires when the same
-        bytes are re-submitted, and the sync layer skips unchanged content
-        before submitting, so a failed job for content that never changes
-        again stays failed forever (2026-08-12: 235 jobs failed while the
-        embedding engine was down, with no path back). This is the manual
-        path: the same reset accept_source applies, over all failed jobs.
-        The worker then drains them via claim_next_job.
-        """
+    def failed_projection_candidates(
+        self,
+        projection: ProjectionRequest,
+    ) -> tuple[str, ...]:
+        """Preview failed current-head jobs for one projection identity."""
+        with self._connect() as connection:
+            return self._failed_projection_candidates(connection, projection)
+
+    def requeue_failed_projections(
+        self,
+        projection: ProjectionRequest,
+        *,
+        expected_count: int,
+        candidate_ids: tuple[str, ...],
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Reset one exact preview of active failed jobs to pending."""
+        if expected_count < 0:
+            raise ValueError("expected_count must not be negative")
+        if any(not candidate_id.strip() for candidate_id in candidate_ids):
+            raise ValueError("candidate_ids must contain non-empty strings")
+        if candidate_ids != tuple(sorted(set(candidate_ids))):
+            raise ValueError("candidate_ids must be sorted and unique")
         changed_text = _utc_text(now or datetime.now(UTC))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                failed_jobs = [
-                    str(row["projection_job_id"])
-                    for row in connection.execute(
-                        "SELECT projection_job_id FROM projection_jobs WHERE state = 'failed'"
-                    ).fetchall()
-                ]
+                failed_jobs = self._failed_projection_candidates(connection, projection)
+                if expected_count != len(failed_jobs) or candidate_ids != failed_jobs:
+                    raise LifecycleRequeueDriftError(
+                        expected_count=expected_count,
+                        actual_candidate_ids=failed_jobs,
+                    )
                 for job_id in failed_jobs:
                     connection.execute(
                         """
@@ -998,6 +1061,7 @@ class LifecycleStore:
                         """,
                         (changed_text, changed_text, job_id),
                     )
+                    self._inject_fault("after_requeue_projection_job")
                     connection.execute(
                         """
                         UPDATE projection_receipts
@@ -1010,11 +1074,13 @@ class LifecycleStore:
                         """,
                         (changed_text, job_id),
                     )
+                    self._inject_fault("after_requeue_projection_receipts")
+                self._inject_fault("before_requeue_commit")
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
-        return len(failed_jobs)
+        return failed_jobs
 
     def read_retained_content(self, source_revision_id: str) -> bytes:
         with self._connect() as connection:
@@ -2040,6 +2106,18 @@ class LifecycleStore:
                     parameters,
                 ).fetchone()[0]
             )
+            job_rows = connection.execute(
+                """
+                SELECT job.state, COUNT(*) AS count
+                FROM source_heads AS head
+                JOIN projection_jobs AS job
+                  ON job.source_revision_id = head.source_revision_id
+                WHERE job.generation_id = ? AND job.projection_version = ?
+                  AND job.config_digest = ?
+                GROUP BY job.state
+                """,
+                parameters,
+            ).fetchall()
             receipt_rows = connection.execute(
                 """
                 SELECT receipt.backend, receipt.state, COUNT(*) AS count
@@ -2054,13 +2132,20 @@ class LifecycleStore:
                 """,
                 parameters,
             ).fetchall()
+        job_states = {
+            str(row["state"]): int(row["count"])
+            for row in job_rows
+        }
+        receipt_states: dict[str, int] = {}
         receipts_by_backend: dict[str, int] = {}
         searchable_by_backend: dict[str, int] = {}
         for row in receipt_rows:
             backend = str(row["backend"])
+            state = str(row["state"])
             count = int(row["count"])
             receipts_by_backend[backend] = receipts_by_backend.get(backend, 0) + count
-            if row["state"] == "searchable":
+            receipt_states[state] = receipt_states.get(state, 0) + count
+            if state == "searchable":
                 searchable_by_backend[backend] = count
         return GenerationCensus(
             generation_id=generation_id,
@@ -2069,6 +2154,8 @@ class LifecycleStore:
             current_sources=current_sources,
             current_projection_jobs=current_projection_jobs,
             current_projection_receipts=sum(receipts_by_backend.values()),
+            current_job_states=dict(sorted(job_states.items())),
+            current_receipt_states=dict(sorted(receipt_states.items())),
             current_receipts_by_backend=dict(sorted(receipts_by_backend.items())),
             current_searchable_by_backend=dict(sorted(searchable_by_backend.items())),
         )
