@@ -22,6 +22,7 @@ from kb.access import AccessIdentity, AccessStore, SESSION_TRACES_DATASET
 from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
+from kb.lifecycle import LifecycleRequeueDriftError
 from kb.mesh import MeshState
 from kb.models import FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
@@ -1502,15 +1503,39 @@ def test_lifecycle_requeue_failed_requires_admin() -> None:
     assert client.post("/api/lifecycle/requeue-failed").status_code == 403
 
 
-def test_lifecycle_requeue_failed_returns_the_reset_count(monkeypatch) -> None:
+def test_lifecycle_requeue_failed_previews_without_resuming(monkeypatch) -> None:
     client = authed_client()
     import kb.server as server_mod
 
     citadel = server_mod.get_citadel()
-    monkeypatch.setattr(type(citadel), "lifecycle_requeue_failed", lambda self: 7, raising=False)
+    resumed: list[bool] = []
+    monkeypatch.setattr(
+        type(citadel),
+        "lifecycle_requeue_failed_preview",
+        lambda self: {
+            "ok": True,
+            "applied": False,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "candidate_ids": ["job-1"],
+            "candidate_count": 1,
+            "requeued": 0,
+            "worker_resumed": False,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(citadel),
+        "resume_lifecycle_queue",
+        lambda self: resumed.append(True),
+        raising=False,
+    )
     response = client.post("/api/lifecycle/requeue-failed")
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "requeued": 7}
+    assert response.json()["candidate_ids"] == ["job-1"]
+    assert response.json()["applied"] is False
+    assert resumed == []
 
 
 def test_lifecycle_requeue_failed_restarts_the_drain(monkeypatch) -> None:
@@ -1524,17 +1549,153 @@ def test_lifecycle_requeue_failed_restarts_the_drain(monkeypatch) -> None:
 
     citadel = server_mod.get_citadel()
     resumed: list[bool] = []
-    monkeypatch.setattr(type(citadel), "lifecycle_requeue_failed", lambda self: 3, raising=False)
+
+    def apply_recovery(self, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "expected_count": 1,
+            "candidate_ids": ("job-1",),
+        }
+        return {
+            "ok": True,
+            "applied": True,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "candidate_ids": ["job-1"],
+            "candidate_count": 1,
+            "requeued": 1,
+            "worker_resumed": False,
+        }
+
+    monkeypatch.setattr(
+        type(citadel),
+        "lifecycle_requeue_failed",
+        apply_recovery,
+        raising=False,
+    )
     monkeypatch.setattr(
         type(citadel),
         "resume_lifecycle_queue",
-        lambda self: resumed.append(True),
+        lambda self: resumed.append(True) or True,
         raising=False,
     )
-    response = client.post("/api/lifecycle/requeue-failed")
+    response = client.post(
+        "/api/lifecycle/requeue-failed",
+        json={
+            "apply": True,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "expected_count": 1,
+            "candidate_ids": ["job-1"],
+        },
+    )
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "requeued": 3}
+    assert response.json()["requeued"] == 1
+    assert response.json()["worker_resumed"] is True
     assert resumed == [True], "requeue must restart the projection drain"
+    events = app.state.access_store.snapshot()["audit_events"]
+    actions = [event["action"] for event in events]
+    assert "lifecycle.requeue.apply.request" in actions
+    assert "lifecycle.requeue.apply" in actions
+
+
+def test_lifecycle_requeue_failed_requires_exact_confirmation() -> None:
+    client = authed_client()
+    response = client.post(
+        "/api/lifecycle/requeue-failed",
+        json={"apply": True},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == (
+        "LIFECYCLE_REQUEUE_CONFIRMATION_REQUIRED"
+    )
+
+
+def test_lifecycle_requeue_failed_returns_conflict_on_drift(monkeypatch) -> None:
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+
+    def drift(self, **kwargs: Any) -> dict[str, Any]:
+        raise LifecycleRequeueDriftError(
+            expected_count=1,
+            actual_candidate_ids=("job-1", "job-2"),
+        )
+
+    monkeypatch.setattr(
+        type(citadel),
+        "lifecycle_requeue_failed",
+        drift,
+        raising=False,
+    )
+    response = client.post(
+        "/api/lifecycle/requeue-failed",
+        json={
+            "apply": True,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "expected_count": 1,
+            "candidate_ids": ["job-1"],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "LIFECYCLE_REQUEUE_DRIFT",
+        "expected_count": 1,
+        "current_count": 2,
+    }
+
+
+def test_lifecycle_health_uses_active_generation_failure_buckets() -> None:
+    class CensusCitadel:
+        config = CitadelConfig(lifecycle_enabled=True)
+
+        def __init__(self) -> None:
+            self.current_job_states = {"completed": 1}
+            self.current_receipt_states = {"searchable": 3}
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 2,
+                "projection_jobs": 2,
+                "projection_receipts": 6,
+                "job_states": {"completed": 1, "failed": 1},
+                "receipt_states": {"searchable": 3, "failed": 3},
+                "current_generation": {
+                    "current_sources": 1,
+                    "current_projection_jobs": 1,
+                    "current_projection_receipts": 3,
+                    "current_job_states": self.current_job_states,
+                    "current_receipt_states": self.current_receipt_states,
+                    "current_receipts_by_backend": {
+                        "relational": 1,
+                        "vector": 1,
+                        "graph": 1,
+                    },
+                    "current_searchable_by_backend": {
+                        "relational": 1,
+                        "vector": 1,
+                        "graph": 1,
+                    },
+                },
+            }
+
+    citadel = CensusCitadel()
+    healthy = server_module.lifecycle_health(citadel)
+    assert healthy["ok"] is True
+    assert "failed_projection" not in healthy["invariant_errors"]
+
+    citadel.current_job_states = {"failed": 1}
+    citadel.current_receipt_states = {"failed": 3}
+    failed = server_module.lifecycle_health(citadel)
+    assert failed["ok"] is False
+    assert "failed_projection" in failed["invariant_errors"]
 
 
 def test_admin_can_audit_combined_reconciliation_and_writer_cannot() -> None:

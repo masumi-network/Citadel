@@ -223,6 +223,10 @@ Admin:
 - `GET /api/audit?view=all|mcp|access|failures&limit=50`
 - `GET /api/backup-mirror`, `POST /api/backup-mirror/run`
 - `GET /api/linear-sync`, `POST /api/linear-sync/run`
+- `POST /api/lifecycle/requeue-failed` previews active-generation failures by
+  default. Apply requires the returned generation identity, exact ordered
+  `candidate_ids`, and `expected_count`. A changed preview returns HTTP 409
+  without resetting any job. The route requires admin role and `sources:sync`.
 
 Examples:
 

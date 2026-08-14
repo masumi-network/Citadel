@@ -7,7 +7,11 @@ from typing import Any
 import pytest
 
 from kb.config import CitadelConfig
-from kb.lifecycle import LifecycleConflictError, lifecycle_chunk_source_key
+from kb.lifecycle import (
+    LifecycleConflictError,
+    LifecycleRequeueIdentityMismatchError,
+    lifecycle_chunk_source_key,
+)
 from kb.models import FeedbackRequest
 from kb.repair_journal import RepairJournal
 from kb.security_scan import SecretContentError
@@ -305,6 +309,97 @@ async def test_lifecycle_duplicate_ingest_returns_same_operation(
     assert duplicate.projection_job_id == first.projection_job_id
     assert kb.lifecycle_census()["source_revisions"] == 1
     assert kb.lifecycle_census()["projection_jobs"] == 1
+
+
+def test_lifecycle_requeue_requires_active_worker_identity(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+
+    preview = kb.lifecycle_requeue_failed_preview()
+    assert preview["candidate_ids"] == []
+    applied = kb.lifecycle_requeue_failed(
+        generation_id=preview["generation_id"],
+        projection_version=preview["projection_version"],
+        config_digest=preview["config_digest"],
+        expected_count=0,
+        candidate_ids=(),
+    )
+    assert applied["applied"] is True
+    assert applied["requeued"] == 0
+
+    assert kb.lifecycle_worker is not None
+    kb.lifecycle_worker.generation_id = "generation-stale"
+    with pytest.raises(LifecycleRequeueIdentityMismatchError):
+        kb.lifecycle_requeue_failed(
+            generation_id=preview["generation_id"],
+            projection_version=preview["projection_version"],
+            config_digest=preview["config_digest"],
+            expected_count=0,
+            candidate_ids=(),
+        )
+
+
+def test_lifecycle_requeue_preview_does_not_mutate_failed_jobs(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from kb.lifecycle import CaptureContext
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    assert kb.lifecycle_store is not None
+    projection = kb._lifecycle_projection_request()
+    accepted = kb.lifecycle_store.accept_source(
+        b"preview must not mutate",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="manual:preview-no-mutation",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="preview-no-mutation",
+            captured_at=datetime.now(UTC),
+        ),
+        projection=projection,
+    )
+    with sqlite3.connect(kb.lifecycle_store.path) as connection:
+        connection.execute(
+            "UPDATE projection_jobs SET state = 'failed' WHERE projection_job_id = ?",
+            (accepted.projection_job_id,),
+        )
+        connection.execute(
+            "UPDATE projection_receipts SET state = 'failed' WHERE projection_job_id = ?",
+            (accepted.projection_job_id,),
+        )
+
+    before = kb.lifecycle_store.get_operation(accepted.projection_job_id)
+    preview = kb.lifecycle_requeue_failed_preview()
+    after = kb.lifecycle_store.get_operation(accepted.projection_job_id)
+
+    assert preview["candidate_ids"] == [accepted.projection_job_id]
+    assert before.job.state == after.job.state == "failed"
+    assert {receipt.state for receipt in before.receipts} == {"failed"}
+    assert {receipt.state for receipt in after.receipts} == {"failed"}
 
 
 @pytest.mark.asyncio

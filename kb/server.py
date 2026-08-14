@@ -30,7 +30,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from kb.build_identity import SERVICE_BUILD_IDENTITY, build_identity_from_env
 from kb import chunk_window
@@ -60,7 +60,11 @@ from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
-from kb.lifecycle import LifecycleNotFoundError
+from kb.lifecycle import (
+    LifecycleNotFoundError,
+    LifecycleRequeueDriftError,
+    LifecycleRequeueIdentityMismatchError,
+)
 from kb.session_trace import enrich_shared_trace, force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
@@ -1113,6 +1117,15 @@ class CorpusReconcileBody(BaseModel):
     recover: bool = False
     # Compatibility switch. The default runs the combined zero/oversized census.
     oversized: bool = False
+
+
+class LifecycleRequeueFailedBody(BaseModel):
+    apply: bool = False
+    generation_id: StrictStr | None = Field(default=None, min_length=1)
+    projection_version: StrictStr | None = Field(default=None, min_length=1)
+    config_digest: StrictStr | None = Field(default=None, min_length=1)
+    expected_count: StrictInt | None = Field(default=None, ge=0)
+    candidate_ids: list[StrictStr] | None = None
 
 
 class GraphCleanupBody(BaseModel):
@@ -4611,8 +4624,6 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
     source_revisions = int(census.get("source_revisions", 0))
     projection_jobs = int(census.get("projection_jobs", 0))
     projection_receipts = int(census.get("projection_receipts", 0))
-    failed_jobs = int((census.get("job_states") or {}).get("failed", 0))
-    failed_receipts = int((census.get("receipt_states") or {}).get("failed", 0))
     invariant_errors: list[str] = []
     if projection_jobs < source_revisions:
         invariant_errors.append("source_revision_without_projection_job")
@@ -4626,6 +4637,12 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
         )
         current_receipts = int(
             current_generation.get("current_projection_receipts", 0)
+        )
+        current_failed_jobs = int(
+            (current_generation.get("current_job_states") or {}).get("failed", 0)
+        )
+        current_failed_receipts = int(
+            (current_generation.get("current_receipt_states") or {}).get("failed", 0)
         )
         if current_jobs != current_sources:
             invariant_errors.append("current_generation_job_census_mismatch")
@@ -4648,8 +4665,8 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
             invariant_errors.append(
                 "current_generation_searchable_census_mismatch"
             )
-    if failed_jobs or failed_receipts:
-        invariant_errors.append("failed_projection")
+        if current_failed_jobs or current_failed_receipts:
+            invariant_errors.append("failed_projection")
     return {
         "enabled": True,
         "ok": not invariant_errors,
@@ -7024,29 +7041,149 @@ async def ingest(body: IngestBody, request: Request) -> Any:
 
 
 @app.post("/api/lifecycle/requeue-failed")
-async def lifecycle_requeue_failed(request: Request) -> dict[str, Any]:
-    """Reset every failed projection job to pending so the worker re-drains it.
-
-    The manual half of the heal design: accept_source heals a failed job only
-    when the same bytes are re-submitted, and sync skips unchanged content, so
-    failed jobs for stable content are otherwise permanent (2026-08-12).
-    """
-    require_access(request, "admin", "access:manage")
+async def lifecycle_requeue_failed(
+    request: Request,
+    body: LifecycleRequeueFailedBody | None = None,
+) -> dict[str, Any]:
+    """Preview or apply recovery for failed jobs owned by the active worker."""
+    actor = require_access(request, "admin", "sources:sync")
+    body = body or LifecycleRequeueFailedBody()
     citadel = get_citadel()
+
+    def record(action: str, success: bool, detail: dict[str, Any]) -> None:
+        get_access_store().record_event(
+            action=action,
+            actor=actor,
+            success=success,
+            detail=detail,
+        )
+
+    if not body.apply:
+        try:
+            result = citadel.lifecycle_requeue_failed_preview()
+        except LifecycleNotFoundError as exc:
+            record(
+                "lifecycle.requeue.preview",
+                False,
+                {"code": "LIFECYCLE_DISABLED"},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "LIFECYCLE_DISABLED", "message": str(exc)},
+            ) from exc
+        except LifecycleRequeueIdentityMismatchError as exc:
+            record(
+                "lifecycle.requeue.preview",
+                False,
+                {"code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH"},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH",
+                    "generation_id": exc.generation_id,
+                    "projection_version": exc.projection_version,
+                    "config_digest": exc.config_digest,
+                },
+            ) from exc
+        record(
+            "lifecycle.requeue.preview",
+            True,
+            {
+                "generation_id": result["generation_id"],
+                "projection_version": result["projection_version"],
+                "candidate_count": result["candidate_count"],
+            },
+        )
+        return result
+
+    required = {
+        "generation_id": body.generation_id,
+        "projection_version": body.projection_version,
+        "config_digest": body.config_digest,
+        "expected_count": body.expected_count,
+        "candidate_ids": body.candidate_ids,
+    }
+    missing = sorted(name for name, value in required.items() if value is None)
+    if missing:
+        detail = {
+            "code": "LIFECYCLE_REQUEUE_CONFIRMATION_REQUIRED",
+            "missing": missing,
+        }
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=422, detail=detail)
+
+    assert body.generation_id is not None
+    assert body.projection_version is not None
+    assert body.config_digest is not None
+    assert body.expected_count is not None
+    assert body.candidate_ids is not None
+    candidate_ids = tuple(body.candidate_ids)
+    if (
+        body.expected_count != len(candidate_ids)
+        or candidate_ids != tuple(sorted(set(candidate_ids)))
+        or any(
+            not candidate_id or candidate_id != candidate_id.strip()
+            for candidate_id in candidate_ids
+        )
+    ):
+        detail = {"code": "LIFECYCLE_REQUEUE_CANDIDATES_INVALID"}
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=422, detail=detail)
+
+    record(
+        "lifecycle.requeue.apply.request",
+        True,
+        {
+            "generation_id": body.generation_id,
+            "projection_version": body.projection_version,
+            "candidate_count": body.expected_count,
+        },
+    )
     try:
-        requeued = citadel.lifecycle_requeue_failed()
+        result = citadel.lifecycle_requeue_failed(
+            generation_id=body.generation_id,
+            projection_version=body.projection_version,
+            config_digest=body.config_digest,
+            expected_count=body.expected_count,
+            candidate_ids=candidate_ids,
+        )
     except LifecycleNotFoundError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    # Resetting rows is not enough on its own. next_wakeup_delay only counts
-    # 'pending' and 'running' jobs, so while every job sat in 'failed' the
-    # drain task had already returned (kb/service.py:424-425) and nothing was
-    # left polling. Without this kick the requeued work waits for the next
-    # caller of resume_lifecycle_queue, which is the hourly evolve pass, so a
-    # 200 here would report success while the corpus stayed frozen.
+        detail = {"code": "LIFECYCLE_DISABLED", "message": str(exc)}
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleRequeueIdentityMismatchError as exc:
+        detail = {
+            "code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH",
+            "generation_id": exc.generation_id,
+            "projection_version": exc.projection_version,
+            "config_digest": exc.config_digest,
+        }
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleRequeueDriftError as exc:
+        detail = {
+            "code": "LIFECYCLE_REQUEUE_DRIFT",
+            "expected_count": exc.expected_count,
+            "current_count": len(exc.actual_candidate_ids),
+        }
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+
     resume = getattr(citadel, "resume_lifecycle_queue", None)
-    if callable(resume):
-        resume()
-    return {"ok": True, "requeued": requeued}
+    worker_resumed = bool(resume()) if callable(resume) else False
+    result["worker_resumed"] = worker_resumed
+    record(
+        "lifecycle.requeue.apply",
+        True,
+        {
+            "generation_id": result["generation_id"],
+            "projection_version": result["projection_version"],
+            "requeued": result["requeued"],
+            "worker_resumed": worker_resumed,
+        },
+    )
+    return result
 
 
 @app.get("/api/operations/{projection_job_id}")

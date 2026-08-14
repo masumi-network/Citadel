@@ -26,6 +26,7 @@ from kb.lifecycle import (
     CaptureContext,
     LIFECYCLE_CHUNK_SOURCE_PREFIX,
     LifecycleNotFoundError,
+    LifecycleRequeueIdentityMismatchError,
     LifecycleStore,
     ProjectionRequest,
     lifecycle_chunk_source_key,
@@ -601,11 +602,70 @@ class Citadel:
             ],
         }
 
-    def lifecycle_requeue_failed(self) -> int:
-        """Reset all failed projection jobs to pending; returns the count."""
+    def _lifecycle_requeue_projection(self) -> ProjectionRequest:
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
-        return self.lifecycle_store.requeue_failed_projections()
+        projection = self._lifecycle_projection_request()
+        worker = self.lifecycle_worker
+        if worker is None or not worker.matches_projection(
+            generation_id=projection.generation_id,
+            projection_version=projection.projection_version,
+            config_digest=projection.config_digest,
+        ):
+            raise LifecycleRequeueIdentityMismatchError(projection)
+        return projection
+
+    def lifecycle_requeue_failed_preview(self) -> dict[str, Any]:
+        """Preview failed current-head jobs bound to the active worker."""
+        projection = self._lifecycle_requeue_projection()
+        assert self.lifecycle_store is not None
+        candidate_ids = self.lifecycle_store.failed_projection_candidates(projection)
+        return {
+            "ok": True,
+            "applied": False,
+            "generation_id": projection.generation_id,
+            "projection_version": projection.projection_version,
+            "config_digest": projection.config_digest,
+            "candidate_ids": list(candidate_ids),
+            "candidate_count": len(candidate_ids),
+            "requeued": 0,
+            "worker_resumed": False,
+        }
+
+    def lifecycle_requeue_failed(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+        expected_count: int,
+        candidate_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Apply one exact active-generation recovery preview."""
+        projection = self._lifecycle_requeue_projection()
+        if (
+            generation_id != projection.generation_id
+            or projection_version != projection.projection_version
+            or config_digest != projection.config_digest
+        ):
+            raise LifecycleRequeueIdentityMismatchError(projection)
+        assert self.lifecycle_store is not None
+        requeued_ids = self.lifecycle_store.requeue_failed_projections(
+            projection,
+            expected_count=expected_count,
+            candidate_ids=candidate_ids,
+        )
+        return {
+            "ok": True,
+            "applied": True,
+            "generation_id": projection.generation_id,
+            "projection_version": projection.projection_version,
+            "config_digest": projection.config_digest,
+            "candidate_ids": list(requeued_ids),
+            "candidate_count": len(requeued_ids),
+            "requeued": len(requeued_ids),
+            "worker_resumed": False,
+        }
 
     def lifecycle_census(self) -> dict[str, Any]:
         """Return exact SQLite lifecycle counts and state buckets."""
