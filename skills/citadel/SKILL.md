@@ -192,7 +192,7 @@ citadel activity --watch       # live-tail new activity
 citadel ingest "note" --tag x  # WRITE: stores now; graph projection is async by default
 citadel ingest "note" --cognify # WRITE: explicitly wait for inline graph build
 citadel promotion list --json  # your pending Promotion Approval queue
-citadel onboard --non-interactive --json  # token from env; wire hooks/.mcp.json/capture
+citadel onboard --non-interactive --json  # token from env; wire hooks/.mcp.json/capture + Cursor/Codex/Claude
 citadel doctor --fix           # diagnose / repair local setup
 citadel mcp add claude         # add the Citadel MCP server to a client (`citadel mcp list`)
 citadel seat create "Alice Smith" alice --role writer  # admin: create human seat + token

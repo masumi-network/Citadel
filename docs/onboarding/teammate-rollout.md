@@ -66,13 +66,17 @@ citadel onboard
 
 Pixel Bastion mark (magenta→cyan). See [`brand.md`](../../brand.md).
 
-This runs all of the steps below for you — pastes your token into your shell rc
+This runs all of the steps below for you: pastes your token into your shell rc
 (once, masked), installs the bundled git-push + SessionEnd/SessionStart hooks
 (`kb.hooks.*`, no vendoring), writes the proactive agent policy for your coding
 tools (`AGENTS.md` always; Cursor / Windsurf / Gemini native rules when detected;
-Claude Code via SessionStart), adds the Citadel MCP server, and offers to set up
-Approved Capture Roots. Idempotent; safe to re-run. `--no-mcp` for capture-only;
-`--non-interactive --json --token …` for agents/CI. See the
+Claude Code via SessionStart), adds the Citadel MCP server to project
+`.mcp.json` **and** to detected clients (Claude Code, Cursor, Codex, Gemini,
+Windsurf; same path as `citadel mcp add`), and on macOS publishes the token to
+the GUI session with `launchctl setenv` (until logout). Then it offers Approved
+Capture Roots. Idempotent; safe to re-run. `--no-mcp` for capture-only;
+`--no-tools` to skip client wiring; `--non-interactive --json --token …` for
+agents/CI (that path now auto-wires write-tier clients). See the
 [`citadel-onboard`](../../skills/citadel-onboard/SKILL.md) skill.
 
 The manual steps below are what `onboard` does under the hood (and the path if
@@ -84,13 +88,19 @@ you'd rather do it by hand).
 |---|---|---|
 | **Rules / SessionStart** | `AGENTS.md` + Cursor/Windsurf rules; Claude `SessionStart` hook | Always-on: search before coding; traces are reference-only; share only with approval; if no `citadel_*` tools, use CLI (`citadel search` / `status` / `doctor`) |
 | **Skill** | Not installed by onboard — load via `npx skills add` or hosted `/skills/*` | How-to: connect, vault usage, onboard workflows |
-| **MCP** | Project `.mcp.json` with `${CITADEL_MCP_ACCESS_TOKEN}` | Live tools — only work when the token is in the **process env** that launched the client |
+| **MCP** | Project `.mcp.json` with `${CITADEL_MCP_ACCESS_TOKEN}`, plus `~/.cursor/mcp.json` / Codex / Claude user-scope / Gemini / Windsurf when those tools are detected | Live tools. They only work when the token is in the **process env** that launched the client. On macOS, onboard also runs `launchctl setenv` so Dock apps can see the token until logout. |
 
 **Claude MCP root cause (teammates hit this often):** the token must be in
 Claude's process environment. Local: `source ~/.zshrc` then launch `claude`.
 Cloud: set `CITADEL_MCP_ACCESS_TOKEN` in Claude cloud environment settings.
 PRs/docs do **not** inject secrets. Verify with `claude mcp list`, `/mcp`, and
 `citadel doctor`.
+
+**Cursor MCP root cause:** Cursor.app from Dock/Spotlight does not read
+`~/.zshrc`. After onboard, quit Cursor fully (Cmd-Q) and relaunch from a shell
+that has the token: `cursor .`. `launchctl setenv` (run by onboard on macOS)
+covers GUI launches until logout. A reconnect in `/mcp` will not pick up a
+token that was missing at launch.
 
 ## Teammate — manual (4 steps)
 
@@ -106,15 +116,16 @@ source ~/.zshrc
 
 ### 2 · Add the MCP server
 
-Citadel is a hosted HTTP MCP server. Add this to the repo's `.mcp.json` (or your
-global MCP config). The token is read from the env var set in step 1.
+`citadel onboard` writes this. So does `citadel mcp add cursor` (or `claude`,
+`codex`, `gemini`, `windsurf`). Citadel is a hosted HTTP MCP server. The token
+is read from the env var set in step 1.
 
 ```json
 {
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": { "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}" }
     }
   }

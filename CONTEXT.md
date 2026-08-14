@@ -225,7 +225,7 @@ push, session close, or agent work.
 
 **Member day-to-day:** update the **Node** only (hooks, `citadel capture`, optional MCP ingest). **Central** updates automatically when the **Promotion Agent** rules pass, or when the member **approves** a **New Org Project** proposal in their queue.
 
-Install dev-side hooks once: `citadel onboard` (idempotent; writes a self-contained git pre-push hook running `python -m kb.hooks.sync_push`, SessionEnd/SessionStart hooks running `python -m kb.hooks.sync_session` / `kb.hooks.sync_start`, and the proactive agent policy for your coding tools — `AGENTS.md` plus native rules for Cursor, Windsurf, and Gemini when detected).
+Install once: `citadel onboard` (idempotent). It writes a self-contained git pre-push hook (`python -m kb.hooks.sync_push`), SessionEnd/SessionStart hooks (`kb.hooks.sync_session` / `kb.hooks.sync_start`), the proactive agent policy (`AGENTS.md` plus native rules for Cursor, Windsurf, and Gemini when detected), project `.mcp.json`, and detected client MCP configs (Claude Code, Cursor, Codex, Gemini, Windsurf). On macOS it also runs `launchctl setenv` so Dock-launched Cursor can see `CITADEL_MCP_ACCESS_TOKEN` until logout.
 Register **Approved Capture Roots** locally, assign **Capture Root Tags**, and merge the server **Capture Policy** template during seat setup (Citadel CLI wizard).
 
 **Agent sync policy:** rely on hooks + cron for allowlisted org repos. Agents read via `citadel_search`,

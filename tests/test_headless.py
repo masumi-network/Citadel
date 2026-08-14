@@ -241,6 +241,7 @@ def test_onboard_json_no_prompts(tmp_path: Path, monkeypatch, capsys) -> None:
             "--repo", str(repo),
             "--shell-rc", str(tmp_path / ".zshrc"),
             "--no-capture",
+            "--no-tools",
         ]
     )
     assert rc == 0

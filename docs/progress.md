@@ -1,6 +1,31 @@
 # Citadel Progress
 
-Last updated: 2026-07-29.
+Last updated: 2026-08-14.
+
+## 2026-08-14 — Onboard wires Claude / Cursor / Codex (and the macOS GUI env)
+
+`citadel mcp add` already wrote client configs. Interactive `citadel onboard`
+already offered a coding-tools checkbox. `--non-interactive` skipped that step,
+so a headless onboard left `~/.cursor/mcp.json` unwired. Dock-launched Cursor
+also never saw `CITADEL_MCP_ACCESS_TOKEN` from `~/.zshrc`, which is the
+`CallMcpTool` timeout we hit in Cursor while Codex MCP on the same Node worked.
+
+What shipped in this tree (not a PyPI/Railway cut):
+
+- Non-interactive onboard calls the same `tool_detect.apply` path as
+  `citadel mcp add` for every detected write-tier client: Claude Code, Cursor,
+  Codex, Gemini, Windsurf. `--no-tools` still skips. Cline/Zed stay snippet-only
+  unless you pick them on the interactive checkbox.
+- Interactive checkbox is unchanged (write-tier preselected). Those results now
+  show up in the onboard summary instead of a one-off print above it.
+- On macOS, a token the Node did not reject is published with
+  `launchctl setenv CITADEL_MCP_ACCESS_TOKEN` (until logout). Not a LaunchAgent.
+  The next-steps block says to Cmd-Q Cursor and run `cursor .` from that shell.
+- Tests: `uv run pytest tests/test_onboard.py tests/test_cli_commands.py tests/test_headless.py tests/test_tool_detect.py` → `162 passed` (VERIFIED this session, outside the sandbox). Autouse fixture stubs `launchctl` so the suite cannot write the developer GUI env.
+
+Out of scope here: corpus `failed_projection` / census mismatch, discovery still
+advertising `*.up.railway.app` via `X-Forwarded-Host`, `citadel doctor --fix`
+writing `~/.cursor/mcp.json`.
 
 ## 2026-07-29 (evening) — The Kuzu lock is dead, and six things that reported success while doing nothing
 

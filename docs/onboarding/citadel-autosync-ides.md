@@ -12,8 +12,10 @@ citadel onboard
 ```
 
 `citadel onboard` is idempotent: it writes a self-contained `.git/hooks/pre-push`
-that runs `"<python>" -m kb.hooks.sync_push`, plus the SessionEnd hook, MCP
-server config, and capture roots.
+that runs `"<python>" -m kb.hooks.sync_push`, plus the SessionEnd hook, project
+`.mcp.json`, detected client MCP configs (Cursor, Codex, Claude, Gemini,
+Windsurf), and capture roots. On macOS it publishes the token with
+`launchctl setenv` until logout.
 
 Requires `CITADEL_MCP_ACCESS_TOKEN` in your environment (same token as MCP).
 Every push snapshots commit metadata to your private **Node** — always exits 0,
@@ -27,10 +29,17 @@ snapshots.
 
 ## Cursor
 
-No Cursor-specific hook is required. The git pre-push hook is the universal
-baseline. Optionally add a project rule reminding agents to call
-`citadel_ingest` for durable decisions mid-session (see
-`skills/citadel-proactive-ingest/SKILL.md`).
+`citadel onboard` writes `~/.cursor/mcp.json` when Cursor is detected
+(`${env:CITADEL_MCP_ACCESS_TOKEN}` in the header, token stays in the shell rc).
+No Cursor-specific capture hook is required. The git pre-push hook is the
+universal baseline.
+
+Dock/Spotlight launches do not inherit `~/.zshrc`. After onboard: quit Cursor
+(Cmd-Q), then from that shell run `cursor .`. Onboard's `launchctl setenv` on
+macOS covers GUI launches until logout.
+
+Optionally add a project rule reminding agents to call `citadel_ingest` for
+durable decisions mid-session (see `skills/citadel-proactive-ingest/SKILL.md`).
 
 ## Codex / other agents
 

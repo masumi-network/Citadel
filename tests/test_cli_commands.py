@@ -1072,11 +1072,12 @@ def test_wire_detected_tools_applies_only_selection(monkeypatch, capsys) -> None
     # The checkbox returns cursor + zed; codex (preselected) was deselected.
     monkeypatch.setattr("kb.prompt.checkbox_select", lambda header, options, checked: {0, 2})
 
-    _wire_detected_tools("https://node.example", color=False)
+    steps, wired = _wire_detected_tools("https://node.example", color=False)
     out = capsys.readouterr().out
     assert applied == ["cursor", "zed", "pi"]  # pi is the always-shown note
-    assert "Cursor" in out and "wrote" in out
-    assert "paste into" in out  # zed snippet printed
+    assert ("Cursor", "wrote") in steps
+    assert wired == ["cursor"]
+    assert "paste into" in out  # zed snippet printed inline, not in the summary list
 
 
 def test_wire_detected_tools_skip_selects_nothing(monkeypatch, capsys) -> None:
@@ -1090,8 +1091,16 @@ def test_wire_detected_tools_skip_selects_nothing(monkeypatch, capsys) -> None:
         lambda name, node_url: applied.append(name) or ToolResult(name, "wrote", "ok"),
     )
     monkeypatch.setattr("kb.prompt.checkbox_select", lambda *a: None)  # user pressed q
-    _wire_detected_tools("https://node.example", color=False)
+    assert _wire_detected_tools("https://node.example", color=False) == ([], [])
     assert applied == []
+
+
+def test_humanize_error_status_is_failure() -> None:
+    from kb.cli import _humanize_status
+
+    text, ok, skipped = _humanize_status("error: permission denied")
+    assert ok is False and skipped is False
+    assert "permission denied" in text
 
 
 def test_stale_env_hint_points_at_shell_rc(tmp_path: Path, monkeypatch) -> None:

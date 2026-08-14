@@ -473,18 +473,74 @@ def claude_user_mcp_path() -> Path:
     return claude_home() / ".claude.json"
 
 
+def publish_token_to_macos_gui(token: str) -> str:
+    """Put the seat token in the macOS GUI session env (Dock / Spotlight apps).
+
+    ``launchctl setenv`` lasts until logout. This is not a LaunchAgent. The
+    token is never interpolated into the returned status. No-op off Darwin.
+    """
+    if sys.platform != "darwin":
+        return "skipped:not-darwin"
+    try:
+        subprocess.run(
+            ["launchctl", "setenv", TOKEN_ENV, token],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"error:{type(exc).__name__}"
+    return "set"
+
+
+def format_onboard_next_steps(
+    rc_path: Path,
+    *,
+    tools: list[str] | None = None,
+    gui_env: str = "",
+) -> str:
+    """One post-onboard block: reload the shell, then relaunch each wired client."""
+    tools = tools or []
+    lines = [
+        f"\nNext: restart your shell (or `source {rc_path}`), then:",
+    ]
+    if "claude" in tools:
+        lines.append(
+            f"  • Claude Code: source the rc, then `claude`. Cloud: set {TOKEN_ENV} "
+            "in your cloud environment settings. Verify: `claude mcp list`."
+        )
+        lines.append(
+            "    project `.mcp.json` alone does not inject secrets into cloud sessions."
+        )
+        lines.append(
+            "    In Claude, `/mcp` should list citadel tools (not zero tools)."
+        )
+    if "cursor" in tools:
+        gui = "macOS GUI env is set until logout. " if gui_env == "set" else ""
+        lines.append(
+            f"  • Cursor: quit fully (Cmd-Q). {gui}Relaunch from this shell: `cursor .`"
+        )
+    if "codex" in tools:
+        lines.append(
+            "  • Codex CLI: restart the Codex session from this shell so it picks up the token."
+        )
+    if "gemini" in tools:
+        lines.append("  • Gemini CLI: restart `gemini` from this shell.")
+    if "windsurf" in tools:
+        lines.append("  • Windsurf: quit and relaunch from this shell.")
+    lines.append(
+        '  • smoke test: "use citadel_search to find what we decided about the vault"'
+    )
+    lines.append(
+        "  • when a route is worth reusing, ask, then `citadel_share_session` "
+        "(traces are reference-only, not org truth)"
+    )
+    return "\n".join(lines)
+
+
 def format_claude_mcp_next_steps(rc_path: Path) -> str:
     """Post-onboard hints for Claude Code local CLI + cloud MCP auth."""
-    return (
-        f"\nClaude Code MCP ({TOKEN_ENV}):\n"
-        f"  • Local CLI — reload your shell before starting Claude:\n"
-        f"      source {rc_path}   (or open a new terminal)\n"
-        f"    Or export {TOKEN_ENV} in the same shell before running `claude`.\n"
-        f"  • Claude cloud — add {TOKEN_ENV} in your cloud environment settings;\n"
-        f"    project `.mcp.json` alone does not inject secrets into cloud sessions.\n"
-        f"  • Verify — run `claude mcp list` (no missing-env warning on citadel).\n"
-        f"    In Claude, `/mcp` should list citadel tools (not zero tools)."
-    )
+    return format_onboard_next_steps(rc_path, tools=["claude"])
 
 
 def diagnose_mcp_config(repo: Path) -> list[dict[str, str]]:

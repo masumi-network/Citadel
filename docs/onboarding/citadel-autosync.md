@@ -29,8 +29,10 @@ citadel onboard
 
 This is idempotent: it wires the token into your shell rc, installs the git
 pre-push hook (`python -m kb.hooks.sync_push`), the Claude Code SessionEnd hook
-(`python -m kb.hooks.sync_session`), the MCP server (`.mcp.json`), and capture
-roots. Requires the `citadel` CLI (`pipx install citadel-archive`).
+(`python -m kb.hooks.sync_session`), project `.mcp.json`, detected coding
+clients (Claude Code, Cursor, Codex, Gemini, Windsurf), and capture roots. On
+macOS it also runs `launchctl setenv` so Dock-launched Cursor can see the
+token until logout. Requires the `citadel` CLI (`pipx install citadel-archive`).
 
 ## What auto-syncs, and when
 

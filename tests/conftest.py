@@ -19,6 +19,20 @@ def _isolate_claude_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_macos_gui_setenv(monkeypatch):
+    """Onboard publishes the token via `launchctl setenv` on Darwin.
+
+    Tests must not write the developer's GUI session env. Individual tests that
+    assert the publish step patch ``kb.cli.publish_token_to_macos_gui``.
+    """
+    monkeypatch.setattr(
+        "kb.cli.publish_token_to_macos_gui",
+        lambda token: "skipped:not-darwin",
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_credentials_for_a_real_node(monkeypatch):
     """Stop the suite authenticating to whatever Node the developer is pointed at.
 

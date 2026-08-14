@@ -6,6 +6,16 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`citadel onboard` wires detected coding tools in non-interactive mode too.**
+  Same write-tier clients as the interactive checkbox (Claude Code, Cursor,
+  Codex, Gemini, Windsurf), using `citadel mcp add`'s `tool_detect.apply`.
+  `--no-tools` still skips. On macOS a verified token is also published with
+  `launchctl setenv` (until logout) so Dock-launched Cursor can resolve
+  `${env:CITADEL_MCP_ACCESS_TOKEN}`. The post-onboard next-steps block tells
+  you to Cmd-Q Cursor and run `cursor .` from that shell.
+
 ## [0.5.0] (2026-08-14)
 
 ### Added

@@ -49,7 +49,7 @@ Promotion is the deliberate part. Captured work lands in your own space, and rea
 ```bash
 npx skills add masumi-network/citadel --skill citadel
 pipx install citadel-archive
-citadel onboard      # token, hooks, MCP config, capture roots
+citadel onboard      # token, hooks, MCP (project + Cursor/Codex/Claude/…), capture roots
 citadel status       # connection, identity, local setup
 ```
 
@@ -67,7 +67,9 @@ Full walkthrough in [`docs/onboarding/teammate-rollout.md`](docs/onboarding/team
 
 ## Connecting an agent
 
-Agents need a URL and a token. `citadel onboard` writes this for you:
+Agents need a URL and a token. `citadel onboard` writes project `.mcp.json` and,
+when those tools are detected, `~/.cursor/mcp.json`, Codex, Claude user-scope,
+Gemini, and Windsurf:
 
 ```json
 {
@@ -90,7 +92,7 @@ For headless setup, pass the token through the environment instead of `argv`:
 
 ```bash
 export CITADEL_MCP_ACCESS_TOKEN=ctdl_...
-citadel onboard --non-interactive --json
+citadel onboard --non-interactive --json   # also wires Cursor/Codex/Claude when detected
 citadel status --json --check-search
 ```
 

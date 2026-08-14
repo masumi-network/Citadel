@@ -77,10 +77,10 @@ Pick the user's client. Each config points at the hosted `/mcp/` URL and sends t
 token in the `Authorization` header. Store the token in an env var or the client's
 secret store — **never** as a literal in a tracked file.
 
-> **Shortcut:** with the CLI installed (`pipx install citadel-archive`),
-> `citadel mcp add <tool>` writes this config for you — it auto-configures
-> Cursor, Codex, Gemini, and Windsurf, and prints a paste-in snippet for the
-> rest (`citadel mcp list` shows supported targets). The manual configs below
+> **Shortcut:** `citadel onboard` wires detected write-tier clients (Claude Code,
+> Cursor, Codex, Gemini, Windsurf) on both interactive and `--non-interactive`
+> runs. `--no-tools` skips that. `citadel mcp add <tool>` does the same one
+> client at a time (`citadel mcp list` shows targets). Manual configs below
 > stay valid if you prefer to edit by hand.
 
 #### Claude Code — project `.mcp.json`

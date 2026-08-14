@@ -143,6 +143,7 @@ For headless setup, keep the token out of `argv`:
 ```bash
 export CITADEL_MCP_ACCESS_TOKEN="ctdl_..."
 citadel onboard --non-interactive --json
+# also wires detected write-tier clients (Cursor, Codex, Claude, …); --no-tools to skip
 citadel status --json --check-search
 ```
 
@@ -191,10 +192,11 @@ info, the connection works.
 
 ### Local CLI + cloud environment
 
-`citadel onboard` writes your seat token to the shell rc and adds a project
-`.mcp.json` that references `${CITADEL_MCP_ACCESS_TOKEN}` — the secret is
-**never** stored in git. Claude Code only expands that header when the variable
-is present in the **process environment** that launched Claude:
+`citadel onboard` writes your seat token to the shell rc, adds a project
+`.mcp.json` that references `${CITADEL_MCP_ACCESS_TOKEN}`, and (unless
+`--no-tools`) wires detected clients via the same path as `citadel mcp add`.
+The secret is **never** stored in git. Claude Code only expands that header
+when the variable is present in the **process environment** that launched Claude:
 
 | Where you run Claude | What you need |
 |---|---|
@@ -319,6 +321,10 @@ config-file route above until Citadel exposes an OAuth flow.
 
 ## Codex (OpenAI)
 
+`citadel onboard` (or `citadel mcp add codex`) prefers `codex mcp add` with
+`bearer_token_env_var`, so the token stays in the shell rc. Restart the Codex
+session from that shell. The block below is the manual fallback.
+
 ### Step 1 — Add to `~/.codex/config.toml`
 
 Append this to `~/.codex/config.toml`:
@@ -397,7 +403,15 @@ Caveats:
 
 ## Cursor
 
-### Step 1 — Add MCP server
+`citadel onboard` (or `citadel mcp add cursor`) writes `~/.cursor/mcp.json`.
+Prefer that over hand-editing Settings. The header uses
+`${env:CITADEL_MCP_ACCESS_TOKEN}`; the token stays in the shell rc.
+
+After onboard on macOS: quit Cursor (Cmd-Q), then `cursor .` from that shell.
+`launchctl setenv` (run by onboard) lasts until logout. Dock/Spotlight launches
+do not read `~/.zshrc`. `/mcp` reconnect does not recapture a missing launch env.
+
+### Step 1 — Add MCP server (manual)
 
 Open Cursor Settings → Features → Model Context Protocol. Add a new MCP server:
 
@@ -695,8 +709,10 @@ A reconnect cannot fix this; you need a fresh process:
    reconnect — and **relaunch it from that terminal** so it recaptures the env.
 
 **macOS:** apps launched from the Dock/Spotlight do **not** inherit `~/.zshrc`, so
-the placeholder resolves to empty. Launch from a terminal, or set the token in the
-GUI login environment: `launchctl setenv CITADEL_MCP_ACCESS_TOKEN <token>`.
+the placeholder resolves to empty. `citadel onboard` runs
+`launchctl setenv CITADEL_MCP_ACCESS_TOKEN` for you (until logout). Then quit
+the app fully and relaunch from a sourced shell (`cursor .`), or run
+`launchctl setenv CITADEL_MCP_ACCESS_TOKEN <token>` yourself.
 
 `citadel doctor` flags the common case (token in rc but missing from the current
 env). This is distinct from **connected but zero tools** — see

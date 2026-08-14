@@ -50,13 +50,14 @@ from kb.onboard import (
     diagnose_mcp_config,
     ensure_env_in_rc,
     ensure_token_in_rc,
-    format_claude_mcp_next_steps,
+    format_onboard_next_steps,
     git_root_or_cwd,
     install_agent_policies,
     install_pre_push_hook,
     mask_token,
     merge_claude_settings,
     merge_mcp_config,
+    publish_token_to_macos_gui,
     read_token_from_rc,
 )
 from kb.banner import (
@@ -1959,20 +1960,41 @@ def _indent(text: str, prefix: str = "    ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
-def _wire_detected_tools(node_url: str, *, color: bool) -> None:
+def _tool_step(name: str, result: Any) -> tuple[str, str]:
+    from kb import tool_detect
+
+    spec = tool_detect.SPECS[name]
+    status = result.action if result.action != "error" else f"error:{result.detail}"
+    return spec.label, status
+
+
+def _wire_write_tier_tools(node_url: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Non-interactive: wire every detected write-tier client (same as checkbox defaults)."""
+    from kb import tool_detect
+
+    names = [n for n in tool_detect.detect() if tool_detect.SPECS[n].mode == "write"]
+    if not names:
+        return [], []
+    labels = ", ".join(tool_detect.SPECS[n].label for n in names)
+    with _Spinner(f"Wiring {labels}…"):
+        results = [(name, tool_detect.apply(name, node_url=node_url)) for name in names]
+    steps = [_tool_step(name, result) for name, result in results]
+    return steps, names
+
+
+def _wire_detected_tools(node_url: str, *, color: bool) -> tuple[list[tuple[str, str]], list[str]]:
     """Interactive: one checkbox list of detected tools, then wire the selection.
 
-    Write-tier tools (token stays in the rc via an env reference) are merged;
-    snippet-tier tools print a paste-in block; Pi gets a note. Preselection
-    mirrors the old per-tool defaults: write-tier on, snippet-tier off. Used
-    only on an interactive `citadel onboard`.
+    Write-tier tools land in the onboard summary. Snippet-tier tools print a
+    paste-in block. Pi gets a note. Preselection matches the old defaults:
+    write-tier on, snippet-tier off.
     """
     from kb import tool_detect
     from kb.prompt import checkbox_select
 
     detected = tool_detect.detect()
     if not detected:
-        return
+        return [], []
     selectable = [name for name in detected if tool_detect.SPECS[name].mode != "note"]
     notes = [name for name in detected if tool_detect.SPECS[name].mode == "note"]
 
@@ -1987,7 +2009,7 @@ def _wire_detected_tools(node_url: str, *, color: bool) -> None:
         print()
         picked = checkbox_select(
             paint("Coding tools", "bold", enable=color)
-            + paint(" — add Citadel MCP to:", "dim", enable=color),
+            + paint(": add Citadel MCP to", "dim", enable=color),
             labels,
             preselected,
         )
@@ -1995,20 +2017,27 @@ def _wire_detected_tools(node_url: str, *, color: bool) -> None:
 
     results: list[tuple[str, Any]] = []
     if chosen:
-        with _Spinner(f"Wiring {len(chosen)} tool(s)…"):
+        labels = ", ".join(tool_detect.SPECS[n].label for n in chosen)
+        with _Spinner(f"Wiring {labels}…"):
             results = [(name, tool_detect.apply(name, node_url=node_url)) for name in chosen]
+    steps: list[tuple[str, str]] = []
+    wired: list[str] = []
     for name, result in results:
         spec = tool_detect.SPECS[name]
         if spec.mode == "write":
-            sigil = mark(result.action != "error", enable=color)
-            print(f"  {sigil} {spec.label}  {paint(f'{result.action} · {result.detail}', 'dim', enable=color)}")
-        else:  # snippet
-            print(f"  {paint(spec.label, 'bold', enable=color)} — paste into {paint(spec.config_hint, 'dim', enable=color)}:")
+            steps.append(_tool_step(name, result))
+            wired.append(name)
+        else:
+            print(
+                f"  {paint(spec.label, 'bold', enable=color)}: paste into "
+                f"{paint(spec.config_hint, 'dim', enable=color)}:"
+            )
             print(_indent(result.snippet or ""))
     for name in notes:
         result = tool_detect.apply(name, node_url=node_url)
         spec = tool_detect.SPECS[name]
         print(f"  {paint('•', 'dim', enable=color)} {spec.label}: {paint(result.detail, 'dim', enable=color)}")
+    return steps, wired
 
 
 async def _mcp_add(args: argparse.Namespace) -> int:
@@ -2549,8 +2578,12 @@ def _humanize_status(status: str) -> tuple[str, bool, bool]:
     """
     if status.startswith("skipped:"):
         reason = status.split(":", 1)[1].replace("-", " ")
-        reason = {"not git": "not a git repo"}.get(reason, reason)
+        reason = {"not git": "not a git repo", "not darwin": "not macOS"}.get(reason, reason)
         return f"skipped ({reason})", True, True
+    if status.startswith("error:"):
+        return status.split(":", 1)[1].strip() or status, False, False
+    if status == "set":
+        return "set (until logout)", True, False
     return status, True, False
 
 
@@ -2740,6 +2773,12 @@ async def _onboard(args: argparse.Namespace) -> int:
             print(f"citadel onboard: {exc}", file=sys.stderr)
         return 1
 
+    gui_env = "skipped:not-darwin"
+    if not token_rejected:
+        gui_env = publish_token_to_macos_gui(token)
+        if not gui_env.startswith("skipped:"):
+            steps.append(("macOS GUI env", gui_env))
+
     # A custom --node-url is persisted to the capture config so MCP and capture
     # target the same Node (no split-brain). Done before the roots wizard, which
     # preserves node_url when it re-saves.
@@ -2818,8 +2857,13 @@ async def _onboard(args: argparse.Namespace) -> int:
         else:
             steps.append(("capture roots → Node", sync_result.detail))
 
-    if interactive and not getattr(args, "no_tools", False):
-        _wire_detected_tools(node_url, color=color)
+    wired_tools: list[str] = []
+    if not getattr(args, "no_tools", False):
+        if interactive:
+            tool_steps, wired_tools = _wire_detected_tools(node_url, color=color)
+        else:
+            tool_steps, wired_tools = _wire_write_tier_tools(node_url)
+        steps.extend(tool_steps)
 
     if as_json:
         _print_json(
@@ -2854,22 +2898,16 @@ async def _onboard(args: argparse.Namespace) -> int:
     if token_rejected:
         print(
             paint(
-                f"{WARN} The Node rejected this token — searches will fail until you set "
+                f"{WARN} The Node rejected this token. Searches will fail until you set "
                 "a valid one with `citadel token set`.",
                 "yellow",
                 enable=color,
             )
         )
-    print(
-        f"\nNext: restart your shell (or `source {rc_path}`), then in your agent:\n"
-        '  • at task start — "use citadel_search before we code on <topic>"\n'
-        '  • proactive capture — see /skills/proactive-ingest for mid-session ingest + autosync\n'
-        '  • when a route is worth reusing — ask the user, then `citadel_share_session` '
-        "(Shared Session Traces are reference-only, not org truth)\n"
-        '  • smoke test — "use citadel_search to find what we decided about the vault"'
-    )
-    if not args.no_mcp:
-        print(format_claude_mcp_next_steps(rc_path))
+    next_tools = list(wired_tools)
+    if not args.no_mcp and "claude" not in next_tools:
+        next_tools.append("claude")
+    print(format_onboard_next_steps(rc_path, tools=next_tools, gui_env=gui_env))
     return 0
 
 

@@ -30,6 +30,7 @@ existing config (never clobbering) and safe to re-run:
 | **Session hooks** | Merges the Claude Code `SessionEnd` + `SessionStart` hooks into user-scope `.claude/settings.json` (SessionEnd → private Node trace; SessionStart → proactive policy reminder) | yes |
 | **Agent policy** | Same three-rule proactive policy for every coding agent you use — see [Proactive agent policy](#proactive-agent-policy-after-onboard) | yes |
 | **MCP server** | Adds the `citadel` HTTP MCP server to `.mcp.json` (in-session `citadel_search`, `citadel_ingest`, `citadel_share_session`) | optional, default on (`--no-mcp` to skip) |
+| **Coding tools** | Wires Claude Code, Cursor, Codex, Gemini, Windsurf when detected (`citadel mcp add`). Interactive: checkbox. Non-interactive: write-tier defaults. macOS: `launchctl setenv` until logout. | optional, default on (`--no-tools` to skip) |
 | **Capture roots** | Optional `citadel setup` wizard → `~/.citadel/capture.json` | optional, prompted |
 
 ## Where to get the token
@@ -79,10 +80,15 @@ with an intentional dataset and role. Do not use one for teammate onboarding.
 - Manual ingest/search always works via the CLI (`citadel ingest`,
   `citadel search`, `citadel capture`) — both HTTP-backed against the Node by
   default (`--local` runs the in-process server stack instead).
-- Onboard writes `.mcp.json` for Claude Code. To add the Citadel MCP server to
-  another client, run `citadel mcp add <tool>` (auto-configures Cursor, Codex,
-  Gemini, Windsurf; prints a snippet for the rest — `citadel mcp list` shows
-  targets).
+- Onboard writes `.mcp.json` and wires detected write-tier clients (Claude
+  Code, Cursor, Codex, Gemini, Windsurf) via the same path as
+  `citadel mcp add <tool>`. Interactive onboard keeps the checkbox
+  (write-tier preselected). `--non-interactive` auto-wires those defaults.
+  Skip with `--no-tools`. `citadel mcp list` shows targets; snippet-tier
+  tools (Cline, Zed) still print a paste-in block only when you pick them.
+  On macOS, onboard also runs `launchctl setenv` so Dock-launched Cursor can
+  see `CITADEL_MCP_ACCESS_TOKEN` until logout. Then quit Cursor (Cmd-Q) and
+  relaunch from that shell: `cursor .`.
 
 ## Non-interactive / scripted
 
@@ -93,7 +99,7 @@ citadel onboard --non-interactive --json \
 ```
 
 Flags: `--token`, `--node-url`, `--repo`, `--shell-rc`, `--no-mcp`,
-`--no-capture`, `--non-interactive`. Prefer `CITADEL_MCP_ACCESS_TOKEN` so the
+`--no-capture`, `--no-tools`, `--non-interactive`. Prefer `CITADEL_MCP_ACCESS_TOKEN` so the
 secret does not appear in `argv`. Exits non-zero if no token is available.
 
 ## Check status (the dashboard replacement)
@@ -169,6 +175,10 @@ the vault."* A grounded answer means the token + MCP work.
 launched Claude — not only in your shell rc. Local: `source ~/.zshrc` before
 `claude`. Cloud: add `CITADEL_MCP_ACCESS_TOKEN` in cloud env settings. Verify
 with `claude mcp list` and `/mcp` (citadel tools, not zero tools).
+
+**Cursor:** quit fully (Cmd-Q), then from a shell that has the token:
+`cursor .`. Dock/Spotlight launches miss `~/.zshrc`. Onboard's `launchctl setenv`
+covers GUI apps until logout.
 
 See [`docs/onboarding/teammate-rollout.md`](../../docs/onboarding/teammate-rollout.md)
 for the manual step-by-step and what auto-syncs.

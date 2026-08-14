@@ -20,6 +20,7 @@ from kb.onboard import (
     diagnose_mcp_config,
     ensure_token_in_rc,
     format_claude_mcp_next_steps,
+    format_onboard_next_steps,
     install_agent_policies,
     install_cursor_agent_policy_rule,
     install_markdown_policy_file,
@@ -353,6 +354,7 @@ def test_onboard_non_interactive_full_run(tmp_path: Path, monkeypatch) -> None:
         no_mcp=False,
         no_capture=True,
         non_interactive=True,
+        no_tools=True,
     )
     rc_code = asyncio.run(_onboard(args))
     assert rc_code == 0
@@ -383,6 +385,7 @@ def test_onboard_no_mcp_flag_skips_mcp(tmp_path: Path) -> None:
         no_mcp=True,
         no_capture=True,
         non_interactive=True,
+        no_tools=True,
     )
     assert asyncio.run(_onboard(args)) == 0
     assert not (repo / ".mcp.json").exists()
@@ -397,6 +400,7 @@ def test_onboard_no_token_non_interactive_exits_one(tmp_path: Path, monkeypatch,
         no_mcp=False,
         no_capture=True,
         non_interactive=True,
+        no_tools=True,
     )
     rc = asyncio.run(_onboard(args))
     assert rc == 1
@@ -615,3 +619,123 @@ def test_onboard_syncs_capture_roots_to_node(tmp_path: Path, monkeypatch) -> Non
     assert len(calls) == 1
     assert calls[0][1]["token"] == "ctdl_test_seat_token"
     assert cfg_path.exists()
+
+
+def test_publish_token_to_macos_gui_sets_on_darwin(monkeypatch) -> None:
+    from kb.onboard import publish_token_to_macos_gui
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr("kb.onboard.sys.platform", "darwin")
+    monkeypatch.setattr("kb.onboard.subprocess.run", fake_run)
+    assert publish_token_to_macos_gui("ctdl_secret_token") == "set"
+    assert calls == [["launchctl", "setenv", TOKEN_ENV, "ctdl_secret_token"]]
+
+
+def test_publish_token_to_macos_gui_skips_off_darwin(monkeypatch) -> None:
+    from kb.onboard import publish_token_to_macos_gui
+
+    monkeypatch.setattr("kb.onboard.sys.platform", "linux")
+    called = []
+    monkeypatch.setattr(
+        "kb.onboard.subprocess.run", lambda *a, **k: called.append(a) or type("R", (), {"returncode": 0})()
+    )
+    assert publish_token_to_macos_gui("ctdl_secret_token") == "skipped:not-darwin"
+    assert called == []
+
+
+def test_publish_token_to_macos_gui_error_does_not_raise(monkeypatch) -> None:
+    from kb.onboard import publish_token_to_macos_gui
+
+    monkeypatch.setattr("kb.onboard.sys.platform", "darwin")
+
+    def boom(*a, **k):
+        raise OSError("launchctl missing")
+
+    monkeypatch.setattr("kb.onboard.subprocess.run", boom)
+    status = publish_token_to_macos_gui("ctdl_secret_token")
+    assert status.startswith("error:")
+    assert "ctdl_secret_token" not in status
+
+
+def test_format_onboard_next_steps_covers_cursor_and_claude(tmp_path: Path) -> None:
+    from kb.onboard import format_onboard_next_steps
+
+    rc = tmp_path / ".zshrc"
+    text = format_onboard_next_steps(
+        rc, tools=["cursor", "claude", "codex"], gui_env="set"
+    )
+    assert str(rc) in text
+    assert "cursor ." in text
+    assert "Cmd-Q" in text
+    assert "claude mcp list" in text
+    assert "Codex" in text
+    assert "ctdl_" not in text
+
+
+def test_onboard_non_interactive_wires_write_tier_tools(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from kb.tool_detect import ToolResult
+
+    repo = _make_repo(tmp_path)
+    applied: list[str] = []
+    monkeypatch.setattr(
+        "kb.tool_detect.detect", lambda: ["cursor", "codex", "claude", "zed", "pi"]
+    )
+    monkeypatch.setattr(
+        "kb.tool_detect.apply",
+        lambda name, node_url: applied.append(name) or ToolResult(name, "wrote", "ok"),
+    )
+    monkeypatch.setattr("kb.cli.publish_token_to_macos_gui", lambda token: "set")
+    args = argparse.Namespace(
+        token="ctdl_test_seat_token",
+        repo=str(repo),
+        shell_rc=str(tmp_path / ".zshrc"),
+        no_mcp=True,
+        no_capture=True,
+        non_interactive=True,
+        json=True,
+        no_tools=False,
+        node_url=None,
+    )
+    assert asyncio.run(_onboard(args)) == 0
+    assert applied == ["cursor", "codex", "claude"]
+    out = json.loads(capsys.readouterr().out)
+    names = [s["name"] for s in out["steps"]]
+    assert "Cursor" in names
+    assert "Codex CLI" in names
+    assert "Claude Code (user scope)" in names
+    assert "macOS GUI env" in names
+    assert "Zed" not in names
+    dumped = json.dumps(out)
+    assert "ctdl_test_seat_token" not in dumped
+
+
+def test_onboard_no_tools_skips_write_tier(tmp_path: Path, monkeypatch) -> None:
+    from kb.tool_detect import ToolResult
+
+    repo = _make_repo(tmp_path)
+    applied: list[str] = []
+    monkeypatch.setattr("kb.tool_detect.detect", lambda: ["cursor", "codex"])
+    monkeypatch.setattr(
+        "kb.tool_detect.apply",
+        lambda name, node_url: applied.append(name) or ToolResult(name, "wrote", "ok"),
+    )
+    args = argparse.Namespace(
+        token="ctdl_test_seat_token",
+        repo=str(repo),
+        shell_rc=str(tmp_path / ".zshrc"),
+        no_mcp=True,
+        no_capture=True,
+        non_interactive=True,
+        json=True,
+        no_tools=True,
+        node_url=None,
+    )
+    assert asyncio.run(_onboard(args)) == 0
+    assert applied == []
