@@ -641,10 +641,10 @@ _PUBLIC_PROVENANCE_KEYS = frozenset(
 def is_search_content_hit(item: Any) -> bool:
     """True when a retrieved row carries user-facing content.
 
-    Qdrant content chunks use ``IndexSchema`` too, so that type alone cannot
-    distinguish a document from an engine row. A valid IndexSchema hit needs
-    both text and its parent document id. Other retrieval paths, including the
-    GitHub digest fallback, may carry text without a document id.
+    Qdrant content chunks use ``IndexSchema`` and ``DocumentChunk``. A valid
+    typed hit needs both text and its parent document id. Other retrieval
+    paths, including the GitHub digest fallback, may carry untyped text without
+    a document id.
     """
     if isinstance(item, str):
         return bool(item.strip())
@@ -653,7 +653,11 @@ def is_search_content_hit(item: Any) -> bool:
     raw_type = item.get("type")
     if raw_type is not None and not isinstance(raw_type, str):
         return False
-    if raw_type is not None and raw_type.strip().lower() != "indexschema":
+    normalized_type = raw_type.strip().lower() if isinstance(raw_type, str) else None
+    if normalized_type is not None and normalized_type not in {
+        "indexschema",
+        "documentchunk",
+    }:
         return False
     text = _first_str(
         item.get("text"),
@@ -667,7 +671,7 @@ def is_search_content_hit(item: Any) -> bool:
     )
     if not text:
         return False
-    if isinstance(raw_type, str) and raw_type.strip().lower() == "indexschema":
+    if normalized_type in {"indexschema", "documentchunk"}:
         return bool(_first_str(item.get("document_id")))
     return True
 

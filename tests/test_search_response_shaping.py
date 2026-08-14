@@ -138,11 +138,16 @@ def test_public_search_hit_drops_engine_fields_and_keeps_drilldown() -> None:
     assert "projection" not in shaped["_citadel"]
 
 
-def test_index_schema_content_requires_a_document_identity() -> None:
-    valid = {
+def test_typed_search_content_requires_a_document_identity() -> None:
+    valid_index = {
         "type": "IndexSchema",
         "document_id": "document-1",
         "text": "A source-backed chunk.",
+    }
+    valid_chunk = {
+        "type": "DocumentChunk",
+        "document_id": "document-1",
+        "text": "A production source-backed chunk.",
     }
     engine_row = {
         "type": "IndexSchema",
@@ -155,10 +160,48 @@ def test_index_schema_content_requires_a_document_identity() -> None:
         "text": "Internal document node",
     }
 
-    assert is_search_content_hit(valid) is True
+    assert is_search_content_hit(valid_index) is True
+    assert is_search_content_hit(valid_chunk) is True
     assert is_search_content_hit(engine_row) is False
     assert is_search_content_hit(other_typed_row) is False
     assert is_search_content_hit({"type": "IndexSchema", "document_id": "document-1"}) is False
+
+
+def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
+    document_id = "0c9d5df0-0000-4000-8000-000000000002"
+    raw = {
+        "id": "0c9d5df0-0000-4000-8000-000000000001",
+        "created_at": 1782742208187,
+        "updated_at": 1782742208187,
+        "version": 1,
+        "type": "DocumentChunk",
+        "text": "synthetic chunk body",
+        "chunk_index": 0,
+        "document_id": document_id,
+        "document_name": "text_0123456789abcdef0123456789abcdef",
+        "metadata": {"index_fields": ["text"]},
+        "_citadel": {
+            "content_hint": "unclassified",
+            "content_sha256": "0" * 64,
+            "dataset": "seat:synthetic",
+            "doc_type": "other",
+            "document_endpoint": f"/api/documents/{document_id}",
+            "provenance": {},
+            "rank": 1,
+            "result_id": "0c9d5df0-0000-4000-8000-000000000001",
+        },
+    }
+
+    response = shaped_client(PageCitadel([raw])).post(
+        "/search",
+        json={"query": "synthetic chunk", "top_k": 5},
+    )
+
+    assert response.status_code == 200
+    hits = response.json()["results"]
+    assert hits
+    assert hits[0]["text"] == "synthetic chunk body"
+    assert hits[0]["document_id"] == document_id
 
 
 def test_public_search_shape_rejects_malformed_engine_values() -> None:

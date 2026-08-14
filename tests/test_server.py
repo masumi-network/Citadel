@@ -5044,6 +5044,8 @@ class MultiSearchCitadel(FakeCitadel):
             {
                 "query": query,
                 "dataset": dataset,
+                "type": "DocumentChunk",
+                "document_id": f"document-{dataset}",
                 "text": f"{query} in {dataset}",
                 "top_k": kwargs["top_k"],
             }
