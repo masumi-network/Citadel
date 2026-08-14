@@ -2150,7 +2150,11 @@ async def search_across_datasets(
         ]
     )
     per_dataset: list[tuple[str, list[Any]]] = [
-        (dataset, list(results)) for dataset, results in zip(datasets, results_per)
+        (
+            dataset,
+            [result for result in results if is_search_content_hit(result)],
+        )
+        for dataset, results in zip(datasets, results_per)
     ]
     literal_query = len(query_terms(query)) == 1
 

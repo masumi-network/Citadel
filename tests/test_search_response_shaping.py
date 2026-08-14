@@ -8,6 +8,7 @@ call down to its ``search_id``. Each test here fails on the pre-fix code.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,12 @@ from kb.search_format import (
     parse_content_header,
     shape_public_search_hit,
 )
-from kb.server import app, result_provenance, with_result_metadata
+from kb.server import (
+    app,
+    result_provenance,
+    search_across_datasets,
+    with_result_metadata,
+)
 
 
 def repo_doc_text(repo: str, path: str, body: str) -> str:
@@ -79,6 +85,19 @@ class PageCitadel:
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         return None
+
+
+class CollisionCitadel:
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        if kwargs["dataset"] == "seat:alice":
+            return [{"type": "IndexSchema", "text": "shared answer"}]
+        return [
+            {
+                "type": "DocumentChunk",
+                "document_id": "central-document",
+                "text": "shared answer",
+            }
+        ]
 
 
 def shaped_client(citadel: Any) -> TestClient:
@@ -167,6 +186,29 @@ def test_typed_search_content_requires_a_document_identity() -> None:
     assert is_search_content_hit({"type": "IndexSchema", "document_id": "document-1"}) is False
 
 
+def test_invalid_primary_row_cannot_hide_valid_secondary_hit() -> None:
+    merged = asyncio.run(
+        search_across_datasets(
+            CollisionCitadel(),
+            query="shared answer",
+            datasets=["seat:alice", "central"],
+            sessions={},
+            top_k=5,
+        )
+    )
+
+    assert merged == [
+        (
+            "central",
+            {
+                "type": "DocumentChunk",
+                "document_id": "central-document",
+                "text": "shared answer",
+            },
+        )
+    ]
+
+
 def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
     document_id = "0c9d5df0-0000-4000-8000-000000000002"
     raw = {
@@ -202,6 +244,41 @@ def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
     assert hits
     assert hits[0]["text"] == "synthetic chunk body"
     assert hits[0]["document_id"] == document_id
+
+
+def test_public_shape_keeps_validated_lifecycle_receipt_identity() -> None:
+    promoted = with_result_metadata(
+        {
+            "type": "DocumentChunk",
+            "document_id": "document-1",
+            "text": "projected content",
+            "_lifecycle": {
+                "source_revision_id": "source-1",
+                "projection_receipt_id": "receipt-1",
+                "generation_id": "generation-1",
+                "backend": "vector",
+                "provider": "qdrant",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+                "private": "drop-me",
+            },
+        },
+        0,
+        "notes",
+    )
+
+    shaped = shape_public_search_hit(promoted)
+    envelope = shaped["_citadel"]
+    assert envelope["source_revision_id"] == "source-1"
+    assert envelope["projection_receipt_id"] == "receipt-1"
+    assert envelope["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "vector",
+        "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
+    assert "private" not in envelope["projection"]
 
 
 def test_public_search_shape_rejects_malformed_engine_values() -> None:

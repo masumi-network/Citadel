@@ -3461,7 +3461,7 @@ def test_search_across_datasets_runs_concurrently() -> None:
             order.append(("start", dataset))
             await aio.sleep(0.05)
             order.append(("end", dataset))
-            return [{"id": dataset}]
+            return [{"id": dataset, "text": dataset}]
 
     merged = aio.run(
         search_across_datasets(

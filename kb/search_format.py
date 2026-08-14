@@ -694,6 +694,8 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
         "doc_type",
         "content_hint",
         "trust_tier",
+        "source_revision_id",
+        "projection_receipt_id",
     ):
         value = envelope.get(key)
         if isinstance(value, str) and value:
@@ -701,6 +703,26 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
     endpoint = envelope.get("document_endpoint")
     if isinstance(endpoint, str) and endpoint.startswith("/api/documents/"):
         public["document_endpoint"] = endpoint
+
+    projection = envelope.get("projection")
+    if (
+        "source_revision_id" in public
+        and "projection_receipt_id" in public
+        and isinstance(projection, dict)
+    ):
+        clean_projection = {
+            key: value
+            for key in (
+                "generation_id",
+                "backend",
+                "provider",
+                "projection_version",
+                "state",
+            )
+            if isinstance((value := projection.get(key)), str) and value
+        }
+        if clean_projection:
+            public["projection"] = clean_projection
 
     provenance = envelope.get("provenance")
     if isinstance(provenance, dict):
