@@ -45,8 +45,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from kb.capture_config import DEFAULT_NODE_URL as DEFAULT_BASE_URL
+
 DEFAULT_MAX_INGEST_BYTES = 200_000
-DEFAULT_BASE_URL = "https://citadel-archive-production.up.railway.app"
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 HTTP_TIMEOUT_SECONDS = 10
 MAX_CHANGED_FILES = 80
@@ -228,6 +229,16 @@ def _changed_files(cwd: str, sha: str) -> list[str]:
     return files[:MAX_CHANGED_FILES]
 
 
+def _filter_denied_paths(paths: list[str]) -> list[str]:
+    from kb.capture_policy import DEFAULT_ORG_CAPTURE_DENY_GLOBS, path_is_denied
+
+    return [
+        path
+        for path in paths
+        if not path_is_denied(path, DEFAULT_ORG_CAPTURE_DENY_GLOBS)
+    ]
+
+
 def _repo_name(cwd: str) -> str:
     top = git_toplevel(cwd)
     return os.path.basename(top.rstrip("/")) if top else ""
@@ -303,7 +314,7 @@ def build_commit_snapshot(
         remote_name=remote_name,
         remote_ref=remote_ref,
         repo_name=_repo_name(root),
-        changed_files=_changed_files(root, sha),
+        changed_files=_filter_denied_paths(_changed_files(root, sha)),
     )
 
 

@@ -112,9 +112,10 @@ def test_the_theme_bootstrap_is_served_as_executable_javascript() -> None:
 
 
 def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
-    """The React Flow bundle is a few hundred kilobytes and is fetched only when
-    the diagram scrolls into view, so the document has to carry a correct
-    picture on its own."""
+    """The React Flow bundle is fetched when the diagram scrolls into view.
+    The export still carries a correct picture (the numbered path plus the
+    layered stack) so a phone or a no-JS client is not blank.
+    """
     body = _client().get("/next").text
 
     for step in ("Capture", "Your Node", "Promotion", "Central"):
@@ -125,13 +126,11 @@ def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
 def test_the_landing_architecture_reaches_phones_and_names_what_runs() -> None:
     """Two regressions pinned at once.
 
-    Mobile: pipeline-diagram.tsx never mounts React Flow under 620px (fitView
-    cannot fit the topology there), and the static spine was all a phone got:
-    four step names, no architecture. The stacked lanes are exported markup,
-    shown by CSS exactly where that gate keeps the diagram off, so a phone
-    reads the whole architecture with no JavaScript.
+    Mobile: the React Flow canvas mounts at every width (fitView, pan off on
+    coarse pointers). The layered markup stays in the export so a phone with
+    no JavaScript still reads the architecture.
 
-    Content: the stages name what actually runs at head, the stores
+    Content: the layers name what actually runs at head, the stores
     kb/lite_runtime.py configures and the lifecycle wording of kb/lifecycle.py,
     and carry no cadence figure. "hourly" sat on the org sources while the
     shipped default interval was six hours (kb/config.py
@@ -140,13 +139,15 @@ def test_the_landing_architecture_reaches_phones_and_names_what_runs() -> None:
     """
     body = _client().get("/next").text
 
-    lanes = re.search(r'<div[^>]*aria-label="The architecture, lane by lane"[^>]*>', body)
-    assert lanes is not None, "the stacked architecture block is not in the export"
-    assert "max-[620px]:block" in lanes.group(0), "the lanes are not the below-620px rendering"
+    layers = re.search(
+        r'<div[^>]*aria-label="The architecture, layer by layer"[^>]*>', body
+    )
+    assert layers is not None, "the layered architecture block is not in the export"
+    assert "max-[620px]:hidden" not in layers.group(0)
 
-    spine = re.search(r'<div[^>]*aria-label="How work reaches the vault"[^>]*>', body)
-    assert spine is not None
-    assert "max-[620px]:hidden" in spine.group(0), "the spine does not yield to the lanes"
+    spine = re.search(r'<ol[^>]*aria-label="How work reaches the vault"[^>]*>', body)
+    assert spine is not None, "the capture-to-read path is not in the export"
+    assert "max-[620px]:hidden" not in spine.group(0)
 
     for fact in (
         "Lifecycle ledger",
@@ -416,8 +417,11 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     """
     body = _client().get("/next/info").text
 
-    assert "v0.4.1" in body
-    assert "~$55/mo" in body
+    assert "Live · v0.5.0" in body
+    assert "Window: v0.2.0 → v0.5.0" in body
+    assert "Window: v0.2.0 → v0.4.1" not in body
+    assert "~$38/mo" in body
+    assert "~$55/mo" not in body
     assert "269 ms" in body
     assert "commits on main" not in body
     assert "architecture decision records" not in body

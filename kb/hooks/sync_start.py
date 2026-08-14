@@ -35,7 +35,8 @@ import sys
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE_URL = "https://citadel-archive-production.up.railway.app"
+from kb.capture_config import DEFAULT_NODE_URL as DEFAULT_BASE_URL
+
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 HTTP_TIMEOUT_SECONDS = 5
 RECENT_LIMIT = 8

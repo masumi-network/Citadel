@@ -9,7 +9,7 @@ description: >-
   detect client, collect only the token, write the remote MCP config
   (URL + Authorization header), verify, then search the vault. Triggers include
   connect citadel, set up citadel mcp, citadel mcp connector, citadel archive mcp,
-  and https://citadel-archive-production.up.railway.app/skills/connect.
+  and https://citadel.utxo.ag/skills/connect.
 ---
 
 # Citadel MCP Connector
@@ -18,7 +18,7 @@ Citadel is served as a **hosted MCP endpoint**. Agents connect with a URL and a
 token — there is **no repository to clone**, no `uv`, and no local Python.
 
 ```
-MCP endpoint:  https://citadel-archive-production.up.railway.app/mcp/
+MCP endpoint:  https://citadel.utxo.ag/mcp/
 Auth:          Authorization: Bearer ctdl_<your-token>
 ```
 
@@ -30,12 +30,12 @@ Auth:          Authorization: Bearer ctdl_<your-token>
 | [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) — app code, skills | Team/organization memory behind the token |
 
 Never commit tokens. Never copy vault search results into a public repo or issue.
-Boundary detail: `https://citadel-archive-production.up.railway.app/skills/boundary`
+Boundary detail: `https://citadel.utxo.ag/skills/boundary`
 
 ## Skill URLs
 
-- Connect (this skill): `https://citadel-archive-production.up.railway.app/skills/connect`
-- After MCP works: `https://citadel-archive-production.up.railway.app/skills/vault`
+- Connect (this skill): `https://citadel.utxo.ag/skills/connect`
+- After MCP works: `https://citadel.utxo.ag/skills/vault`
 - Full repo skill install: `npx skills add masumi-network/citadel --skill citadel`
 
 If the user shares the `npx skills add` command, install the `citadel`
@@ -67,7 +67,7 @@ Defaults (override only if the user does):
 
 | Setting | Default |
 |---|---|
-| MCP endpoint | `https://citadel-archive-production.up.railway.app/mcp/` |
+| MCP endpoint | `https://citadel.utxo.ag/mcp/` |
 | Token env name | `CITADEL_MCP_ACCESS_TOKEN` |
 | Search dataset | Omit it; the seat token controls its allowed and default datasets |
 
@@ -90,7 +90,7 @@ secret store — **never** as a literal in a tracked file.
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": {
         "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
       }
@@ -103,7 +103,7 @@ Or one command (token expanded from your shell):
 
 ```bash
 claude mcp add --transport http citadel \
-  https://citadel-archive-production.up.railway.app/mcp/ \
+  https://citadel.utxo.ag/mcp/ \
   --header "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
 ```
 
@@ -128,7 +128,7 @@ tools listed, not "connected with zero tools"), and `citadel doctor`.
 {
   "mcpServers": {
     "citadel": {
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": { "Authorization": "Bearer ctdl_..." }
     }
   }
@@ -146,7 +146,7 @@ For a client that only speaks stdio, bridge to the hosted endpoint with
 command = "npx"
 args = [
   "-y", "mcp-remote@0.1.38",
-  "https://citadel-archive-production.up.railway.app/mcp/",
+  "https://citadel.utxo.ag/mcp/",
   "--header", "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}",
 ]
 ```
@@ -174,9 +174,9 @@ Confirm the output reports the expected `seat_slug` and
 **B. HTTP reachability (works immediately):**
 
 ```bash
-curl -fsS "https://citadel-archive-production.up.railway.app/healthz"
+curl -fsS "https://citadel.utxo.ag/healthz"
 curl -fsS -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \
-  "https://citadel-archive-production.up.railway.app/api/session"
+  "https://citadel.utxo.ag/api/session"
 ```
 
 Expect HTTP 200 and JSON with `role` / `actor`. On 401 the token is missing,
@@ -316,6 +316,6 @@ header. It does not install background hooks by itself. Trust boundary:
 
 ## Reference
 
-- Hosted MCP URL: `https://citadel-archive-production.up.railway.app/mcp/`
-- Hosted UI (create tokens): `https://citadel-archive-production.up.railway.app`
-- Vault usage skill: `https://citadel-archive-production.up.railway.app/skills/vault`
+- Hosted MCP URL: `https://citadel.utxo.ag/mcp/`
+- Hosted UI (create tokens): `https://citadel.utxo.ag`
+- Vault usage skill: `https://citadel.utxo.ag/skills/vault`

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 CAPTURE_CONFIG_VERSION = 1
-DEFAULT_NODE_URL = "https://citadel-archive-production.up.railway.app"
+DEFAULT_NODE_URL = "https://citadel.utxo.ag"
 
 # Preset Capture Root Tags (ADR-0007 §4). Custom tags are allowed as search
 # labels; only these presets carry promotion semantics.

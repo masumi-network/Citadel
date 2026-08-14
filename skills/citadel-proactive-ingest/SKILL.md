@@ -1,6 +1,6 @@
 ---
 name: citadel-proactive-ingest
-description: Use to capture durable engineering knowledge into Citadel automatically and proactively while working in an org repo. Covers (0) proactive citadel_search at task start plus optional citadel_share_session for dead-end routes (user-approved), (1) mid-session citadel_ingest for durable facts (personal-by-default; all seat writes land on the Node — Central via Promotion Agent only), (2) git pre-push commit snapshots (universal baseline — Cursor, Codex, Claude), (3) optional Claude Code SessionEnd distill, and (4) server-side Railway cron for GitHub org sync, Linear sync, and the learning pipeline. Triggers include "auto sync my sessions", "remember this in citadel", "proactive ingest", "set up citadel autosync", "personal kb sync", "install autosync", and https://citadel-archive-production.up.railway.app/skills/proactive-ingest.
+description: Use to capture durable engineering knowledge into Citadel automatically and proactively while working in an org repo. Covers (0) proactive citadel_search at task start plus optional citadel_share_session for dead-end routes (user-approved), (1) mid-session citadel_ingest for durable facts (personal-by-default; all seat writes land on the Node — Central via Promotion Agent only), (2) git pre-push commit snapshots (universal baseline — Cursor, Codex, Claude), (3) optional Claude Code SessionEnd distill, and (4) server-side Railway cron for GitHub org sync, Linear sync, and the learning pipeline. Triggers include "auto sync my sessions", "remember this in citadel", "proactive ingest", "set up citadel autosync", "personal kb sync", "install autosync", and https://citadel.utxo.ag/skills/proactive-ingest.
 ---
 
 # Citadel Proactive Ingest
@@ -31,11 +31,11 @@ explicitly promoted or volunteered.
 ```
 Personal node:  seat:{slug}   (the dev's private Citadel node — default target)
 Shared Central: masumi-network (org-wide; Promotion Agent + org sync — not seat tags)
-Hosted base:    https://citadel-archive-production.up.railway.app
+Hosted base:    https://citadel.utxo.ag
 ```
 
-Setup first (token + MCP): `https://citadel-archive-production.up.railway.app/skills/connect`
-Read/write rules: `https://citadel-archive-production.up.railway.app/skills/vault`
+Setup first (token + MCP): `https://citadel.utxo.ag/skills/connect`
+Read/write rules: `https://citadel.utxo.ag/skills/vault`
 
 ## Personal-by-default (read first)
 
@@ -147,7 +147,7 @@ structuring after the note lands; the hook stays deliberately dumb and fast.
 ### One-time token setup (the only step)
 
 Get a **seat-writer** token from the connect wizard
-(`https://citadel-archive-production.up.railway.app/skills/connect`) and export
+(`https://citadel.utxo.ag/skills/connect`) and export
 it once:
 
 ```bash
@@ -288,9 +288,9 @@ does nothing. See `README.md`.
 
 ## Reference
 
-- This skill: `https://citadel-archive-production.up.railway.app/skills/proactive-ingest`
-- Connect wizard: `https://citadel-archive-production.up.railway.app/skills/connect`
-- Vault read/write rules: `https://citadel-archive-production.up.railway.app/skills/vault`
+- This skill: `https://citadel.utxo.ag/skills/proactive-ingest`
+- Connect wizard: `https://citadel.utxo.ag/skills/connect`
+- Vault read/write rules: `https://citadel.utxo.ag/skills/vault`
 - Dev onboarding: [`docs/onboarding/citadel-autosync.md`](../../docs/onboarding/citadel-autosync.md)
 - Teammate one-pager: [`docs/onboarding/teammate-rollout.md`](../../docs/onboarding/teammate-rollout.md)
 - Ingest API: `POST /ingest` with `{data, dataset?, tags?, session_id?}` (writer token)

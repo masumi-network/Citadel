@@ -559,6 +559,39 @@ async def test_ingest_allows_clean_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ingest_rejects_denied_env_path_on_source_locator() -> None:
+    """Org deny globs must run at ingest, not only as JSON on the capture policy.
+
+    `CITADEL_ADMIN_KEY=…` does not match `secret_assignment`. A `.env` file
+    posted as ordinary text with a GitHub blob locator is the hole. Dropping
+    the locator check (and leaving regex-only `_guard_content`) turns this red.
+    """
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.ingest(
+        "NOTE=hello-from-an-env-file",
+        source_locator="https://github.com/org/repo/blob/main/.env",
+    )
+
+    assert result.accepted is False
+    assert result.reason == "excluded_path"
+    assert fake.remember_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_absolute_env_path_as_data() -> None:
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(default_dataset="notes"), cognee=fake)
+
+    result = await kb.ingest("/Users/dev/project/.env")
+
+    assert result.accepted is False
+    assert result.reason == "excluded_path"
+    assert fake.remember_calls == []
+
+
+@pytest.mark.asyncio
 async def test_ingest_scan_can_be_disabled() -> None:
     fake = FakeCognee()
     kb = Citadel(

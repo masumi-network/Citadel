@@ -64,7 +64,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-DEFAULT_NODE = "https://citadel-archive-production.up.railway.app"
+from kb.capture_config import DEFAULT_NODE_URL as DEFAULT_NODE
+
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_BENCH_DIR = PACKAGE_ROOT.parent / "scripts" / "bench"
 # Source checkouts keep the full frozen set and private ground-truth cache under
