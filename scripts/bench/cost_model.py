@@ -29,30 +29,35 @@ from dataclasses import asdict, dataclass
 
 SECONDS_PER_MONTH = 30 * 24 * 3600
 
-# Railway list price, fetched from https://railway.com/pricing on 2026-07-31.
-# Per second, which is also how they bill.
+# Railway list price, fetched from https://railway.com/pricing on 2026-07-31
+# and rechecked 2026-08-14: same four usage rates.
 PRICE_VCPU_SECOND = 0.00000772
 PRICE_GB_RAM_SECOND = 0.00000386
 PRICE_GB_VOLUME_SECOND = 0.00000006
 PRICE_EGRESS_GB = 0.05
 
 # EVERY service in the Railway project, measured over a 24h window on
-# 2026-07-31 via service_metrics. Averages, not peaks.
+# 2026-08-14 via service_metrics (averages, not peaks). Project
+# b1f41db2-93cf-4fa4-88de-173dd87c0f85, environment production.
+# list_services that day returned Citadel-Archive and Qdrant only.
+# Postgres and Citadel-GitHub-Sync were in the 2026-07-31 model and are
+# gone from the project; leaving them in would invent cost.
 #
-# The first version of this model covered only Citadel-Archive and reported
-# $46.74. That was wrong by 18%: `list_services` shows three services, and a
-# cost model that silently omits two of them is worse than no model, because it
-# reads as complete. Whenever a service is added to the project it has to be
-# added here, or this understates again in exactly the same way.
+# A trailing-7-day window the same day totals nearer $58. Qdrant's 7-day
+# average is pulled down by zero samples (the service was not up for the
+# whole week), so the public quote uses the 24h window, same method as
+# 2026-07-31.
 #
 #   name, vCPU, memory GB, volume GB, egress GB/hour
 MEASURED_SERVICES: tuple[tuple[str, float, float, float, float], ...] = (
-    ("Citadel-Archive", 0.0864, 4.4398, 1.4376, 0.0102),
-    ("Postgres", 0.0105, 0.7402, 1.8468, 0.0000),
-    ("Citadel-GitHub-Sync", 0.0000, 0.0208, 1.0573, 0.0000),
+    ("Citadel-Archive", 0.0551, 2.1960, 2.2411, 0.0001),
+    ("Qdrant", 0.0033, 1.4256, 1.3899, 0.0000),
 )
 
 # Measured by scripts/bench/search_bench.py against production on 2026-07-31.
+# A 2026-08-14 rerun timed 105 failed requests (10 HTTP 401, 95 HTTP 429) at
+# p50 106.5ms. That is time-to-error, not a search round-trip, so it does
+# not replace this figure.
 MEASURED_SEARCH_P50_SECONDS = 0.2695
 
 
@@ -178,7 +183,7 @@ def main() -> int:
             "monthly_total_usd": total,
             "monthly_total_note": (
                 "24h-average basis. Memory dominates and moves with the window: a "
-                "trailing-7-day basis gives ~$61. Quote as 'about $55', not to the cent."
+                "trailing-7-day basis gives ~$58. Quote as 'about $38', not to the cent."
             ),
             "services": per_service,
             "lines": [asdict(line) for line in lines],
@@ -188,12 +193,12 @@ def main() -> int:
             "marginal_cost_per_1k_searches_usd": round(per_search * 1000, 4),
             "searches_per_month_to_double_cost": int(total / per_search) if per_search else None,
             "search_response_bytes_median": MEASURED_SEARCH_RESPONSE_BYTES,
-            "price_source": "https://railway.com/pricing, fetched 2026-07-31",
+            "price_source": "https://railway.com/pricing, fetched 2026-07-31, rechecked 2026-08-14",
         }, indent=2))
         return 0
 
     print("Citadel project: monthly cost from measured resource use")
-    print("Prices: Railway list, fetched 2026-07-31. Usage: 24h averages.")
+    print("Prices: Railway list, fetched 2026-07-31, rechecked 2026-08-14. Usage: 24h averages.")
     print(f"Covers all {len(services)} services in the project.\n")
     for name, value in per_service.items():
         print(f"  {name:22} ${value:7.2f}")
@@ -206,8 +211,8 @@ def main() -> int:
     dominant = max(lines, key=lambda line: line.monthly_usd)
     print(f"  {dominant.component} is {dominant.share_pct:.0f}% of the bill.")
     print("  The lever is resident footprint, not query volume.")
-    print("  Quote as 'about $55'. Memory moves with the averaging window:")
-    print("  a trailing-7-day basis gives ~$61. Two decimals would be false precision.\n")
+    print("  Quote as 'about $38'. Memory moves with the averaging window:")
+    print("  a trailing-7-day basis gives ~$58. Two decimals would be false precision.\n")
     print(f"  Marginal cost per search : ${per_search:.8f}")
     print(f"    CPU                    : ${cpu_cost:.8f}  ({100 * cpu_cost / per_search:.0f}%)")
     print(f"    Response egress        : ${egress_cost:.8f}  ({100 * egress_cost / per_search:.0f}%)"

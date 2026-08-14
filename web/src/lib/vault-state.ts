@@ -1,7 +1,7 @@
 /* The public node snapshot, read from `/api/state`.
  *
  * Every public page shows something from it: the health pill in the section
- * index on all four, plus the live tiles and the commit chart on /info. The
+ * index on all four, plus the live tiles and the health strip on /info. The
  * endpoint and its shape are owned by kb/server.py and are not changed here.
  *
  * The fetch is deduplicated at module scope rather than per component, because
@@ -25,9 +25,16 @@ export type RepoBlock = {
 };
 
 export type VaultSource = {
+  name?: string;
   type?: string;
   documents?: number;
+  status?: string;
   last_synced_at?: string | null;
+};
+
+export type LifecycleState = {
+  enabled?: boolean;
+  ok?: boolean;
 };
 
 export type VaultState = {
@@ -35,7 +42,12 @@ export type VaultState = {
   healthy?: boolean;
   updated_at?: string | null;
   sources?: VaultSource[];
-  totals?: { github_repositories?: number };
+  totals?: {
+    github_repositories?: number;
+    documents?: number;
+    linear_issues?: number;
+  };
+  lifecycle?: LifecycleState;
   repo?: RepoBlock;
 };
 

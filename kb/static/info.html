@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Citadel: State of the Vault</title>
+  <title>Citadel</title>
   <meta name="description" content="Citadel: shared, governed memory for your team and its AI agents. Current state, shipped releases, and roadmap.">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/info.css">
@@ -67,18 +67,15 @@
         <div class="metric tealn"><div class="n" id="m-version">v0.4.1</div><div class="k">deployed &amp; healthy on Railway</div></div>
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
         <div class="metric accent"><div class="n">11</div><div class="k">releases shipped (v0.1.0 → v0.4.1)</div></div>
-        <div class="metric"><div class="n" id="m-tools">22</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n sm">~$55/mo</div><div class="k">to self-host, measured 2026-07-31</div></div>
+        <div class="metric"><div class="n" id="m-tools">24</div><div class="k">MCP tools for agents</div></div>
+        <div class="metric"><div class="n sm">~$38/mo</div><div class="k">to self-host, measured 2026-08-14</div></div>
         <div class="metric"><div class="n">269 ms</div><div class="k">median search round-trip, from a client</div></div>
       </div>
       <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.4.1, 2026-08-06.</span></p>
-      <!-- Two different kinds of snapshot, and the sentence has to say which is
-           which. cost_model.py holds 2026-07-31's Railway averages as a constant,
-           so re-running it reprints the same total by construction and can never
-           show drift. search_bench.py really does re-measure. Calling both
-           "reproducible" flattened that difference, which is how a frozen number
-           starts reading as a live one. -->
-      <p class="verified"><span class="vdot"></span>Both are snapshots from 2026-07-31, not live calls, and the method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. The cost model carries that day's resource averages in its source, so re-running it reprints the figure rather than re-measuring it; the round-trip is re-measurable with <code>search_bench.py</code>, and being a client round-trip it reads higher than server-side timing does.</p>
+      <!-- Cost is a 2026-08-14 24h Railway average written into cost_model.py.
+           Latency is still 2026-07-31: the 2026-08-14 search_bench rerun was
+           105 failed requests, so its p50 is not a search measurement. -->
+      <p class="verified"><span class="vdot"></span>Cost is a 2026-08-14 snapshot of 24-hour Railway averages for Citadel-Archive and Qdrant, via the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. A trailing-7-day window the same day is nearer $58. The 269 ms round-trip is still 2026-07-31; a 2026-08-14 rerun did not complete a successful search, so that figure was not replaced. Re-running <code>cost_model.py</code> reprints today's written averages; <code>search_bench.py</code> really does re-measure when the token can search.</p>
     </div>
   </section>
 
