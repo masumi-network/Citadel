@@ -99,6 +99,11 @@ def test_project_supports_python_3_12() -> None:
 
 
 def test_installed_cognee_141_metadata_accepts_secure_cryptography() -> None:
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    uv_overrides = [
+        str(item)
+        for item in pyproject.get("tool", {}).get("uv", {}).get("override-dependencies", [])
+    ]
     cognee = metadata.distribution("cognee")
     cryptography_requirements = [
         Requirement(item)
@@ -109,10 +114,18 @@ def test_installed_cognee_141_metadata_accepts_secure_cryptography() -> None:
     assert cognee.version == COGNEE_VERSION
     assert metadata.version("cryptography") == CRYPTOGRAPHY_VERSION
     assert cryptography_requirements, "Cognee metadata has no cryptography requirement"
-    assert all(
+    metadata_accepts_secure = all(
         requirement.specifier.contains(CRYPTOGRAPHY_VERSION, prereleases=True)
         for requirement in cryptography_requirements
-    ), (
-        f"Cognee {COGNEE_VERSION} metadata rejects cryptography {CRYPTOGRAPHY_VERSION}: "
-        f"{cryptography_requirements}"
     )
+
+    if not metadata_accepts_secure:
+        assert any(
+            Requirement(item).name == "cryptography"
+            and Requirement(item).specifier.contains(CRYPTOGRAPHY_VERSION, prereleases=True)
+            for item in uv_overrides
+        ), (
+            f"Cognee {COGNEE_VERSION} metadata rejects cryptography {CRYPTOGRAPHY_VERSION}: "
+            f"{cryptography_requirements}. uv override is also missing a matching rule in "
+            "pyproject.toml tool.uv.override-dependencies."
+        )

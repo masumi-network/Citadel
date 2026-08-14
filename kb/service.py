@@ -19,6 +19,7 @@ from kb.cognee_client import (
     CogneePublicClient,
     _suppress_inline_cognify,
 )
+from kb.capture_policy import merged_deny_globs, path_is_denied
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.logging_utils import safe_log_value
@@ -131,7 +132,9 @@ class Citadel:
         self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,
-            exclude_patterns=self.config.exclude_patterns,
+            exclude_patterns=merged_deny_globs(
+                env_exclude_patterns=self.config.exclude_patterns,
+            ),
         )
         # Keyed by (dataset, content_hash) so dual-writes (e.g. share_session to
         # seat Node + session-traces) are not rejected as duplicate_in_process.
@@ -177,6 +180,22 @@ class Citadel:
                 decision.reason,
             )
             return IngestResult(False, decision.reason, target_dataset, merged_tags)
+
+        denied_locator = next(
+            (
+                candidate
+                for candidate in (source_key, source_locator)
+                if candidate and path_is_denied(candidate, self.filter.exclude_patterns)
+            ),
+            None,
+        )
+        if denied_locator is not None:
+            logger.info(
+                "Ingest rejected for dataset %s: %s",
+                safe_log_value(target_dataset),
+                "excluded_path",
+            )
+            return IngestResult(False, "excluded_path", target_dataset, merged_tags)
 
         self._guard_content(data, target_dataset)
 

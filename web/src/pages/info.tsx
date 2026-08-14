@@ -54,11 +54,11 @@ const SECTIONS: Section[] = [
    last published values, so a visitor who arrives while the node is unreachable
    reads something true and slightly old rather than a row of dashes. */
 const STAMPED = {
-  version: "v0.4.1",
+  version: "v0.5.0",
   mcpTools: 24,
 };
 
-const AS_OF = "Releases are as of v0.4.1, 2026-08-06.";
+const AS_OF = "Releases are as of v0.5.0, 2026-08-14.";
 
 /* A closing footer that is itself a band is full-bleed, so it carries no top
    margin: the gap an in-column footer wants would show as a stripe of --ground
@@ -107,7 +107,7 @@ function useInfoTiles() {
     footNote: state
       ? `State-of-the-vault report · live tiles from /api/state${
           updatedAt ? ` (updated ${updatedAt})` : ""
-        } · window v0.2.0 → v0.4.1.`
+        } · window v0.2.0 → v0.5.0.`
       : null,
   };
 }
@@ -133,15 +133,14 @@ export default function Info() {
         </h1>
         <div className={`${META} mb-8`}>
           <span className={PILL}>Railway + PyPI</span>
-          <span className={PILL}>Window: v0.2.0 → v0.4.1</span>
+          <span className={PILL}>Window: v0.2.0 → v0.5.0</span>
         </div>
         <dl className={HERO_STRIP}>
           <HeroFact kicker="Numbers">
-            What is deployed, what shipped from v0.2.0 to v0.4.1, and what is still open.
+            What is deployed, what shipped from v0.2.0 to v0.5.0, and what is still open.
           </HeroFact>
           <HeroFact kicker="Roadmap">
-            On main, not tagged: graph, chunk reads, and async ingest. A <b>GitHub App</b> and
-            structured knowledge are still in design.
+            A <b>GitHub App</b> and structured knowledge are still in design.
           </HeroFact>
         </dl>
       </HeroBand>
@@ -176,7 +175,7 @@ export default function Info() {
             }
             label={tiles.docsSub}
           />
-          <Metric accent value="11" label="releases shipped (v0.1.0 → v0.4.1)" />
+          <Metric accent value="12" label="releases shipped (v0.1.0 → v0.5.0)" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
           <Metric
             value={<span className="text-[19px]">~$38/mo</span>}
@@ -194,7 +193,7 @@ export default function Info() {
         <Verified>
           {tiles.stateUpdated ??
             (tiles.failed ? (
-              "Live data unavailable right now. Showing the last published repo figures, as of v0.4.1, 2026-08-06."
+              "Live data unavailable right now. Showing the last published repo figures, as of v0.5.0, 2026-08-14."
             ) : (
               <>
                 Live tiles pull from <code className={CODE}>/api/state</code>. MCP tools refresh on
@@ -328,7 +327,7 @@ export default function Info() {
       </Band>
 
       <Band tone="white" id="releases">
-        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.4.1" />
+        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.5.0" />
         <p className={LEDE}>
           Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.
         </p>
@@ -338,35 +337,14 @@ export default function Info() {
       <Band tone="grey" id="next">
         <SecHead kicker="04 · The road ahead" title="What's next" />
         <p className={LEDE}>
-          Some of this already landed on main and is waiting for a tagged release. Some is still in
-          design. Nothing here is claimed as a PyPI release unless it has a version in the history
-          above.
+          Some of this is still in design. Nothing here is claimed as a PyPI release unless it has a
+          version in the history above.
         </p>
         <div className="mb-[22px] flex flex-wrap gap-2.5">
-          <Chip tone="ship">On main</Chip>
           <Chip tone="prog">In design</Chip>
           <Chip tone="plan">Brainstorming</Chip>
         </div>
         <div className={ROWS}>
-          <Row
-            label={<Chip tone="ship">On main</Chip>}
-            title="Dataset-scoped graph and chunk-scoped document reads"
-          >
-            <code className={CODE}>/api/mesh/graph?dataset=</code> narrows the graph to one dataset
-            before the node cap, and a seat&apos;s own cluster now orders ahead of that cap.{" "}
-            <code className={CODE}>/api/documents/{"{id}"}?scope=chunk</code> returns the clicked
-            chunk&apos;s own text instead of the whole parent. On main, not a tagged release.
-          </Row>
-          <Row
-            label={<Chip tone="ship">On main</Chip>}
-            title="Async ingest is the default"
-          >
-            <code className={CODE}>citadel ingest</code> and MCP{" "}
-            <code className={CODE}>citadel_ingest</code> return once the Node stores the note (
-            <span className={ROW_K}>queued_not_confirmed</span>). Inline cognify is opt-in; the old
-            default held the request open until the proxy edge killed it with a 502. On main, not a
-            tagged release.
-          </Row>
           <Row
             label={<Chip tone="prog">In design</Chip>}
             title="GitHub App: PR context injection + verifying checks"
@@ -424,7 +402,7 @@ export default function Info() {
           </div>
           <p className={FOOT_NOTE}>
             Live node: <code className={CODE}>citadel-archive-production.up.railway.app</code>
-            {tiles.footNote ? ` · ${tiles.footNote}` : " · window v0.2.0 → v0.4.1."}
+            {tiles.footNote ? ` · ${tiles.footNote}` : " · window v0.2.0 → v0.5.0."}
           </p>
         </div>
       </footer>
@@ -546,7 +524,33 @@ function Releases() {
     <div className="relative pl-[30px]">
       <span className="absolute bottom-3 left-[5px] top-3 w-0.5 bg-[linear-gradient(var(--accent),var(--accent-ink))] opacity-35" />
 
-      <Release version="v0.4.1" date="2026-08-06 · latest" tip open
+      <Release version="v0.5.0" date="2026-08-14 · latest" tip open
+        title="Async ingest, dataset-scoped graph, and capture deny globs.">
+        <DeepLi>
+          <b className={DEEP_B}>Async ingest is the default</b>:{" "}
+          <code className={CODE}>citadel ingest</code> and MCP{" "}
+          <code className={CODE}>citadel_ingest</code> return once the Node stores the note (
+          <span className={ROW_K}>queued_not_confirmed</span>). Inline cognify is opt-in.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Dataset-scoped graph and chunk reads</b>:{" "}
+          <code className={CODE}>/api/mesh/graph?dataset=</code> narrows the graph before the node
+          cap. <code className={CODE}>/api/documents/{"{id}"}?scope=chunk</code> returns the clicked
+          chunk&apos;s own text.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Capture deny globs</b>: org defaults now apply at ingest and
+          pre-push, so a path such as <code className={CODE}>.env</code> is refused rather than
+          JSON-only.
+        </DeepLi>
+        <DeepLi>
+          <b className={DEEP_B}>Public stamp</b>: shipped pages and{" "}
+          <code className={CODE}>citadel --version</code> report v0.5.0. Self-host cost stays
+          ~$38/mo.
+        </DeepLi>
+      </Release>
+
+      <Release version="v0.4.1" date="2026-08-06"
         title="Indexing repair, retrieval gates, and the Next migration boundary.">
         <DeepLi>
           <b className={DEEP_B}>Indexing repair safety</b>: zero-chunk and oversized-document

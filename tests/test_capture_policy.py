@@ -49,6 +49,16 @@ def test_capture_policy_payload_includes_effective_list() -> None:
     assert payload["default_org_deny_globs"] == list(DEFAULT_ORG_CAPTURE_DENY_GLOBS)
 
 
+def test_path_is_denied_matches_basename_and_github_blob_url() -> None:
+    from kb.capture_policy import path_is_denied
+
+    globs = DEFAULT_ORG_CAPTURE_DENY_GLOBS
+    assert path_is_denied("/Users/dev/project/.env", globs)
+    assert path_is_denied("https://github.com/org/repo/blob/main/.env", globs)
+    assert path_is_denied("github:org/repo:path:secrets/prod.pem", globs)
+    assert not path_is_denied("kb/filters.py", globs)
+
+
 def test_capture_policy_payload_without_seat_slug() -> None:
     payload = capture_policy_payload(
         seat_slug=None,

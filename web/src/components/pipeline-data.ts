@@ -114,7 +114,7 @@ export const LAYERS: ArchLayer[] = [
         label: "mesh",
         sub: "/api/mesh · citadel_get_mesh",
         detail:
-          "The graph API and the dashboard mesh read the same stores the search path does. Each dataset has its own Ladybug graph; an org-wide read merges those stores. Seat presence is universal; content is caller-scoped. Next hop is the Cognee client, which talks to Ladybug and Qdrant.",
+          "The graph API and the dashboard mesh read the same stores the search path uses. Each dataset has its own Ladybug graph; an org-wide read merges those stores. Seat presence is universal; content is caller-scoped. Next hop is the memory engine, which talks to Ladybug and Qdrant.",
       },
       {
         id: "share",
@@ -141,7 +141,7 @@ export const LAYERS: ArchLayer[] = [
         label: "Learning process",
         sub: "filter · chunk · embed",
         detail:
-          "Accepted content is filtered, chunked, embedded, and projected. A document counts as searchable in a backend only when that backend's receipt says so. Ingest, share-session, and the evolve pass all enter here, then the lifecycle ledger records the acceptance. Cognee runs the embed and graph work. This is not a separate service: it runs inside the FastAPI process.",
+          "Accepted content is filtered, chunked, embedded, and projected. A document counts as searchable in a backend only when that backend's receipt says so. Ingest, share-session, and the evolve pass all enter here, then the lifecycle ledger records the acceptance. The memory engine runs the embed and graph work. This is not a separate service: it runs inside the FastAPI process.",
       },
       {
         id: "promote",
@@ -159,10 +159,10 @@ export const LAYERS: ArchLayer[] = [
       },
       {
         id: "cognee",
-        label: "Cognee client",
+        label: "Memory engine",
         sub: "memory engine",
         detail:
-          "Citadel wraps Cognee for embeddings and graph operations. Storage, access, sync, and the UI stay Citadel's. add is the fast write (no graph). cognify projects into Qdrant and Ladybug. Search and mesh both read through this client. The lifecycle ledger is what Citadel believes; Cognee is how a backend is filled.",
+          "Citadel handles embeddings and graph operations through this engine. Storage, access, sync, and the UI stay Citadel's. add is the fast write (no graph). cognify projects into Qdrant and Ladybug. Search and mesh both read through this client. The lifecycle ledger is what Citadel believes; the engine is how a backend is filled.",
       },
       {
         id: "access",
@@ -197,7 +197,7 @@ export const LAYERS: ArchLayer[] = [
         label: "Lifecycle ledger",
         sub: "durable receipts",
         detail:
-          "Ingest is an acceptance: source bytes, the revision head, projection jobs, and per-backend receipts commit in one SQLite transaction. A document is searchable in a backend only when that backend's receipt says so. Relational, vector, and graph are the three required backends (SQLite · Qdrant · Ladybug). Recovery replays failed jobs from this ledger, not from Cognee's internals.",
+          "Ingest is an acceptance: source bytes, the revision head, projection jobs, and per-backend receipts commit in one SQLite transaction. A document is searchable in a backend only when that backend's receipt says so. Relational, vector, and graph are the three required backends (SQLite · Qdrant · Ladybug). Recovery replays failed jobs from this ledger, not from the internal engine.",
       },
       {
         id: "sqlite",
