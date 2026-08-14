@@ -47,6 +47,7 @@ Promotion is the deliberate part. Captured work lands in your own space, and rea
 ## Quick start
 
 ```bash
+npx skills add masumi-network/citadel --skill citadel
 pipx install citadel-archive
 citadel onboard      # token, hooks, MCP config, capture roots
 citadel status       # connection, identity, local setup
@@ -79,6 +80,22 @@ Agents need a URL and a token. `citadel onboard` writes this for you:
   }
 }
 ```
+
+Use one seat per human. Give each agent process a distinct seat-bound token.
+After the human signs in with a seat token, the Access page can mint a reader
+token for search-only work or a writer token for explicit ingest. Do not share
+one token across agent processes.
+
+For headless setup, pass the token through the environment instead of `argv`:
+
+```bash
+export CITADEL_MCP_ACCESS_TOKEN=ctdl_...
+citadel onboard --non-interactive --json
+citadel status --json --check-search
+```
+
+Confirm that status reports the expected `seat_slug` and
+`default_dataset: seat:<slug>` before the agent starts work.
 
 Twenty-two tools cover search, document fetch, ingest, contribution, and the admin surface. Core CLI commands speak `--json`. Setup per client and the tool reference are in [`docs/mcp/README.md`](docs/mcp/README.md).
 

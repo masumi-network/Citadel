@@ -512,25 +512,31 @@ class AccessStore:
         *,
         slug: str,
         token_name: str | None = None,
+        role: str | None = None,
         central_dataset: str = CENTRAL_DATASET,
     ) -> TokenCreation:
         """Mint a FRESH token for an EXISTING seat's principal.
 
-        Scoped exactly like the seat's original token (default_dataset =
-        seat node, allowlist = seat node + Central), so the new token carries
-        seat_slug and routes writes to the seat. Used to re-link a seat whose
-        original (shown-once) token was lost or never adopted.
+        Scoped like the seat's original token (default_dataset = seat node,
+        allowlist = seat node + Central), with an optional role below the
+        principal's role. The new token carries seat_slug and routes writes to
+        the seat. Used to re-link a seat whose original (shown-once) token was
+        lost or never adopted.
         """
         normalized_slug = validate_seat_slug(slug)
         principal = self.find_seat_by_slug(normalized_slug)
         if principal is None:
             raise KeyError(normalized_slug)
+        resolved_role = role if role is not None else principal.role
+        validate_role(resolved_role)
+        if resolved_role == "admin" or ROLE_ORDER[resolved_role] > ROLE_ORDER[principal.role]:
+            raise ValueError("A seat token cannot exceed its principal's role.")
         node_dataset = seat_dataset(normalized_slug)
         session_id = f"seat-{normalized_slug}"
         return self.create_token(
             principal_id=principal.id,
             name=token_name or f"{principal.name} token",
-            role=principal.role,
+            role=resolved_role,
             default_dataset=node_dataset,
             default_session=session_id,
             allowed_datasets=[node_dataset, central_dataset, SESSION_TRACES_DATASET],

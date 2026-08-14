@@ -241,6 +241,7 @@ def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
     latency = int((time.monotonic() - started) * 1000)
     identity = {
         "seat_slug": data.get("seat_slug"),
+        "default_dataset": data.get("default_dataset"),
         "node_label": data.get("node_label"),
         "role": data.get("role"),
         "capabilities": data.get("capabilities", {}),

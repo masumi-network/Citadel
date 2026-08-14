@@ -33,6 +33,7 @@ const ENTRIES: Array<{ href: string; label: string; minRole?: Role }> = [
   { href: "/next/app/search", label: "Search" },
   { href: "/next/app/sources", label: "Sources" },
   { href: "/next/app/graph", label: "Graph" },
+  { href: "/app#access", label: "Access" },
   { href: "/next/app/review", label: "Review", minRole: "writer" },
   { href: "/next/app/admin", label: "Admin", minRole: "admin" },
 ];

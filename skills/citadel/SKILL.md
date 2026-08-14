@@ -49,14 +49,16 @@ Handed a `ctdl_...` token and told to use Citadel? Four commands, headless, no p
 citadel --version                             # already installed & >= 0.3.0? skip the install
 pipx install citadel-archive                  # install if missing (or `citadel update` if older)
 export CITADEL_MCP_ACCESS_TOKEN=ctdl_...       # your token, intact — no quotes, no whitespace
-citadel status --json                          # VERIFY — prints identity + role, or the exact failure reason
+citadel status --json --check-search           # VERIFY identity, seat dataset, and search access
 citadel search "your question" --json          # use it
 ```
 
-**Verify-first is not optional.** `citadel status --json` tells you immediately
+**Verify-first is not optional.** `citadel status --json --check-search` tells you immediately
 whether the token works — parse `checks[]` where `name == "auth"`:
 
-- `auth.ok == true` → you're in; `auth.data` has your `seat_slug`, `role`, `capabilities`.
+- `auth.ok == true` → you're in; `auth.data` has your `seat_slug`,
+  `default_dataset`, `role`, and `capabilities`. Confirm the expected
+  `seat_slug` and `default_dataset: seat:<slug>` before continuing.
 - `auth.ok == false` **while** `node.ok == true` → **token problem, not an install or
   network problem.** Reinstalling won't help — fix the token or its Node. (Only when
   your *shell* token is stale vs your rc does a `hint` field — and a top-level `hint`
@@ -68,8 +70,12 @@ whether the token works — parse `checks[]` where `name == "auth"`:
 wizard. To wire hooks / `.mcp.json` / capture non-interactively:
 
 ```bash
-citadel onboard --non-interactive --token ctdl_...
+export CITADEL_MCP_ACCESS_TOKEN=ctdl_...
+citadel onboard --non-interactive --json
 ```
+
+Prefer the environment variable in headless runs so the token does not appear
+in the process argument list.
 
 ## How Citadel Works (30-second model)
 
@@ -84,11 +90,11 @@ citadel onboard --non-interactive --token ctdl_...
   `dataset`, `content_sha256`, `retrieval.document_drilldown_available`); the rest
   are Cognee internals. Content is **caller-scoped** (ADR-0009): you see your seat +
   Central, never another seat's content.
-- **Writing is two-stage.** `citadel ingest` / `citadel_ingest` *stages* a note
-  (`status: session_stored`) — **not searchable yet**. A separate **cognify** pass
-  builds the embeddings + graph edges that make it findable. The CLI `citadel
-  ingest` cognifies inline by default; MCP ingest stages only, so expect 0 hits for
-  a fresh MCP note until the next admin/cron cognify.
+- **Writing is two-stage.** `citadel ingest` and `citadel_ingest` store the
+  source, then project it into embeddings and graph edges. Both use asynchronous
+  projection by default, so a new note might not appear in search immediately.
+  For an explicit inline graph build, use CLI `--cognify` or MCP
+  `cognify=true`.
 - **Activity vs Mesh.** `citadel activity` = recent events (captures, syncs,
   searches — a transient projection). The **Knowledge Mesh** = the durable graph.
   `citadel activity --global` = team **Seat Presence** (contribution counts only,
@@ -108,24 +114,29 @@ npx skills add masumi-network/citadel --skill citadel
 
 This installs `skills/citadel` (and optionally the sibling skills under
 `skills/`). The root skill points agents to the hosted connector, vault usage,
-and data-boundary skills. Then provide a per-agent `ctdl_...` token. Do not
-share one token across multiple users or agents, and rotate any token that was
-pasted into chat or logs.
+and data-boundary skills.
 
-> **Admins — mint a SEAT-BOUND token for a teammate, never a bare one.** A token
-> minted without a seat is a *service account*: it has **no default dataset**, so
-> the teammate's searches fail with `DatasetNotFoundError` and their writes route
-> to the shared org dataset. This looks like "invalid/mis-provisioned token" but
-> the token authenticates fine — it's just seat-less. Always bind to the seat:
+> **Admins: create one seat per human.** `seat create` requires the human name
+> and seat slug:
 >
 > ```bash
-> citadel seat list                        # is the seat provisioned?
-> citadel seat create <slug> --role writer # new seat + its bound writer token (printed once)
-> citadel seat token <slug>                # OR: re-mint a token for an existing seat
+> citadel seat list
+> citadel seat create "Alice Smith" alice --role writer
+> citadel seat token alice                 # another token with the seat's current role
 > ```
 >
-> A correctly seat-bound token reports `seat_slug: <slug>`,
-> `default_dataset: seat:<slug>`, and the seat's role in `citadel status --json`.
+> The human can sign in at `/login` with the initial seat token. The Access
+> page then mints a distinct seat-bound token for each agent process. A writer
+> seat can mint reader or writer tokens. A reader seat can mint reader tokens.
+> Use reader tokens for search-only processes and writer tokens only where the
+> user allows explicit ingest. Never share one token across processes.
+>
+> Use a standalone service-account token only for an explicit non-human service
+> with an intentional dataset and role. Do not use one for a teammate or their
+> agents. A seat-less token without a default dataset has no personal Node.
+>
+> Verify each process with `citadel status --json --check-search`. The output
+> must report `seat_slug: <slug>` and `default_dataset: seat:<slug>`.
 
 The hosted skill index includes content hashes. Agents that load skills from
 URLs can verify `/skills/*` markdown with the `X-Citadel-Skill-SHA256` or
@@ -178,12 +189,13 @@ citadel activity --json        # recent Vault Activity — captures · syncs · 
 citadel activity --local       # offline capture receipts (~/.citadel/activity.log) — no server needed
 citadel activity --global      # team Seat Presence board (contribution counts only, never another seat's content)
 citadel activity --watch       # live-tail new activity
-citadel ingest "note" --tag x  # WRITE — two-stage; NOT searchable until an admin cognify (see "Writing to Citadel")
+citadel ingest "note" --tag x  # WRITE: stores now; graph projection is async by default
+citadel ingest "note" --cognify # WRITE: explicitly wait for inline graph build
 citadel promotion list --json  # your pending Promotion Approval queue
-citadel onboard --non-interactive --token ctdl_...   # wire hooks/.mcp.json/capture, no prompts (the agent path)
+citadel onboard --non-interactive --json  # token from env; wire hooks/.mcp.json/capture
 citadel doctor --fix           # diagnose / repair local setup
 citadel mcp add claude         # add the Citadel MCP server to a client (`citadel mcp list`)
-citadel seat create            # admin: mint a seat token (needs CITADEL_ADMIN_KEY)
+citadel seat create "Alice Smith" alice --role writer  # admin: create human seat + token
 citadel seat token <slug>      # admin: re-mint a token for an existing seat
 ```
 
@@ -327,7 +339,7 @@ asyncio.run(main())
 
 ### Reading from Citadel
 
-- **Search before answering** when the question involves project history, architecture decisions, past incidents, team knowledge, or anything that may already be in the vault.
+- **Search before answering** when the question involves project history, architecture decisions, past incidents, team knowledge, or anything that may already be in the vault. Prefer `citadel_search` when MCP is present and working.
 - Use `citadel search "<query>" --json` (headless CLI) or the `citadel_search` MCP tool with specific queries. Include `dataset` when targeting a known dataset (e.g. `masumi-network`).
 - **No `citadel_*` tools registered in your session?** Don't retry or re-auth MCP — shell out to the CLI (`citadel search --json`, `citadel status --json`) or call the HTTP API; same token, same access.
 - Use `citadel_get_mesh` to understand the current knowledge graph relationships.
@@ -349,14 +361,11 @@ asyncio.run(main())
 
 ### Writing to Citadel
 
-- **Ingest is a two-stage write.** `citadel_ingest` / `POST /ingest` only *stages*
-  the note into the session store (Cognee returns `status: session_stored`);
-  it does **not** build embeddings or graph edges, so the note is **not yet
-  searchable**. A separate cognify pass (`POST /api/cognify/run`) or improvement
-  cycle (`POST /improve` / `citadel_improve`) indexes it. Both are **admin-only** —
-  a writer seat **cannot** index its own note. Expect a freshly-ingested note to
-  return 0 search results until the next admin/cron cognify runs; that is expected,
-  not a failure. (Personal notes stay in `seat:{slug}`; they are never lost.)
+- **Ingest is a two-stage write.** `citadel ingest`, `citadel_ingest`, and
+  `POST /ingest` store the durable source before graph projection. CLI and MCP
+  use asynchronous projection by default. A fresh note might not appear in
+  search until that projection finishes. For an explicit inline graph build,
+  use CLI `--cognify` or MCP `cognify=true`.
 - **Only write when the user explicitly asks** to preserve durable context.
 - **Seat MCP writers:** personal node only; Central is read-only from MCP. The server
   rejects `citadel_contribute`, Central `dataset`, and org/Central tags on MCP ingest.
@@ -399,7 +408,8 @@ asyncio.run(main())
 ### Token safety
 
 - Do not hard-code `CITADEL_MCP_ACCESS_TOKEN` in any file.
-- Do not share tokens between users. Each agent identity should have its own token.
+- Create one seat per human, then mint one distinct seat-bound token per agent process.
+- Do not share tokens between users or agent processes.
 - Do not store tokens in plain-text config files that are checked into version control.
 - Rotate tokens if they may have been exposed.
 
@@ -411,21 +421,22 @@ Load the connector skill and follow it end-to-end:
 
 Summary:
 
-1. **Get a token.** Ask the user for their Citadel token (starts with `ctdl_`). For a
-   person/teammate this must be a **seat-bound** token (admin mints it with
-   `citadel seat token <slug>`, or the dashboard's *Assign to seat* picker) — a
-   seat-less *service-account* token has **no default dataset** and every search
-   fails with `DatasetNotFoundError`. Never ask for seed phrases, private keys, or admin keys.
-2. **Choose the role.** Reader for search-only; writer if the agent should also ingest
-   (a seat-bound token inherits the seat's role — mint the seat as `writer` if it ingests).
+1. **Get a token.** Use a distinct **seat-bound** token for this process. The
+   human mints it from the Access page after signing in with their seat token.
+   Never ask for seed phrases, private keys, or admin keys.
+2. **Choose the role in the Access page.** Reader is for search-only work.
+   Writer is only for explicit ingest. A writer seat can mint either role; a
+   reader seat can mint reader tokens. The CLI's `seat token` command issues a
+   token with the seat's current role and does not narrow it.
 3. **Write the config.** See `docs/mcp/README.md` or `.mcp.json.example` for Claude Code, Codex, and Cursor templates.
 4. **Set `CITADEL_MCP_MAX_INGEST_BYTES`** to limit ingest payload size (default 200KB).
 5. **Gate write/admin tools.** Configure the client to require approval for `citadel_ingest`, `citadel_contribute`, `citadel_record_feedback`, `citadel_run_learning_agent`, `citadel_run_backup_mirror`, and `citadel_improve`.
-6. **Verify.** After writing config, restart the client and call
-   `citadel_discovery`, then `citadel_session`. If both work, try a small
-   `citadel_search`.
+6. **Verify.** Run `citadel status --json --check-search` and confirm the
+   expected `seat_slug` and `default_dataset: seat:<slug>`. After writing MCP
+   config, restart the client and call `citadel_discovery`, `citadel_session`,
+   then a small `citadel_search`.
 7. **Debug.** If the MCP tools never register or calls hang: verify access
-   headlessly first — `citadel status --json` and `citadel search "test" --json`
+   headlessly first: `citadel status --json --check-search`
    use the same token over plain HTTPS. If those work, the vault and token are
    fine; use the CLI and move on rather than fighting the MCP transport. Do not
    print the token.
@@ -457,10 +468,10 @@ Railway cron keeps org memory fresh. Devs never trigger these.
 | `linear-sync` | Linear workspace → **Central**; assignee issues **Seat-Scoped Mirror** → each **Node** |
 | `pipeline` | GitHub + skills refresh + self-improve + backup mirror |
 
-**Agent policy:** read via `citadel search --json` (CLI) or `citadel_search` /
-`citadel_linear_my_issues` (MCP, when registered); write via `citadel ingest`
-or `citadel_ingest` when durable facts crystallize; **do not** trigger admin
-sync unless the user explicitly asks.
+**Agent policy:** search first with `citadel_search` when MCP is registered,
+then fall back to `citadel search --json`. Write only through an explicit
+`citadel ingest`, `citadel_ingest`, or configured capture flow. Do not trigger
+admin sync or add a new automatic write path unless the user explicitly asks.
 
 Skill: `https://citadel-archive-production.up.railway.app/skills/proactive-ingest`
 

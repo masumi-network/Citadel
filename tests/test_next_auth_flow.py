@@ -11,7 +11,7 @@ def _client() -> TestClient:
     return TestClient(app, base_url="https://testserver")
 
 
-def test_next_login_routes_readers_to_next_and_privileged_roles_to_legacy_app() -> None:
+def test_next_login_routes_seat_users_to_legacy_and_seatless_readers_to_next() -> None:
     source = (
         Path(server_module.__file__).resolve().parent.parent
         / "web"
@@ -20,8 +20,11 @@ def test_next_login_routes_readers_to_next_and_privileged_roles_to_legacy_app() 
         / "login.tsx"
     ).read_text(encoding="utf-8")
 
-    assert 'session.role === "reader" ? "/next/app" : "/app"' in source
-    assert 'window.location.assign("/app")' not in source
+    assert (
+        'const hasSeat = typeof session.seat_slug === "string" '
+        '&& Boolean(session.seat_slug.trim());'
+    ) in source
+    assert 'window.location.assign(hasSeat || session.role !== "reader" ? "/app" : "/next/app");' in source
 
     compiled = "\n".join(
         path.read_text(encoding="utf-8")

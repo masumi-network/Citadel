@@ -30,7 +30,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from kb.build_identity import SERVICE_BUILD_IDENTITY, build_identity_from_env
 from kb import chunk_window
@@ -1136,6 +1136,13 @@ class IssueSeatTokenBody(BaseModel):
     role: str | None = None
 
 
+class SelfSeatTokenBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_name: str | None = Field(default=None, max_length=120)
+    role: str = Field(min_length=1)
+
+
 class CapturePolicyBody(BaseModel):
     deny_globs: list[str] = Field(default_factory=list, max_length=200)
 
@@ -1582,6 +1589,25 @@ def require_access(request: Request, minimum_role: str, scope: str) -> AccessIde
     if scope not in effective_scopes(identity):
         raise HTTPException(status_code=403, detail=f"Scope required: {scope}.")
     return identity
+
+
+def require_self_seat(request: Request, minimum_role: str, scope: str) -> tuple[AccessIdentity, Any]:
+    identity = require_access(request, minimum_role, scope)
+    if identity.source != "api_token" or identity.actor_kind != "user" or not identity.seat_slug:
+        raise HTTPException(
+            status_code=403,
+            detail="Seat self-service requires a personal seat token.",
+        )
+    principal = get_access_store().find_seat_by_slug(identity.seat_slug)
+    if (
+        principal is None
+        or principal.id != identity.actor_id
+        or principal.kind != "user"
+        or principal.seat_slug != identity.seat_slug
+        or principal.disabled_at
+    ):
+        raise HTTPException(status_code=403, detail="Seat self-service is unavailable.")
+    return identity, principal
 
 
 def can_bypass_dataset_allowlist(identity: AccessIdentity) -> bool:
@@ -4086,6 +4112,124 @@ async def list_access_seats(request: Request) -> dict[str, Any]:
         "seatless_tokens": seatless,
         "seatless_token_count": len(seatless),
     }
+
+
+@app.get("/api/access/self")
+async def access_self(request: Request) -> dict[str, Any]:
+    identity, principal = require_self_seat(request, "reader", "kb:read")
+    snapshot = get_access_store().snapshot()
+    tokens = [
+        token
+        for token in snapshot["tokens"]
+        if token.get("principal_id") == principal.id
+        and token.get("role") in ROLE_ORDER
+        and ROLE_ORDER[token["role"]] <= ROLE_ORDER[identity.role]
+    ]
+    renderer_principal = {
+        "id": principal.id,
+        "kind": principal.kind,
+        "name": principal.name,
+        "role": principal.role,
+        "scopes": list(principal.scopes),
+        "team_id": principal.team_id,
+        "seat_slug": principal.seat_slug,
+        "default_dataset": principal.default_dataset,
+    }
+    return {
+        "ok": True,
+        "current_token_id": identity.token_id,
+        "principals": [renderer_principal],
+        "seat": {
+            "principal_id": principal.id,
+            "name": principal.name,
+            "role": principal.role,
+            "seat_slug": principal.seat_slug,
+            "node_dataset": principal.default_dataset,
+            "default_session": principal.default_session,
+            "email": principal.email,
+        },
+        "tokens": tokens,
+    }
+
+
+@app.post("/api/access/self/tokens")
+async def create_self_seat_token(
+    body: SelfSeatTokenBody, request: Request
+) -> dict[str, Any]:
+    if body.role not in ROLE_ORDER or body.role == "admin":
+        raise HTTPException(status_code=422, detail="Self-service tokens may be reader or writer.")
+    minimum_role = "writer" if body.role == "writer" else "reader"
+    required_scope = "kb:ingest" if body.role == "writer" else "kb:read"
+    identity, principal = require_self_seat(request, minimum_role, required_scope)
+    if ROLE_ORDER[body.role] > ROLE_ORDER[identity.role] or ROLE_ORDER[body.role] > ROLE_ORDER[principal.role]:
+        raise HTTPException(status_code=403, detail="Token role exceeds the current seat role.")
+    try:
+        created = get_access_store().issue_seat_token(
+            slug=principal.seat_slug or "",
+            token_name=body.token_name,
+            role=body.role,
+            central_dataset=central_dataset(get_citadel().config),
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    get_access_store().record_event(
+        action="access.seat.token.create",
+        actor=identity,
+        success=True,
+        dataset=created.api_token.default_dataset,
+        detail={
+            "principal_id": principal.id,
+            "seat_slug": principal.seat_slug,
+            "token_id": created.api_token.id,
+            "role": created.api_token.role,
+            "self_service": True,
+        },
+    )
+    return {
+        "ok": True,
+        "token": created.token,
+        "api_token": jsonable_encoder(
+            {key: value for key, value in created.api_token.__dict__.items() if key != "token_hash"}
+        ),
+    }
+
+
+@app.post("/api/access/self/tokens/{token_id}/revoke")
+async def revoke_self_seat_token(token_id: str, request: Request) -> dict[str, Any]:
+    identity, principal = require_self_seat(request, "reader", "kb:read")
+    snapshot = get_access_store().snapshot()
+    token = next(
+        (
+            item
+            for item in snapshot["tokens"]
+            if item.get("id") == token_id and item.get("principal_id") == principal.id
+        ),
+        None,
+    )
+    if token is None:
+        raise HTTPException(status_code=404, detail="Token not found.")
+    if token_id == identity.token_id:
+        raise HTTPException(status_code=409, detail="Cannot revoke the current session token.")
+    token_role = token.get("role")
+    if token_role not in ROLE_ORDER or ROLE_ORDER[token_role] > ROLE_ORDER[identity.role]:
+        raise HTTPException(status_code=403, detail="Token role exceeds the current seat role.")
+    revoked = get_access_store().revoke_token(token_id)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Token not found.")
+    get_access_store().record_event(
+        action="access.seat.token.revoke",
+        actor=identity,
+        success=True,
+        dataset=revoked.default_dataset,
+        detail={
+            "principal_id": principal.id,
+            "seat_slug": principal.seat_slug,
+            "token_id": token_id,
+            "self_service": True,
+        },
+    )
+    redacted = {key: value for key, value in revoked.__dict__.items() if key != "token_hash"}
+    return {"ok": True, "api_token": jsonable_encoder(redacted)}
 
 
 @app.post("/api/access/seats")

@@ -69,6 +69,8 @@ const state = {
   eventSource: null,
   role: null,
   seatSlug: null,
+  actorId: null,
+  currentTokenId: null,
   nodeLabel: null,
   defaultDataset: null,
   searchDatasets: null,
@@ -148,6 +150,10 @@ const obsidianSourceList = document.getElementById("obsidianSourceList");
 const feedbackStatus = document.getElementById("feedbackStatus");
 const feedbackResult = document.getElementById("feedbackResult");
 const accessTokenStatus = document.getElementById("accessTokenStatus");
+const accessEyebrow = document.getElementById("accessEyebrow");
+const accessTitle = document.getElementById("accessTitle");
+const accessTokenPanelTitle = document.getElementById("accessTokenPanelTitle");
+const accessTokenPanelNote = document.getElementById("accessTokenPanelNote");
 const accessPrincipalList = document.getElementById("accessPrincipalList");
 const accessTokenList = document.getElementById("accessTokenList");
 const accessSeatsList = document.getElementById("accessSeatsList");
@@ -653,6 +659,7 @@ function applyAccessControls() {
     const allowed = canUse(element.dataset.minRole);
     if (element.classList.contains("nav-link")) {
       element.disabled = !allowed;
+      element.hidden = !allowed;
       return;
     }
     if (element.matches("form, fieldset")) {
@@ -669,6 +676,8 @@ function applyAccessControls() {
       element.hidden = !allowed;
     }
   });
+
+  configureAccessPanel();
 
   renderDashboardMcpSession();
   renderConflicts();
@@ -702,6 +711,8 @@ async function loadSession() {
     const session = await api("/api/session");
     state.role = session.role;
     state.seatSlug = session.seat_slug || null;
+    state.actorId = session.actor?.id || session.actor_id || null;
+    state.currentTokenId = session.actor?.token_id || session.token_id || null;
     state.nodeLabel = session.node_label || null;
     state.defaultDataset = session.default_dataset || null;
     state.searchDatasets = session.search_datasets || null;
@@ -738,7 +749,7 @@ function setPage(name) {
   // lit on the Audit sub-page); in-content [data-page-target] buttons keep
   // exact-match highlighting.
   const activeGroup = pageToGroup[resolvedName];
-  const activeNavTarget = activeGroup ? activeGroup.nav : name;
+  const activeNavTarget = resolvedName === "access" ? "access" : activeGroup ? activeGroup.nav : name;
   pageButtons.forEach((button) => {
     const isNavLink = button.classList.contains("nav-link");
     const match = isNavLink
@@ -771,6 +782,48 @@ function setPage(name) {
   if (resolvedName === "conflicts") {
     loadConflicts();
   }
+}
+
+function selfAccessAvailable() {
+  return !canUse("admin") && Boolean(state.seatSlug) && canUse("reader");
+}
+
+function configureAccessPanel() {
+  const admin = canUse("admin");
+  const self = selfAccessAvailable();
+  if (accessEyebrow) accessEyebrow.textContent = admin ? "Admin" : "Seat";
+  if (accessTitle) accessTitle.textContent = admin ? "Team Access" : "Your Access";
+  if (accessTokenPanelTitle) {
+    accessTokenPanelTitle.textContent = admin ? "Invite Or Agent Token" : "Create Seat Token";
+  }
+  if (accessTokenPanelNote) {
+    accessTokenPanelNote.textContent = admin
+      ? "Stored locally, token shown once"
+      : "Scoped to your seat, token shown once";
+  }
+  const form = document.getElementById("accessTokenForm");
+  if (form) form.hidden = !admin && !self;
+  document.querySelectorAll("[data-self-hidden]").forEach((field) => {
+    field.hidden = self;
+    field.querySelectorAll("input, select, textarea").forEach((control) => {
+      control.disabled = self;
+    });
+  });
+  const roleSelect = document.getElementById("accessRole");
+  if (roleSelect && !admin) {
+    const roles = state.role === "writer" ? ["reader", "writer"] : ["reader"];
+    roleSelect.replaceChildren(
+      ...roles.map((role) => {
+        const option = document.createElement("option");
+        option.value = role;
+        option.textContent = role === "writer" ? "Read write" : "Read only";
+        return option;
+      })
+    );
+    roleSelect.value = state.role === "writer" ? "writer" : "reader";
+  }
+  const submit = document.getElementById("accessTokenSubmit");
+  if (submit && !admin) submit.textContent = "Create seat token";
 }
 
 function initializeNavigation() {
@@ -3807,7 +3860,15 @@ async function loadSources() {
 }
 
 async function loadAccess() {
-  if (!canUse("admin")) return;
+  const admin = canUse("admin");
+  const self = selfAccessAvailable();
+  if (!admin && !self) {
+    accessPrincipalList.innerHTML = "";
+    accessPrincipalList.append(emptyState("Seat access unavailable", "This token has no seat."));
+    accessTokenList.innerHTML = "";
+    accessTokenList.append(emptyState("Seat access unavailable", "This token has no seat."));
+    return;
+  }
   accessTokenStatus.textContent = "Loading";
   accessTokenStatus.className = "status-chip status-standby";
   if (agentsStatus) {
@@ -3819,7 +3880,7 @@ async function loadAccess() {
     auditStatus.className = "status-chip status-standby";
   }
   try {
-    const snapshot = await api("/api/access");
+    const snapshot = await api(admin ? "/api/access" : "/api/access/self");
     state.accessSnapshot = snapshot;
     renderAccess(snapshot);
     accessTokenStatus.textContent = "Ready";
@@ -3861,20 +3922,31 @@ async function loadAccess() {
 }
 
 function renderAccess(snapshot) {
+  const admin = canUse("admin");
   accessPrincipalList.innerHTML = "";
   accessTokenList.innerHTML = "";
   accessAuditList.innerHTML = "";
-  renderDashboardMcpAccess(snapshot);
-  renderAgents(snapshot);
-  loadSeats();
-  renderAuditAccessEvents(snapshot.audit_events || []);
+  if (admin) {
+    renderDashboardMcpAccess(snapshot);
+    renderAgents(snapshot);
+    loadSeats();
+    renderAuditAccessEvents(snapshot.audit_events || []);
+  }
 
-  if (!snapshot.principals?.length) {
+  const principals = admin
+    ? snapshot.principals || []
+    : (snapshot.principals || []).filter(
+        (principal) => principal.id === state.actorId || principal.seat_slug === state.seatSlug,
+      );
+  if (!principals.length) {
     accessPrincipalList.append(
-      emptyState("No stored principals", "Create a teammate or service-account token."),
+      emptyState(
+        admin ? "No stored principals" : "No seat identity",
+        admin ? "Create a teammate or service-account token." : "This seat is not provisioned.",
+      ),
     );
   } else {
-    snapshot.principals.forEach((principal) => {
+    principals.forEach((principal) => {
       const item = document.createElement("div");
       item.className = "entity-item";
       item.innerHTML = `
@@ -3890,10 +3962,20 @@ function renderAccess(snapshot) {
     });
   }
 
-  if (!snapshot.tokens?.length) {
-    accessTokenList.append(emptyState("No stored tokens", "Bootstrap env keys are still available."));
+  const tokens = admin
+    ? snapshot.tokens || []
+    : (snapshot.tokens || []).filter(
+        (token) => token.principal_id === state.actorId || token.seat_slug === state.seatSlug,
+      );
+  if (!tokens.length) {
+    accessTokenList.append(
+      emptyState(
+        admin ? "No stored tokens" : "No seat tokens",
+        admin ? "Bootstrap env keys are still available." : "Create a token for this seat.",
+      ),
+    );
   } else {
-    snapshot.tokens.forEach((token) => {
+    tokens.forEach((token) => {
       const item = document.createElement("div");
       item.className = "entity-item";
       const status = token.revoked_at ? "Revoked" : token.expires_at ? "Expires" : "Active";
@@ -3908,9 +3990,10 @@ function renderAccess(snapshot) {
       const action = document.createElement("button");
       action.className = "secondary-button compact-button";
       action.type = "button";
-      action.textContent = token.revoked_at ? "Revoked" : "Revoke";
-      action.disabled = Boolean(token.revoked_at);
-      action.title = status;
+      const current = !admin && token.id === state.currentTokenId;
+      action.textContent = token.revoked_at ? "Revoked" : current ? "Current" : "Revoke";
+      action.disabled = Boolean(token.revoked_at) || current;
+      action.title = current ? "Current session token" : status;
       action.addEventListener("click", () => revokeAccessToken(token.id));
       item.append(action);
       accessTokenList.append(item);
@@ -4088,6 +4171,10 @@ function renderTokenSeatOptions(seats = []) {
 function applyTokenSeatScopeToggle() {
   const select = document.getElementById("accessSeat");
   if (!select) return;
+  if (!canUse("admin")) {
+    configureAccessPanel();
+    return;
+  }
   const hasSeat = Boolean(select.value);
   const datasetField = document.getElementById("accessDefaultDatasetField");
   const allowedField = document.getElementById("accessAllowedDatasetsField");
@@ -4381,10 +4468,14 @@ function renderDashboardMcpAccess(snapshot) {
 }
 
 async function revokeAccessToken(tokenId) {
+  if (!canUse("admin") && tokenId === state.currentTokenId) return;
   accessTokenStatus.textContent = "Revoking";
   accessTokenStatus.className = "status-chip status-standby";
   try {
-    await api(`/api/access/tokens/${encodeURIComponent(tokenId)}/revoke`, {
+    const endpoint = canUse("admin")
+      ? `/api/access/tokens/${encodeURIComponent(tokenId)}/revoke`
+      : `/api/access/self/tokens/${encodeURIComponent(tokenId)}/revoke`;
+    await api(endpoint, {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -4431,6 +4522,8 @@ document.getElementById("refreshButton").addEventListener("click", () => {
   if (canUse("admin")) {
     loadAccess();
     loadSettings();
+  } else if (state.seatSlug) {
+    loadAccess();
   }
 });
 document.getElementById("logoutButton").addEventListener("click", async () => {
@@ -4777,9 +4870,17 @@ document.getElementById("accessTokenForm").addEventListener("submit", async (eve
   accessTokenStatus.className = "status-chip status-standby";
   setBusy(button, true, { idle: "Create access token", loading: "Creating" });
   try {
-    const seatSlug = String(formData.get("seat") || "").trim();
     let response;
-    if (seatSlug) {
+    if (!canUse("admin")) {
+      response = await api("/api/access/self/tokens", {
+        method: "POST",
+        body: JSON.stringify({
+          token_name: name,
+          role: String(formData.get("role") || "reader"),
+        }),
+      });
+    } else if (String(formData.get("seat") || "").trim()) {
+      const seatSlug = String(formData.get("seat") || "").trim();
       // Seat selected: mint via the seat endpoint. Role/dataset scoping derive
       // from the seat server-side, so only the token name is sent.
       response = await api(`/api/access/seats/${encodeURIComponent(seatSlug)}/tokens`, {
