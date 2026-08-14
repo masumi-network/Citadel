@@ -2131,8 +2131,8 @@ async def search_across_datasets(
 ) -> list[tuple[str, Any]]:
     # Query every dataset before merging so a result-rich primary node can never
     # short-circuit (and thereby silently drop) Central. The primary still wins
-    # dedup and takes the bulk of the slots; a reserved slice keeps room for the
-    # secondary datasets when more than one is in scope. Sessions are resolved per
+    # dedup. Final ranking, filtering, and dataset reservation happen after public
+    # shaping, over this full per-dataset candidate pool. Sessions are resolved per
     # dataset: a seat's private session must not scope shared datasets like Central
     # (see resolve_search_sessions), or it would hide org-wide hits.
     # Query datasets concurrently (the reads are independent and touch no Kuzu
@@ -2152,11 +2152,10 @@ async def search_across_datasets(
     per_dataset: list[tuple[str, list[Any]]] = [
         (
             dataset,
-            [result for result in results if is_search_content_hit(result)],
+            [result for result in results if is_search_content_hit(result)][:top_k],
         )
         for dataset, results in zip(datasets, results_per)
     ]
-    literal_query = len(query_terms(query)) == 1
 
     merged: list[tuple[str, Any]] = []
     seen: set[str] = set()
@@ -2171,13 +2170,8 @@ async def search_across_datasets(
         if dataset == SESSION_TRACES_DATASET
         for result in results
     }
-
-    merge_limit = top_k * len(per_dataset) if literal_query else top_k
-
-    def take(dataset: str, results: list[Any], budget: int) -> None:
+    for dataset, results in per_dataset:
         for result in results:
-            if budget <= 0 or len(merged) >= merge_limit:
-                return
             key = search_result_dedup_key(result)
             if key in seen:
                 continue
@@ -2189,26 +2183,6 @@ async def search_across_datasets(
             ):
                 result = {**result, SHARED_TRACE_MARKER: True}
             merged.append((dataset, result))
-            budget -= 1
-
-    if not per_dataset:
-        return merged
-
-    if literal_query:
-        # Single-token searches are commonly exact identifiers. Preserve the
-        # candidate page from every dataset so response shaping can place an
-        # observable literal match above unrelated cross-dataset hits (#106).
-        for dataset, results in per_dataset:
-            take(dataset, results, top_k)
-        return merged
-
-    reserve = max(1, top_k // 5) if len(per_dataset) > 1 else 0
-    primary_dataset, primary_results = per_dataset[0]
-    take(primary_dataset, primary_results, top_k - reserve)
-    for dataset, results in per_dataset[1:]:
-        take(dataset, results, top_k - len(merged))
-    # Backfill any slots the secondaries left unused from the primary node.
-    take(primary_dataset, primary_results, top_k - len(merged))
     return merged
 
 
@@ -3001,6 +2975,60 @@ def public_search_result(
         query=query,
     )
     return shape_public_search_hit(enriched, index=index)
+
+
+def select_public_search_page(
+    shaped_hits: list[dict[str, Any]],
+    *,
+    query: str,
+    datasets: list[str],
+    limit: int,
+    mode: str | None = None,
+    filter_kwargs: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Rank, filter, and select one public page from shaped candidates."""
+    candidates = list(shaped_hits)
+    candidates_fetched = len(candidates)
+    ranked_query = (
+        is_docs_mode_query(query, mode=mode)
+        or is_spec_mode_query(query)
+        or len(query_terms(query)) == 1
+    )
+    if ranked_query:
+        candidates = apply_query_ranking(candidates, query, mode=mode)
+    if filter_kwargs is not None:
+        candidates = filter_hits(candidates, **dict(filter_kwargs))
+    candidates_matched = len(candidates)
+
+    if ranked_query or limit <= 1 or len(datasets) <= 1:
+        selected = candidates[:limit]
+    else:
+        primary_dataset = datasets[0]
+        reserve = min(max(1, limit // 5), limit - 1)
+
+        def hit_dataset(hit: dict[str, Any]) -> Any:
+            envelope = hit.get("_citadel")
+            return envelope.get("dataset") if isinstance(envelope, dict) else None
+
+        primary = [hit for hit in candidates if hit_dataset(hit) == primary_dataset]
+        secondary = [
+            hit
+            for dataset in datasets[1:]
+            for hit in candidates
+            if hit_dataset(hit) == dataset
+        ]
+        selected = primary[: limit - reserve]
+        selected.extend(secondary[: limit - len(selected)])
+        if len(selected) < limit:
+            selected.extend(primary[limit - reserve : limit - len(selected) + limit - reserve])
+
+    for rank, hit in enumerate(selected, start=1):
+        if "rank" in hit:
+            hit["rank"] = rank
+        envelope = hit.get("_citadel")
+        if isinstance(envelope, dict):
+            envelope["rank"] = rank
+    return selected, candidates_fetched, candidates_matched
 
 
 def _trace_author_seat(result: dict[str, Any]) -> str | None:
@@ -7345,7 +7373,7 @@ async def knowledge(
                 "message": "Search exceeded the configured server budget.",
             },
         )
-    public_pairs: list[tuple[str, dict[str, Any]]] = []
+    public_candidates: list[dict[str, Any]] = []
     for index, (search_dataset, result) in enumerate(merged):
         shaped = public_search_result(
             result,
@@ -7358,21 +7386,26 @@ async def knowledge(
             query=query,
         )
         if shaped is not None:
-            public_pairs.append((search_dataset, shaped))
-    public_pairs = public_pairs[:limit]
-    for rank, (_, result) in enumerate(public_pairs, start=1):
-        result["rank"] = rank
-        result["_citadel"]["rank"] = rank
+            public_candidates.append(shaped)
+    public_results, _, _ = select_public_search_page(
+        public_candidates,
+        query=query,
+        datasets=search_datasets,
+        limit=limit,
+    )
     latency_ms = (time.perf_counter() - started) * 1000.0
     for search_dataset in search_datasets:
         await mesh_state.record_search(
             citadel.config,
             query=query,
             dataset=search_dataset,
-            result_count=sum(1 for ds, _ in public_pairs if ds == search_dataset),
+            result_count=sum(
+                1
+                for result in public_results
+                if result.get("_citadel", {}).get("dataset") == search_dataset
+            ),
         )
     primary_dataset = search_datasets[0]
-    public_results = [result for _, result in public_pairs]
     telemetry = await capture_search_feedback(
         mesh_state=mesh_state,
         config=citadel.config,
@@ -7550,7 +7583,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             },
         )
 
-    # Shaping order: envelope -> rank -> filter -> trim -> drilldown. The
+    # Shaping order: envelope -> rank -> filter -> select -> drilldown. The
     # drill-down hints are resolved LAST, over the final page only, because
     # each scoped resolution costs a get_document call and over-fetching for
     # filters would otherwise triple that cost for hits the caller never sees.
@@ -7572,22 +7605,14 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             normalized.append(shaped)
     cleaned_mode = body.cleaned_mode()
     docs_mode = is_docs_mode_query(body.query, mode=cleaned_mode)
-    if docs_mode or is_spec_mode_query(body.query) or len(query_terms(body.query)) == 1:
-        normalized = apply_query_ranking(normalized, body.query, mode=cleaned_mode)
-    candidates_fetched = len(normalized)
-    if filters_active:
-        dict_hits = [item for item in normalized if isinstance(item, dict)]
-        other = [item for item in normalized if not isinstance(item, dict)]
-        normalized = filter_hits(dict_hits, **filter_kw) + other
-    candidates_matched = len(normalized)
-    if len(normalized) > body.top_k:
-        normalized = normalized[: body.top_k]
-    # Refresh rank numbers after re-order / filter / trim so agents see
-    # consistent ordering.
-    for index, item in enumerate(normalized):
-        if isinstance(item, dict) and isinstance(item.get("_citadel"), dict):
-            item["_citadel"]["rank"] = index + 1
-            item["rank"] = index + 1
+    normalized, candidates_fetched, candidates_matched = select_public_search_page(
+        normalized,
+        query=body.query,
+        datasets=search_datasets,
+        limit=body.top_k,
+        mode=cleaned_mode,
+        filter_kwargs=filter_kw if filters_active else None,
+    )
 
     # Honest drill-down hint (ADR-0009): the document_drilldown_available flag
     # (and the document_endpoint URL) must be TRUE only when /api/documents would

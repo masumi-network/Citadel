@@ -5052,6 +5052,40 @@ class MultiSearchCitadel(FakeCitadel):
         ]
 
 
+class FinalPageCitadel(FakeCitadel):
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        dataset = kwargs["dataset"]
+
+        def chunk(identifier: str, text: str) -> dict[str, Any]:
+            return {
+                "id": identifier,
+                "document_id": f"document-{identifier}",
+                "type": "DocumentChunk",
+                "text": text,
+            }
+
+        if query == "needle":
+            if dataset == "masumi-network":
+                rows = [chunk("central-exact", "needle central exact match")]
+            elif dataset.startswith("seat:"):
+                rows = [chunk("node-unrelated", "unrelated node material")]
+            else:
+                rows = []
+        elif dataset == "masumi-network":
+            rows = [
+                chunk(f"central-{index}", f"architecture central {index}")
+                for index in range(8)
+            ]
+        elif dataset.startswith("seat:"):
+            rows = [
+                chunk(f"node-{index}", f"architecture node {index}")
+                for index in range(8)
+            ]
+        else:
+            rows = []
+        return rows[: kwargs["top_k"]]
+
+
 class TrackingCitadel(FakeCitadel):
     def __init__(self) -> None:
         self.ingest_calls: list[dict[str, Any]] = []
@@ -5441,6 +5475,66 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     ]
     assert "sections" in payload
     assert payload["sections"]["session_traces"]
+
+
+def test_seat_search_pages_include_central_results(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    search = api_client.post(
+        "/search", json={"query": "architecture patterns", "top_k": 5}, headers=headers
+    )
+    knowledge = api_client.get(
+        "/api/knowledge",
+        params={"q": "architecture patterns", "limit": 5},
+        headers=headers,
+    )
+
+    assert search.status_code == 200
+    assert knowledge.status_code == 200
+    for response in (search, knowledge):
+        results = response.json()["results"]
+        assert len(results) == 5
+        assert any(result["dataset"] == "masumi-network" for result in results)
+        assert len({result["id"] for result in results}) == 5
+
+
+def test_seat_search_top_one_prefers_exact_central_result(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    search = api_client.post(
+        "/search", json={"query": "needle", "top_k": 1}, headers=headers
+    )
+    knowledge = api_client.get(
+        "/api/knowledge", params={"q": "needle", "limit": 1}, headers=headers
+    )
+
+    assert search.status_code == 200
+    assert knowledge.status_code == 200
+    search_result = search.json()["results"]
+    knowledge_result = knowledge.json()["results"]
+    assert len(search_result) == len(knowledge_result) == 1
+    assert (search_result[0]["id"], search_result[0]["dataset"]) == (
+        "central-exact",
+        "masumi-network",
+    )
+    assert (knowledge_result[0]["id"], knowledge_result[0]["dataset"]) == (
+        "central-exact",
+        "masumi-network",
+    )
 
 
 def test_seat_cannot_recall_another_seats_session(tmp_path: Any) -> None:
