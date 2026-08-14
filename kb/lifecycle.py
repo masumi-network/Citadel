@@ -1024,6 +1024,64 @@ class LifecycleStore:
         with self._connect() as connection:
             return self._failed_projection_candidates(connection, projection)
 
+    def failed_projection_records(
+        self,
+        projection: ProjectionRequest,
+        *,
+        error_code: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Failed current-head jobs, optionally filtered by last_error_code."""
+        wanted = None if error_code is None else str(error_code).strip()
+        if error_code is not None and not wanted:
+            raise ValueError("error_code must be a non-empty string when provided")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job.projection_job_id, job.dataset, revision.source_key,
+                       job.last_error_code, job.last_error_message
+                FROM source_heads AS head
+                JOIN projection_jobs AS job
+                  ON job.source_revision_id = head.source_revision_id
+                JOIN source_revisions AS revision
+                  ON revision.source_revision_id = head.source_revision_id
+                WHERE job.state = 'failed'
+                  AND job.generation_id = ?
+                  AND job.projection_version = ?
+                  AND job.config_digest = ?
+                  AND (? IS NULL OR job.last_error_code = ?)
+                ORDER BY job.projection_job_id
+                """,
+                (
+                    projection.generation_id,
+                    projection.projection_version,
+                    projection.config_digest,
+                    wanted,
+                    wanted,
+                ),
+            ).fetchall()
+        return tuple(
+            {
+                "projection_job_id": str(row["projection_job_id"]),
+                "dataset": str(row["dataset"]),
+                "source_key": str(row["source_key"]),
+                "error_code": row["last_error_code"],
+                "last_error_code": row["last_error_code"],
+                "error_message": row["last_error_message"],
+                "last_error_message": row["last_error_message"],
+            }
+            for row in rows
+        )
+
+    def failed_missing_path_candidates(
+        self,
+        projection: ProjectionRequest,
+    ) -> tuple[dict[str, Any], ...]:
+        """Failed current-head jobs whose last error is FileNotFoundError."""
+        return self.failed_projection_records(
+            projection,
+            error_code="FileNotFoundError",
+        )
+
     def requeue_failed_projections(
         self,
         projection: ProjectionRequest,

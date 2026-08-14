@@ -1427,3 +1427,70 @@ def test_projection_source_revision_states_tracks_active_and_completed_jobs(
     assert store.projection_source_revision_states(
         [revision_id], **lookup_kwargs
     ) == (set(), {revision_id})
+
+
+def test_failed_missing_path_candidates_select_file_not_found_jobs(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    pathfile = store.accept_source(
+        b"/private/tmp/claude-501/marker3_pathfile.txt",
+        capture=CaptureContext(
+            dataset="seat:citadel-dev-team",
+            source_key="manual:marker3-pathfile",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-pathfile",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    other = store.accept_source(
+        b"transient provider failure",
+        capture=CaptureContext(
+            dataset="seat:citadel-dev-team",
+            source_key="manual:other-failure",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-other",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    first = store.claim_next_job(worker_id="w1", now=T0, lease_seconds=30)
+    assert first is not None
+    assert first.projection_job_id == pathfile.projection_job_id
+    store.fail_job(
+        first,
+        error_code="FileNotFoundError",
+        error_message="Storage directory does not exist: '/private/tmp/claude-501/x'",
+        now=T0,
+    )
+    second = store.claim_next_job(worker_id="w1", now=T0, lease_seconds=30)
+    assert second is not None
+    assert second.projection_job_id == other.projection_job_id
+    store.fail_job(
+        second,
+        error_code="ProjectionVerificationError",
+        error_message="no chunks",
+        now=T0,
+    )
+    candidates = store.failed_projection_records(
+        projection, error_code="FileNotFoundError"
+    )
+    assert [item["projection_job_id"] for item in candidates] == [
+        pathfile.projection_job_id
+    ]
+    assert candidates[0]["source_key"] == "manual:marker3-pathfile"
+    assert candidates[0]["dataset"] == "seat:citadel-dev-team"
+    assert candidates[0]["error_code"] == "FileNotFoundError"

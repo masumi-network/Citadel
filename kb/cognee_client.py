@@ -2572,6 +2572,37 @@ class CogneePublicClient:
             rows = await session.execute(statement)
             return [str(row[0]) for row in rows.all() if row[0] is not None]
 
+    def _unscoped_stored_chunk_budget_kwargs(
+        self,
+        *,
+        dataset: str | None,
+        corpus_rows_by_id: Mapping[str, Mapping[str, Any]],
+        budget: int,
+    ) -> dict[str, Any]:
+        """Kwargs for a full-payload chunk census.
+
+        Pgvector can scan the whole table with no dataset filter. Qdrant
+        cannot: each scroll is tenant-filtered, so pass the requested
+        dataset, or every dataset seen on the relational walk when the
+        census is org-wide.
+        """
+        kwargs: dict[str, Any] = {"budget": budget}
+        if os.getenv("VECTOR_DB_PROVIDER", "").strip().lower() != "qdrant":
+            return kwargs
+        if dataset:
+            scoped = [dataset]
+        else:
+            names: set[str] = set()
+            for row in corpus_rows_by_id.values():
+                row_datasets = row.get("datasets")
+                if isinstance(row_datasets, list):
+                    names.update(str(value) for value in row_datasets if value)
+            scoped = sorted(names)
+        if not scoped:
+            raise RuntimeError("Qdrant chunk census requires explicit dataset scope")
+        kwargs["datasets"] = scoped
+        return kwargs
+
     async def corpus_oversized_chunk_documents(
         self,
         *,
@@ -2682,7 +2713,15 @@ class CogneePublicClient:
         # Run the persisted scan without a document-id filter. A scoped query
         # cannot see malformed/orphan payloads, which must block an apply rather
         # than disappear behind an apparently clean accepted-document census.
-        check = await self.stored_chunk_budget_check(None, budget=base["budget"])
+        # Qdrant has no unscoped scroll, so pass dataset scope there.
+        check = await self.stored_chunk_budget_check(
+            None,
+            **self._unscoped_stored_chunk_budget_kwargs(
+                dataset=dataset,
+                corpus_rows_by_id=corpus_rows_by_id,
+                budget=base["budget"],
+            ),
+        )
         if check is None:
             raise RuntimeError("stored chunk budget measurement is unavailable")
         violation_counts = check.get("violation_document_counts")
@@ -2959,7 +2998,14 @@ class CogneePublicClient:
                 "census_complete": False,
             }
 
-        check = await self.stored_chunk_budget_check(None, budget=base["budget"])
+        check = await self.stored_chunk_budget_check(
+            None,
+            **self._unscoped_stored_chunk_budget_kwargs(
+                dataset=dataset,
+                corpus_rows_by_id=corpus_rows_by_id,
+                budget=base["budget"],
+            ),
+        )
         if check is None:
             return {
                 **base,
@@ -4678,10 +4724,7 @@ class CogneePublicClient:
                             ):
                                 if document_id not in fatal_missing:
                                     fatal_missing.append(document_id)
-                if (
-                    stored_check["violation_count"] == 0
-                    and not fatal_missing
-                ):
+                if stored_check["violation_count"] == 0:
                     if in_flight:
                         logger.warning(
                             "stored chunk budget check: %d document id(s) missing "
@@ -4695,6 +4738,18 @@ class CogneePublicClient:
                             "stored chunk budget check: stale missing document ids "
                             "cleared after lifecycle projection completion: %s",
                             stale_missing_cleared[:10],
+                        )
+                    if fatal_missing:
+                        # A 52-byte masumi-network row with 0 chunks (live id
+                        # 4552e276-…) used to raise here and stamp /readyz red
+                        # forever. Missing ids with no over-budget chunks are
+                        # per-document gaps, not a global stored-budget failure.
+                        logger.warning(
+                            "stored chunk budget check: %d document id(s) missing "
+                            "from persisted chunks with 0 budget violations; "
+                            "per-document failure, not failing the cognify run: %s",
+                            len(fatal_missing),
+                            fatal_missing[:10],
                         )
                 else:
                     # Name the violators. The check already collects chunk_id

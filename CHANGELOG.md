@@ -16,6 +16,34 @@ All notable changes to `citadel-archive` are documented here. Format follows
   `${env:CITADEL_MCP_ACCESS_TOKEN}`. The post-onboard next-steps block tells
   you to Cmd-Q Cursor and run `cursor .` from that shell.
 
+- **`POST /api/lifecycle/tombstone-failed`.** Admin preview/apply for current-head
+  jobs whose last error is `FileNotFoundError` (path-string notes that cannot
+  be requeued). Same confirmation fields as `requeue-failed`. Apply tombstones
+  those `source_key`s and restarts the drain.
+
+### Fixed
+
+- **Qdrant `POST /api/corpus/reconcile` no longer 500s on a scoped census.**
+  The census called `stored_chunk_budget_check(None)` with no dataset list.
+  Qdrant cannot scroll unscoped, so even `dataset=masumi-network` raised
+  `Qdrant chunk census requires explicit dataset scope`. The unscoped payload
+  scan now passes the requested dataset, or every dataset seen on the
+  relational walk when the census is org-wide.
+
+- **A missing zero-chunk document no longer fails the whole cognify canary.**
+  Document `4552e276-e329-5dbf-9d45-d029160d82f4` (52-byte `masumi-network`
+  row, 0 chunks) made `verify=True` raise `RuntimeError` and stamp `_LAST_CANARY`
+  red forever. Missing ids with 0 budget violations are now a per-document
+  warning. Over-budget chunks still fail the run. `POST /api/cognify/run` with
+  `verify: true` stamps `_LAST_CANARY` on success and failure, same as evolve.
+
+- **Lifecycle `FileNotFoundError` jobs tombstone instead of retrying forever.**
+  Path-string notes (`marker3_pathfile.txt`) failed with
+  `Storage directory does not exist` and sat in `failed` so requeue could not
+  succeed. The worker now tombstones that current head on the first
+  `FileNotFoundError`. The admin tombstone-failed route covers jobs that
+  already failed before this drain change.
+
 ## [0.5.0] (2026-08-14)
 
 ### Added

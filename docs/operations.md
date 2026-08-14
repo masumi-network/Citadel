@@ -238,6 +238,9 @@ Admin:
   default. Apply requires the returned generation identity, exact ordered
   `candidate_ids`, and `expected_count`. A changed preview returns HTTP 409
   without resetting any job. The route requires admin role and `sources:sync`.
+- `POST /api/lifecycle/tombstone-failed` previews current-head jobs whose last
+  error is `FileNotFoundError` (missing local path). Apply uses the same
+  confirmation fields and tombstones those `source_key`s instead of requeueing.
 
 Examples:
 

@@ -3660,6 +3660,130 @@ async def test_corpus_reconciliation_census_scopes_oversized_totals_to_dataset(
 
 
 @pytest.mark.asyncio
+async def test_corpus_reconciliation_census_passes_qdrant_dataset_scope(
+    monkeypatch: Any,
+) -> None:
+    """Qdrant forbids an unscoped payload scan. Production reconcile 500'd
+    with 'Qdrant chunk census requires explicit dataset scope' even when the
+    caller passed dataset=masumi-network, because the census called
+    stored_chunk_budget_check(None) with no datasets kwarg.
+    """
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    client = CogneePublicClient()
+    captured: dict[str, Any] = {}
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 1}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "doc-zero",
+                "name": "Zero",
+                "datasets": ["masumi-network"],
+                "created_at": "1",
+            }
+        ]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        return {document_id: 0 for document_id in document_ids}
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None,
+        *,
+        budget: int | None = None,
+        datasets: list[str] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        captured["document_ids"] = document_ids
+        captured["datasets"] = datasets
+        captured["budget"] = budget
+        return {
+            "ok": True,
+            "scope": "full",
+            "violation_count": 0,
+            "violation_document_counts": {},
+            "missing_document_id_violation_count": 0,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_reconciliation_census(dataset="masumi-network")
+
+    assert captured["document_ids"] is None
+    assert captured["datasets"] == ["masumi-network"]
+    assert report["ok"] is True
+    assert report["zero_chunk_count"] == 1
+    assert report["zero_chunk_document_ids"] == ["doc-zero"]
+
+
+@pytest.mark.asyncio
+async def test_corpus_reconciliation_census_passes_qdrant_org_wide_dataset_scope(
+    monkeypatch: Any,
+) -> None:
+    """Org-wide Qdrant census has no single dataset argument. Scope comes from
+    every dataset name seen on the relational walk."""
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    client = CogneePublicClient()
+    captured: dict[str, Any] = {}
+
+    async def corpus_totals() -> dict[str, int]:
+        return {"documents": 2}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "doc-a",
+                "name": "A",
+                "datasets": ["masumi-network"],
+                "created_at": "1",
+            },
+            {
+                "id": "doc-b",
+                "name": "B",
+                "datasets": ["seat:alice"],
+                "created_at": "2",
+            },
+        ]
+
+    async def corpus_chunk_counts(document_ids: list[str]) -> dict[str, int]:
+        return {document_id: 1 for document_id in document_ids}
+
+    async def stored_chunk_budget_check(
+        document_ids: list[str] | None,
+        *,
+        budget: int | None = None,
+        datasets: list[str] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        captured["document_ids"] = document_ids
+        captured["datasets"] = datasets
+        return {
+            "ok": True,
+            "scope": "full",
+            "violation_count": 0,
+            "violation_document_counts": {},
+            "missing_document_id_violation_count": 0,
+        }
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+    monkeypatch.setattr(client, "corpus_chunk_counts", corpus_chunk_counts)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr("kb.chunk_window.resolve_chunk_budget", lambda: 256)
+
+    report = await client.corpus_reconciliation_census()
+
+    assert captured["document_ids"] is None
+    assert captured["datasets"] == ["masumi-network", "seat:alice"]
+    assert report["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_graph_chunk_ids_use_source_document_property(monkeypatch: Any) -> None:
     client = CogneePublicClient()
     calls: list[tuple[str, dict[str, Any]]] = []
@@ -4891,18 +5015,25 @@ async def test_cognify_missing_docs_with_active_projection_do_not_fail(
 
 
 @pytest.mark.asyncio
-async def test_cognify_missing_docs_without_active_job_still_fail(
-    monkeypatch: Any,
+async def test_cognify_missing_empty_document_does_not_fail_the_pass(
+    monkeypatch: Any, caplog: Any
 ) -> None:
-    """Fail-closed for real gaps: a missing id with NO pending/running job is
-    exactly as fatal as before the partition existed."""
-    client = _cognify_fakes(monkeypatch, missing=["doc-gone"], violations=0)
+    """A 52-byte masumi-network row with 0 chunks (live id 4552e276-...) made
+    cognify verify=True raise RuntimeError and stamp /readyz unhealthy forever.
+    Zero budget violations plus a missing id is a per-document gap, not a
+    global stored-chunk failure.
+    """
+    live_id = "4552e276-e329-5dbf-9d45-d029160d82f4"
+    client = _cognify_fakes(monkeypatch, missing=[live_id], violations=0)
     client.lifecycle_projection_state_lookup = lambda document_ids: (set(), set())
 
-    with pytest.raises(RuntimeError) as excinfo:
-        await client.cognify(datasets=["notes"])
+    with caplog.at_level("WARNING"):
+        await client.cognify(datasets=["notes"])  # must not raise
 
-    assert "doc-gone" in str(excinfo.value)
+    assert any(
+        live_id in record.getMessage() and "per-document" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

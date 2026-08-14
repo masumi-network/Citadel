@@ -1512,6 +1512,13 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     client = authed_client()
 
     recover = client.post("/api/cognify/run", json={"dataset": "masumi-network"})
+    server_module._LAST_CANARY = {
+        "ok": False,
+        "search_hit": None,
+        "graph_grew": None,
+        "marker": None,
+        "error": "RuntimeError",
+    }
     verify = client.post("/api/cognify/run", json={"verify": True})
 
     assert recover.status_code == 200
@@ -1521,6 +1528,9 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     assert verify.status_code == 200
     assert verify.json()["verify"] is True
     assert verify.json()["verification"]["ok"] is True
+    assert server_module._LAST_CANARY is not None
+    assert server_module._LAST_CANARY["ok"] is True
+    assert "error" not in server_module._LAST_CANARY
 
 
 def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
@@ -1540,6 +1550,12 @@ def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
 
     client = authed_client()
     app.state.citadel = FailingCognify()
+    server_module._LAST_CANARY = {
+        "ok": True,
+        "search_hit": True,
+        "graph_grew": True,
+        "marker": "old",
+    }
 
     response = client.post("/api/cognify/run", json={"verify": True})
 
@@ -1548,6 +1564,32 @@ def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
     events = app.state.access_store.snapshot()["audit_events"]
     cognify_events = [event for event in events if event["action"] == "cognify.run"]
     assert cognify_events[-1]["success"] is False
+    assert server_module._LAST_CANARY is not None
+    assert server_module._LAST_CANARY["ok"] is False
+
+
+def test_cognify_run_verify_exception_stamps_canary() -> None:
+    class Boom(FakeCitadel):
+        async def cognify_dataset(
+            self, *, dataset: Any = None, verify: bool = False, force: bool = False
+        ) -> dict[str, Any]:
+            raise RuntimeError("stored chunk budget check failed")
+
+    client = authed_client()
+    app.state.citadel = Boom()
+    server_module._LAST_CANARY = {
+        "ok": True,
+        "search_hit": True,
+        "graph_grew": True,
+        "marker": "old",
+    }
+
+    response = client.post("/api/cognify/run", json={"verify": True})
+
+    assert response.status_code == 500
+    assert server_module._LAST_CANARY is not None
+    assert server_module._LAST_CANARY["ok"] is False
+    assert server_module._LAST_CANARY.get("error") == "RuntimeError"
 
 
 def test_cognify_run_requires_admin() -> None:
@@ -1710,6 +1752,115 @@ def test_lifecycle_requeue_failed_returns_conflict_on_drift(monkeypatch) -> None
         "expected_count": 1,
         "current_count": 2,
     }
+
+
+def test_lifecycle_tombstone_failed_requires_admin() -> None:
+    client = authed_client("test-writer")
+    assert client.post("/api/lifecycle/tombstone-failed").status_code == 403
+
+
+def test_lifecycle_tombstone_failed_previews_without_applying(monkeypatch) -> None:
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+    resumed: list[bool] = []
+    monkeypatch.setattr(
+        type(citadel),
+        "lifecycle_tombstone_failed_preview",
+        lambda self, **_: {
+            "ok": True,
+            "applied": False,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "candidate_ids": ["job-1"],
+            "candidate_count": 1,
+            "candidates": [
+                {
+                    "projection_job_id": "job-1",
+                    "source_key": "manual:marker3-pathfile",
+                    "dataset": "seat:citadel-dev-team",
+                    "last_error_code": "FileNotFoundError",
+                }
+            ],
+            "tombstoned": 0,
+            "worker_resumed": False,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(citadel),
+        "resume_lifecycle_queue",
+        lambda self: resumed.append(True),
+        raising=False,
+    )
+    response = client.post("/api/lifecycle/tombstone-failed")
+    assert response.status_code == 200
+    assert response.json()["applied"] is False
+    assert response.json()["candidates"][0]["source_key"] == "manual:marker3-pathfile"
+    assert resumed == []
+
+
+def test_lifecycle_tombstone_failed_apply_requires_confirmation() -> None:
+    client = authed_client()
+    response = client.post(
+        "/api/lifecycle/tombstone-failed",
+        json={"apply": True},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == (
+        "LIFECYCLE_TOMBSTONE_CONFIRMATION_REQUIRED"
+    )
+
+
+def test_lifecycle_tombstone_failed_apply_tombstones_and_resumes(monkeypatch) -> None:
+    client = authed_client()
+    import kb.server as server_mod
+
+    citadel = server_mod.get_citadel()
+    resumed: list[bool] = []
+
+    async def apply_tombstone(self, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["candidate_ids"] == ("job-1",)
+        return {
+            "ok": True,
+            "applied": True,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "candidate_ids": ["job-1"],
+            "candidate_count": 1,
+            "tombstoned": 1,
+            "worker_resumed": False,
+        }
+
+    monkeypatch.setattr(
+        type(citadel),
+        "lifecycle_tombstone_failed",
+        apply_tombstone,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(citadel),
+        "resume_lifecycle_queue",
+        lambda self: resumed.append(True) or True,
+        raising=False,
+    )
+    response = client.post(
+        "/api/lifecycle/tombstone-failed",
+        json={
+            "apply": True,
+            "generation_id": "generation-1",
+            "projection_version": "projection-v1",
+            "config_digest": "sha256:config-1",
+            "expected_count": 1,
+            "candidate_ids": ["job-1"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["tombstoned"] == 1
+    assert resumed == [True]
 
 
 def test_lifecycle_health_uses_active_generation_failure_buckets() -> None:

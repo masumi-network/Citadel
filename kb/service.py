@@ -27,6 +27,7 @@ from kb.lifecycle import (
     CaptureContext,
     LIFECYCLE_CHUNK_SOURCE_PREFIX,
     LifecycleNotFoundError,
+    LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
     LifecycleStore,
     ProjectionRequest,
@@ -683,6 +684,94 @@ class Citadel:
             "candidate_ids": list(requeued_ids),
             "candidate_count": len(requeued_ids),
             "requeued": len(requeued_ids),
+            "worker_resumed": False,
+        }
+
+    def lifecycle_tombstone_failed_preview(
+        self,
+        *,
+        error_code: str = "FileNotFoundError",
+    ) -> dict[str, Any]:
+        """Preview failed current-head jobs that should be tombstoned, not requeued."""
+        projection = self._lifecycle_requeue_projection()
+        assert self.lifecycle_store is not None
+        records = self.lifecycle_store.failed_projection_records(
+            projection,
+            error_code=error_code,
+        )
+        candidate_ids = [str(record["projection_job_id"]) for record in records]
+        return {
+            "ok": True,
+            "applied": False,
+            "error_code": error_code,
+            "generation_id": projection.generation_id,
+            "projection_version": projection.projection_version,
+            "config_digest": projection.config_digest,
+            "candidates": list(records),
+            "candidate_ids": candidate_ids,
+            "candidate_count": len(candidate_ids),
+            "tombstoned": 0,
+            "worker_resumed": False,
+        }
+
+    async def lifecycle_tombstone_failed(
+        self,
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+        expected_count: int,
+        candidate_ids: tuple[str, ...],
+        error_code: str = "FileNotFoundError",
+    ) -> dict[str, Any]:
+        """Tombstone one exact preview of non-retryable failed current-head jobs."""
+        projection = self._lifecycle_requeue_projection()
+        if (
+            generation_id != projection.generation_id
+            or projection_version != projection.projection_version
+            or config_digest != projection.config_digest
+        ):
+            raise LifecycleRequeueIdentityMismatchError(projection)
+        assert self.lifecycle_store is not None
+        records = self.lifecycle_store.failed_projection_records(
+            projection,
+            error_code=error_code,
+        )
+        actual_ids = tuple(str(record["projection_job_id"]) for record in records)
+        if expected_count != len(actual_ids) or candidate_ids != actual_ids:
+            raise LifecycleRequeueDriftError(
+                expected_count=expected_count,
+                actual_candidate_ids=actual_ids,
+            )
+        tombstoned_keys: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            dataset = str(record["dataset"])
+            source_key = str(record["source_key"])
+            identity = (dataset, source_key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            await self.tombstone_source(
+                dataset=dataset,
+                source_key=source_key,
+                reason=(
+                    "FileNotFoundError: missing local path is a non-retryable "
+                    "source and must not stay a failed current-head job"
+                ),
+            )
+            tombstoned_keys.append(source_key)
+        return {
+            "ok": True,
+            "applied": True,
+            "error_code": error_code,
+            "generation_id": projection.generation_id,
+            "projection_version": projection.projection_version,
+            "config_digest": projection.config_digest,
+            "candidate_ids": list(actual_ids),
+            "candidate_count": len(actual_ids),
+            "tombstoned": len(tombstoned_keys),
+            "tombstoned_source_keys": tombstoned_keys,
             "worker_resumed": False,
         }
 

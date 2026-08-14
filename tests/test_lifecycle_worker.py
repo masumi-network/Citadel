@@ -73,6 +73,15 @@ class FakeProjectionGateway:
         )
 
 
+class MissingLocalPathGateway(FakeProjectionGateway):
+    async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+        self.remember_calls.append({"data": data, **kwargs})
+        raise FileNotFoundError(
+            "Storage directory does not exist: "
+            "'/private/tmp/claude-501/marker3_pathfile.txt'"
+        )
+
+
 class SlowRememberGateway(FakeProjectionGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -490,6 +499,68 @@ async def test_worker_marks_job_failed_after_bounded_attempts(
     assert retried.projection_job_id == accepted.projection_job_id
     assert retried.operation.state == "pending"
     assert {receipt.state for receipt in retried.operation.receipts} == {"pending"}
+
+
+async def test_worker_tombstones_missing_local_path_without_retry(
+    tmp_path: Path,
+) -> None:
+    """A path-string note dies on FileNotFoundError. Requeue cannot succeed.
+    Treat it as a non-retryable terminal tombstone on the first attempt.
+    """
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    capture = CaptureContext(
+        dataset="seat:alice",
+        source_key="manual:marker3-pathfile",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="alice",
+        capture_run_id="run-pathfile",
+        captured_at=T0,
+    )
+    accepted = store.accept_source(
+        b"/private/tmp/claude-501/marker3_pathfile.txt",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+    worker = LifecycleProjectionWorker(
+        store,
+        MissingLocalPathGateway(),
+        worker_id="worker-pathfile",
+        max_attempts=5,
+    )
+
+    assert await worker.run_once(now=T0) is True
+
+    poison = store.get_operation(accepted.projection_job_id)
+    assert poison.job.state == "stale"
+    assert poison.job.last_error_code == "FileNotFoundError"
+    current = store.current_revisions_for_source(
+        capture.dataset,
+        capture.source_key,
+        include_chunks=False,
+    )
+    assert len(current) == 1
+    assert current[0].tombstone is True
+    current_jobs = store.generation_census(
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    )
+    assert current_jobs.current_job_states.get("failed", 0) == 0
+    assert current_jobs.current_job_states.get("pending", 0) == 1
+    assert store.failed_projection_candidates(projection) == ()
+    assert store.next_wakeup_delay(now=T0) is not None
 
 
 async def test_worker_projects_tombstone_as_provider_neutral_exclusion(

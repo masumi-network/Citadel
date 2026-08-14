@@ -349,6 +349,81 @@ def test_lifecycle_requeue_requires_active_worker_identity(
         )
 
 
+@pytest.mark.asyncio
+async def test_lifecycle_tombstone_failed_missing_path_jobs(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    from kb.lifecycle import CaptureContext
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    assert kb.lifecycle_store is not None
+    now = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    projection = kb._lifecycle_projection_request()
+    accepted = kb.lifecycle_store.accept_source(
+        b"/private/tmp/claude-501/marker3_pathfile.txt",
+        capture=CaptureContext(
+            dataset="seat:citadel-dev-team",
+            source_key="manual:marker3-pathfile",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-pathfile",
+            captured_at=now,
+        ),
+        projection=projection,
+        now=now,
+    )
+    lease = kb.lifecycle_store.claim_next_job(
+        worker_id="w1",
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+        now=now,
+        lease_seconds=30,
+    )
+    assert lease is not None
+    kb.lifecycle_store.fail_job(
+        lease,
+        error_code="FileNotFoundError",
+        error_message="Storage directory does not exist: '/private/tmp/claude-501/x'",
+        now=now,
+    )
+
+    preview = kb.lifecycle_tombstone_failed_preview()
+    assert preview["applied"] is False
+    assert preview["candidate_ids"] == [accepted.projection_job_id]
+    assert preview["candidates"][0]["source_key"] == "manual:marker3-pathfile"
+
+    applied = await kb.lifecycle_tombstone_failed(
+        generation_id=preview["generation_id"],
+        projection_version=preview["projection_version"],
+        config_digest=preview["config_digest"],
+        expected_count=preview["candidate_count"],
+        candidate_ids=tuple(preview["candidate_ids"]),
+    )
+    assert applied["applied"] is True
+    assert applied["tombstoned"] == 1
+    current = kb.lifecycle_store.current_revisions_for_source(
+        "seat:citadel-dev-team",
+        "manual:marker3-pathfile",
+        include_chunks=False,
+    )
+    assert len(current) == 1
+    assert current[0].tombstone is True
+    assert kb.lifecycle_tombstone_failed_preview()["candidate_ids"] == []
+
+
 def test_lifecycle_requeue_preview_does_not_mutate_failed_jobs(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,

@@ -156,6 +156,29 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
 # search stops working — not only when node/auth are down (#27). None until the
 # first scheduled pass runs.
 _LAST_CANARY: dict[str, Any] | None = None
+
+
+def _record_canary_verdict(
+    *,
+    ok: bool,
+    search_hit: Any = None,
+    graph_grew: Any = None,
+    marker: Any = None,
+    error: str | None = None,
+) -> None:
+    """Stamp the /readyz canary. Evolve and POST /api/cognify/run share this."""
+    global _LAST_CANARY
+    payload: dict[str, Any] = {
+        "ok": bool(ok),
+        "search_hit": search_hit,
+        "graph_grew": graph_grew,
+        "marker": marker,
+    }
+    if error is not None:
+        payload["error"] = error
+    _LAST_CANARY = payload
+
+
 # Corpus-volume gate: if at least this many sources are tracked but the graph holds
 # fewer than the floor of indexed nodes, the data plane is broken (green dashboards
 # over an empty graph were the #27 failure mode).
@@ -392,19 +415,18 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             # verify=True runs the end-to-end ingest+cognify+search canary and
             # records its verdict for /readyz (#27).
             result = await get_citadel().cognify_dataset(force=force, verify=True)
-            global _LAST_CANARY
             verification = result.get("verification") or {}
-            _LAST_CANARY = {
-                "ok": bool(result.get("ok")),
-                "search_hit": verification.get("search_hit"),
-                "graph_grew": result.get("graph_grew"),
-                "marker": verification.get("marker"),
-            }
+            _record_canary_verdict(
+                ok=bool(result.get("ok")),
+                search_hit=verification.get("search_hit"),
+                graph_grew=result.get("graph_grew"),
+                marker=verification.get("marker"),
+            )
             logger.info(
                 "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
                 result.get("graph_after"),
                 result.get("graph_grew"),
-                _LAST_CANARY["ok"],
+                _LAST_CANARY["ok"] if _LAST_CANARY is not None else None,
             )
         except asyncio.CancelledError:
             # Teardown landing mid-Phase-2 (the canary can now wait minutes on
@@ -420,13 +442,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             # exists to surface. Recording only clean passes above would leave
             # the previous verdict standing, so /readyz would read GREEN through
             # the exact break it is meant to catch. Stamp it unhealthy.
-            _LAST_CANARY = {
-                "ok": False,
-                "search_hit": None,
-                "graph_grew": None,
-                "marker": None,
-                "error": exc.__class__.__name__,
-            }
+            _record_canary_verdict(ok=False, error=exc.__class__.__name__)
         finally:
             if not cancelled:
                 # Stamp the pass even when a stage failed. This records that the
@@ -1121,6 +1137,16 @@ class CorpusReconcileBody(BaseModel):
 
 class LifecycleRequeueFailedBody(BaseModel):
     apply: bool = False
+    generation_id: StrictStr | None = Field(default=None, min_length=1)
+    projection_version: StrictStr | None = Field(default=None, min_length=1)
+    config_digest: StrictStr | None = Field(default=None, min_length=1)
+    expected_count: StrictInt | None = Field(default=None, ge=0)
+    candidate_ids: list[StrictStr] | None = None
+
+
+class LifecycleTombstoneFailedBody(BaseModel):
+    apply: bool = False
+    error_code: StrictStr = Field(default="FileNotFoundError", min_length=1)
     generation_id: StrictStr | None = Field(default=None, min_length=1)
     projection_version: StrictStr | None = Field(default=None, min_length=1)
     config_digest: StrictStr | None = Field(default=None, min_length=1)
@@ -6618,8 +6644,10 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
     dataset = body.dataset or citadel.config.default_dataset
     try:
         result = await citadel.cognify_dataset(dataset=dataset, verify=body.verify, force=body.force)
-    except Exception as exc:  # pragma: no cover - depends on Cognee config.
+    except Exception as exc:
         logger.error("Cognify run failed: %s", exc.__class__.__name__)
+        if body.verify:
+            _record_canary_verdict(ok=False, error=exc.__class__.__name__)
         get_access_store().record_event(
             action="cognify.run",
             actor=actor,
@@ -6643,6 +6671,13 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
 
     verification = result.get("verification") or {}
     result_ok = result.get("ok", True) is True
+    if body.verify:
+        _record_canary_verdict(
+            ok=result_ok,
+            search_hit=verification.get("search_hit"),
+            graph_grew=result.get("graph_grew"),
+            marker=verification.get("marker"),
+        )
     get_access_store().record_event(
         action="cognify.run",
         actor=actor,
@@ -7180,6 +7215,157 @@ async def lifecycle_requeue_failed(
             "generation_id": result["generation_id"],
             "projection_version": result["projection_version"],
             "requeued": result["requeued"],
+            "worker_resumed": worker_resumed,
+        },
+    )
+    return result
+
+
+@app.post("/api/lifecycle/tombstone-failed")
+async def lifecycle_tombstone_failed(
+    request: Request,
+    body: LifecycleTombstoneFailedBody | None = None,
+) -> dict[str, Any]:
+    """Preview or tombstone failed jobs whose error is non-retryable."""
+    actor = require_access(request, "admin", "sources:sync")
+    body = body or LifecycleTombstoneFailedBody()
+    citadel = get_citadel()
+    error_code = body.error_code
+
+    def record(action: str, success: bool, detail: dict[str, Any]) -> None:
+        get_access_store().record_event(
+            action=action,
+            actor=actor,
+            success=success,
+            detail=detail,
+        )
+
+    if not body.apply:
+        try:
+            result = citadel.lifecycle_tombstone_failed_preview(error_code=error_code)
+        except LifecycleNotFoundError as exc:
+            record(
+                "lifecycle.tombstone.preview",
+                False,
+                {"code": "LIFECYCLE_DISABLED"},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "LIFECYCLE_DISABLED", "message": str(exc)},
+            ) from exc
+        except LifecycleRequeueIdentityMismatchError as exc:
+            record(
+                "lifecycle.tombstone.preview",
+                False,
+                {"code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH"},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH",
+                    "generation_id": exc.generation_id,
+                    "projection_version": exc.projection_version,
+                    "config_digest": exc.config_digest,
+                },
+            ) from exc
+        record(
+            "lifecycle.tombstone.preview",
+            True,
+            {
+                "generation_id": result["generation_id"],
+                "projection_version": result["projection_version"],
+                "error_code": error_code,
+                "candidate_count": result["candidate_count"],
+            },
+        )
+        return result
+
+    required = {
+        "generation_id": body.generation_id,
+        "projection_version": body.projection_version,
+        "config_digest": body.config_digest,
+        "expected_count": body.expected_count,
+        "candidate_ids": body.candidate_ids,
+    }
+    missing = sorted(name for name, value in required.items() if value is None)
+    if missing:
+        detail = {
+            "code": "LIFECYCLE_TOMBSTONE_CONFIRMATION_REQUIRED",
+            "missing": missing,
+        }
+        record("lifecycle.tombstone.apply", False, detail)
+        raise HTTPException(status_code=422, detail=detail)
+
+    assert body.generation_id is not None
+    assert body.projection_version is not None
+    assert body.config_digest is not None
+    assert body.expected_count is not None
+    assert body.candidate_ids is not None
+    candidate_ids = tuple(body.candidate_ids)
+    if (
+        body.expected_count != len(candidate_ids)
+        or candidate_ids != tuple(sorted(set(candidate_ids)))
+        or any(
+            not candidate_id or candidate_id != candidate_id.strip()
+            for candidate_id in candidate_ids
+        )
+    ):
+        detail = {"code": "LIFECYCLE_TOMBSTONE_CANDIDATES_INVALID"}
+        record("lifecycle.tombstone.apply", False, detail)
+        raise HTTPException(status_code=422, detail=detail)
+
+    record(
+        "lifecycle.tombstone.apply.request",
+        True,
+        {
+            "generation_id": body.generation_id,
+            "projection_version": body.projection_version,
+            "error_code": error_code,
+            "candidate_count": body.expected_count,
+        },
+    )
+    try:
+        result = await citadel.lifecycle_tombstone_failed(
+            generation_id=body.generation_id,
+            projection_version=body.projection_version,
+            config_digest=body.config_digest,
+            expected_count=body.expected_count,
+            candidate_ids=candidate_ids,
+            error_code=error_code,
+        )
+    except LifecycleNotFoundError as exc:
+        detail = {"code": "LIFECYCLE_DISABLED", "message": str(exc)}
+        record("lifecycle.tombstone.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleRequeueIdentityMismatchError as exc:
+        detail = {
+            "code": "LIFECYCLE_WORKER_IDENTITY_MISMATCH",
+            "generation_id": exc.generation_id,
+            "projection_version": exc.projection_version,
+            "config_digest": exc.config_digest,
+        }
+        record("lifecycle.tombstone.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleRequeueDriftError as exc:
+        detail = {
+            "code": "LIFECYCLE_TOMBSTONE_DRIFT",
+            "expected_count": exc.expected_count,
+            "current_count": len(exc.actual_candidate_ids),
+        }
+        record("lifecycle.tombstone.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+
+    resume = getattr(citadel, "resume_lifecycle_queue", None)
+    worker_resumed = bool(resume()) if callable(resume) else False
+    result["worker_resumed"] = worker_resumed
+    record(
+        "lifecycle.tombstone.apply",
+        True,
+        {
+            "generation_id": result["generation_id"],
+            "projection_version": result["projection_version"],
+            "error_code": error_code,
+            "tombstoned": result["tombstoned"],
             "worker_resumed": worker_resumed,
         },
     )
