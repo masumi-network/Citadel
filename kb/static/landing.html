@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Citadel, the organization vault</title>
+  <title>Citadel</title>
   <meta name="description" content="Citadel is shared, governed memory for your team and its AI agents. Your work flows in automatically, no other seat can read your Node, and Central is the org's curated memory.">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/info.css">
@@ -69,22 +69,20 @@
           <div class="k">Median search round-trip, from a client</div>
         </div>
         <div class="tile">
-          <div class="n">22</div>
+          <div class="n">24</div>
           <div class="k">MCP tools for agents</div>
         </div>
         <div class="tile">
-          <div class="n sm">~$55/mo</div>
+          <div class="n sm">~$38/mo</div>
           <div class="k">To self-host the whole node</div>
         </div>
       </div>
       <p class="proof-note">This page is served by the system it describes. Live numbers, releases, and the roadmap are on the <a href="/info">status page</a>.</p>
-      <!-- Both tiles above are dated snapshots, and the wording has to keep them
-           that way. The cost model has 2026-07-31's resource averages written
-           into its source, so re-running it reprints the same total instead of
-           re-measuring; the round-trip is what search_bench.py timed from a
-           laptop, which is not server-side latency. Claiming either is live, or
-           quoting the cost to the cent, would be false. -->
-      <p class="proof-note">Both were measured against this deployment on 2026-07-31 and the method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. The cost applies Railway's published prices to 24-hour average resource use across all three services of the project; a trailing-7-day basis comes out nearer $61, so read it as about $55 rather than a figure to the cent. The 269 ms is a round-trip timed from a client, so it carries DNS, TLS and the network path with it, and server-side timing on the same run was lower. Self-hosting the whole server, not just the CLI, is covered in the <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.</p>
+      <!-- Cost is a 2026-08-14 24h Railway average. Latency is still the
+           2026-07-31 client round-trip: a 2026-08-14 search_bench rerun
+           recorded 105 failed requests (401/429), so its p50 is time-to-error
+           and must not replace 269 ms. -->
+      <p class="proof-note">Cost was re-measured on 2026-08-14. The method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. It applies Railway's published prices to 24-hour average resource use across the two services in the project (Citadel-Archive and Qdrant); a trailing-7-day basis comes out nearer $58, so read it as about $38 rather than a figure to the cent. The 269 ms search round-trip is still the 2026-07-31 client measurement. A rerun on 2026-08-14 did not complete a successful search, so that figure was not replaced. Self-hosting the whole server, not just the CLI, is covered in the <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.</p>
     </div>
   </section>
 
@@ -212,10 +210,11 @@
   <section class="band band-start" id="start">
     <div class="band-in">
       <div class="sechead"><span class="kicker">04 · Get started</span><h2>Two commands</h2></div>
-      <p class="lede">Install the CLI, then hand it your seat token. The onboarding wires up the MCP client you already use.</p>
+      <p class="lede">You need a seat token from us to try the live node. This is not a public sandbox. <a href="/contact">Contact us</a>, we send an access token, then install the CLI and run onboard. Onboarding wires up the MCP client you already use.</p>
       <div class="cmd"><span class="p">$</span> pipx install citadel-archive</div>
       <div class="cmd"><span class="p">$</span> citadel onboard</div>
       <div class="endrow">
+        <span>Need a token? <a href="/contact">Contact us</a>.</span>
         <span>Already have a seat? <a href="/login">Sign in</a>.</span>
         <span>Watch the node on the <a href="/info">live status page</a>.</span>
         <span>Read the <a href="https://github.com/masumi-network/Citadel">source on GitHub</a>.</span>

@@ -3,6 +3,7 @@ import Head from "next/head";
 import { HeroBand } from "@/components/hero-band";
 import { SectionIndex, type Section } from "@/components/section-index";
 import {
+  BAND,
   BAND_IN,
   BTN,
   BTN_PRIMARY,
@@ -20,6 +21,8 @@ import {
   FOOT_NOTE,
   GoDeeper,
   H1_WIDE,
+  HERO_STRIP,
+  HeroFact,
   LEDE,
   META,
   PILL,
@@ -31,8 +34,6 @@ import {
   Row,
   SecHead,
   TLDR_P,
-  TLDR_P_LAST,
-  Tldr,
   Verified,
 } from "@/components/ui";
 
@@ -46,11 +47,38 @@ const SECTIONS: Section[] = [
   { id: "verify", label: "Check us" },
 ];
 
+const TEAM_CASES = [
+  {
+    n: "01",
+    title: "The first two weeks of a new engineer",
+    body: "Why is it built this way, what was tried before, who decided. A new joiner asks the vault and gets an answer with the commit, issue, or decision record behind it, instead of interrupting the three people who remember.",
+    tag: "onboarding without a tax on the team",
+  },
+  {
+    n: "02",
+    title: "Agents that know your codebase",
+    body: "Claude Code, Cursor, or your own agent connects over MCP and answers from your team's memory under your seat and your read scope. The agent stops guessing at context it was never given.",
+    tag: "MCP · same seat, same isolation",
+  },
+  {
+    n: "03",
+    title: "One question across every tool",
+    body: 'The answer to "what happened with X" is usually split across a commit, a ticket, a document, and a coding session nobody wrote down. One search reads all of them and tells you which memory answered.',
+    tag: "code · tickets · docs · sessions",
+  },
+  {
+    n: "04",
+    title: "Evidence you can hand to someone else",
+    body: "Every retrieved item carries a content fingerprint and points back at where it came from, and every read and write is logged. When a report or a review needs proof, it is already assembled.",
+    tag: "source linked · audited",
+  },
+] as const;
+
 export default function UseCases() {
   return (
     <>
       <Head>
-        <title>Citadel use cases and partnering</title>
+        <title>Citadel</title>
         <meta
           name="description"
           content="What teams run Citadel for, and how utxo AG joins EU consortia as a work-package partner: an open-source system that keeps a project's records organised, access-controlled and auditable."
@@ -63,26 +91,19 @@ export default function UseCases() {
         <h1 className={H1_WIDE}>
           What people run Citadel for, <span className="grad">and where we partner</span>.
         </h1>
-        <div className={META}>
+        <div className={`${META} mb-8`}>
           <span className={PILL}>utxo AG · Zug, Switzerland</span>
           <span className={PILL}>Looking for: one work package</span>
         </div>
-        <Tldr label="The short version">
-          <p className={TLDR_P}>
-            <b>For a team.</b> Citadel gathers the records you already produce, code, tickets,
-            documents, coding sessions, and keeps them in one place where each item is{" "}
-            <b>traceable to its source</b>, only visible to the people allowed to see it, and logged
-            every time it is read or changed. You and your agents ask it questions instead of asking
-            each other the same ones again.
-          </p>
-          <p className={TLDR_P_LAST}>
-            <b>For a consortium.</b> That same system is what utxo AG brings to an EU project, as a
-            partner running one work package. We are a Swiss company, and Switzerland is part of the
-            Digital Europe Programme, so we count toward your minimum number of countries rather
-            than sitting outside it. We apply for Swiss national co-funding toward our own share,
-            and we scope the work package with you rather than off a price list.
-          </p>
-        </Tldr>
+        <dl className={HERO_STRIP}>
+          <HeroFact kicker="Team">
+            Citadel gathers your code, tickets, documents, and sessions, each with a{" "}
+            <b>content fingerprint</b>.
+          </HeroFact>
+          <HeroFact kicker="Consortium">
+            utxo AG brings this system to an EU project as one work package.
+          </HeroFact>
+        </dl>
       </HeroBand>
 
       <SectionIndex sections={SECTIONS} />
@@ -93,39 +114,15 @@ export default function UseCases() {
           None of these need anyone to file anything. The capture already happened while people were
           working.
         </p>
-        <div className={PILLARS}>
-          <Card title="The first two weeks of a new engineer">
-            <p className={CARD_P}>
-              Why is it built this way, what was tried before, who decided. A new joiner asks the
-              vault and gets an answer with the commit, issue, or decision record behind it, instead
-              of interrupting the three people who remember.
-            </p>
-            <span className={CARD_TAG}>onboarding without a tax on the team</span>
-          </Card>
-          <Card title="Agents that know your codebase">
-            <p className={CARD_P}>
-              Claude Code, Cursor, or your own agent connects over MCP and answers from your
-              team&apos;s memory under your seat and your read scope. The agent stops guessing at
-              context it was never given.
-            </p>
-            <span className={CARD_TAG}>MCP · same seat, same isolation</span>
-          </Card>
-          <Card title="One question across every tool">
-            <p className={CARD_P}>
-              The answer to &quot;what happened with X&quot; is usually split across a commit, a
-              ticket, a document, and a coding session nobody wrote down. One search reads all of
-              them and tells you which memory answered.
-            </p>
-            <span className={CARD_TAG}>code · tickets · docs · sessions</span>
-          </Card>
-          <Card title="Evidence you can hand to someone else">
-            <p className={CARD_P}>
-              Every retrieved item carries a content fingerprint and points back at where it came
-              from, and every read and write is logged. When a report or a review needs proof, it is
-              already assembled.
-            </p>
-            <span className={CARD_TAG}>source linked · audited</span>
-          </Card>
+        <div className="grid grid-cols-2 gap-px border border-border bg-border max-[620px]:grid-cols-1">
+          {TEAM_CASES.map((item) => (
+            <article key={item.n} className="bg-surface px-6 py-6 max-[620px]:px-4 max-[620px]:py-5">
+              <p className="mb-3 font-mono text-[11px] tracking-[.16em] text-accent-ink">{item.n}</p>
+              <h3 className="m-0 mb-2.5 text-base font-semibold">{item.title}</h3>
+              <p className={CARD_P}>{item.body}</p>
+              <span className={CARD_TAG}>{item.tag}</span>
+            </article>
+          ))}
         </div>
         <Verified>
           The rest of this page is the same system offered to EU consortia as a work-package
@@ -276,34 +273,69 @@ export default function UseCases() {
 
       <Band tone="grey" id="honest">
         <SecHead kicker="What we don't claim" title="Where we would fail a technical review" />
-        {/* The TL;DR panel does double duty here: this is the section a
-            coordinator should read first, so it gets the same accent bar. */}
-        <div className="relative overflow-hidden border border-border bg-surface px-8 py-7">
-          <span className="absolute inset-y-0 left-0 w-[3px] bg-[linear-gradient(var(--accent),var(--accent-ink))]" />
-          <p className="mb-3.5 text-xs font-semibold uppercase tracking-[.16em] text-accent-ink">
-            Read this before you believe the rest
-          </p>
-          <p className={TLDR_P}>
-            Partner profiles list capabilities and stop. These are the gaps, checked against the
-            live system rather than copied from our own documentation.
-          </p>
-          <ul className={`${PLAINLIST} mt-1 text-[15.5px]`}>
-            <li>
-              <b className={DEEP_B}>Items are fingerprinted, but not yet traceable.</b> We can prove
-              a record hasn&apos;t changed; we cannot yet show you, on every record, exactly which
-              document it came from. That is the single biggest thing a project would fund, and we
-              would rather fund it than claim it.
-            </li>
-            <li>
-              <b className={DEEP_B}>Disagreement detection is shallow.</b> Today it compares
-              document titles. Comparing the actual claims is designed and specified, but not built.
-            </li>
-            <li>
-              <b className={DEEP_B}>We are proven at team scale, not national scale.</b> The system
-              runs daily for a working team. Handling a country&apos;s reporting volume is real
-              project work, and we scope it as such.
-            </li>
-          </ul>
+        {/* Accent bar stays: this is the section a coordinator should read
+            first. The old 65ch box left the right of the 1200px measure empty,
+            so shipped vs still-open sit in two columns instead. */}
+        <div className="relative border border-border bg-surface">
+          <span className="absolute inset-y-0 left-0 w-[3px] bg-accent" />
+          <div className="px-6 py-5 pl-7 max-[620px]:px-4 max-[620px]:py-4 max-[620px]:pl-5">
+            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-[.16em] text-accent-ink">
+              Read this before you believe the rest
+            </p>
+            <p className={TLDR_P}>
+              Partner profiles list capabilities and stop. These are the gaps, checked against the
+              live system rather than copied from our own documentation. A few items that used to
+              sit here have shipped. They are listed first so this page does not keep advertising
+              them as holes.
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-x-12 gap-y-6 max-[620px]:grid-cols-1 max-[620px]:gap-y-0">
+              <div className="max-[620px]:pb-6">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-good">
+                  Shipped since v0.3
+                </p>
+                <ul className={`${PLAINLIST} mt-1`}>
+                  <li>
+                    <b className={DEEP_B}>Mesh read isolation</b> (v0.3.0): graph, activity, and
+                    document drill-down are caller-scoped.
+                  </li>
+                  <li>
+                    <b className={DEEP_B}>Shared Session Traces</b> (v0.4.0): share a dead end,
+                    reference-only, without leaking private memory.
+                  </li>
+                  <li>
+                    <b className={DEEP_B}>Next public pages</b> (v0.4.1 preview at{" "}
+                    <code className="bg-surface-2 px-1.5 py-[1.5px] font-mono text-[.84em] text-ink">
+                      /next
+                    </code>
+                    ): this site, as a static export, not yet the default public surface.
+                  </li>
+                </ul>
+              </div>
+              <div className="max-[620px]:border-t max-[620px]:border-border max-[620px]:pt-6">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-warn">
+                  Still open, and on the roadmap
+                </p>
+                <ul className={`${PLAINLIST} mt-1`}>
+                  <li>
+                    <b className={DEEP_B}>Items are fingerprinted, but not yet attested.</b> Search
+                    can say a source is linked. That is not per-item provenance with a confidence
+                    and a match type on every record. A project would fund that, and we would rather
+                    fund it than claim it.
+                  </li>
+                  <li>
+                    <b className={DEEP_B}>Disagreement detection is shallow.</b> Today it compares
+                    document titles. Comparing the actual claims is designed, and specified, but not
+                    built.
+                  </li>
+                  <li>
+                    <b className={DEEP_B}>We are proven at team scale, not national scale.</b> The
+                    system runs daily for a working team. Handling a country&apos;s reporting volume
+                    is real project work, and we scope it as such.
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
         </div>
       </Band>
 
@@ -418,7 +450,7 @@ export default function UseCases() {
         </div>
       </Band>
 
-      <section className="relative py-[74px] max-[620px]:py-12 bg-accent-soft" id="talk">
+      <section className={`${BAND} bg-accent-soft`} id="talk">
         <div className={BAND_IN}>
           <SecHead kicker="Talk to us" title="Tell us the call and the gap" />
           <p className={LEDE}>

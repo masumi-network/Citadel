@@ -1,5 +1,6 @@
 import { Mark } from "@/components/mark";
 import { ThemeButton } from "@/components/theme-button";
+import { MEASURE } from "@/components/ui";
 
 const LINKS: Array<{ href: string; label: string }> = [
   { href: "/", label: "Home" },
@@ -22,7 +23,8 @@ const LINK_CURRENT = "text-accent-ink bg-accent-soft hover:text-accent-ink hover
 const SIGN_IN =
   "ml-1.5 whitespace-nowrap px-3 py-[5px] text-[13px] font-medium no-underline text-ink border border-border-2 transition-[color,border-color] duration-150 hover:text-accent-ink hover:border-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent max-[620px]:px-2 max-[620px]:text-[12.5px] max-[470px]:ml-0 max-[470px]:px-1.5 max-[470px]:py-[7px]";
 
-/* The shared top navigation.
+/* The shared top navigation. Sticky at the page edge, filled so scrolled
+ * content does not show through. Square, like the rest of the chrome.
  *
  * Every link points at a hand-written page, so these are plain <a> and not
  * next/link: they are full document loads by definition, and a client-side
@@ -35,13 +37,13 @@ const SIGN_IN =
 export function TopNav({ current }: { current?: string }) {
   return (
     <nav
-      className="topnav relative z-20 border-b-0 bg-transparent"
+      className="topnav sticky top-0 z-20 border-b border-border bg-ground"
       aria-label="Main"
     >
       {/* Below 470px the single row cannot hold everything (it needs ~395px),
           so the bar wraps: brand + theme toggle on the first row, the links
           spread across a full-width second row. */}
-      <div className="mx-auto flex max-w-[940px] items-center gap-3.5 px-[26px] py-[11px] max-[620px]:gap-2 max-[620px]:px-4 max-[620px]:py-[9px] max-[470px]:flex-wrap max-[470px]:gap-y-0.5">
+      <div className={`${MEASURE} flex items-center gap-3.5 py-[11px] max-[620px]:gap-2 max-[620px]:py-[9px] max-[470px]:flex-wrap max-[470px]:gap-y-0.5`}>
         <a
           href="/"
           className="mr-auto flex items-center gap-2.5 text-inherit no-underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
