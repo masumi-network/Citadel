@@ -6,6 +6,8 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] (2026-08-14)
+
 ### Added
 
 - **`/api/documents/{id}` takes `?scope=chunk`.** A DocumentChunk id used to
@@ -42,7 +44,29 @@ All notable changes to `citadel-archive` are documented here. Format follows
   `cognify=true` on MCP) whose help warns it can exceed proxy timeouts.
   `--no-cognify` still parses and now names the default.
 
+- **Public version stamp matches the package.** `/info`, the health pills, and
+  `citadel --version` all report `v0.5.0` / `0.5.0` from `kb.__version__`. The
+  self-host cost tile stays `~$38/mo` (measured 2026-08-14).
+
 ### Fixed
+
+- **Org capture deny globs now apply at ingest and pre-push.** `merged_deny_globs`
+  was JSON-only. Ingest now merges org defaults into `PreIngestFilter`, matches
+  the basename (so `/path/.env` is denied), and rejects a matching
+  `source_locator` / `source_key`. The pre-push snapshot drops denied paths from
+  the changed-files list.
+
+- **MCP `citadel_search` sanitization is pinned at the tool.** A tool-level test
+  fails if forged `trust_tier` or `source_user` survives the search tool path.
+
+- **Test fixture stability for configured service checks.** The shared `authed_client` test fixture now sets a
+  deterministic fake repo-content syncer. Without that explicit state, `/api/mesh` inherited
+  environment-dependent values from the process default syncer and `tracked_sources` varied per run.
+  The fixture now keeps `tracked_sources` stable across test environments.
+
+- **Landing export text parity with source.** The committed `/next` export now uses
+  `aria-label="The architecture, layer by layer"` in the mobile architecture block, matching the source
+  React component and the expectation in `test_the_landing_architecture_reaches_phones_and_names_what_runs`.
 
 - **The post-cognify stored-chunk check no longer fails on documents the
   lifecycle drain is still projecting (#286).** Phase-2 incremental cognify

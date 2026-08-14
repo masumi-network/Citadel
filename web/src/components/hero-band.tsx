@@ -3,9 +3,10 @@ import type { ReactNode } from "react";
 import { TopNav } from "@/components/top-nav";
 import { BAND_IN } from "@/components/ui";
 
-/* The hero: white, no chrome box. The nav rides inside the band, transparent,
- * so the page opens on white rather than on a bordered strip, and the glow sits
- * behind both, in the same corner on every page.
+/* The hero: white, no chrome box. TopNav sits above this band as a page-level
+ * sticky bar. The glow is clipped here, on a child that does not wrap the nav:
+ * overflow-hidden on an ancestor of a sticky element would pin the bar inside
+ * the band instead of the viewport.
  *
  * The glow is deliberately not given a view-transition-name. Naming an element
  * hands it to the transition machinery, which snapshots it and freezes its own
@@ -24,18 +25,20 @@ export function HeroBand({
   children: ReactNode;
 }) {
   return (
-    <div className="relative overflow-hidden bg-surface p-0">
-      <div className="hero-glow" aria-hidden="true" />
+    <>
       <TopNav current={current} />
-      <div className={BAND_IN}>
-        <header
-          className={`relative z-[1] pt-[58px] max-[620px]:pt-[34px] ${
-            wide ? "pb-[66px]" : "pb-[92px] max-[620px]:pb-[60px]"
-          }`}
-        >
-          {children}
-        </header>
+      <div className="relative overflow-hidden bg-surface p-0">
+        <div className="hero-glow" aria-hidden="true" />
+        <div className={BAND_IN}>
+          <header
+            className={`relative z-[1] pt-10 max-[620px]:pt-8 ${
+              wide ? "pb-12 max-[620px]:pb-10" : "pb-14 max-[620px]:pb-10"
+            }`}
+          >
+            {children}
+          </header>
+        </div>
       </div>
-    </div>
+    </>
   );
 }

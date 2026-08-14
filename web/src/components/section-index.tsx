@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 
+import { MEASURE } from "@/components/ui";
 import { useVaultState, versionLabel } from "@/lib/vault-state";
 
 export type Section = { id: string; label: string };
 
-const FALLBACK_VERSION = "v0.4.1";
+const FALLBACK_VERSION = "v0.5.0";
 
 /* The topmost band currently in view owns the underline. Tracking the set of
    intersecting bands, rather than the last entry the callback handed us, keeps
@@ -21,6 +22,10 @@ function useActiveSection(sections: Section[]): string | null {
     if (!bands.length) return;
 
     const visible = new Set<string>();
+    // Clear sticky TopNav. --topnav-h tracks the wrap at 620px / 470px.
+    const navH =
+      getComputedStyle(document.documentElement).getPropertyValue("--topnav-h").trim() ||
+      "62px";
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
@@ -29,9 +34,9 @@ function useActiveSection(sections: Section[]): string | null {
         }
         setActive(sections.find((section) => visible.has(section.id))?.id ?? null);
       },
-      // The sticky bar is 46px tall, and the bottom margin keeps a band from
-      // claiming the underline while it is still only a sliver at the fold.
-      { rootMargin: "-46px 0px -55% 0px" }
+      // The bottom margin keeps a band from claiming the underline while it
+      // is still only a sliver at the fold.
+      { rootMargin: `-${navH} 0px -55% 0px` }
     );
     bands.forEach((band) => observer.observe(band));
     return () => observer.disconnect();
@@ -52,22 +57,22 @@ function useHealth(): { text: string; down: boolean } {
     : { text: `Live · ${version}`, down: false };
 }
 
-/** The sticky section index. It takes over from the hero nav on scroll. */
+/** Jump row under the hero. It scrolls away with the page. */
 export function SectionIndex({ sections }: { sections: Section[] }) {
   const active = useActiveSection(sections);
   const health = useHealth();
 
   return (
     <nav
-      className="sticky top-0 z-20 h-[46px] border-b border-border bg-ground"
+      className="h-[46px] overflow-x-clip border-b border-border bg-ground"
       aria-label="Sections"
     >
-      <div className="mx-auto flex h-full max-w-[940px] items-center gap-0.5 overflow-x-auto px-[26px] max-[620px]:px-4">
+      <div className={`${MEASURE} flex h-full min-w-0 items-center gap-0.5 overflow-x-auto`}>
         {sections.map((section) => (
           <a
             key={section.id}
             href={`#${section.id}`}
-            className={`inline-flex h-full items-center whitespace-nowrap border-b-2 px-[11px] text-[13px] font-medium no-underline transition-[color,border-color] duration-150 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
+            className={`inline-flex h-full items-center whitespace-nowrap border-b-2 px-[11px] text-[13px] font-medium no-underline transition-[color,border-color] duration-150 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent max-[620px]:px-2 ${
               active === section.id
                 ? "border-accent text-ink"
                 : "border-transparent text-ink-2 hover:text-ink"
@@ -76,18 +81,14 @@ export function SectionIndex({ sections }: { sections: Section[] }) {
             {section.label}
           </a>
         ))}
-        {/* Sticky below 940px: the pill sits at the far end of a row that
-            overflows on phones (and on /use-cases at tablet width), so it was
-            entirely off-screen there. When the bar does not overflow the
-            sticky constraint is never violated and nothing moves. Its tint is
-            translucent, so a --ground layer underneath keeps scrolled links
-            from showing through; over the bar's own ground it paints the
-            same. */}
+        {/* Sticky on a wrapping bar: the pill sat off-screen on phones when
+            the row overflowed. Tint is translucent, so a --ground layer
+            underneath keeps scrolled links from showing through. */}
         <span
-          className={`ml-auto inline-flex flex-none items-center gap-[7px] rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[940px]:sticky max-[940px]:right-0 max-[940px]:z-[1] ${
+          className={`ml-auto inline-flex flex-none items-center gap-[7px] rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[620px]:px-2.5 max-[620px]:text-[12px] max-[720px]:sticky max-[720px]:right-0 max-[720px]:z-[1] ${
             health.down
-              ? "bg-warn-bg text-warn max-[940px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]"
-              : "bg-good-bg text-good max-[940px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]"
+              ? "bg-warn-bg text-warn max-[720px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]"
+              : "bg-good-bg text-good max-[720px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]"
           }`}
         >
           <span className={`size-[7px] rounded-full ${health.down ? "bg-warn" : "bg-good"}`} />

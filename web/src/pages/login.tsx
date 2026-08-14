@@ -51,21 +51,19 @@ export default function Login() {
   return (
     <>
       <Head>
-        <title>Sign in to Citadel</title>
+        <title>Citadel</title>
         <meta name="description" content="Sign in to your Citadel seat." />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      {/* The nav has to sit inside a hero band exactly as it does on every other
-          public page. Bare, it falls through to the sticky, filled, bordered
-          treatment and the nav visibly changes shape when you click Sign in.
-          The glow is the band's first child here too, in the same corner: it
-          used to be anchored behind the card, and a glow that moves between
-          pages reads as a jump rather than as a signature. */}
+      {/* TopNav is sticky at the page edge. The glow is clipped on a child that
+          does not wrap the nav, same split as HeroBand: overflow-hidden on the
+          nav's ancestor would pin the bar inside this box. The glow sits in
+          the same corner as every other public page. */}
+      <TopNav current="/login" />
       <div className="relative overflow-hidden bg-surface p-0">
         <div className="hero-glow" aria-hidden="true" />
-        <TopNav current="/login" />
-        <main className="relative flex min-h-[calc(100vh-46px)] items-center justify-center px-[26px] pb-20 pt-10 max-[620px]:min-h-[calc(100vh-42px)] max-[620px]:px-4 max-[620px]:pb-[60px] max-[620px]:pt-7">
+        <main className="relative flex min-h-[calc(100vh-var(--topnav-h))] items-center justify-center px-[26px] pb-20 pt-10 max-[620px]:px-4 max-[620px]:pb-[60px] max-[620px]:pt-7">
           <div className="relative z-[1] w-full max-w-[380px]">
             <p className={EYEBROW}>Seat access</p>
             <h1 className="mb-3 text-[clamp(28px,4.4vw,38px)] font-light leading-[1.08] tracking-[-.03em]">

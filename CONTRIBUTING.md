@@ -15,14 +15,14 @@ Citadel splits an **open application** from **closed organization memory**. Full
 | Layer | Where | Visibility |
 |---|---|---|
 | **Application** (this repo) | `masumi-network/Citadel` | **Public** — code, MCP wrapper, agent skills, docs, UI, tests |
-| **Live vault** | Railway node + Postgres/pgvector/Kuzu | **Private** — structured knowledge, embeddings, mesh, audit, hashed tokens |
+| **Live vault** | Railway node (v0.5 Lite: SQLite + Qdrant + Ladybug) | **Private** — structured knowledge, embeddings, mesh, audit, hashed tokens |
 | **Backup mirror** | separate private repo | **Private** — exported vault evidence |
 
 **Outside contributors work on the application only.** You will not be issued a `ctdl_` token for the production node, and you do not need one. No pull request requires vault access to write, test, or review.
 
 ### What you can do locally
 
-- Run the **entire test suite offline**. It needs no token, no network, and no database — the tests mock their dependencies, and `tests/conftest.py` redirects `CITADEL_HOME` to a throwaway directory so your real `~/.claude` config is never touched.
+- Run the **entire test suite offline**. It needs no token, no network, and no database — the tests mock their dependencies, and `tests/conftest.py` redirects `CITADEL_HOME` to a throwaway directory so your real `~/.claude` config is never touched. A 2026-08-14 audit still saw `test_api_uses_configured_citadel_service` read repo-local `.citadel/repo_content_sync_state.json` and fail `tracked_sources == 5`. If that test fails locally, check for that file before assuming your diff broke it.
 - Run `uv run ruff check .`.
 - Run the client CLI (`uv run citadel --help`, `uv run citadel doctor`) — the base package is standard-library only.
 - Run the server against **your own** infrastructure: `cp .env.example .env`, supply your own Postgres/pgvector, your own LLM API key, then `uv run uvicorn kb.server:app --reload --port 8000`.
@@ -51,14 +51,20 @@ uv sync --all-extras --dev
 
 `--all-extras` pulls in the `server` optional-dependency group (fastapi, mcp, cognee, …). The test suite imports `kb.server` and the MCP module, so a base-only sync fails collection with `ModuleNotFoundError`.
 
-Then run exactly what CI runs:
+Then run what CI runs. CI pins **uv 0.12.1**, runs `uv sync --locked --all-extras --dev`,
+reinstalls the audited Cognee wheel (`scripts/build_secure_cognee.py`), then:
 
 ```bash
 uv run ruff check .          # lint — must be clean
 uv run pytest tests/ -q      # full suite — must pass
 ```
 
-These two commands are what CI runs against your code, on both 3.11 and 3.12. If they pass locally, that leg of CI will almost certainly agree. CI additionally runs a `pip-audit` dependency audit, a DCO sign-off check, and a gitleaks secret scan — see [Pull requests](#pull-requests).
+These two commands are the lint and test steps. If they pass locally **after**
+the locked sync and Cognee wheel reinstall, that pytest+ruff leg of CI will
+almost certainly agree. A local `uv run pytest` without the wheel can fail the
+Cognee cryptography pin. CI additionally runs a `pip-audit` dependency audit
+(currently `--ignore-vuln PYSEC-2026-2447`), a DCO sign-off check, and a
+gitleaks secret scan — see [Pull requests](#pull-requests).
 
 ### Python version
 
