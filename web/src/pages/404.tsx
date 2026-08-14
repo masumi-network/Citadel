@@ -1,6 +1,7 @@
 import Head from "next/head";
 
 import { TopNav } from "@/components/top-nav";
+import { BAND_IN } from "@/components/ui";
 
 /* Next ships a built-in 404, and that page styles itself with an inline
  * <style> block and half a dozen style="" attributes. Under this site's
@@ -12,14 +13,14 @@ export default function NotFound() {
   return (
     <>
       <Head>
-        <title>Not found</title>
+        <title>Citadel</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
+      <TopNav />
       <div className="relative overflow-hidden bg-surface p-0">
         <div className="hero-glow" aria-hidden="true" />
-        <TopNav />
-        <div className="mx-auto max-w-[940px] px-[26px] max-[620px]:px-4">
-          <header className="relative z-[1] pb-[92px] pt-[58px] max-[620px]:pb-[60px] max-[620px]:pt-[34px]">
+        <div className={BAND_IN}>
+          <header className="relative z-[1] pb-14 pt-10 max-[620px]:pb-10 max-[620px]:pt-8">
             <p className="mb-[18px] font-mono text-xs font-semibold uppercase tracking-[.16em] text-accent-ink">
               404
             </p>

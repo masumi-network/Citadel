@@ -1,6 +1,6 @@
 ---
 name: citadel-onboard
-description: One-command teammate onboarding for Citadel. Use when a teammate wants to set up Citadel in a repo — connect their seat token, install the autonomous git-push + SessionEnd capture hooks, add the Citadel MCP server, and (optionally) declare Approved Capture Roots. Triggers include "onboard me to citadel", "set up citadel", "citadel onboard", "connect citadel", "install citadel here", and https://citadel-archive-production.up.railway.app/skills/onboard.
+description: One-command teammate onboarding for Citadel. Use when a teammate wants to set up Citadel in a repo — connect their seat token, install the autonomous git-push + SessionEnd capture hooks, add the Citadel MCP server, and (optionally) declare Approved Capture Roots. Triggers include "onboard me to citadel", "set up citadel", "citadel onboard", "connect citadel", "install citadel here", and https://citadel.utxo.ag/skills/onboard.
 ---
 
 # Citadel Onboard
@@ -157,7 +157,7 @@ The policy itself — agents should use Citadel **without waiting to be asked**:
    Railway cron syncs org sources, not per-agent search or share decisions.
 
 Load the hosted proactive-ingest skill for hook/sync detail:
-`https://citadel-archive-production.up.railway.app/skills/proactive-ingest`
+`https://citadel.utxo.ag/skills/proactive-ingest`
 
 ## Verify
 

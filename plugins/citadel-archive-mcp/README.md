@@ -15,14 +15,14 @@ Agents read vault content only through MCP with a user `ctdl_` token — never f
 
 | Skill | URL |
 |---|---|
-| Connect MCP | `https://citadel-archive-production.up.railway.app/skills/connect` |
-| Use the vault | `https://citadel-archive-production.up.railway.app/skills/vault` |
-| Public vs private | `https://citadel-archive-production.up.railway.app/skills/boundary` |
+| Connect MCP | `https://citadel.utxo.ag/skills/connect` |
+| Use the vault | `https://citadel.utxo.ag/skills/vault` |
+| Public vs private | `https://citadel.utxo.ag/skills/boundary` |
 
 The agent will ask for a `ctdl_...` access token, configure MCP locally, verify the connection, and start searching the vault.
 
 > **Hosted MCP is the supported path.** Connect any client to
-> `https://citadel-archive-production.up.railway.app/mcp` with
+> `https://citadel.utxo.ag/mcp` with
 > `Authorization: Bearer ctdl_...` — no clone needed. This plugin is a legacy
 > stdio wrapper kept for offline/dev use.
 

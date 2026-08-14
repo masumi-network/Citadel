@@ -42,12 +42,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from kb.capture_config import DEFAULT_NODE_URL as DEFAULT_BASE_URL
 from kb.session_trace_distill import distill_node_note as distill_transcript
 from kb.session_trace_distill import git_branch, repo_name
 
 # Mirror kb/mcp_server.py: DEFAULT_MAX_INGEST_BYTES = 200_000.
 DEFAULT_MAX_INGEST_BYTES = 200_000
-DEFAULT_BASE_URL = "https://citadel-archive-production.up.railway.app"
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
 HTTP_TIMEOUT_SECONDS = 10
 

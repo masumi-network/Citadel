@@ -18,10 +18,10 @@ Do not commit tokens or vault content to git. See [public-and-private.md](../pub
 
 | Skill | URL |
 |---|---|
-| Connect MCP | `https://citadel-archive-production.up.railway.app/skills/connect` |
-| Use vault | `https://citadel-archive-production.up.railway.app/skills/vault` |
-| Data boundary | `https://citadel-archive-production.up.railway.app/skills/boundary` |
-| Discovery manifest | `https://citadel-archive-production.up.railway.app/.well-known/citadel.json` |
+| Connect MCP | `https://citadel.utxo.ag/skills/connect` |
+| Use vault | `https://citadel.utxo.ag/skills/vault` |
+| Data boundary | `https://citadel.utxo.ag/skills/boundary` |
+| Discovery manifest | `https://citadel.utxo.ag/.well-known/citadel.json` |
 
 For Codex-compatible agents, share the install command instead:
 
@@ -102,7 +102,7 @@ Skill reference: [`skills/citadel/SKILL.md`](../../skills/citadel/SKILL.md).
 
 Before connecting, you need:
 
-1. **Citadel URL.** Default: `https://citadel-archive-production.up.railway.app`
+1. **Citadel URL.** Default: `https://citadel.utxo.ag`
 2. **Citadel access token.** Use a seat-bound token beginning with `ctdl_` for
    a human's agent process. Create one through the Citadel UI Access page or ask
    your vault admin.
@@ -162,7 +162,7 @@ In your project root, create or merge into `.mcp.json`:
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": {
         "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
       }
@@ -282,7 +282,7 @@ bridge rather than a direct `type: "http"` entry). Requires Node.js on PATH:
       "args": [
         "-y",
         "mcp-remote@0.1.38",
-        "https://citadel-archive-production.up.railway.app/mcp/",
+        "https://citadel.utxo.ag/mcp/",
         "--header",
         "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
       ],
@@ -307,7 +307,7 @@ role, you're connected.
 
 If your Claude plan (Pro/Max/Team/Enterprise) exposes **Settings → Connectors →
 Add custom connector**, paste the endpoint
-`https://citadel-archive-production.up.railway.app/mcp/`. This path is best when
+`https://citadel.utxo.ag/mcp/`. This path is best when
 the app can send a bearer header for you; if it only offers OAuth, stay on the
 config-file route above until Citadel exposes an OAuth flow.
 
@@ -329,7 +329,7 @@ command = "npx"
 args = [
   "-y",
   "mcp-remote@0.1.38",
-  "https://citadel-archive-production.up.railway.app/mcp/",
+  "https://citadel.utxo.ag/mcp/",
   "--header",
   "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}",
 ]
@@ -374,7 +374,7 @@ of a config file. For those:
 1. Open the app's connector / MCP settings (often behind a **Developer mode**
    toggle).
 2. Add a remote MCP server with:
-   - **URL**: `https://citadel-archive-production.up.railway.app/mcp/`
+   - **URL**: `https://citadel.utxo.ag/mcp/`
    - **Auth**: `Authorization: Bearer ctdl_<your-token>` if the app lets you set
      a custom header.
 3. Restart the app and ask it to call `citadel_discovery`, then
@@ -403,7 +403,7 @@ Open Cursor Settings → Features → Model Context Protocol. Add a new MCP serv
 
 - **Name**: `citadel`
 - **Type**: hosted HTTP / streamable HTTP
-- **URL**: `https://citadel-archive-production.up.railway.app/mcp/`
+- **URL**: `https://citadel.utxo.ag/mcp/`
 - **Headers**:
   - `Authorization` = `Bearer ctdl_...` (your token)
 
@@ -506,7 +506,7 @@ section.
 The supported production endpoint is hosted streamable HTTP:
 
 ```text
-https://citadel-archive-production.up.railway.app/mcp/
+https://citadel.utxo.ag/mcp/
 Authorization: Bearer ctdl_<your-token>
 ```
 
@@ -514,7 +514,7 @@ If a client only supports stdio, bridge to the hosted endpoint:
 
 ```bash
 npx -y mcp-remote@0.1.38 \
-  https://citadel-archive-production.up.railway.app/mcp/ \
+  https://citadel.utxo.ag/mcp/ \
   --header "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
 ```
 
@@ -540,7 +540,7 @@ The server exposes:
 The local stdio wrapper is still available for offline/dev use:
 
 ```bash
-CITADEL_HTTP_BASE_URL=https://citadel-archive-production.up.railway.app
+CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag
 CITADEL_MCP_ACCESS_TOKEN=ctdl_...
 CITADEL_MCP_DEFAULT_DATASET=masumi-network
 CITADEL_MCP_MAX_INGEST_BYTES=200000
@@ -555,16 +555,16 @@ If the client doesn't support MCP, call the HTTP API directly:
 
 ```bash
 # Health check
-curl https://citadel-archive-production.up.railway.app/healthz
+curl https://citadel.utxo.ag/healthz
 
 # Search
-curl -X POST https://citadel-archive-production.up.railway.app/search \
+curl -X POST https://citadel.utxo.ag/search \
   -H "Authorization: Bearer ctdl_..." \
   -H "Content-Type: application/json" \
   -d '{"query": "architecture decisions", "top_k": 5}'
 
 # Ingest
-curl -X POST https://citadel-archive-production.up.railway.app/ingest \
+curl -X POST https://citadel.utxo.ag/ingest \
   -H "Authorization: Bearer ctdl_..." \
   -H "Content-Type: application/json" \
   -d '{"data": "Project decided on PostgreSQL + pgvector for vault storage.", "tags": ["architecture", "decision"]}'
@@ -710,7 +710,7 @@ cd "/absolute/path/to/Citadel-Archive"
 uv sync --dev
 
 # Test the MCP server manually
-CITADEL_HTTP_BASE_URL=https://citadel-archive-production.up.railway.app \
+CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag \
 CITADEL_MCP_ACCESS_TOKEN=ctdl_... \
 uv run python -m kb.mcp_server
 ```
@@ -772,11 +772,11 @@ GitHub auth; vault content is never in these files):
 
 | Skill | URL |
 |---|---|
-| MCP setup | `https://citadel-archive-production.up.railway.app/skills/connect` |
-| Vault usage | `https://citadel-archive-production.up.railway.app/skills/vault` |
-| Public vs private | `https://citadel-archive-production.up.railway.app/skills/boundary` |
-| Index | `https://citadel-archive-production.up.railway.app/skills` |
-| Discovery manifest | `https://citadel-archive-production.up.railway.app/.well-known/citadel.json` |
+| MCP setup | `https://citadel.utxo.ag/skills/connect` |
+| Vault usage | `https://citadel.utxo.ag/skills/vault` |
+| Public vs private | `https://citadel.utxo.ag/skills/boundary` |
+| Index | `https://citadel.utxo.ag/skills` |
+| Discovery manifest | `https://citadel.utxo.ag/.well-known/citadel.json` |
 
 Use the index when an agent needs verification metadata. Skill responses include
 `X-Citadel-Skill-SHA256`, `X-Citadel-Skill-Integrity`, and an ETag derived from

@@ -10,10 +10,8 @@ import {
   BTN_PRIMARY,
   Band,
   CARD_P,
-  CARD_TAG,
   CODE,
   CTA,
-  Card,
   Chip,
   DEEP_B,
   DEEP_H4,
@@ -24,8 +22,8 @@ import {
   GoDeeper,
   H1,
   HAIRLINE_ROW,
+  HERO_P,
   LEDE,
-  PILLARS,
   ROW_H3,
   SecHead,
 } from "@/components/ui";
@@ -33,7 +31,7 @@ import {
 /* The front door.
  *
  * A port of kb/static/landing.html, copy for copy. Full-bleed bands, each
- * holding a 940px measure, alternating white and grey with one accent-tinted
+ * holding a 1200px measure, alternating white and grey with one accent-tinted
  * band at the fork. Every band colour is a token, so dark mode inverts with the
  * rest of the ramp.
  */
@@ -61,7 +59,7 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>Citadel, the organization vault</title>
+        <title>Citadel</title>
         <meta
           name="description"
           content="Citadel is shared, governed memory for your team and its AI agents. Your work flows in automatically, no other seat can read your Node, and Central is the org's curated memory."
@@ -88,7 +86,7 @@ export default function Home() {
             </span>
           </span>
         </h1>
-        <p className="mb-[30px] max-w-[58ch] text-[17.5px] leading-[1.6] text-ink-2">
+        <p className={`${HERO_P} mb-[30px]`}>
           Your team already wrote it down, in commits, sessions, docs, and issues. Citadel captures
           it as it happens and gives you, and the agents beside you, one place to ask.
         </p>
@@ -107,20 +105,20 @@ export default function Home() {
       <section className={`${BAND} bg-surface`}>
         <div className={BAND_IN}>
           <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
-            <div className="border border-border bg-surface p-5">
+            <div className="border border-border bg-surface p-5 max-[620px]:p-4">
               <div className={`${TILE_N} text-[19px] text-accent-ink`}>Apache-2.0</div>
               <div className={TILE_K}>Open source, self-hosted</div>
             </div>
-            <div className="border border-border bg-surface p-5">
+            <div className="border border-border bg-surface p-5 max-[620px]:p-4">
               <div className={TILE_N}>269 ms</div>
               <div className={TILE_K}>Median search round-trip, from a client</div>
             </div>
-            <div className="border border-border bg-surface p-5">
-              <div className={TILE_N}>22</div>
+            <div className="border border-border bg-surface p-5 max-[620px]:p-4">
+              <div className={TILE_N}>24</div>
               <div className={TILE_K}>MCP tools for agents</div>
             </div>
-            <div className="border border-border bg-surface p-5">
-              <div className={`${TILE_N} text-[19px]`}>~$55/mo</div>
+            <div className="border border-border bg-surface p-5 max-[620px]:p-4">
+              <div className={`${TILE_N} text-[19px]`}>~$38/mo</div>
               <div className={TILE_K}>To self-host the whole node</div>
             </div>
           </div>
@@ -128,24 +126,21 @@ export default function Home() {
             This page is served by the system it describes. Live numbers, releases, and the roadmap
             are on the <a href="/info">status page</a>.
           </p>
-          {/* Both tiles above are dated snapshots, and the wording has to keep
-              them that way. The cost model has 2026-07-31's resource averages
-              written into its source, so re-running it reprints the same total
-              instead of re-measuring; the round-trip is what search_bench.py
-              timed from a laptop, which is not server-side latency. Claiming
-              either is live, or quoting the cost to the cent, would be false. */}
+          {/* Cost is a 2026-08-14 24h Railway average. Latency is still the
+              2026-07-31 client round-trip: a 2026-08-14 search_bench rerun
+              recorded 105 failed requests (401/429), so its p50 is time-to-error
+              and must not replace 269 ms. */}
           <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
-            Both were measured against this deployment on 2026-07-31 and the method is in the
-            repo&apos;s{" "}
+            Cost was re-measured on 2026-08-14. The method is in the repo&apos;s{" "}
             <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
               bench harness
             </a>
-            . The cost applies Railway&apos;s published prices to 24-hour average resource use
-            across all three services of the project; a trailing-7-day basis comes out nearer $61,
-            so read it as about $55 rather than a figure to the cent. The 269&nbsp;ms is a
-            round-trip timed from a client, so it carries DNS, TLS and the network path with it,
-            and server-side timing on the same run was lower. Self-hosting the whole server, not
-            just the CLI, is covered in the{" "}
+            . It applies Railway&apos;s published prices to 24-hour average resource use across
+            the two services in the project (Citadel-Archive and Qdrant); a trailing-7-day basis
+            comes out nearer $58, so read it as about $38 rather than a figure to the cent. The
+            269&nbsp;ms search round-trip is still the 2026-07-31 client measurement. A rerun on
+            2026-08-14 did not complete a successful search, so that figure was not replaced.
+            Self-hosting the whole server, not just the CLI, is covered in the{" "}
             <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.
           </p>
         </div>
@@ -160,36 +155,39 @@ export default function Home() {
 
         <PipelineDiagram />
 
-        <div className={PILLARS}>
-          <Card title="Personal by default">
-            <p className={CARD_P}>
-              Everything you capture lands in your own <b>Node</b>. No other seat can read it, and
-              no background job promotes it into the shared memory. Sharing is an act, not a
-              setting.
+        <div className="grid grid-cols-2 gap-px bg-border max-[620px]:grid-cols-1">
+          <div className="bg-surface px-6 py-5 max-[620px]:px-4">
+            <p className="mb-1.5 font-mono text-[10.5px] font-semibold uppercase tracking-[.14em] text-accent-ink">
+              Your Node
             </p>
-            <span className={CARD_TAG}>seat scoped</span>
-          </Card>
-          <Card title="Central is curated">
+            <h3 className="m-0 mb-2 text-base font-semibold">Personal by default</h3>
+            <p className={CARD_P}>
+              Everything you capture lands here. No other seat can read it, and no job promotes it
+              into shared memory. Sharing is an act, not a setting.
+            </p>
+          </div>
+          <div className="bg-surface px-6 py-5 max-[620px]:px-4">
+            <p className="mb-1.5 font-mono text-[10.5px] font-semibold uppercase tracking-[.14em] text-ink-3">
+              Central
+            </p>
+            <h3 className="m-0 mb-2 text-base font-semibold">Curated, not a dump</h3>
             <p className={CARD_P}>
               The org&apos;s shared memory only holds what a person promoted into it, so it stays
-              worth trusting instead of turning into a dump of everyone&apos;s scratch notes.
+              worth trusting instead of everyone&apos;s scratch notes.
             </p>
-            <span className={CARD_TAG}>promotion gated</span>
-          </Card>
-          <Card title="Agents are first class">
+          </div>
+          <div className="bg-surface px-6 py-4 max-[620px]:px-4">
+            <h3 className="m-0 mb-1 text-[15px] font-semibold">Agents search as you</h3>
             <p className={CARD_P}>
-              Any MCP client, Claude Code, Cursor, or your own agent, searches the same vault under
-              the same seat and the same read isolation as you do.
+              Claude Code, Cursor, or your own MCP client, same seat, same read isolation.
             </p>
-            <span className={CARD_TAG}>MCP native</span>
-          </Card>
-          <Card title="Source linked">
+          </div>
+          <div className="bg-surface px-6 py-4 max-[620px]:px-4">
+            <h3 className="m-0 mb-1 text-[15px] font-semibold">Every answer cites a source</h3>
             <p className={CARD_P}>
-              Every answer points back at where it came from, a commit, an issue, a session, so you
-              can check the claim instead of taking the vault&apos;s word for it.
+              A commit, an issue, a session. Check the claim instead of taking the vault&apos;s word.
             </p>
-            <span className={CARD_TAG}>provenance</span>
-          </Card>
+          </div>
         </div>
 
         <GoDeeper title="The access and data model in one pass">
@@ -284,7 +282,7 @@ export default function Home() {
         <SecHead kicker="03 · Where to go next" title="Two ways in" />
         <div className="grid grid-cols-2 gap-3.5 max-[620px]:grid-cols-1">
           {/* The left door is the one we want taken. */}
-          <div className="flex flex-col border border-accent bg-surface px-7 py-[26px]">
+          <div className="flex flex-col border border-accent bg-surface px-7 py-[26px] max-[620px]:px-4 max-[620px]:py-5">
             <h3 className="mb-2 text-xl font-medium tracking-[-.02em]">Use it</h3>
             <p className="mb-[22px] text-[14.5px] leading-[1.6] text-ink-2">
               Run it on your own work. Install the CLI, hand it a seat token, and your agents search
@@ -300,7 +298,7 @@ export default function Home() {
               </a>
             </div>
           </div>
-          <div className="flex flex-col border border-border-2 bg-surface px-7 py-[26px]">
+          <div className="flex flex-col border border-border-2 bg-surface px-7 py-[26px] max-[620px]:px-4 max-[620px]:py-5">
             <h3 className="mb-2 text-xl font-medium tracking-[-.02em]">Work with us</h3>
             <p className="mb-[22px] text-[14.5px] leading-[1.6] text-ink-2">
               Build it into your project. utxo AG joins consortia as a work-package partner,
@@ -321,8 +319,9 @@ export default function Home() {
       <Band tone="grey" id="start">
         <SecHead kicker="04 · Get started" title="Two commands" />
         <p className={LEDE}>
-          Install the CLI, then hand it your seat token. The onboarding wires up the MCP client you
-          already use.
+          You need a seat token from us to try the live node. This is not a public sandbox.{" "}
+          <a href="/contact">Contact us</a>, we send an access token, then install the CLI and run
+          onboard. Onboarding wires up the MCP client you already use.
         </p>
         <div className={CMD}>
           <span className="select-none text-accent-ink">$</span> pipx install citadel-archive
@@ -331,6 +330,13 @@ export default function Home() {
           <span className="select-none text-accent-ink">$</span> citadel onboard
         </div>
         <div className="mt-[26px] flex flex-wrap gap-x-6 gap-y-2 border-t border-border pt-5 text-[13.5px] text-ink-3">
+          <span>
+            Need a token?{" "}
+            <a className={END_LINK} href="/contact">
+              Contact us
+            </a>
+            .
+          </span>
           <span>
             Already have a seat?{" "}
             <a className={END_LINK} href="/login">

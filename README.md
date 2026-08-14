@@ -6,7 +6,7 @@
 
 > Self-hosted memory for engineering teams and the agents working alongside them.
 
-[![State of the Vault](https://img.shields.io/badge/live-state%20of%20the%20vault-FF51FF?style=flat&labelColor=0a0a0a)](https://citadel-archive-production.up.railway.app/info)
+[![State of the Vault](https://img.shields.io/badge/live-state%20of%20the%20vault-FF51FF?style=flat&labelColor=0a0a0a)](https://citadel.utxo.ag/info)
 [![Test](https://github.com/masumi-network/Citadel/actions/workflows/test.yml/badge.svg)](https://github.com/masumi-network/Citadel/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -74,7 +74,7 @@ Agents need a URL and a token. `citadel onboard` writes this for you:
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": { "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}" }
     }
   }

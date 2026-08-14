@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable
 
+from kb.capture_policy import path_is_denied
 from kb.models import IngestDecision
 
 
@@ -26,9 +26,7 @@ class PreIngestFilter:
         return IngestDecision(True)
 
     def _is_excluded_path(self, value: str) -> bool:
-        path = value[7:] if value.startswith("file://") else value
-        normalized = Path(path).as_posix()
-        return any(fnmatch(normalized, pattern) for pattern in self.exclude_patterns)
+        return path_is_denied(value, self.exclude_patterns)
 
     @staticmethod
     def _looks_like_path(value: str) -> bool:

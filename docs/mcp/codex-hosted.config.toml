@@ -3,7 +3,7 @@ command = "npx"
 args = [
   "-y",
   "mcp-remote@0.1.38",
-  "https://citadel-archive-production.up.railway.app/mcp/",
+  "https://citadel.utxo.ag/mcp/",
   "--header",
   # Expand from the environment — never commit a literal ctdl_ token.
   "Authorization: Bearer ${CITADEL_MCP_ACCESS_TOKEN}",

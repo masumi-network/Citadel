@@ -77,7 +77,7 @@ exports it (the same token that powers `citadel_search` and MCP — most devs
 already have it):
 
 ```bash
-# https://citadel-archive-production.up.railway.app/skills/connect
+# https://citadel.utxo.ag/skills/connect
 export CITADEL_MCP_ACCESS_TOKEN='ctdl_...'
 ```
 

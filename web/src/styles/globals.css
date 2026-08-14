@@ -17,6 +17,7 @@
  */
 
 @import "tailwindcss";
+@import "@xyflow/react/dist/style.css" layer(base);
 
 /* Dark is an explicit choice, remembered in localStorage under
    `citadel-info-theme` and applied as data-theme on <html> by public/theme.js.
@@ -67,6 +68,10 @@
   --good-bg: rgba(22, 163, 74, 0.10);
   --warn: #b45309;
   --warn-bg: rgba(180, 83, 9, 0.10);
+
+  /* Sticky TopNav height. One row on desktop; GitHub control grows at 620px;
+     the bar wraps at 470px. scroll-mt and the section observer read this. */
+  --topnav-h: 62px;
 }
 :root[data-theme="light"] {
   --ground: #fafafa; --surface: #ffffff; --surface-2: #f5f5f5;
@@ -170,6 +175,13 @@
 @view-transition { navigation: auto; }
 
 .topnav { view-transition-name: topnav; }
+
+@media (max-width: 620px) {
+  :root { --topnav-h: 64px; }
+}
+@media (max-width: 470px) {
+  :root { --topnav-h: 104px; }
+}
 
 ::view-transition-old(root),
 ::view-transition-new(root) { animation-duration: .28s; }
@@ -280,18 +292,34 @@
    None of these selectors match until the diagram has been lazily loaded and
    mounted, which happens on scroll. */
 
-.flowcanvas { position: relative; width: 100%; height: 100%; }
+.flowcanvas {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overscroll-behavior: auto;
+}
+/* Fine pointer: let the page take vertical pan and browser pinch, so the
+   wheel still scrolls the landing page. Coarse / phone: none, so xyflow
+   sees two-finger pinch and one-finger pan inside the 700px box. */
+.flowcanvas .react-flow,
+.flowcanvas .react-flow__pane,
+.flowcanvas .react-flow__renderer {
+  touch-action: pan-y pinch-zoom;
+}
+@media (pointer: coarse), (max-width: 620px) {
+  .flowcanvas,
+  .flowcanvas .react-flow,
+  .flowcanvas .react-flow__pane,
+  .flowcanvas .react-flow__renderer {
+    touch-action: none;
+  }
+}
 
-/* React Flow theming hooks, so the canvas, the dot grid and the zoom controls
-   follow the page instead of shipping their default grey. */
+/* React Flow theming hooks, so the canvas and the dot grid follow the page
+   instead of shipping default grey. */
 .flowcanvas .react-flow {
   --xy-background-color: var(--surface);
   --xy-background-pattern-color: var(--border);
-  --xy-controls-button-background-color: var(--surface);
-  --xy-controls-button-background-color-hover: var(--surface-2);
-  --xy-controls-button-color: var(--ink-2);
-  --xy-controls-button-color-hover: var(--accent-ink);
-  --xy-controls-button-border-color: var(--border);
   --xy-attribution-background-color: transparent;
 }
 /* Nothing here is connectable, so the ports are anchors, not affordances. */
@@ -300,31 +328,56 @@
 .flowcanvas .react-flow__attribution a { color: var(--ink-3); }
 
 .fnode {
-  width: 178px; box-sizing: border-box;
-  display: flex; flex-direction: column; gap: 1px;
-  padding: 9px 12px; border-radius: 0;
+  width: 188px; min-height: 62px; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 1px; justify-content: center;
+  padding: 11px 14px; border-radius: 0;
   font-family: var(--font-sans); font-size: 12.5px; font-weight: 500; line-height: 1.32;
   color: var(--ink); background: var(--surface); border: 1px solid var(--border-2);
   transition: opacity .18s ease, border-color .15s ease;
 }
-.fnode-s { font-family: var(--font-mono); font-size: 9.5px; font-weight: 400; letter-spacing: .02em; color: var(--ink-3); }
+.fnode-s { font-family: var(--font-mono); font-size: 9.5px; font-weight: 400; letter-spacing: .02em; color: var(--ink-3); white-space: normal; }
 .fnode.is-dim { opacity: .2; }
+.flowcanvas .react-flow__node.selected .fnode,
+.flowcanvas .react-flow__node:focus-visible .fnode {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.flowcanvas .react-flow__node-band {
+  padding: 0; border: none; background: transparent; pointer-events: none; border-radius: 0;
+}
+.fband {
+  position: relative; width: 100%; height: 100%; box-sizing: border-box;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 97%, var(--ink) 3%);
+  border-radius: 0;
+  pointer-events: none;
+}
+.fband-k {
+  position: absolute; left: 12px; top: 12px; width: 104px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--ink-3); line-height: 1.3;
+}
+.fband-s {
+  position: absolute; left: 12px; top: 48px; width: 104px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: .02em;
+  color: var(--ink-3); line-height: 1.35;
+}
+.fband.is-dim { opacity: .35; }
+.fband.is-on { border-color: var(--accent); }
 
-.fnode-source { background: var(--surface-2); border-color: var(--border); }
+.fnode-source { background: var(--surface); border-color: var(--border); }
 /* The two stores are the point of the diagram, so they are the two nodes that
    do not look like the others. */
 .fnode-store-node { background: var(--accent-soft); border-color: var(--accent); padding: 13px 14px; }
 .fnode-store-node .fnode-l { font-size: 14px; font-weight: 600; color: var(--accent-ink); }
-.fnode-store-central { background: var(--surface-2); border: 2px solid var(--ink-3); padding: 12px 13px; }
+.fnode-store-central { background: var(--surface); border: 2px solid var(--ink-3); padding: 12px 13px; }
 .fnode-store-central .fnode-l { font-size: 14px; font-weight: 600; }
 .fnode-gate { border-style: dashed; }
 .fnode-read { border-color: var(--accent); }
 .fnode-audit { background: var(--surface-2); border-style: dotted; }
 /* The physical stores (lifecycle ledger, the three backends), as opposed to
    the two memories above: infrastructure, so they stay quieter than either. */
-.fnode-store { background: var(--surface-2); border-color: var(--border-2); }
+.fnode-store { background: var(--surface); border-color: var(--border-2); }
 
-.fhead { font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
 
 .flowcanvas .react-flow__edge-path { stroke: var(--border-2); stroke-width: 1.5; }
 .flowcanvas .fedge.is-on .react-flow__edge-path { stroke: var(--accent); stroke-width: 2; }

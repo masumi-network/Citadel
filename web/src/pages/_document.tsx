@@ -21,7 +21,10 @@ export default function Document() {
   return (
     <Html lang="en">
       <Head>
-        <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+        {/* Next dev serves web/public/static/favicon.svg at this path. FastAPI
+            serves the same mark from kb/static/favicon.svg. Keep the two files
+            byte-identical (test_banner.py pins the fortress bitmask). */}
+        <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" sizes="any" />
         {/* Not deferred: the attribute has to be on <html> before first paint,
             or someone who chose dark gets a white flash on every navigation.
             It costs one getItem and one setAttribute. */}

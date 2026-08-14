@@ -22,20 +22,20 @@ must never do.
 
 Vault content and `ctdl_` tokens never belong in the public repo. See
 [`docs/public-and-private.md`](docs/public-and-private.md) or
-`https://citadel-archive-production.up.railway.app/skills/boundary`.
+`https://citadel.utxo.ag/skills/boundary`.
 
 ## Quick Reference
 
 | What | Value |
 |---|---|
-| Hosted URL | `https://citadel-archive-production.up.railway.app` |
-| Discovery manifest | `https://citadel-archive-production.up.railway.app/.well-known/citadel.json` |
-| Skill index | `https://citadel-archive-production.up.railway.app/skills` |
-| Connect skill | `https://citadel-archive-production.up.railway.app/skills/connect` |
-| Vault skill | `https://citadel-archive-production.up.railway.app/skills/vault` |
-| Boundary skill | `https://citadel-archive-production.up.railway.app/skills/boundary` |
+| Hosted URL | `https://citadel.utxo.ag` |
+| Discovery manifest | `https://citadel.utxo.ag/.well-known/citadel.json` |
+| Skill index | `https://citadel.utxo.ag/skills` |
+| Connect skill | `https://citadel.utxo.ag/skills/connect` |
+| Vault skill | `https://citadel.utxo.ag/skills/vault` |
+| Boundary skill | `https://citadel.utxo.ag/skills/boundary` |
 | HTTP API | Same host as hosted URL |
-| MCP endpoint | `https://citadel-archive-production.up.railway.app/mcp/` (hosted, no clone) |
+| MCP endpoint | `https://citadel.utxo.ag/mcp/` (hosted, no clone) |
 | MCP auth | `Authorization: Bearer ctdl_...` |
 | Token format | `ctdl_...` (service-account or user token) |
 | Roles | `reader`, `writer`, `admin` |
@@ -223,7 +223,7 @@ headless CLI (Option A) or the HTTP API.**
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": { "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}" }
     }
   }
@@ -417,7 +417,7 @@ asyncio.run(main())
 
 Load the connector skill and follow it end-to-end:
 
-`https://citadel-archive-production.up.railway.app/skills/connect`
+`https://citadel.utxo.ag/skills/connect`
 
 Summary:
 
@@ -473,7 +473,7 @@ then fall back to `citadel search --json`. Write only through an explicit
 `citadel ingest`, `citadel_ingest`, or configured capture flow. Do not trigger
 admin sync or add a new automatic write path unless the user explicitly asks.
 
-Skill: `https://citadel-archive-production.up.railway.app/skills/proactive-ingest`
+Skill: `https://citadel.utxo.ag/skills/proactive-ingest`
 
 Current production verification: hosted MCP (Citadel Archive v1.28.0) verified
 end-to-end on 2026-06-25 with a writer seat — `citadel_session` (role +
