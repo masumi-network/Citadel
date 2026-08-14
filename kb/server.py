@@ -2158,7 +2158,6 @@ async def search_across_datasets(
     ]
 
     merged: list[tuple[str, Any]] = []
-    seen: set[str] = set()
     # A volunteered trace is dual-written to the author's Node and to
     # session-traces (resolve_write_targets_for_share). The Node copy wins dedup
     # below, and ``reference-only`` is stamped off the dataset alone — so without
@@ -2173,9 +2172,6 @@ async def search_across_datasets(
     for dataset, results in per_dataset:
         for result in results:
             key = search_result_dedup_key(result)
-            if key in seen:
-                continue
-            seen.add(key)
             if (
                 dataset != SESSION_TRACES_DATASET
                 and key in trace_keys
@@ -2780,11 +2776,13 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     (``search_github_sync_state``) supplies its own ``id`` and no
     ``document_id``, because a digest section is not a stored document.
     """
-    if result.get("id"):
+    raw_id = result.get("id")
+    if isinstance(raw_id, str) and raw_id.strip():
         return result
-    basis = json.dumps(result, sort_keys=True, default=str)
+    idless = {key: value for key, value in result.items() if key != "id"}
+    basis = json.dumps(idless, sort_keys=True, default=str)
     derived = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
-    return {"id": f"chunk:{derived}", **result}
+    return {**idless, "id": f"chunk:{derived}"}
 
 
 def _result_retriever_score(result: dict[str, Any]) -> float | None:
@@ -2994,11 +2992,24 @@ def select_public_search_page(
         or is_spec_mode_query(query)
         or len(query_terms(query)) == 1
     )
-    if ranked_query:
-        candidates = apply_query_ranking(candidates, query, mode=mode)
     if filter_kwargs is not None:
         candidates = filter_hits(candidates, **dict(filter_kwargs))
+
+    # Keep collision alternatives through filtering. A primary Node hit that a
+    # request filter rejects must not erase an eligible Central copy with the
+    # same text. Dataset order still decides the winner when both remain.
+    unique_candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = search_result_dedup_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    candidates = unique_candidates
     candidates_matched = len(candidates)
+    if ranked_query:
+        candidates = apply_query_ranking(candidates, query, mode=mode)
 
     if ranked_query or limit <= 1 or len(datasets) <= 1:
         selected = candidates[:limit]

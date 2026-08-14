@@ -157,6 +157,36 @@ def test_public_search_hit_drops_engine_fields_and_keeps_drilldown() -> None:
     assert "projection" not in shaped["_citadel"]
 
 
+def test_public_search_hit_drops_nonfinite_relevance_and_keeps_finite_values() -> None:
+    finite = shape_public_search_hit(
+        {
+            "text": "finite relevance",
+            "_citadel": {
+                "relevance": {"term_coverage": 0.5, "retriever_score": 0.42}
+            },
+        }
+    )
+    assert finite["_citadel"]["relevance"] == {
+        "term_coverage": 0.5,
+        "retriever_score": 0.42,
+    }
+
+    nonfinite = shape_public_search_hit(
+        {
+            "text": "nonfinite relevance",
+            "_citadel": {
+                "relevance": {
+                    "term_coverage": float("inf"),
+                    "retriever_score": float("nan"),
+                }
+            },
+        }
+    )
+    relevance = nonfinite["_citadel"]["relevance"]
+    assert "term_coverage" not in relevance
+    assert "retriever_score" not in relevance
+
+
 def test_typed_search_content_requires_a_document_identity() -> None:
     valid_index = {
         "type": "IndexSchema",

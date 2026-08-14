@@ -5071,6 +5071,34 @@ class FinalPageCitadel(FakeCitadel):
                 rows = [chunk("node-unrelated", "unrelated node material")]
             else:
                 rows = []
+        elif query == "filter dedup":
+            if dataset == "masumi-network":
+                central = chunk("central-filter", "shared filtered text")
+                central["repo"] = "masumi-network/central"
+                rows = [central]
+            elif dataset.startswith("seat:"):
+                rows = [chunk("node-filter", "shared filtered text")]
+            else:
+                rows = []
+        elif query == "nested identity":
+            if dataset.startswith("seat:"):
+                nested = chunk("nested-result", "nested identity content")
+                nested["id"] = {"private_marker": "PRIVATE_MARKER"}
+                rows = [nested]
+            else:
+                rows = []
+        elif query == "nonfinite values":
+            if dataset.startswith("seat:"):
+                nan_row = chunk("nan-result", "nonfinite nan content")
+                nan_row["score"] = float("nan")
+                nan_row["_citadel"] = {
+                    "relevance": {"term_coverage": float("inf")}
+                }
+                infinite_row = chunk("infinite-result", "nonfinite infinite content")
+                infinite_row["score"] = float("inf")
+                rows = [nan_row, infinite_row]
+            else:
+                rows = []
         elif dataset == "masumi-network":
             rows = [
                 chunk(f"central-{index}", f"architecture central {index}")
@@ -5535,6 +5563,96 @@ def test_seat_search_top_one_prefers_exact_central_result(tmp_path: Any) -> None
         "central-exact",
         "masumi-network",
     )
+
+
+def test_search_filter_keeps_central_duplicate_when_node_lacks_identity(
+    tmp_path: Any,
+) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+
+    response = api_client.post(
+        "/search",
+        json={
+            "query": "filter dedup",
+            "top_k": 1,
+            "repo": "masumi-network/central",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"]
+    assert len(result) == 1
+    assert (result[0]["id"], result[0]["dataset"]) == (
+        "central-filter",
+        "masumi-network",
+    )
+
+
+def test_search_sanitizes_nested_result_identity(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+
+    response = api_client.post(
+        "/search",
+        json={"query": "nested identity", "top_k": 1},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    result = payload["results"][0]
+    assert isinstance(result["id"], str)
+    assert isinstance(result["qa_id"], str)
+    assert isinstance(result["_citadel"]["result_id"], str)
+    assert "PRIVATE_MARKER" not in response.text
+    assert "PRIVATE_MARKER" not in json.dumps(payload)
+
+
+def test_search_omits_nonfinite_values_on_both_read_routes(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    responses = [
+        api_client.post(
+            "/search",
+            json={"query": "nonfinite values", "top_k": 5},
+            headers=headers,
+        ),
+        api_client.get(
+            "/api/knowledge",
+            params={"q": "nonfinite values", "limit": 5},
+            headers=headers,
+        ),
+    ]
+
+    for response in responses:
+        assert response.status_code == 200
+        payload = response.json()
+        assert "NaN" not in response.text
+        assert "Infinity" not in response.text
+        assert payload["results"]
+        for result in payload["results"]:
+            assert result.get("score") is None
+            relevance = result.get("_citadel", {}).get("relevance", {})
+            assert "retriever_score" not in relevance
 
 
 def test_seat_cannot_recall_another_seats_session(tmp_path: Any) -> None:

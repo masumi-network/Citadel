@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from functools import lru_cache
+from math import isfinite
 from typing import Any
 
 SPEC_QUERY_RE = re.compile(
@@ -574,6 +575,14 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and isfinite(value)
+
+
 # Epoch windows for _first_timestamp. A number is read in whichever unit puts
 # it inside [2001-09-09, 2096-10-02]; the two windows are three orders of
 # magnitude apart, so no value is valid in both and a unit can never be
@@ -763,7 +772,7 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
         clean_relevance: dict[str, Any] = {}
         for key in ("term_coverage", "retriever_score"):
             value = relevance.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if _is_finite_number(value):
                 clean_relevance[key] = value
         matched_terms = relevance.get("matched_terms")
         if isinstance(matched_terms, list):
@@ -837,7 +846,7 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
         else []
     )
     score = raw.get("score")
-    if not isinstance(score, (int, float)) or isinstance(score, bool):
+    if not _is_finite_number(score):
         score = None
     chunk_index = _hit_chunk_index(raw)
     if not isinstance(chunk_index, int) or isinstance(chunk_index, bool):
