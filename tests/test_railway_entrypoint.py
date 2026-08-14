@@ -20,6 +20,7 @@ def test_railway_toml_boots_the_published_image_entrypoint() -> None:
         config = tomllib.load(file)
 
     assert config["deploy"]["startCommand"] == "python -m kb.lite_runtime"
+    assert config["deploy"]["healthcheckPath"] == "/health/ready"
     assert importlib.util.find_spec("kb.lite_runtime") is not None
 
 

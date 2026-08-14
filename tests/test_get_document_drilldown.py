@@ -32,6 +32,7 @@ metadata.assembled_from == "chunk_store".
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ pytestmark = pytest.mark.asyncio
 DOC_ID = str(uuid5(NAMESPACE_OID, "drilldown-doc"))
 CHUNK_IDS = [str(uuid5(NAMESPACE_OID, f"{DOC_ID}-{index}")) for index in range(3)]
 ENTITY_ID = str(uuid5(NAMESPACE_OID, "drilldown-entity"))
+MALFORMED_NODE_ID = str(uuid5(NAMESPACE_OID, "malformed-document-chunk"))
+MALFORMED_DOCUMENT_ID = str(uuid5(NAMESPACE_OID, "malformed-document"))
 # In the chunk store but never written to the graph (the measured 404 class).
 ORPHAN_DOC_ID = str(uuid5(NAMESPACE_OID, "orphan-doc"))
 ORPHAN_CHUNK_IDS = [
@@ -139,6 +142,34 @@ def real_graph(tmp_path_factory: pytest.TempPathFactory) -> Any:
                     }
                 ),
             ]
+        )
+        valid_properties = json.dumps(
+            {"document_id": MALFORMED_DOCUMENT_ID, "padding": ""},
+            separators=(",", ":"),
+        )
+        valid_properties = json.dumps(
+            {
+                "document_id": MALFORMED_DOCUMENT_ID,
+                "padding": "x" * (675 - len(valid_properties)),
+            },
+            separators=(",", ":"),
+        )
+        assert len(valid_properties) == 675
+        await adapter.query(
+            """
+            CREATE (n:Node {
+                id: $id,
+                name: $name,
+                type: $type,
+                properties: $properties
+            })
+            """,
+            {
+                "id": MALFORMED_NODE_ID,
+                "name": "DocumentChunk",
+                "type": "DocumentChunk",
+                "properties": valid_properties + "{}",
+            },
         )
         await adapter.add_edges(
             [
@@ -293,6 +324,13 @@ async def test_textless_entity_still_resolves_none(real_graph: Any) -> None:
     _install_chunk_store(client, _empty_store())
 
     assert await client.get_document(ENTITY_ID) is None
+
+
+async def test_graph_presence_ignores_malformed_unrelated_chunk(real_graph: Any) -> None:
+    """A malformed unrelated chunk must not abort requested graph presence."""
+    client = _client_over(real_graph)
+
+    assert await client.corpus_graph_presence([DOC_ID]) == {DOC_ID}
 
 
 # --------------------------------------------------------------------------

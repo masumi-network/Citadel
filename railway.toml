@@ -11,8 +11,8 @@ builder = "DOCKERFILE"
 # FastAPI Organization Vault. Other Railway services select scripts.run_railway
 # modes such as github-sync, backup-mirror, and pipeline in their own config.
 startCommand = "python -m kb.lite_runtime"
-healthcheckPath = "/healthz"
-# Cold boot initialises cognee + Ladybug before /healthz answers, which can
+healthcheckPath = "/health/ready"
+# Cold boot initialises cognee + Ladybug before /health/ready answers, which can
 # exceed 30s on a fresh volume. The embedding model is baked into the image
 # since 2026-08-12, so no model download happens at boot any more.
 healthcheckTimeout = 300

@@ -3224,6 +3224,8 @@ class CogneePublicClient:
         requested = {str(document_id) for document_id in document_ids}
         query_text = """
         MATCH (n:Node)
+        WHERE n.type = 'DocumentChunk'
+          AND json_valid(n.properties)
         WITH n.type AS node_type,
              CAST(json_extract(n.properties, '$.document_id') AS STRING) AS document_id_json
         WHERE node_type = 'DocumentChunk'

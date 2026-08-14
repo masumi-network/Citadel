@@ -160,10 +160,10 @@ _INDEXED_FLOOR = 1
 _CORPUS_HEALTH_PROBE_LIMIT = 64
 try:
     _CORPUS_HEALTH_CACHE_TTL_SECONDS = max(
-        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_CACHE_TTL_SECONDS", "5"))
+        0.0, float(os.getenv("CITADEL_CORPUS_HEALTH_CACHE_TTL_SECONDS", "30"))
     )
 except ValueError:
-    _CORPUS_HEALTH_CACHE_TTL_SECONDS = 5.0
+    _CORPUS_HEALTH_CACHE_TTL_SECONDS = 30.0
 # /api/mesh and /api/indexes already degrade to restart-scoped counters when
 # corpus measurement fails. Bound that dependency so a slow graph read follows
 # the existing response contract instead of holding the dashboard request open.
@@ -173,9 +173,24 @@ try:
     )
 except ValueError:
     _CORPUS_HEALTH_TIMEOUT_SECONDS = 2.0
+try:
+    _LIFECYCLE_HEALTH_TIMEOUT_SECONDS = max(
+        0.0, float(os.getenv("CITADEL_LIFECYCLE_HEALTH_TIMEOUT_SECONDS", "2"))
+    )
+except ValueError:
+    _LIFECYCLE_HEALTH_TIMEOUT_SECONDS = 2.0
+_LIFECYCLE_HEALTH_CACHE_TTL_SECONDS = max(
+    30.0, _CORPUS_HEALTH_CACHE_TTL_SECONDS
+)
 _CORPUS_HEALTH_CACHE: tuple[float, tuple[int, ...], dict[str, Any]] | None = None
 _CORPUS_HEALTH_LOCK = asyncio.Lock()
 _CORPUS_HEALTH_TASK: asyncio.Task[dict[str, Any]] | None = None
+_LIFECYCLE_HEALTH_CACHE: tuple[float, int, dict[str, Any]] | None = None
+_LIFECYCLE_HEALTH_TASK: tuple[
+    int,
+    asyncio.AbstractEventLoop,
+    asyncio.Task[dict[str, Any]],
+] | None = None
 
 # In-flight counts for the soft concurrency cap / 429 backpressure contract
 # (#50). Single-loop server → increment/decrement need no lock. Search and the
@@ -4622,6 +4637,17 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
             for backend in ("relational", "vector", "graph")
         ):
             invariant_errors.append("current_generation_backend_census_mismatch")
+        searchable_by_backend = current_generation.get(
+            "current_searchable_by_backend"
+        )
+        if not isinstance(searchable_by_backend, dict) or any(
+            int(searchable_by_backend.get(backend, 0)) != current_sources
+            or int(searchable_by_backend.get(backend, 0)) != current_jobs
+            for backend in ("relational", "vector", "graph")
+        ):
+            invariant_errors.append(
+                "current_generation_searchable_census_mismatch"
+            )
     if failed_jobs or failed_receipts:
         invariant_errors.append("failed_projection")
     return {
@@ -4706,7 +4732,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         }
 
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
-    lifecycle = lifecycle_health(get_citadel())
+    lifecycle = await _bounded_lifecycle_health(get_citadel())
     return {
         "ok": True,
         "service": "Citadel Archive",
@@ -5018,8 +5044,8 @@ async def _bounded_corpus_health() -> dict[str, Any]:
     A zero timeout keeps the previous unbounded behavior for operators that need
     the full measurement. The normal setting is finite. A timed-out probe is
     shielded so it can finish and populate the shared cache after the request
-    returns; callers use the last cached result when one exists, otherwise the
-    existing uptime-counter fallback.
+    returns; callers retain cached measurements for diagnostics, but timeout
+    results remain explicitly not ready.
     """
     try:
         if _CORPUS_HEALTH_TIMEOUT_SECONDS <= 0:
@@ -5034,6 +5060,7 @@ async def _bounded_corpus_health() -> dict[str, Any]:
         cached = _CORPUS_HEALTH_CACHE
         if cached is not None:
             result = dict(cached[2])
+            result["ok"] = False
             result["degraded"] = (
                 f"corpus health timed out after {timeout:g}s; serving cached result"
             )
@@ -5047,20 +5074,106 @@ async def _bounded_corpus_health() -> dict[str, Any]:
         }
 
 
-@app.get("/readyz")
-async def readyz(request: Request) -> Any:
-    require_access(request, "reader", "kb:read")
-    config = get_citadel().config
-    corpus = await _corpus_health()
+def _complete_lifecycle_health_task(
+    citadel_id: int,
+    task: asyncio.Task[dict[str, Any]],
+) -> None:
+    """Cache a completed census at completion time and release its shared slot."""
+    global _LIFECYCLE_HEALTH_CACHE, _LIFECYCLE_HEALTH_TASK
+
+    current = _LIFECYCLE_HEALTH_TASK
+    if current is None or current[0] != citadel_id or current[2] is not task:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        return
+    _LIFECYCLE_HEALTH_TASK = None
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001 - consume background task failures
+        logger.warning("lifecycle health task failed: %s", exc.__class__.__name__)
+        return
+    if _LIFECYCLE_HEALTH_CACHE_TTL_SECONDS > 0:
+        _LIFECYCLE_HEALTH_CACHE = (time.monotonic(), citadel_id, dict(result))
+
+
+def _lifecycle_health_task(citadel: Any) -> asyncio.Task[dict[str, Any]]:
+    """Return one shared lifecycle census task for this process and event loop."""
+    global _LIFECYCLE_HEALTH_TASK
+
+    loop = asyncio.get_running_loop()
+    current = _LIFECYCLE_HEALTH_TASK
+    if current is None or current[0] != id(citadel) or current[1] is not loop:
+        task = asyncio.create_task(asyncio.to_thread(lifecycle_health, citadel))
+        _LIFECYCLE_HEALTH_TASK = (id(citadel), loop, task)
+        task.add_done_callback(
+            lambda completed: _complete_lifecycle_health_task(id(citadel), completed)
+        )
+        return task
+    return current[2]
+
+
+async def _bounded_lifecycle_health(citadel: Any) -> dict[str, Any]:
+    """Return lifecycle health without letting SQLite hold readiness open."""
+    global _LIFECYCLE_HEALTH_CACHE, _LIFECYCLE_HEALTH_TASK
+
+    if not citadel.config.lifecycle_enabled:
+        return lifecycle_health(citadel)
+    cached = _LIFECYCLE_HEALTH_CACHE
+    if (
+        cached is not None
+        and cached[1] == id(citadel)
+        and _LIFECYCLE_HEALTH_CACHE_TTL_SECONDS > 0
+        and time.monotonic() - cached[0] < _LIFECYCLE_HEALTH_CACHE_TTL_SECONDS
+    ):
+        return dict(cached[2])
+    task = _lifecycle_health_task(citadel)
+    try:
+        if _LIFECYCLE_HEALTH_TIMEOUT_SECONDS <= 0:
+            result = await asyncio.shield(task)
+        else:
+            result = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_LIFECYCLE_HEALTH_TIMEOUT_SECONDS,
+            )
+        return result
+    except asyncio.TimeoutError:
+        timeout = _LIFECYCLE_HEALTH_TIMEOUT_SECONDS
+        logger.warning("bounded lifecycle health timed out after %.2fs", timeout)
+        return {
+            "enabled": bool(citadel.config.lifecycle_enabled),
+            "ok": False,
+            "error_type": "TimeoutError",
+        }
+    except Exception as exc:  # noqa: BLE001 - readiness returns a typed failure
+        return {
+            "enabled": bool(citadel.config.lifecycle_enabled),
+            "ok": False,
+            "error_type": exc.__class__.__name__,
+        }
+    finally:
+        if task.done():
+            _complete_lifecycle_health_task(id(citadel), task)
+
+
+async def _readiness_payload() -> dict[str, Any]:
+    """Return the detailed readiness state used by authenticated operators."""
+    citadel = get_citadel()
+    config = citadel.config
+    corpus, lifecycle = await asyncio.gather(
+        _bounded_corpus_health(),
+        _bounded_lifecycle_health(citadel),
+    )
     canary = _LAST_CANARY
-    lifecycle = lifecycle_health(get_citadel())
-    # RED when the corpus gate trips or the last end-to-end canary failed.
     ok = (
         corpus["ok"]
         and lifecycle["ok"]
         and (canary is None or bool(canary.get("ok", True)))
     )
-    payload = {
+    return {
         "ok": ok,
         "service": "citadel",
         "tenant_id": config.tenant_id,
@@ -5071,7 +5184,32 @@ async def readyz(request: Request) -> Any:
         "lifecycle": lifecycle,
         "canary": canary,
     }
-    return JSONResponse(payload, status_code=200 if ok else 503)
+
+
+@app.get("/health/ready")
+async def deployment_readiness() -> Any:
+    """Return detail-free dependency readiness for the Railway deploy gate."""
+    if _CORPUS_HEALTH_CACHE_TTL_SECONDS <= 0:
+        return JSONResponse(
+            {"ok": False, "service": "citadel"},
+            status_code=503,
+        )
+    payload = await _readiness_payload()
+    dependency_ok = (
+        "degraded" not in payload["corpus"]
+        and "error_type" not in payload["lifecycle"]
+    )
+    return JSONResponse(
+        {"ok": dependency_ok, "service": "citadel"},
+        status_code=200 if dependency_ok else 503,
+    )
+
+
+@app.get("/readyz")
+async def readyz(request: Request) -> Any:
+    require_access(request, "reader", "kb:read")
+    payload = await _readiness_payload()
+    return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
 
 
 def _mesh_dataset_visible(
