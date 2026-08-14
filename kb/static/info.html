@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Citadel</title>
+  <title>Citadel: State of the Vault</title>
   <meta name="description" content="Citadel: shared, governed memory for your team and its AI agents. Current state, shipped releases, and roadmap.">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/info.css">
@@ -36,12 +36,12 @@
         <h1>Shared, governed memory for the team <span class="grad">and its AI agents</span>.</h1>
         <div class="meta">
           <span class="pill">Railway + PyPI</span>
-          <span class="pill">Window: v0.2.0 → v0.5.0</span>
+          <span class="pill">Window: v0.2.0 → v0.4.1</span>
         </div>
 
         <div class="tldr">
           <p class="lbl">TL;DR: read this, skim the rest</p>
-          <p>This is the running node reporting on itself: what is deployed right now, what shipped across v0.2.0 → v0.5.0, and what is being built next. If you are new to Citadel, the <a href="/">home page</a> covers what it is, how it's built, and how to start; this page is the numbers.</p>
+          <p>This is the running node reporting on itself: what is deployed right now, what shipped across v0.2.0 → v0.4.1, and what is being built next. If you are new to Citadel, the <a href="/">home page</a> covers what it is, how it's built, and how to start; this page is the numbers.</p>
           <p>Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear sync, read-side isolation, and <b>Shared Session Traces</b> (share a dead end, reference-only, without leaking private memory). Next: a <b>GitHub App</b> for PR context + checks, a <b>Google Chat digest bot</b>, and one <b>central agent hub</b> over all org knowledge. Every section below expands. Open the ones you care about.</p>
         </div>
       </header>
@@ -55,7 +55,7 @@
       <a href="#releases">Releases</a>
       <a href="#next">What's next</a>
       <a href="#opensource">Open source</a>
-          <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.5.0</span></span>
+          <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.4.1</span></span>
     </div>
   </nav>
 
@@ -64,18 +64,21 @@
       <div class="sechead"><span class="kicker">01 · Current state</span><h2>Where things stand today</h2></div>
       <p class="lede">Health and scale. The live tiles below refresh from the running node each time this page loads; the rest are dated measurements, and the line under them says when each was taken.</p>
       <div class="metrics">
-        <div class="metric tealn"><div class="n" id="m-version">v0.5.0</div><div class="k">deployed &amp; healthy on Railway</div></div>
+        <div class="metric tealn"><div class="n" id="m-version">v0.4.1</div><div class="k">deployed &amp; healthy on Railway</div></div>
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
-        <div class="metric accent"><div class="n">12</div><div class="k">releases shipped (v0.1.0 → v0.5.0)</div></div>
-        <div class="metric"><div class="n" id="m-tools">24</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n sm">~$38/mo</div><div class="k">to self-host, measured 2026-08-14</div></div>
+        <div class="metric accent"><div class="n">11</div><div class="k">releases shipped (v0.1.0 → v0.4.1)</div></div>
+        <div class="metric"><div class="n" id="m-tools">22</div><div class="k">MCP tools for agents</div></div>
+        <div class="metric"><div class="n sm">~$55/mo</div><div class="k">to self-host, measured 2026-07-31</div></div>
         <div class="metric"><div class="n">269 ms</div><div class="k">median search round-trip, from a client</div></div>
       </div>
-      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.5.0, 2026-08-14.</span></p>
-      <!-- Cost is a 2026-08-14 24h Railway average written into cost_model.py.
-           Latency is still 2026-07-31: the 2026-08-14 search_bench rerun was
-           105 failed requests, so its p50 is not a search measurement. -->
-      <p class="verified"><span class="vdot"></span>Cost is a 2026-08-14 snapshot of 24-hour Railway averages for Citadel-Archive and Qdrant, via the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. A trailing-7-day window the same day is nearer $58. The 269 ms round-trip is still 2026-07-31; a 2026-08-14 rerun did not complete a successful search, so that figure was not replaced. Re-running <code>cost_model.py</code> reprints today's written averages; <code>search_bench.py</code> really does re-measure when the token can search.</p>
+      <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.4.1, 2026-08-06.</span></p>
+      <!-- Two different kinds of snapshot, and the sentence has to say which is
+           which. cost_model.py holds 2026-07-31's Railway averages as a constant,
+           so re-running it reprints the same total by construction and can never
+           show drift. search_bench.py really does re-measure. Calling both
+           "reproducible" flattened that difference, which is how a frozen number
+           starts reading as a live one. -->
+      <p class="verified"><span class="vdot"></span>Both are snapshots from 2026-07-31, not live calls, and the method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. The cost model carries that day's resource averages in its source, so re-running it reprints the figure rather than re-measuring it; the round-trip is re-measurable with <code>search_bench.py</code>, and being a client round-trip it reads higher than server-side timing does.</p>
     </div>
   </section>
 
@@ -122,7 +125,7 @@
 
   <section class="band band-white" id="releases">
     <div class="band-in">
-      <div class="sechead"><span class="kicker">03 · Release history</span><h2>v0.2.0 → v0.5.0</h2></div>
+      <div class="sechead"><span class="kicker">03 · Release history</span><h2>v0.2.0 → v0.4.1</h2></div>
       <p class="lede">Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.</p>
       <div class="chartwrap">
         <div class="charthead"><span class="t">Commits per week</span><span class="note">brand-color bars = a release shipped that week</span></div>
@@ -134,18 +137,7 @@
       <div class="rail">
         <div class="rel tip">
           <details open>
-            <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.5.0</span><span class="date">2026-08-14 · latest</span><span class="reltitle">Async ingest, dataset-scoped graph, and capture deny globs.</span></span></summary>
-            <div class="dbody"><ul>
-              <li><b>Async ingest is the default</b>: <code>citadel ingest</code> and MCP <code>citadel_ingest</code> return once the Node stores the note (<span class="k">queued_not_confirmed</span>). Inline cognify is opt-in.</li>
-              <li><b>Dataset-scoped graph and chunk reads</b>: <code>/api/mesh/graph?dataset=</code> narrows the graph before the node cap. <code>/api/documents/{id}?scope=chunk</code> returns the clicked chunk's own text.</li>
-              <li><b>Capture deny globs</b>: org defaults now apply at ingest and pre-push, so a path such as <code>.env</code> is refused rather than JSON-only.</li>
-              <li><b>Public stamp</b>: shipped pages and <code>citadel --version</code> report v0.5.0. Self-host cost stays ~$38/mo.</li>
-            </ul></div>
-          </details>
-        </div>
-        <div class="rel">
-          <details>
-            <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.4.1</span><span class="date">2026-08-06</span><span class="reltitle">Indexing repair, retrieval gates, and the Next migration boundary.</span></span></summary>
+            <summary><span class="chev">▸</span><span class="relsum"><span class="ver">v0.4.1</span><span class="date">2026-08-06 · latest</span><span class="reltitle">Indexing repair, retrieval gates, and the Next migration boundary.</span></span></summary>
             <div class="dbody"><ul>
               <li><b>Indexing repair safety</b>: zero-chunk and oversized-document census and repair paths, journaled phases, rollback, source-backed recovery, and a cross-process repair lease.</li>
               <li><b>Retrieval verification</b>: chunk-budget enforcement, frozen benchmark fixtures, literal-ranking checks, and failure gates for transport and trust.</li>
@@ -238,7 +230,7 @@
     <div class="band-in">
       <p>Verify any of this yourself with <code>citadel status</code>, or read the source at <a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a>. Live node: <code>citadel-archive-production.up.railway.app</code></p>
       <p>New here? <a href="/">Start on the home page</a>. Building an EU-funded project? <a href="/use-cases">See the use cases and how we partner</a>.</p>
-      <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.5.0.</p>
+      <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.4.1.</p>
     </div>
   </footer>
 </body>

@@ -1,13 +1,46 @@
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState, type ReactNode, Component } from "react";
+import {
+  Component,
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
-import { LAYERS, PATH } from "@/components/pipeline-data";
+import { HEADERS, STAGES } from "@/components/pipeline-data";
 
-/* React Flow has to be client-only: it measures the DOM, and a static export
- * cannot carry a `style=""` from a Node render. See web/README.md and
- * https://reactflow.dev/learn */
+/* React, React DOM and React Flow are a few hundred kilobytes, on a page that
+   otherwise ships almost nothing. So the four-step spine below is the real
+   diagram: plain markup, in the exported HTML, no download. This upgrades it in
+   place the first time it comes near the viewport.
+
+   `ssr: false` is not an optimisation here, it is a requirement. React Flow
+   measures the DOM to place its nodes, and the export is pre-rendered in Node
+   where there is nothing to measure. It also keeps the component out of the
+   pre-rendered HTML, which is what keeps a `transform` style attribute out of
+   the exported markup and the strict style-src policy intact. */
 const PipelineFlow = dynamic(() => import("@/components/pipeline-flow"), { ssr: false });
 
+const STEPS: Array<{ title: string; sub: string; highlight?: boolean }> = [
+  { title: "Capture", sub: "hooks, no filing" },
+  { title: "Your Node", sub: "seat scoped", highlight: true },
+  { title: "Promotion", sub: "scan · approve" },
+  { title: "Central", sub: "shared" },
+];
+
+/* The same stages the flow draws, grouped into their columns, for the stacked
+   rendering below 620px. Grouping is by x position, so a stage added to the
+   data shows up in its lane here without a second edit. */
+const LANES = HEADERS.map(([, x, label]) => ({
+  label,
+  stages: STAGES.filter((stage) => stage[1] === x),
+}));
+
+/* A chunk that fails to load, or a diagram that throws while rendering, must
+   not take the section with it. The spine is already on screen and already
+   correct, so the fallback is to keep it and say nothing. */
 class FlowBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
 
@@ -21,23 +54,32 @@ class FlowBoundary extends Component<{ children: ReactNode }, { failed: boolean 
 }
 
 export function PipelineDiagram() {
-  const fallback = useRef<HTMLDivElement>(null);
+  const spine = useRef<HTMLDivElement>(null);
   const [wanted, setWanted] = useState(false);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (!("IntersectionObserver" in window)) {
-      setWanted(true);
-      return;
-    }
-    const target = fallback.current;
+    if (!("IntersectionObserver" in window)) return;
+    const target = spine.current;
     if (!target) return;
+
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
+        // Below 620px React Flow cannot fit the ~2000px-wide topology:
+        // fitView clamps at minZoom, both sides are clipped, and with
+        // panning off for coarse pointers the clipped columns are
+        // unreachable. The stacked lanes are the honest rendering there,
+        // so phones keep them. Not disconnecting means a viewport that
+        // later widens past the gate (rotation, window resize) upgrades on
+        // the next intersection instead of being locked out.
+        if (!window.matchMedia("(min-width: 620px)").matches) return;
         observer.disconnect();
         setWanted(true);
       },
+      // 300px of lead time, so the chunk is usually already parsed by the time
+      // the section is actually read and the swap is not something you watch
+      // happen.
       { rootMargin: "300px 0px" }
     );
     observer.observe(target);
@@ -47,77 +89,104 @@ export function PipelineDiagram() {
   const onReady = useCallback(() => setReady(true), []);
 
   return (
-    <div className="mb-8">
+    <>
+      {/* Unmounted rather than marked `hidden` once the real diagram is up. The
+          `hidden` attribute is only a UA-stylesheet `display: none`, so any
+          author rule setting a display -- `flex`, here -- outranks it and the
+          element stays on screen. Removing it says what is meant and cannot be
+          quietly undone by a styling change. */}
       {ready ? null : (
-        <div ref={fallback}>
-          <ol
-            aria-label="How work reaches the vault"
-            className="mb-4 grid list-none grid-cols-5 gap-2 p-0 max-[620px]:grid-cols-1"
-          >
-            {PATH.map((step, i) => (
-              <li key={step.title} className="flex items-center gap-3 border border-border bg-surface px-3 py-3">
-                <span className="font-mono text-[11px] text-ink-3">{i + 1}</span>
-                <span>
-                  <span
-                    className={`block text-[15px] font-semibold tracking-[-.01em] ${
-                      step.highlight ? "text-accent-ink" : ""
-                    }`}
-                  >
-                    {step.title}
-                  </span>
-                  <span className="mt-0.5 block font-mono text-xs text-ink-3">{step.sub}</span>
+        <div
+          ref={spine}
+          aria-label="How work reaches the vault"
+          className="mt-[26px] flex items-center justify-between gap-2.5 max-[620px]:hidden"
+        >
+          {STEPS.map((step, i) => (
+            <Fragment key={step.title}>
+              {i > 0 ? (
+                <span aria-hidden="true" className="flex-none text-[18px] text-border-2">
+                  →
                 </span>
-              </li>
-            ))}
-          </ol>
-          <div aria-label="The architecture, layer by layer" className="border border-border">
-            {LAYERS.map((layer) => (
-              <div
-                key={layer.id}
-                className="grid grid-cols-[9rem_minmax(0,1fr)] border-t border-border first:border-t-0 max-[620px]:grid-cols-1"
-              >
-                <p className="bg-surface px-3 py-3 font-mono text-[10.5px] font-semibold uppercase tracking-[.14em] text-ink-3">
-                  {layer.label}
-                </p>
-                <div className="grid grid-cols-3 gap-2 bg-surface p-2 max-[620px]:grid-cols-1">
-                  {layer.items.map((item) => (
-                    <details key={item.id} className="border border-border bg-surface">
-                      <summary className="cursor-pointer px-3 py-2.5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent">
-                        <span
-                          className={`text-[13.5px] font-semibold tracking-[-.01em] ${
-                            item.highlight ? "text-accent-ink" : ""
-                          }`}
-                        >
-                          {item.label}
-                        </span>{" "}
-                        <span className="font-mono text-[9.5px] tracking-[.02em] text-ink-3">
-                          {item.sub}
-                        </span>
-                      </summary>
-                      <p className="border-t border-border px-3 py-2 text-[12.5px] leading-[1.55] text-ink-2">
-                        {item.detail}
-                      </p>
-                    </details>
-                  ))}
-                </div>
+              ) : null}
+              <div className="min-w-0 flex-1 text-center">
+                <span
+                  className={`block text-[15.5px] font-semibold tracking-[-.01em] ${
+                    step.highlight ? "text-accent-ink" : ""
+                  }`}
+                >
+                  {step.title}
+                </span>
+                <span className="mt-0.5 block font-mono text-xs text-ink-3">{step.sub}</span>
               </div>
-            ))}
-          </div>
+            </Fragment>
+          ))}
         </div>
       )}
 
+      {/* The stacked lanes: every stage of the diagram, one lane per column,
+          served in the document and shown exactly where the gate above keeps
+          React Flow off. A phone reads the whole architecture with no
+          JavaScript at all; each stage opens to the same detail text the
+          interactive diagram shows on select. */}
+      <div aria-label="The architecture, lane by lane" className="mt-[26px] hidden max-[620px]:block">
+        {LANES.map((lane, i) => (
+          <Fragment key={lane.label}>
+            {i > 0 ? (
+              <div aria-hidden="true" className="my-1.5 text-center text-[16px] leading-none text-border-2">
+                ↓
+              </div>
+            ) : null}
+            <p className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-[.14em] text-ink-3">
+              {lane.label}
+            </p>
+            {lane.stages.map(([id, , , kind, label, sub, detail]) => (
+              <details key={id} className="mb-1.5 border border-border bg-surface">
+                <summary className="cursor-pointer px-3 py-2">
+                  <span
+                    className={`text-[13.5px] font-semibold tracking-[-.01em] ${
+                      kind === "store-node" ? "text-accent-ink" : ""
+                    }`}
+                  >
+                    {label}
+                  </span>{" "}
+                  <span className="font-mono text-[9.5px] tracking-[.02em] text-ink-3">{sub}</span>
+                </summary>
+                <p className="border-t border-border px-3 py-2 text-[12.5px] leading-[1.55] text-ink-2">
+                  {detail}
+                </p>
+              </details>
+            ))}
+          </Fragment>
+        ))}
+      </div>
+
+      {/* The read line is the guarantee, and the interactive diagram does not
+          restate it, so it stays on screen either way. */}
+      <p className="mb-[30px] mt-[18px] border-t border-border pt-3.5 text-center text-[14.5px] text-ink-2">
+        You and your agents read via <b className="text-ink">MCP, CLI or web</b>: your Node plus
+        Central, never another seat's.
+      </p>
+
       {wanted ? (
         <FlowBoundary>
-          <div className="mb-3.5 h-[1100px] border border-border bg-surface max-[620px]:h-[700px]">
+          {/* Rendered before it reports ready, because React Flow fits the graph
+              to a container it can measure and a hidden container measures
+              zero. The 300px of lead time above is what keeps that from being
+              something the reader sees. */}
+          {/* Hidden rather than unmounted below 620px, for the one path that
+              gets here that small: an upgrade at a wide width followed by the
+              window shrinking. The stacked lanes take over there. */}
+          <div className="mb-3.5 h-[520px] border border-border bg-surface max-[620px]:hidden">
             <PipelineFlow onReady={onReady} />
           </div>
+          {ready ? (
+            <p className="mb-[30px] text-[12.5px] leading-[1.6] text-ink-3 max-[620px]:hidden">
+              Capture to promotion to read, end to end. Hover a step to follow its path, and select
+              one to read what it does.
+            </p>
+          ) : null}
         </FlowBoundary>
       ) : null}
-
-      <p className="mb-0 mt-4 border-t border-border pt-3.5 text-[14.5px] text-ink-2">
-        You and your agents read via <b className="text-ink">MCP, CLI or web</b>: your Node plus
-        Central, never another seat&apos;s.
-      </p>
-    </div>
+    </>
   );
 }

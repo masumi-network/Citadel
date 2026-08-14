@@ -1,16 +1,16 @@
 import Head from "next/head";
 import type { ReactNode } from "react";
 
+import { CommitChart } from "@/components/commit-chart";
 import { HeroBand } from "@/components/hero-band";
 import { SectionIndex, type Section } from "@/components/section-index";
 import {
-  BAND,
-  BAND_IN,
   Band,
   CODE,
   Card,
   CARD_P,
   CARD_TAG,
+  CHIP_TONE,
   Chip,
   DEEP_B,
   DEEP_H4,
@@ -21,8 +21,6 @@ import {
   FOOT_NOTE,
   GoDeeper,
   H1_WIDE,
-  HERO_STRIP,
-  HeroFact,
   LEDE,
   META,
   METRICS,
@@ -33,15 +31,12 @@ import {
   ROW_K,
   Row,
   SecHead,
+  TLDR_P,
+  TLDR_P_LAST,
+  Tldr,
   Verified,
 } from "@/components/ui";
-import {
-  relativeTime,
-  useVaultState,
-  versionLabel,
-  type LifecycleState,
-  type VaultSource,
-} from "@/lib/vault-state";
+import { relativeTime, useVaultState, versionLabel } from "@/lib/vault-state";
 
 const SECTIONS: Section[] = [
   { id: "state", label: "Current state" },
@@ -54,16 +49,16 @@ const SECTIONS: Section[] = [
    last published values, so a visitor who arrives while the node is unreachable
    reads something true and slightly old rather than a row of dashes. */
 const STAMPED = {
-  version: "v0.5.0",
-  mcpTools: 24,
+  version: "v0.4.1",
+  mcpTools: 22,
 };
 
-const AS_OF = "Releases are as of v0.5.0, 2026-08-14.";
+const AS_OF = "Releases are as of v0.4.1, 2026-08-06.";
 
 /* A closing footer that is itself a band is full-bleed, so it carries no top
    margin: the gap an in-column footer wants would show as a stripe of --ground
    between two bands. */
-const BAND_FOOTER = BAND;
+const BAND_FOOTER = "relative mt-0 py-[74px] max-[620px]:py-12";
 
 /* The live half of /info, resolved from one /api/state read.
  *
@@ -81,18 +76,27 @@ function useInfoTiles() {
   const repositories = state?.totals?.github_repositories || github?.documents || 0;
   const syncedAt = relativeTime(github?.last_synced_at);
   const updatedAt = relativeTime(state?.updated_at);
+  const repoAge = relativeTime(repo?.refreshed_at);
 
   // mcp_tools is computed fresh on every /api/state call (a policy-table
   // length, not a cache), so it carries no "refreshed X ago" note here.
-  const sourceNote = github
-    ? ` GitHub last synced${syncedAt ? ` ${syncedAt}` : ""}.`
-    : "";
+  // Commit and ADR counts used to live here too; they are gone from the page
+  // by design (repo trivia, not evidence the system works), but the weekly
+  // commit chart stays as recent git activity.
+  let repoNote: string;
+  if (repo?.source !== "github") {
+    // No successful fetch yet: the chart is showing the baked series.
+    repoNote = " The commit-activity chart has not refreshed yet.";
+  } else if (repo.stale) {
+    repoNote = ` The commit-activity chart last refreshed ${repoAge}.`;
+  } else {
+    repoNote = ` The commit-activity chart refreshed ${repoAge}.`;
+  }
 
   return {
     live: state !== null,
     failed,
-    sources: state?.sources ?? [],
-    lifecycle: state?.lifecycle,
+    repo,
     version: state ? versionLabel(state.version) || STAMPED.version : STAMPED.version,
     repositories,
     docsSub: state
@@ -102,12 +106,12 @@ function useInfoTiles() {
         : "GitHub org sync",
     mcpTools: typeof repo?.mcp_tools === "number" ? repo.mcp_tools : STAMPED.mcpTools,
     stateUpdated: state
-      ? `Live tiles updated${updatedAt ? ` ${updatedAt}` : ""}.${sourceNote} ${AS_OF}`
+      ? `Live tiles updated${updatedAt ? ` ${updatedAt}` : ""}.${repoNote} ${AS_OF}`
       : null,
     footNote: state
       ? `State-of-the-vault report · live tiles from /api/state${
           updatedAt ? ` (updated ${updatedAt})` : ""
-        } · window v0.2.0 → v0.5.0.`
+        } · window v0.2.0 → v0.4.1.`
       : null,
   };
 }
@@ -118,7 +122,7 @@ export default function Info() {
   return (
     <>
       <Head>
-        <title>Citadel</title>
+        <title>Citadel: State of the Vault</title>
         <meta
           name="description"
           content="Citadel: shared, governed memory for your team and its AI agents. Current state, shipped releases, and roadmap."
@@ -131,18 +135,25 @@ export default function Info() {
         <h1 className={H1_WIDE}>
           Shared, governed memory for the team <span className="grad">and its AI agents</span>.
         </h1>
-        <div className={`${META} mb-8`}>
+        <div className={META}>
           <span className={PILL}>Railway + PyPI</span>
-          <span className={PILL}>Window: v0.2.0 → v0.5.0</span>
+          <span className={PILL}>Window: v0.2.0 → v0.4.1</span>
         </div>
-        <dl className={HERO_STRIP}>
-          <HeroFact kicker="Numbers">
-            What is deployed, what shipped from v0.2.0 to v0.5.0, and what is still open.
-          </HeroFact>
-          <HeroFact kicker="Roadmap">
-            A <b>GitHub App</b> and structured knowledge are still in design.
-          </HeroFact>
-        </dl>
+        <Tldr label="TL;DR: read this, skim the rest">
+          <p className={TLDR_P}>
+            This is the running node reporting on itself: what is deployed right now, what shipped
+            across v0.2.0 → v0.4.1, and what is being built next. If you are new to Citadel, the{" "}
+            <a href="/">home page</a> covers what it is, how it&apos;s built, and how to start; this
+            page is the numbers.
+          </p>
+          <p className={TLDR_P_LAST}>
+            Across v0.2 → v0.4 we shipped zero-dependency onboarding, autonomous ingestion, Linear
+            sync, read-side isolation, and <b>Shared Session Traces</b> (share a dead end,
+            reference-only, without leaking private memory). Next: a <b>GitHub App</b> for PR
+            context + checks, a <b>Google Chat digest bot</b>, and one <b>central agent hub</b> over
+            all org knowledge. Every section below expands. Open the ones you care about.
+          </p>
+        </Tldr>
       </HeroBand>
 
       <SectionIndex sections={SECTIONS} />
@@ -154,15 +165,7 @@ export default function Info() {
           loads; the rest are dated measurements, and the line under them says when each was taken.
         </p>
         <div className={METRICS}>
-          <Metric
-            accent
-            value={tiles.version}
-            label={
-              tiles.failed
-                ? "last published version (node unreachable)"
-                : "deployed on Railway"
-            }
-          />
+          <Metric accent value={tiles.version} label="deployed & healthy on Railway" />
           <Metric
             value={
               tiles.live ? (
@@ -175,25 +178,18 @@ export default function Info() {
             }
             label={tiles.docsSub}
           />
-          <Metric accent value="12" label="releases shipped (v0.1.0 → v0.5.0)" />
+          <Metric accent value="11" label="releases shipped (v0.1.0 → v0.4.1)" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
           <Metric
-            value={<span className="text-[19px]">~$38/mo</span>}
-            label="to self-host, measured 2026-08-14"
+            value={<span className="text-[19px]">~$55/mo</span>}
+            label="to self-host, measured 2026-07-31"
           />
           <Metric value="269 ms" label="median search round-trip, from a client" />
         </div>
-        <HealthStrip
-          live={tiles.live}
-          failed={tiles.failed}
-          version={tiles.version}
-          sources={tiles.sources}
-          lifecycle={tiles.lifecycle}
-        />
         <Verified>
           {tiles.stateUpdated ??
             (tiles.failed ? (
-              "Live data unavailable right now. Showing the last published repo figures, as of v0.5.0, 2026-08-14."
+              "Live data unavailable right now. Showing the last published repo figures, as of v0.4.1, 2026-08-06."
             ) : (
               <>
                 Live tiles pull from <code className={CODE}>/api/state</code>. MCP tools refresh on
@@ -201,20 +197,21 @@ export default function Info() {
               </>
             ))}
         </Verified>
-        {/* Cost is a 2026-08-14 24h Railway average written into cost_model.py.
-            Latency is still 2026-07-31: the 2026-08-14 search_bench rerun was
-            105 failed requests, so its p50 is not a search measurement. */}
+        {/* Two different kinds of snapshot, and the sentence has to say which
+            is which. cost_model.py holds 2026-07-31's Railway averages as a
+            constant, so re-running it reprints the same total by construction
+            and can never show drift. search_bench.py really does re-measure.
+            Calling both "reproducible" flattened that difference, which is how
+            a frozen number starts reading as a live one. */}
         <Verified>
-          Cost is a 2026-08-14 snapshot of 24-hour Railway averages for Citadel-Archive and Qdrant,
-          via the repo&apos;s{" "}
+          Both are snapshots from 2026-07-31, not live calls, and the method is in the repo&apos;s{" "}
           <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
             bench harness
           </a>
-          . A trailing-7-day window the same day is nearer $58. The 269 ms round-trip is still
-          2026-07-31; a 2026-08-14 rerun did not complete a successful search, so that figure was
-          not replaced. Re-running <code className={CODE}>cost_model.py</code> reprints today&apos;s
-          written averages; <code className={CODE}>search_bench.py</code> really does re-measure
-          when the token can search.
+          . The cost model carries that day&apos;s resource averages in its source, so re-running it
+          reprints the figure rather than re-measuring it; the round-trip is re-measurable with{" "}
+          <code className={CODE}>search_bench.py</code>, and being a client round-trip it reads
+          higher than server-side timing does.
         </Verified>
       </Band>
 
@@ -236,10 +233,10 @@ export default function Info() {
           <Card title="Autonomous ingestion">
             <p className={CARD_P}>
               A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both
-              are fail-silent. A scheduled evolve cycle folds GitHub, Linear, and repo content into
+              are fail-silent. An hourly evolve cycle folds GitHub, Linear, and repo content into
               the graph.
             </p>
-            <span className={CARD_TAG}>hooks + scheduled evolve</span>
+            <span className={CARD_TAG}>hooks + hourly evolve</span>
           </Card>
           <Card title="Linear sync">
             <p className={CARD_P}>
@@ -315,30 +312,31 @@ export default function Info() {
               : summarizes each approved root (git metadata + README, never raw files).
             </DeepLi>
           </ul>
-          <h4 className={DEEP_H4}>Evolve (→ Central, scheduled)</h4>
+          <h4 className={DEEP_H4}>Evolve (→ Central, hourly)</h4>
           <ul className={DEEP_UL}>
             <DeepLi>
               GitHub org digest + repo content sync + Linear sync run as staged subprocesses, then
-              cognify runs in-loop on the web service, the single Kuzu writer. Default interval is
-              six hours (<code className={CODE}>evolve_interval_seconds</code>).
+              cognify runs in-loop on the web service, the single Kuzu writer. Cadence went 6h → 1h
+              in v0.2.1.
             </DeepLi>
           </ul>
         </GoDeeper>
       </Band>
 
       <Band tone="white" id="releases">
-        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.5.0" />
+        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.4.1" />
         <p className={LEDE}>
           Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.
         </p>
+        <CommitChart repo={tiles.repo} />
         <Releases />
       </Band>
 
       <Band tone="grey" id="next">
         <SecHead kicker="04 · The road ahead" title="What's next" />
         <p className={LEDE}>
-          Some of this is still in design. Nothing here is claimed as a PyPI release unless it has a
-          version in the history above.
+          Honest status: some of this is in active design, some is still a sketch we&apos;re
+          pressure-testing. Nothing here is claimed as shipped.
         </p>
         <div className="mb-[22px] flex flex-wrap gap-2.5">
           <Chip tone="prog">In design</Chip>
@@ -346,173 +344,72 @@ export default function Info() {
         </div>
         <div className={ROWS}>
           <Row
-            label={<Chip tone="prog">In design</Chip>}
+            label={<Chip tone="plan">Brainstorming</Chip>}
             title="GitHub App: PR context injection + verifying checks"
           >
             A GitHub App that injects relevant vault context into pull requests and runs{" "}
             <span className={ROW_K}>verifying checks</span> as a PR status, kept{" "}
             <span className={ROW_K}>in sync with Linear</span> and other connected apps, so a review
-            sees the same knowledge an agent would. Not built yet.
+            sees the same knowledge an agent would. Direction sketched via the modular update-agent
+            architecture; not built yet.
           </Row>
-          <Row label={<Chip tone="prog">In design</Chip>} title="Structured Knowledge: own the representation">
+          <Row label={<Chip tone="prog">In design</Chip>} title="One central agent hub">
+            A single point of access to <span className={ROW_K}>all org knowledge and context</span>
+            : an internal update agent plus hosted MCP consolidating GitHub, Citadel search, Linear,
+            and future approved sources behind one contract. Repository boundary and initial
+            contract are drafted.
+          </Row>
+          <Row label={<Chip tone="prog">In design</Chip>} title="Google Chat digest bot">
+            A daily <span className={ROW_K}>Organization Update Digest</span> to one Google Chat
+            space: what changed, what&apos;s open, what merged, plus a cautious source-linked
+            &quot;Agent read.&quot; Outbound-only in Phase 1; app-auth and schedule are settled.
+            Silent on quiet days.
+          </Row>
+          <Row
+            label={<Chip tone="prog">In design</Chip>}
+            title="Structured Knowledge: own the representation"
+          >
             Make durable, first-class <span className={ROW_K}>Structured Knowledge</span> the source
             of truth Citadel owns, with the retrieval layer demoted to a rebuildable index. Plus a
             retrieval eval harness (<code className={CODE}>citadel bench</code>) and vault lint (
-            <code className={CODE}>citadel lint</code>).
+            <code className={CODE}>citadel lint</code>). This is how the vault stops depending on
+            any one engine to hold the truth.
           </Row>
-          <Row label={<Chip tone="plan">Brainstorming</Chip>} title="Digest bot and more delivery surfaces">
-            A daily <span className={ROW_K}>Organization Update Digest</span> to one chat space, plus
-            extra gateways (Agent Messenger, Slack, email, webhook) off the same update-agent
-            contract. Outbound-only in Phase 1. Silent on quiet days.
+          <Row
+            label={<Chip tone="plan">Brainstorming</Chip>}
+            title="Session Traces v1.1 + more surfaces"
+          >
+            Retraction controls (<code className={CODE}>citadel unshare</code>, ~90-day TTL, admin
+            hard-delete), overlap-ranked <span className={ROW_K}>prior-work retrieval</span>, and
+            more delivery gateways (Agent Messenger, Slack, email, webhook) off the same
+            update-agent contract.
           </Row>
         </div>
       </Band>
 
       <footer className={`${BAND_FOOTER} bg-surface`}>
-        <div className={BAND_IN}>
-          <div className="grid grid-cols-3 gap-8 border-t border-border pt-8 max-[620px]:grid-cols-1 max-[620px]:gap-5">
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Check
-              </p>
-              <p className="m-0 text-[14.5px] text-ink-2">
-                <code className={CODE}>citadel status</code>
-              </p>
-            </div>
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Source
-              </p>
-              <p className="m-0 text-[14.5px]">
-                <a href="https://github.com/masumi-network/Citadel">
-                  github.com/masumi-network/Citadel
-                </a>
-              </p>
-            </div>
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Start
-              </p>
-              <p className="m-0 text-[14.5px] text-ink-2">
-                <a href="/">Home</a>
-                {" · "}
-                <a href="/use-cases">Use cases</a>
-              </p>
-            </div>
-          </div>
+        <div className="mx-auto max-w-[940px] px-[26px] text-[15px] text-ink-2 max-[620px]:px-4">
+          <p>
+            Verify any of this yourself with <code className={CODE}>citadel status</code>, or read
+            the source at{" "}
+            <a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a>
+            . Live node: <code className={CODE}>citadel-archive-production.up.railway.app</code>
+          </p>
+          <p>
+            New here? <a href="/">Start on the home page</a>. Building an EU-funded project?{" "}
+            <a href="/use-cases">See the use cases and how we partner</a>.
+          </p>
           <p className={FOOT_NOTE}>
-            Live node: <code className={CODE}>citadel-archive-production.up.railway.app</code>
-            {tiles.footNote ? ` · ${tiles.footNote}` : " · window v0.2.0 → v0.5.0."}
+            {tiles.footNote ?? (
+              <>
+                State-of-the-vault report · live tiles from <code className={CODE}>/api/state</code>{" "}
+                · window v0.2.0 → v0.4.1.
+              </>
+            )}
           </p>
         </div>
       </footer>
     </>
-  );
-}
-
-/* Reachability of /api/state, plus the source rows that payload already
-   returns. `healthy` in that JSON is hardcoded True in kb/server.py, so this
-   strip never treats it as a probe. Indexing uses lifecycle.enabled / ok only
-   and does not print invariant_errors. totals.documents is a sum of repo
-   counts, file counts and issue counts, so it is not shown as "documents". */
-function sourceKind(type: string | undefined): { label: string; unit: string } {
-  if (type === "github") return { label: "GitHub", unit: "repos" };
-  if (type === "repo_content") return { label: "Repo files", unit: "files" };
-  if (type === "linear") return { label: "Linear", unit: "issues" };
-  return { label: type || "Source", unit: "items" };
-}
-
-function indexingLabel(live: boolean, lifecycle: LifecycleState | undefined): string {
-  if (!live) return "—";
-  if (lifecycle?.enabled === false) return "Off";
-  if (lifecycle?.ok === false) return "Degraded";
-  return "Running";
-}
-
-function HealthStrip({
-  live,
-  failed,
-  version,
-  sources,
-  lifecycle,
-}: {
-  live: boolean;
-  failed: boolean;
-  version: string;
-  sources: VaultSource[];
-  lifecycle: LifecycleState | undefined;
-}) {
-  const reach = failed ? "Unreachable" : live ? "Reachable" : "Checking";
-  const reachClass = failed ? "text-warn" : live ? "text-good" : "text-ink-3";
-  const indexing = indexingLabel(live, lifecycle);
-
-  return (
-    <div className="mb-4 mt-8 border border-border bg-surface">
-      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-border px-6 py-4 max-[620px]:px-4">
-        <span className="text-sm font-semibold">System health</span>
-        <span className="text-[11.5px] text-ink-3">
-          from <code className={CODE}>/api/state</code>
-          {failed ? " · this page could not reach the node" : ""}
-        </span>
-      </div>
-      <div className="grid grid-cols-4 gap-px bg-border max-[760px]:grid-cols-2 max-[620px]:grid-cols-1">
-        <div className="bg-surface px-6 py-4 max-[620px]:px-4">
-          <div className="text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">Node</div>
-          <div className={`mt-1.5 font-mono text-[15px] ${reachClass}`}>{reach}</div>
-        </div>
-        <div className="bg-surface px-6 py-4 max-[620px]:px-4">
-          <div className="text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-            Version
-          </div>
-          <div className="mt-1.5 font-mono text-[15px]">{version}</div>
-        </div>
-        <div className="bg-surface px-6 py-4 max-[620px]:px-4">
-          <div className="text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-            Sources
-          </div>
-          <div className="mt-1.5 font-mono text-[15px]">
-            {live ? sources.length : "—"}
-          </div>
-        </div>
-        <div className="bg-surface px-6 py-4 max-[620px]:px-4">
-          <div className="text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-            Indexing
-          </div>
-          <div
-            className={`mt-1.5 font-mono text-[15px] ${
-              indexing === "Degraded" ? "text-warn" : ""
-            }`}
-          >
-            {indexing}
-          </div>
-        </div>
-      </div>
-      {live && sources.length > 0 ? (
-        <ul className="m-0 grid list-none grid-cols-3 gap-px border-t border-border bg-border p-0 max-[760px]:grid-cols-1">
-          {sources.map((source) => {
-            const kind = sourceKind(source.type);
-            const synced = relativeTime(source.last_synced_at);
-            return (
-              <li key={`${source.type}-${source.name || ""}`} className="bg-surface px-6 py-4 max-[620px]:px-4">
-                <div className="text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                  {kind.label}
-                  {source.name ? ` · ${source.name}` : ""}
-                </div>
-                <div className="mt-1.5 font-mono text-[15px]">
-                  {typeof source.documents === "number" ? source.documents : "—"}{" "}
-                  <span className="font-sans text-[12.5px] font-normal text-ink-3">
-                    {kind.unit}
-                  </span>
-                </div>
-                <div className="mt-1 text-[12px] text-ink-3">
-                  {synced ? `synced ${synced}` : source.status || "no sync time"}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      ) : null}
-    </div>
   );
 }
 
@@ -524,33 +421,7 @@ function Releases() {
     <div className="relative pl-[30px]">
       <span className="absolute bottom-3 left-[5px] top-3 w-0.5 bg-[linear-gradient(var(--accent),var(--accent-ink))] opacity-35" />
 
-      <Release version="v0.5.0" date="2026-08-14 · latest" tip open
-        title="Async ingest, dataset-scoped graph, and capture deny globs.">
-        <DeepLi>
-          <b className={DEEP_B}>Async ingest is the default</b>:{" "}
-          <code className={CODE}>citadel ingest</code> and MCP{" "}
-          <code className={CODE}>citadel_ingest</code> return once the Node stores the note (
-          <span className={ROW_K}>queued_not_confirmed</span>). Inline cognify is opt-in.
-        </DeepLi>
-        <DeepLi>
-          <b className={DEEP_B}>Dataset-scoped graph and chunk reads</b>:{" "}
-          <code className={CODE}>/api/mesh/graph?dataset=</code> narrows the graph before the node
-          cap. <code className={CODE}>/api/documents/{"{id}"}?scope=chunk</code> returns the clicked
-          chunk&apos;s own text.
-        </DeepLi>
-        <DeepLi>
-          <b className={DEEP_B}>Capture deny globs</b>: org defaults now apply at ingest and
-          pre-push, so a path such as <code className={CODE}>.env</code> is refused rather than
-          JSON-only.
-        </DeepLi>
-        <DeepLi>
-          <b className={DEEP_B}>Public stamp</b>: shipped pages and{" "}
-          <code className={CODE}>citadel --version</code> report v0.5.0. Self-host cost stays
-          ~$38/mo.
-        </DeepLi>
-      </Release>
-
-      <Release version="v0.4.1" date="2026-08-06"
+      <Release version="v0.4.1" date="2026-08-06 · latest" tip open
         title="Indexing repair, retrieval gates, and the Next migration boundary.">
         <DeepLi>
           <b className={DEEP_B}>Indexing repair safety</b>: zero-chunk and oversized-document
@@ -690,17 +561,17 @@ function Release({
         open={open}
         className="godeeper overflow-hidden border border-border bg-surface open:border-border-2"
       >
-        <summary className="flex cursor-pointer items-center gap-3 px-[22px] py-[17px] text-[15px] font-medium text-ink focus-visible:-outline-offset-2 focus-visible:outline-2 focus-visible:outline-accent max-[620px]:px-4">
+        <summary className="flex cursor-pointer items-center gap-3 px-[22px] py-[17px] text-[15px] font-medium text-ink focus-visible:-outline-offset-2 focus-visible:outline-2 focus-visible:outline-accent">
           <span className="chev shrink-0 text-[13px] text-accent-ink transition-transform duration-200">
             ▸
           </span>
-          <span className="flex min-w-0 flex-wrap items-baseline gap-3">
+          <span className="flex flex-wrap items-baseline gap-3">
             <span className="font-mono text-[15px] font-semibold text-accent-ink">{version}</span>
             <span className="font-mono text-[11.5px] text-ink-3">{date}</span>
             <span className="mt-0.5 basis-full text-[13.5px] text-ink-2">{title}</span>
           </span>
         </summary>
-        <div className="px-6 pb-6 pt-0.5 max-[620px]:px-4">
+        <div className="px-6 pb-6 pt-0.5">
           <ul className={DEEP_UL}>{children}</ul>
         </div>
       </details>

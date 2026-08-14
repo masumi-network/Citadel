@@ -60,7 +60,7 @@ export function ContactForm() {
   }
 
   return (
-    <form onSubmit={onSubmit} className="relative mx-auto flex w-full flex-col gap-4">
+    <form onSubmit={onSubmit} className="flex max-w-[640px] flex-col gap-3.5">
       <div className="grid grid-cols-2 gap-3.5 max-[620px]:grid-cols-1">
         <div className="flex flex-col gap-[7px]">
           <label className={FIELD_LABEL} htmlFor="cf-name">
@@ -133,7 +133,7 @@ export function ContactForm() {
       >
         {note?.text ?? ""}
       </p>
-      <button type="submit" disabled={sending} aria-busy={sending} className={`${SUBMIT} w-full`}>
+      <button type="submit" disabled={sending} aria-busy={sending} className={`${SUBMIT} self-start mt-1`}>
         {sending ? "Sending" : "Send enquiry"}
       </button>
     </form>

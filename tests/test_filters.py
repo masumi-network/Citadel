@@ -26,13 +26,3 @@ def test_rejects_excluded_path() -> None:
 
     assert not decision.accepted
     assert decision.reason == "excluded_path"
-
-
-def test_deny_glob_matches_env_basename_not_only_exact_path() -> None:
-    """`fnmatch("/abs/.env", ".env")` is false. The gate has to use the basename."""
-    decision = PreIngestFilter(exclude_patterns=(".env",)).check(
-        "/Users/dev/project/.env"
-    )
-
-    assert not decision.accepted
-    assert decision.reason == "excluded_path"

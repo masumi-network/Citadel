@@ -141,17 +141,15 @@ def test_the_landing_proof_tiles_say_what_they_measure() -> None:
         "To self-host the whole node",
     ):
         assert label in body, f"missing landing tile: {label}"
-    assert "~$38/mo" in body
-    assert "~$55/mo" not in body
+    assert "~$55/mo" in body
     assert "269 ms" in body
 
 
 def test_the_info_tiles_say_when_each_figure_was_taken() -> None:
     body = (STATIC / "info.html").read_text(encoding="utf-8")
-    assert "to self-host, measured 2026-08-14" in body
+    assert "to self-host, measured 2026-07-31" in body
     assert "median search round-trip, from a client" in body
-    assert "~$38/mo" in body
-    assert "~$55/mo" not in body
+    assert "~$55/mo" in body
     assert "269 ms" in body
 
 
