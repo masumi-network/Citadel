@@ -406,6 +406,110 @@ def test_healthz() -> None:
     assert response.json() == {"ok": True, "service": "citadel"}
 
 
+def test_deployment_readiness_allows_recoverable_data_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def backlog_corpus() -> dict[str, Any]:
+        return {"ok": False, "tracked_sources": 50, "indexed_docs": 40}
+
+    async def backlog_lifecycle(_citadel: Any) -> dict[str, Any]:
+        return {"enabled": True, "ok": False, "invariant_errors": ["failed_projection"]}
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", backlog_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", backlog_lifecycle)
+    client = TestClient(app)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "service": "citadel"}
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("corpus", "lifecycle"),
+    [
+        (
+            {"ok": False, "degraded": "TimeoutError"},
+            {"enabled": True, "ok": True},
+        ),
+        (
+            {"ok": True},
+            {"enabled": True, "ok": False, "error_type": "TimeoutError"},
+        ),
+    ],
+)
+def test_deployment_readiness_rejects_dependency_failures_without_details(
+    monkeypatch: pytest.MonkeyPatch,
+    corpus: dict[str, Any],
+    lifecycle: dict[str, Any],
+) -> None:
+    async def corpus_health() -> dict[str, Any]:
+        return corpus
+
+    async def lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        return lifecycle
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", corpus_health)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", lifecycle_health)
+    client = TestClient(app)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "service": "citadel"}
+
+
+def test_deployment_readiness_caches_serial_lifecycle_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"enabled": True, "ok": True}
+
+    async def corpus_health() -> dict[str, Any]:
+        return {"ok": True}
+
+    citadel = FakeCitadel()
+    citadel.config = CitadelConfig(lifecycle_enabled=True)
+    app.state.citadel = citadel
+    monkeypatch.setattr(server_module, "lifecycle_health", lifecycle_health)
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", corpus_health)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE_TTL_SECONDS", 30.0)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+    client = TestClient(app)
+
+    first = client.get("/health/ready")
+    second = client.get("/health/ready")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == 1
+
+
+def test_deployment_readiness_rejects_disabled_corpus_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_corpus() -> dict[str, Any]:
+        raise AssertionError("public readiness must not run an uncached corpus probe")
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE_TTL_SECONDS", 0.0)
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", unexpected_corpus)
+    client = TestClient(app)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "service": "citadel"}
+
+
 def test_public_state_uses_the_package_source_version() -> None:
     client = authed_client("test-reader")
     response = client.get("/api/state")
@@ -446,9 +550,9 @@ def test_public_state_and_readyz_report_lifecycle_census(
                         "vector": 3,
                     },
                     "current_searchable_by_backend": {
-                        "graph": 2,
+                        "graph": 3,
                         "relational": 3,
-                        "vector": 2,
+                        "vector": 3,
                     },
                 },
             }
@@ -468,6 +572,64 @@ def test_public_state_and_readyz_report_lifecycle_census(
     assert state.json()["lifecycle"]["ok"] is True
     assert ready.status_code == 200
     assert ready.json()["lifecycle"]["projection_receipts"] == 12
+
+
+def test_public_state_uses_bounded_lifecycle_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def bounded_lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        return {"enabled": True, "ok": True, "marker": "bounded"}
+
+    def unbounded_lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        raise AssertionError("public state must not block on a synchronous census")
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(
+        server_module, "_bounded_lifecycle_health", bounded_lifecycle_health
+    )
+    monkeypatch.setattr(server_module, "lifecycle_health", unbounded_lifecycle_health)
+    client = TestClient(app)
+
+    response = client.get("/api/state?cache-bust=bounded-lifecycle")
+
+    assert response.status_code == 200
+    assert response.json()["lifecycle"]["marker"] == "bounded"
+
+
+def test_lifecycle_health_rejects_unsearchable_current_generation() -> None:
+    class UnsearchableGenerationCitadel(FakeCitadel):
+        config = CitadelConfig(lifecycle_enabled=True)
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 1,
+                "projection_jobs": 1,
+                "projection_receipts": 3,
+                "job_states": {"completed": 1},
+                "receipt_states": {"searchable": 3},
+                "current_generation": {
+                    "current_sources": 1,
+                    "current_projection_jobs": 1,
+                    "current_projection_receipts": 3,
+                    "current_receipts_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 0,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                },
+            }
+
+    result = server_module.lifecycle_health(UnsearchableGenerationCitadel())
+
+    assert result["ok"] is False
+    assert result["invariant_errors"] == [
+        "current_generation_searchable_census_mismatch"
+    ]
 
 
 def test_lifecycle_health_rejects_incomplete_current_generation() -> None:
@@ -3328,6 +3490,332 @@ def test_readyz_fails_closed_when_timeout_uses_cached_health(
     assert ready.json()["corpus"]["degraded"] == (
         "corpus health timed out after 0.01s; serving cached result"
     )
+
+
+def test_readyz_reuses_corpus_cache_across_docker_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = authed_client("test-reader")
+
+    class UnexpectedSyncer:
+        async def status(self) -> dict[str, Any]:
+            raise AssertionError("cached readiness must not start another probe")
+
+    citadel = FakeCitadel()
+    github_syncer = UnexpectedSyncer()
+    repo_content_syncer = UnexpectedSyncer()
+    linear_syncer = UnexpectedSyncer()
+    app.state.citadel = citadel
+    app.state.github_syncer = github_syncer
+    app.state.repo_content_syncer = repo_content_syncer
+    app.state.linear_syncer = linear_syncer
+    cache_key = (
+        id(citadel),
+        id(github_syncer),
+        id(repo_content_syncer),
+        id(linear_syncer),
+    )
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE_TTL_SECONDS", 30.0)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    monkeypatch.setattr(
+        server_module,
+        "_CORPUS_HEALTH_CACHE",
+        (
+            time.monotonic() - 16.0,
+            cache_key,
+            {
+                "ok": True,
+                "tracked_sources": 50,
+                "indexed_docs": 65,
+                "indexed_edges": 64,
+            },
+        ),
+    )
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 200
+    assert ready.json()["corpus"]["indexed_docs"] == 65
+
+
+def test_readyz_refreshes_corpus_cache_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = authed_client("test-reader")
+
+    class CountingCitadel(FakeCitadel):
+        graph_calls = 0
+
+        async def _graph_counts(self) -> dict[str, int]:
+            self.graph_calls += 1
+            return {"nodes": 65, "edges": 64}
+
+    class Syncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    citadel = CountingCitadel()
+    github_syncer = Syncer()
+    repo_content_syncer = Syncer()
+    linear_syncer = Syncer()
+    app.state.citadel = citadel
+    app.state.github_syncer = github_syncer
+    app.state.repo_content_syncer = repo_content_syncer
+    app.state.linear_syncer = linear_syncer
+    cache_key = (
+        id(citadel),
+        id(github_syncer),
+        id(repo_content_syncer),
+        id(linear_syncer),
+    )
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE_TTL_SECONDS", 30.0)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    monkeypatch.setattr(
+        server_module,
+        "_CORPUS_HEALTH_CACHE",
+        (
+            time.monotonic() - 31.0,
+            cache_key,
+            {
+                "ok": True,
+                "tracked_sources": 50,
+                "indexed_docs": 1,
+                "indexed_edges": 0,
+            },
+        ),
+    )
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 200
+    assert ready.json()["corpus"]["indexed_docs"] == 65
+    assert citadel.graph_calls == 1
+
+
+def test_readyz_bounds_a_slow_lifecycle_census(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = authed_client("test-reader")
+
+    class SlowLifecycleCitadel(FakeCitadel):
+        config = CitadelConfig(
+            tenant_id="test",
+            default_dataset="notes",
+            admin_key="test-admin",
+            reader_keys=("test-reader",),
+            lifecycle_enabled=True,
+        )
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            time.sleep(0.1)
+            return {
+                "source_revisions": 0,
+                "projection_jobs": 0,
+                "projection_receipts": 0,
+                "job_states": {},
+                "receipt_states": {},
+                "current_generation": {
+                    "current_sources": 0,
+                    "current_projection_jobs": 0,
+                    "current_projection_receipts": 0,
+                    "current_receipts_by_backend": {
+                        "graph": 0,
+                        "relational": 0,
+                        "vector": 0,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 0,
+                        "relational": 0,
+                        "vector": 0,
+                    },
+                },
+            }
+
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+    app.state.citadel = SlowLifecycleCitadel()
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == 503
+    assert ready.json()["lifecycle"] == {
+        "enabled": True,
+        "ok": False,
+        "error_type": "TimeoutError",
+    }
+
+
+def test_bounded_lifecycle_health_shares_a_timed_out_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowLifecycleCitadel(FakeCitadel):
+        config = CitadelConfig(lifecycle_enabled=True)
+        calls = 0
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            self.calls += 1
+            time.sleep(0.1)
+            return {
+                "source_revisions": 0,
+                "projection_jobs": 0,
+                "projection_receipts": 0,
+                "job_states": {},
+                "receipt_states": {},
+                "current_generation": {
+                    "current_sources": 0,
+                    "current_projection_jobs": 0,
+                    "current_projection_receipts": 0,
+                    "current_receipts_by_backend": {
+                        "graph": 0,
+                        "relational": 0,
+                        "vector": 0,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 0,
+                        "relational": 0,
+                        "vector": 0,
+                    },
+                },
+            }
+
+    citadel = SlowLifecycleCitadel()
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+
+    async def exercise() -> None:
+        first = await server_module._bounded_lifecycle_health(citadel)
+        second = await server_module._bounded_lifecycle_health(citadel)
+        assert first["error_type"] == "TimeoutError"
+        assert second["error_type"] == "TimeoutError"
+        assert citadel.calls == 1
+        current = server_module._LIFECYCLE_HEALTH_TASK
+        assert current is not None
+        assert current[2].done() is False
+        await asyncio.sleep(0.11)
+        completed = await server_module._bounded_lifecycle_health(citadel)
+        assert completed["ok"] is True
+        assert citadel.calls == 1
+        assert server_module._LIFECYCLE_HEALTH_TASK is None
+
+    asyncio.run(exercise())
+
+
+def test_bounded_lifecycle_health_refreshes_an_expired_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"enabled": True, "ok": True, "fresh": True}
+
+    citadel = FakeCitadel()
+    citadel.config = CitadelConfig(lifecycle_enabled=True)
+    monkeypatch.setattr(server_module, "lifecycle_health", lifecycle_health)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE_TTL_SECONDS", 30.0)
+    monkeypatch.setattr(
+        server_module,
+        "_LIFECYCLE_HEALTH_CACHE",
+        (time.monotonic() - 31.0, id(citadel), {"enabled": True, "ok": True}),
+    )
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+
+    result = asyncio.run(server_module._bounded_lifecycle_health(citadel))
+
+    assert result["fresh"] is True
+    assert calls == 1
+
+
+def test_bounded_lifecycle_health_does_not_refresh_a_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.01)
+        return {"enabled": True, "ok": True}
+
+    citadel = FakeCitadel()
+    citadel.config = CitadelConfig(lifecycle_enabled=True)
+    monkeypatch.setattr(server_module, "lifecycle_health", lifecycle_health)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE_TTL_SECONDS", 0.02)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+
+    async def exercise() -> None:
+        timed_out = await server_module._bounded_lifecycle_health(citadel)
+        assert timed_out["error_type"] == "TimeoutError"
+        await asyncio.sleep(0.04)
+        timed_out_again = await server_module._bounded_lifecycle_health(citadel)
+        assert timed_out_again["error_type"] == "TimeoutError"
+        assert calls == 2
+        await asyncio.sleep(0.02)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, TimeoutError])
+def test_bounded_lifecycle_health_clears_a_failed_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[Exception],
+) -> None:
+    citadel = FakeCitadel()
+    citadel.config = CitadelConfig(lifecycle_enabled=True)
+    calls = 0
+
+    def flaky_lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure("probe failed")
+        return {"enabled": True, "ok": True}
+
+    monkeypatch.setattr(server_module, "lifecycle_health", flaky_lifecycle_health)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+
+    async def exercise() -> None:
+        failed = await server_module._bounded_lifecycle_health(citadel)
+        assert failed == {
+            "enabled": True,
+            "ok": False,
+            "error_type": failure.__name__,
+        }
+        assert server_module._LIFECYCLE_HEALTH_TASK is None
+        recovered = await server_module._bounded_lifecycle_health(citadel)
+        assert recovered == {"enabled": True, "ok": True}
+        assert calls == 2
+
+    asyncio.run(exercise())
+
+
+def test_bounded_lifecycle_health_clears_a_cancelled_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    citadel = FakeCitadel()
+    citadel.config = CitadelConfig(lifecycle_enabled=True)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_LIFECYCLE_HEALTH_TASK", None)
+
+    async def exercise() -> None:
+        task = server_module._lifecycle_health_task(citadel)
+        task.cancel()
+        await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            await server_module._bounded_lifecycle_health(citadel)
+        assert server_module._LIFECYCLE_HEALTH_TASK is None
+
+    asyncio.run(exercise())
 
 
 def test_readyz_rejects_inconsistent_complete_corpus_probe(
