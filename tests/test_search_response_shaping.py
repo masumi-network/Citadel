@@ -8,6 +8,7 @@ call down to its ``search_id``. Each test here fails on the pre-fix code.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -20,10 +21,17 @@ from kb.mesh import MeshState
 from kb.search_format import (
     apply_query_ranking,
     filter_hits,
+    is_search_content_hit,
     normalize_search_hit,
     parse_content_header,
+    shape_public_search_hit,
 )
-from kb.server import app, result_provenance, with_result_metadata
+from kb.server import (
+    app,
+    result_provenance,
+    search_across_datasets,
+    with_result_metadata,
+)
 
 
 def repo_doc_text(repo: str, path: str, body: str) -> str:
@@ -79,6 +87,19 @@ class PageCitadel:
         return None
 
 
+class CollisionCitadel:
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        if kwargs["dataset"] == "seat:alice":
+            return [{"type": "IndexSchema", "text": "shared answer"}]
+        return [
+            {
+                "type": "DocumentChunk",
+                "document_id": "central-document",
+                "text": "shared answer",
+            }
+        ]
+
+
 def shaped_client(citadel: Any) -> TestClient:
     app.state.citadel = citadel
     app.state.mesh = MeshState()
@@ -89,6 +110,224 @@ def shaped_client(citadel: Any) -> TestClient:
     response = client.post("/admin/session", json={"access_key": "test-admin"})
     assert response.status_code == 200
     return client
+
+
+def test_public_search_hit_drops_engine_fields_and_keeps_drilldown() -> None:
+    raw = {
+        "id": "chunk-1",
+        "document_id": "document-1",
+        "type": "IndexSchema",
+        "text": "Rotate keys quarterly.",
+        "source_url": "https://example.com/runbook",
+        "source_pipeline": "internal-pipeline",
+        "source_task": "internal-task",
+        "source_node_set": "internal-node-set",
+        "source_user": "default-user@example.invalid",
+        "metadata": {"citadel_tags": ["ops"], "private": "internal"},
+        "_citadel": {
+            "rank": 1,
+            "dataset": "masumi-network",
+            "result_id": "chunk-1",
+            "document_endpoint": "/api/documents/document-1",
+            "retrieval": {"document_drilldown_available": True},
+            "unexpected_internal": "drop-me",
+        },
+    }
+
+    shaped = shape_public_search_hit(raw)
+
+    assert shaped["id"] == "chunk-1"
+    assert shaped["document_id"] == "document-1"
+    assert shaped["qa_id"] == "chunk-1"
+    assert shaped["text"] == "Rotate keys quarterly."
+    assert shaped["source"] == "https://example.com/runbook"
+    assert shaped["tags"] == ["ops"]
+    assert shaped["dataset"] == "masumi-network"
+    assert shaped["_citadel"]["document_endpoint"] == "/api/documents/document-1"
+    forbidden = {
+        "type",
+        "metadata",
+        "source_pipeline",
+        "source_task",
+        "source_node_set",
+        "source_user",
+    }
+    assert forbidden.isdisjoint(shaped)
+    assert "unexpected_internal" not in shaped["_citadel"]
+    assert "projection" not in shaped["_citadel"]
+
+
+def test_public_search_hit_drops_nonfinite_relevance_and_keeps_finite_values() -> None:
+    finite = shape_public_search_hit(
+        {
+            "text": "finite relevance",
+            "_citadel": {
+                "relevance": {"term_coverage": 0.5, "retriever_score": 0.42}
+            },
+        }
+    )
+    assert finite["_citadel"]["relevance"] == {
+        "term_coverage": 0.5,
+        "retriever_score": 0.42,
+    }
+
+    nonfinite = shape_public_search_hit(
+        {
+            "text": "nonfinite relevance",
+            "_citadel": {
+                "relevance": {
+                    "term_coverage": float("inf"),
+                    "retriever_score": float("nan"),
+                }
+            },
+        }
+    )
+    relevance = nonfinite["_citadel"]["relevance"]
+    assert "term_coverage" not in relevance
+    assert "retriever_score" not in relevance
+
+
+def test_typed_search_content_requires_a_document_identity() -> None:
+    valid_index = {
+        "type": "IndexSchema",
+        "document_id": "document-1",
+        "text": "A source-backed chunk.",
+    }
+    valid_chunk = {
+        "type": "DocumentChunk",
+        "document_id": "document-1",
+        "text": "A production source-backed chunk.",
+    }
+    engine_row = {
+        "type": "IndexSchema",
+        "text": "Internal index schema row",
+        "source_user": "default-user@example.invalid",
+    }
+    other_typed_row = {
+        "type": "TextDocument",
+        "document_id": "document-1",
+        "text": "Internal document node",
+    }
+
+    assert is_search_content_hit(valid_index) is True
+    assert is_search_content_hit(valid_chunk) is True
+    assert is_search_content_hit(engine_row) is False
+    assert is_search_content_hit(other_typed_row) is False
+    assert is_search_content_hit({"type": "IndexSchema", "document_id": "document-1"}) is False
+
+
+def test_invalid_primary_row_cannot_hide_valid_secondary_hit() -> None:
+    merged = asyncio.run(
+        search_across_datasets(
+            CollisionCitadel(),
+            query="shared answer",
+            datasets=["seat:alice", "central"],
+            sessions={},
+            top_k=5,
+        )
+    )
+
+    assert merged == [
+        (
+            "central",
+            {
+                "type": "DocumentChunk",
+                "document_id": "central-document",
+                "text": "shared answer",
+            },
+        )
+    ]
+
+
+def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
+    document_id = "0c9d5df0-0000-4000-8000-000000000002"
+    raw = {
+        "id": "0c9d5df0-0000-4000-8000-000000000001",
+        "created_at": 1782742208187,
+        "updated_at": 1782742208187,
+        "version": 1,
+        "type": "DocumentChunk",
+        "text": "synthetic chunk body",
+        "chunk_index": 0,
+        "document_id": document_id,
+        "document_name": "text_0123456789abcdef0123456789abcdef",
+        "metadata": {"index_fields": ["text"]},
+        "_citadel": {
+            "content_hint": "unclassified",
+            "content_sha256": "0" * 64,
+            "dataset": "seat:synthetic",
+            "doc_type": "other",
+            "document_endpoint": f"/api/documents/{document_id}",
+            "provenance": {},
+            "rank": 1,
+            "result_id": "0c9d5df0-0000-4000-8000-000000000001",
+        },
+    }
+
+    response = shaped_client(PageCitadel([raw])).post(
+        "/search",
+        json={"query": "synthetic chunk", "top_k": 5},
+    )
+
+    assert response.status_code == 200
+    hits = response.json()["results"]
+    assert hits
+    assert hits[0]["text"] == "synthetic chunk body"
+    assert hits[0]["document_id"] == document_id
+
+
+def test_public_shape_keeps_validated_lifecycle_receipt_identity() -> None:
+    promoted = with_result_metadata(
+        {
+            "type": "DocumentChunk",
+            "document_id": "document-1",
+            "text": "projected content",
+            "_lifecycle": {
+                "source_revision_id": "source-1",
+                "projection_receipt_id": "receipt-1",
+                "generation_id": "generation-1",
+                "backend": "vector",
+                "provider": "qdrant",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+                "private": "drop-me",
+            },
+        },
+        0,
+        "notes",
+    )
+
+    shaped = shape_public_search_hit(promoted)
+    envelope = shaped["_citadel"]
+    assert envelope["source_revision_id"] == "source-1"
+    assert envelope["projection_receipt_id"] == "receipt-1"
+    assert envelope["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "vector",
+        "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
+    assert "private" not in envelope["projection"]
+
+
+def test_public_search_shape_rejects_malformed_engine_values() -> None:
+    for value in (None, 7, ["internal"], {"type": ["IndexSchema"], "text": "internal"}):
+        assert is_search_content_hit(value) is False
+
+    malformed = shape_public_search_hit(
+        {
+            "id": {"private": "value"},
+            "document_id": ["private"],
+            "text": "public content",
+            "_citadel": {"rank": "first", "dataset": ["private"]},
+        },
+        index=2,
+    )
+    assert malformed["id"] is None
+    assert malformed["document_id"] is None
+    assert malformed["rank"] == 3
+    assert malformed["dataset"] is None
 
 
 # --- defect 1: provenance was empty on 117 of 117 hits ----------------------

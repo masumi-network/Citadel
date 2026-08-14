@@ -76,7 +76,14 @@ class FakeCitadel:
         }
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
-        return [{"query": query, "dataset": kwargs["dataset"], "top_k": kwargs["top_k"]}]
+        return [
+            {
+                "query": query,
+                "dataset": kwargs["dataset"],
+                "top_k": kwargs["top_k"],
+                "text": f"{query} result",
+            }
+        ]
 
     documents: dict[str, dict[str, Any]] = {}
 
@@ -1177,7 +1184,9 @@ def test_api_uses_configured_citadel_service() -> None:
     assert ingest.json()["tags"] == ["research"]
     assert search.status_code == 200
     search_hit = search.json()["results"][0]
-    assert search_hit["top_k"] == 3
+    assert search_hit["text"] == "useful result"
+    assert "query" not in search_hit
+    assert "top_k" not in search_hit
     assert search_hit["id"].startswith("chunk:")
     assert search_hit["_citadel"]["rank"] == 1
     assert search_hit["_citadel"]["dataset"] == "notes"
@@ -1912,6 +1921,8 @@ def test_search_view_groups_central_before_node() -> None:
     assert '"/api/access/self"' in app_js
     assert '"/api/access/self/tokens"' in app_js
     assert "/api/access/self/tokens/${encodeURIComponent(tokenId)}/revoke" in app_js
+    assert "placed.add(searchResultKey(hit))" in app_js
+    assert "!placed.has(searchResultKey(hit))" in app_js
     assert "Search results" in app_page
 
 
@@ -3450,7 +3461,7 @@ def test_search_across_datasets_runs_concurrently() -> None:
             order.append(("start", dataset))
             await aio.sleep(0.05)
             order.append(("end", dataset))
-            return [{"id": dataset}]
+            return [{"id": dataset, "text": dataset}]
 
     merged = aio.run(
         search_across_datasets(
@@ -4748,10 +4759,21 @@ class KnowledgeCitadel(FakeCitadel):
     async def search(self, query: str, **kwargs: Any) -> list[Any]:
         return [
             {
+                "id": "rotate-keys-chunk",
+                "document_id": "rotate-keys-document",
                 "text": "Rotate keys quarterly",
                 "source_url": "https://example.com/runbook",
                 "score": 0.92,
-                "metadata": {"citadel_tags": ["ops"]},
+                "metadata": {"citadel_tags": ["ops"], "private": "internal"},
+                "source_pipeline": "internal-pipeline",
+                "source_task": "internal-task",
+                "source_node_set": "internal-node-set",
+                "source_user": "default-user@example.invalid",
+            },
+            {
+                "type": "IndexSchema",
+                "text": "Internal index schema row",
+                "source_user": "default-user@example.invalid",
             },
             "bare string result",
         ]
@@ -4933,17 +4955,24 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     app.state.citadel = KnowledgeCitadel()
 
     response = client.get("/api/knowledge", params={"q": "rotate keys", "limit": 5})
+    search = client.post("/search", json={"query": "rotate keys", "top_k": 5})
 
     assert response.status_code == 200
+    assert search.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
     assert payload["query"] == "rotate keys"
-    assert payload["results"][0] == {
-        "text": "Rotate keys quarterly",
-        "source": "https://example.com/runbook",
-        "score": 0.92,
-        "tags": ["ops"],
-    }
+    assert [set(result) for result in payload["results"]] == [
+        set(result) for result in search.json()["results"]
+    ]
+    assert len(payload["results"]) == 2
+    assert payload["results"][0]["text"] == "Rotate keys quarterly"
+    assert payload["results"][0]["source"] == "https://example.com/runbook"
+    assert payload["results"][0]["score"] == 0.92
+    assert payload["results"][0]["tags"] == ["ops"]
+    assert payload["results"][0]["document_id"] == "rotate-keys-document"
+    assert "metadata" not in payload["results"][0]
+    assert "source_user" not in payload["results"][0]
     assert payload["results"][1]["text"] == "bare string result"
     assert payload["results"][1]["source"] is None
 
@@ -5015,10 +5044,74 @@ class MultiSearchCitadel(FakeCitadel):
             {
                 "query": query,
                 "dataset": dataset,
+                "type": "DocumentChunk",
+                "document_id": f"document-{dataset}",
                 "text": f"{query} in {dataset}",
                 "top_k": kwargs["top_k"],
             }
         ]
+
+
+class FinalPageCitadel(FakeCitadel):
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        dataset = kwargs["dataset"]
+
+        def chunk(identifier: str, text: str) -> dict[str, Any]:
+            return {
+                "id": identifier,
+                "document_id": f"document-{identifier}",
+                "type": "DocumentChunk",
+                "text": text,
+            }
+
+        if query == "needle":
+            if dataset == "masumi-network":
+                rows = [chunk("central-exact", "needle central exact match")]
+            elif dataset.startswith("seat:"):
+                rows = [chunk("node-unrelated", "unrelated node material")]
+            else:
+                rows = []
+        elif query == "filter dedup":
+            if dataset == "masumi-network":
+                central = chunk("central-filter", "shared filtered text")
+                central["repo"] = "masumi-network/central"
+                rows = [central]
+            elif dataset.startswith("seat:"):
+                rows = [chunk("node-filter", "shared filtered text")]
+            else:
+                rows = []
+        elif query == "nested identity":
+            if dataset.startswith("seat:"):
+                nested = chunk("nested-result", "nested identity content")
+                nested["id"] = {"private_marker": "PRIVATE_MARKER"}
+                rows = [nested]
+            else:
+                rows = []
+        elif query == "nonfinite values":
+            if dataset.startswith("seat:"):
+                nan_row = chunk("nan-result", "nonfinite nan content")
+                nan_row["score"] = float("nan")
+                nan_row["_citadel"] = {
+                    "relevance": {"term_coverage": float("inf")}
+                }
+                infinite_row = chunk("infinite-result", "nonfinite infinite content")
+                infinite_row["score"] = float("inf")
+                rows = [nan_row, infinite_row]
+            else:
+                rows = []
+        elif dataset == "masumi-network":
+            rows = [
+                chunk(f"central-{index}", f"architecture central {index}")
+                for index in range(8)
+            ]
+        elif dataset.startswith("seat:"):
+            rows = [
+                chunk(f"node-{index}", f"architecture node {index}")
+                for index in range(8)
+            ]
+        else:
+            rows = []
+        return rows[: kwargs["top_k"]]
 
 
 class TrackingCitadel(FakeCitadel):
@@ -5375,7 +5468,7 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     )
     knowledge = api_client.get(
         "/api/knowledge",
-        params={"q": "architecture", "limit": 5},
+        params={"q": "architecture", "limit": 2},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -5401,6 +5494,8 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     }
 
     assert knowledge.status_code == 200
+    assert len(knowledge.json()["results"]) == 2
+    assert [result["rank"] for result in knowledge.json()["results"]] == [1, 2]
     assert knowledge.json()["datasets"] == [
         "seat:bob",
         "masumi-network",
@@ -5408,6 +5503,156 @@ def test_seat_token_searches_node_and_central(tmp_path: Any) -> None:
     ]
     assert "sections" in payload
     assert payload["sections"]["session_traces"]
+
+
+def test_seat_search_pages_include_central_results(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    search = api_client.post(
+        "/search", json={"query": "architecture patterns", "top_k": 5}, headers=headers
+    )
+    knowledge = api_client.get(
+        "/api/knowledge",
+        params={"q": "architecture patterns", "limit": 5},
+        headers=headers,
+    )
+
+    assert search.status_code == 200
+    assert knowledge.status_code == 200
+    for response in (search, knowledge):
+        results = response.json()["results"]
+        assert len(results) == 5
+        assert any(result["dataset"] == "masumi-network" for result in results)
+        assert len({result["id"] for result in results}) == 5
+
+
+def test_seat_search_top_one_prefers_exact_central_result(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    search = api_client.post(
+        "/search", json={"query": "needle", "top_k": 1}, headers=headers
+    )
+    knowledge = api_client.get(
+        "/api/knowledge", params={"q": "needle", "limit": 1}, headers=headers
+    )
+
+    assert search.status_code == 200
+    assert knowledge.status_code == 200
+    search_result = search.json()["results"]
+    knowledge_result = knowledge.json()["results"]
+    assert len(search_result) == len(knowledge_result) == 1
+    assert (search_result[0]["id"], search_result[0]["dataset"]) == (
+        "central-exact",
+        "masumi-network",
+    )
+    assert (knowledge_result[0]["id"], knowledge_result[0]["dataset"]) == (
+        "central-exact",
+        "masumi-network",
+    )
+
+
+def test_search_filter_keeps_central_duplicate_when_node_lacks_identity(
+    tmp_path: Any,
+) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+
+    response = api_client.post(
+        "/search",
+        json={
+            "query": "filter dedup",
+            "top_k": 1,
+            "repo": "masumi-network/central",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"]
+    assert len(result) == 1
+    assert (result[0]["id"], result[0]["dataset"]) == (
+        "central-filter",
+        "masumi-network",
+    )
+
+
+def test_search_sanitizes_nested_result_identity(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+
+    response = api_client.post(
+        "/search",
+        json={"query": "nested identity", "top_k": 1},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    result = payload["results"][0]
+    assert isinstance(result["id"], str)
+    assert isinstance(result["qa_id"], str)
+    assert isinstance(result["_citadel"]["result_id"], str)
+    assert "PRIVATE_MARKER" not in response.text
+    assert "PRIVATE_MARKER" not in json.dumps(payload)
+
+
+def test_search_omits_nonfinite_values_on_both_read_routes(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = FinalPageCitadel()
+    api_client = TestClient(app, base_url="https://testserver")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    responses = [
+        api_client.post(
+            "/search",
+            json={"query": "nonfinite values", "top_k": 5},
+            headers=headers,
+        ),
+        api_client.get(
+            "/api/knowledge",
+            params={"q": "nonfinite values", "limit": 5},
+            headers=headers,
+        ),
+    ]
+
+    for response in responses:
+        assert response.status_code == 200
+        payload = response.json()
+        assert "NaN" not in response.text
+        assert "Infinity" not in response.text
+        assert payload["results"]
+        for result in payload["results"]:
+            assert result.get("score") is None
+            relevance = result.get("_citadel", {}).get("relevance", {})
+            assert "retriever_score" not in relevance
 
 
 def test_seat_cannot_recall_another_seats_session(tmp_path: Any) -> None:
