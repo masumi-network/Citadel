@@ -19,15 +19,13 @@ import type { NextConfig } from "next";
  * at all. That is the whole reason /next can send the site's strict policy
  * unchanged instead of asking for an exemption. See web/README.md.
  */
-const isDev = process.env.NODE_ENV === "development";
-
 const nextConfig: NextConfig = {
   output: "export",
 
-  // Production export is served by FastAPI at /next. `next dev` drops the
-  // prefix so the same <a href="/info"> links resolve on localhost:3000.
-  // The committed export still prefixes every asset with /next.
-  basePath: isDev ? "" : "/next",
+  // Served at /next while the hand-written pages keep serving /. Every asset
+  // URL Next generates is prefixed with this, so the export drops straight
+  // into kb/webui/ and mounts there. kb/server.py pins the same string.
+  basePath: "/next",
 
   // next/image's default loader wants a server to resize on. There is none.
   images: { unoptimized: true },

@@ -366,33 +366,12 @@ class FakeLearningAgent:
         }
 
 
-class FakeRepoContentSyncer:
-    async def status(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "enabled": True,
-            "source_type": "github_repo_content",
-            "tracked_files": 0,
-        }
-
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "enabled": True,
-            "files_ingested": 0,
-            "files_skipped": 0,
-            "improved": not dry_run,
-            "dry_run": dry_run,
-        }
-
-
 def authed_client(access_key: str = "test-admin") -> TestClient:
     app.state.citadel = FakeCitadel()
     app.state.mesh = MeshState()
     app.state.github_syncer = FakeGitHubSyncer()
     app.state.linear_syncer = FakeLinearSyncer()
     app.state.learning_agent = FakeLearningAgent()
-    app.state.repo_content_syncer = FakeRepoContentSyncer()
     # Keep knowledge-conflict state out of the repo-local .citadel directory.
     app.state.conflict_store = KnowledgeConflictStore(
         Path(tempfile.mkdtemp()) / "conflicts.json"
@@ -1402,45 +1381,6 @@ def test_api_uses_configured_citadel_service() -> None:
     # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
     assert updated_mesh.json()["stats"]["since_restart"]["feedback"] >= 2
     assert upgrade.status_code == 200
-
-
-def test_authed_client_ignores_on_disk_repo_content_files(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    """Laptop `.citadel/repo_content_sync_state.json` must not change mesh stats.
-
-    `tracked_sources` is github repos + repo-content files + linear issues.
-    Without a stubbed syncer, a real RepoContentSyncer reads the config path.
-    CI has an empty tree (5). A laptop with 90 tracked files reports 95.
-    This plants 90 files on the path the real syncer would use, so dropping
-    `app.state.repo_content_syncer = FakeRepoContentSyncer()` turns it red
-    on CI too. It does not write into the developer's `.citadel` directory.
-    """
-    from dataclasses import replace
-
-    state_path = tmp_path / "repo_content_sync_state.json"
-    state_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "files": {f"org/repo/file-{i}.md": {"sha": "x"} for i in range(90)},
-            }
-        ),
-        encoding="utf-8",
-    )
-    original = FakeCitadel.config
-    FakeCitadel.config = replace(
-        original, repo_content_sync_state_path=str(state_path)
-    )
-    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
-    try:
-        client = authed_client()
-        mesh = client.get("/api/mesh")
-        assert mesh.status_code == 200
-        assert mesh.json()["stats"]["tracked_sources"] == 5
-        assert isinstance(app.state.repo_content_syncer, FakeRepoContentSyncer)
-    finally:
-        FakeCitadel.config = original
 
 
 def test_learning_agent_run_audit_records_gateway_skip_reason() -> None:

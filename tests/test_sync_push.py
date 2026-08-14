@@ -50,42 +50,6 @@ def test_format_commit_snapshot_includes_metadata() -> None:
     assert "should-not-appear" not in note
 
 
-def test_build_commit_snapshot_omits_denied_env_paths(monkeypatch: Any) -> None:
-    """Pre-push must not list `.env` paths in the snapshot it POSTs.
-
-    The hook sends metadata, not file bytes. The glob still has to drop the
-    path. Mocking `_changed_files` keeps git out of it; removing the filter
-    call in `build_commit_snapshot` turns this red.
-    """
-    monkeypatch.setattr(sync_push, "git_toplevel", lambda cwd="": "/tmp/repo")
-    monkeypatch.setattr(
-        sync_push,
-        "_commit_fields",
-        lambda cwd, sha: {
-            "hash": "a" * 40,
-            "short": "abc1234",
-            "author": "Ada",
-            "email": "ada@example.invalid",
-            "committed_at": "2026-08-14 12:00:00 +0000",
-            "subject": "chore: local config",
-            "body": "",
-        },
-    )
-    monkeypatch.setattr(
-        sync_push,
-        "_changed_files",
-        lambda cwd, sha: [".env", "kb/foo.py", "secrets/prod.pem"],
-    )
-    monkeypatch.setattr(sync_push, "_repo_name", lambda cwd: "Citadel-Archive")
-    monkeypatch.setattr(sync_push, "_git_branch", lambda cwd: "main")
-
-    note = sync_push.build_commit_snapshot("/tmp/repo", "a" * 40)
-
-    assert "kb/foo.py" in note
-    assert ".env" not in note
-    assert "secrets/prod.pem" not in note
-
-
 def test_missing_token_no_post(monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
     recorder: list[Any] = []

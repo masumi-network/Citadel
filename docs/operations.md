@@ -22,24 +22,13 @@ overview and quick start, see the [README](../README.md).
 
 ## Deployment (Railway)
 
-[CORRECTED 2026-08-14] `railway.toml` for the web service is
-`startCommand = "python -m kb.lite_runtime"` (`railway.toml:13`) with
-`healthcheckPath = "/health/ready"` and `healthcheckTimeout = 300`. Lite
-defaults in `kb/lite_runtime.py:77-82` are `DB_PROVIDER=sqlite`,
-`GRAPH_DATABASE_PROVIDER=ladybug`, `VECTOR_DB_PROVIDER=qdrant`. Other Railway
-services may still select `scripts.run_railway` job modes in their own config
-(github-sync, backup-mirror, pipeline). Do not start the published web image
-with `python -m scripts.run_railway` as the web entry. That is the command that
-failed the 2026-08-11 cutover when `scripts/` was not importable.
+The repo includes `railway.toml`. The entry command is `python -m
+scripts.run_railway`; `CITADEL_RUN_MODE` selects the role (`web` default,
+`pipeline`, `learning-agent`, `linear-sync`, `backup-mirror`). The web service
+runs `uvicorn kb.server:app --host 0.0.0.0 --port $PORT`. Dependencies install
+from `requirements.txt`, so a new runtime dependency must be added there.
 
-The Postgres + pgvector + Kuzu shape below is a self-host option. It is not
-the live Railway web profile as of 2026-08-14.
-
-Dependencies for the image still need to be listed where the Dockerfile and
-`pyproject.toml` install them. A new runtime dependency must be added there.
-
-Recommended first deployment shape for a **Postgres self-host** (not current
-Railway Lite):
+Recommended first deployment shape:
 
 - One web service for this repository.
 - One cron service for daily GitHub syncs (`CITADEL_RUN_MODE=learning-agent`).

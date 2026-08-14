@@ -147,7 +147,7 @@
   fetch("/api/state", { headers: { "Accept": "application/json" } })
     .then(function (r) { if (!r.ok) throw new Error("state " + r.status); return r.json(); })
     .then(function (d) {
-      var ver = vlabel(d.version) || "v0.5.0";
+      var ver = vlabel(d.version) || "v0.4.1";
       set("m-version", ver);
       var healthEl = document.getElementById("pill-health");
       var healthText = document.getElementById("pill-health-text");
@@ -194,13 +194,13 @@
 
       var upd = rel(d.updated_at);
       set("state-updated", "Live tiles updated" + (upd ? " " + upd : "") + "." +
-        repoNote + " Releases are as of v0.5.0, 2026-08-14.");
+        repoNote + " Releases are as of v0.4.1, 2026-08-06.");
       set("foot-note", "State-of-the-vault report · live tiles from /api/state" +
-        (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.5.0.");
+        (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.4.1.");
     })
     .catch(function () {
       set("m-docs", "—");
       set("m-docs-sub", "GitHub org sync (live data unavailable)");
-      set("state-updated", "Live data unavailable right now. Showing the last published repo figures, as of v0.5.0, 2026-08-14.");
+      set("state-updated", "Live data unavailable right now. Showing the last published repo figures, as of v0.4.1, 2026-08-06.");
     });
 })();

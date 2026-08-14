@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any
 
 DEFAULT_ORG_CAPTURE_DENY_GLOBS: tuple[str, ...] = (
@@ -50,40 +49,6 @@ def merged_deny_globs(
         parts.extend(DEFAULT_ORG_CAPTURE_DENY_GLOBS)
     parts.extend(seat_deny_globs)
     return normalize_deny_globs(parts)
-
-
-def path_is_denied(path: str, globs: tuple[str, ...] | None = None) -> bool:
-    """True when ``path`` matches a deny glob on the posix path or its basename.
-
-    ``fnmatch("/abs/.env", ".env")`` is false. GitHub blob URLs and
-    ``github:org/repo:path:…`` locators are reduced to the file path first.
-    """
-    from fnmatch import fnmatchcase
-    from urllib.parse import urlsplit
-
-    raw = path.strip()
-    if not raw:
-        return False
-    patterns = DEFAULT_ORG_CAPTURE_DENY_GLOBS if globs is None else globs
-    posix = raw.replace("\\", "/")
-    if posix.startswith("file://"):
-        posix = posix[7:]
-    candidates: set[str] = {posix, Path(posix).name}
-    if ":path:" in posix:
-        rest = posix.rsplit(":path:", 1)[-1]
-        candidates.add(rest)
-        candidates.add(Path(rest).name)
-    if "://" in posix:
-        url_path = urlsplit(posix).path.lstrip("/")
-        if url_path:
-            candidates.add(url_path)
-            candidates.add(Path(url_path).name)
-    return any(
-        fnmatchcase(candidate, pattern)
-        for pattern in patterns
-        for candidate in candidates
-        if candidate
-    )
 
 
 def capture_policy_payload(

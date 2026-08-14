@@ -25,12 +25,6 @@ Citadel is a FastAPI application with several subsystems around a knowledge engi
                     Cognee (knowledge engine)
 ```
 
-[CORRECTED 2026-08-14] The boxes above are the older Postgres + pgvector + Kuzu
-sketch. The Railway web service at `railway.toml` starts `python -m
-kb.lite_runtime`. Lite defaults (`kb/lite_runtime.py:77-82`) are SQLite,
-Qdrant, and Ladybug. `.env.example` still shows pgvector and kuzu as examples.
-Self-hosting that older shape is documented in [`operations.md`](operations.md).
-
 | Layer | Role |
 |---|---|
 | **Seat** | One licensed team member (Principal). Admin creates the seat before any tokens. |
