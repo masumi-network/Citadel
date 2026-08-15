@@ -3946,9 +3946,14 @@ async def test_graph_totals_enrichment_unlocks_mesh_stats(
     app.state.repo_content_syncer = IdleSyncer()
     app.state.linear_syncer = IdleSyncer()
 
+    before = set(server_module._BACKGROUND_TASKS)
     unenriched = await server_module._corpus_health()
     assert "indexed_edges" not in unenriched
-    pending = [task for task in server_module._BACKGROUND_TASKS if not task.done()]
+    pending = [
+        task
+        for task in server_module._BACKGROUND_TASKS
+        if task not in before and not task.done()
+    ]
     if pending:
         await asyncio.wait(pending)
 
@@ -4519,6 +4524,7 @@ def test_corpus_health_cache_is_shared_by_readyz_and_mesh(
     assert calls == 1
 
 
+@pytest.mark.asyncio
 async def test_corpus_health_deduplicates_concurrent_probes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4552,7 +4558,7 @@ async def test_corpus_health_deduplicates_concurrent_probes(
             self.cognee = MeasuredCorpus()
 
         async def _graph_counts(self) -> dict[str, int]:
-            return {"nodes": 1, "edges": 1}
+            return {"nodes": 16000, "edges": 50000}
 
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
     app.state.citadel = MeasuredCitadel()
@@ -4560,12 +4566,30 @@ async def test_corpus_health_deduplicates_concurrent_probes(
     app.state.repo_content_syncer = Syncer()
     app.state.linear_syncer = Syncer()
 
-    first, second = await asyncio.gather(
-        server_module._corpus_health(), server_module._corpus_health()
-    )
+    before = set(server_module._BACKGROUND_TASKS)
+    try:
+        first, second = await asyncio.gather(
+            server_module._corpus_health(), server_module._corpus_health()
+        )
 
-    assert calls == 1
-    assert first == second
+        assert calls == 1
+        # Graph fill is distinct from the probe. Concurrent waiters must keep
+        # the relational snapshot, not a mix of probe vs enriched cache.
+        assert first["indexed_docs"] == 1
+        assert second["indexed_docs"] == 1
+        assert "indexed_edges" not in first
+        assert "indexed_edges" not in second
+        assert first == second
+    finally:
+        leftover = [
+            task
+            for task in server_module._BACKGROUND_TASKS
+            if task not in before and not task.done()
+        ]
+        for task in leftover:
+            task.cancel()
+        if leftover:
+            await asyncio.gather(*leftover, return_exceptions=True)
 
 
 def test_readyz_rejects_measured_empty_corpus_when_sources_are_tracked(

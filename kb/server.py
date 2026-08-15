@@ -4925,7 +4925,9 @@ def _schedule_graph_totals_enrichment(
 
     The bounded relational probe is the readiness signal (#280). `/api/mesh`
     still wants exact graph volume for `stats.edges`, so a background read
-    enriches the same cache after the probe returns.
+    enriches the same cache after the probe returns. Call this after
+    `_CORPUS_HEALTH_LOCK` is released so waiters queued on that probe copy
+    the unenriched snapshot before this task replaces the cache.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -4961,7 +4963,7 @@ def _schedule_graph_totals_enrichment(
     task.add_done_callback(_forget_background_task)
 
 
-async def _corpus_health_impl() -> dict[str, Any]:
+async def _corpus_health_impl() -> tuple[dict[str, Any], tuple[tuple[int, ...], Any] | None]:
     """Data-plane volume gate using exact relational projection measurements. (#27)
 
     A failed measurement is a readiness failure, not an empty or healthy
@@ -4994,7 +4996,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
             and _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0
             and time.monotonic() - cached[0] < _CORPUS_HEALTH_CACHE_TTL_SECONDS
         ):
-            return dict(cached[2])
+            return dict(cached[2]), None
 
         tracked = 0
         github_status = await github_syncer.status()
@@ -5071,9 +5073,11 @@ async def _corpus_health_impl() -> dict[str, Any]:
             }
             if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
                 cached = _cache_corpus_health_result(cache_key, result)
-                _schedule_graph_totals_enrichment(cache_key, citadel)
-                return cached
-            return result
+                # Copy. The live cache entry is replaced when graph totals land.
+                # Schedule that fill after `_CORPUS_HEALTH_LOCK` is released so
+                # waiters queued on this probe copy the same snapshot first.
+                return dict(cached), (cache_key, citadel)
+            return result, None
 
         # Preserve the old method-boundary fallback for local fakes and older
         # clients that do not expose the bounded probe yet.
@@ -5092,8 +5096,8 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "indexed_edges": edges,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            return _cache_corpus_health_result(cache_key, result)
-        return result
+            return dict(_cache_corpus_health_result(cache_key, result)), None
+        return result, None
     except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
         # Class name only, in the log and in the payload: /readyz embeds this
         # dict verbatim for any reader-scoped caller, and exception text can
@@ -5110,14 +5114,17 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "degraded": exc.__class__.__name__,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            return _cache_corpus_health_result(cache_key, result)
-        return result
+            return dict(_cache_corpus_health_result(cache_key, result)), None
+        return result, None
 
 
 async def _corpus_health() -> dict[str, Any]:
     """Serialize uncached corpus probes so concurrent readiness checks share work."""
     async with _CORPUS_HEALTH_LOCK:
-        return await _corpus_health_impl()
+        result, enrich = await _corpus_health_impl()
+    if enrich is not None:
+        _schedule_graph_totals_enrichment(*enrich)
+    return result
 
 
 def _corpus_health_task() -> asyncio.Task[dict[str, Any]]:
