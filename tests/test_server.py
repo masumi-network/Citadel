@@ -657,6 +657,50 @@ def test_lifecycle_health_rejects_unsearchable_current_generation() -> None:
     ]
 
 
+def test_lifecycle_health_ignores_in_flight_jobs_for_searchable_census() -> None:
+    """Pending current-generation jobs are not a searchable gap.
+
+    Live /readyz went 503 with current_generation_searchable_census_mismatch
+    while the drain still held work. Same family as #273/#286: in-flight is
+    not a hole. Completed-but-unsearchable still fails, covered by the
+    sibling test without job_states.
+    """
+
+    class InFlightGenerationCitadel(FakeCitadel):
+        config = CitadelConfig(lifecycle_enabled=True)
+
+        def lifecycle_census(self) -> dict[str, Any]:
+            return {
+                "source_revisions": 2,
+                "projection_jobs": 2,
+                "projection_receipts": 6,
+                "job_states": {"completed": 1, "pending": 1},
+                "receipt_states": {"searchable": 3, "pending": 3},
+                "current_generation": {
+                    "current_sources": 2,
+                    "current_projection_jobs": 2,
+                    "current_projection_receipts": 6,
+                    "current_job_states": {"completed": 1, "pending": 1},
+                    "current_receipt_states": {"searchable": 3, "pending": 3},
+                    "current_receipts_by_backend": {
+                        "graph": 2,
+                        "relational": 2,
+                        "vector": 2,
+                    },
+                    "current_searchable_by_backend": {
+                        "graph": 1,
+                        "relational": 1,
+                        "vector": 1,
+                    },
+                },
+            }
+
+    result = server_module.lifecycle_health(InFlightGenerationCitadel())
+
+    assert result["ok"] is True
+    assert result["invariant_errors"] == []
+
+
 def test_lifecycle_health_rejects_incomplete_current_generation() -> None:
     class IncompleteGenerationCitadel(FakeCitadel):
         config = CitadelConfig(lifecycle_enabled=True)
@@ -3725,9 +3769,202 @@ def test_readyz_does_not_use_graph_nodes_as_projection_health(
 
     assert ready.status_code == 503
     corpus = ready.json()["corpus"]
-    assert corpus["indexed_docs"] == 280
+    assert corpus["indexed_docs"] == 2
     assert corpus["probe_fully_indexed_documents"] == 0
     assert corpus["probe_ok"] is False
+
+
+def test_readyz_does_not_wait_on_full_graph_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#280: the bounded probe is enough; graph_data() must not hold /readyz."""
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 2,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 2,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 2,
+                "probe_ok": True,
+            }
+
+    class SlowGraphCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(0.2)
+            return {"nodes": 16000, "edges": 50000}
+
+    class IdleSyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = SlowGraphCitadel()
+    app.state.github_syncer = IdleSyncer()
+    app.state.repo_content_syncer = IdleSyncer()
+    app.state.linear_syncer = IdleSyncer()
+
+    started = time.perf_counter()
+    ready = client.get("/readyz")
+    elapsed = time.perf_counter() - started
+
+    assert ready.status_code == 200
+    assert elapsed < 0.15
+    corpus = ready.json()["corpus"]
+    assert corpus["ok"] is True
+    assert corpus["indexed_docs"] == 2
+    assert corpus["probe_ok"] is True
+    assert "indexed_edges" not in corpus
+
+
+def test_api_mesh_does_not_publish_projection_counts_before_graph_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unenriched probe cache must not become silent understated mesh totals.
+
+    After #280, /readyz caches relational ``indexed_docs`` and omits
+    ``indexed_edges``, then fills graph volume in the background. /api/mesh
+    used to map that payload onto ``stats.nodes`` / ``stats.edges`` and fall
+    back to the in-memory projection without marking the corpus unknown.
+    """
+
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            assert limit == server_module._CORPUS_HEALTH_PROBE_LIMIT
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 2,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 2,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 2,
+                "probe_ok": True,
+            }
+
+    class SlowGraphCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            await asyncio.sleep(0.2)
+            return {"nodes": 16000, "edges": 50000}
+
+    class IdleSyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    client = authed_client("test-reader")
+    app.state.citadel = SlowGraphCitadel()
+    app.state.github_syncer = IdleSyncer()
+    app.state.repo_content_syncer = IdleSyncer()
+    app.state.linear_syncer = IdleSyncer()
+    mesh = app.state.mesh
+    for i in range(3):
+        mesh.edges[f"probe-{i}"] = {
+            "id": f"probe-{i}",
+            "source": "a",
+            "target": "b",
+        }
+
+    started = time.perf_counter()
+    ready = client.get("/readyz")
+    ready_elapsed = time.perf_counter() - started
+    mesh_body = client.get("/api/mesh").json()
+    stats = mesh_body["stats"]
+    projection_edges = stats["since_restart"]["projection_edges"]
+
+    assert ready.status_code == 200
+    assert ready_elapsed < 0.15
+    assert "indexed_edges" not in ready.json()["corpus"]
+    assert projection_edges >= 3
+    assert stats["edges"] != projection_edges
+    assert stats["edges"] is None
+    assert stats["nodes"] != 2
+    assert stats["nodes"] is None
+    indexes = {index["id"]: index for index in mesh_body["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["graph"]["records"] is None
+
+
+@pytest.mark.asyncio
+async def test_graph_totals_enrichment_unlocks_mesh_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MeasuredCorpus:
+        async def corpus_health(self, *, limit: int) -> dict[str, Any]:
+            return {
+                "relational_documents": 2,
+                "probe_limit": 64,
+                "probe_max_documents": 10000,
+                "probe_documents": 2,
+                "probe_pages": 1,
+                "probe_complete": True,
+                "probe_cap_exceeded": False,
+                "probe_chunked_documents": 2,
+                "probe_graph_documents": 2,
+                "probe_fully_indexed_documents": 2,
+                "probe_ok": True,
+            }
+
+    class FastGraphCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.cognee = MeasuredCorpus()
+
+        async def _graph_counts(self) -> dict[str, int]:
+            return {"nodes": 16000, "edges": 50000}
+
+    class IdleSyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"tracked_repositories": 0, "tracked_files": 0, "issue_count": 0}
+
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TASK", None)
+    monkeypatch.setattr(server_module, "_CORPUS_HEALTH_TIMEOUT_SECONDS", 0)
+    app.state.citadel = FastGraphCitadel()
+    app.state.mesh = MeshState()
+    app.state.github_syncer = IdleSyncer()
+    app.state.repo_content_syncer = IdleSyncer()
+    app.state.linear_syncer = IdleSyncer()
+
+    before = set(server_module._BACKGROUND_TASKS)
+    unenriched = await server_module._corpus_health()
+    assert "indexed_edges" not in unenriched
+    pending = [
+        task
+        for task in server_module._BACKGROUND_TASKS
+        if task not in before and not task.done()
+    ]
+    if pending:
+        await asyncio.wait(pending)
+
+    enriched = await server_module._corpus_health()
+    assert enriched["indexed_docs"] == 16000
+    assert enriched["indexed_edges"] == 50000
+    snapshot = await app.state.mesh.snapshot(
+        app.state.citadel.config, corpus=enriched
+    )
+    assert snapshot["stats"]["nodes"] == 16000
+    assert snapshot["stats"]["edges"] == 50000
 
 
 def test_readyz_rejects_a_partial_corpus_probe(
@@ -4287,6 +4524,7 @@ def test_corpus_health_cache_is_shared_by_readyz_and_mesh(
     assert calls == 1
 
 
+@pytest.mark.asyncio
 async def test_corpus_health_deduplicates_concurrent_probes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4320,7 +4558,7 @@ async def test_corpus_health_deduplicates_concurrent_probes(
             self.cognee = MeasuredCorpus()
 
         async def _graph_counts(self) -> dict[str, int]:
-            return {"nodes": 1, "edges": 1}
+            return {"nodes": 16000, "edges": 50000}
 
     monkeypatch.setattr(server_module, "_CORPUS_HEALTH_CACHE", None)
     app.state.citadel = MeasuredCitadel()
@@ -4328,12 +4566,30 @@ async def test_corpus_health_deduplicates_concurrent_probes(
     app.state.repo_content_syncer = Syncer()
     app.state.linear_syncer = Syncer()
 
-    first, second = await asyncio.gather(
-        server_module._corpus_health(), server_module._corpus_health()
-    )
+    before = set(server_module._BACKGROUND_TASKS)
+    try:
+        first, second = await asyncio.gather(
+            server_module._corpus_health(), server_module._corpus_health()
+        )
 
-    assert calls == 1
-    assert first == second
+        assert calls == 1
+        # Graph fill is distinct from the probe. Concurrent waiters must keep
+        # the relational snapshot, not a mix of probe vs enriched cache.
+        assert first["indexed_docs"] == 1
+        assert second["indexed_docs"] == 1
+        assert "indexed_edges" not in first
+        assert "indexed_edges" not in second
+        assert first == second
+    finally:
+        leftover = [
+            task
+            for task in server_module._BACKGROUND_TASKS
+            if task not in before and not task.done()
+        ]
+        for task in leftover:
+            task.cancel()
+        if leftover:
+            await asyncio.gather(*leftover, return_exceptions=True)
 
 
 def test_readyz_rejects_measured_empty_corpus_when_sources_are_tracked(

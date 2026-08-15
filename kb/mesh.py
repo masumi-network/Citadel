@@ -262,7 +262,16 @@ class MeshState:
         """
         async with self._lock:
             self._ensure_base_graph(config)
-            corpus = corpus or {}
+            corpus = dict(corpus or {})
+            # Probe cache: relational indexed_docs, no indexed_edges yet.
+            # Copy only. Do not mutate the shared /readyz cache.
+            if (
+                corpus.get("measurement") == "bounded_relational_projection_probe"
+                and corpus.get("indexed_edges") is None
+            ):
+                corpus.pop("indexed_docs", None)
+                if not corpus.get("degraded"):
+                    corpus["degraded"] = "graph_totals_pending"
             indexes = self._indexes(config, corpus=corpus)
             since_restart = {
                 "started_at": self.started_at,

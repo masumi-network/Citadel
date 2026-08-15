@@ -536,6 +536,69 @@ async def test_snapshot_edges_falls_back_to_the_projection_without_a_real_total(
 
 
 @pytest.mark.asyncio
+async def test_snapshot_does_not_treat_unenriched_probe_as_graph_totals() -> None:
+    """#280 probe cache sets indexed_docs to relational volume and omits
+    indexed_edges. That is not graph volume. Mesh must not map it onto
+    stats.nodes or silently fall back to the in-memory projection for
+    stats.edges.
+    """
+    config = CitadelConfig()
+    mesh = MeshState()
+    for i in range(3):
+        mesh.edges[f"e{i}"] = {"id": f"e{i}", "source": "a", "target": "b"}
+
+    snapshot = await mesh.snapshot(
+        config,
+        corpus={
+            "ok": True,
+            "tracked_sources": 308,
+            "indexed_docs": 2,
+            "indexed_graph_nodes": 2,
+            "measurement": "bounded_relational_projection_probe",
+            "relational_documents": 2,
+        },
+    )
+    stats = snapshot["stats"]
+    projection_edges = stats["since_restart"]["projection_edges"]
+
+    assert stats["nodes"] is None
+    assert stats["edges"] is None
+    assert stats["edges"] != projection_edges
+    assert projection_edges == len(mesh.edges)
+    assert stats["tracked_sources"] == 308
+    indexes = {index["id"]: index for index in snapshot["indexes"]}
+    assert indexes["graph"]["status"] == "warming"
+    assert indexes["graph"]["records"] is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_uses_enriched_graph_totals_after_probe() -> None:
+    config = CitadelConfig()
+    mesh = MeshState()
+    for i in range(3):
+        mesh.edges[f"e{i}"] = {"id": f"e{i}", "source": "a", "target": "b"}
+
+    snapshot = await mesh.snapshot(
+        config,
+        corpus={
+            "ok": True,
+            "tracked_sources": 308,
+            "indexed_docs": 16000,
+            "indexed_graph_nodes": 16000,
+            "indexed_edges": 50000,
+            "measurement": "bounded_relational_projection_probe",
+            "relational_documents": 2,
+        },
+    )
+    stats = snapshot["stats"]
+
+    assert stats["nodes"] == 16000
+    assert stats["edges"] == 50000
+    assert stats["since_restart"]["projection_edges"] == len(mesh.edges)
+    assert stats["since_restart"]["projection_edges"] < stats["edges"]
+
+
+@pytest.mark.asyncio
 async def test_snapshot_drops_indexed_chunks_when_it_only_duplicates_nodes() -> None:
     """indexed_chunks was assigned the same corpus['indexed_docs'] as nodes,
     equal by construction. Removed, not renamed — the same call #206 made for

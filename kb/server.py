@@ -4683,9 +4683,16 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
         searchable_by_backend = current_generation.get(
             "current_searchable_by_backend"
         )
+        job_states = current_generation.get("current_job_states")
+        expected_searchable = current_jobs
+        if isinstance(job_states, dict) and job_states:
+            # Pending/running jobs are not a searchable gap (#273/#286 family):
+            # the drain has not written those receipts yet. Compare searchable
+            # counts to completed jobs only. Missing job_states keeps the
+            # fail-closed comparison against current_jobs.
+            expected_searchable = max(0, int(job_states.get("completed") or 0))
         if not isinstance(searchable_by_backend, dict) or any(
-            int(searchable_by_backend.get(backend, 0)) != current_sources
-            or int(searchable_by_backend.get(backend, 0)) != current_jobs
+            int(searchable_by_backend.get(backend, 0)) != expected_searchable
             for backend in ("relational", "vector", "graph")
         ):
             invariant_errors.append(
@@ -4911,7 +4918,52 @@ def _cache_corpus_health_result(
     return _CORPUS_HEALTH_CACHE[2]
 
 
-async def _corpus_health_impl() -> dict[str, Any]:
+def _schedule_graph_totals_enrichment(
+    cache_key: tuple[int, ...], citadel: Any
+) -> None:
+    """Fill graph node/edge totals on the shared cache without blocking /readyz.
+
+    The bounded relational probe is the readiness signal (#280). `/api/mesh`
+    still wants exact graph volume for `stats.edges`, so a background read
+    enriches the same cache after the probe returns. Call this after
+    `_CORPUS_HEALTH_LOCK` is released so waiters queued on that probe copy
+    the unenriched snapshot before this task replaces the cache.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _fill() -> None:
+        global _CORPUS_HEALTH_CACHE
+        try:
+            counts = await citadel._graph_counts()
+        except Exception as exc:  # noqa: BLE001 - enrichment must not fail readiness
+            logger.warning(
+                "graph totals enrichment failed: %s", exc.__class__.__name__
+            )
+            return
+        cached = _CORPUS_HEALTH_CACHE
+        if cached is None or cached[1] != cache_key:
+            return
+        if cached[2].get("degraded"):
+            return
+        nodes = int(counts.get("nodes") or 0)
+        edges = int(counts.get("edges") or 0)
+        enriched = dict(cached[2])
+        # Mesh stats.nodes/edges still want graph volume (#232). Readiness
+        # already returned using the relational probe and does not wait here.
+        enriched["indexed_docs"] = nodes
+        enriched["indexed_graph_nodes"] = nodes
+        enriched["indexed_edges"] = edges
+        _CORPUS_HEALTH_CACHE = (cached[0], cache_key, enriched)
+
+    task = loop.create_task(_fill())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_forget_background_task)
+
+
+async def _corpus_health_impl() -> tuple[dict[str, Any], tuple[tuple[int, ...], Any] | None]:
     """Data-plane volume gate using exact relational projection measurements. (#27)
 
     A failed measurement is a readiness failure, not an empty or healthy
@@ -4944,7 +4996,7 @@ async def _corpus_health_impl() -> dict[str, Any]:
             and _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0
             and time.monotonic() - cached[0] < _CORPUS_HEALTH_CACHE_TTL_SECONDS
         ):
-            return dict(cached[2])
+            return dict(cached[2]), None
 
         tracked = 0
         github_status = await github_syncer.status()
@@ -5003,9 +5055,6 @@ async def _corpus_health_impl() -> dict[str, Any]:
                     "complete bounded corpus probe does not cover the relational document total"
                 )
 
-            counts = await citadel._graph_counts()
-            indexed = int(counts.get("nodes") or 0)
-            edges = int(counts.get("edges") or 0)
             result = {
                 **measured,
                 "ok": measured["probe_complete"] is True
@@ -5015,16 +5064,20 @@ async def _corpus_health_impl() -> dict[str, Any]:
                     and measured["relational_documents"] == 0
                 ),
                 "tracked_sources": tracked,
-                # Compatibility for MeshState: graph nodes are not relational
-                # document projections and are not used for readiness.
-                "indexed_docs": indexed,
-                "indexed_graph_nodes": indexed,
-                "indexed_edges": edges,
+                # Relational document count, not graph node volume. /readyz used
+                # to await _graph_counts() here and spend ~11s loading 16k+
+                # nodes (#280). Graph volume is not the readiness signal.
+                "indexed_docs": measured["relational_documents"],
+                "indexed_graph_nodes": measured["probe_graph_documents"],
                 "measurement": "bounded_relational_projection_probe",
             }
             if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-                return _cache_corpus_health_result(cache_key, result)
-            return result
+                cached = _cache_corpus_health_result(cache_key, result)
+                # Copy. The live cache entry is replaced when graph totals land.
+                # Schedule that fill after `_CORPUS_HEALTH_LOCK` is released so
+                # waiters queued on this probe copy the same snapshot first.
+                return dict(cached), (cache_key, citadel)
+            return result, None
 
         # Preserve the old method-boundary fallback for local fakes and older
         # clients that do not expose the bounded probe yet.
@@ -5043,8 +5096,8 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "indexed_edges": edges,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            return _cache_corpus_health_result(cache_key, result)
-        return result
+            return dict(_cache_corpus_health_result(cache_key, result)), None
+        return result, None
     except Exception as exc:  # noqa: BLE001 - convert dependency failures to readiness state
         # Class name only, in the log and in the payload: /readyz embeds this
         # dict verbatim for any reader-scoped caller, and exception text can
@@ -5061,14 +5114,17 @@ async def _corpus_health_impl() -> dict[str, Any]:
             "degraded": exc.__class__.__name__,
         }
         if _CORPUS_HEALTH_CACHE_TTL_SECONDS > 0:
-            return _cache_corpus_health_result(cache_key, result)
-        return result
+            return dict(_cache_corpus_health_result(cache_key, result)), None
+        return result, None
 
 
 async def _corpus_health() -> dict[str, Any]:
     """Serialize uncached corpus probes so concurrent readiness checks share work."""
     async with _CORPUS_HEALTH_LOCK:
-        return await _corpus_health_impl()
+        result, enrich = await _corpus_health_impl()
+    if enrich is not None:
+        _schedule_graph_totals_enrichment(*enrich)
+    return result
 
 
 def _corpus_health_task() -> asyncio.Task[dict[str, Any]]:

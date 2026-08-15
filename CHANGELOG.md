@@ -6,6 +6,29 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **/readyz no longer waits on a full graph load (#280).** The bounded
+  relational probe is the readiness signal. `/readyz` used to call
+  `_graph_counts()` after that probe and load every graph node (16k+ live,
+  about 11s) for `indexed_docs` / `indexed_edges` that readiness does not
+  use. Graph totals still fill the shared cache in the background for
+  `/api/mesh`.
+
+- **`/api/mesh` no longer publishes projection counts as graph totals
+  while the #280 cache is still unenriched.** The probe stores relational
+  `indexed_docs` and omits `indexed_edges`. Mesh used to map that onto
+  `stats.nodes` / `stats.edges` and fall back to the in-memory projection
+  without saying the graph volume was unknown. Unenriched probe payloads
+  now keep `stats.nodes` and `stats.edges` unknown (`warming`) until
+  enrichment writes the real graph counts.
+
+- **Lifecycle readiness no longer fails while projections are in flight.**
+  `current_generation_searchable_census_mismatch` compared searchable
+  receipts to every current job, so a pending drain stamped `/readyz` 503.
+  Searchable counts now compare to completed jobs when job states are
+  present. Failed current-generation jobs still fail closed.
+
 ## [0.5.0] (2026-08-15)
 
 ### Added
