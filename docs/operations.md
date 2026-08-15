@@ -214,7 +214,14 @@ timestamp. Pass it as `Authorization: Bearer <token>`.
 
 ## HTTP API reference
 
-Health: `GET /healthz`, `GET /readyz` (authed).
+Health probes are split on purpose:
+
+- `GET /healthz` is liveness. Unauthenticated. No corpus or canary work.
+- `GET /health/ready` is the Railway deploy gate (`railway.toml`
+  `healthcheckPath`). It checks dependency readiness, not the canary or
+  lifecycle invariants.
+- `GET /readyz` is authenticated readiness (bounded corpus probe, lifecycle
+  census, last canary). The image `HEALTHCHECK` targets this route.
 
 Core:
 
