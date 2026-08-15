@@ -29,6 +29,12 @@ All notable changes to `citadel-archive` are documented here. Format follows
   Searchable counts now compare to completed jobs when job states are
   present. Failed current-generation jobs still fail closed.
 
+- **Publish smoke picks one linux/<arch> image digest.** BuildKit
+  `provenance: mode=max` repeats each platform digest on the
+  attestation-manifest. `grep -c` over the raw index counted 2 and
+  failed the v0.5.0 publish. The check now uses `jq` to select the
+  image manifest once.
+
 ## [0.5.0] (2026-08-15)
 
 ### Added

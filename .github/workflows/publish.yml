@@ -140,12 +140,26 @@ jobs:
           INDEX_DIGEST: ${{ needs.stage-image.outputs.digest }}
         run: |
           manifest="$(docker buildx imagetools inspect "${IMAGE_NAME}@${INDEX_DIGEST}" --raw)"
+          # BuildKit provenance mode=max adds an attestation-manifest per
+          # platform. That descriptor repeats the image digest in
+          # vnd.docker.reference.digest, so grep -c over the raw index
+          # counts 2 and fails a valid unique linux/<arch> image.
           platform_digest="$(jq -r \
             --arg architecture "$ARCHITECTURE" \
-            '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest' \
+            '[.manifests[]
+              | select(
+                  .platform.os == "linux"
+                  and .platform.architecture == $architecture
+                  and (.mediaType == "application/vnd.oci.image.manifest.v1+json"
+                       or .mediaType == "application/vnd.docker.distribution.manifest.v2+json")
+                  and (.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest"
+                )
+              | .digest]
+              | if length == 1 then .[0]
+                else error("expected exactly one linux/\($architecture) image digest, got \(length)")
+                end' \
             <<<"$manifest")"
           [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          test "$(grep -c "$platform_digest" <<<"$manifest")" -eq 1
           echo "digest=$platform_digest" >> "$GITHUB_OUTPUT"
       - name: Smoke exact platform digest
         env:
