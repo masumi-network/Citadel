@@ -6,6 +6,8 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] (2026-08-15)
+
 ### Added
 
 - **`citadel onboard` wires detected coding tools in non-interactive mode too.**
@@ -20,33 +22,6 @@ All notable changes to `citadel-archive` are documented here. Format follows
   jobs whose last error is `FileNotFoundError` (path-string notes that cannot
   be requeued). Same confirmation fields as `requeue-failed`. Apply tombstones
   those `source_key`s and restarts the drain.
-
-### Fixed
-
-- **Qdrant `POST /api/corpus/reconcile` no longer 500s on a scoped census.**
-  The census called `stored_chunk_budget_check(None)` with no dataset list.
-  Qdrant cannot scroll unscoped, so even `dataset=masumi-network` raised
-  `Qdrant chunk census requires explicit dataset scope`. The unscoped payload
-  scan now passes the requested dataset, or every dataset seen on the
-  relational walk when the census is org-wide.
-
-- **A missing zero-chunk document no longer fails the whole cognify canary.**
-  Document `4552e276-e329-5dbf-9d45-d029160d82f4` (52-byte `masumi-network`
-  row, 0 chunks) made `verify=True` raise `RuntimeError` and stamp `_LAST_CANARY`
-  red forever. Missing ids with 0 budget violations are now a per-document
-  warning. Over-budget chunks still fail the run. `POST /api/cognify/run` with
-  `verify: true` stamps `_LAST_CANARY` on success and failure, same as evolve.
-
-- **Lifecycle `FileNotFoundError` jobs tombstone instead of retrying forever.**
-  Path-string notes (`marker3_pathfile.txt`) failed with
-  `Storage directory does not exist` and sat in `failed` so requeue could not
-  succeed. The worker now tombstones that current head on the first
-  `FileNotFoundError`. The admin tombstone-failed route covers jobs that
-  already failed before this drain change.
-
-## [0.5.0] (2026-08-14)
-
-### Added
 
 - **`/api/documents/{id}` takes `?scope=chunk`.** A DocumentChunk id used to
   return the whole assembled parent (a 23k-char daily digest for one clicked
@@ -87,6 +62,27 @@ All notable changes to `citadel-archive` are documented here. Format follows
   self-host cost tile stays `~$38/mo` (measured 2026-08-14).
 
 ### Fixed
+
+- **Qdrant `POST /api/corpus/reconcile` no longer 500s on a scoped census.**
+  The census called `stored_chunk_budget_check(None)` with no dataset list.
+  Qdrant cannot scroll unscoped, so even `dataset=masumi-network` raised
+  `Qdrant chunk census requires explicit dataset scope`. The unscoped payload
+  scan now passes the requested dataset, or every dataset seen on the
+  relational walk when the census is org-wide.
+
+- **A missing zero-chunk document no longer fails the whole cognify canary.**
+  Document `4552e276-e329-5dbf-9d45-d029160d82f4` (52-byte `masumi-network`
+  row, 0 chunks) made `verify=True` raise `RuntimeError` and stamp `_LAST_CANARY`
+  red forever. Missing ids with 0 budget violations are now a per-document
+  warning. Over-budget chunks still fail the run. `POST /api/cognify/run` with
+  `verify: true` stamps `_LAST_CANARY` on success and failure, same as evolve.
+
+- **Lifecycle `FileNotFoundError` jobs tombstone instead of retrying forever.**
+  Path-string notes (`marker3_pathfile.txt`) failed with
+  `Storage directory does not exist` and sat in `failed` so requeue could not
+  succeed. The worker now tombstones that current head on the first
+  `FileNotFoundError`. The admin tombstone-failed route covers jobs that
+  already failed before this drain change.
 
 - **Org capture deny globs now apply at ingest and pre-push.** `merged_deny_globs`
   was JSON-only. Ingest now merges org defaults into `PreIngestFilter`, matches
@@ -883,6 +879,7 @@ self-hosted Organization Vault server.
   references it as `${CITADEL_MCP_ACCESS_TOKEN}` and it is never echoed.
 - The pre-push allowlist fails **closed** on a corrupt config.
 
+[0.5.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.0
 [0.4.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.1
 [0.4.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.0
 [0.3.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.3.0
