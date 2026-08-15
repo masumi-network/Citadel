@@ -75,6 +75,12 @@ keywords = ["citadel_admin_key", "citadel_access_key", "citadel_mcp_access_token
 # live `ctdl_` token committed to .env.example scanned clean under it.
 
 [[allowlists]]
+description = "Local MCP env. gitignored; accidentally tracked in 28c83df and untracked after. Not repository source."
+paths = [
+  '''^\.citadel/company-reader-mcp\.env$''',
+]
+
+[[allowlists]]
 description = "Files whose every credential-shaped string is fake by construction"
 # The one place `targetRules` is deliberately absent, because these files are
 # exempt from everything:

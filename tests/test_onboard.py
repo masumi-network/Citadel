@@ -663,8 +663,6 @@ def test_publish_token_to_macos_gui_error_does_not_raise(monkeypatch) -> None:
 
 
 def test_format_onboard_next_steps_covers_cursor_and_claude(tmp_path: Path) -> None:
-    from kb.onboard import format_onboard_next_steps
-
     rc = tmp_path / ".zshrc"
     text = format_onboard_next_steps(
         rc, tools=["cursor", "claude", "codex"], gui_env="set"

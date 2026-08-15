@@ -387,6 +387,9 @@ class FakeRepoContentSyncer:
 
 
 def authed_client(access_key: str = "test-admin") -> TestClient:
+    # Cognify-verify tests stamp this process-global. A leftover ok=False
+    # makes later /readyz calls 503 even when corpus and lifecycle are fine.
+    server_module._LAST_CANARY = None
     app.state.citadel = FakeCitadel()
     app.state.mesh = MeshState()
     app.state.github_syncer = FakeGitHubSyncer()
@@ -1590,6 +1593,20 @@ def test_cognify_run_verify_exception_stamps_canary() -> None:
     assert server_module._LAST_CANARY is not None
     assert server_module._LAST_CANARY["ok"] is False
     assert server_module._LAST_CANARY.get("error") == "RuntimeError"
+
+
+def test_authed_client_clears_a_failed_canary_before_readyz() -> None:
+    server_module._LAST_CANARY = {
+        "ok": False,
+        "search_hit": None,
+        "graph_grew": None,
+        "marker": None,
+        "error": "RuntimeError",
+    }
+    client = authed_client("test-reader")
+    ready = client.get("/readyz")
+    assert ready.status_code == 200
+    assert server_module._LAST_CANARY is None
 
 
 def test_cognify_run_requires_admin() -> None:
