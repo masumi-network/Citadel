@@ -6,6 +6,8 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.1] (2026-08-16)
+
 ### Fixed
 
 - **/readyz no longer waits on a full graph load (#280).** The bounded
@@ -908,6 +910,7 @@ self-hosted Organization Vault server.
   references it as `${CITADEL_MCP_ACCESS_TOKEN}` and it is never echoed.
 - The pre-push allowlist fails **closed** on a corrupt config.
 
+[0.5.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.1
 [0.5.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.0
 [0.4.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.1
 [0.4.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.0

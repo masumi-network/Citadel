@@ -7,7 +7,7 @@ from kb.server import _build_id_from_env, app
 
 
 def test_cli_and_server_use_the_package_source_version() -> None:
-    assert __version__ == "0.5.0"
+    assert __version__ == "0.5.1"
     assert _cli_version() == __version__
     assert app.version == __version__
 
