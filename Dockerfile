@@ -11,7 +11,7 @@ RUN python -m pip install build==1.5.0 hatchling==1.31.0
 COPY . .
 RUN python scripts/build_secure_cognee.py --output /wheels
 RUN python -m build --no-isolation --wheel --outdir /wheels .
-RUN sha256sum /wheels/citadel_archive-0.5.0-py3-none-any.whl \
+RUN sha256sum /wheels/citadel_archive-0.5.1-py3-none-any.whl \
     | cut -d ' ' -f1 > /wheels/citadel-build-id
 
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS runtime
@@ -38,7 +38,7 @@ COPY --from=builder /wheels /wheels
 RUN install -d /opt/citadel \
     && install -m 0444 /wheels/citadel-build-id /opt/citadel/build-id \
     && python -m pip install /wheels/cognee-1.4.1-py3-none-any.whl \
-    "/wheels/citadel_archive-0.5.0-py3-none-any.whl[server]" \
+    "/wheels/citadel_archive-0.5.1-py3-none-any.whl[server]" \
     && python -m pip check \
     && python -c "from importlib.metadata import version; assert (version('cognee'), version('ladybug'), version('qdrant-client')) == ('1.4.1', '0.18.2', '1.19.0')" \
     && rm -rf /wheels
