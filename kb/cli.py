@@ -1655,15 +1655,18 @@ def _print_minted_token(token: str, api_token: dict[str, Any], *, color: bool) -
     """Print a freshly minted token once, with its write-scope + adopt steps."""
     print()
     print(paint("  Token (shown once — copy it now, it cannot be retrieved later):", "yellow", enable=color))
-    # codeql[py/clear-text-logging-sensitive-data]: one-time CLI display; token cannot be retrieved later
+    # codeql[py/clear-text-logging-sensitive-data]
     print("    " + paint(token, "bold", enable=color))
     dataset = api_token.get("default_dataset")
     if dataset and str(dataset).startswith("seat:"):
+        # codeql[py/clear-text-logging-sensitive-data]
         scope = f"ingests go to {dataset} (their private seat) only"
     elif dataset:
+        # codeql[py/clear-text-logging-sensitive-data]
         scope = f"ingests go to {dataset}"
     else:
         scope = "ingests go to the org default dataset — NOT a private seat"
+    # codeql[py/clear-text-logging-sensitive-data]
     print(paint(f"  scope: {scope}  ·  role={api_token.get('role')}", "dim", enable=color))
     print(paint("  Adopt:  citadel onboard --token <token-above>   ·   share over a private channel", "dim", enable=color))
 
