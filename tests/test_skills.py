@@ -220,6 +220,18 @@ def test_codex_plugin_skills_dir_resolves() -> None:
     assert (plugin_skills / "citadel-cli" / "SKILL.md").is_file()
 
 
+def test_sdist_force_includes_skills_tree() -> None:
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    )
+    sdist = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert sdist["force-include"]["skills"] == "skills"
+    assert "plugins/citadel-archive-mcp/skills" in sdist["exclude"]
+
+
 def test_get_skill_unknown() -> None:
     client = TestClient(app)
     response = client.get("/skills/not-a-real-skill")

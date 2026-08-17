@@ -28,7 +28,9 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 - **Hosted `/skills/onboard`, `/skills/cli`, `/skills/debug`.** The
   `citadel` skill is an entry router (~50 lines). Satellites cover vault,
-  MCP connect, CLI, ingest, boundary, onboard, and debug.
+  MCP connect, CLI, ingest, boundary, onboard, and debug. The sdist
+  force-includes `skills/` so the Codex plugin symlink does not hide the
+  tree from hatchling.
 
 - **Lite boot quarantines an unreadable `cognee.db` instead of crashing.**
   Railway's live start wrapper renamed a bad SQLite file to
