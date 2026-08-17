@@ -8,6 +8,17 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [0.5.1] (2026-08-16)
 
+### Added
+
+- **Role-aware TTY home.** Writer and reader omit `seat` and keep `token`
+  as self-mint. Admin key or `access:manage` still see `seat`. A failed
+  identity fetch hides `seat`.
+- **`citadel token create` self-mints** via `POST /api/access/self/tokens`
+  with the seat token, capped to the seat role. `--seat` stays the admin
+  path. Writer `citadel seat create` exits before the admin API.
+- **`citadel mcp` with no args** opens the onboard coding-tools checkbox.
+  Esc/q writes nothing. `mcp install` help matches `mcp add`.
+
 ### Fixed
 
 - **CLI default Node URL is `https://citadel.utxo.ag`.** `citadel mcp add`

@@ -74,6 +74,31 @@ def test_issue_seat_token_posts_to_seat_endpoint(monkeypatch) -> None:
     assert captured["method"] == "POST"
 
 
+def test_create_self_seat_token_posts_seat_bearer(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_open(req: Any, timeout: float | None = None) -> _FakeResp:
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["body"] = json.loads(req.data.decode())
+        captured["auth"] = req.headers.get("Authorization")
+        return _FakeResp({"ok": True, "token": "ctdl_self"})
+
+    monkeypatch.setattr(ac._OPENER, "open", fake_open)
+    monkeypatch.setattr(ac, "admin_key", lambda: pytest.fail("must not read CITADEL_ADMIN_KEY"))
+    out = ac.create_self_seat_token(
+        base_url="https://node.example",
+        token="ctdl_seat",
+        role="writer",
+        token_name="laptop",
+    )
+    assert out["token"] == "ctdl_self"
+    assert captured["url"] == "https://node.example/api/access/self/tokens"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {"role": "writer", "token_name": "laptop"}
+    assert captured["auth"] == "Bearer ctdl_seat"
+
+
 def test_http_error_maps_detail_and_status(monkeypatch) -> None:
     def fake_open(req: Any, timeout: float | None = None) -> _FakeResp:
         raise urllib.error.HTTPError(

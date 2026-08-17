@@ -73,8 +73,10 @@ from kb.banner import (
     supports_color,
 )
 from kb.access_client import (
+    ADMIN_KEY_ENV,
     AccessClientError,
     create_seat,
+    create_self_seat_token,
     create_token,
     issue_seat_token,
     list_seats,
@@ -93,6 +95,7 @@ from kb.status import (
     MCP_STATE_NEEDS_AUTH,
     MCP_STATE_READY_BUT_UNCONFIGURED,
     assess_mcp_setup,
+    check_auth,
     fetch_events,
     fetch_mesh,
     fetch_presence,
@@ -1686,8 +1689,44 @@ async def _seat_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _admin_key_present() -> bool:
+    return bool((os.getenv(ADMIN_KEY_ENV) or "").strip())
+
+
+_ROLE_RANK = {"reader": 0, "writer": 1, "admin": 2}
+
+
+def _self_mint_role(wanted: str | None, seat_role: str | None) -> tuple[str | None, str | None]:
+    """Return (role, error). Caps self-mint to reader/writer at or below the seat."""
+    seat = seat_role if seat_role in ("reader", "writer") else "writer"
+    role = wanted or seat
+    if role not in ("reader", "writer"):
+        return None, "self-mint tokens may be reader or writer"
+    if _ROLE_RANK[role] > _ROLE_RANK[seat]:
+        return None, f"role {role} exceeds this seat's role ({seat})"
+    return role, None
+
+
+def _should_self_mint(args: argparse.Namespace, *, seat_slug: str | None, dataset: str | None) -> bool:
+    if seat_slug or dataset or args.kind or args.expires_at:
+        return False
+    if _admin_key_present():
+        return False
+    return bool(capture_token())
+
+
 async def _seat_create(args: argparse.Namespace) -> int:
     as_json = args.json
+    if not _admin_key_present():
+        msg = (
+            "admin only. Ask an admin to create a seat. "
+            "Mint a token for your own seat with `citadel token create`."
+        )
+        if as_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"citadel seat create: {msg}", file=sys.stderr)
+        return 1
     try:
         result = create_seat(
             base_url=node_base_url(args.node_url),
@@ -1809,10 +1848,10 @@ async def _token_create(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        # Interactive picker: TTY, human output, and no explicit target given.
-        # --role/--kind/--expires-at signal standalone intent (and minted
-        # immediately before seat binding existed) — never route them into the
-        # picker, where a picked seat would silently drop them.
+        # Interactive picker: TTY, human output, admin key, and no explicit
+        # target given. --role/--kind/--expires-at signal standalone intent
+        # (and minted immediately before seat binding existed) — never route
+        # them into the picker, where a picked seat would silently drop them.
         if (
             not seat_slug
             and not dataset
@@ -1820,6 +1859,7 @@ async def _token_create(args: argparse.Namespace) -> int:
             and not as_json
             and sys.stdin.isatty()
             and sys.stdout.isatty()
+            and _admin_key_present()
         ):
             try:
                 seat_slug = _pick_seat(_active_seats(base_url))
@@ -1864,6 +1904,9 @@ async def _token_create(args: argparse.Namespace) -> int:
                     )
                 return 1
 
+        if _should_self_mint(args, seat_slug=seat_slug, dataset=dataset):
+            return await _token_self_mint(args, as_json=as_json, base_url=base_url)
+
         result = create_token(
             base_url=base_url,
             name=args.name,
@@ -1892,6 +1935,45 @@ async def _token_create(args: argparse.Namespace) -> int:
                 enable=color,
             )
         )
+    return 0
+
+
+async def _token_self_mint(args: argparse.Namespace, *, as_json: bool, base_url: str) -> int:
+    """Mint a token for the caller's own seat. Never reads CITADEL_ADMIN_KEY."""
+    token = capture_token()
+    auth = check_auth(base_url, token)
+    if not auth.ok:
+        msg = auth.detail or "could not verify seat token"
+        if as_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"citadel token create: {msg}", file=sys.stderr)
+        return 1
+    ident = auth.data or {}
+    role, err = _self_mint_role(args.role, ident.get("role"))
+    if err or not role:
+        if as_json:
+            _print_json({"ok": False, "error": err})
+        else:
+            print(f"citadel token create: {err}", file=sys.stderr)
+        return 2
+    try:
+        result = create_self_seat_token(
+            base_url=base_url,
+            token=token,
+            role=role,
+            token_name=args.name,
+        )
+    except AccessClientError as exc:
+        return _access_exit(exc, as_json=as_json)
+    if as_json:
+        _print_json(result)
+        return 0
+    color = supports_color()
+    seat = ident.get("seat_slug") or "your seat"
+    print(paint(f"New token for seat {seat}", "green", enable=color))
+    if result.get("token"):
+        _print_minted_token(result["token"], result.get("api_token") or {}, color=color)
     return 0
 
 
@@ -2067,6 +2149,19 @@ async def _mcp_add(args: argparse.Namespace) -> int:
         else:
             print(f"{spec.label}: {result.detail}")
     return rc
+
+
+async def _mcp(args: argparse.Namespace) -> int:
+    """Bare `citadel mcp`: onboard checkbox. Esc/q writes nothing and exits 0."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "citadel mcp: run on a TTY to pick tools, or `citadel mcp add <tool>`.",
+            file=sys.stderr,
+        )
+        return 2
+    color = supports_color()
+    _wire_detected_tools(node_base_url(getattr(args, "node_url", None)), color=color)
+    return 0
 
 
 async def _mcp_list(args: argparse.Namespace) -> int:
@@ -3160,29 +3255,76 @@ async def _update(args: argparse.Namespace) -> int:
     return 0
 
 
-_HOME_MENU = (
-    ("Get started", (
-        ("onboard", "one-command setup — token · hooks · MCP · capture roots"),
-        ("status", "connection · identity · local setup (--json for agents)"),
-        ("doctor", "diagnose setup problems · --fix to repair"),
-        ("update", "update citadel to the latest release"),
-    )),
-    ("Capture", (
-        ("setup", "declare Approved Capture Roots (~/.citadel/capture.json)"),
-        ("capture", "push summaries of approved roots to your Node"),
-        ("promotion", "list · approve · reject · run the Promotion Agent queue"),
-    )),
-    ("Knowledge", (
-        ("search", "search the Organization Vault"),
-        ("ingest", "add a durable note to your Node"),
-        ("activity", "recent vault activity — captures · syncs · searches (--global for the team)"),
-    )),
-    ("Connect & admin", (
-        ("mcp", "add Citadel MCP to Claude · Cursor · Codex · …"),
-        ("seat", "create · list seats and mint tokens (admin)"),
-        ("token", "set this machine's seat token · admin create/revoke"),
-    )),
+_HOME_STARTED = (
+    ("onboard", "one-command setup — token · hooks · MCP · capture roots"),
+    ("status", "connection · identity · local setup (--json for agents)"),
+    ("doctor", "diagnose setup problems · --fix to repair"),
+    ("update", "update citadel to the latest release"),
 )
+_HOME_CAPTURE = (
+    ("setup", "declare Approved Capture Roots (~/.citadel/capture.json)"),
+    ("capture", "push summaries of approved roots to your Node"),
+    ("promotion", "list · approve · reject · run the Promotion Agent queue"),
+)
+_HOME_KNOWLEDGE = (
+    ("search", "search the Organization Vault"),
+    ("ingest", "add a durable note to your Node"),
+    ("activity", "recent vault activity — captures · syncs · searches (--global for the team)"),
+)
+
+
+def _home_show_seat(
+    *,
+    admin_key: bool,
+    auth_ok: bool,
+    capabilities: dict[str, Any] | None,
+    scopes: list[str] | None,
+) -> bool:
+    if admin_key:
+        return True
+    if not auth_ok:
+        return False
+    caps = capabilities or {}
+    if caps.get("admin"):
+        return True
+    return "access:manage" in (scopes or [])
+
+
+def _home_menu(*, show_seat: bool) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    token_desc = (
+        "set this machine's seat token · admin create/revoke"
+        if show_seat
+        else "mint a token for your seat · set this machine's token"
+    )
+    connect: list[tuple[str, str]] = [
+        ("mcp", "add Citadel MCP to Claude · Cursor · Codex · …"),
+    ]
+    if show_seat:
+        connect.append(("seat", "create · list seats and mint tokens (admin)"))
+    connect.append(("token", token_desc))
+    connect_title = "Connect & admin" if show_seat else "Connect"
+    return (
+        ("Get started", _HOME_STARTED),
+        ("Capture", _HOME_CAPTURE),
+        ("Knowledge", _HOME_KNOWLEDGE),
+        (connect_title, tuple(connect)),
+    )
+
+
+def _resolve_home_show_seat() -> bool:
+    if _admin_key_present():
+        return True
+    try:
+        auth = check_auth(node_base_url(), capture_token() or None, timeout=3.0)
+    except Exception:
+        return False
+    ident = auth.data or {}
+    return _home_show_seat(
+        admin_key=False,
+        auth_ok=auth.ok,
+        capabilities=ident.get("capabilities") if isinstance(ident.get("capabilities"), dict) else {},
+        scopes=ident.get("scopes") if isinstance(ident.get("scopes"), list) else [],
+    )
 
 
 def _already_onboarded() -> bool:
@@ -3233,11 +3375,12 @@ def _print_home() -> None:
         )
     print("  " + state + paint(f"  ·  v{_cli_version()}", "dim", enable=color))
     print()
+    menu = _home_menu(show_seat=_resolve_home_show_seat())
     # Pad command names to the widest, so descriptions form a clean column.
-    pad = max(len(name) for _, rows in _HOME_MENU for name, _ in rows) + 2
+    pad = max(len(name) for _, rows in menu for name, _ in rows) + 2
     cols = shutil.get_terminal_size((80, 24)).columns
     desc_budget = cols - 4 - pad - 1  # indent + name column + gap
-    for title, rows in _HOME_MENU:
+    for title, rows in menu:
         print("  " + paint(title, "bold", enable=color))
         for name, desc in rows:
             # Truncate the RAW description (never the ANSI codes) so narrow
@@ -3249,6 +3392,27 @@ def _print_home() -> None:
         print()
     print("  " + paint("Run `citadel <command> --help` for details.", "dim", enable=color))
     asyncio.run(_maybe_prompt_update(color=color))
+
+
+def _subparser_choice_help(sub_action: argparse._SubParsersAction, name: str) -> str:
+    """Help text for a subcommand name, including argparse aliases.
+
+    argparse stores help on the primary dest (e.g. ``add``). Alias names
+    (e.g. ``install``) share the same parser object but are missing from
+    ``_choices_actions``, so a dest-keyed lookup leaves them blank.
+    """
+    help_by_dest = {
+        a.dest: (a.help or "") for a in getattr(sub_action, "_choices_actions", [])
+    }
+    if name in help_by_dest:
+        return help_by_dest[name]
+    parser = sub_action.choices.get(name)
+    if parser is None:
+        return ""
+    for dest, other in sub_action.choices.items():
+        if other is parser and dest in help_by_dest:
+            return help_by_dest[dest]
+    return ""
 
 
 class CitadelParser(argparse.ArgumentParser):
@@ -3302,14 +3466,13 @@ class CitadelParser(argparse.ArgumentParser):
             )
             # A subcommand group was invoked bare → list its subcommands.
             if sub_action and any(m.endswith("command") for m in missing):
-                help_by_name = {
-                    a.dest: (a.help or "") for a in getattr(sub_action, "_choices_actions", [])
-                }
                 pad = max((len(n) for n in sub_action.choices), default=8) + 2
                 lines = [paint(f"✗ {self.prog} needs a subcommand:", "red", enable=color), ""]
                 for name in sub_action.choices:
                     label = paint(name.ljust(pad), "cyan", enable=color)
-                    lines.append(f"  {label}{paint(help_by_name.get(name, ''), 'dim', enable=color)}")
+                    lines.append(
+                        f"  {label}{paint(_subparser_choice_help(sub_action, name), 'dim', enable=color)}"
+                    )
                 lines.append("")
                 lines.append(
                     "  e.g. " + paint(f"{self.prog} {next(iter(sub_action.choices))}", "bold", "cyan", enable=color)
@@ -3670,7 +3833,9 @@ def build_parser() -> argparse.ArgumentParser:
         "mcp",
         help="Add the Citadel MCP server to your other coding tools",
     )
-    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp.add_argument("--node-url", help="Override Node URL")
+    mcp.set_defaults(handler=_mcp)
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=False)
 
     mcp_add = mcp_sub.add_parser(
         "add",

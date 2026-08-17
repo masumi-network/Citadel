@@ -143,6 +143,25 @@ def issue_seat_token(
     )
 
 
+def create_self_seat_token(
+    *,
+    base_url: str,
+    token: str,
+    role: str,
+    token_name: str | None = None,
+) -> dict[str, Any]:
+    """Mint a token for the caller's own seat (POST /api/access/self/tokens).
+
+    Uses the seat token as Bearer. Never reads ``CITADEL_ADMIN_KEY``.
+    """
+    payload: dict[str, Any] = {"role": role}
+    if token_name:
+        payload["token_name"] = token_name
+    return _request(
+        "POST", "/api/access/self/tokens", base_url=base_url, key=token, payload=payload
+    )
+
+
 def create_token(
     *,
     base_url: str,
