@@ -29,7 +29,7 @@ citadel seat token jane
 ```
 
 (The web Access page —
-`https://citadel-archive-production.up.railway.app/skills/connect` — does the
+`https://citadel.utxo.ag/skills/connect` — does the
 same thing if you'd rather click.)
 
 > ⚠️ **Always bind the token to a seat.** On the Access page choose the seat under

@@ -356,7 +356,7 @@ Re-run the frozen set at the same pin against the same node:
 # this PR is merged.
 
 export CITADEL_MCP_ACCESS_TOKEN=...        # kb:search, plus admin or audit:read for the census block
-export CITADEL_NODE_URL=https://citadel-archive-production.up.railway.app
+export CITADEL_NODE_URL=https://citadel.utxo.ag
 
 python scripts/bench/search_bench.py run \
   --questions scripts/bench/golden_questions.json \

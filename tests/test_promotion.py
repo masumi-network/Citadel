@@ -103,14 +103,14 @@ def _engine(
 def _org_note(extra: str = "roadmap") -> str:
     return (
         f"Org note about the product {extra} — "
-        "https://github.com/masumi-network/Citadel-Archive"
+        "https://github.com/masumi-network/Citadel"
     )
 
 
 def _github_state(tmp_path: Path) -> CitadelConfig:
     state_path = tmp_path / "github-state.json"
     state_path.write_text(
-        '{"repos": {"masumi-network/Citadel-Archive": {}}}',
+        '{"repos": {"masumi-network/Citadel": {}}}',
         encoding="utf-8",
     )
     return _config(github_sync_state_path=str(state_path))
@@ -299,7 +299,7 @@ async def test_new_org_project_queues_pending_approval(tmp_path: Path, monkeypat
         "- Capture Root Tags: org-work\n"
     )
     state_path = tmp_path / "github-state.json"
-    state_path.write_text('{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8")
+    state_path.write_text('{"repos": {"masumi-network/Citadel": {}}}', encoding="utf-8")
     engine, learning, store = _engine(
         tmp_path,
         [summary],
@@ -357,7 +357,7 @@ async def test_custom_capture_tag_never_auto_promotes(
 ) -> None:
     summary = (
         "# Capture summary: side repo\n"
-        "- Remote: `https://github.com/masumi-network/Citadel-Archive.git`\n"
+        "- Remote: `https://github.com/masumi-network/Citadel.git`\n"
         "- Capture Root Tags: custom-label\n"
     )
     engine, learning, _store = _engine(
@@ -738,7 +738,7 @@ async def test_approve_pending_surfaces_the_write_reason(
     )
     state_path = tmp_path / "github-state.json"
     state_path.write_text(
-        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
+        '{"repos": {"masumi-network/Citadel": {}}}', encoding="utf-8"
     )
     config = _config(github_sync_state_path=str(state_path))
     learning = FakeLearning(central_reject_reason="duplicate_in_process")
@@ -778,7 +778,7 @@ async def test_approved_promotion_attests_the_approver(
     )
     state_path = tmp_path / "github-state.json"
     state_path.write_text(
-        '{"repos": {"masumi-network/Citadel-Archive": {}}}', encoding="utf-8"
+        '{"repos": {"masumi-network/Citadel": {}}}', encoding="utf-8"
     )
     config = _config(github_sync_state_path=str(state_path))
     engine, learning, store = _engine(tmp_path, [summary], config)

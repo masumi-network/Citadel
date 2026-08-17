@@ -84,7 +84,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 ### Redeploy after a code change
 
 From a machine with Railway CLI linked to the **Citadel Archive** project
-(service that serves `https://citadel-archive-production.up.railway.app`):
+(service that serves `https://citadel.utxo.ag`):
 
 ```bash
 # Confirm link
@@ -252,7 +252,7 @@ Admin:
 Examples:
 
 ```bash
-export CITADEL_BASE_URL=https://citadel-archive-production.up.railway.app
+export CITADEL_BASE_URL=https://citadel.utxo.ag
 
 curl -fsS -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \
   "$CITADEL_BASE_URL/api/knowledge?q=payment+flow&limit=5"
@@ -296,7 +296,7 @@ tool, path, scope, dataset, status, and safe counts/hashes — never raw tokens,
 queries, or note bodies.
 
 ```text
-https://citadel-archive-production.up.railway.app/mcp/
+https://citadel.utxo.ag/mcp/
 Authorization: Bearer ctdl_<token>
 ```
 
@@ -305,7 +305,7 @@ Authorization: Bearer ctdl_<token>
   "mcpServers": {
     "citadel": {
       "type": "http",
-      "url": "https://citadel-archive-production.up.railway.app/mcp/",
+      "url": "https://citadel.utxo.ag/mcp/",
       "headers": { "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}" }
     }
   }
@@ -316,7 +316,7 @@ A **local stdio** server is available for offline/dev use and points at the
 hosted API:
 
 ```bash
-CITADEL_HTTP_BASE_URL=https://citadel-archive-production.up.railway.app
+CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag
 CITADEL_MCP_ACCESS_TOKEN=ctdl_...
 CITADEL_MCP_DEFAULT_DATASET=masumi-network
 uv run python -m kb.mcp_server
@@ -326,7 +326,7 @@ Hosted-MCP environment (Railway web service):
 
 ```bash
 CITADEL_MCP_SELF_BASE_URL=http://127.0.0.1:8000   # forwarded calls hit the API in-process
-CITADEL_MCP_ALLOWED_HOSTS=citadel-archive-production.up.railway.app  # optional Host/Origin allow-list
+CITADEL_MCP_ALLOWED_HOSTS=citadel.utxo.ag  # optional Host/Origin allow-list
 ```
 
 **Safe defaults:** use a reader service-account token for normal agent work;

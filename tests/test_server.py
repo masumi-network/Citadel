@@ -6109,7 +6109,7 @@ def test_contribute_routes_through_learning_process_and_audits(tmp_path: Any) ->
             "title": "Decision: adopt deepseek for enrichment",
             "content": "We standardized on deepseek/deepseek-v4-flash via OpenRouter.",
             "tags": ["decision", "llm"],
-            "source_url": "https://github.com/masumi-network/Citadel-Archive",
+            "source_url": "https://github.com/masumi-network/Citadel",
         },
     )
 

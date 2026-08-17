@@ -25,6 +25,10 @@ All notable changes to `citadel-archive` are documented here. Format follows
   and onboard write `https://citadel.utxo.ag/mcp/`. Override with
   `--node-url`, `~/.citadel/capture.json`, or `CITADEL_BASE_URL` on the
   capture hooks. PyPI `0.4.0` still defaulted to the Railway hostname.
+  Docs, skills, clone/raw URLs, and GitHub release links use
+  `masumi-network/Citadel`. User-facing hosted URLs use
+  `https://citadel.utxo.ag` (MCP path `/mcp/`). The old GitHub slug
+  `Citadel-Archive` still redirects. PyPI stays `citadel-archive`.
 
 - **`citadel update` re-applies write-tier MCP URLs after a successful
   pipx upgrade.** Skips when `~/.citadel/capture.json` has a custom
@@ -952,12 +956,12 @@ self-hosted Organization Vault server.
 
 [0.5.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.1
 [0.5.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.0
-[0.4.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.1
-[0.4.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.0
-[0.3.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.3.0
-[0.2.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.2.1
-[0.2.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.2.0
-[0.1.3]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.3
-[0.1.2]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.2
-[0.1.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.1
-[0.1.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.0
+[0.4.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.4.1
+[0.4.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.4.0
+[0.3.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.3.0
+[0.2.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.2.1
+[0.2.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.2.0
+[0.1.3]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.3
+[0.1.2]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.2
+[0.1.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.1
+[0.1.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.0

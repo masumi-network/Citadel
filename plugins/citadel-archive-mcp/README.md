@@ -1,12 +1,12 @@
 # Citadel Archive MCP Plugin
 
-Codex-compatible plugin that connects coding agents to the [Citadel Organization Vault](https://github.com/masumi-network/Citadel-Archive) via MCP.
+Codex-compatible plugin that connects coding agents to the [Citadel Organization Vault](https://github.com/masumi-network/Citadel) via MCP.
 
 ## What is public vs private
 
 | Public | Private |
 |---|---|
-| This plugin and [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) | Hosted Organization Vault (team memory) |
+| This plugin and [Citadel](https://github.com/masumi-network/Citadel) | Hosted Organization Vault (team memory) |
 | Skill markdown at `/skills/*` | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) |
 
 Agents read vault content only through MCP with a user `ctdl_` token — never from git.
@@ -47,6 +47,6 @@ exposes the same tree at `./skills` (symlink) because
 
 ## Install as Codex plugin (legacy stdio)
 
-Point Codex at this directory (`plugins/citadel-archive-mcp/`). The bundled `.mcp.json` uses `"../.."` as the repo root when the plugin lives inside a Citadel-Archive clone. For the no-clone path, use the hosted `/mcp` endpoint via the connect skill instead.
+Point Codex at this directory (`plugins/citadel-archive-mcp/`). The bundled `.mcp.json` uses `"../.."` as the repo root when the plugin lives inside a Citadel clone. For the no-clone path, use the hosted `/mcp` endpoint via the connect skill instead.
 
 See [docs/mcp/README.md](../../docs/mcp/README.md) and [docs/public-and-private.md](../../docs/public-and-private.md).

@@ -294,4 +294,4 @@ does nothing. See `README.md`.
 - Dev onboarding: [`docs/onboarding/citadel-autosync.md`](../../docs/onboarding/citadel-autosync.md)
 - Teammate one-pager: [`docs/onboarding/teammate-rollout.md`](../../docs/onboarding/teammate-rollout.md)
 - Ingest API: `POST /ingest` with `{data, dataset?, tags?, session_id?}` (writer token)
-- Seat/**Node**/Central + **Seat-Scoped Mirror**: [ADR-0003](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0003-seat-node-central-private-memory.md), [ADR-0004](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0004-linear-seat-scoped-mirror.md)
+- Seat/**Node**/Central + **Seat-Scoped Mirror**: [ADR-0003](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0003-seat-node-central-private-memory.md), [ADR-0004](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0004-linear-seat-scoped-mirror.md)

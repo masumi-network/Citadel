@@ -10,7 +10,7 @@ description: Use when a user asks project, source, architecture, or operational 
 **Public vs private:** `https://citadel.utxo.ag/skills/boundary`
 
 Organization memory lives on the **hosted Organization Vault**, not in the public
-Citadel-Archive git repo. Access it only through the CLI, HTTP API, or MCP with
+Citadel git repo. Access it only through the CLI, HTTP API, or MCP with
 the user's `ctdl_` token. Never commit vault content or tokens to git.
 
 The headless CLI is the dependable default for agents — `citadel search --json`,
@@ -46,7 +46,7 @@ restricts search/ingest/contribute to those datasets (admin and
 organization-wide knowledge lives in Central (`masumi-network`). The node is the
 storage boundary — not the token. Read scope is own node + Central; never
 another seat's node. Default writes go to the seat node; org-bound and tagged
-content targets Central. See [ADR-0003](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
+content targets Central. See [ADR-0003](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
 
 Common scopes:
 
@@ -224,5 +224,5 @@ Onboarding: [`docs/onboarding/teammate-rollout.md`](../../docs/onboarding/teamma
 | Seat / Node / Central | user account, personal vault, shared DB |
 | Repository Daily Update | employee report |
 
-Full domain language: `CONTEXT.md` in [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive).
-Architecture: [ADR-0003](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
+Full domain language: `CONTEXT.md` in [Citadel](https://github.com/masumi-network/Citadel).
+Architecture: [ADR-0003](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0003-seat-node-central-private-memory.md).

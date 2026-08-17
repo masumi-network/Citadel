@@ -27,7 +27,7 @@ Auth:          Authorization: Bearer ctdl_<your-token>
 | Public | Private |
 |---|---|
 | The hosted REST + MCP API surface and these `/skills/*` docs | The vault contents — only readable with a `ctdl_` token |
-| [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) — app code, skills | Team/organization memory behind the token |
+| [Citadel](https://github.com/masumi-network/Citadel) — app code, skills | Team/organization memory behind the token |
 
 Never commit tokens. Never copy vault search results into a public repo or issue.
 Boundary detail: `https://citadel.utxo.ag/skills/boundary`

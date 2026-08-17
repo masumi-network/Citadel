@@ -1380,7 +1380,7 @@ def test_contribute_tool_posts_through_the_contribute_endpoint() -> None:
         "We standardized on deepseek/deepseek-v4-flash for enrichment.",
         None,
         tags=["decision"],
-        source_url="https://github.com/masumi-network/Citadel-Archive",
+        source_url="https://github.com/masumi-network/Citadel",
     )
 
     assert result["path"] == "/api/contribute"
@@ -1388,7 +1388,7 @@ def test_contribute_tool_posts_through_the_contribute_endpoint() -> None:
     assert result["payload"]["title"] == "Decision: adopt deepseek"
     assert result["payload"]["tags"] == ["decision"]
     assert result["payload"]["source_url"] == (
-        "https://github.com/masumi-network/Citadel-Archive"
+        "https://github.com/masumi-network/Citadel"
     )
 
 
