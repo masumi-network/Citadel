@@ -100,10 +100,11 @@ def test_release_trigger_guard_and_python_build_gate() -> None:
     build = _job(workflow, "build", "stage-image")
 
     assert 'tags:\n      - "v*"' in workflow
+    assert "workflow_dispatch:" in workflow
     assert "cancel-in-progress: false" in workflow
     assert r"^v[0-9]+\.[0-9]+\.[0-9]+$" in guard
-    assert 'git merge-base --is-ancestor "$GITHUB_SHA" "origin/main"' in guard
-    assert "commits/${GITHUB_SHA}/check-runs" in guard
+    assert 'git merge-base --is-ancestor HEAD "origin/main"' in guard
+    assert "commits/${commit}/check-runs" in guard
     assert 'select(.name == "CI gate" and .conclusion == "success")' in guard
     assert "needs: release-guard" in build
     assert 'test "${RELEASE_TAG#v}" =' in build
@@ -210,6 +211,7 @@ def test_keyless_attestation_and_pypi_fail_closed_on_oci_gates() -> None:
     assert "id-token: write" in attestation
     assert "attestations: write" in attestation
     assert "artifact-metadata: write" in attestation
+    assert "uses: docker/login-action@v3" in attestation
     assert "uses: actions/attest@v4" in attestation
     assert "subject-digest: ${{ needs.stage-image.outputs.digest }}" in attestation
     assert "push-to-registry: true" in attestation
@@ -234,6 +236,7 @@ def test_promotion_and_release_use_only_the_exact_immutable_version() -> None:
     assert "needs: [build, stage-image, promote-image]" in release
     assert "citadel-image-receipt.txt" in release
     assert '"$IMAGE_NAME" "$VERSION" "$INDEX_DIGEST" "$GITHUB_SHA"' in release
+    assert 'gh release view "${GITHUB_REF_NAME}"' in release
     assert 'gh release create "${GITHUB_REF_NAME}"' in release
     assert ":latest" not in workflow.lower()
     assert "${VERSION%.*}" not in workflow
