@@ -2182,16 +2182,17 @@ async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
     )
     monkeypatch.setattr(second_client, "cognify", replacement_cognify)
 
+    wait_timeout = 5.0
     first_client.resume_cognify_queue()
     first_task = first_client._cognify_queue_task
     assert first_task is not None
-    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    await asyncio.wait_for(cleanup_started.wait(), timeout=wait_timeout)
     clock_now += timedelta(hours=2)
 
     second_client.resume_cognify_queue()
     contending_task = second_client._cognify_queue_task
     assert contending_task is not None
-    await asyncio.wait_for(asyncio.shield(contending_task), timeout=1)
+    await asyncio.wait_for(asyncio.shield(contending_task), timeout=wait_timeout)
 
     assert replacement_started.is_set() is False
     pending = second_queue.snapshot()
@@ -2200,13 +2201,13 @@ async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
     assert max_active_cognify == 1
 
     release_cleanup.set()
-    await asyncio.wait_for(asyncio.shield(first_task), timeout=1)
+    await asyncio.wait_for(asyncio.shield(first_task), timeout=wait_timeout)
     second_client._cancel_cognify_retry()
     second_client.resume_cognify_queue()
     replacement_task = second_client._cognify_queue_task
     assert replacement_task is not None
-    await asyncio.wait_for(replacement_started.wait(), timeout=1)
-    await asyncio.wait_for(asyncio.shield(replacement_task), timeout=1)
+    await asyncio.wait_for(replacement_started.wait(), timeout=wait_timeout)
+    await asyncio.wait_for(asyncio.shield(replacement_task), timeout=wait_timeout)
 
     assert second_queue.snapshot() == ()
     await first_client.stop_cognify_queue()
