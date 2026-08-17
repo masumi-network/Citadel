@@ -3082,6 +3082,9 @@ def _write_update_cache(data: dict[str, Any]) -> None:
         path.write_text(json.dumps(data) + "\n")
     except OSError:
         pass  # update-check cache is best-effort
+
+
+def _declined_recently(*, now: float | None = None) -> bool:
     stamp = now if now is not None else datetime.now(timezone.utc).timestamp()
     raw = _read_update_cache().get("declined_at")
     if not isinstance(raw, (int, float)):
