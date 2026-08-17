@@ -10,7 +10,7 @@ description: Use when deciding what Citadel data may be quoted, committed, or sh
 | Location | Public? | What lives there |
 |---|---|---|
 | [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) | **Yes** | Code, MCP, docs, agent skills — **not** vault content |
-| Railway hosted vault | **No** | Live memory, search, tokens (hashed), DB |
+| Hosted Organization Vault | **No** | Live memory, search, tokens (hashed), DB |
 | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) | **No** | Backup evidence export (private git) |
 
 **Never** put `ctdl_` tokens, API keys, `.env` values, or vault search results into the

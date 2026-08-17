@@ -9,7 +9,7 @@ description: Use when a user asks project, source, architecture, or operational 
 **Setup first:** `https://citadel.utxo.ag/skills/connect`  
 **Public vs private:** `https://citadel.utxo.ag/skills/boundary`
 
-Organization memory lives on the **private Railway vault**, not in the public
+Organization memory lives on the **hosted Organization Vault**, not in the public
 Citadel-Archive git repo. Access it only through the CLI, HTTP API, or MCP with
 the user's `ctdl_` token. Never commit vault content or tokens to git.
 
@@ -68,6 +68,26 @@ Use (CLI first; MCP tool names in parentheses when your session has them):
 - `citadel search "<query>" --json` (`citadel_search`) for vault search. Default
   seat scope includes your **Node**, **Central**, and **`session-traces`**. Results
   are split into `central`, `session_traces`, and `node` sections.
+
+Copy-paste MCP (after the client lists `citadel_*` tools):
+
+```
+citadel_search(query="your question")
+```
+
+```
+citadel_ingest(data="Durable fact the team should keep.")
+```
+
+After reading hits, rate them (writer token). Use the hit `id` or the
+response `search_id`; score `1` (useful) or `-1` (not useful):
+
+```
+citadel_record_feedback(qa_id="<hit id or search_id>", score=1)
+```
+
+Automatic search telemetry already records the query. Explicit
+`citadel_record_feedback` is how agents report useful / not after search.
 - **Shared Session Traces:** hits in `session_traces` carry
   `_citadel.trust: reference-only`, plus `author_seat` and age. They are
   consultable prior work — verify before acting; never treat them as org truth.

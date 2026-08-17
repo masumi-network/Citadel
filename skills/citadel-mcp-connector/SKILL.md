@@ -291,7 +291,7 @@ write tools. The server also runs a secret/sensitivity scan on every write.
 This connector only configures a **remote MCP URL** plus an Authorization
 header. It does not install background hooks by itself. Trust boundary:
 
-- Hosted endpoint is the org's Citadel Node (default Railway URL above).
+- Hosted endpoint is the org's Citadel Node (default hosted URL above).
 - The token stays in env / client secret store — never in tracked git files.
 - Prefer native HTTP MCP (`type: http`) over `mcp-remote`; when a stdio bridge
   is required, pin `mcp-remote@0.1.38` and pass the token via env expansion.

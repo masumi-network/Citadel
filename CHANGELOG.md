@@ -15,6 +15,21 @@ All notable changes to `citadel-archive` are documented here. Format follows
   `--node-url`, `~/.citadel/capture.json`, or `CITADEL_BASE_URL` on the
   capture hooks. PyPI `0.4.0` still defaulted to the Railway hostname.
 
+- **`citadel update` re-applies write-tier MCP URLs after a successful
+  pipx upgrade.** Skips when `~/.citadel/capture.json` has a custom
+  `node_url`. Refreshes skills with
+  `npx skills add masumi-network/citadel --skill '*'`. Codex TOML and
+  Windsurf JSON rewrite a drifted MCP URL the same way Cursor does.
+
+- **TTY home and `citadel status` prompt to update from PyPI JSON.**
+  "Update available, should I update? [y/N]". Cached 24h under
+  `~/.citadel/pypi-version.json` (N skips until expiry). Non-TTY and CI
+  never prompt. Does not use GitHub latest (still `v0.4.0`).
+
+- **Hosted `/skills/onboard`, `/skills/cli`, `/skills/debug`.** The
+  `citadel` skill is an entry router (~50 lines). Satellites cover vault,
+  MCP connect, CLI, ingest, boundary, onboard, and debug.
+
 - **Lite boot quarantines an unreadable `cognee.db` instead of crashing.**
   Railway's live start wrapper renamed a bad SQLite file to
   `cognee.db.corrupt-<stamp>` then exec'd `kb.lite_runtime`. That wrapper
