@@ -22,7 +22,7 @@ Agents read vault content only through MCP with a user `ctdl_` token — never f
 The agent will ask for a `ctdl_...` access token, configure MCP locally, verify the connection, and start searching the vault.
 
 > **Hosted MCP is the supported path.** Connect any client to
-> `https://citadel.utxo.ag/mcp` with
+> `https://citadel.utxo.ag/mcp/` with
 > `Authorization: Bearer ctdl_...` — no clone needed. This plugin is a legacy
 > stdio wrapper kept for offline/dev use.
 
