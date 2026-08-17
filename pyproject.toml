@@ -119,9 +119,15 @@ artifacts = ["kb/webui/**", "kb/data/tiktoken-cache/*"]
 
 # The repository-wide `*-export.md` ignore pattern matches ADR 0014 even though
 # it is tracked. Force the complete tree into the sdist so wheel and source
-# distributions carry the same public runtime records.
+# distributions carry the same public runtime records. `skills` must be forced
+# too: the Codex plugin symlink `plugins/citadel-archive-mcp/skills` ->
+# `../../skills` is visited first and hatchling then omits the top-level tree.
+[tool.hatch.build.targets.sdist]
+exclude = ["plugins/citadel-archive-mcp/skills"]
+
 [tool.hatch.build.targets.sdist.force-include]
 "docs/adr" = "docs/adr"
+"skills" = "skills"
 
 [tool.ruff]
 line-length = 100

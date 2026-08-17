@@ -5,7 +5,7 @@
 # isn't — then installs the `citadel` CLI from PyPI. Runs without Python (it is
 # the thing that puts Python there), so it's the entry point for a fresh machine.
 #
-#   curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel-Archive/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel/main/install.sh | sh
 #   # skip prompts:  ... | sh -s -- -y
 #   # preview only:   ... | sh -s -- --dry-run
 

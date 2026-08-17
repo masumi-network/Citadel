@@ -54,6 +54,12 @@ def test_mask_token() -> None:
     assert mask_token("ctdl_abcdef1234567890") == "…7890"
 
 
+def test_mcp_block_defaults_to_utxo_ag() -> None:
+    block = mcp_server_block()
+    assert block["url"] == "https://citadel.utxo.ag/mcp/"
+    assert block["headers"]["Authorization"] == "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
+
+
 def test_mcp_block_references_env_not_secret() -> None:
     block = mcp_server_block("https://node.example/")
     assert block["url"] == "https://node.example/mcp/"

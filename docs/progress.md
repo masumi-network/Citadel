@@ -634,7 +634,7 @@ landed.
 
 ## 2026-06-27 — ADR-0007 P5/P6 merged + promotion enabled in prod (PR #19)
 
-- **Merged [PR #19](https://github.com/masumi-network/Citadel-Archive/pull/19)** → `main`
+- **Merged [PR #19](https://github.com/masumi-network/Citadel/pull/19)** → `main`
   (`a9aecbc`): Promotion Agent, approval queue, MCP tools, dashboard panel,
   `citadel promotion` CLI, grill-aligned docs/skills.
 - **Production env** on Railway **Citadel-Archive**:
@@ -1105,7 +1105,7 @@ SaaS onboarding + autonomous sync, and started the knowledge-graph redesign.
 
 - Checked current Citadel automation and tightened the cron/gateway path:
   - GitHub reports no Actions workflows and no Actions runs for
-    `masumi-network/Citadel-Archive`; active automation is Railway, not GitHub
+    `masumi-network/Citadel`; active automation is Railway, not GitHub
     Actions.
   - Railway production has `Citadel-Archive`, `Citadel-GitHub-Sync`, and
     `Postgres` deployed successfully.
@@ -1340,7 +1340,7 @@ SaaS onboarding + autonomous sync, and started the knowledge-graph redesign.
 ## 2026-06-02
 
 - Team-share readiness verified after commit `7a4a1d9`:
-  - `npx skills add masumi-network/Citadel-Archive` installs the root
+  - `npx skills add masumi-network/citadel` installs the root
     `citadel-archive` skill.
   - Production web service `Citadel-Archive` is `SUCCESS` and `RUNNING` on
     Railway at commit `7a4a1d9`.
@@ -1384,7 +1384,7 @@ SaaS onboarding + autonomous sync, and started the knowledge-graph redesign.
   - Current scaffold includes `.gitignore`, `README.md`, `manifests/`, and
     `snapshots/`.
 - Split repositories for production topology:
-  - [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) is public
+  - [Citadel](https://github.com/masumi-network/Citadel) is public
     (app, MCP, hosted agent skills).
   - [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) is
     private (Phase 1 Vault Backup Mirror target).

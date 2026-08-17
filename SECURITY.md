@@ -85,4 +85,4 @@ and a **private backup mirror**. See [docs/public-and-private.md](docs/public-an
 
 ## Agent-facing summary
 
-https://citadel-archive-production.up.railway.app/skills/boundary
+https://citadel.utxo.ag/skills/boundary

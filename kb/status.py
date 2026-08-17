@@ -239,13 +239,16 @@ def check_auth(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         detail = _humanize_net_error(exc)
         return Check("auth", ok=False, detail=detail, data={"code": CODE_AUTH_REQUIRED})
     latency = int((time.monotonic() - started) * 1000)
+    raw_actor = data.get("actor") or {}
+    actor = raw_actor if isinstance(raw_actor, dict) else {}
     identity = {
         "seat_slug": data.get("seat_slug"),
         "default_dataset": data.get("default_dataset"),
         "node_label": data.get("node_label"),
         "role": data.get("role"),
         "capabilities": data.get("capabilities", {}),
-        "actor": (data.get("actor") or {}).get("name"),
+        "actor": actor.get("name"),
+        "scopes": list(actor.get("scopes") or []),
     }
     ok = bool(data.get("ok"))
     auth_data: dict[str, Any] = dict(identity)

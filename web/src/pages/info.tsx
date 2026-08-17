@@ -401,7 +401,7 @@ export default function Info() {
             </div>
           </div>
           <p className={FOOT_NOTE}>
-            Live node: <code className={CODE}>citadel-archive-production.up.railway.app</code>
+            Live node: <code className={CODE}>citadel.utxo.ag</code>
             {tiles.footNote ? ` · ${tiles.footNote}` : " · window v0.2.0 → v0.5.0."}
           </p>
         </div>

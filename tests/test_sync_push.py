@@ -37,7 +37,7 @@ def test_format_commit_snapshot_includes_metadata() -> None:
         branch="main",
         remote_name="origin",
         remote_ref="refs/heads/main",
-        repo_name="Citadel-Archive",
+        repo_name="Citadel",
         changed_files=["kb/foo.py", "tests/test_sync_push.py"],
     )
     assert "Git commit snapshot" in note
@@ -76,7 +76,7 @@ def test_build_commit_snapshot_omits_denied_env_paths(monkeypatch: Any) -> None:
         "_changed_files",
         lambda cwd, sha: [".env", "kb/foo.py", "secrets/prod.pem"],
     )
-    monkeypatch.setattr(sync_push, "_repo_name", lambda cwd: "Citadel-Archive")
+    monkeypatch.setattr(sync_push, "_repo_name", lambda cwd: "Citadel")
     monkeypatch.setattr(sync_push, "_git_branch", lambda cwd: "main")
 
     note = sync_push.build_commit_snapshot("/tmp/repo", "a" * 40)

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -170,7 +171,21 @@ def _wire_codex(url: str) -> ToolResult:
         except OSError as exc:
             return ToolResult("codex", "error", f"{path}: {exc}")
     if marker in existing:
-        return ToolResult("codex", "unchanged", str(path))
+        wanted = f'url = "{url}"'
+        start = existing.index(marker)
+        rest = existing.find("\n[", start + len(marker))
+        section = existing[start:] if rest < 0 else existing[start:rest]
+        if wanted in section:
+            return ToolResult("codex", "unchanged", str(path))
+        new_section = re.sub(r'url\s*=\s*"[^"]*"', wanted, section, count=1)
+        if new_section == section:
+            return ToolResult("codex", "unchanged", str(path))
+        updated = existing[:start] + new_section + (existing[rest:] if rest >= 0 else "")
+        try:
+            path.write_text(updated)
+        except OSError as exc:
+            return ToolResult("codex", "error", f"{path}: {exc}")
+        return ToolResult("codex", "wrote", str(path))
     block = f"\n{marker}\nurl = \"{url}\"\nbearer_token_env_var = \"{TOKEN_ENV}\"\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -275,6 +275,7 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
     )
     assert report.healthy
     assert report.identity["seat_slug"] == "sarthi"
+    assert report.identity["scopes"] == []
     names = {c.name: c.ok for c in report.checks}
     assert names["node"] and names["auth"] and names["search"]
     assert report.recent[0]["title"] == "feat: x"
@@ -329,6 +330,28 @@ def test_auth_no_token_sets_code() -> None:
     auth = status_mod.check_auth("https://node.example", None)
     assert auth.ok is False
     assert auth.data.get("code") == status_mod.CODE_AUTH_REQUIRED
+
+
+def test_check_auth_keeps_actor_scopes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        status_mod._OPENER,
+        "open",
+        _route(
+            {
+                "/api/session": {
+                    "ok": True,
+                    "role": "writer",
+                    "seat_slug": "alice",
+                    "capabilities": {"read": True, "write": True, "admin": False},
+                    "actor": {"name": "Alice", "scopes": ["kb:read", "access:manage"]},
+                }
+            }
+        ),
+    )
+    auth = status_mod.check_auth("https://node.example", "ctdl_tok")
+    assert auth.ok is True
+    assert auth.data["scopes"] == ["kb:read", "access:manage"]
+    assert auth.data["actor"] == "Alice"
 
 
 def test_check_local_setup_corrupt_config_does_not_raise(tmp_path: Path) -> None:

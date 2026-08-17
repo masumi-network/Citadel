@@ -27,7 +27,7 @@ Auth:          Authorization: Bearer ctdl_<your-token>
 | Public | Private |
 |---|---|
 | The hosted REST + MCP API surface and these `/skills/*` docs | The vault contents — only readable with a `ctdl_` token |
-| [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) — app code, skills | Team/organization memory behind the token |
+| [Citadel](https://github.com/masumi-network/Citadel) — app code, skills | Team/organization memory behind the token |
 
 Never commit tokens. Never copy vault search results into a public repo or issue.
 Boundary detail: `https://citadel.utxo.ag/skills/boundary`
@@ -291,7 +291,7 @@ write tools. The server also runs a secret/sensitivity scan on every write.
 This connector only configures a **remote MCP URL** plus an Authorization
 header. It does not install background hooks by itself. Trust boundary:
 
-- Hosted endpoint is the org's Citadel Node (default Railway URL above).
+- Hosted endpoint is the org's Citadel Node (default hosted URL above).
 - The token stays in env / client secret store — never in tracked git files.
 - Prefer native HTTP MCP (`type: http`) over `mcp-remote`; when a stdio bridge
   is required, pin `mcp-remote@0.1.38` and pass the token via env expansion.

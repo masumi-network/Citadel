@@ -207,13 +207,19 @@ def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> 
         "/api/state",
         "/skills",
         "/skills/boundary",
+        "/skills/cli",
         "/skills/connect",
+        "/skills/debug",
+        "/skills/onboard",
         "/skills/proactive-ingest",
         "/skills/vault",
     )
     skill_names = (
+        "citadel-cli",
         "citadel-data-boundary",
+        "citadel-debug",
         "citadel-mcp-connector",
+        "citadel-onboard",
         "citadel-proactive-ingest",
         "citadel-vault",
     )

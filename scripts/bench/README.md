@@ -63,7 +63,7 @@ Tracking issue for the harness: #122.
    gitignored `.env` is stale and 401s. Without it: `CITADEL_MCP_ACCESS_TOKEN
    is not set`, exit 2.
 2. **The node URL**, defaulting to
-   `https://citadel-archive-production.up.railway.app`; override with
+   `https://citadel.utxo.ag`; override with
    `--node-url` or `CITADEL_NODE_URL`.
 3. **The content fingerprint, to make the run comparable to a later one.**
    `--repo-state PATH` or `CITADEL_REPO_STATE_PATH`, else

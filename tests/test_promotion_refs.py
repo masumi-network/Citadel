@@ -42,21 +42,21 @@ def test_parse_capture_tags_from_text() -> None:
 def test_load_tracked_org_repos_reads_github_state(tmp_path: Path) -> None:
     state_path = tmp_path / "github-state.json"
     state_path.write_text(
-        json.dumps({"repos": {"masumi-network/Citadel-Archive": {"updated_at": "now"}}}),
+        json.dumps({"repos": {"masumi-network/Citadel": {"updated_at": "now"}}}),
         encoding="utf-8",
     )
     repos = load_tracked_org_repos(state_path, "masumi-network")
-    assert "masumi-network/citadel-archive" in repos
-    assert "citadel-archive" in repos
+    assert "masumi-network/citadel" in repos
+    assert "citadel" in repos
 
 
 async def test_assess_org_reference_known_repo(tmp_path: Path) -> None:
     state_path = tmp_path / "github-state.json"
     state_path.write_text(
-        json.dumps({"repos": {"masumi-network/Citadel-Archive": {}}}),
+        json.dumps({"repos": {"masumi-network/Citadel": {}}}),
         encoding="utf-8",
     )
-    text = "Work on https://github.com/masumi-network/Citadel-Archive/pull/1"
+    text = "Work on https://github.com/masumi-network/Citadel/pull/1"
     result = await assess_org_reference(
         FakeCitadel(),
         candidate_text=text,
@@ -69,7 +69,7 @@ async def test_assess_org_reference_known_repo(tmp_path: Path) -> None:
 
 async def test_assess_org_reference_new_project(tmp_path: Path) -> None:
     state_path = tmp_path / "github-state.json"
-    state_path.write_text(json.dumps({"repos": {"masumi-network/Citadel-Archive": {}}}), encoding="utf-8")
+    state_path.write_text(json.dumps({"repos": {"masumi-network/Citadel": {}}}), encoding="utf-8")
     text = "Remote: https://github.com/other-org/brand-new-app.git"
     result = await assess_org_reference(
         FakeCitadel(central_hits=False),

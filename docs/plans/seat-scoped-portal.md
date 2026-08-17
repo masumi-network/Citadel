@@ -1,8 +1,8 @@
 # Seat-Scoped Portal — Product & Architecture Plan
 
-**Status:** Phase 1 **SHIPPED** (PR [#95](https://github.com/masumi-network/Citadel-Archive/pull/95), 2026-07-21) — Phase 2 remaining  
+**Status:** Phase 1 **SHIPPED** (PR [#95](https://github.com/masumi-network/Citadel/pull/95), 2026-07-21) — Phase 2 remaining  
 **Date:** 2026-07-21  
-**Brand UX:** Login + sidebar use the **Pixel Bastion** mark and Interface chrome (PR [#96](https://github.com/masumi-network/Citadel-Archive/pull/96)); does not change seat auth or Node isolation.  
+**Brand UX:** Login + sidebar use the **Pixel Bastion** mark and Interface chrome (PR [#96](https://github.com/masumi-network/Citadel/pull/96)); does not change seat auth or Node isolation.  
 **Relates:** [ADR-0003](../adr/0003-seat-node-central-private-memory.md), [ADR-0006](../adr/0006-agent-auth-and-onboarding.md), [ADR-0007](../adr/0007-seat-capture-promotion-write-policy.md), [ADR-0009](../adr/0009-mesh-read-isolation-presence-vs-content.md), [`agent-access-model.md`](../agent-access-model.md), [`organization-vault-plan.md`](../organization-vault-plan.md), [`onboarding/teammate-rollout.md`](../onboarding/teammate-rollout.md)
 
 ## Vision

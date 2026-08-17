@@ -8,7 +8,7 @@ Citadel uses a private GitHub repository as the Phase 1 **Vault Backup Mirror** 
 https://github.com/masumi-network/Vault-Backup-Mirror
 
 **Application repository (public):**  
-https://github.com/masumi-network/Citadel-Archive
+https://github.com/masumi-network/Citadel
 
 GitHub gives low-cost private storage, readable diffs, commit history, and familiar access controls, but it is not the live retrieval store and should not be used as a 1 TB blob backup target; large bodies can move to object storage later while GitHub keeps traceable manifests and metadata.
 

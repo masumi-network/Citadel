@@ -1,6 +1,6 @@
 # ADR 0011 — Shared Session Traces as a third storage layer
 
-- **Status:** Accepted (2026-07-20 grill); **v1 shipped** in [PR #93](https://github.com/masumi-network/Citadel-Archive/pull/93) (`design/shared-session-index`)
+- **Status:** Accepted (2026-07-20 grill); **v1 shipped** in [PR #93](https://github.com/masumi-network/Citadel/pull/93) (`design/shared-session-index`)
 - **Amends:** ADR-0007 (seat capture, promotion, and write policy), ADR-0003
   (seat/node/Central private memory)
 - **Relates:** ADR-0009 (mesh read isolation — presence vs content),

@@ -27,13 +27,19 @@ BUNDLED_TREES = (
 )
 CANONICAL_SKILLS = {
     "boundary": "citadel-data-boundary",
+    "cli": "citadel-cli",
     "connect": "citadel-mcp-connector",
+    "debug": "citadel-debug",
+    "onboard": "citadel-onboard",
     "proactive-ingest": "citadel-proactive-ingest",
     "vault": "citadel-vault",
 }
 EXPECTED_SKILL_ALIASES = {
     "boundary": ["citadel-data-boundary", "policy", "privacy", "public-private"],
+    "cli": ["citadel-cli"],
     "connect": ["citadel-mcp-connector", "mcp", "mcp-connector"],
+    "debug": ["citadel-debug"],
+    "onboard": ["citadel-onboard"],
     "proactive-ingest": ["autosync", "citadel-proactive-ingest"],
     "vault": ["citadel-vault"],
 }

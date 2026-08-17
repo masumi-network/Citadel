@@ -13,16 +13,24 @@ from typing import Any
 import pytest
 
 from kb.cli import (
+    _PYPI_PROJECT_JSON,
+    _SKILLS_ADD_HINT,
     _activity,
+    _cached_pypi_latest,
+    _capture_has_custom_node_url,
+    _declined_recently,
     _doctor,
     _ingest,
+    _maybe_prompt_update,
     _operation,
     _search,
+    _should_prompt_update,
     _token_set,
     _update,
     _wizard_roots,
     build_parser,
 )
+from kb.capture_config import DEFAULT_NODE_URL, CaptureConfig, capture_config_path, save_capture_config
 from kb.status import Check, StatusReport
 
 
@@ -992,6 +1000,7 @@ def test_update_editable_install_is_left_alone(monkeypatch, capsys) -> None:
 
 
 def test_update_pipx_already_latest(monkeypatch, capsys) -> None:
+    wired: list[str] = []
     monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
     monkeypatch.setattr(
         "kb.cli.subprocess.run",
@@ -1001,12 +1010,20 @@ def test_update_pipx_already_latest(monkeypatch, capsys) -> None:
             stderr="",
         ),
     )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
-    assert "already up to date" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already up to date" in out
+    assert _SKILLS_ADD_HINT in out
+    assert wired == [DEFAULT_NODE_URL]
 
 
 def test_update_pipx_upgraded(monkeypatch, capsys) -> None:
+    wired: list[str] = []
     monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
     monkeypatch.setattr(
         "kb.cli.subprocess.run",
@@ -1016,9 +1033,39 @@ def test_update_pipx_upgraded(monkeypatch, capsys) -> None:
             stderr="",
         ),
     )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
-    assert "upgraded package citadel-archive" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "upgraded package citadel-archive" in out
+    assert _SKILLS_ADD_HINT in out
+    assert wired == [DEFAULT_NODE_URL]
+
+
+def test_update_skips_rewire_when_capture_has_custom_node_url(monkeypatch, capsys) -> None:
+    wired: list[str] = []
+    save_capture_config(CaptureConfig(node_url="https://node.example"))
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+    monkeypatch.setattr(
+        "kb.cli.subprocess.run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout="upgraded package citadel-archive from 0.2.1 to 0.3.0 (location: …)",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
+    assert _capture_has_custom_node_url() is True
+    rc = asyncio.run(_update(argparse.Namespace()))
+    assert rc == 0
+    assert wired == []
+    assert _SKILLS_ADD_HINT in capsys.readouterr().out
 
 
 def test_update_pipx_failure_exits_one(monkeypatch, capsys) -> None:
@@ -1037,6 +1084,103 @@ def test_update_unmanaged_install_prints_instructions(monkeypatch, capsys) -> No
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
     assert "pip install --upgrade citadel-archive" in capsys.readouterr().out
+
+
+def test_update_check_uses_pypi_json_not_github() -> None:
+    assert _PYPI_PROJECT_JSON == "https://pypi.org/pypi/citadel-archive/json"
+    assert "github.com" not in _PYPI_PROJECT_JSON
+
+
+def test_cached_pypi_latest_uses_cache_within_24h(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    cache = capture_config_path().parent / "pypi-version.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"latest": "0.9.9", "checked_at": now}) + "\n")
+    monkeypatch.setattr("kb.cli._fetch_pypi_latest", lambda: pytest.fail("must not hit network"))
+    assert _cached_pypi_latest(now=now + 60) == "0.9.9"
+
+
+def test_cached_pypi_latest_refetches_after_24h(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    cache = capture_config_path().parent / "pypi-version.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"latest": "0.9.9", "checked_at": now}) + "\n")
+    monkeypatch.setattr("kb.cli._fetch_pypi_latest", lambda: "1.2.3")
+    assert _cached_pypi_latest(now=now + 24 * 3600 + 1) == "1.2.3"
+    stored = json.loads(cache.read_text())
+    assert stored["latest"] == "1.2.3"
+    assert stored["checked_at"] == now + 24 * 3600 + 1
+
+
+def test_should_prompt_update_false_under_pytest(monkeypatch) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert _should_prompt_update() is False
+
+
+def test_should_prompt_update_false_non_tty(monkeypatch) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert _should_prompt_update() is False
+
+
+def test_update_prompt_skipped_non_tty(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: False)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "9.9.9")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.5.1")
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert capsys.readouterr().out == ""
+
+
+def test_update_prompt_yes_runs_upgrade_and_wire(monkeypatch, capsys) -> None:
+    wired: list[str] = []
+    pipx_cmds: list[list[str]] = []
+    prompts: list[str] = []
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: True)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "0.5.1")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.4.0")
+    monkeypatch.setattr("kb.cli._declined_recently", lambda now=None: False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "y")
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+
+    def fake_run(cmd, **kwargs):
+        pipx_cmds.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="upgraded package citadel-archive from 0.4.0 to 0.5.1",
+            stderr="",
+        )
+
+    monkeypatch.setattr("kb.cli.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
+    monkeypatch.setattr("kb.cli._refresh_skills_pack", lambda: None)
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert pipx_cmds and pipx_cmds[0][:2] == ["/usr/bin/pipx", "upgrade"]
+    assert wired == [DEFAULT_NODE_URL]
+    assert "Update available" in prompts[0]
+    assert "0.5.1 on PyPI" in capsys.readouterr().out
+
+
+def test_update_prompt_no_skips_until_cache(monkeypatch, capsys) -> None:
+    prompts: list[str] = []
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: True)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "0.5.1")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.4.0")
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "n")
+    monkeypatch.setattr(
+        "kb.cli._update",
+        lambda args: pytest.fail("must not update on N"),
+    )
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert _declined_recently() is True
+    assert "Update available" in prompts[0]
+    assert "0.5.1 on PyPI" in capsys.readouterr().out
 
 
 # ---- coding-tools checkbox + stale-token hint ----------------------------------
@@ -1217,6 +1361,9 @@ def _token_create_args(**kw):
 
 def _wire_access(monkeypatch, *, seats=None):
     calls = {}
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("CITADEL_WRITER_KEYS", raising=False)
+    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
 
     def fake_issue_seat_token(slug, **k):
         calls["seat"] = (slug, k.get("token_name"))
@@ -1523,3 +1670,179 @@ def test_activity_global_json_error_is_parseable(monkeypatch, capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False
     assert out["code"] == "NODE_UNREACHABLE"
+
+
+# ---- role-aware home, writer self-mint, mcp picker -----------------------------
+
+
+def _home_names(show_seat: bool) -> list[str]:
+    from kb.cli import _home_menu
+
+    return [name for _, rows in _home_menu(show_seat=show_seat) for name, _ in rows]
+
+
+def _printed_command_names(out: str) -> list[str]:
+    import re
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    names = []
+    for line in plain.splitlines():
+        if line.startswith("    "):
+            part = line.strip().split()
+            if part:
+                names.append(part[0])
+    return names
+
+
+def test_writer_home_omits_seat_create() -> None:
+    from kb.cli import _home_menu
+
+    names = _home_names(False)
+    assert "seat" not in names
+    assert "token" in names
+    blob = " ".join(desc for _, rows in _home_menu(show_seat=False) for _, desc in rows)
+    assert "seat create" not in blob
+
+
+def test_admin_home_includes_seat() -> None:
+    names = _home_names(True)
+    assert "seat" in names
+    assert "token" in names
+
+
+def test_home_fetch_fail_hides_seat(monkeypatch, capsys) -> None:
+    from kb.cli import _print_home
+
+    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_writer")
+    monkeypatch.setattr(
+        "kb.cli.check_auth",
+        lambda *a, **k: Check("auth", False, "HTTP Error 401: Unauthorized"),
+    )
+    _print_home()
+    names = _printed_command_names(capsys.readouterr().out)
+    assert "seat" not in names
+    assert "token" in names
+
+
+def test_admin_key_home_shows_seat_without_fetch(monkeypatch, capsys) -> None:
+    from kb.cli import _print_home
+
+    monkeypatch.setenv("CITADEL_ADMIN_KEY", "owner-admin")
+    monkeypatch.setattr(
+        "kb.cli.check_auth",
+        lambda *a, **k: pytest.fail("home must not fetch identity when admin key is set"),
+    )
+    _print_home()
+    names = _printed_command_names(capsys.readouterr().out)
+    assert "seat" in names
+    assert "token" in names
+
+
+def test_seat_create_without_admin_key_exits_before_api(monkeypatch, capsys) -> None:
+    from kb.cli import _seat_create
+
+    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
+    monkeypatch.setattr("kb.cli.create_seat", lambda **k: pytest.fail("admin API"))
+    args = argparse.Namespace(
+        name="Alice", slug="alice", email=None, role="writer",
+        no_token=False, json=False, node_url="https://node.example",
+    )
+    rc = asyncio.run(_seat_create(args))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "admin only" in err
+    assert "citadel token create" in err
+
+
+def test_token_create_self_mints_without_admin_key(monkeypatch, capsys) -> None:
+    from kb.cli import _token_create
+
+    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_seat_tok")
+    monkeypatch.setattr(
+        "kb.cli.check_auth",
+        lambda *a, **k: Check(
+            "auth", True, "valid",
+            data={"role": "writer", "seat_slug": "alice", "capabilities": {"write": True}, "scopes": []},
+        ),
+    )
+    calls: dict = {}
+
+    def fake_self(**k):
+        calls["self"] = k
+        return {
+            "ok": True,
+            "token": "ctdl_new",
+            "api_token": {"role": "writer", "default_dataset": "seat:alice"},
+        }
+
+    monkeypatch.setattr("kb.cli.create_self_seat_token", fake_self)
+    monkeypatch.setattr("kb.cli.issue_seat_token", lambda *a, **k: pytest.fail("admin seat path"))
+    monkeypatch.setattr("kb.cli.create_token", lambda **k: pytest.fail("standalone admin path"))
+    monkeypatch.setattr(
+        "kb.access_client.admin_key",
+        lambda: pytest.fail("must not read CITADEL_ADMIN_KEY"),
+    )
+    rc = asyncio.run(_token_create(_token_create_args(json=True)))
+    assert rc == 0
+    assert calls["self"]["token"] == "ctdl_seat_tok"
+    assert calls["self"]["role"] == "writer"
+    assert calls["self"]["token_name"] == "ci-bot"
+    assert json.loads(capsys.readouterr().out)["token"] == "ctdl_new"
+
+
+def test_mcp_no_args_uses_checkbox(monkeypatch) -> None:
+    from kb.cli import _mcp
+    from kb.tool_detect import ToolResult
+
+    applied: list[str] = []
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("kb.tool_detect.detect", lambda: ["cursor", "codex"])
+    monkeypatch.setattr(
+        "kb.tool_detect.apply",
+        lambda name, node_url: applied.append(name) or ToolResult(name, "wrote", "ok"),
+    )
+    monkeypatch.setattr("kb.prompt.checkbox_select", lambda *a, **k: {0})
+    rc = asyncio.run(_mcp(argparse.Namespace(node_url="https://node.example", mcp_command=None)))
+    assert rc == 0
+    assert applied == ["cursor"]
+
+
+def test_mcp_checkbox_skip_writes_nothing(monkeypatch) -> None:
+    from kb.cli import _mcp
+    from kb.tool_detect import ToolResult
+
+    applied: list[str] = []
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("kb.tool_detect.detect", lambda: ["cursor"])
+    monkeypatch.setattr(
+        "kb.tool_detect.apply",
+        lambda name, node_url: applied.append(name) or ToolResult(name, "wrote", "ok"),
+    )
+    monkeypatch.setattr("kb.prompt.checkbox_select", lambda *a, **k: None)
+    rc = asyncio.run(_mcp(argparse.Namespace(node_url="https://node.example", mcp_command=None)))
+    assert rc == 0
+    assert applied == []
+
+
+def test_mcp_install_help_contains_add_help(capsys) -> None:
+    from kb.cli import _subparser_choice_help
+
+    parser = build_parser()
+    mcp = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices["mcp"]
+    sub = next(a for a in mcp._actions if isinstance(a, argparse._SubParsersAction))
+    add_help = _subparser_choice_help(sub, "add")
+    install_help = _subparser_choice_help(sub, "install")
+    assert add_help == install_help
+    assert "Add Citadel MCP to a tool" in add_help
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(["mcp", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "add (install)" in out
+    assert "Add Citadel MCP to a tool" in out
+

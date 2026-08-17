@@ -8,7 +8,7 @@ agents may repeat in chat.
 
 | Layer | Where | Visibility | Contains |
 |---|---|---|---|
-| **Application** | [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) | **Public** | Python app, MCP wrapper, agent skills, docs, UI code, tests |
+| **Application** | [Citadel](https://github.com/masumi-network/Citadel) | **Public** | Python app, MCP wrapper, agent skills, docs, UI code, tests |
 | **Live vault** | Railway (+ Postgres / pgvector / Kuzu volume) | **Private** | Structured knowledge, embeddings, mesh, audit, access tokens (hashed) |
 | **Backup mirror** | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) | **Private** | Text-first export of vault evidence (snapshots, manifests)—not live search |
 
@@ -19,7 +19,7 @@ Agents / humans ──MCP/HTTPS + ctdl token──► Railway (live vault)
                                     Vault-Backup-Mirror (private git)
 ```
 
-## Public (safe in Citadel-Archive)
+## Public (safe in the Citadel git repo)
 
 - Source code, licenses, and architecture docs
 - Agent skills at `/skills/connect`, `/skills/vault`, `/skills/boundary`
@@ -62,25 +62,25 @@ queries go to Railway with a user-provided token.
 
 | Action | OK? |
 |---|---|
-| Open-source Citadel-Archive | ✅ |
+| Open-source Citadel | ✅ |
 | Share `/skills/connect` URL | ✅ |
 | Paste a `ctdl_` token in Discord/PR | ❌ |
 | Commit `.mcp.json` with a real token | ❌ |
-| Put vault exports in Citadel-Archive | ❌ |
-| Put synthetic docs/examples in Citadel-Archive | ✅ (no real org data) |
+| Put vault exports in the Citadel git repo | ❌ |
+| Put synthetic docs/examples in the Citadel git repo | ✅ (no real org data) |
 
 ## GitHub org repos
 
-- **Citadel-Archive** — public; integration and app.
+- **Citadel** (`masumi-network/Citadel`) — public; integration and app. Formerly `Citadel-Archive`.
 - **Vault-Backup-Mirror** — private; backup evidence only.
-- **Other masumi-network repos** — may be public or private; GitHub sync ingests only what the configured token can read. Synced **content** stays on Railway, not in Citadel-Archive git.
+- **Other masumi-network repos** — may be public or private; GitHub sync ingests only what the configured token can read. Synced **content** stays on Railway, not in the Citadel git repo.
 
 ## Agent skill URL
 
 Boundary summary for agents (also served over HTTP):
 
 ```
-https://citadel-archive-production.up.railway.app/skills/boundary
+https://citadel.utxo.ag/skills/boundary
 ```
 
 ## Related

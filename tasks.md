@@ -462,7 +462,7 @@ Still open (root-caused; need node-testable fixes, not blind deploys):
 - [x] **Grill parity:** reject dedupe / candidate hash — no re-queue unchanged notes
 - [x] Seat-scoped `POST /api/promote/run` (member own seat; admin any)
 - [x] `citadel promotion run|list|approve|reject` CLI + `--json` — **on PyPI v0.1.3** (2026-06-29)
-- [x] **Production:** `CITADEL_PROMOTION_ENABLED=true` on Railway **Citadel-Archive** ([PR #19](https://github.com/masumi-network/Citadel-Archive/pull/19))
+- [x] **Production:** `CITADEL_PROMOTION_ENABLED=true` on Railway **Citadel-Archive** ([PR #19](https://github.com/masumi-network/Citadel/pull/19))
 - [x] **6h evolve scheduler** (2026-06-29) — NOT a separate Railway service (volume
   isn't shareable; promotion+cognify need the web's `/data` volume). Env-gated
   in-process scheduler in `kb/server.py` lifespan
@@ -713,7 +713,7 @@ evolve scheduler. Only operational remainder: each dev runs `citadel onboard`.
   - scopes: `kb:read`, `kb:search`, `sources:read`, `obsidian:sync:pull`
   - raw token stored only in ignored local `.citadel/company-reader-mcp.env`
 - Team-share flow verified on 2026-06-02:
-  - share command: `npx skills add masumi-network/Citadel-Archive`
+  - share command: `npx skills add masumi-network/citadel`
   - production verification commit: `7a4a1d9`
   - hosted MCP `citadel_session`, `citadel_search`, and `citadel_ingest`
     succeed with a writer token

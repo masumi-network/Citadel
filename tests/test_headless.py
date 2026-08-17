@@ -37,6 +37,9 @@ def test_setup_json_emits_pure_config(tmp_path: Path, capsys) -> None:
 
 
 def test_bare_citadel_shows_home_screen(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("CITADEL_MCP_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("CITADEL_WRITER_KEYS", raising=False)
     monkeypatch.setattr(sys, "argv", ["citadel"])
     with pytest.raises(SystemExit) as exc:
         kb.cli.main()

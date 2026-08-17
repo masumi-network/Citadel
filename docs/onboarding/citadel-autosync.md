@@ -12,7 +12,7 @@ sync to **Central** on Railway cron.
 Mint a **seat-writer** token from the connect wizard and export it once:
 
 ```bash
-# https://citadel-archive-production.up.railway.app/skills/connect
+# https://citadel.utxo.ag/skills/connect
 export CITADEL_MCP_ACCESS_TOKEN='ctdl_...'
 ```
 
@@ -131,7 +131,7 @@ when you want external-project notes shared org-wide.
 
 ## More
 
-- Skill: `https://citadel-archive-production.up.railway.app/skills/proactive-ingest`
-- Connect wizard: `https://citadel-archive-production.up.railway.app/skills/connect`
+- Skill: `https://citadel.utxo.ag/skills/proactive-ingest`
+- Connect wizard: `https://citadel.utxo.ag/skills/connect`
 - Per-IDE notes: [`citadel-autosync-ides.md`](citadel-autosync-ides.md)
 - Repo setup details: `skills/citadel-proactive-ingest/README.md`

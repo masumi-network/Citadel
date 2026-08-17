@@ -11,7 +11,7 @@ See also [public-and-private.md](public-and-private.md).
 
 | Repository | Visibility | Role |
 |---|---|---|
-| [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive) | Public | Application, MCP, skills, docs |
+| [Citadel](https://github.com/masumi-network/Citadel) | Public | Application, MCP, skills, docs |
 | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) | Private | Durable mirror of vault evidence and history |
 
 Live retrieval, embeddings, and the knowledge mesh stay on Railway (Postgres /
@@ -74,7 +74,7 @@ Operational checkpoint on 2026-06-03:
   `CITADEL_BACKUP_MIRROR_ENABLED=true`, `CITADEL_BACKUP_MIRROR_PUSH_ENABLED=true`,
   and a dedicated mirror token are configured.
 
-## Configuration (Citadel Archive)
+## Configuration (Citadel)
 
 Set on the Railway web service when mirror export is enabled:
 
@@ -94,7 +94,7 @@ Dry-run the cron wrapper before enabling writes:
 
 ```bash
 CITADEL_RUN_MODE=backup-mirror
-CITADEL_BACKUP_MIRROR_TARGET_URL=https://citadel-archive-production.up.railway.app
+CITADEL_BACKUP_MIRROR_TARGET_URL=https://citadel.utxo.ag
 CITADEL_BACKUP_MIRROR_ACCESS_KEY=ctdl_...
 CITADEL_BACKUP_MIRROR_DRY_RUN=true
 uv run python scripts/run_railway.py

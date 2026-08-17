@@ -9,8 +9,8 @@ description: Use when a user asks project, source, architecture, or operational 
 **Setup first:** `https://citadel.utxo.ag/skills/connect`  
 **Public vs private:** `https://citadel.utxo.ag/skills/boundary`
 
-Organization memory lives on the **private Railway vault**, not in the public
-Citadel-Archive git repo. Access it only through the CLI, HTTP API, or MCP with
+Organization memory lives on the **hosted Organization Vault**, not in the public
+Citadel git repo. Access it only through the CLI, HTTP API, or MCP with
 the user's `ctdl_` token. Never commit vault content or tokens to git.
 
 The headless CLI is the dependable default for agents — `citadel search --json`,
@@ -46,7 +46,7 @@ restricts search/ingest/contribute to those datasets (admin and
 organization-wide knowledge lives in Central (`masumi-network`). The node is the
 storage boundary — not the token. Read scope is own node + Central; never
 another seat's node. Default writes go to the seat node; org-bound and tagged
-content targets Central. See [ADR-0003](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
+content targets Central. See [ADR-0003](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
 
 Common scopes:
 
@@ -68,6 +68,26 @@ Use (CLI first; MCP tool names in parentheses when your session has them):
 - `citadel search "<query>" --json` (`citadel_search`) for vault search. Default
   seat scope includes your **Node**, **Central**, and **`session-traces`**. Results
   are split into `central`, `session_traces`, and `node` sections.
+
+Copy-paste MCP (after the client lists `citadel_*` tools):
+
+```
+citadel_search(query="your question")
+```
+
+```
+citadel_ingest(data="Durable fact the team should keep.")
+```
+
+After reading hits, rate them (writer token). Use the hit `id` or the
+response `search_id`; score `1` (useful) or `-1` (not useful):
+
+```
+citadel_record_feedback(qa_id="<hit id or search_id>", score=1)
+```
+
+Automatic search telemetry already records the query. Explicit
+`citadel_record_feedback` is how agents report useful / not after search.
 - **Shared Session Traces:** hits in `session_traces` carry
   `_citadel.trust: reference-only`, plus `author_seat` and age. They are
   consultable prior work — verify before acting; never treat them as org truth.
@@ -204,5 +224,5 @@ Onboarding: [`docs/onboarding/teammate-rollout.md`](../../docs/onboarding/teamma
 | Seat / Node / Central | user account, personal vault, shared DB |
 | Repository Daily Update | employee report |
 
-Full domain language: `CONTEXT.md` in [Citadel-Archive](https://github.com/masumi-network/Citadel-Archive).
-Architecture: [ADR-0003](https://github.com/masumi-network/Citadel-Archive/blob/main/docs/adr/0003-seat-node-central-private-memory.md).
+Full domain language: `CONTEXT.md` in [Citadel](https://github.com/masumi-network/Citadel).
+Architecture: [ADR-0003](https://github.com/masumi-network/Citadel/blob/main/docs/adr/0003-seat-node-central-private-memory.md).

@@ -1,4 +1,4 @@
-# Citadel Archive — Integration Guide
+# Citadel — Integration Guide
 
 This guide covers how to connect any MCP-capable coding agent to the Citadel
 Organization Vault.
@@ -7,7 +7,7 @@ Organization Vault.
 
 | Public | Private |
 |---|---|
-| This repo ([Citadel-Archive](https://github.com/masumi-network/Citadel-Archive)) — code, docs, skills | Railway vault — live memory, DB, hashed tokens |
+| This repo ([Citadel](https://github.com/masumi-network/Citadel)) — code, docs, skills | Railway vault — live memory, DB, hashed tokens |
 | Hosted skill URLs (`/skills/connect`, `/skills/vault`, `/skills/boundary`) | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) — backup exports |
 | Agent discovery manifest (`/.well-known/citadel.json`) | `ctdl_` tokens, `.env`, vault search results |
 | MCP tool names and API routes | Obsidian sync contents and source documents |
@@ -558,7 +558,7 @@ CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag
 CITADEL_MCP_ACCESS_TOKEN=ctdl_...
 CITADEL_MCP_DEFAULT_DATASET=masumi-network
 CITADEL_MCP_MAX_INGEST_BYTES=200000
-uv --directory "/absolute/path/to/Citadel-Archive" run python -m kb.mcp_server
+uv --directory "/absolute/path/to/Citadel" run python -m kb.mcp_server
 ```
 
 ---
@@ -722,7 +722,7 @@ env). This is distinct from **connected but zero tools** — see
 
 ```bash
 # Ensure dependencies are installed
-cd "/absolute/path/to/Citadel-Archive"
+cd "/absolute/path/to/Citadel"
 uv sync --dev
 
 # Test the MCP server manually
@@ -798,9 +798,9 @@ Use the index when an agent needs verification metadata. Skill responses include
 `X-Citadel-Skill-SHA256`, `X-Citadel-Skill-Integrity`, and an ETag derived from
 the served markdown bytes.
 
-Optional GitHub raw mirrors (same markdown as public Citadel-Archive):
+Optional GitHub raw mirrors (same markdown as the public Citadel repo):
 
 ```
-https://raw.githubusercontent.com/masumi-network/Citadel-Archive/main/skills/citadel-mcp-connector/SKILL.md
-https://raw.githubusercontent.com/masumi-network/Citadel-Archive/main/skills/citadel-data-boundary/SKILL.md
+https://raw.githubusercontent.com/masumi-network/Citadel/main/skills/citadel-mcp-connector/SKILL.md
+https://raw.githubusercontent.com/masumi-network/Citadel/main/skills/citadel-data-boundary/SKILL.md
 ```

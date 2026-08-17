@@ -6,7 +6,53 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.1] (2026-08-16)
+
+### Added
+
+- **Role-aware TTY home.** Writer and reader omit `seat` and keep `token`
+  as self-mint. Admin key or `access:manage` still see `seat`. A failed
+  identity fetch hides `seat`.
+- **`citadel token create` self-mints** via `POST /api/access/self/tokens`
+  with the seat token, capped to the seat role. `--seat` stays the admin
+  path. Writer `citadel seat create` exits before the admin API.
+- **`citadel mcp` with no args** opens the onboard coding-tools checkbox.
+  Esc/q writes nothing. `mcp install` help matches `mcp add`.
+
 ### Fixed
+
+- **CLI default Node URL is `https://citadel.utxo.ag`.** `citadel mcp add`
+  and onboard write `https://citadel.utxo.ag/mcp/`. Override with
+  `--node-url`, `~/.citadel/capture.json`, or `CITADEL_BASE_URL` on the
+  capture hooks. PyPI `0.4.0` still defaulted to the Railway hostname.
+  Docs, skills, clone/raw URLs, and GitHub release links use
+  `masumi-network/Citadel`. User-facing hosted URLs use
+  `https://citadel.utxo.ag` (MCP path `/mcp/`). The old GitHub slug
+  `Citadel-Archive` still redirects. PyPI stays `citadel-archive`.
+
+- **`citadel update` re-applies write-tier MCP URLs after a successful
+  pipx upgrade.** Skips when `~/.citadel/capture.json` has a custom
+  `node_url`. Refreshes skills with
+  `npx skills add masumi-network/citadel --skill '*'`. Codex TOML and
+  Windsurf JSON rewrite a drifted MCP URL the same way Cursor does.
+
+- **TTY home and `citadel status` prompt to update from PyPI JSON.**
+  "Update available, should I update? [y/N]". Cached 24h under
+  `~/.citadel/pypi-version.json` (N skips until expiry). Non-TTY and CI
+  never prompt. Does not use GitHub latest (still `v0.4.0`).
+
+- **Hosted `/skills/onboard`, `/skills/cli`, `/skills/debug`.** The
+  `citadel` skill is an entry router (~50 lines). Satellites cover vault,
+  MCP connect, CLI, ingest, boundary, onboard, and debug. The sdist
+  force-includes `skills/` so the Codex plugin symlink does not hide the
+  tree from hatchling.
+
+- **Lite boot quarantines an unreadable `cognee.db` instead of crashing.**
+  Railway's live start wrapper renamed a bad SQLite file to
+  `cognee.db.corrupt-<stamp>` then exec'd `kb.lite_runtime`. That wrapper
+  is not in git. `python -m kb.lite_runtime` now does the same rename
+  (plus `-wal`/`-shm`) so the next git deploy does not drop the repair.
+  The volume is not wiped.
 
 - **/readyz no longer waits on a full graph load (#280).** The bounded
   relational probe is the readiness signal. `/readyz` used to call
@@ -908,13 +954,14 @@ self-hosted Organization Vault server.
   references it as `${CITADEL_MCP_ACCESS_TOKEN}` and it is never echoed.
 - The pre-push allowlist fails **closed** on a corrupt config.
 
+[0.5.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.1
 [0.5.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.5.0
-[0.4.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.1
-[0.4.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.4.0
-[0.3.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.3.0
-[0.2.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.2.1
-[0.2.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.2.0
-[0.1.3]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.3
-[0.1.2]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.2
-[0.1.1]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.1
-[0.1.0]: https://github.com/masumi-network/Citadel-Archive/releases/tag/v0.1.0
+[0.4.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.4.1
+[0.4.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.4.0
+[0.3.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.3.0
+[0.2.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.2.1
+[0.2.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.2.0
+[0.1.3]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.3
+[0.1.2]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.2
+[0.1.1]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.1
+[0.1.0]: https://github.com/masumi-network/Citadel/releases/tag/v0.1.0

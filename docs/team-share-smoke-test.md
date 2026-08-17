@@ -15,7 +15,7 @@ npx skills add masumi-network/citadel --skill citadel
 For agents that cannot install skills:
 
 ```text
-https://citadel-archive-production.up.railway.app/skills
+https://citadel.utxo.ag/skills
 ```
 
 Give each teammate or agent identity its own `ctdl_...` token. Use reader tokens
@@ -48,7 +48,7 @@ Verified on 2026-06-03, production commit
 ## Public Endpoint Smoke Test
 
 ```bash
-export CITADEL_BASE_URL=https://citadel-archive-production.up.railway.app
+export CITADEL_BASE_URL=https://citadel.utxo.ag
 
 curl -fsS "$CITADEL_BASE_URL/healthz"
 curl -fsS "$CITADEL_BASE_URL/.well-known/citadel.json" | python3 -m json.tool
@@ -61,7 +61,7 @@ curl -fsS "$CITADEL_BASE_URL/skills/connect" | sed -n '1,80p'
 Keep token and vault output out of public repos, issues, PRs, and shared chats.
 
 ```bash
-export CITADEL_BASE_URL=https://citadel-archive-production.up.railway.app
+export CITADEL_BASE_URL=https://citadel.utxo.ag
 export CITADEL_MCP_ACCESS_TOKEN=ctdl_... # paste locally; never commit
 
 curl -fsS -H "Authorization: Bearer $CITADEL_MCP_ACCESS_TOKEN" \

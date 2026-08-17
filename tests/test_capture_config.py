@@ -68,6 +68,10 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
     assert loaded.updated_at == "2026-06-27T00:00:00+00:00"
 
 
+def test_default_node_url_is_utxo_ag() -> None:
+    assert DEFAULT_NODE_URL == "https://citadel.utxo.ag"
+
+
 def test_load_missing_returns_defaults(tmp_path: Path) -> None:
     config = load_capture_config(tmp_path / "absent.json")
     assert DEFAULT_NODE_URL == "https://citadel.utxo.ag"

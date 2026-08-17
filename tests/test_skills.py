@@ -17,7 +17,15 @@ def test_list_skills() -> None:
     payload = response.json()
     assert payload["ok"] is True
     slugs = {item["slug"] for item in payload["skills"]}
-    assert slugs == {"boundary", "connect", "proactive-ingest", "vault"}
+    assert slugs == {
+        "boundary",
+        "cli",
+        "connect",
+        "debug",
+        "onboard",
+        "proactive-ingest",
+        "vault",
+    }
     connect = next(item for item in payload["skills"] if item["slug"] == "connect")
     assert connect["url"] == "https://citadel.example/skills/connect"
     assert "mcp" in connect["aliases"]
@@ -176,6 +184,54 @@ def test_get_skill_alias() -> None:
     assert response.headers["x-citadel-skill-sha256"] == connect["sha256"]
 
 
+def test_get_skill_onboard() -> None:
+    client = TestClient(app)
+    catalog = client.get("/skills").json()
+    onboard = next(item for item in catalog["skills"] if item["slug"] == "onboard")
+
+    response = client.get("/skills/onboard")
+    assert response.status_code == 200
+    assert "citadel onboard" in response.text
+    assert response.headers["x-citadel-skill-sha256"] == onboard["sha256"]
+
+    alias = client.get("/skills/citadel-onboard")
+    assert alias.status_code == 200
+    assert alias.content == response.content
+
+
+def test_get_skill_cli_and_debug() -> None:
+    client = TestClient(app)
+    cli = client.get("/skills/cli")
+    assert cli.status_code == 200
+    assert "citadel update" in cli.text
+    debug = client.get("/skills/debug")
+    assert debug.status_code == 200
+    assert "/healthz" in debug.text
+    assert "/api/health" in debug.text
+
+
+def test_codex_plugin_skills_dir_resolves() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    plugin_skills = (root / "plugins/citadel-archive-mcp/skills").resolve()
+    assert plugin_skills.is_dir()
+    assert (plugin_skills / "citadel" / "SKILL.md").is_file()
+    assert (plugin_skills / "citadel-cli" / "SKILL.md").is_file()
+
+
+def test_sdist_force_includes_skills_tree() -> None:
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    )
+    sdist = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert sdist["force-include"]["skills"] == "skills"
+    assert "plugins/citadel-archive-mcp/skills" in sdist["exclude"]
+
+
 def test_get_skill_unknown() -> None:
     client = TestClient(app)
     response = client.get("/skills/not-a-real-skill")
@@ -198,8 +254,16 @@ def test_refresh_skill_catalog_tracks_changes(tmp_path) -> None:
 
     first = refresh_skill_catalog(state)
     assert first["ok"] is True
-    assert first["skills"] == 4
-    assert first["added"] == ["boundary", "connect", "proactive-ingest", "vault"]
+    assert first["skills"] == 7
+    assert first["added"] == [
+        "boundary",
+        "cli",
+        "connect",
+        "debug",
+        "onboard",
+        "proactive-ingest",
+        "vault",
+    ]
     assert first["changed"] == []
     assert first["removed"] == []
 
@@ -225,4 +289,12 @@ def test_refresh_skill_catalog_recovers_from_corrupt_state(tmp_path) -> None:
     result = refresh_skill_catalog(state)
 
     assert result["ok"] is True
-    assert result["added"] == ["boundary", "connect", "proactive-ingest", "vault"]
+    assert result["added"] == [
+        "boundary",
+        "cli",
+        "connect",
+        "debug",
+        "onboard",
+        "proactive-ingest",
+        "vault",
+    ]
