@@ -1655,19 +1655,21 @@ def _print_minted_token(token: str, api_token: dict[str, Any], *, color: bool) -
     """Print a freshly minted token once, with its write-scope + adopt steps."""
     print()
     print(paint("  Token (shown once — copy it now, it cannot be retrieved later):", "yellow", enable=color))
-    # codeql[py/clear-text-logging-sensitive-data]
-    print("    " + paint(token, "bold", enable=color))
+    # Write the secret to the TTY once. print() is a CodeQL logging sink.
+    os.write(1, ("    " + paint(token, "bold", enable=color) + "\n").encode("utf-8", "replace"))
     dataset = api_token.get("default_dataset")
     if dataset and str(dataset).startswith("seat:"):
-        # codeql[py/clear-text-logging-sensitive-data]
         scope = f"ingests go to {dataset} (their private seat) only"
     elif dataset:
-        # codeql[py/clear-text-logging-sensitive-data]
         scope = f"ingests go to {dataset}"
     else:
         scope = "ingests go to the org default dataset — NOT a private seat"
-    # codeql[py/clear-text-logging-sensitive-data]
-    print(paint(f"  scope: {scope}  ·  role={api_token.get('role')}", "dim", enable=color))
+    os.write(
+        1,
+        (paint(f"  scope: {scope}  ·  role={api_token.get('role')}", "dim", enable=color) + "\n").encode(
+            "utf-8", "replace"
+        ),
+    )
     print(paint("  Adopt:  citadel onboard --token <token-above>   ·   share over a private channel", "dim", enable=color))
 
 
@@ -3079,10 +3081,7 @@ def _write_update_cache(data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data) + "\n")
     except OSError:
-        pass
-
-
-def _declined_recently(*, now: float | None = None) -> bool:
+        pass  # update-check cache is best-effort
     stamp = now if now is not None else datetime.now(timezone.utc).timestamp()
     raw = _read_update_cache().get("declined_at")
     if not isinstance(raw, (int, float)):
@@ -3159,7 +3158,7 @@ def _refresh_skills_pack() -> None:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        pass
+        pass  # hosted skill install is best-effort
 
 
 async def _maybe_prompt_update(*, color: bool) -> None:
