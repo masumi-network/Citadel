@@ -289,3 +289,56 @@ def test_offline_accepts_the_baked_model(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("EMBEDDING_MODEL", lite_runtime.BAKED_EMBEDDING_MODEL)
     assert lite_runtime.configure_lite_environment() == tmp_path.resolve()
+
+
+def test_quarantine_skips_missing_sqlite(tmp_path: Path) -> None:
+    missing = tmp_path / "cognee.db"
+    assert lite_runtime.quarantine_unreadable_sqlite(missing) is None
+    assert not missing.exists()
+
+
+def test_quarantine_leaves_a_readable_sqlite(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "cognee.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE t (id INTEGER)")
+    assert lite_runtime.quarantine_unreadable_sqlite(path) is None
+    assert path.is_file()
+
+
+def test_quarantine_renames_header_valid_but_unreadable_sqlite(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    path = tmp_path / "cognee.db"
+    path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 32)
+    stamp = datetime(2026, 8, 17, 7, 31, tzinfo=UTC)
+
+    dest = lite_runtime.quarantine_unreadable_sqlite(path, now=stamp)
+
+    assert dest == tmp_path / "cognee.db.corrupt-20260817T073100Z"
+    assert not path.exists()
+    assert dest is not None and dest.is_file()
+
+
+def test_quarantine_renames_unreadable_sqlite_and_sidecars(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    path = tmp_path / "cognee.db"
+    path.write_bytes(b"this is not a database")
+    wal = tmp_path / "cognee.db-wal"
+    shm = tmp_path / "cognee.db-shm"
+    wal.write_bytes(b"wal")
+    shm.write_bytes(b"shm")
+    stamp = datetime(2026, 8, 17, 7, 30, tzinfo=UTC)
+
+    dest = lite_runtime.quarantine_unreadable_sqlite(path, now=stamp)
+
+    assert dest == tmp_path / "cognee.db.corrupt-20260817T073000Z"
+    assert dest is not None
+    assert dest.read_bytes() == b"this is not a database"
+    assert not path.exists()
+    assert (tmp_path / "cognee.db.corrupt-20260817T073000Z-wal").read_bytes() == b"wal"
+    assert (tmp_path / "cognee.db.corrupt-20260817T073000Z-shm").read_bytes() == b"shm"
+    assert not wal.exists()
+    assert not shm.exists()

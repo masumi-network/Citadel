@@ -10,6 +10,18 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ### Fixed
 
+- **CLI default Node URL is `https://citadel.utxo.ag`.** `citadel mcp add`
+  and onboard write `https://citadel.utxo.ag/mcp/`. Override with
+  `--node-url`, `~/.citadel/capture.json`, or `CITADEL_BASE_URL` on the
+  capture hooks. PyPI `0.4.0` still defaulted to the Railway hostname.
+
+- **Lite boot quarantines an unreadable `cognee.db` instead of crashing.**
+  Railway's live start wrapper renamed a bad SQLite file to
+  `cognee.db.corrupt-<stamp>` then exec'd `kb.lite_runtime`. That wrapper
+  is not in git. `python -m kb.lite_runtime` now does the same rename
+  (plus `-wal`/`-shm`) so the next git deploy does not drop the repair.
+  The volume is not wiped.
+
 - **/readyz no longer waits on a full graph load (#280).** The bounded
   relational probe is the readiness signal. `/readyz` used to call
   `_graph_counts()` after that probe and load every graph node (16k+ live,

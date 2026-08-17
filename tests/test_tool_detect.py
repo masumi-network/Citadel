@@ -3,8 +3,19 @@ from __future__ import annotations
 import json
 
 from kb import tool_detect as td
+from kb.capture_config import DEFAULT_NODE_URL
 
 NODE = "https://node.example"
+
+
+def test_default_mcp_url_is_utxo_ag() -> None:
+    assert DEFAULT_NODE_URL == "https://citadel.utxo.ag"
+    assert td.mcp_url(DEFAULT_NODE_URL) == "https://citadel.utxo.ag/mcp/"
+    assert td.apply.__kwdefaults__ == {"node_url": DEFAULT_NODE_URL}
+    hosted = "https://citadel.utxo.ag/mcp/"
+    assert hosted in (td.apply("cline").snippet or "")
+    assert hosted in (td.apply("zed").snippet or "")
+    assert hosted in td.apply("pi").detail
 
 
 def test_specs_modes() -> None:

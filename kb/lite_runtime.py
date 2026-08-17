@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pwd
 import socket
+import sqlite3
 import sys
 import time
 from typing import IO, Any
@@ -145,6 +146,59 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
     ):
         directory.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def sqlite_database_path() -> Path:
+    return Path(os.environ["DB_PATH"]) / os.environ["DB_NAME"]
+
+
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _sqlite_file_is_readable(path: Path) -> bool:
+    try:
+        header = path.read_bytes()[:16]
+    except OSError:
+        return False
+    if header != _SQLITE_HEADER:
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+def quarantine_unreadable_sqlite(
+    db_path: Path | None = None,
+    *,
+    now: datetime | None = None,
+) -> Path | None:
+    """Rename an unreadable cognee.db so boot can recreate it.
+
+    The live Railway start wrapper did ``p.rename(...corrupt-...)`` then
+    ``os.execv(... kb.lite_runtime)``. Keep that repair in-repo so a git
+    deploy of ``python -m kb.lite_runtime`` does not drop it. Sidecar
+    ``-wal`` / ``-shm`` files move with the db so a new file is not
+    poisoned. The volume is not wiped.
+    """
+    path = (db_path or sqlite_database_path()).resolve()
+    if not path.is_file() or _sqlite_file_is_readable(path):
+        return None
+    stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+    if dest.exists():
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}-{os.getpid()}")
+    path.rename(dest)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(path) + suffix)
+        if sidecar.is_file():
+            sidecar.rename(Path(str(dest) + suffix))
+    return dest
 
 
 def drop_root_privileges(root: Path, *, user_name: str = "citadel") -> None:
@@ -290,6 +344,9 @@ def main() -> None:
         root = configure_lite_environment()
         drop_root_privileges(root)
         acquire_single_instance_lock(root)
+        quarantined = quarantine_unreadable_sqlite()
+        if quarantined is not None:
+            print(f"Citadel Lite quarantined unreadable SQLite: {quarantined}", flush=True)
         wait_for_qdrant()
         asyncio.run(run_migrations())
         receipt = write_bootstrap_receipt(root)
