@@ -43,7 +43,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - name: Require the tagged commit to be on main
         run: |
-          git fetch origin main --depth=1
+          git fetch origin main
           git merge-base --is-ancestor HEAD "origin/main"
       - name: Require a successful CI gate for the tagged commit
         env:

@@ -103,6 +103,8 @@ def test_release_trigger_guard_and_python_build_gate() -> None:
     assert "workflow_dispatch:" in workflow
     assert "cancel-in-progress: false" in workflow
     assert r"^v[0-9]+\.[0-9]+\.[0-9]+$" in guard
+    assert "git fetch origin main" in guard
+    assert "git fetch origin main --depth=1" not in guard
     assert 'git merge-base --is-ancestor HEAD "origin/main"' in guard
     assert "commits/${commit}/check-runs" in guard
     assert 'select(.name == "CI gate" and .conclusion == "success")' in guard
