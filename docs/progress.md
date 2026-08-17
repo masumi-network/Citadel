@@ -1,6 +1,39 @@
 # Citadel Progress
 
-Last updated: 2026-08-14.
+Last updated: 2026-08-17.
+
+## 2026-08-17 — citadel-archive 0.5.1 published to PyPI
+
+PyPI package name stays `citadel-archive`. Public node is
+https://citadel.utxo.ag (MCP `/mcp/`). Source is
+https://github.com/masumi-network/Citadel. Railway hostname is historical.
+
+What landed (measured this session unless tagged [REPORTED]):
+
+- PR #301 MERGED. Merge commit `caf8eb99520b9eaf459c3009924238c242bd0df1`.
+  Tag `v0.5.1` points at that SHA. Tag `v0.5.0` stays
+  `fb47665522d67256d2f36f1cf80f1800d324d1da`. Do not retag `v0.5.0`.
+- PyPI `citadel-archive` version `0.5.1` (pypi.org JSON;
+  wheel upload `2026-08-17T17:44:26`). pipx venv reports `0.5.1`. The
+  `pipx upgrade citadel-archive` 0.4.0 → 0.5.1 step is [REPORTED] by the
+  user.
+- GitHub Release: https://github.com/masumi-network/Citadel/releases/tag/v0.5.1
+- Publish dispatch https://github.com/masumi-network/Citadel/actions/runs/32051600953
+  succeeded. PyPI job success. OCI stage / attest / smoke / promote SKIPPED
+  on `workflow_dispatch`. `docker buildx imagetools inspect
+  ghcr.io/masumi-network/citadel:0.5.1` returned not found. Do not claim
+  GHCR `:0.5.1` is live.
+- PR #304 MERGED (`a6d8919`, attest docker login). PR #305 MERGED
+  (`51c9776`, fetch main without `--depth=1`). `origin/main` is `51c9776`.
+- Local leftover branch: `fix/publish-main-fetch-depth`.
+- TUI + URL sweep shipped in #301 (Release body: default Node
+  `https://citadel.utxo.ag`, role-aware TTY home).
+- [REPORTED by user] `citadel mcp add all` after upgrade: Claude/Cursor/
+  Windsurf unchanged; Codex/Gemini wrote; Cline/Zed/Pi paste-only. Cursor
+  already writes `~/.cursor/mcp.json` to citadel.utxo.ag.
+
+Still open (not this cut): GitHub issues #228 and #247. #128 still OPEN.
+GHCR `:0.5.1` not promoted.
 
 ## 2026-08-14 — Onboard wires Claude / Cursor / Codex (and the macOS GUI env)
 

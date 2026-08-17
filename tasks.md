@@ -1,5 +1,35 @@
 # Citadel Tasks
 
+## Current (2026-08-17, after 0.5.1 PyPI)
+
+PyPI `citadel-archive==0.5.1` is live. Public node:
+https://citadel.utxo.ag. Source: https://github.com/masumi-network/Citadel.
+Do not retag `v0.5.0` or `v0.5.1`.
+
+### Do now
+
+1. **GHCR `:0.5.1`.** [VERIFIED] `docker buildx imagetools inspect
+   ghcr.io/masumi-network/citadel:0.5.1` returned not found. Publish run
+   `32051600953` skipped OCI stage/attest/smoke/promote on dispatch.
+   Promote only after owner yes.
+2. **Data-plane #228 and #247.** [VERIFIED] both OPEN this session
+   (accepted-but-unindexed documents; tail recall 0 of 11).
+3. **Local leftover branch.** [VERIFIED] worktree is
+   `fix/publish-main-fetch-depth`. `origin/main` already has #304 and #305.
+   Checkout `main` when done with that branch.
+
+### Done this cut (do not re-open as next-up)
+
+- PR #301 MERGED (`caf8eb9`). TUI + URL sweep is in that merge.
+- Tag `v0.5.1` at `caf8eb9`. GitHub Release
+  https://github.com/masumi-network/Citadel/releases/tag/v0.5.1
+- PyPI `citadel-archive` 0.5.1. [REPORTED] user ran `pipx upgrade
+  citadel-archive` (0.4.0 → 0.5.1). [VERIFIED] pipx venv version is 0.5.1.
+- PR #304 and #305 MERGED on `origin/main`.
+
+The 2026-07-29 queue below is historical. Several items there already
+shipped. Do not treat it as the live sprint.
+
 ## Next up (as of 2026-07-29 end of day)
 
 Ordered by what actually costs the org something today. Every root cause below was
