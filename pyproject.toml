@@ -33,12 +33,12 @@ server = [
     # Exact pin required because Citadel reads Cognee private dataset APIs and
     # registers its audited Qdrant adapter against Cognee's internal maps.
     "cognee[fastembed]==1.4.1",
-    "ladybug==0.18.2",
+    "ladybug==0.19.1",
     # Real tokenizer for BGE chunk sizing; the resolver silently falls back to
     # approximate TikToken counts when transformers is missing.
     "transformers==5.15.0",
     "huggingface-hub==1.27.0",
-    "tokenizers==0.22.2",
+    "tokenizers==0.23.1",
     "cryptography==50.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
@@ -63,7 +63,7 @@ citadel = "kb.cli:main"
 [dependency-groups]
 dev = [
     "build==1.5.0",
-    "hatchling==1.31.0",
+    "hatchling==1.32.0",
     "pip-audit>=2.7.0,<3",
     "pytest>=9.0.3,<10",
     "pytest-asyncio>=0.21.1,<2",
@@ -87,7 +87,7 @@ override-dependencies = [
 ]
 
 [build-system]
-requires = ["hatchling==1.31.0"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]

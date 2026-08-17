@@ -2,7 +2,7 @@
 # scripts/build_secure_cognee.py before resolving this file. The source wheel
 # carries the reviewed one-line cryptography metadata correction.
 cognee[fastembed]==1.4.1
-ladybug==0.18.2
+ladybug==0.19.1
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
 aiohttp>=3.14.3,<4.0.0
@@ -19,7 +19,7 @@ transformers==5.15.0
 # Freeze the verified companion set: hub 1.x and tokenizers<=0.23.0 are what
 # transformers 5.15.0 resolves and what fastembed 0.8.0 was verified against.
 huggingface-hub==1.27.0
-tokenizers==0.22.2
+tokenizers==0.23.1
 tiktoken==0.13.0
 uvicorn[standard]>=0.34.0,<1.0.0
 
