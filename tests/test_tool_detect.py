@@ -42,6 +42,18 @@ def test_cursor_merge_preserves_and_idempotent(tmp_path, monkeypatch) -> None:
     assert td.apply("cursor", node_url=NODE).action == "unchanged"
 
 
+def test_cursor_overwrites_url_mismatch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cur = tmp_path / ".cursor" / "mcp.json"
+    cur.parent.mkdir(parents=True)
+    cur.write_text(json.dumps({"mcpServers": {"citadel": {"url": "https://old.example/mcp/"}}}))
+
+    result = td.apply("cursor", node_url=NODE)
+    assert result.action == "wrote"
+    data = json.loads(cur.read_text())
+    assert data["mcpServers"]["citadel"]["url"] == "https://node.example/mcp/"
+
+
 def test_cursor_creates_file_when_absent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert td.apply("cursor", node_url=NODE).action == "wrote"
@@ -87,6 +99,35 @@ def test_windsurf_write_uses_serverurl_and_env_ref(tmp_path, monkeypatch) -> Non
     )["mcpServers"]["citadel"]
     assert entry["serverUrl"] == "https://node.example/mcp/"
     assert entry["headers"]["Authorization"] == "Bearer ${env:CITADEL_MCP_ACCESS_TOKEN}"
+
+
+def test_codex_overwrites_url_mismatch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(td, "_which", lambda name: False)
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        '[mcp_servers.citadel]\nurl = "https://old.example/mcp/"\n'
+        'bearer_token_env_var = "CITADEL_MCP_ACCESS_TOKEN"\n'
+    )
+    result = td.apply("codex", node_url=NODE)
+    assert result.action == "wrote"
+    text = cfg.read_text()
+    assert "https://node.example/mcp/" in text
+    assert "https://old.example/mcp/" not in text
+
+
+def test_windsurf_overwrites_url_mismatch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / ".codeium" / "windsurf" / "mcp_config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"mcpServers": {"citadel": {"serverUrl": "https://old.example/mcp/"}}})
+    )
+    result = td.apply("windsurf", node_url=NODE)
+    assert result.action == "wrote"
+    entry = json.loads(path.read_text())["mcpServers"]["citadel"]
+    assert entry["serverUrl"] == "https://node.example/mcp/"
 
 
 def test_snippet_shapes() -> None:

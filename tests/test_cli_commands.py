@@ -13,16 +13,24 @@ from typing import Any
 import pytest
 
 from kb.cli import (
+    _PYPI_PROJECT_JSON,
+    _SKILLS_ADD_HINT,
     _activity,
+    _cached_pypi_latest,
+    _capture_has_custom_node_url,
+    _declined_recently,
     _doctor,
     _ingest,
+    _maybe_prompt_update,
     _operation,
     _search,
+    _should_prompt_update,
     _token_set,
     _update,
     _wizard_roots,
     build_parser,
 )
+from kb.capture_config import DEFAULT_NODE_URL, CaptureConfig, capture_config_path, save_capture_config
 from kb.status import Check, StatusReport
 
 
@@ -992,6 +1000,7 @@ def test_update_editable_install_is_left_alone(monkeypatch, capsys) -> None:
 
 
 def test_update_pipx_already_latest(monkeypatch, capsys) -> None:
+    wired: list[str] = []
     monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
     monkeypatch.setattr(
         "kb.cli.subprocess.run",
@@ -1001,12 +1010,20 @@ def test_update_pipx_already_latest(monkeypatch, capsys) -> None:
             stderr="",
         ),
     )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
-    assert "already up to date" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already up to date" in out
+    assert _SKILLS_ADD_HINT in out
+    assert wired == [DEFAULT_NODE_URL]
 
 
 def test_update_pipx_upgraded(monkeypatch, capsys) -> None:
+    wired: list[str] = []
     monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
     monkeypatch.setattr(
         "kb.cli.subprocess.run",
@@ -1016,9 +1033,39 @@ def test_update_pipx_upgraded(monkeypatch, capsys) -> None:
             stderr="",
         ),
     )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
-    assert "upgraded package citadel-archive" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "upgraded package citadel-archive" in out
+    assert _SKILLS_ADD_HINT in out
+    assert wired == [DEFAULT_NODE_URL]
+
+
+def test_update_skips_rewire_when_capture_has_custom_node_url(monkeypatch, capsys) -> None:
+    wired: list[str] = []
+    save_capture_config(CaptureConfig(node_url="https://node.example"))
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+    monkeypatch.setattr(
+        "kb.cli.subprocess.run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout="upgraded package citadel-archive from 0.2.1 to 0.3.0 (location: …)",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
+    assert _capture_has_custom_node_url() is True
+    rc = asyncio.run(_update(argparse.Namespace()))
+    assert rc == 0
+    assert wired == []
+    assert _SKILLS_ADD_HINT in capsys.readouterr().out
 
 
 def test_update_pipx_failure_exits_one(monkeypatch, capsys) -> None:
@@ -1037,6 +1084,103 @@ def test_update_unmanaged_install_prints_instructions(monkeypatch, capsys) -> No
     rc = asyncio.run(_update(argparse.Namespace()))
     assert rc == 0
     assert "pip install --upgrade citadel-archive" in capsys.readouterr().out
+
+
+def test_update_check_uses_pypi_json_not_github() -> None:
+    assert _PYPI_PROJECT_JSON == "https://pypi.org/pypi/citadel-archive/json"
+    assert "github.com" not in _PYPI_PROJECT_JSON
+
+
+def test_cached_pypi_latest_uses_cache_within_24h(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    cache = capture_config_path().parent / "pypi-version.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"latest": "0.9.9", "checked_at": now}) + "\n")
+    monkeypatch.setattr("kb.cli._fetch_pypi_latest", lambda: pytest.fail("must not hit network"))
+    assert _cached_pypi_latest(now=now + 60) == "0.9.9"
+
+
+def test_cached_pypi_latest_refetches_after_24h(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    cache = capture_config_path().parent / "pypi-version.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"latest": "0.9.9", "checked_at": now}) + "\n")
+    monkeypatch.setattr("kb.cli._fetch_pypi_latest", lambda: "1.2.3")
+    assert _cached_pypi_latest(now=now + 24 * 3600 + 1) == "1.2.3"
+    stored = json.loads(cache.read_text())
+    assert stored["latest"] == "1.2.3"
+    assert stored["checked_at"] == now + 24 * 3600 + 1
+
+
+def test_should_prompt_update_false_under_pytest(monkeypatch) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert _should_prompt_update() is False
+
+
+def test_should_prompt_update_false_non_tty(monkeypatch) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert _should_prompt_update() is False
+
+
+def test_update_prompt_skipped_non_tty(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: False)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "9.9.9")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.5.1")
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert capsys.readouterr().out == ""
+
+
+def test_update_prompt_yes_runs_upgrade_and_wire(monkeypatch, capsys) -> None:
+    wired: list[str] = []
+    pipx_cmds: list[list[str]] = []
+    prompts: list[str] = []
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: True)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "0.5.1")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.4.0")
+    monkeypatch.setattr("kb.cli._declined_recently", lambda now=None: False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "y")
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+
+    def fake_run(cmd, **kwargs):
+        pipx_cmds.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="upgraded package citadel-archive from 0.4.0 to 0.5.1",
+            stderr="",
+        )
+
+    monkeypatch.setattr("kb.cli.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "kb.cli._wire_write_tier_tools",
+        lambda url: wired.append(url) or ([], []),
+    )
+    monkeypatch.setattr("kb.cli._refresh_skills_pack", lambda: None)
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert pipx_cmds and pipx_cmds[0][:2] == ["/usr/bin/pipx", "upgrade"]
+    assert wired == [DEFAULT_NODE_URL]
+    assert "Update available" in prompts[0]
+    assert "0.5.1 on PyPI" in capsys.readouterr().out
+
+
+def test_update_prompt_no_skips_until_cache(monkeypatch, capsys) -> None:
+    prompts: list[str] = []
+    monkeypatch.setattr("kb.cli._should_prompt_update", lambda: True)
+    monkeypatch.setattr("kb.cli._cached_pypi_latest", lambda: "0.5.1")
+    monkeypatch.setattr("kb.cli._cli_version", lambda: "0.4.0")
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "n")
+    monkeypatch.setattr(
+        "kb.cli._update",
+        lambda args: pytest.fail("must not update on N"),
+    )
+    asyncio.run(_maybe_prompt_update(color=False))
+    assert _declined_recently() is True
+    assert "Update available" in prompts[0]
+    assert "0.5.1 on PyPI" in capsys.readouterr().out
 
 
 # ---- coding-tools checkbox + stale-token hint ----------------------------------

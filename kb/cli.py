@@ -15,6 +15,7 @@ import sys
 import threading
 import urllib.error
 import urllib.parse
+import urllib.request
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
@@ -2150,6 +2151,7 @@ async def _status(args: argparse.Namespace) -> int:
             hint = _stale_env_hint(code) if code else None
             if hint:
                 print(paint(f"  hint: {hint}", "yellow", enable=use_color))
+        await _maybe_prompt_update(color=use_color)
     return 0 if report.healthy else 1
 
 
@@ -2920,6 +2922,176 @@ def _cli_version() -> str:
     return __version__
 
 
+_PYPI_PROJECT_JSON = "https://pypi.org/pypi/citadel-archive/json"
+_UPDATE_CHECK_TTL_SECONDS = 24 * 60 * 60
+_SKILLS_ADD_HINT = "npx skills add masumi-network/citadel --skill '*'"
+
+
+def _update_check_cache_path() -> Path:
+    return capture_config_path().parent / "pypi-version.json"
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in value.split("."):
+        match = re.match(r"(\d+)", chunk)
+        parts.append(int(match.group(1)) if match else 0)
+    return tuple(parts)
+
+
+def _is_older_version(current: str, latest: str) -> bool:
+    return _version_tuple(current) < _version_tuple(latest)
+
+
+def _capture_has_custom_node_url() -> bool:
+    path = capture_config_path()
+    if not path.is_file():
+        return False
+    try:
+        config = load_capture_config(path)
+    except ValueError:
+        return False
+    return config.node_url.rstrip("/") != DEFAULT_NODE_URL.rstrip("/")
+
+
+def _should_prompt_update() -> bool:
+    if os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _read_update_cache() -> dict[str, Any]:
+    path = _update_check_cache_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_update_cache(data: dict[str, Any]) -> None:
+    path = _update_check_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data) + "\n")
+    except OSError:
+        pass
+
+
+def _declined_recently(*, now: float | None = None) -> bool:
+    stamp = now if now is not None else datetime.now(timezone.utc).timestamp()
+    raw = _read_update_cache().get("declined_at")
+    if not isinstance(raw, (int, float)):
+        return False
+    return (stamp - float(raw)) < _UPDATE_CHECK_TTL_SECONDS
+
+
+def _mark_update_declined(*, now: float | None = None) -> None:
+    data = _read_update_cache()
+    data["declined_at"] = now if now is not None else datetime.now(timezone.utc).timestamp()
+    _write_update_cache(data)
+
+
+def _fetch_pypi_latest() -> str | None:
+    request = urllib.request.Request(
+        _PYPI_PROJECT_JSON,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": f"citadel-archive/{_cli_version()}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2.0) as response:  # noqa: S310
+            payload = json.loads(response.read().decode())
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    version = info.get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return None
+
+
+def _cached_pypi_latest(*, now: float | None = None) -> str | None:
+    stamp = now if now is not None else datetime.now(timezone.utc).timestamp()
+    data = _read_update_cache()
+    cached_latest: str | None = None
+    cached_at = 0.0
+    raw_latest = data.get("latest")
+    raw_at = data.get("checked_at")
+    if isinstance(raw_latest, str) and raw_latest.strip():
+        cached_latest = raw_latest.strip()
+    if isinstance(raw_at, (int, float)):
+        cached_at = float(raw_at)
+    if cached_latest and (stamp - cached_at) < _UPDATE_CHECK_TTL_SECONDS:
+        return cached_latest
+    latest = _fetch_pypi_latest()
+    if latest is None:
+        return cached_latest
+    data["latest"] = latest
+    data["checked_at"] = stamp
+    _write_update_cache(data)
+    return latest
+
+
+def _refresh_skills_pack() -> None:
+    """Refresh bundled skills the documented way. Skip npx under pytest."""
+    print(f"  {_SKILLS_ADD_HINT}")
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    npx = shutil.which("npx")
+    if not npx:
+        return
+    try:
+        subprocess.run(
+            [npx, "--yes", "skills", "add", "masumi-network/citadel", "--skill", "*"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+async def _maybe_prompt_update(*, color: bool) -> None:
+    if not _should_prompt_update():
+        return
+    latest = _cached_pypi_latest()
+    if not latest:
+        return
+    current = _cli_version()
+    if not _is_older_version(current, latest):
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    if _declined_recently(now=now):
+        return
+    print(
+        paint(
+            f"  citadel {current} installed; {latest} on PyPI.",
+            "yellow",
+            enable=color,
+        )
+    )
+    try:
+        answer = input("  Update available, should I update? [y/N] ").strip().lower()
+    except EOFError:
+        return
+    if answer in {"y", "yes"}:
+        await _update(argparse.Namespace())
+        return
+    _mark_update_declined(now=now)
+
+
 def _install_channel() -> tuple[str, str]:
     """How this CLI was installed: ("editable", src) | ("pipx", bin) | ("other", "").
 
@@ -2982,6 +3154,9 @@ async def _update(args: argparse.Namespace) -> int:
     else:
         upgraded = next((line for line in out.splitlines() if "upgraded" in line.lower()), out)
         print(f"  {mark(True, enable=color)} {upgraded.strip()}")
+    if not _capture_has_custom_node_url():
+        _wire_write_tier_tools(node_base_url())
+    _refresh_skills_pack()
     return 0
 
 
@@ -3073,6 +3248,7 @@ def _print_home() -> None:
             print(f"    {label} {paint(desc, 'dim', enable=color)}")
         print()
     print("  " + paint("Run `citadel <command> --help` for details.", "dim", enable=color))
+    asyncio.run(_maybe_prompt_update(color=color))
 
 
 class CitadelParser(argparse.ArgumentParser):
