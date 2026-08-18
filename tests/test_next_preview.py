@@ -32,7 +32,7 @@ def _exported_html() -> list[Path]:
 PREVIEWS = (
     ("/next", "Citadel remembers your"),
     ("/next/info", "Shared, governed memory for the team"),
-    ("/next/use-cases", "What people run Citadel for,"),
+    ("/next/use-cases", "What people run Citadel for"),
     ("/next/contact", "Tell us what you are building,"),
     ("/next/login", "Open your vault."),
 )
@@ -121,6 +121,62 @@ def test_the_landing_preview_ships_its_diagram_as_markup() -> None:
     for step in ("Capture", "Your Node", "Promotion", "Central"):
         assert step in body
     assert "xyflow" not in body
+
+
+def test_the_landing_preview_quotes_cost_as_a_range() -> None:
+    """A single cheap monthly figure understates a memory-dominated bill.
+
+    The hero keeps a dollar tile, but as a measured range (24h low, 7-day
+    high), not ~$23/mo alone. ~$55/mo is a stale visitor memory of that
+    7-day window and must not appear as an exact substring.
+    """
+    body = _client().get("/next").text
+
+    assert "Apache-2.0" in body
+    assert "Seat + Node" in body
+    assert "MCP tools for agents" in body
+    assert "~$23–$58/mo" in body
+    assert "Self-host; mostly RAM, not a fixed bill" in body
+    assert "~$23/mo" not in body
+    assert "~$55/mo" not in body
+    assert ">25 s<" not in body
+    assert ">269 ms<" not in body
+
+
+def test_landing_and_info_share_the_formal_site_footer() -> None:
+    """Licence, owner, and contact. No invented privacy or terms page.
+
+    Policy is omitted: this repo has /contact and no privacy or terms route.
+    Owner is the name already on /contact (utxo AG), not a made-up entity.
+    """
+    footer = (
+        Path(server_module.__file__).resolve().parent.parent
+        / "web"
+        / "src"
+        / "components"
+        / "site-footer.tsx"
+    ).read_text(encoding="utf-8")
+    assert "citadel status" in footer
+    assert "github.com/masumi-network/Citadel" in footer
+    assert "https://github.com/masumi-network/Citadel/blob/main/LICENSE" in footer
+    assert "Apache-2.0" in footer
+    assert "utxo AG" in footer
+    assert 'href="/contact"' in footer
+    assert "citadel.utxo.ag" in footer
+    assert "window v0.2.0 → v0.5.1." in footer
+    assert "Privacy" not in footer
+    assert "Policy" not in footer
+    assert "Terms" not in footer
+
+    for path in ("/next", "/next/info"):
+        body = _client().get(path).text
+        assert "citadel status" in body, path
+        assert "Apache-2.0" in body, path
+        assert "utxo AG" in body, path
+        assert "/contact" in body, path
+        assert "citadel.utxo.ag" in body, path
+        assert "window v0.2.0 → v0.5.1." in body, path
+        assert "blob/main/LICENSE" in body, path
 
 
 def test_the_landing_architecture_reaches_phones_and_names_what_runs() -> None:
@@ -411,23 +467,64 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
 
     Four counts were dropped from these tiles: commits, decision records, a test
     count and a LOC count. None was evidence the system works and every one of
-    them had drifted stale on the page. A dated cost snapshot and a dated search
-    round-trip, both traceable to `scripts/bench/`, took two of the slots and the
-    row went from eight tiles to six.
+    them had drifted stale on the page. A dated cost snapshot and a Seat + Node
+    product claim took two of the slots and the row went from eight tiles to
+    six. Search 25 s stays in docs/performance.md, not the hero or the
+    verified note. Self-host cost is a range (24h 2026-08-17 about $23,
+    7-day 2026-08-14 about $58), not a single monthly figure.
     """
     body = _client().get("/next/info").text
 
     assert "Live · v0.5.0" in body
     assert "Window: v0.2.0 → v0.5.0" in body
     assert "Window: v0.2.0 → v0.4.1" not in body
-    assert "~$38/mo" in body
+    assert "~$23–$58/mo" in body
+    assert "~$23/mo" not in body
+    assert "about $58" in body
+    assert "7-day 2026-08-14" in body
     assert "~$55/mo" not in body
-    assert "269 ms" in body
+    assert "Seat + Node" in body
+    assert ">25 s<" not in body and '">25 s<' not in body
+    assert ">269 ms<" not in body and '">269 ms<' not in body
+    assert "Search 25 s is the" not in body
+    # v0.5.0 release note is historical and stays true for that tag.
+    assert "Self-host cost stays ~$38/mo" in body
     assert "commits on main" not in body
     assert "architecture decision records" not in body
     assert "tests across 52 files" not in body
     assert "53 modules" not in body
     assert "Live tiles pull from" in body
+
+
+def test_use_cases_partner_blocks_are_hidden_by_default() -> None:
+    """Team is the default. Partner copy stays in the export, not shown.
+
+    Coordinators still get THE ASK after pressing Partner, or by landing on
+    #ask. A visitor who never toggles should not see the work-package pitch,
+    and those anchors should not sit in the section rail.
+    """
+    body = (server_module.WEBUI_DIR / "use-cases.html").read_text(encoding="utf-8")
+
+    assert "Four things teams run it for" in body
+    assert "One work package, scoped to your call" in body
+    assert "Draft work package" in body
+    assert 'id="audience"' in body
+    assert "Team" in body and "Partner" in body
+
+    for section_id in ("fit", "can", "wp", "ask", "talk"):
+        tag = re.search(rf"<section[^>]*id=\"{section_id}\"[^>]*>", body)
+        assert tag is not None, section_id
+        assert "hidden" in tag.group(0), f"#{section_id} should be hidden by default"
+
+    teams = re.search(r'<section[^>]*id="teams"[^>]*>', body)
+    assert teams is not None
+    assert "hidden" not in teams.group(0)
+
+    assert 'href="#ask"' not in body
+    assert 'href="#wp"' not in body
+    assert 'href="#fit"' not in body
+    assert 'href="#teams"' in body
+    assert 'href="#verify"' in body
 
 
 def test_the_contact_preview_keeps_the_honeypot_and_posts_nowhere_else() -> None:

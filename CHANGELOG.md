@@ -6,6 +6,11 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Public tiles** quote self-host cost as a range (`~$23–$58/mo`): 24h
+  Railway average 2026-08-17 about $23, trailing-7-day 2026-08-14 about
+  $58. Memory dominates. Not a fixed bill. Search 25 s stays in the
+  `/info` note (CLI p50, n=20, 2026-08-17). 269 ms was 2026-07-31.
+
 ## [0.5.1] (2026-08-16)
 
 ### Added

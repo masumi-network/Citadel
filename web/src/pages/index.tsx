@@ -2,7 +2,8 @@ import Head from "next/head";
 
 import { HeroBand } from "@/components/hero-band";
 import { PipelineDiagram } from "@/components/pipeline-diagram";
-import { SectionIndex, type Section } from "@/components/section-index";
+import { WithSectionRail, type Section } from "@/components/section-index";
+import { SiteFooter } from "@/components/site-footer";
 import {
   BAND,
   BAND_IN,
@@ -67,7 +68,7 @@ export default function Home() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      <HeroBand current="/">
+      <HeroBand current="/" sections={SECTIONS}>
         <p className={EYEBROW}>The organization vault</p>
         <h1 className={`${H1} max-w-[15ch]`}>
           Citadel remembers your{" "}
@@ -100,8 +101,7 @@ export default function Home() {
         </div>
       </HeroBand>
 
-      <SectionIndex sections={SECTIONS} />
-
+      <WithSectionRail>
       <section className={`${BAND} bg-surface`}>
         <div className={BAND_IN}>
           <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
@@ -110,38 +110,31 @@ export default function Home() {
               <div className={TILE_K}>Open source, self-hosted</div>
             </div>
             <div className="border border-border bg-surface p-5 max-[620px]:p-4">
-              <div className={TILE_N}>269 ms</div>
-              <div className={TILE_K}>Median search round-trip, from a client</div>
+              <div className={`${TILE_N} text-[19px]`}>Seat + Node</div>
+              <div className={TILE_K}>Per agent. Central stays in sync</div>
             </div>
             <div className="border border-border bg-surface p-5 max-[620px]:p-4">
               <div className={TILE_N}>24</div>
               <div className={TILE_K}>MCP tools for agents</div>
             </div>
             <div className="border border-border bg-surface p-5 max-[620px]:p-4">
-              <div className={`${TILE_N} text-[19px]`}>~$38/mo</div>
-              <div className={TILE_K}>To self-host the whole node</div>
+              <div className={`${TILE_N} text-[19px]`}>~$23–$58/mo</div>
+              <div className={TILE_K}>Self-host; mostly RAM, not a fixed bill</div>
             </div>
           </div>
           <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
             This page is served by the system it describes. Live numbers, releases, and the roadmap
             are on the <a href="/info">status page</a>.
           </p>
-          {/* Cost is a 2026-08-14 24h Railway average. Latency is still the
-              2026-07-31 client round-trip: a 2026-08-14 search_bench rerun
-              recorded 105 failed requests (401/429), so its p50 is time-to-error
-              and must not replace 269 ms. */}
+          {/* Cost range: 2026-08-17 24h ~$23 and 2026-08-14 7-day ~$58.
+              Search 25 s and 269 ms stay in docs/performance.md, not this note. */}
           <p className="mt-[18px] text-[13px] leading-[1.6] text-ink-3">
-            Cost was re-measured on 2026-08-14. The method is in the repo&apos;s{" "}
+            Self-host cost is mostly RAM: 24h 2026-08-17 about $23; 7-day 2026-08-14
+            about $58. Not a ceiling; method in the{" "}
             <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
               bench harness
             </a>
-            . It applies Railway&apos;s published prices to 24-hour average resource use across
-            the two services in the project (Citadel-Archive and Qdrant); a trailing-7-day basis
-            comes out nearer $58, so read it as about $38 rather than a figure to the cent. The
-            269&nbsp;ms search round-trip is still the 2026-07-31 client measurement. A rerun on
-            2026-08-14 did not complete a successful search, so that figure was not replaced.
-            Self-hosting the whole server, not just the CLI, is covered in the{" "}
-            <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.
+            .
           </p>
         </div>
       </section>
@@ -320,14 +313,14 @@ export default function Home() {
         <SecHead kicker="04 · Get started" title="Two commands" />
         <p className={LEDE}>
           You need a seat token from us to try the live node. This is not a public sandbox.{" "}
-          <a href="/contact">Contact us</a>, we send an access token, then install the CLI and run
-          onboard. Onboarding wires up the MCP client you already use.
+          <a href="/contact">Contact us</a>, we send an access token, then install the CLI and the
+          agent skill.
         </p>
         <div className={CMD}>
           <span className="select-none text-accent-ink">$</span> pipx install citadel-archive
         </div>
         <div className={CMD}>
-          <span className="select-none text-accent-ink">$</span> citadel onboard
+          <span className="select-none text-accent-ink">$</span> npx skills add masumi-network/citadel --skill citadel
         </div>
         <div className="mt-[26px] flex flex-wrap gap-x-6 gap-y-2 border-t border-border pt-5 text-[13.5px] text-ink-3">
           <span>
@@ -360,6 +353,8 @@ export default function Home() {
           </span>
         </div>
       </Band>
+      <SiteFooter />
+      </WithSectionRail>
     </>
   );
 }

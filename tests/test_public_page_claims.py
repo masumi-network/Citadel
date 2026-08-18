@@ -136,23 +136,56 @@ def test_the_landing_proof_tiles_say_what_they_measure() -> None:
     body = (STATIC / "landing.html").read_text(encoding="utf-8")
     for label in (
         "Open source, self-hosted",
-        "Median search round-trip, from a client",
+        "Per agent. Central stays in sync",
         "MCP tools for agents",
-        "To self-host the whole node",
+        "Self-host; mostly RAM, not a fixed bill",
     ):
         assert label in body, f"missing landing tile: {label}"
-    assert "~$38/mo" in body
+    assert "Apache-2.0" in body
+    assert "Seat + Node" in body
+    assert "~$23–$58/mo" in body
+    assert "To self-host the whole node" not in body
+    assert "~$23/mo" not in body
+    assert "~$38/mo" not in body
     assert "~$55/mo" not in body
-    assert "269 ms" in body
+    assert ">25 s<" not in body
+    assert ">269 ms<" not in body
+    tsx = (WEB_SRC / "pages" / "index.tsx").read_text(encoding="utf-8")
+    assert "Apache-2.0" in tsx
+    assert "Seat + Node" in tsx
+    assert "~$23–$58/mo" in tsx
+    assert ">25 s<" not in tsx
+    assert "~$23/mo" not in tsx
+    assert "~$55/mo" not in tsx
+    assert ">269 ms<" not in tsx
 
 
 def test_the_info_tiles_say_when_each_figure_was_taken() -> None:
     body = (STATIC / "info.html").read_text(encoding="utf-8")
-    assert "to self-host, measured 2026-08-14" in body
-    assert "median search round-trip, from a client" in body
-    assert "~$38/mo" in body
+    assert "Self-host; mostly RAM, not a fixed bill" in body
+    assert "per agent. Central stays in sync" in body
+    assert "Seat + Node" in body
+    assert "~$23–$58/mo" in body
+    assert "~$23/mo" not in body
+    assert "about $58" in body
+    assert "7-day 2026-08-14" in body
+    assert ">25 s<" not in body
+    assert ">269 ms<" not in body
+    assert "Search 25 s is the" not in body
     assert "~$55/mo" not in body
-    assert "269 ms" in body
+    # v0.5.0 release note is historical and stays true for that tag.
+    assert "Self-host cost stays ~$38/mo" in body
+    tsx = (WEB_SRC / "pages" / "info.tsx").read_text(encoding="utf-8")
+    assert "~$23–$58/mo" in tsx
+    assert "~$23/mo" not in tsx
+    assert "Seat + Node" in tsx
+    assert 'value="25 s"' not in tsx
+    assert 'value="269 ms"' not in tsx
+    assert "Self-host; mostly RAM, not a fixed bill" in tsx
+    assert "Search 25 s is the" not in tsx
+    assert "about $58" in tsx
+    assert "7-day 2026-08-14" in tsx
+    assert "Self-host cost stays" in tsx and "~$38/mo" in tsx
 
 
 @pytest.mark.parametrize(
@@ -185,6 +218,31 @@ def test_no_page_calls_the_cost_snapshot_reproducible() -> None:
     """
     for name, body in authored_sources().items():
         assert "reproducible on demand" not in body, name
+
+
+def test_landing_and_info_share_the_formal_site_footer() -> None:
+    """Same five columns on both doors. Policy omitted: no such page exists."""
+    footer = (WEB_SRC / "components" / "site-footer.tsx").read_text(encoding="utf-8")
+    for marker in (
+        "citadel status",
+        "https://github.com/masumi-network/Citadel/blob/main/LICENSE",
+        "Apache-2.0",
+        "utxo AG",
+        'href="/contact"',
+        "citadel.utxo.ag",
+        "window v0.2.0 → v0.5.1.",
+    ):
+        assert marker in footer, marker
+    assert "Privacy" not in footer
+    assert "Policy" not in footer
+    for page in ("pages/index.tsx", "pages/info.tsx"):
+        assert "SiteFooter" in (WEB_SRC / page).read_text(encoding="utf-8"), page
+    for name in ("landing.html", "info.html"):
+        body = (STATIC / name).read_text(encoding="utf-8")
+        assert "utxo AG" in body, name
+        assert "blob/main/LICENSE" in body, name
+        assert "window v0.2.0 → v0.5.1." in body, name
+        assert "Privacy Policy" not in body, name
 
 
 # --------------------------------------------------------------------------
@@ -239,6 +297,9 @@ def test_every_link_into_our_repo_resolves_to_something_committed() -> None:
 
         if path in ("", "/", "/issues"):
             target = REPO / "README.md"
+        elif re.match(r"^/issues/\d+$", path):
+            # GitHub issue URLs. They are not paths in this tree.
+            continue
         elif match := re.match(r"^/(?:tree|blob)/main/(.+)$", path):
             target = REPO / match.group(1)
             if not target.exists():

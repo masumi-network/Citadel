@@ -105,7 +105,9 @@ Twenty-two tools cover search, document fetch, ingest, contribution, and the adm
 
 We publish the numbers, including the ones that look bad.
 
-Search runs at a 311 to 472 ms median depending on token role. A 69-question golden harness scores `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans.
+Search median on 2026-08-17 was 25 s (citadel-archive 0.5.1 CLI, warm, golden q01, n=20, node https://citadel.utxo.ag). The 2026-07-31 client round-trip of 269 ms is no longer what production does. Self-host cost is about $23/mo from Railway 24-hour averages on 2026-08-17 (Citadel-Archive and Qdrant). Quote as about $23, not to the cent.
+
+A 2026-08-03 69-question golden harness scored `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans.
 
 Two limits belong next to that number. Roughly a third of stored documents are not reachable by search at all ([#228](https://github.com/masumi-network/Citadel/issues/228)), and the documents that are indexed were embedded only at the head, so text past roughly the first 1,500 characters is also unreachable ([#227](https://github.com/masumi-network/Citadel/issues/227)). Ranking also correlates poorly with query relevance. All three are open work, and no recall figure currently describes the whole corpus.
 

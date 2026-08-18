@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 
 import { MEASURE } from "@/components/ui";
@@ -7,7 +8,7 @@ export type Section = { id: string; label: string };
 
 const FALLBACK_VERSION = "v0.5.0";
 
-/* The topmost band currently in view owns the underline. Tracking the set of
+/* The topmost band currently in view owns the mark. Tracking the set of
    intersecting bands, rather than the last entry the callback handed us, keeps
    the state right when a fast scroll crosses two boundaries in one frame. */
 function useActiveSection(sections: Section[]): string | null {
@@ -22,10 +23,10 @@ function useActiveSection(sections: Section[]): string | null {
     if (!bands.length) return;
 
     const visible = new Set<string>();
-    // Clear sticky TopNav. --topnav-h tracks the wrap at 620px / 470px.
-    const navH =
-      getComputedStyle(document.documentElement).getPropertyValue("--topnav-h").trim() ||
-      "62px";
+    const style = getComputedStyle(document.documentElement);
+    const topnav = parseFloat(style.getPropertyValue("--topnav-h")) || 62;
+    const sectionnav = parseFloat(style.getPropertyValue("--sectionnav-h")) || 46;
+    const chromeH = `${topnav + sectionnav}px`;
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
@@ -34,9 +35,7 @@ function useActiveSection(sections: Section[]): string | null {
         }
         setActive(sections.find((section) => visible.has(section.id))?.id ?? null);
       },
-      // The bottom margin keeps a band from claiming the underline while it
-      // is still only a sliver at the fold.
-      { rootMargin: `-${navH} 0px -55% 0px` }
+      { rootMargin: `-${chromeH} 0px -55% 0px` }
     );
     bands.forEach((band) => observer.observe(band));
     return () => observer.disconnect();
@@ -45,9 +44,6 @@ function useActiveSection(sections: Section[]): string | null {
   return active;
 }
 
-/* The live pill, from the same public endpoint the /info tiles read. A failed
-   fetch leaves the baked-in label rather than showing an error: this is one
-   word on a marketing page, and "unknown" is worse than slightly stale. */
 function useHealth(): { text: string; down: boolean } {
   const { state } = useVaultState();
   if (!state) return { text: `Live · ${FALLBACK_VERSION}`, down: false };
@@ -57,22 +53,29 @@ function useHealth(): { text: string; down: boolean } {
     : { text: `Live · ${version}`, down: false };
 }
 
-/** Jump row under the hero. It scrolls away with the page. */
+const LINK =
+  "inline-flex h-full shrink-0 items-center whitespace-nowrap border-b-2 px-[11px] text-[13px] font-medium no-underline transition-[color,border-color] duration-150 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent max-[620px]:px-2";
+
+/** TopNav plus SectionIndex as one sticky unit. They cannot split on scroll. */
+export function StickyChrome({ children }: { children: ReactNode }) {
+  return <div className="topnav sticky top-0 z-20 bg-ground">{children}</div>;
+}
+
+/** Full-width subnav. Lives inside StickyChrome, directly under TopNav. */
 export function SectionIndex({ sections }: { sections: Section[] }) {
   const active = useActiveSection(sections);
   const health = useHealth();
 
   return (
-    <nav
-      className="h-[46px] overflow-x-clip border-b border-border bg-ground"
-      aria-label="Sections"
-    >
-      <div className={`${MEASURE} flex h-full min-w-0 items-center gap-0.5 overflow-x-auto`}>
+    <nav className="border-b border-border bg-ground" aria-label="Sections">
+      <div
+        className={`${MEASURE} flex h-[var(--sectionnav-h)] items-stretch gap-0 overflow-x-auto`}
+      >
         {sections.map((section) => (
           <a
             key={section.id}
             href={`#${section.id}`}
-            className={`inline-flex h-full items-center whitespace-nowrap border-b-2 px-[11px] text-[13px] font-medium no-underline transition-[color,border-color] duration-150 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent max-[620px]:px-2 ${
+            className={`${LINK} ${
               active === section.id
                 ? "border-accent text-ink"
                 : "border-transparent text-ink-2 hover:text-ink"
@@ -81,11 +84,8 @@ export function SectionIndex({ sections }: { sections: Section[] }) {
             {section.label}
           </a>
         ))}
-        {/* Sticky on a wrapping bar: the pill sat off-screen on phones when
-            the row overflowed. Tint is translucent, so a --ground layer
-            underneath keeps scrolled links from showing through. */}
         <span
-          className={`ml-auto inline-flex flex-none items-center gap-[7px] rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[620px]:px-2.5 max-[620px]:text-[12px] max-[720px]:sticky max-[720px]:right-0 max-[720px]:z-[1] ${
+          className={`ml-auto inline-flex flex-none items-center gap-[7px] self-center rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[620px]:px-2.5 max-[620px]:text-[12px] max-[720px]:sticky max-[720px]:right-0 max-[720px]:z-[1] ${
             health.down
               ? "bg-warn-bg text-warn max-[720px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]"
               : "bg-good-bg text-good max-[720px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]"
@@ -97,4 +97,9 @@ export function SectionIndex({ sections }: { sections: Section[] }) {
       </div>
     </nav>
   );
+}
+
+/** Pages with in-page sections. SectionIndex lives in HeroBand under TopNav. */
+export function WithSectionRail({ children }: { children: ReactNode }) {
+  return children;
 }

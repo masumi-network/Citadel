@@ -65,24 +65,22 @@
           <div class="k">Open source, self-hosted</div>
         </div>
         <div class="tile">
-          <div class="n">269 ms</div>
-          <div class="k">Median search round-trip, from a client</div>
+          <div class="n sm">Seat + Node</div>
+          <div class="k">Per agent. Central stays in sync</div>
         </div>
         <div class="tile">
           <div class="n">24</div>
           <div class="k">MCP tools for agents</div>
         </div>
         <div class="tile">
-          <div class="n sm">~$38/mo</div>
-          <div class="k">To self-host the whole node</div>
+          <div class="n sm">~$23–$58/mo</div>
+          <div class="k">Self-host; mostly RAM, not a fixed bill</div>
         </div>
       </div>
       <p class="proof-note">This page is served by the system it describes. Live numbers, releases, and the roadmap are on the <a href="/info">status page</a>.</p>
-      <!-- Cost is a 2026-08-14 24h Railway average. Latency is still the
-           2026-07-31 client round-trip: a 2026-08-14 search_bench rerun
-           recorded 105 failed requests (401/429), so its p50 is time-to-error
-           and must not replace 269 ms. -->
-      <p class="proof-note">Cost was re-measured on 2026-08-14. The method is in the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. It applies Railway's published prices to 24-hour average resource use across the two services in the project (Citadel-Archive and Qdrant); a trailing-7-day basis comes out nearer $58, so read it as about $38 rather than a figure to the cent. The 269 ms search round-trip is still the 2026-07-31 client measurement. A rerun on 2026-08-14 did not complete a successful search, so that figure was not replaced. Self-hosting the whole server, not just the CLI, is covered in the <a href="https://github.com/masumi-network/Citadel/blob/main/README.md">README</a>.</p>
+      <!-- Cost range: 2026-08-17 24h ~$23 and 2026-08-14 7-day ~$58.
+           Search 25 s and 269 ms stay in docs/performance.md, not this note. -->
+      <p class="proof-note">Self-host cost is mostly RAM: 24h 2026-08-17 about $23; 7-day 2026-08-14 about $58. Not a ceiling; method in the <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>.</p>
     </div>
   </section>
 
@@ -210,9 +208,9 @@
   <section class="band band-start" id="start">
     <div class="band-in">
       <div class="sechead"><span class="kicker">04 · Get started</span><h2>Two commands</h2></div>
-      <p class="lede">You need a seat token from us to try the live node. This is not a public sandbox. <a href="/contact">Contact us</a>, we send an access token, then install the CLI and run onboard. Onboarding wires up the MCP client you already use.</p>
+      <p class="lede">You need a seat token from us to try the live node. This is not a public sandbox. <a href="/contact">Contact us</a>, we send an access token, then install the CLI and the agent skill.</p>
       <div class="cmd"><span class="p">$</span> pipx install citadel-archive</div>
-      <div class="cmd"><span class="p">$</span> citadel onboard</div>
+      <div class="cmd"><span class="p">$</span> npx skills add masumi-network/citadel --skill citadel</div>
       <div class="endrow">
         <span>Need a token? <a href="/contact">Contact us</a>.</span>
         <span>Already have a seat? <a href="/login">Sign in</a>.</span>
@@ -221,5 +219,33 @@
       </div>
     </div>
   </section>
+
+  <footer class="band band-white">
+    <div class="band-in">
+      <div class="site-foot">
+        <div>
+          <p class="site-foot-k">Check</p>
+          <p class="site-foot-v"><code>citadel status</code></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Source</p>
+          <p class="site-foot-v"><a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">License</p>
+          <p class="site-foot-v"><a href="https://github.com/masumi-network/Citadel/blob/main/LICENSE">Apache-2.0</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Owner</p>
+          <p class="site-foot-v"><a href="https://utxo.ag/">utxo AG</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Contact</p>
+          <p class="site-foot-v"><a href="/contact">Contact</a></p>
+        </div>
+      </div>
+      <p class="foot-note">Live node: <code>citadel.utxo.ag</code> · window v0.2.0 → v0.5.1.</p>
+    </div>
+  </footer>
 </body>
 </html>

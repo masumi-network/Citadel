@@ -197,6 +197,20 @@ h1 .grad {
 .pill { font-size: 12.5px; font-weight: 500; padding: 6px 13px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); background: var(--surface); }
 .pill.live { color: var(--good); border-color: transparent; background: var(--good-bg); display: inline-flex; align-items: center; gap: 7px; }
 .pill.live .hdot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+
+.audience { display: inline-flex; margin-top: 24px; }
+.audience button {
+  font-family: var(--sans); font-size: 12.5px; font-weight: 500;
+  padding: 6px 12px; cursor: pointer; margin: 0;
+  color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-2);
+}
+.audience button + button { margin-left: -1px; }
+.audience button[aria-pressed="true"] {
+  position: relative; z-index: 1;
+  color: var(--accent-ink); background: var(--accent-soft); border-color: var(--accent);
+}
+.audience button:hover { color: var(--accent-ink); border-color: var(--accent); }
+.audience button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .pill.live.down { color: var(--warn); background: var(--warn-bg); }
 .pill.live.down .hdot { background: var(--warn); }
 
@@ -246,7 +260,96 @@ section { padding-top: 66px; }
 .card h3 { margin: 0 0 10px; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
 .card h3 .dot { width: 8px; height: 8px; border-radius: 0; background: var(--accent); flex: 0 0 auto; }
 .card p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.6; }
-.card .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 0; }
+.card .tag,
+#teams .case-row .tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--ink-3); background: var(--surface-2); padding: 3px 9px; border-radius: 0; }
+
+/* #live: one stacked list, not the 2x2 .pillars used on other bands. */
+#live .live-list {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  margin-bottom: 40px;
+}
+#live .live-cap {
+  padding: 32px;
+  border-top: 1px solid var(--border);
+}
+#live .live-cap:first-child { border-top: 0; }
+#live .live-cap h3 {
+  margin: 0 0 12px;
+  font-size: clamp(18px, 2.2vw, 22px);
+  font-weight: 600;
+  letter-spacing: -.02em;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#live .live-cap h3 .dot {
+  width: 8px;
+  height: 8px;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+#live .live-cap p {
+  margin: 0;
+  max-width: 68ch;
+  color: var(--ink-2);
+  font-size: 15.5px;
+  line-height: 1.65;
+}
+#live .live-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 20px 0 0;
+  padding: 0;
+  list-style: none;
+}
+#live .live-tags .pill {
+  font-size: 11.5px;
+  padding: 4px 11px;
+  background: var(--surface-2);
+}
+#live details { margin-top: 16px; }
+#live .live-list + details { margin-top: 0; }
+
+/* #teams: stacked rows with a 01–04 gutter, not the 2x2 .pillars. */
+#teams .case-list {
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+#teams .case-row {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  align-items: start;
+  gap: 24px;
+  padding: 32px;
+  border-top: 1px solid var(--border);
+}
+#teams .case-row:first-child { border-top: 0; }
+#teams .case-n {
+  margin: 0;
+  padding-top: 4px;
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: .04em;
+  color: var(--accent-ink);
+  font-variant-numeric: tabular-nums;
+}
+#teams .case-row h3 {
+  margin: 0 0 12px;
+  font-size: clamp(18px, 2.2vw, 22px);
+  font-weight: 600;
+  letter-spacing: -.02em;
+}
+#teams .case-row > div p {
+  margin: 0;
+  max-width: 68ch;
+  color: var(--ink-2);
+  font-size: 15.5px;
+  line-height: 1.65;
+}
 
 /* details / go-deeper */
 details { background: var(--surface); border: 1px solid var(--border); border-radius: 0; margin-top: 14px; overflow: hidden; }
@@ -363,12 +466,15 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
   .tldr p, .dbody p, .dbody li, .nrow p { max-width: 76ch; }
   .metric .n { font-size: 28px; }
   .nrow { grid-template-columns: 150px 1fr; }
+  #teams .case-row { grid-template-columns: 88px 1fr; }
 }
 
 @media (max-width: 760px) { .metrics { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 620px) {
   .pillars { grid-template-columns: 1fr; }
   .nrow { grid-template-columns: 1fr; gap: 11px; }
+  #live .live-cap { padding: 20px; }
+  #teams .case-row { grid-template-columns: 1fr; gap: 12px; padding: 20px; }
   body { font-size: 16px; }
   summary .go { display: none; }
   .sechead { gap: 4px 24px; }
@@ -676,6 +782,33 @@ code { font-family: var(--mono); font-size: .84em; background: var(--surface-2);
    separates an in-column footer from the text above it would show as a stripe
    of --ground between two bands. */
 footer.band { margin-top: 0; }
+
+.site-foot {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 32px;
+  border-top: 1px solid var(--border);
+  padding-top: 32px;
+}
+.site-foot-k {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.site-foot-v {
+  margin: 0;
+  font-size: 14.5px;
+  color: var(--ink-2);
+}
+@media (max-width: 900px) {
+  .site-foot { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  .site-foot { grid-template-columns: 1fr; gap: 20px; }
+}
 
 /* --- /partners contact form ----------------------------------------------
    Reuses the /login field and button styles below, so the two forms in the

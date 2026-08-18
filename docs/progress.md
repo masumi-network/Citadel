@@ -2,6 +2,35 @@
 
 Last updated: 2026-08-17.
 
+## 2026-08-17 — inside bench: CLI 0.4.0 vs 0.5.1
+
+Recorded on `docs/performance.md`. Raw JSON (gitignored):
+`scripts/bench/runs/2026-08-17-cli-0.4.0-vs-0.5.1.json`.
+
+**VERIFIED** this session against `https://citadel.utxo.ag`, golden q01,
+n=20, warm, `top_k=5`:
+
+- Deciding metric: successful search wall time p50.
+- 0.5.1: 20/20 ok. p50 25049 ms. p95 26488 ms.
+- 0.4.0: 0/20 ok. Hard 20 s timeout. stderr `citadel search: The read operation timed out`.
+- q01 span hit: 0/20 on 0.5.1. Top 5 were git commit snapshots plus a GitHub daily update.
+- Railway 24h averages: about $23/month. Egress not determined.
+- Frozen 105-question `citadel bench run` was **not** run (about 45 min at 25 s/query).
+
+Outside products were not measured. Recommended harness for Mem0 / Zep /
+Letta / Cognee: OmniMemEval `--lib` (conversation-memory datasets, not our
+vault). Citadel needs a custom adapter. Document retrieval vs Elasticsearch
+belongs on BEIR, not LoCoMo.
+
+## 2026-08-17 — later brainstorm, locked (not this pass)
+
+Positioning locked for a later brainstorm, not for this landing/info update.
+Citadel as multi-agent context: each agent gets a seat/node with its own
+memory; those memories sync to Central; the org result is multi-agent memory.
+Stack logos (Cognee, Qdrant) belong on the architecture React Flow later, not
+a separate strip. Knowledge-base screenshot and moving architecture off
+landing are also later.
+
 ## 2026-08-17 — citadel-archive 0.5.1 published to PyPI
 
 PyPI package name stays `citadel-archive`. Public node is
