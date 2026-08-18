@@ -335,9 +335,9 @@ export default function Info() {
             Make retrieval honest and repeatable: frozen fixtures in{" "}
             <code className={CODE}>citadel bench</code>, published latency and recall numbers, and
             fixes for documents that are accepted but not reachable (
-            <a href="https://github.com/masumi-network/Citadel/issues/228">#228</a>
+            <a href="https://github.com/masumi-network/Citadel/issues/228">{"#" + "228"}</a>
             ) and tail recall (
-            <a href="https://github.com/masumi-network/Citadel/issues/247">#247</a>
+            <a href="https://github.com/masumi-network/Citadel/issues/247">{"#" + "247"}</a>
             ). The harness exists. The full benchmark run and the indexing fixes are still open.
           </Row>
           <Row label={<Chip tone="prog">In design</Chip>} title="Structured Knowledge Citadel owns">
@@ -394,7 +394,7 @@ function LiveCap({
     <article className="border-t border-border px-8 py-8 first:border-t-0 max-[620px]:px-5 max-[620px]:py-7">
       <h3 className="m-0 mb-3 flex items-center gap-3 text-[clamp(18px,2.2vw,22px)] font-semibold tracking-[-.02em]">
         <span className="size-2 shrink-0 bg-accent" aria-hidden="true" />
-        {title}
+        <span>{title}</span>
       </h3>
       <p className="m-0 max-w-[68ch] text-[15.5px] leading-[1.65] text-ink-2">{children}</p>
       <ul className="mt-5 mb-0 flex list-none flex-wrap gap-2 p-0">
