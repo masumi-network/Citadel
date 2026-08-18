@@ -6,6 +6,9 @@ PyPI `citadel-archive==0.5.1` is live. Public node:
 https://citadel.utxo.ag. Source: https://github.com/masumi-network/Citadel.
 Do not retag `v0.5.0` or `v0.5.1`.
 
+Inside bench 0.4.0 vs 0.5.1 is recorded in `docs/performance.md`
+(2026-08-17 section). Raw JSON is gitignored under `scripts/bench/runs/`.
+
 ### Do now
 
 1. **GHCR `:0.5.1`.** [VERIFIED] `docker buildx imagetools inspect
@@ -17,6 +20,11 @@ Do not retag `v0.5.0` or `v0.5.1`.
 3. **Local leftover branch.** [VERIFIED] worktree is
    `fix/publish-main-fetch-depth`. `origin/main` already has #304 and #305.
    Checkout `main` when done with that branch.
+4. **Outside bench (not started).** OmniMemEval can run Mem0 / Zep / Letta /
+   Cognee on LongMemEval and LoCoMo. Citadel needs a custom `add`/`search`
+   adapter. Pick a rival before spending an afternoon. Elasticsearch belongs
+   on BEIR, not those chat-memory sets. The 105-question `citadel bench run`
+   against our own corpus is still the missing inside quality number.
 
 ### Done this cut (do not re-open as next-up)
 

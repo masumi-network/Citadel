@@ -37,28 +37,25 @@ PRICE_GB_VOLUME_SECOND = 0.00000006
 PRICE_EGRESS_GB = 0.05
 
 # EVERY service in the Railway project, measured over a 24h window on
-# 2026-08-14 via service_metrics (averages, not peaks). Project
-# b1f41db2-93cf-4fa4-88de-173dd87c0f85, environment production.
-# list_services that day returned Citadel-Archive and Qdrant only.
-# Postgres and Citadel-GitHub-Sync were in the 2026-07-31 model and are
-# gone from the project; leaving them in would invent cost.
+# 2026-08-17 via service_metrics (averages, not peaks). Project
+# b1f41db2-93cf-4fa4-88de-173dd87c0f85, environment production
+# (4e8b4a2a-8ba6-41be-831b-8555636443b2). list_services that day returned
+# Citadel-Archive and Qdrant only. NETWORK_TX_GB averaged 0.0000, so egress
+# is recorded as 0.0 (a positive rate is not determined).
 #
-# A trailing-7-day window the same day totals nearer $58. Qdrant's 7-day
-# average is pulled down by zero samples (the service was not up for the
-# whole week), so the public quote uses the 24h window, same method as
-# 2026-07-31.
+# A trailing-7-day window was not re-measured on 2026-08-17. The 2026-08-14
+# 7-day total of ~$58 is historical, not current.
 #
 #   name, vCPU, memory GB, volume GB, egress GB/hour
 MEASURED_SERVICES: tuple[tuple[str, float, float, float, float], ...] = (
-    ("Citadel-Archive", 0.0551, 2.1960, 2.2411, 0.0001),
-    ("Qdrant", 0.0033, 1.4256, 1.3899, 0.0000),
+    ("Citadel-Archive", 0.0317, 1.0727, 2.8499, 0.0000),
+    ("Qdrant", 0.0031, 1.1117, 1.6592, 0.0000),
 )
 
-# Measured by scripts/bench/search_bench.py against production on 2026-07-31.
-# A 2026-08-14 rerun timed 105 failed requests (10 HTTP 401, 95 HTTP 429) at
-# p50 106.5ms. That is time-to-error, not a search round-trip, so it does
-# not replace this figure.
-MEASURED_SEARCH_P50_SECONDS = 0.2695
+# CLI client round-trip p50 on 2026-08-17: citadel-archive 0.5.1, n=20,
+# warm, golden q01, node https://citadel.utxo.ag. Wall p50 25048.5 ms.
+# Raw run: scripts/bench/runs/2026-08-17-cli-0.4.0-vs-0.5.1.json (gitignored).
+MEASURED_SEARCH_P50_SECONDS = 25.0485
 
 
 @dataclass
@@ -182,8 +179,8 @@ def main() -> int:
         print(json.dumps({
             "monthly_total_usd": total,
             "monthly_total_note": (
-                "24h-average basis. Memory dominates and moves with the window: a "
-                "trailing-7-day basis gives ~$58. Quote as 'about $38', not to the cent."
+                "24h-average basis measured 2026-08-17. Quote as 'about $23', "
+                "not to the cent. A trailing-7-day window was not re-measured."
             ),
             "services": per_service,
             "lines": [asdict(line) for line in lines],
@@ -211,8 +208,8 @@ def main() -> int:
     dominant = max(lines, key=lambda line: line.monthly_usd)
     print(f"  {dominant.component} is {dominant.share_pct:.0f}% of the bill.")
     print("  The lever is resident footprint, not query volume.")
-    print("  Quote as 'about $38'. Memory moves with the averaging window:")
-    print("  a trailing-7-day basis gives ~$58. Two decimals would be false precision.\n")
+    print("  Quote as 'about $23'. A trailing-7-day window was not re-measured")
+    print("  on 2026-08-17. Two decimals would be false precision.\n")
     print(f"  Marginal cost per search : ${per_search:.8f}")
     print(f"    CPU                    : ${cpu_cost:.8f}  ({100 * cpu_cost / per_search:.0f}%)")
     print(f"    Response egress        : ${egress_cost:.8f}  ({100 * egress_cost / per_search:.0f}%)"

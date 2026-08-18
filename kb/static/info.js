@@ -41,6 +41,35 @@
     });
   }
 
+  // ---- use-cases audience (Team / Partner) ----
+  // Partner copy stays in the document. Default is Team: those blocks carry
+  // hidden until the visitor asks. A #ask (or other partner) hash opens Partner
+  // so a coordinator link still lands on the work-package text.
+  var audience = document.getElementById("audience");
+  if (audience) {
+    var teamBtn = document.getElementById("audience-team");
+    var partnerBtn = document.getElementById("audience-partner");
+    var partnerBlocks = document.querySelectorAll("[data-audience='partner']");
+    var partnerHashes = { fit: 1, can: 1, wp: 1, ask: 1, talk: 1 };
+    function setPartner(on) {
+      for (var i = 0; i < partnerBlocks.length; i++) partnerBlocks[i].hidden = !on;
+      if (teamBtn) teamBtn.setAttribute("aria-pressed", on ? "false" : "true");
+      if (partnerBtn) partnerBtn.setAttribute("aria-pressed", on ? "true" : "false");
+      var hash = location.hash.replace(/^#/, "");
+      if (!on && partnerHashes[hash]) {
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+    }
+    if (teamBtn) teamBtn.addEventListener("click", function () { setPartner(false); });
+    if (partnerBtn) partnerBtn.addEventListener("click", function () { setPartner(true); });
+    var landing = location.hash.replace(/^#/, "");
+    if (partnerHashes[landing]) {
+      setPartner(true);
+      var target = document.getElementById(landing);
+      if (target) target.scrollIntoView();
+    }
+  }
+
   // ---- commits per week ----
   // The baked series is the fallback, drawn immediately so the chart is never
   // an empty box. It came from git log at report time, which is also why it
@@ -163,7 +192,7 @@
       var docsEl = document.getElementById("m-docs");
       if (docsEl) docsEl.innerHTML = repos + " <small>repos</small>";
       var when = gh && gh.last_synced_at ? rel(gh.last_synced_at) : "";
-      set("m-docs-sub", "GitHub org synced" + (when ? " · " + when : ""));
+      set("m-docs-sub", when ? "GitHub org synced · " + when : "GitHub org not synced on this node");
 
       // ---- repo figures ----
       // mcp_tools is computed fresh on every /api/state call (a policy-table
@@ -196,7 +225,7 @@
       set("state-updated", "Live tiles updated" + (upd ? " " + upd : "") + "." +
         repoNote + " Releases are as of v0.5.0, 2026-08-14.");
       set("foot-note", "State-of-the-vault report · live tiles from /api/state" +
-        (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.5.0.");
+        (upd ? " (updated " + upd + ")" : "") + " · window v0.2.0 → v0.5.1.");
     })
     .catch(function () {
       set("m-docs", "—");

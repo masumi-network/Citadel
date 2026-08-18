@@ -52,7 +52,7 @@
     <div class="index-in">
       <a href="#state">Current state</a>
       <a href="#live">What's live</a>
-      <a href="#releases">Releases</a>
+      <a href="#releases">Changelog</a>
       <a href="#next">What's next</a>
       <a href="#opensource">Open source</a>
           <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.5.0</span></span>
@@ -68,14 +68,13 @@
         <div class="metric"><div class="n" id="m-docs">—</div><div class="k" id="m-docs-sub">GitHub org sync</div></div>
         <div class="metric accent"><div class="n">12</div><div class="k">releases shipped (v0.1.0 → v0.5.0)</div></div>
         <div class="metric"><div class="n" id="m-tools">24</div><div class="k">MCP tools for agents</div></div>
-        <div class="metric"><div class="n sm">~$38/mo</div><div class="k">to self-host, measured 2026-08-14</div></div>
-        <div class="metric"><div class="n">269 ms</div><div class="k">median search round-trip, from a client</div></div>
+        <div class="metric"><div class="n sm">~$23–$58/mo</div><div class="k">Self-host; mostly RAM, not a fixed bill</div></div>
+        <div class="metric"><div class="n sm">Seat + Node</div><div class="k">per agent. Central stays in sync</div></div>
       </div>
       <p class="verified"><span class="vdot"></span><span id="state-updated">Live tiles pull from <code>/api/state</code>. MCP tools refresh on every load. Releases are as of v0.5.0, 2026-08-14.</span></p>
-      <!-- Cost is a 2026-08-14 24h Railway average written into cost_model.py.
-           Latency is still 2026-07-31: the 2026-08-14 search_bench rerun was
-           105 failed requests, so its p50 is not a search measurement. -->
-      <p class="verified"><span class="vdot"></span>Cost is a 2026-08-14 snapshot of 24-hour Railway averages for Citadel-Archive and Qdrant, via the repo's <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>. A trailing-7-day window the same day is nearer $58. The 269 ms round-trip is still 2026-07-31; a 2026-08-14 rerun did not complete a successful search, so that figure was not replaced. Re-running <code>cost_model.py</code> reprints today's written averages; <code>search_bench.py</code> really does re-measure when the token can search.</p>
+      <!-- Cost range: 2026-08-17 24h ~$23 and 2026-08-14 7-day ~$58.
+           Search 25 s and 269 ms stay in docs/performance.md, not this note. -->
+      <p class="verified"><span class="vdot"></span>Self-host cost is mostly RAM: 24h 2026-08-17 about $23; 7-day 2026-08-14 about $58. Not a ceiling; method in the <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">bench harness</a>.</p>
     </div>
   </section>
 
@@ -83,11 +82,39 @@
     <div class="band-in">
       <div class="sechead"><span class="kicker">02 · Shipped &amp; live</span><h2>What you can use right now</h2></div>
       <p class="lede">The capabilities that are in production today. The three you'll touch most are session sharing, autonomous capture, and Linear sync.</p>
-      <div class="pillars">
-        <div class="card"><h3><span class="dot"></span>Shared Session Context</h3><p>SessionEnd distills how you approached a problem into a private Session Trace. Hit a dead end worth flagging? <code>citadel_share_session</code> shares a redacted, compacted version to a shared dataset.</p><span class="tag">reference-only · never promotes</span></div>
-        <div class="card"><h3><span class="dot"></span>Autonomous ingestion</h3><p>A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both are fail-silent. An hourly evolve cycle folds GitHub, Linear, and repo content into the graph.</p><span class="tag">hooks + hourly evolve</span></div>
-        <div class="card"><h3><span class="dot"></span>Linear sync</h3><p>The full workspace syncs to Central; issues assigned to you mirror into your Node as a Seat-Scoped Mirror, so an agent answers "what do I need to do?" from your memory.</p><span class="tag">workspace → Central · yours → Node</span></div>
-        <div class="card"><h3><span class="dot"></span>Knowledge Mesh &amp; portal</h3><p>A web UI renders org knowledge as a concept map and a live sync/search/ingest timeline. Portal Phase 1: paste your token, land on <b>My Node</b> (stats, checklist, deep links).</p><span class="tag">Pixel Bastion brand · caller-scoped</span></div>
+      <div class="live-list">
+        <article class="live-cap">
+          <h3><span class="dot"></span>Shared Session Context</h3>
+          <p>SessionEnd distills how you approached a problem into a private Session Trace. Hit a dead end worth flagging? <code>citadel_share_session</code> shares a redacted, compacted version to a shared dataset.</p>
+          <ul class="live-tags">
+            <li><span class="pill">reference-only</span></li>
+            <li><span class="pill">never promotes</span></li>
+          </ul>
+        </article>
+        <article class="live-cap">
+          <h3><span class="dot"></span>Autonomous ingestion</h3>
+          <p>A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both are fail-silent. An hourly evolve cycle folds GitHub, Linear, and repo content into the graph.</p>
+          <ul class="live-tags">
+            <li><span class="pill">hooks</span></li>
+            <li><span class="pill">hourly evolve</span></li>
+          </ul>
+        </article>
+        <article class="live-cap">
+          <h3><span class="dot"></span>Linear sync</h3>
+          <p>The full workspace syncs to Central; issues assigned to you mirror into your Node as a Seat-Scoped Mirror, so an agent answers "what do I need to do?" from your memory.</p>
+          <ul class="live-tags">
+            <li><span class="pill">workspace → Central</span></li>
+            <li><span class="pill">yours → Node</span></li>
+          </ul>
+        </article>
+        <article class="live-cap">
+          <h3><span class="dot"></span>Knowledge Mesh &amp; portal</h3>
+          <p>A web UI renders org knowledge as a concept map and a live sync/search/ingest timeline. Portal Phase 1: paste your token, land on <b>My Node</b> (stats, checklist, deep links).</p>
+          <ul class="live-tags">
+            <li><span class="pill">Pixel Bastion brand</span></li>
+            <li><span class="pill">caller-scoped</span></li>
+          </ul>
+        </article>
       </div>
       <details>
         <summary><span class="chev">▸</span> How Shared Session Traces actually work <span class="go">Go deeper</span></summary>
@@ -122,7 +149,7 @@
 
   <section class="band band-white" id="releases">
     <div class="band-in">
-      <div class="sechead"><span class="kicker">03 · Release history</span><h2>v0.2.0 → v0.5.0</h2></div>
+      <div class="sechead"><span class="kicker">03 · Changelog</span><h2>v0.2.0 → v0.5.0</h2></div>
       <p class="lede">Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.</p>
       <div class="chartwrap">
         <div class="charthead"><span class="t">Commits per week</span><span class="note">brand-color bars = a release shipped that week</span></div>
@@ -204,17 +231,15 @@
   <section class="band band-grey" id="next">
     <div class="band-in">
       <div class="sechead"><span class="kicker">04 · The road ahead</span><h2>What's next</h2></div>
-      <p class="lede">Honest status: some of this is in active design, some is still a sketch we're pressure-testing. Nothing here is claimed as shipped.</p>
+      <p class="lede">Some of this is still in design. Nothing here is claimed as a PyPI release unless it has a version in the history above.</p>
       <div class="status-legend">
         <span class="chip prog">In design</span>
-        <span class="chip plan">Brainstorming</span>
       </div>
       <div class="next">
-        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>GitHub App: PR context injection + verifying checks</h3><p>A GitHub App that injects relevant vault context into pull requests and runs <span class="k">verifying checks</span> as a PR status, kept <span class="k">in sync with Linear</span> and other connected apps, so a review sees the same knowledge an agent would. Direction sketched via the modular update-agent architecture; not built yet.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>One central agent hub</h3><p>A single point of access to <span class="k">all org knowledge and context</span>: an internal update agent plus hosted MCP consolidating GitHub, Citadel search, Linear, and future approved sources behind one contract. Repository boundary and initial contract are drafted.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Google Chat digest bot</h3><p>A daily <span class="k">Organization Update Digest</span> to one Google Chat space: what changed, what's open, what merged, plus a cautious source-linked "Agent read." Outbound-only in Phase 1; app-auth and schedule are settled. Silent on quiet days.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Structured Knowledge: own the representation</h3><p>Make durable, first-class <span class="k">Structured Knowledge</span> the source of truth Citadel owns, with the retrieval layer demoted to a rebuildable index. Plus a retrieval eval harness (<code>citadel bench</code>) and vault lint (<code>citadel lint</code>). This is how the vault stops depending on any one engine to hold the truth.</p></div></div>
-        <div class="nrow"><div class="left"><span class="chip plan">Brainstorming</span></div><div><h3>Session Traces v1.1 + more surfaces</h3><p>Retraction controls (<code>citadel unshare</code>, ~90-day TTL, admin hard-delete), overlap-ranked <span class="k">prior-work retrieval</span>, and more delivery gateways (Agent Messenger, Slack, email, webhook) off the same update-agent contract.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>GitHub App: PR context and verifying checks</h3><p>A GitHub App that injects relevant vault context into pull requests and posts a <span class="k">verifying check</span> on each PR, kept <span class="k">in sync with Linear</span> and the other connectors, so a review sees the same knowledge an agent would. Check runs and annotations carry exact context, not a hand-wavy summary. Not built yet.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Search you can measure</h3><p>Make retrieval honest and repeatable: frozen fixtures in <code>citadel bench</code>, published latency and recall numbers, and fixes for documents that are accepted but not reachable (<a href="https://github.com/masumi-network/Citadel/issues/228">#228</a>) and tail recall (<a href="https://github.com/masumi-network/Citadel/issues/247">#247</a>). The harness exists. The full benchmark run and the indexing fixes are still open.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Structured Knowledge Citadel owns</h3><p>Durable, first-class <span class="k">Structured Knowledge</span> pages as the source of truth on live storage, with the vector index demoted to a rebuildable projection. Contradictions surface as conflicts, not silent overwrites. <code>citadel lint</code> guards orphans and near-duplicates. Bench and lint are companions, not afterthoughts.</p></div></div>
+        <div class="nrow"><div class="left"><span class="chip prog">In design</span></div><div><h3>Evidence and provenance</h3><p>Capture-time fingerprints on every retrieved item, a claim-level contradiction ledger, and export packages a third party can verify without trusting the node. This is the evidence layer after search quality and Structured Knowledge land. Per-item attestation and disagreement detection are not shipped yet.</p></div></div>
       </div>
     </div>
   </section>
@@ -236,9 +261,29 @@
 
   <footer class="band band-white">
     <div class="band-in">
-      <p>Verify any of this yourself with <code>citadel status</code>, or read the source at <a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a>. Live node: <code>citadel.utxo.ag</code></p>
-      <p>New here? <a href="/">Start on the home page</a>. Building an EU-funded project? <a href="/use-cases">See the use cases and how we partner</a>.</p>
-      <p class="foot-note" id="foot-note">State-of-the-vault report · live tiles from <code>/api/state</code> · window v0.2.0 → v0.5.0.</p>
+      <div class="site-foot">
+        <div>
+          <p class="site-foot-k">Check</p>
+          <p class="site-foot-v"><code>citadel status</code></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Source</p>
+          <p class="site-foot-v"><a href="https://github.com/masumi-network/Citadel">github.com/masumi-network/Citadel</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">License</p>
+          <p class="site-foot-v"><a href="https://github.com/masumi-network/Citadel/blob/main/LICENSE">Apache-2.0</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Owner</p>
+          <p class="site-foot-v"><a href="https://utxo.ag/">utxo AG</a></p>
+        </div>
+        <div>
+          <p class="site-foot-k">Contact</p>
+          <p class="site-foot-v"><a href="/contact">Contact</a></p>
+        </div>
+      </div>
+      <p class="foot-note">Live node: <code>citadel.utxo.ag</code> · <span id="foot-note">window v0.2.0 → v0.5.1.</span></p>
     </div>
   </footer>
 </body>

@@ -2,15 +2,11 @@ import Head from "next/head";
 import type { ReactNode } from "react";
 
 import { HeroBand } from "@/components/hero-band";
-import { SectionIndex, type Section } from "@/components/section-index";
+import { WithSectionRail, type Section } from "@/components/section-index";
+import { SiteFooter } from "@/components/site-footer";
 import {
-  BAND,
-  BAND_IN,
   Band,
   CODE,
-  Card,
-  CARD_P,
-  CARD_TAG,
   Chip,
   DEEP_B,
   DEEP_H4,
@@ -18,17 +14,13 @@ import {
   DEEP_UL,
   DeepLi,
   EYEBROW,
-  FOOT_NOTE,
   GoDeeper,
   H1_WIDE,
-  HERO_STRIP,
-  HeroFact,
   LEDE,
   META,
   METRICS,
   Metric,
   PILL,
-  PILLARS,
   ROWS,
   ROW_K,
   Row,
@@ -46,7 +38,7 @@ import {
 const SECTIONS: Section[] = [
   { id: "state", label: "Current state" },
   { id: "live", label: "What's live" },
-  { id: "releases", label: "Releases" },
+  { id: "releases", label: "Changelog" },
   { id: "next", label: "What's next" },
 ];
 
@@ -59,11 +51,6 @@ const STAMPED = {
 };
 
 const AS_OF = "Releases are as of v0.5.0, 2026-08-14.";
-
-/* A closing footer that is itself a band is full-bleed, so it carries no top
-   margin: the gap an in-column footer wants would show as a stripe of --ground
-   between two bands. */
-const BAND_FOOTER = BAND;
 
 /* The live half of /info, resolved from one /api/state read.
  *
@@ -96,7 +83,9 @@ function useInfoTiles() {
     version: state ? versionLabel(state.version) || STAMPED.version : STAMPED.version,
     repositories,
     docsSub: state
-      ? `GitHub org synced${syncedAt ? ` · ${syncedAt}` : ""}`
+      ? syncedAt
+        ? `GitHub org synced · ${syncedAt}`
+        : "GitHub org not synced on this node"
       : failed
         ? "GitHub org sync (live data unavailable)"
         : "GitHub org sync",
@@ -107,7 +96,7 @@ function useInfoTiles() {
     footNote: state
       ? `State-of-the-vault report · live tiles from /api/state${
           updatedAt ? ` (updated ${updatedAt})` : ""
-        } · window v0.2.0 → v0.5.0.`
+        } · window v0.2.0 → v0.5.1.`
       : null,
   };
 }
@@ -126,7 +115,7 @@ export default function Info() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      <HeroBand current="/info" wide>
+      <HeroBand current="/info" wide sections={SECTIONS}>
         <p className={EYEBROW}>State of the vault · internal report</p>
         <h1 className={H1_WIDE}>
           Shared, governed memory for the team <span className="grad">and its AI agents</span>.
@@ -135,18 +124,9 @@ export default function Info() {
           <span className={PILL}>Railway + PyPI</span>
           <span className={PILL}>Window: v0.2.0 → v0.5.0</span>
         </div>
-        <dl className={HERO_STRIP}>
-          <HeroFact kicker="Numbers">
-            What is deployed, what shipped from v0.2.0 to v0.5.0, and what is still open.
-          </HeroFact>
-          <HeroFact kicker="Roadmap">
-            A <b>GitHub App</b> and structured knowledge are still in design.
-          </HeroFact>
-        </dl>
       </HeroBand>
 
-      <SectionIndex sections={SECTIONS} />
-
+      <WithSectionRail>
       <Band tone="white" id="state">
         <SecHead kicker="01 · Current state" title="Where things stand today" />
         <p className={LEDE}>
@@ -178,10 +158,13 @@ export default function Info() {
           <Metric accent value="12" label="releases shipped (v0.1.0 → v0.5.0)" />
           <Metric value={tiles.mcpTools} label="MCP tools for agents" />
           <Metric
-            value={<span className="text-[19px]">~$38/mo</span>}
-            label="to self-host, measured 2026-08-14"
+            value={<span className="text-[19px]">~$23–$58/mo</span>}
+            label="Self-host; mostly RAM, not a fixed bill"
           />
-          <Metric value="269 ms" label="median search round-trip, from a client" />
+          <Metric
+            value={<span className="text-[19px]">Seat + Node</span>}
+            label="per agent. Central stays in sync"
+          />
         </div>
         <HealthStrip
           live={tiles.live}
@@ -201,20 +184,15 @@ export default function Info() {
               </>
             ))}
         </Verified>
-        {/* Cost is a 2026-08-14 24h Railway average written into cost_model.py.
-            Latency is still 2026-07-31: the 2026-08-14 search_bench rerun was
-            105 failed requests, so its p50 is not a search measurement. */}
+        {/* Cost range: 2026-08-17 24h ~$23 and 2026-08-14 7-day ~$58.
+            Search 25 s and 269 ms stay in docs/performance.md, not this note. */}
         <Verified>
-          Cost is a 2026-08-14 snapshot of 24-hour Railway averages for Citadel-Archive and Qdrant,
-          via the repo&apos;s{" "}
+          Self-host cost is mostly RAM: 24h 2026-08-17 about $23; 7-day 2026-08-14
+          about $58. Not a ceiling; method in the{" "}
           <a href="https://github.com/masumi-network/Citadel/tree/main/scripts/bench">
             bench harness
           </a>
-          . A trailing-7-day window the same day is nearer $58. The 269 ms round-trip is still
-          2026-07-31; a 2026-08-14 rerun did not complete a successful search, so that figure was
-          not replaced. Re-running <code className={CODE}>cost_model.py</code> reprints today&apos;s
-          written averages; <code className={CODE}>search_bench.py</code> really does re-measure
-          when the token can search.
+          .
         </Verified>
       </Band>
 
@@ -224,41 +202,39 @@ export default function Info() {
           The capabilities that are in production today. The three you&apos;ll touch most are
           session sharing, autonomous capture, and Linear sync.
         </p>
-        <div className={PILLARS}>
-          <Card title="Shared Session Context">
-            <p className={CARD_P}>
-              SessionEnd distills how you approached a problem into a private Session Trace. Hit a
-              dead end worth flagging? <code className={CODE}>citadel_share_session</code> shares a
-              redacted, compacted version to a shared dataset.
-            </p>
-            <span className={CARD_TAG}>reference-only · never promotes</span>
-          </Card>
-          <Card title="Autonomous ingestion">
-            <p className={CARD_P}>
-              A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both
-              are fail-silent. A scheduled evolve cycle folds GitHub, Linear, and repo content into
-              the graph.
-            </p>
-            <span className={CARD_TAG}>hooks + scheduled evolve</span>
-          </Card>
-          <Card title="Linear sync">
-            <p className={CARD_P}>
-              The full workspace syncs to Central; issues assigned to you mirror into your Node as a
-              Seat-Scoped Mirror, so an agent answers &quot;what do I need to do?&quot; from your
-              memory.
-            </p>
-            <span className={CARD_TAG}>workspace → Central · yours → Node</span>
-          </Card>
-          <Card title="Knowledge Mesh & portal">
-            <p className={CARD_P}>
-              A web UI renders org knowledge as a concept map and a live sync/search/ingest
-              timeline. Portal Phase 1: paste your token, land on <b>My Node</b> (stats, checklist,
-              deep links).
-            </p>
-            <span className={CARD_TAG}>Pixel Bastion brand · caller-scoped</span>
-          </Card>
+        <div className="mb-10 border border-border bg-surface">
+          <LiveCap
+            title="Shared Session Context"
+            tags={["reference-only", "never promotes"]}
+          >
+            SessionEnd distills how you approached a problem into a private Session Trace. Hit a
+            dead end worth flagging? <code className={CODE}>citadel_share_session</code> shares a
+            redacted, compacted version to a shared dataset.
+          </LiveCap>
+          <LiveCap title="Autonomous ingestion" tags={["hooks", "scheduled evolve"]}>
+            A git pre-push hook and Claude Code SessionEnd hook snapshot work to your Node. Both
+            are fail-silent. A scheduled evolve cycle folds GitHub, Linear, and repo content into
+            the graph.
+          </LiveCap>
+          <LiveCap
+            title="Linear sync"
+            tags={["workspace → Central", "yours → Node"]}
+          >
+            The full workspace syncs to Central; issues assigned to you mirror into your Node as a
+            Seat-Scoped Mirror, so an agent answers &quot;what do I need to do?&quot; from your
+            memory.
+          </LiveCap>
+          <LiveCap
+            title="Knowledge Mesh & portal"
+            tags={["Pixel Bastion brand", "caller-scoped"]}
+          >
+            A web UI renders org knowledge as a concept map and a live sync/search/ingest
+            timeline. Portal Phase 1: paste your token, land on <b>My Node</b> (stats, checklist,
+            deep links).
+          </LiveCap>
         </div>
 
+        <div className="flex flex-col gap-4 [&>.godeeper]:mt-0">
         <GoDeeper title="How Shared Session Traces actually work">
           <p className={DEEP_P}>
             Shipped in v0.4.0. The goal: let the team learn from each other&apos;s dead ends
@@ -324,10 +300,11 @@ export default function Info() {
             </DeepLi>
           </ul>
         </GoDeeper>
+        </div>
       </Band>
 
       <Band tone="white" id="releases">
-        <SecHead kicker="03 · Release history" title="v0.2.0 → v0.5.0" />
+        <SecHead kicker="03 · Changelog" title="v0.2.0 → v0.5.0" />
         <p className={LEDE}>
           Every tag shipped to PyPI and deployed to Railway. Expand any release for its full notes.
         </p>
@@ -342,70 +319,45 @@ export default function Info() {
         </p>
         <div className="mb-[22px] flex flex-wrap gap-2.5">
           <Chip tone="prog">In design</Chip>
-          <Chip tone="plan">Brainstorming</Chip>
         </div>
         <div className={ROWS}>
           <Row
             label={<Chip tone="prog">In design</Chip>}
-            title="GitHub App: PR context injection + verifying checks"
+            title="GitHub App: PR context and verifying checks"
           >
-            A GitHub App that injects relevant vault context into pull requests and runs{" "}
-            <span className={ROW_K}>verifying checks</span> as a PR status, kept{" "}
-            <span className={ROW_K}>in sync with Linear</span> and other connected apps, so a review
-            sees the same knowledge an agent would. Not built yet.
+            A GitHub App that injects relevant vault context into pull requests and posts a{" "}
+            <span className={ROW_K}>verifying check</span> on each PR, kept{" "}
+            <span className={ROW_K}>in sync with Linear</span> and the other connectors, so a review
+            sees the same knowledge an agent would. Check runs and annotations carry exact context,
+            not a hand-wavy summary. Not built yet.
           </Row>
-          <Row label={<Chip tone="prog">In design</Chip>} title="Structured Knowledge: own the representation">
-            Make durable, first-class <span className={ROW_K}>Structured Knowledge</span> the source
-            of truth Citadel owns, with the retrieval layer demoted to a rebuildable index. Plus a
-            retrieval eval harness (<code className={CODE}>citadel bench</code>) and vault lint (
-            <code className={CODE}>citadel lint</code>).
+          <Row label={<Chip tone="prog">In design</Chip>} title="Search you can measure">
+            Make retrieval honest and repeatable: frozen fixtures in{" "}
+            <code className={CODE}>citadel bench</code>, published latency and recall numbers, and
+            fixes for documents that are accepted but not reachable (
+            <a href="https://github.com/masumi-network/Citadel/issues/228">{"#" + "228"}</a>
+            ) and tail recall (
+            <a href="https://github.com/masumi-network/Citadel/issues/247">{"#" + "247"}</a>
+            ). The harness exists. The full benchmark run and the indexing fixes are still open.
           </Row>
-          <Row label={<Chip tone="plan">Brainstorming</Chip>} title="Digest bot and more delivery surfaces">
-            A daily <span className={ROW_K}>Organization Update Digest</span> to one chat space, plus
-            extra gateways (Agent Messenger, Slack, email, webhook) off the same update-agent
-            contract. Outbound-only in Phase 1. Silent on quiet days.
+          <Row label={<Chip tone="prog">In design</Chip>} title="Structured Knowledge Citadel owns">
+            Durable, first-class <span className={ROW_K}>Structured Knowledge</span> pages as the
+            source of truth on live storage, with the vector index demoted to a rebuildable
+            projection. Contradictions surface as conflicts, not silent overwrites.{" "}
+            <code className={CODE}>citadel lint</code> guards orphans and near-duplicates. Bench
+            and lint are companions, not afterthoughts.
+          </Row>
+          <Row label={<Chip tone="prog">In design</Chip>} title="Evidence and provenance">
+            Capture-time fingerprints on every retrieved item, a claim-level contradiction ledger,
+            and export packages a third party can verify without trusting the node. This is the
+            evidence layer after search quality and Structured Knowledge land. Per-item attestation
+            and disagreement detection are not shipped yet.
           </Row>
         </div>
       </Band>
 
-      <footer className={`${BAND_FOOTER} bg-surface`}>
-        <div className={BAND_IN}>
-          <div className="grid grid-cols-3 gap-8 border-t border-border pt-8 max-[620px]:grid-cols-1 max-[620px]:gap-5">
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Check
-              </p>
-              <p className="m-0 text-[14.5px] text-ink-2">
-                <code className={CODE}>citadel status</code>
-              </p>
-            </div>
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Source
-              </p>
-              <p className="m-0 text-[14.5px]">
-                <a href="https://github.com/masumi-network/Citadel">
-                  github.com/masumi-network/Citadel
-                </a>
-              </p>
-            </div>
-            <div>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-ink-3">
-                Start
-              </p>
-              <p className="m-0 text-[14.5px] text-ink-2">
-                <a href="/">Home</a>
-                {" · "}
-                <a href="/use-cases">Use cases</a>
-              </p>
-            </div>
-          </div>
-          <p className={FOOT_NOTE}>
-            Live node: <code className={CODE}>citadel.utxo.ag</code>
-            {tiles.footNote ? ` · ${tiles.footNote}` : " · window v0.2.0 → v0.5.0."}
-          </p>
-        </div>
-      </footer>
+      <SiteFooter note={tiles.footNote} />
+      </WithSectionRail>
     </>
   );
 }
@@ -427,6 +379,35 @@ function indexingLabel(live: boolean, lifecycle: LifecycleState | undefined): st
   if (lifecycle?.enabled === false) return "Off";
   if (lifecycle?.ok === false) return "Degraded";
   return "Running";
+}
+
+function LiveCap({
+  title,
+  tags,
+  children,
+}: {
+  title: string;
+  tags: string[];
+  children: ReactNode;
+}) {
+  return (
+    <article className="border-t border-border px-8 py-8 first:border-t-0 max-[620px]:px-5 max-[620px]:py-7">
+      <h3 className="m-0 mb-3 flex items-center gap-3 text-[clamp(18px,2.2vw,22px)] font-semibold tracking-[-.02em]">
+        <span className="size-2 shrink-0 bg-accent" aria-hidden="true" />
+        <span>{title}</span>
+      </h3>
+      <p className="m-0 max-w-[68ch] text-[15.5px] leading-[1.65] text-ink-2">{children}</p>
+      <ul className="mt-5 mb-0 flex list-none flex-wrap gap-2 p-0">
+        {tags.map((tag) => (
+          <li key={tag}>
+            <span className="inline-block max-w-full rounded-full border border-border bg-surface-2 px-2.5 py-1 text-[11.5px] font-medium text-ink-2">
+              {tag}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </article>
+  );
 }
 
 function HealthStrip({

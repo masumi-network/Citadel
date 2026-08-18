@@ -34,10 +34,21 @@ const SIGN_IN =
  * `topnav` is the class the cross-document view transition keys off, so the bar
  * holds still while the rest of the page cross-fades.
  */
-export function TopNav({ current }: { current?: string }) {
+export function TopNav({
+  current,
+  embedded,
+}: {
+  current?: string;
+  /** Parent StickyChrome already sticks. Drop the second sticky offset. */
+  embedded?: boolean;
+}) {
   return (
     <nav
-      className="topnav sticky top-0 z-20 border-b border-border bg-ground"
+      className={
+        embedded
+          ? "border-b border-border bg-ground"
+          : "topnav sticky top-0 z-20 border-b border-border bg-ground"
+      }
       aria-label="Main"
     >
       {/* Below 470px the single row cannot hold everything (it needs ~395px),

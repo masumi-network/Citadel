@@ -16,8 +16,8 @@ import type { ReactNode } from "react";
 export const MEASURE = "mx-auto max-w-[1200px] px-6 max-[620px]:px-4";
 export const BAND = "relative py-14 max-[620px]:py-10";
 export const BAND_IN = MEASURE;
-/** Anchor jumps clear sticky TopNav. Height is --topnav-h in globals.css. */
-export const SECTION = `${BAND} scroll-mt-[var(--topnav-h)]`;
+/** Anchor jumps clear sticky TopNav plus section subnav when present. */
+export const SECTION = `${BAND} scroll-mt-[var(--chrome-h)]`;
 
 /** White, grey, and the accent tint that is reserved for a fork in the path. */
 export const TONE = {
@@ -32,13 +32,19 @@ export function Band({
   id,
   tone,
   children,
+  hidden,
 }: {
   id?: string;
   tone: Tone;
   children: ReactNode;
+  hidden?: boolean;
 }) {
   return (
-    <section className={`${id ? SECTION : BAND} ${TONE[tone]}`} id={id}>
+    <section
+      className={`${id ? SECTION : BAND} ${TONE[tone]}`}
+      id={id}
+      hidden={hidden || undefined}
+    >
       <div className={BAND_IN}>{children}</div>
     </section>
   );

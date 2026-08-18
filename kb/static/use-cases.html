@@ -32,17 +32,21 @@
     </nav>
     <div class="band-in">
       <header class="hero hero-wide">
-        <p class="eyebrow">Use cases · teams and consortia</p>
-        <h1>What people run Citadel for, <span class="grad">and where we partner</span>.</h1>
+        <p class="eyebrow">Use cases · teams<span data-audience="partner" hidden> and consortia</span></p>
+        <h1>What people run Citadel for<span data-audience="partner" hidden>, <span class="grad">and where we partner</span></span>.</h1>
         <div class="meta">
           <span class="pill">utxo AG · Zug, Switzerland</span>
-          <span class="pill">Looking for: one work package</span>
+          <span class="pill" data-audience="partner" hidden>Looking for: one work package</span>
+        </div>
+        <div class="audience" id="audience" role="group" aria-label="Use case audience">
+          <button type="button" id="audience-team" aria-pressed="true">Team</button>
+          <button type="button" id="audience-partner" aria-pressed="false">Partner</button>
         </div>
 
         <div class="tldr">
           <p class="lbl">The short version</p>
           <p><b>For a team.</b> Citadel gathers the records you already produce, code, tickets, documents, coding sessions, and keeps them in one place where each item is <b>traceable to its source</b>, only visible to the people allowed to see it, and logged every time it is read or changed. You and your agents ask it questions instead of asking each other the same ones again.</p>
-          <p><b>For a consortium.</b> That same system is what utxo AG brings to an EU project, as a partner running one work package. We are a Swiss company, and Switzerland is part of the Digital Europe Programme, so we count toward your minimum number of countries rather than sitting outside it. We apply for Swiss national co-funding toward our own share, and we scope the work package with you rather than off a price list.</p>
+          <p data-audience="partner" hidden><b>For a consortium.</b> That same system is what utxo AG brings to an EU project, as a partner running one work package. We are a Swiss company, and Switzerland is part of the Digital Europe Programme, so we count toward your minimum number of countries rather than sitting outside it. We apply for Swiss national co-funding toward our own share, and we scope the work package with you rather than off a price list.</p>
         </div>
       </header>
     </div>
@@ -51,11 +55,10 @@
   <nav class="index" aria-label="Sections">
     <div class="index-in">
       <a href="#teams">Use cases</a>
-      <a href="#fit">Where we fit</a>
-      <a href="#can">What we can and can't do</a>
-      <a href="#honest">What we don't claim</a>
-      <a href="#wp">Work package</a>
-      <a href="#ask">The ask</a>
+      <a href="#fit" data-audience="partner" hidden>Where we fit</a>
+      <a href="#can" data-audience="partner" hidden>What we can and can't do</a>
+      <a href="#wp" data-audience="partner" hidden>Work package</a>
+      <a href="#ask" data-audience="partner" hidden>The ask</a>
       <a href="#verify">Check us</a>
       <span class="pill live" id="pill-health"><span class="hdot"></span><span id="pill-health-text">Live · v0.5.0</span></span>
     </div>
@@ -65,33 +68,45 @@
     <div class="band-in">
       <div class="sechead"><span class="kicker">Use cases</span><h2>Four things teams run it for</h2></div>
       <p class="lede">None of these need anyone to file anything. The capture already happened while people were working.</p>
-      <div class="pillars">
-        <div class="card">
-          <h3><span class="dot"></span>The first two weeks of a new engineer</h3>
-          <p>Why is it built this way, what was tried before, who decided. A new joiner asks the vault and gets an answer with the commit, issue, or decision record behind it, instead of interrupting the three people who remember.</p>
-          <span class="tag">onboarding without a tax on the team</span>
-        </div>
-        <div class="card">
-          <h3><span class="dot"></span>Agents that know your codebase</h3>
-          <p>Claude Code, Cursor, or your own agent connects over MCP and answers from your team's memory under your seat and your read scope. The agent stops guessing at context it was never given.</p>
-          <span class="tag">MCP · same seat, same isolation</span>
-        </div>
-        <div class="card">
-          <h3><span class="dot"></span>One question across every tool</h3>
-          <p>The answer to "what happened with X" is usually split across a commit, a ticket, a document, and a coding session nobody wrote down. One search reads all of them and tells you which memory answered.</p>
-          <span class="tag">code · tickets · docs · sessions</span>
-        </div>
-        <div class="card">
-          <h3><span class="dot"></span>Evidence you can hand to someone else</h3>
-          <p>Every retrieved item carries a content fingerprint and points back at where it came from, and every read and write is logged. When a report or a review needs proof, it is already assembled.</p>
-          <span class="tag">source linked · audited</span>
-        </div>
+      <div class="case-list">
+        <article class="case-row">
+          <p class="case-n">01</p>
+          <div>
+            <h3>The first two weeks of a new engineer</h3>
+            <p>Why is it built this way, what was tried before, who decided. A new joiner asks the vault and gets an answer with the commit, issue, or decision record behind it, instead of interrupting the three people who remember.</p>
+            <span class="tag">onboarding without a tax on the team</span>
+          </div>
+        </article>
+        <article class="case-row">
+          <p class="case-n">02</p>
+          <div>
+            <h3>Agents that know your codebase</h3>
+            <p>Claude Code, Cursor, or your own agent connects over MCP and answers from your team's memory under your seat and your read scope. The agent stops guessing at context it was never given.</p>
+            <span class="tag">MCP · same seat, same isolation</span>
+          </div>
+        </article>
+        <article class="case-row">
+          <p class="case-n">03</p>
+          <div>
+            <h3>One question across every tool</h3>
+            <p>The answer to "what happened with X" is usually split across a commit, a ticket, a document, and a coding session nobody wrote down. One search reads all of them and tells you which memory answered.</p>
+            <span class="tag">code · tickets · docs · sessions</span>
+          </div>
+        </article>
+        <article class="case-row">
+          <p class="case-n">04</p>
+          <div>
+            <h3>Evidence you can hand to someone else</h3>
+            <p>Every retrieved item carries a content fingerprint and points back at where it came from, and every read and write is logged. When a report or a review needs proof, it is already assembled.</p>
+            <span class="tag">source linked · audited</span>
+          </div>
+        </article>
       </div>
-      <p class="verified"><span class="vdot"></span>The rest of this page is the same system offered to EU consortia as a work-package partner. If you are here as a team rather than a coordinator, <a href="/">the home page</a> and <a href="/info">the live status</a> are the shorter read.</p>
+      <p class="verified" data-audience="partner" hidden><span class="vdot"></span>The rest of this page is the same system offered to EU consortia as a work-package partner. If you are here as a team rather than a coordinator, <a href="/">the home page</a> and <a href="/info">the live status</a> are the shorter read.</p>
     </div>
   </section>
 
-  <section class="band band-grey" id="fit">
+  <section class="band band-grey" id="fit" data-audience="partner" hidden>
     <div class="band-in">
       <div class="sechead"><span class="kicker">Partnering · where we fit</span><h2>Two jobs consortia give us</h2></div>
       <p class="lede">The software is the same in both. Only what we connect it to changes.</p>
@@ -110,7 +125,7 @@
     </div>
   </section>
 
-  <section class="band band-white" id="can">
+  <section class="band band-white" id="can" data-audience="partner" hidden>
     <div class="band-in">
       <div class="sechead"><span class="kicker">What we can and can't do</span><h2>Three honest categories</h2></div>
       <p class="lede">Rather than one long capability list, here is the only distinction that matters to you when you are assembling a consortium: what already works, what we would build with project funding, and what you need somebody else for.</p>
@@ -172,22 +187,7 @@
     </div>
   </section>
 
-  <section class="band band-grey" id="honest">
-    <div class="band-in">
-      <div class="sechead"><span class="kicker">What we don't claim</span><h2>Where we would fail a technical review</h2></div>
-      <div class="tldr">
-        <p class="lbl">Read this before you believe the rest</p>
-        <p>Partner profiles list capabilities and stop. These are the gaps, checked against the live system rather than copied from our own documentation.</p>
-        <ul class="plainlist">
-          <li><b>Items are fingerprinted, but not yet traceable.</b> We can prove a record hasn't changed; we cannot yet show you, on every record, exactly which document it came from. That is the single biggest thing a project would fund, and we would rather fund it than claim it.</li>
-          <li><b>Disagreement detection is shallow.</b> Today it compares document titles. Comparing the actual claims is designed and specified, but not built.</li>
-          <li><b>We are proven at team scale, not national scale.</b> The system runs daily for a working team. Handling a country's reporting volume is real project work, and we scope it as such.</li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
-  <section class="band band-white" id="wp">
+  <section class="band band-white" id="wp" data-audience="partner" hidden>
     <div class="band-in">
       <div class="sechead"><span class="kicker">Draft work package</span><h2>Written so you can lift it and edit</h2></div>
       <p class="lede">A coordinator assembling a proposal under time pressure needs text, not a brochure. Six tasks across 24 months, all negotiable against the structure you already have.</p>
@@ -203,7 +203,7 @@
     </div>
   </section>
 
-  <section class="band band-grey" id="ask">
+  <section class="band band-grey" id="ask" data-audience="partner" hidden>
     <div class="band-in">
       <div class="sechead"><span class="kicker">The ask</span><h2>One work package, scoped to your call</h2></div>
       <p class="lede">Effort and cost depend on the call, the pilot systems, and which partners cover what around us. We work those out with you rather than publishing a figure that would be wrong for your project. Send us the call and the gap, and we come back with a costed work package written against your structure.</p>
@@ -226,7 +226,7 @@
     </div>
   </section>
 
-  <section class="band band-tint" id="talk">
+  <section class="band band-tint" id="talk" data-audience="partner" hidden>
     <div class="band-in">
       <div class="sechead"><span class="kicker">Talk to us</span><h2>Tell us the call and the gap</h2></div>
       <p class="lede">Send the call identifier, the topic, and the piece you need covered. We reply with a work package written against your structure rather than ours, usually within two working days.</p>

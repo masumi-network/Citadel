@@ -1010,9 +1010,20 @@ def test_login_page_uses_the_public_design_system() -> None:
 def test_use_cases_page_is_public_and_csp_clean() -> None:
     page = legacy_public_markup("/use-cases")
     # No token, no session — a coordinator or a curious engineer must be able
-    # to open this. Team use cases lead; the partnering profile follows.
+    # to open this. Team use cases are the default; partner copy stays in the
+    # document, hidden until Partner is pressed.
     assert "Four things teams run it for" in page
     assert "Draft work package" in page
+    assert "One work package, scoped to your call" in page
+    for section_id in ("fit", "can", "wp", "ask", "talk"):
+        tag = re.search(rf'<section[^>]*id="{section_id}"[^>]*>', page)
+        assert tag is not None, section_id
+        assert "hidden" in tag.group(0), f"#{section_id} should be hidden by default"
+    teams = re.search(r'<section[^>]*id="teams"[^>]*>', page)
+    assert teams is not None
+    assert "hidden" not in teams.group(0)
+    assert 'id="audience"' in page
+    assert 'aria-pressed="true"' in page
     # Reuses the /info stylesheet + script rather than shipping its own.
     assert '<link rel="stylesheet" href="/static/info.css">' in page
     assert '<script src="/static/info.js" defer></script>' in page
@@ -1224,6 +1235,8 @@ def test_each_public_page_owns_its_subject() -> None:
     assert 'class="spine"' in home
     assert 'class="spine"' not in info
     assert "pipx install citadel-archive" in home
+    assert "npx skills add masumi-network/citadel --skill citadel" in home
+    assert "citadel onboard" not in home
     assert "citadel onboard" not in info
     # The live tiles and the roadmap live on /info only.
     assert 'id="m-version"' in info
@@ -1245,6 +1258,8 @@ def test_home_owns_install_and_the_diagram() -> None:
 
     assert 'class="spine"' in home
     assert "pipx install citadel-archive" in home
+    assert "npx skills add masumi-network/citadel --skill citadel" in home
+    assert "citadel onboard" not in home
     assert 'id="m-version"' not in home
     for path, page in others.items():
         assert 'class="spine"' not in page, path

@@ -1,7 +1,9 @@
 import Head from "next/head";
+import { useEffect, useState } from "react";
 
 import { HeroBand } from "@/components/hero-band";
-import { SectionIndex, type Section } from "@/components/section-index";
+import { SectionIndex, StickyChrome, WithSectionRail, type Section } from "@/components/section-index";
+import { TopNav } from "@/components/top-nav";
 import {
   BAND,
   BAND_IN,
@@ -21,19 +23,15 @@ import {
   FOOT_NOTE,
   GoDeeper,
   H1_WIDE,
-  HERO_STRIP,
-  HeroFact,
   LEDE,
   META,
   PILL,
   PILLARS,
-  PLAINLIST,
   ROWS,
   ROW_H3,
   ROW_K,
   Row,
   SecHead,
-  TLDR_P,
   Verified,
 } from "@/components/ui";
 
@@ -41,11 +39,20 @@ const SECTIONS: Section[] = [
   { id: "teams", label: "Use cases" },
   { id: "fit", label: "Where we fit" },
   { id: "can", label: "What we can and can't do" },
-  { id: "honest", label: "What we don't claim" },
   { id: "wp", label: "Work package" },
   { id: "ask", label: "The ask" },
   { id: "verify", label: "Check us" },
 ];
+
+/* EU / consortium / work-package blocks. Hidden until Partner is pressed.
+   #talk is not in the rail; it still follows this set. */
+const PARTNER_IDS = new Set(["fit", "can", "wp", "ask", "talk"]);
+const CONSUMER_SECTIONS = SECTIONS.filter((section) => !PARTNER_IDS.has(section.id));
+
+const TAB =
+  "cursor-pointer border px-3 py-1.5 text-[12.5px] font-medium transition-[background-color,border-color,color] duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
+const TAB_ON = `${TAB} relative z-[1] border-accent bg-accent-soft text-accent-ink`;
+const TAB_OFF = `${TAB} border-border-2 bg-surface text-ink-2 hover:border-accent hover:text-accent-ink`;
 
 const TEAM_CASES = [
   {
@@ -75,6 +82,27 @@ const TEAM_CASES = [
 ] as const;
 
 export default function UseCases() {
+  const [partner, setPartner] = useState(false);
+
+  useEffect(() => {
+    const id = window.location.hash.replace(/^#/, "");
+    if (PARTNER_IDS.has(id)) setPartner(true);
+  }, []);
+
+  useEffect(() => {
+    if (!partner) return;
+    const id = window.location.hash.replace(/^#/, "");
+    if (!PARTNER_IDS.has(id)) return;
+    document.getElementById(id)?.scrollIntoView();
+  }, [partner]);
+
+  function setAudience(next: boolean) {
+    setPartner(next);
+    if (!next && PARTNER_IDS.has(window.location.hash.replace(/^#/, ""))) {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  }
+
   return (
     <>
       <Head>
@@ -86,27 +114,68 @@ export default function UseCases() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      <HeroBand current="/use-cases" wide>
-        <p className={EYEBROW}>Use cases · teams and consortia</p>
+      <StickyChrome>
+        <TopNav current="/use-cases" embedded />
+        <SectionIndex sections={partner ? SECTIONS : CONSUMER_SECTIONS} />
+      </StickyChrome>
+
+      <HeroBand wide nav={false}>
+        <p className={EYEBROW}>Use cases · teams{partner ? " and consortia" : ""}</p>
         <h1 className={H1_WIDE}>
-          What people run Citadel for, <span className="grad">and where we partner</span>.
+          What people run Citadel for
+          {partner ? (
+            <>
+              , <span className="grad">and where we partner</span>
+            </>
+          ) : null}
+          .
         </h1>
-        <div className={`${META} mb-8`}>
+        <div className={META}>
           <span className={PILL}>utxo AG · Zug, Switzerland</span>
-          <span className={PILL}>Looking for: one work package</span>
+          {partner ? <span className={PILL}>Looking for: one work package</span> : null}
         </div>
-        <dl className={HERO_STRIP}>
-          <HeroFact kicker="Team">
-            Citadel gathers your code, tickets, documents, and sessions, each with a{" "}
-            <b>content fingerprint</b>.
-          </HeroFact>
-          <HeroFact kicker="Consortium">
-            utxo AG brings this system to an EU project as one work package.
-          </HeroFact>
-        </dl>
+        <div className="mt-6 inline-flex" id="audience" role="group" aria-label="Use case audience">
+          <button
+            type="button"
+            aria-pressed={!partner}
+            className={!partner ? TAB_ON : TAB_OFF}
+            onClick={() => setAudience(false)}
+          >
+            Team
+          </button>
+          <button
+            type="button"
+            aria-pressed={partner}
+            className={`-ml-px ${partner ? TAB_ON : TAB_OFF}`}
+            onClick={() => setAudience(true)}
+          >
+            Partner
+          </button>
+        </div>
       </HeroBand>
 
-      <SectionIndex sections={SECTIONS} />
+      <WithSectionRail>
+      <Band tone="grey" hidden={!partner}>
+        <dl className="grid grid-cols-2 gap-x-20 gap-y-12 max-[620px]:grid-cols-1">
+          <div>
+            <dt className="mb-3 font-mono text-[10.5px] font-semibold uppercase tracking-[.14em] text-accent-ink">
+              Team
+            </dt>
+            <dd className="m-0 max-w-[46ch] text-[17.5px] leading-[1.7] text-ink-2">
+              Citadel gathers your code, tickets, documents, and sessions, each with a{" "}
+              <b>content fingerprint</b>.
+            </dd>
+          </div>
+          <div>
+            <dt className="mb-3 font-mono text-[10.5px] font-semibold uppercase tracking-[.14em] text-accent-ink">
+              Consortium
+            </dt>
+            <dd className="m-0 max-w-[46ch] text-[17.5px] leading-[1.7] text-ink-2">
+              utxo AG brings this system to an EU project as one work package.
+            </dd>
+          </div>
+        </dl>
+      </Band>
 
       <Band tone="white" id="teams">
         <SecHead kicker="Use cases" title="Four things teams run it for" />
@@ -114,24 +183,37 @@ export default function UseCases() {
           None of these need anyone to file anything. The capture already happened while people were
           working.
         </p>
-        <div className="grid grid-cols-2 gap-px border border-border bg-border max-[620px]:grid-cols-1">
+        {/* Stacked list, same rhythm as /info #live. 01–04 sit in a gutter so
+            the four cases are not four equal cells. */}
+        <div className="border border-border bg-surface">
           {TEAM_CASES.map((item) => (
-            <article key={item.n} className="bg-surface px-6 py-6 max-[620px]:px-4 max-[620px]:py-5">
-              <p className="mb-3 font-mono text-[11px] tracking-[.16em] text-accent-ink">{item.n}</p>
-              <h3 className="m-0 mb-2.5 text-base font-semibold">{item.title}</h3>
-              <p className={CARD_P}>{item.body}</p>
-              <span className={CARD_TAG}>{item.tag}</span>
+            <article
+              key={item.n}
+              className="grid grid-cols-[72px_1fr] items-start gap-6 border-t border-border px-8 py-8 first:border-t-0 min-[1120px]:grid-cols-[88px_1fr] max-[620px]:grid-cols-1 max-[620px]:gap-3 max-[620px]:px-5 max-[620px]:py-7"
+            >
+              <p className="m-0 pt-1 font-mono text-[22px] font-medium leading-none tracking-[.04em] text-accent-ink tabular-nums">
+                {item.n}
+              </p>
+              <div>
+                <h3 className="m-0 mb-3 text-[clamp(18px,2.2vw,22px)] font-semibold tracking-[-.02em]">
+                  {item.title}
+                </h3>
+                <p className="m-0 max-w-[68ch] text-[15.5px] leading-[1.65] text-ink-2">{item.body}</p>
+                <span className={CARD_TAG}>{item.tag}</span>
+              </div>
             </article>
           ))}
         </div>
-        <Verified>
-          The rest of this page is the same system offered to EU consortia as a work-package
-          partner. If you are here as a team rather than a coordinator, <a href="/">the home page</a>{" "}
-          and <a href="/info">the live status</a> are the shorter read.
-        </Verified>
+        {partner ? (
+          <Verified>
+            The rest of this page is the same system offered to EU consortia as a work-package
+            partner. If you are here as a team rather than a coordinator, <a href="/">the home page</a>{" "}
+            and <a href="/info">the live status</a> are the shorter read.
+          </Verified>
+        ) : null}
       </Band>
 
-      <Band tone="grey" id="fit">
+      <Band tone="grey" id="fit" hidden={!partner}>
         <SecHead kicker="Partnering · where we fit" title="Two jobs consortia give us" />
         <p className={LEDE}>
           The software is the same in both. Only what we connect it to changes.
@@ -157,7 +239,7 @@ export default function UseCases() {
         </div>
       </Band>
 
-      <Band tone="white" id="can">
+      <Band tone="white" id="can" hidden={!partner}>
         <SecHead kicker="What we can and can't do" title="Three honest categories" />
         <p className={LEDE}>
           Rather than one long capability list, here is the only distinction that matters to you
@@ -271,75 +353,7 @@ export default function UseCases() {
         </div>
       </Band>
 
-      <Band tone="grey" id="honest">
-        <SecHead kicker="What we don't claim" title="Where we would fail a technical review" />
-        {/* Accent bar stays: this is the section a coordinator should read
-            first. The old 65ch box left the right of the 1200px measure empty,
-            so shipped vs still-open sit in two columns instead. */}
-        <div className="relative border border-border bg-surface">
-          <span className="absolute inset-y-0 left-0 w-[3px] bg-accent" />
-          <div className="px-6 py-5 pl-7 max-[620px]:px-4 max-[620px]:py-4 max-[620px]:pl-5">
-            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-[.16em] text-accent-ink">
-              Read this before you believe the rest
-            </p>
-            <p className={TLDR_P}>
-              Partner profiles list capabilities and stop. These are the gaps, checked against the
-              live system rather than copied from our own documentation. A few items that used to
-              sit here have shipped. They are listed first so this page does not keep advertising
-              them as holes.
-            </p>
-            <div className="mt-4 grid grid-cols-2 gap-x-12 gap-y-6 max-[620px]:grid-cols-1 max-[620px]:gap-y-0">
-              <div className="max-[620px]:pb-6">
-                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-good">
-                  Shipped since v0.3
-                </p>
-                <ul className={`${PLAINLIST} mt-1`}>
-                  <li>
-                    <b className={DEEP_B}>Mesh read isolation</b> (v0.3.0): graph, activity, and
-                    document drill-down are caller-scoped.
-                  </li>
-                  <li>
-                    <b className={DEEP_B}>Shared Session Traces</b> (v0.4.0): share a dead end,
-                    reference-only, without leaking private memory.
-                  </li>
-                  <li>
-                    <b className={DEEP_B}>Next public pages</b> (v0.4.1 preview at{" "}
-                    <code className="bg-surface-2 px-1.5 py-[1.5px] font-mono text-[.84em] text-ink">
-                      /next
-                    </code>
-                    ): this site, as a static export, not yet the default public surface.
-                  </li>
-                </ul>
-              </div>
-              <div className="max-[620px]:border-t max-[620px]:border-border max-[620px]:pt-6">
-                <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.16em] text-warn">
-                  Still open, and on the roadmap
-                </p>
-                <ul className={`${PLAINLIST} mt-1`}>
-                  <li>
-                    <b className={DEEP_B}>Items are fingerprinted, but not yet attested.</b> Search
-                    can say a source is linked. That is not per-item provenance with a confidence
-                    and a match type on every record. A project would fund that, and we would rather
-                    fund it than claim it.
-                  </li>
-                  <li>
-                    <b className={DEEP_B}>Disagreement detection is shallow.</b> Today it compares
-                    document titles. Comparing the actual claims is designed, and specified, but not
-                    built.
-                  </li>
-                  <li>
-                    <b className={DEEP_B}>We are proven at team scale, not national scale.</b> The
-                    system runs daily for a working team. Handling a country&apos;s reporting volume
-                    is real project work, and we scope it as such.
-                  </li>
-                </ul>
-              </div>
-            </div>
-          </div>
-        </div>
-      </Band>
-
-      <Band tone="white" id="wp">
+      <Band tone="white" id="wp" hidden={!partner}>
         <SecHead kicker="Draft work package" title="Written so you can lift it and edit" />
         <p className={LEDE}>
           A coordinator assembling a proposal under time pressure needs text, not a brochure. Six
@@ -383,7 +397,7 @@ export default function UseCases() {
         </Verified>
       </Band>
 
-      <Band tone="grey" id="ask">
+      <Band tone="grey" id="ask" hidden={!partner}>
         <SecHead kicker="The ask" title="One work package, scoped to your call" />
         {/* The four-tile metrics block that used to sit here is gone. Scope and
             cost are worked out after a contact request, not published: a figure
@@ -450,7 +464,7 @@ export default function UseCases() {
         </div>
       </Band>
 
-      <section className={`${BAND} bg-accent-soft`} id="talk">
+      <section className={`${BAND} bg-accent-soft`} id="talk" hidden={!partner || undefined}>
         <div className={BAND_IN}>
           <SecHead kicker="Talk to us" title="Tell us the call and the gap" />
           <p className={LEDE}>
@@ -477,6 +491,7 @@ export default function UseCases() {
           </footer>
         </div>
       </section>
+      </WithSectionRail>
     </>
   );
 }
