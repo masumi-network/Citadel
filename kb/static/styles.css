@@ -1467,6 +1467,15 @@ pre {
   font-size: 12px;
 }
 
+.selection .node-connections-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: min(280px, 40vh);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .selection .node-connection {
   display: block;
   width: 100%;
@@ -1493,8 +1502,19 @@ pre {
 .selection .node-connections-more {
   display: block;
   margin-top: 4px;
-  color: var(--quiet);
+  color: var(--primary);
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
   font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.selection .node-connections-more:hover,
+.selection .node-connections-more:focus-visible {
+  color: var(--text);
 }
 
 /* Kind legend overlaid on the knowledge-graph canvas; chips toggle kinds
