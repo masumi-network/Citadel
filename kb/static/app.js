@@ -2178,33 +2178,52 @@ function renderKnowledgeInspector(node) {
 
   const neighbors = knowledgeNeighbors(node.id);
   if (!neighbors.length) return;
+
   const container = document.createElement("div");
   container.className = "node-connections";
   const heading = document.createElement("strong");
   heading.textContent = "Connections";
-  container.append(heading);
-  neighbors.slice(0, MAX_INSPECTOR_NEIGHBORS).forEach((item) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "node-connection";
-    button.textContent = `${item.relationship} · ${item.node.label || item.node.id}`;
-    // Resolve by id at click time: a graph refresh replaces state.realGraph
-    // while this button persists, so the captured node object may be stale.
-    const targetId = item.node.id;
-    button.addEventListener("click", () => {
-      const target = state.realGraph?.nodes.get(targetId);
-      if (!target) return;
-      focusGraphNode(targetId);
-      selectNode(target);
+  const list = document.createElement("div");
+  list.className = "node-connections-list";
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "node-connections-more";
+
+  container.append(heading, list);
+
+  const renderConnections = (showAll) => {
+    list.innerHTML = "";
+    const visibleNeighbors = showAll
+      ? neighbors
+      : neighbors.slice(0, MAX_INSPECTOR_NEIGHBORS);
+    visibleNeighbors.forEach((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "node-connection";
+      button.textContent = `${item.relationship} · ${item.node.label || item.node.id}`;
+      // Resolve by id at click time: a graph refresh replaces state.realGraph
+      // while this button persists, so the captured node object may be stale.
+      const targetId = item.node.id;
+      button.addEventListener("click", () => {
+        const target = state.realGraph?.nodes.get(targetId);
+        if (!target) return;
+        focusGraphNode(targetId);
+        selectNode(target);
+      });
+      list.append(button);
     });
-    container.append(button);
-  });
-  if (neighbors.length > MAX_INSPECTOR_NEIGHBORS) {
-    const more = document.createElement("span");
-    more.className = "node-connections-more";
-    more.textContent = `+${neighbors.length - MAX_INSPECTOR_NEIGHBORS} more`;
-    container.append(more);
-  }
+
+    if (neighbors.length > MAX_INSPECTOR_NEIGHBORS) {
+      more.textContent = showAll ? "Show fewer" : `Show all ${neighbors.length} connections`;
+      more.hidden = false;
+      more.onclick = () => renderConnections(!showAll);
+    } else {
+      more.hidden = true;
+    }
+  };
+
+  container.append(more);
+  renderConnections(false);
   selectedNode.append(container);
 }
 
