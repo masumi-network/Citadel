@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -57,6 +57,7 @@ from kb.config import CitadelConfig
 from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
 from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
+from kb.improvement_policy import ImprovementScopeError, central_improvement_dataset
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
@@ -164,6 +165,8 @@ def _record_canary_verdict(
     search_hit: Any = None,
     graph_grew: Any = None,
     marker: Any = None,
+    projection_chain_ok: Any = None,
+    projection_receipt_count: Any = None,
     error: str | None = None,
 ) -> None:
     """Stamp the /readyz canary. Evolve and POST /api/cognify/run share this."""
@@ -173,6 +176,8 @@ def _record_canary_verdict(
         "search_hit": search_hit,
         "graph_grew": graph_grew,
         "marker": marker,
+        "projection_chain_ok": projection_chain_ok,
+        "projection_receipt_count": projection_receipt_count,
     }
     if error is not None:
         payload["error"] = error
@@ -365,44 +370,47 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         await asyncio.sleep(delay)
         delay = float(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
-        # Phase 1 — heavy stages, in this loop. Hold the in-process writer lock
-        # across them so no interactive cognify (an ingest's, /api/cognify/run)
-        # writes Kuzu underneath the pass. Phase 2 re-acquires it itself.
-        writer_lock = getattr(getattr(get_citadel(), "cognee", None), "writer_lock", None)
-        acquired = False
-        try:
-            if writer_lock is not None:
-                await writer_lock.acquire()
-                acquired = True
-            # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
-            # A second process can never open the graph: cognee holds an exclusive
-            # OS file lock on cognee_graph_kuzu for the lifetime of whichever
-            # process opens it, and that is always this one. github_sync and
-            # linear_sync died on "Could not set lock on file" every hour because
-            # of it. Add-only for the duration so the per-ingest background
-            # cognify does not storm the writer lock; Phase 2 below cognifies once
-            # as the sole writer (#47).
-            with suppress_inline_cognify():
-                code = await run_evolve_in_loop()
-            if code == 0:
-                logger.info("Evolve scheduler: stages finished (exit=0)")
-            else:
-                # A partial failure is the normal broken case, not an edge one:
-                # the stage names are already on the "Evolve finished: ...
-                # failed=..." line, so log at ERROR here to make the cycle
-                # visibly bad rather than an INFO nobody reads (#89).
-                logger.error(
-                    "Evolve scheduler: stages finished with failures (exit=%s) — "
-                    "see the 'Evolve finished' line above for which stages failed",
-                    code,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Evolve scheduler: stages failed")
-        finally:
-            if acquired:
-                writer_lock.release()
+        # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
+        # the writer lock so lifecycle cannot claim a lease and then wait inside
+        # Cognee while this pass owns the graph.
+        async with get_citadel().cognee.maintenance():
+            writer_lock = getattr(
+                getattr(get_citadel(), "cognee", None), "writer_lock", None
+            )
+            acquired = False
+            try:
+                if writer_lock is not None:
+                    await writer_lock.acquire()
+                    acquired = True
+                # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
+                # A second process can never open the graph: cognee holds an exclusive
+                # OS file lock on cognee_graph_kuzu for the lifetime of whichever
+                # process opens it, and that is always this one. github_sync and
+                # linear_sync died on "Could not set lock on file" every hour because
+                # of it. Add-only for the duration so the per-ingest background
+                # cognify does not storm the writer lock; Phase 2 below cognifies once
+                # as the sole writer (#47).
+                with suppress_inline_cognify():
+                    code = await run_evolve_in_loop()
+                if code == 0:
+                    logger.info("Evolve scheduler: stages finished (exit=0)")
+                else:
+                    # A partial failure is the normal broken case, not an edge one:
+                    # the stage names are already on the "Evolve finished: ...
+                    # failed=..." line, so log at ERROR here to make the cycle
+                    # visibly bad rather than an INFO nobody reads (#89).
+                    logger.error(
+                        "Evolve scheduler: stages finished with failures (exit=%s) - "
+                        "see the 'Evolve finished' line above for which stages failed",
+                        code,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Evolve scheduler: stages failed")
+            finally:
+                if acquired:
+                    writer_lock.release()
         # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
         force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
             "1",
@@ -421,6 +429,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 search_hit=verification.get("search_hit"),
                 graph_grew=result.get("graph_grew"),
                 marker=verification.get("marker"),
+                projection_chain_ok=verification.get("projection_chain_ok"),
+                projection_receipt_count=len(verification.get("projection_receipts") or []),
             )
             logger.info(
                 "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
@@ -963,10 +973,9 @@ class IngestBody(BaseModel):
     dataset: str | None = None
     tags: list[str] = Field(default_factory=list)
     session_id: str | None = None
-    # When true, cognify the written dataset inline (server-side, where it holds
-    # the single Kuzu writer) and block until done — so a writer's ingest is
-    # immediately searchable without needing the admin-only cognify endpoint.
-    cognify: bool = False
+    # Seat and MCP writes must pass through Cognee before they are reported as
+    # searchable. The legacy opt-out is rejected at request validation time.
+    cognify: Literal[True] = True
 
 
 # Upper bound on a search query, in the same spirit as SearchBody's other
@@ -1869,6 +1878,18 @@ def dataset_visible_to(identity: AccessIdentity, dataset: str) -> bool:
     return True
 
 
+def graph_dataset_visible_to(
+    identity: AccessIdentity, dataset: str, config: CitadelConfig
+) -> bool:
+    """Keep seat graph content to Central and the caller's own seat."""
+    if identity.seat_slug:
+        return dataset in {
+            central_dataset(config),
+            seat_dataset(identity.seat_slug),
+        }
+    return dataset_visible_to(identity, dataset)
+
+
 def scope_override_active(
     identity: AccessIdentity,
     datasets: list[str] | tuple[str, ...],
@@ -1905,7 +1926,7 @@ class WriteTarget:
 
 
 def central_dataset(config: CitadelConfig) -> str:
-    return config.github_sync_dataset or CENTRAL_DATASET
+    return central_improvement_dataset(config)
 
 
 def is_org_bound(tags: list[str] | tuple[str, ...]) -> bool:
@@ -2788,6 +2809,43 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     return {key: value for key, value in provenance.items() if value}
 
 
+def result_references(result: dict[str, Any]) -> list[dict[str, str]]:
+    """Keep a bounded, public-safe citation list from graph retrieval."""
+    raw = result.get("references")
+    if raw is None:
+        raw = result.get("reference")
+    if isinstance(raw, str):
+        candidates: list[Any] = [{"url": raw}]
+    elif isinstance(raw, dict):
+        candidates = [raw]
+    elif isinstance(raw, (list, tuple)):
+        candidates = list(raw)
+    else:
+        candidates = []
+
+    references: list[dict[str, str]] = []
+    for candidate in candidates[:10]:
+        if not isinstance(candidate, dict):
+            continue
+        clean: dict[str, str] = {}
+        for key in (
+            "id",
+            "title",
+            "url",
+            "source_url",
+            "document_id",
+            "source_locator",
+            "snippet",
+            "text",
+        ):
+            value = first_string(candidate.get(key))
+            if value:
+                clean[key] = value[:500]
+        if clean:
+            references.append(clean)
+    return references
+
+
 def document_endpoint_for_result(
     result_id: str, *, document_id: str | None = None
 ) -> str | None:
@@ -2929,6 +2987,10 @@ def with_result_metadata(
             "document_drilldown_available": drilldown_available,
         },
     }
+    references = result_references(normalized)
+    metadata["retrieval"]["citations_available"] = bool(references)
+    if references:
+        metadata["references"] = references
     if isinstance(lifecycle, dict):
         source_revision_id = first_string(lifecycle.get("source_revision_id"))
         projection_receipt_id = first_string(lifecycle.get("projection_receipt_id"))
@@ -5422,13 +5484,11 @@ async def knowledge_events(
     return jsonable_encoder({"ok": True, **timeline})
 
 
-def mesh_presence_hubs() -> list[dict[str, str]]:
+def mesh_presence_hubs(seat_slug: str | None = None) -> list[dict[str, str]]:
     """Universal Seat Presence list for the Knowledge Mesh (ADR-0009).
 
-    Every seat principal appears by its seat dataset name — slug ONLY,
-    presence metadata never carries member names or emails — plus Central,
-    so the hub inventory comes from the seat inventory, independent of which
-    content survives caller scoping.
+    Seat callers receive Central plus their own seat. Broad callers receive
+    every seat by dataset name. Presence metadata carries slugs only.
 
     Never breaks the graph endpoint: any failure reading the access store
     degrades to a Central-only presence list instead of raising.
@@ -5436,6 +5496,11 @@ def mesh_presence_hubs() -> list[dict[str, str]]:
     central = central_dataset(get_citadel().config)
     entries: list[dict[str, str]] = [{"dataset": central, "label": central}]
     seen = {central}
+    if seat_slug:
+        name = f"{SEAT_DATASET_PREFIX}{seat_slug}"
+        if name != central:
+            entries.append({"dataset": name, "label": name})
+        return entries
     try:
         # Principals-only read: never materializes the audit list or token
         # roster on this latency-watched endpoint (#50).
@@ -5500,16 +5565,41 @@ async def mesh_graph(
             dataset_visible=(
                 None
                 if can_bypass_dataset_allowlist(identity)
-                else lambda name: dataset_visible_to(identity, name)
+                else lambda name: graph_dataset_visible_to(
+                    identity, name, get_citadel().config
+                )
             ),
             dataset=dataset_filter,
             seat_first=(
                 f"seat:{identity.seat_slug}" if identity.seat_slug else None
             ),
-            presence=mesh_presence_hubs(),
+            presence=mesh_presence_hubs(identity.seat_slug),
             collapse_orphans=True,
         )
     return jsonable_encoder({**graph, "limit": effective_limit})
+
+
+@app.get("/api/mesh/projection-status")
+async def mesh_projection_status(request: Request, limit: int = 10) -> Any:
+    """Return recent Cognee projection states for the caller's own seat."""
+    identity = require_access(request, "reader", "kb:search")
+    if not 1 <= limit <= 50:
+        raise HTTPException(status_code=422, detail="Projection limit must be between 1 and 50.")
+    if not identity.seat_slug:
+        return {"ok": True, "enabled": False, "dataset": None, "operations": []}
+    dataset = f"{SEAT_DATASET_PREFIX}{identity.seat_slug}"
+    try:
+        operations = get_citadel().lifecycle_operations_for_dataset(dataset, limit=limit)
+    except LifecycleNotFoundError:
+        return {"ok": True, "enabled": False, "dataset": dataset, "operations": []}
+    return jsonable_encoder(
+        {
+            "ok": True,
+            "enabled": True,
+            "dataset": dataset,
+            "operations": operations,
+        }
+    )
 
 
 @app.get("/api/conflicts")
@@ -6733,6 +6823,8 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
             search_hit=verification.get("search_hit"),
             graph_grew=result.get("graph_grew"),
             marker=verification.get("marker"),
+            projection_chain_ok=verification.get("projection_chain_ok"),
+            projection_receipt_count=len(verification.get("projection_receipts") or []),
         )
     get_access_store().record_event(
         action="cognify.run",
@@ -7074,6 +7166,35 @@ async def ingest(body: IngestBody, request: Request) -> Any:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     result = outcome.ingest
+    payload = jsonable_encoder(result)
+    # Lifecycle projection is durable and asynchronous. Return the operation
+    # state without holding the HTTP request open while Cognee calls providers.
+    # The source write remains intact when projection is pending or failed.
+    if body.cognify and result.accepted:
+        if result.projection_job_id:
+            payload["projection_state"] = result.projection_state
+            payload["cognified"] = result.projection_state == "searchable"
+        else:
+            try:
+                await citadel.cognify_dataset(dataset=outcome.dataset)
+                payload["cognified"] = True
+            except Exception as exc:  # pragma: no cover - legacy runtime Cognee state
+                logger.error("legacy cognify after ingest failed: %s", exc.__class__.__name__)
+                payload["cognified"] = False
+    audit_detail = {
+        "operation": "ingest",
+        "accepted": result.accepted,
+        "reason": result.reason,
+        "projection_job_id": result.projection_job_id,
+        "projection_state": payload.get("projection_state", result.projection_state),
+        "cognified": payload.get("cognified"),
+        "data_bytes": len(body.data.encode("utf-8")),
+        "tag_count": len(body.tags),
+        "write_targets": [target.dataset for target in write_targets],
+        "scope_override": scope_override_active(
+            actor, [target.dataset for target in write_targets]
+        ),
+    }
     # Durable HTTP ingest audit (MCP path already records via record_mcp_audit).
     # Only accepted writes count as capture proof for Seat home.
     if result.accepted and not mcp_tool_name(request):
@@ -7082,52 +7203,15 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             actor=actor,
             success=True,
             dataset=outcome.dataset,
-            detail={
-                "operation": "ingest",
-                "accepted": True,
-                "reason": result.reason,
-                "data_bytes": len(body.data.encode("utf-8")),
-                "tag_count": len(body.tags),
-                "write_targets": [target.dataset for target in write_targets],
-                "scope_override": scope_override_active(
-                    actor, [target.dataset for target in write_targets]
-                ),
-            },
+            detail={key: value for key, value in audit_detail.items() if value is not None},
         )
     record_mcp_audit(
         request,
         actor=actor,
         success=bool(result.accepted),
         dataset=outcome.dataset,
-        detail={
-            "operation": "ingest",
-            "accepted": result.accepted,
-            "reason": result.reason,
-            "data_bytes": len(body.data.encode("utf-8")),
-            "tag_count": len(body.tags),
-            "write_targets": [target.dataset for target in write_targets],
-            "scope_override": scope_override_active(
-                actor, [target.dataset for target in write_targets]
-            ),
-        },
+        detail={key: value for key, value in audit_detail.items() if value is not None},
     )
-    payload = jsonable_encoder(result)
-    # Inline cognify (opt-in) so the just-written data is immediately searchable.
-    # The write already succeeded; a cognify failure must NOT fail the ingest.
-    if body.cognify and result.accepted:
-        try:
-            if result.projection_job_id:
-                operation = await citadel.wait_for_lifecycle_operation(
-                    result.projection_job_id
-                )
-                payload["projection_state"] = operation["state"]
-                payload["cognified"] = operation["state"] == "searchable"
-            else:
-                await citadel.cognify_dataset(dataset=outcome.dataset)
-                payload["cognified"] = True
-        except Exception as exc:  # pragma: no cover - depends on runtime Cognee state
-            logger.error("inline cognify after ingest failed: %s", exc.__class__.__name__)
-            payload["cognified"] = False
     return payload
 
 
@@ -8464,6 +8548,20 @@ async def run_improve(
             dataset=body.dataset,
             session_ids=body.session_ids,
         )
+    except ImprovementScopeError as exc:
+        await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
+        if request:
+            record_mcp_audit(
+                request,
+                actor=actor,
+                success=False,
+                dataset=dataset,
+                detail={
+                    "operation": "improve",
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
         await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
         if request:
@@ -8476,10 +8574,11 @@ async def run_improve(
             )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    central = central_dataset(citadel.config)
     await mesh_state.record_upgrade(
         citadel.config,
-        dataset=dataset,
-        session_ids=body.session_ids,
+        dataset=central,
+        session_ids=None,
     )
     if request:
         record_mcp_audit(
@@ -8489,7 +8588,7 @@ async def run_improve(
             dataset=dataset,
             detail={
                 "operation": "improve",
-                "session_count": len(body.session_ids or []),
+                "session_count": 0,
             },
         )
     return jsonable_encoder({"result": result})

@@ -20,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 import threading
 from typing import Any
@@ -30,7 +31,21 @@ STATE_VERSION = 1
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_BACKOFF_SECONDS = 5.0
 DEFAULT_MAX_BACKOFF_SECONDS = 3600.0
+DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_LENGTH = 512
+TERMINAL_ERROR_PREFIX = "terminal:"
+_FREE_QUOTA_MARKERS = (
+    "free-model daily quota",
+    "free model daily quota",
+    "free-models-per-day-high-balance",
+    "free-models-per-hour",
+    "free-models-per-min",
+    "openrouter_free_tier_daily",
+)
+_FREE_QUOTA_RESET = re.compile(
+    r"x-ratelimit-reset[\"']?\s*[:=]\s*[\"']?(\d{10,13})",
+    re.IGNORECASE,
+)
 
 _EXECUTION_HANDLES_LOCK = threading.Lock()
 _EXECUTION_HANDLES: dict[int, Any] = {}
@@ -221,6 +236,27 @@ def _bounded_error(error: str) -> str:
     return normalized[:MAX_ERROR_LENGTH]
 
 
+def _is_free_quota_error(error: str) -> bool:
+    lowered = error.lower()
+    return any(marker in lowered for marker in _FREE_QUOTA_MARKERS)
+
+
+def _free_quota_reset_at(error: str) -> float | None:
+    match = _FREE_QUOTA_RESET.search(error)
+    if not match:
+        return None
+    raw = int(match.group(1))
+    return raw / (1000 if raw > 10_000_000_000 else 1)
+
+
+def _terminal_active(record: dict[str, Any], now: datetime) -> bool:
+    error = record["last_error"]
+    if not isinstance(error, str) or not error.startswith(TERMINAL_ERROR_PREFIX):
+        return False
+    reset_at = _free_quota_reset_at(error)
+    return reset_at is None or now.timestamp() < reset_at
+
+
 def _empty_state() -> dict[str, Any]:
     return {"version": STATE_VERSION, "jobs": {}}
 
@@ -235,6 +271,7 @@ class CognifyRetryQueue:
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
         backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
         max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clock: Clock | None = None,
     ) -> None:
         self.path = Path(path).expanduser().resolve(strict=False)
@@ -243,6 +280,9 @@ class CognifyRetryQueue:
         self.max_backoff_seconds = self._positive_duration(
             max_backoff_seconds, "max_backoff_seconds"
         )
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        self.max_attempts = max_attempts
         if self.max_backoff_seconds < self.backoff_seconds:
             raise ValueError("max_backoff_seconds must be >= backoff_seconds")
         self._clock = clock or _default_clock
@@ -342,11 +382,18 @@ class CognifyRetryQueue:
                 for record in unleased:
                     if record is not target:
                         jobs.pop(record["job_id"], None)
+                reset_attempt = any(
+                    isinstance(record["last_error"], str)
+                    and record["last_error"].startswith(TERMINAL_ERROR_PREFIX)
+                    for record in unleased
+                )
                 target.update(
                     {
                         "datasets": sorted(merged),
                         "available_at": current_text,
-                        "attempt": max(record["attempt"] for record in unleased),
+                        "attempt": 0
+                        if reset_attempt
+                        else max(record["attempt"] for record in unleased),
                         "last_error": None,
                         "updated_at": current_text,
                     }
@@ -402,6 +449,7 @@ class CognifyRetryQueue:
                 record
                 for record in state["jobs"].values()
                 if record["lease_id"] is None
+                and not _terminal_active(record, current)
                 and _parse_timestamp(record["available_at"], field_name="available_at") <= current
             ]
             due.sort(key=self._record_order)
@@ -502,7 +550,13 @@ class CognifyRetryQueue:
         with self._exclusive():
             state = self._load()
             record = self._leased_record(state, lease, current)
+            terminal = record["attempt"] >= self.max_attempts or _is_free_quota_error(failure)
+            if terminal:
+                failure = f"{TERMINAL_ERROR_PREFIX}{failure}"
             delay = self._backoff(record["attempt"])
+            reset_at = _free_quota_reset_at(failure)
+            if reset_at is not None:
+                delay = max(delay, reset_at - current.timestamp())
             record.update(
                 {
                     "available_at": _timestamp(current + timedelta(seconds=delay)),
@@ -533,6 +587,12 @@ class CognifyRetryQueue:
             state = self._load()
             delays: list[float] = []
             for record in state["jobs"].values():
+                if record["lease_id"] is None and _terminal_active(record, current):
+                    reset_at = _free_quota_reset_at(record["last_error"] or "")
+                    if reset_at is None:
+                        continue
+                    delays.append(max(0.0, reset_at - current.timestamp()))
+                    continue
                 field_name = "available_at" if record["lease_id"] is None else "leased_until"
                 timestamp = _parse_timestamp(record[field_name], field_name=field_name)
                 delays.append(max(0.0, (timestamp - current).total_seconds()))

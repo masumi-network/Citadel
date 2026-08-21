@@ -1,6 +1,114 @@
 # Citadel Progress
 
-Last updated: 2026-08-17.
+Last updated: 2026-08-21.
+
+## 2026-08-21 - Fresh-eyes correction and projection recovery
+
+**Status:** In progress. Liveness is healthy, but projection readiness is not
+proven.
+
+[CORRECTED] The earlier diagnosis treated OpenRouter quota exhaustion as the
+full blocker. The fresh-eyes review found that quota explains the seat canary
+vector and graph failures only. It does not explain the full current-generation
+backlog or the census mismatch.
+
+- [VERIFIED] Railway deployment `8189ac7e-b48f-4962-ad16-65234ef51d99`
+  contains the five-second lifecycle wakeup bound. The seat canary was later
+  claimed at `attempt=1`, and its relational receipt became `searchable`.
+- [VERIFIED] Seat canary job `64de2086-5861-5e20-89f1-86c8bce96231` has
+  pending vector and graph receipts with `error_code=provider_quota_exhausted`.
+- [VERIFIED] The provider returned HTTP `422` with
+  `OpenRouter free-model daily quota is exhausted` and reset time
+  `2026-08-22T00:00:00Z`.
+- [VERIFIED] A Railway lifecycle SQLite snapshot showed `617` graph receipts
+  pending, `619` vector receipts pending, and `427` relational receipts
+  pending. It showed `13` graph, `11` vector, and `202` relational receipts
+  searchable.
+- [VERIFIED] The oldest sampled pending jobs had
+  `available_at=2026-08-21T06:39:23.870713Z`, `attempt=0`, and no recorded
+  error. This proves an unclaimed backlog separate from the provider error.
+- [VERIFIED] Deployment `b34851a4-580a-4e20-b241-61190f324943` defaults
+  Cognee search to `GRAPH_COMPLETION` unless `CHUNKS` is selected explicitly.
+- [VERIFIED] `/healthz` returns HTTP `200`. `/readyz` remains `ok=false` due
+  to corpus timeout and `current_generation_searchable_census_mismatch`.
+- [VERIFIED] `auto_improve=false`. Automatic improvement stays disabled.
+- [NOT DETERMINED] Cited graph retrieval and full graph UI growth remain
+  unproved until vector and graph projection receipts become searchable.
+
+### Recovery plan
+
+1. [PLANNED] Wait for the provider reset. Do not create another ingest job.
+2. [PLANNED] Poll the existing seat and Central canaries.
+3. [PLANNED] Require searchable relational, vector, and graph receipts for
+   both canaries.
+4. [PLANNED] Run a cited graph search and verify Central plus the current seat,
+   connected nodes, and the scrollable document list.
+5. [PLANNED] If the census still differs, capture receipt-level pending work
+   and fix scheduling only from that evidence.
+
+### Branch and PR
+
+- [PLANNED] Candidate branch: `fix/cognee-projection-readiness`.
+- [PLANNED] Keep the PR focused on the projection readiness fix and its
+  evidence records.
+- [PENDING APPROVAL] Push and PR creation require `/code-review ultra` and
+  explicit approval in the current session.
+
+## 2026-08-21 - Free-router recovery and production readiness
+
+**Status:** In progress. The service is live. Seat vector and graph completion
+remain unproved because the approved canary failed before the OpenRouter free
+quota reset.
+
+- [VERIFIED] Railway deployment `1df5144a-78b6-4bd6-8232-02d3d3e77e6b` returned
+  `SUCCESS` at `2026-08-21 00:23:47 +02:00`.
+- [VERIFIED] The liveness probe returned HTTP `200` with
+  `{"ok":true,"service":"citadel"}` after deployment `173ba4f0-d4a7-4e2d-a142-04092a1f95db`.
+- [VERIFIED] Railway now uses `/healthz` as its deploy probe. `/health/ready`
+  can return `503` while bounded corpus or lifecycle checks time out on a live
+  queue.
+- [VERIFIED] Local and Railway model routes now use `openrouter/free` for direct
+  calls and `openrouter/openrouter/free` for Cognee's LiteLLM form. The embedding
+  route remains `nvidia/nemotron-3-embed-1b:free` through OpenRouter.
+- [VERIFIED] The approved canary operation is `failed` in generation
+  `citadel-railway-v053-dots-free-20260820`. Its relational receipt is
+  `searchable`; its Qdrant vector and Ladybug graph receipts are `failed` with
+  `provider_non_retryable`.
+- [VERIFIED] Production logs show the free-model quota at zero and the provider
+  reset at `2026-08-21 02:00:00 CEST`.
+- [INFERRED] Daily quota errors now schedule delayed lifecycle retries. Invalid
+  credentials, permissions, and missing models remain terminal errors.
+- [NOT DETERMINED] No post-reset seat canary has yet proved vector recall,
+  graph connection, or graph UI growth. The existing canary must not be reused
+  without explicit approval for a retry.
+
+### Next gate
+
+1. Approve one retry of the existing seat canary after the provider reset.
+2. Confirm all three receipts are `searchable`.
+3. Search the canary and verify the seat-scoped graph connection.
+
+## 2026-08-19 — Cognee contract: write accepted vs projection ready
+
+**Status:** confirmed. Writes are accepted into source storage before graph projection. Presence hubs can appear while content nodes are still empty.
+
+- `/ingest` and hook capture still route to `LearningProcess -> Citadel -> cognee`.
+- [VERIFIED] `/api/ingest` requires `cognify=true` for seat writes; explicit opt-out is rejected.
+- A write can be `accepted` while graph projection is still queued, then appears after `queued_not_confirmed` → `ok` completion.
+- `/api/mesh/graph` renders projected projection + dataset scope filtering (`visible_nodes`) and is not a raw ingest log.
+- [VERIFIED] The Next graph UI has a scrollable visible-node list beside the canvas.
+- [VERIFIED] The graph page polls `GET /api/mesh/projection-status`; full operation details remain available at `GET /api/operations/{projection_job_id}`.
+- [VERIFIED] `GET /api/documents?query=` remains a searchable-content check; the graph page now exposes the returned projection nodes in a scrollable list.
+- Graph projection visibility drops fast when dataset attribution fails (`node_dataset_map` read errors) because ADR-0009 is fail-closed; this matches design and explains “only presence hubs” behavior.
+
+### Open TODOs from this cycle
+
+1. [VERIFIED] Keep `projection_job_id` visible after ingest and show completion polling in the same view.
+2. Add a seat graph health line on `/api/access` showing `projection_lag_ms`, `visible_nodes`, and `projection_state` for the seat dataset.
+3. [VERIFIED] Add a seat-scoped document list in Graph with pagination/scroll so users can verify growth without leaving the page.
+4. Add a troubleshooting path for `visible_nodes=0` with `fallback=true`: check operation log + dataset map before assuming ingestion failure.
+5. Document in onboarding that commit snapshot is one node per commit, while branch/file context is metadata only unless explicit sources are ingested.
+6. Track and publish local indexers for the seat projection lag signal after a deploy, then connect it to graph UI state.
 
 ## 2026-08-17 — inside bench: CLI 0.4.0 vs 0.5.1
 
@@ -1504,3 +1612,15 @@ SaaS onboarding + autonomous sync, and started the knowledge-graph redesign.
   UI does not depend on a runtime CDN.
 - Verified backend tests with `uv run pytest` and checked the 3D canvas with
   Playwright on desktop and mobile viewports.
+
+## 2026-08-21 v056 free-route checkpoint
+
+- VERIFIED: Railway deployment `a26c2918-12b2-4e27-ade0-ef21ad98af4a` reached `SUCCESS`.
+- VERIFIED: `GET https://citadel.utxo.ag/healthz` returned `{"ok":true,"service":"citadel"}` with HTTP 200.
+- VERIFIED: The OpenRouter model catalog query returned `nvidia/nemotron-nano-9b-v2:free` as a zero-price model with `structured_outputs` support. This catalog check does not prove successful inference.
+- VERIFIED: The approved MCP canary entered dataset `seat:sarthi` with source revision `d3ce0376-0279-5038-bdfd-3746ace35dc8` and projection job `1c060869-2af4-5988-90a0-151ba70b3453` under generation `citadel-railway-v056-free-quota-guard-20260821`.
+- VERIFIED: The operation receipt reports `state=pending`; relational is `searchable` with `affected_count=1`; vector and graph are `pending` with `error_code=provider_quota_exhausted`.
+- VERIFIED: Current deployment logs emitted `LLMQuotaExceededError` with `This is not retryable` and the OpenRouter daily reset epoch. The quota guard now stops the Cognee retry path.
+- NOT DETERMINED: Vector recall and graph node or edge creation remain unproven until the provider quota resets.
+- NOT DETERMINED: The authenticated graph UI view remains unproven for this new canary.
+- VERIFIED: An MCP search for `production-cognee-v056-nemotron-20260821` scoped to `seat:sarthi` did not return within 20 seconds. This method cannot distinguish a vector-backend wait from a transport timeout.

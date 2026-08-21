@@ -228,7 +228,7 @@ class CitadelConfig:
     github_sync_max_commits_per_repo: int = 5
     github_sync_max_pull_requests_per_repo: int = 5
     github_sync_include_commits: bool = True
-    github_sync_run_improve: bool = True
+    github_sync_run_improve: bool = False
     github_sync_ingest_unchanged: bool = True
     github_sync_include_private: bool = True
     github_sync_repo_allowlist: tuple[str, ...] = field(default_factory=tuple)
@@ -258,6 +258,7 @@ class CitadelConfig:
     repo_content_sync_session: str = "masumi-repo-content"
     repo_content_sync_state_path: str = ".citadel/repo_content_sync_state.json"
     evolve_state_path: str = ".citadel/evolve_state.json"
+    evaluation_gate_path: str = ".citadel/evaluation_gate.json"
     repair_journal_path: str = ".citadel/repair_journal.jsonl"
     cognify_queue_path: str = ".citadel/cognify_queue.json"
     # Direct dataclass construction is used by isolated unit tests and embedded
@@ -381,7 +382,7 @@ class CitadelConfig:
                 os.getenv("CITADEL_GITHUB_SYNC_INCLUDE_COMMITS"),
                 default=True,
             ),
-            github_sync_run_improve=_bool(os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=True),
+            github_sync_run_improve=_bool(os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=False),
             github_sync_ingest_unchanged=_bool(
                 os.getenv("CITADEL_GITHUB_SYNC_INGEST_UNCHANGED"),
                 default=True,
@@ -470,6 +471,8 @@ class CitadelConfig:
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_STATE_PATH")
             ),
             evolve_state_path=_evolve_state_path(os.getenv("CITADEL_EVOLVE_STATE_PATH")),
+            evaluation_gate_path=os.getenv("CITADEL_EVALUATION_GATE_PATH")
+            or str(Path(_state_root()) / "evaluation_gate.json"),
             repair_journal_path=_repair_journal_path(
                 os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
             ),
@@ -503,7 +506,7 @@ class CitadelConfig:
             ),
             repo_content_sync_run_improve=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_RUN_IMPROVE"),
-                default=True,
+                default=False,
             ),
             repo_content_sync_autojoin_enabled=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_ENABLED"),

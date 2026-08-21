@@ -22,6 +22,12 @@ from kb.cognee_client import (
 from kb.capture_policy import merged_deny_globs, path_is_denied
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
+from kb.improvement_policy import (
+    central_improvement_dataset,
+    ImprovementEvaluationError,
+    require_automation_evaluation,
+    validate_central_improvement_scope,
+)
 from kb.logging_utils import safe_log_value
 from kb.lifecycle import (
     CaptureContext,
@@ -130,6 +136,11 @@ class Citadel:
                 projection_version=lifecycle_projection.projection_version,
                 config_digest=lifecycle_projection.config_digest,
             )
+            # Queue current source heads on every boot. The operation id is
+            # generation-scoped, so this is idempotent for normal restarts and
+            # automatically fills a new generation. The worker detects the
+            # prior generation and forces Cognee to rebuild its projections.
+            self.lifecycle_store.queue_generation_rebuild(lifecycle_projection)
         self.repair_journal = RepairJournal(self.config.repair_journal_path)
         self.filter = PreIngestFilter(
             min_chars=self.config.min_chars,
@@ -482,7 +493,8 @@ class Citadel:
         processed_count = 0
         while True:
             try:
-                processed = await self.lifecycle_worker.run_once()
+                async with self.cognee.maintenance():
+                    processed = await self.lifecycle_worker.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -499,7 +511,8 @@ class Citadel:
             if delay is None:
                 return processed_count
             if delay > 0:
-                await asyncio.sleep(delay)
+                # A long quota backoff must not hide newly accepted work.
+                await asyncio.sleep(min(delay, 5.0))
 
     def resume_lifecycle_queue(self) -> bool:
         """Resume durable projection jobs after process startup."""
@@ -621,6 +634,20 @@ class Citadel:
                 for receipt in operation.receipts
             ],
         }
+
+    def lifecycle_operations_for_dataset(
+        self, dataset: str, *, limit: int = 10
+    ) -> tuple[dict[str, Any], ...]:
+        """Return recent projection records for one already-authorized dataset."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        operations = self.lifecycle_store.latest_operations_for_dataset(
+            dataset, limit=limit
+        )
+        return tuple(
+            self.lifecycle_operation(operation.job.projection_job_id)
+            for operation in operations
+        )
 
     def _lifecycle_requeue_projection(self) -> ProjectionRequest:
         if self.lifecycle_store is None:
@@ -1059,12 +1086,17 @@ class Citadel:
 
         improved = False
         if recorded and self.config.auto_improve:
-            await self.cognee.improve(
-                dataset=dataset,
-                session_ids=[session_id],
-                build_global_context_index=self.config.build_global_context_index,
-            )
-            improved = True
+            try:
+                await self.improve(
+                    dataset=central_improvement_dataset(self.config),
+                    session_ids=None,
+                    automation=True,
+                )
+            except ImprovementEvaluationError as exc:
+                logger.warning("Automatic feedback improvement is gated: %s", exc)
+                reason = str(exc)
+            else:
+                improved = True
         return FeedbackResult(recorded=recorded, improved=improved, ok=recorded, reason=reason)
 
     async def improve(
@@ -1072,8 +1104,15 @@ class Citadel:
         *,
         dataset: str | None = None,
         session_ids: list[str] | None = None,
+        automation: bool = False,
     ) -> Any:
-        target_dataset = dataset or self.config.default_dataset
+        if automation:
+            require_automation_evaluation(self.config)
+        target_dataset = validate_central_improvement_scope(
+            self.config,
+            dataset=dataset,
+            session_ids=session_ids,
+        )
         # Short-circuit an empty graph: cognee.improve raises a raw
         # EntityNotFoundError ("Empty graph projected") with nothing to improve, so
         # return a clean no-op instead of a traceback (#41).
@@ -1087,7 +1126,7 @@ class Citadel:
             }
         return await self.cognee.improve(
             dataset=target_dataset,
-            session_ids=session_ids,
+            session_ids=None,
             build_global_context_index=self.config.build_global_context_index,
         )
 
@@ -1746,6 +1785,8 @@ class Citadel:
             search_hit = False
             attempts = 0
             failure_reason: str | None = None
+            projection_receipts: list[dict[str, Any]] = []
+            projection_chain_ok: bool | None = None
             if (
                 self.lifecycle_store is not None
                 and marker_ingest.projection_job_id is not None
@@ -1760,10 +1801,49 @@ class Citadel:
                 # itself), then run ONE confirming search so a green canary
                 # still proves end-to-end recall, not receipt bookkeeping.
                 try:
-                    await self.wait_for_lifecycle_operation(
+                    operation = await self.wait_for_lifecycle_operation(
                         marker_ingest.projection_job_id,
                         timeout_seconds=_canary_timeout_seconds(),
                     )
+                    projection_receipts = [
+                        {
+                            key: receipt.get(key)
+                            for key in (
+                                "projection_receipt_id",
+                                "source_revision_id",
+                                "backend",
+                                "provider",
+                                "state",
+                                "model",
+                                "dimensions",
+                                "searchable_at",
+                            )
+                            if receipt.get(key) is not None
+                        }
+                        for receipt in operation.get("receipts", [])
+                        if isinstance(receipt, dict)
+                    ]
+                    required_backends = {"relational", "vector", "graph"}
+                    expected_providers = {
+                        "relational": (os.getenv("DB_PROVIDER") or "sqlite").strip().lower(),
+                        "vector": (os.getenv("VECTOR_DB_PROVIDER") or "qdrant").strip().lower(),
+                        "graph": (
+                            os.getenv("GRAPH_DATABASE_PROVIDER") or "ladybug"
+                        ).strip().lower(),
+                    }
+                    provider_match = all(
+                        str(item.get("provider") or "").strip().lower()
+                        == expected_providers.get(str(item.get("backend")))
+                        for item in projection_receipts
+                    )
+                    projection_chain_ok = (
+                        {item.get("backend") for item in projection_receipts}
+                        == required_backends
+                        and all(item.get("state") == "searchable" for item in projection_receipts)
+                        and provider_match
+                    )
+                    if not projection_chain_ok:
+                        failure_reason = "projection_receipt_incomplete"
                 except TimeoutError:
                     failure_reason = "projection_timeout"
                 except RuntimeError:
@@ -1795,6 +1875,8 @@ class Citadel:
                 "marker": marker,
                 "search_hit": search_hit,
                 "search_attempts": attempts,
+                "projection_chain_ok": projection_chain_ok,
+                "projection_receipts": projection_receipts,
             }
             if marker_ingest.projection_job_id is not None:
                 verification["projection_job_id"] = marker_ingest.projection_job_id
@@ -1823,7 +1905,10 @@ class Citadel:
             # THIS marker became retrievable. Production showed the cost:
             # "grew=True canary_ok=True" every hour while two of five ingest
             # stages were dead on the Kuzu lock and contributing nothing.
-            verification["ok"] = bool(verification["search_hit"])
+            verification["ok"] = bool(
+                verification["search_hit"]
+                and verification.get("projection_chain_ok") is not False
+            )
 
         return {
             # Surface the verify canary verdict at the top level so the CLI exit

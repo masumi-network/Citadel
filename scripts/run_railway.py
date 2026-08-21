@@ -246,6 +246,7 @@ async def _promotion_stage_async() -> int:
     seat never aborts the others, and the stage only fails when EVERY seat raised.
     """
     from kb.access import AccessStore, is_seat_dataset
+    from kb.improvement_policy import automation_evaluation_passed
     from kb.learning import LearningProcess
     from kb.promotion import PromotionEngine
     from kb.service import Citadel
@@ -254,6 +255,9 @@ async def _promotion_stage_async() -> int:
     config = citadel.config
     if not config.promotion_enabled:
         logger.info("Promotion stage skipped: disabled via CITADEL_PROMOTION_ENABLED")
+        return 0
+    if not automation_evaluation_passed(config):
+        logger.info("Promotion stage skipped: Central evaluation gate has not passed")
         return 0
 
     access_store = AccessStore(config.access_store_path)
@@ -409,7 +413,7 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
         ),
         (
             "self_improve",
-            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=True),
+            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=False),
             _self_improve_stage,
         ),
         (
@@ -451,7 +455,7 @@ def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]
         ),
         (
             "self_improve",
-            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=True),
+            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=False),
             _self_improve_stage_async,
         ),
         (
