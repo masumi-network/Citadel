@@ -2,6 +2,30 @@
 
 Last updated: 2026-08-21.
 
+## 2026-08-21 - WIP PR checkpoint
+
+**Status:** WIP. The scoped implementation is pushed, but the autonomous
+knowledge graph goal is not complete.
+
+- [VERIFIED] Branch `fix/cognee-projection-readiness` was created.
+- [VERIFIED] Commit `722df50` contains 13 scoped files for Cognee projection,
+  lifecycle scheduling, graph retrieval, improvement policy, and progress
+  evidence.
+- [VERIFIED] The branch was pushed to `origin`.
+- [VERIFIED] Draft PR `#309` was opened for the autonomous knowledge graph goal.
+- [VERIFIED] No local tests ran during the commit and push step.
+- [NOT DETERMINED] Vector projection, graph projection, citations, connected
+  seat nodes, and graph UI growth remain unproved until the provider reset.
+
+### Next checkpoint
+
+1. [PLANNED] Poll the existing Central and seat canaries after
+   `2026-08-22T00:00:00Z`.
+2. [PLANNED] Verify searchable relational, vector, and graph receipts.
+3. [PLANNED] Run cited retrieval and verify the current seat graph scope.
+4. [PLANNED] Mark PR `#309` ready only if the positive and negative proof
+   directions pass.
+
 ## 2026-08-21 - Fresh-eyes correction and projection recovery
 
 **Status:** In progress. Liveness is healthy, but projection readiness is not
