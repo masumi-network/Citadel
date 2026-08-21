@@ -19,6 +19,7 @@ from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
 from kb.cognify_queue import CognifyLease, CognifyRetryQueue
+from kb.cognee_retry_guard import install_cognee_retry_guard
 from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
@@ -599,11 +600,17 @@ class CogneePublicClient:
             os.environ["LLM_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
 
     def _prepare_cognee_environment(self) -> None:
+        install_cognee_retry_guard()
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
         self._ensure_qdrant_adapter_registered()
         self._ensure_auto_feedback_default()
         self._ensure_chunk_budget()
+        from kb.model_routing import configure_cognee_model_routes
+
+        routes = configure_cognee_model_routes()
+        if routes:
+            logger.debug("Cognee LLM stage routes active: %s", routes)
 
     def _ensure_qdrant_adapter_registered(self) -> None:
         """Register Citadel's Qdrant adapter before Cognee creates an engine."""
@@ -657,13 +664,39 @@ class CogneePublicClient:
         os.environ.setdefault("AUTO_FEEDBACK", "false")
 
     def _configured_search_type(self, cognee: Any) -> Any | None:
-        raw_value = os.getenv("CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS").strip().upper()
+        raw_value = os.getenv(
+            "CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION"
+        ).strip().upper()
         if raw_value in {"", "AUTO", "RECALL"}:
             return None
         search_type = getattr(cognee, "SearchType", None)
         if search_type is None:
             return None
         return getattr(search_type, raw_value, getattr(search_type, "CHUNKS", None))
+
+    def _graph_search_options(self, query_type: Any) -> dict[str, Any]:
+        """Request cited graph context unless CHUNKS is explicitly selected."""
+        raw_value = os.getenv(
+            "CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION"
+        ).strip().upper()
+        type_name = str(getattr(query_type, "name", query_type)).upper()
+        if "GRAPH" not in raw_value and "GRAPH" not in type_name:
+            return {}
+
+        include_global = (os.getenv("CITADEL_COGNEE_INCLUDE_GLOBAL_CONTEXT") or "")\
+            .strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            global_top_k = int(os.getenv("CITADEL_COGNEE_GLOBAL_CONTEXT_TOP_K", "3"))
+        except ValueError:
+            global_top_k = 3
+        global_top_k = min(max(1, global_top_k), 10)
+        return {
+            "include_references": True,
+            "retriever_specific_config": {
+                "include_global_context_index": include_global,
+                "global_context_index_top_k": global_top_k,
+            },
+        }
 
     def _is_no_data_error(self, exc: Exception) -> bool:
         return exc.__class__.__name__ in {
@@ -1129,6 +1162,7 @@ class CogneePublicClient:
         }
         if query_type is not None:
             search_kwargs["query_type"] = query_type
+            search_kwargs.update(self._graph_search_options(query_type))
         try:
             results = await cognee.search(**search_kwargs)
         except Exception as exc:
@@ -1146,9 +1180,26 @@ class CogneePublicClient:
             flattened: list[Any] = []
             for result in results:
                 search_result = result["search_result"]
+                references = result.get("references")
                 if isinstance(search_result, list):
-                    flattened.extend(search_result)
+                    flattened.extend(
+                        {
+                            **item,
+                            "references": references,
+                        }
+                        if isinstance(item, dict)
+                        and references is not None
+                        and "references" not in item
+                        else item
+                        for item in search_result
+                    )
                 elif search_result is not None:
+                    if (
+                        isinstance(search_result, dict)
+                        and references is not None
+                        and "references" not in search_result
+                    ):
+                        search_result = {**search_result, "references": references}
                     flattened.append(search_result)
             return flattened
         return results
@@ -4604,13 +4655,50 @@ class CogneePublicClient:
         expected_ids = await self.dataset_document_ids(datasets) if force else []
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
-        async with self.writer_lock:
-            result = await cognee.cognify(
-                datasets=datasets,
+        async def run_cognify(
+            *, incremental_loading: bool, data_cache: bool
+        ) -> Any:
+            async with self.writer_lock:
+                cognify_result = await cognee.cognify(
+                    datasets=datasets,
+                    incremental_loading=incremental_loading,
+                    data_cache=data_cache,
+                )
+                self._invalidate_graph_data_cache()
+                return cognify_result
+
+        try:
+            result = await run_cognify(
                 incremental_loading=not force,
                 data_cache=not force,
             )
-            self._invalidate_graph_data_cache()
+        except Exception as exc:
+            from kb.embedding_profile import (
+                activate_local_embedding_fallback,
+                is_embedding_provider_failure,
+            )
+            from kb.model_routing import (
+                activate_cognee_free_router_fallback,
+                is_cognee_llm_provider_failure,
+            )
+
+            if is_embedding_provider_failure(exc):
+                if not activate_local_embedding_fallback(exc):
+                    raise
+                logger.warning(
+                    "Cognee embedding provider failed; retrying cognify with local FastEmbed"
+                )
+            elif is_cognee_llm_provider_failure(exc):
+                if not activate_cognee_free_router_fallback(exc):
+                    raise
+                logger.warning(
+                    "Cognee LLM provider failed; retrying cognify with openrouter/free"
+                )
+            else:
+                raise
+
+            self._prepare_cognee_environment()
+            result = await run_cognify(incremental_loading=False, data_cache=False)
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
         processed_ids = _cognify_data_ids(result)

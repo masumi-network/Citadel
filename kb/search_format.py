@@ -763,9 +763,35 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
                 "untrusted_context",
                 "citation_required",
                 "document_drilldown_available",
+                "citations_available",
             )
             if isinstance(retrieval.get(key), bool)
         }
+
+    references = envelope.get("references")
+    if isinstance(references, list):
+        public_references: list[dict[str, str]] = []
+        for reference in references[:10]:
+            if not isinstance(reference, dict):
+                continue
+            clean = {
+                key: value[:500]
+                for key in (
+                    "id",
+                    "title",
+                    "url",
+                    "source_url",
+                    "document_id",
+                    "source_locator",
+                    "snippet",
+                    "text",
+                )
+                if isinstance(value := reference.get(key), str) and value.strip()
+            }
+            if clean:
+                public_references.append(clean)
+        if public_references:
+            public["references"] = public_references
 
     relevance = envelope.get("relevance")
     if isinstance(relevance, dict):
