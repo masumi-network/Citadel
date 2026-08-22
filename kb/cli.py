@@ -533,7 +533,7 @@ async def _ingest(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
-    from kb.status import _COGNIFY_TIMEOUT, ingest_node
+    from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
 
     as_json = getattr(args, "json", False)
     if getattr(args, "no_cognify", False):

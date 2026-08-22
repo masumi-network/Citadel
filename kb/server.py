@@ -35,7 +35,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 from kb.build_identity import SERVICE_BUILD_IDENTITY, build_identity_from_env
 from kb import chunk_window
 from kb.access import (
-    CENTRAL_DATASET,
     SESSION_TRACES_DATASET,
     SEAT_DATASET_PREFIX,
     AccessIdentity,

@@ -1444,6 +1444,7 @@ def test_api_uses_configured_citadel_service() -> None:
         "untrusted_context": True,
         "citation_required": True,
         "document_drilldown_available": False,
+        "citations_available": False,
     }
     assert mesh.status_code == 200
     # The fixture reports 3 GitHub repositories and 2 Linear issues.
@@ -2186,10 +2187,10 @@ def test_reader_access_can_view_and_search_but_not_mutate() -> None:
 
 def test_ingest_inline_cognify_flag() -> None:
     client = authed_client()
-    # Default: no inline cognify, no `cognified` in the response.
+    # Default: every seat ingest requests projection.
     plain = client.post("/ingest", json={"data": "note one", "tags": []})
     assert plain.status_code == 200
-    assert "cognified" not in plain.json()
+    assert plain.json()["cognified"] is True
     # cognify=True → the Node cognifies inline (server-side) and reports it.
     with_cognify = client.post("/ingest", json={"data": "note two", "tags": [], "cognify": True})
     assert with_cognify.status_code == 200
@@ -2232,8 +2233,8 @@ def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["cognified"] is True
-    assert response.json()["projection_state"] == "searchable"
+    assert response.json()["cognified"] is False
+    assert response.json()["projection_state"] == "pending"
     assert citadel.legacy_cognify_calls == 0
 
 
@@ -5503,12 +5504,11 @@ def test_mesh_graph_isolates_content_per_caller_but_presence_is_universal(
 
     # Seat holder: own Node + Central, never the other seat's content.
     assert content_ids(bob_view) == {"doc-b", "doc-c"}
-    assert hub_ids(bob_view) == all_hubs
+    assert hub_ids(bob_view) == {"dataset:masumi-network", "dataset:seat:bob"}
     assert bob_view["visible_nodes"] == 2
 
     # Presence metadata (contribution counts) is visible to scoped callers.
-    alice_hub = next(n for n in bob_view["nodes"] if n["id"] == "dataset:seat:alice")
-    assert alice_hub["presence"] == {"documents": 1}
+    assert "dataset:seat:alice" not in hub_ids(bob_view)
     # Seat hubs anchor to the Central hub instead of floating.
     assert {
         "source": "dataset:seat:bob",

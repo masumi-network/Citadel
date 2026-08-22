@@ -84,6 +84,7 @@ override-dependencies = [
     # Ten CVEs disclosed against 0.59.0 after main last ran CI on 2026-07-24.
     # Pulled in transitively; the highest fix version among them is 0.64.0.
     "datamodel-code-generator>=0.64.0",
+    "pip>=26.2",
 ]
 
 [build-system]

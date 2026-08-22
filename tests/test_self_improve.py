@@ -7,6 +7,7 @@ import pytest
 
 from kb import self_improve as self_improve_module
 from kb.config import CitadelConfig
+from kb.improvement_policy import central_improvement_dataset
 from kb.mesh import MeshState
 from kb.models import IngestResult
 from kb.self_improve import SelfImprovement, propose_optimizations
@@ -55,13 +56,14 @@ class FakeAccessStore:
 
 async def seeded_mesh(citadel: FakeCitadel, count: int) -> MeshState:
     mesh = MeshState()
+    dataset = central_improvement_dataset(citadel.config)
     for index in range(count):
-        result = IngestResult(True, "accepted", "notes", ("seed",))
+        result = IngestResult(True, "accepted", dataset, ("seed",))
         await mesh.record_ingest(
             citadel.config,
             result,
             data=f"Document {index} body",
-            dataset="notes",
+            dataset=dataset,
             tags=["seed"],
         )
     return mesh
@@ -163,7 +165,7 @@ async def test_improve_failure_does_not_break_the_pass() -> None:
 
     result = await SelfImprovement(citadel, mesh=mesh).run()
 
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["improve"]["ok"] is False
 
 

@@ -366,7 +366,7 @@ def test_graph_view_is_a_real_next_dashboard_route() -> None:
     ).read_text(encoding="utf-8")
 
     assert "Knowledge graph" in body
-    assert "/api/mesh/graph?limit=200" in source
+    assert "/api/mesh/graph?limit=1000" in source
     assert "Caller-scoped graph projection" in body
     assert "visible_nodes" in source
     assert "Presence-only view. No content nodes are visible for this scope." in source

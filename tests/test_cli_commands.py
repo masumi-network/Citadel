@@ -708,9 +708,8 @@ def test_ingest_no_token_exits_one(monkeypatch, capsys) -> None:
 
 
 def test_ingest_default_is_async(monkeypatch, capsys) -> None:
-    # The old default (inline cognify) blocked one request until the proxy edge
-    # 502'd it while the Node accepted the write twice (edge retry). The parser
-    # default must therefore be async: cognify only on explicit opt-in.
+    # Seat ingest now requires projection, so the CLI sends cognify=True by
+    # default and waits on the Node's projection result.
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
 
@@ -724,26 +723,18 @@ def test_ingest_default_is_async(monkeypatch, capsys) -> None:
     )
     rc = asyncio.run(_ingest(args))
     assert rc == 0
-    assert seen["cognify"] is False
+    assert seen["cognify"] is True
 
 
-def test_ingest_no_cognify_flag_still_parses(monkeypatch, capsys) -> None:
-    # --no-cognify used to be the only way to skip inline cognify; it now names
-    # the default and must keep working for existing scripts.
+def test_ingest_no_cognify_flag_is_rejected(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
-    seen: dict = {}
-
-    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
-        seen["cognify"] = cognify
-        return {"accepted": True, "dataset": "seat:alice"}
-
-    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
     args = build_parser().parse_args(
         ["ingest", "a durable note", "--no-cognify", "--json", "--node-url", "https://node.example"]
     )
     rc = asyncio.run(_ingest(args))
-    assert rc == 0
-    assert seen["cognify"] is False
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["code"] == "COGNIFY_REQUIRED"
 
 
 def test_ingest_cognify_flag_opts_in(monkeypatch, capsys) -> None:
@@ -764,10 +755,7 @@ def test_ingest_cognify_flag_opts_in(monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["cognified"] is True
 
 
-def test_ingest_async_receipt_says_when_searchable(monkeypatch, capsys) -> None:
-    # The async default must not leave the user guessing: surface the Node's
-    # queued_not_confirmed receipt as "searchable within minutes" plus the
-    # projection-job handle to track it.
+def test_ingest_pending_receipt_says_graph_update_will_follow(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     monkeypatch.setattr(
         "kb.status.ingest_node",
@@ -781,8 +769,7 @@ def test_ingest_async_receipt_says_when_searchable(monkeypatch, capsys) -> None:
     rc = asyncio.run(_ingest(_ingest_args(json=False)))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "within minutes" in out
-    assert "citadel operation job-7" in out
+    assert "graph update will happen" in out
 
 
 # ---- citadel ingest <path> reads the file -------------------------------------
@@ -1845,4 +1832,3 @@ def test_mcp_install_help_contains_add_help(capsys) -> None:
     out = capsys.readouterr().out
     assert "add (install)" in out
     assert "Add Citadel MCP to a tool" in out
-

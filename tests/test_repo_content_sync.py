@@ -828,7 +828,7 @@ async def test_improve_runs_once_for_the_whole_sync_not_once_per_file(
     # ...and exactly one improve for the whole run.
     assert len(learning.improve_calls) == 1
     assert learning.improve_calls[0]["dataset"] == "masumi-network"
-    assert learning.improve_calls[0]["session_ids"] == ["masumi-repo-content"]
+    assert learning.improve_calls[0]["session_ids"] is None
     assert result["improved"] is True
 
 

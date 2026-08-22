@@ -9,6 +9,19 @@ from typing import Any
 from kb.config import CitadelConfig
 
 
+class _AsyncNullContext:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _FakeCognee:
+    def maintenance(self) -> _AsyncNullContext:
+        return _AsyncNullContext()
+
+
 # --- config parsing --------------------------------------------------------
 
 
@@ -79,6 +92,7 @@ class _FakeCitadel:
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
         self.resume_calls: list[bool] = []
+        self.cognee = _FakeCognee()
 
     def resume_lifecycle_queue(self) -> bool:
         # The scheduler kicks the projection drain after every pass, because
@@ -176,6 +190,7 @@ class _RaisingCitadel:
 
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
+        self.cognee = _FakeCognee()
 
     async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
         self._cognify_calls.append(force)

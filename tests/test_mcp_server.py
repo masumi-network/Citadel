@@ -649,11 +649,7 @@ def test_write_tools_reject_empty_or_oversized_payloads(monkeypatch: pytest.Monk
     assert feedback_post["payload"]["correct"] is True
 
 
-def test_ingest_tool_defaults_to_async() -> None:
-    # The inline-cognify default (#53) blocked one request until the proxy edge
-    # 502'd it while the Node accepted the write twice (edge retry). Default is
-    # async now (parity with the CLI): the note lands immediately and the
-    # lifecycle drain makes it searchable within minutes.
+def test_ingest_tool_defaults_to_projected_write() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
@@ -662,9 +658,8 @@ def test_ingest_tool_defaults_to_async() -> None:
     assert len(client.posts) == 1
     post = client.posts[0]
     assert post["path"] == "/ingest"
-    assert post["payload"]["cognify"] is False
-    # No extended budget when not blocking on cognify.
-    assert post["timeout"] is None
+    assert post["payload"]["cognify"] is True
+    assert post["timeout"] == mcp_server._INGEST_COGNIFY_TIMEOUT
 
 
 def test_ingest_tool_cognify_opt_in_extends_budget() -> None:

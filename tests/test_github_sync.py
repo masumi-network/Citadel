@@ -20,6 +20,28 @@ from kb.github_sync import (
 from kb.models import IngestResult
 
 
+def write_evaluation_gate(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scope": "central",
+                "run_id": "test-run",
+                "evaluated_at": "2026-08-22T00:00:00Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "checks": {
+                    "projection_chain": True,
+                    "seat_isolation": True,
+                    "cited_graph_retrieval": True,
+                    "rollback": True,
+                    "free_model_budget": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class FakeCitadel:
     def __init__(self, config: CitadelConfig) -> None:
         self.config = config
@@ -178,7 +200,9 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
         github_sync_session="masumi-github-daily",
         github_sync_state_path=str(tmp_path / "github_state.json"),
         github_sync_run_improve=True,
+        evaluation_gate_path=str(tmp_path / "evaluation_gate.json"),
     )
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FakeCitadel(config)
     syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
 
@@ -194,7 +218,7 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
     assert "masumi-network/agent" in citadel.ingest_calls[0]["data"]
     assert "teach the archive about commits" in citadel.ingest_calls[0]["data"]
     assert citadel.ingest_calls[0]["dataset"] == "masumi-network"
-    assert citadel.improve_calls[0]["session_ids"] == ["masumi-github-daily"]
+    assert citadel.improve_calls[0]["session_ids"] is None
     state = json.loads(Path(config.github_sync_state_path).read_text(encoding="utf-8"))
     assert "teach the archive about commits" in state["last_digest"]
     assert status["tracked_repositories"] == 1
@@ -209,7 +233,9 @@ async def test_github_sync_persists_digest_when_improve_fails(tmp_path: Any) -> 
         github_sync_session="masumi-github-daily",
         github_sync_state_path=str(tmp_path / "github_state.json"),
         github_sync_run_improve=True,
+        evaluation_gate_path=str(tmp_path / "evaluation_gate.json"),
     )
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FailingImproveCitadel(config)
     syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
 
@@ -221,7 +247,7 @@ async def test_github_sync_persists_digest_when_improve_fails(tmp_path: Any) -> 
     assert result["improve_error"] == "llm unavailable"
     assert status["tracked_repositories"] == 1
     assert status["seen_events"] == 1
-    assert citadel.improve_calls[0]["session_ids"] == ["masumi-github-daily"]
+    assert citadel.improve_calls[0]["session_ids"] is None
 
 
 @pytest.mark.asyncio

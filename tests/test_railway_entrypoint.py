@@ -397,6 +397,7 @@ def test_cognify_stage_routes_to_api_when_target_url_set(monkeypatch: Any) -> No
 
 def test_cognify_stage_runs_in_process_without_target_url(monkeypatch: Any) -> None:
     monkeypatch.delenv("CITADEL_COGNIFY_TARGET_URL", raising=False)
+    monkeypatch.delenv("CITADEL_EVOLVE_SCHEDULER_ENABLED", raising=False)
 
     mode_calls: list[bool] = []
 

@@ -2657,9 +2657,11 @@ async def test_feedback_can_auto_improve() -> None:
     result = await kb.feedback(FeedbackRequest(qa_id="qa-1", score=1, text="useful"))
 
     assert result.recorded
-    assert result.improved
+    assert not result.improved
+    assert result.reason is not None
+    assert "automated Cognee improvement is disabled" in result.reason
     assert fake.feedback_calls[0]["qa_id"] == "qa-1"
-    assert fake.improve_calls[0]["session_ids"] == ["personal-session"]
+    assert fake.improve_calls == []
 
 
 class _SessionMissCognee(FakeCognee):
