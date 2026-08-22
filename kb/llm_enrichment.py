@@ -26,6 +26,7 @@ from urllib.request import Request
 
 from kb.secure_http import open_secure
 
+from kb.model_routing import route_for
 from kb.retry import run_with_retries
 from kb.security_scan import SecurityScanEntry, redact_secrets, scan_text_entries
 
@@ -77,7 +78,7 @@ def openrouter_endpoint() -> str:
 
 
 def default_llm_model() -> str:
-    return os.getenv("CITADEL_LLM_MODEL") or DEFAULT_LLM_MODEL
+    return route_for("routine").model
 
 
 def enrichment_enabled() -> bool:
@@ -105,6 +106,7 @@ def openrouter_chat(
     max_tokens: int = 1600,
     temperature: float = 0.2,
     timeout: int = 60,
+    plugins: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
 ) -> str | None:
     """One OpenRouter chat completion; returns content text or None on failure.
 
@@ -121,6 +123,8 @@ def openrouter_chat(
         "max_tokens": max_tokens,
         "messages": messages,
     }
+    if plugins:
+        payload["plugins"] = list(plugins)
     request = Request(
         f"{openrouter_endpoint()}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -148,6 +152,14 @@ def openrouter_chat(
         )
         return None
 
+    selected_model = body.get("model")
+    if isinstance(selected_model, str) and selected_model:
+        logger.info(
+            "%s LLM route selected: requested=%s selected=%s",
+            operation,
+            model,
+            selected_model,
+        )
     choices = body.get("choices") or []
     if not choices:
         return None
@@ -328,7 +340,8 @@ def enrich_source_material(data: str) -> EnrichmentOutcome:
     if not openrouter_api_key():
         return _fallback(data, "no_api_key")
 
-    model = default_llm_model()
+    route = route_for("enrichment")
+    model = route.model
     logger.info(
         "LLM enrichment starting: model=%s, chars=%d, preview=%s",
         model,
@@ -342,6 +355,7 @@ def enrich_source_material(data: str) -> EnrichmentOutcome:
         ],
         model=model,
         operation="llm_enrichment.chunk",
+        plugins=route.plugins,
     )
     if content is None:
         return _fallback(data, "llm_failed")

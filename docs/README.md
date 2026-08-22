@@ -29,6 +29,7 @@ Its output is four decision records (ADR-0020 to ADR-0023) and these documents:
 | [`superpowers/specs/2026-08-03-citadel-substrate-design.md`](superpowers/specs/2026-08-03-citadel-substrate-design.md) | The decisions, the evidence behind each, and an explicit list of what was not decided. |
 | [`superpowers/specs/2026-08-04-citadel-execution-plan.md`](superpowers/specs/2026-08-04-citadel-execution-plan.md) | Every open issue ordered into stages, with an exit criterion per stage. |
 | [`superpowers/specs/2026-08-04-graph-store-migration-runbook.md`](superpowers/specs/2026-08-04-graph-store-migration-runbook.md) | Nine gates that execute ADR-0020. |
+| [`superpowers/specs/2026-08-19-agent-decision-trace-schema.md`](superpowers/specs/2026-08-19-agent-decision-trace-schema.md) | Agent decision and promotion trace contract for duplicate-safe autonomy and repair handoff. |
 | [`superpowers/specs/2026-08-04-control-plane-design.md`](superpowers/specs/2026-08-04-control-plane-design.md) | Per-organisation instances, lifecycle, fleet upgrades, and the cost model. |
 | [`eu-partner-proposal.md`](eu-partner-proposal.md) | Partner-facing. A business document rather than an engineering one. |
 

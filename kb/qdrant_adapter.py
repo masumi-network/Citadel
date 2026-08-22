@@ -13,6 +13,8 @@ from typing import Any, Callable, Iterator, Literal, Sequence
 from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from kb.embedding_profile import active_embedding_profile
+
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.dataset_database_handler import (
     DatasetDatabaseHandlerInterface,
@@ -123,6 +125,11 @@ def physical_collection_name(
     logical = _required_text(logical_collection, "logical collection")
     generation_hash = _hash(generation)
     logical_suffix = f"{_logical_slug(logical)}_{_hash(logical, 10)}"
+    profile_suffix = active_embedding_profile().collection_suffix
+    if profile_suffix:
+        logical_suffix = (
+            f"{logical_suffix}_{_logical_slug(profile_suffix)}_{_hash(profile_suffix, 8)}"
+        )
     if dataset is not None:
         _required_text(dataset, "dataset scope")
     return f"citadel_g_{generation_hash}_{logical_suffix}"
