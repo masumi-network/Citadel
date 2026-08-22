@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kb.config import CitadelConfig
+from kb.improvement_policy import ImprovementEvaluationError, ImprovementScopeError
 from kb.lifecycle import (
     LifecycleConflictError,
     LifecycleRequeueIdentityMismatchError,
@@ -90,6 +92,28 @@ class FakeCognee:
 class EmptyCognee(FakeCognee):
     async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return []
+
+
+def write_evaluation_gate(path: Path, *, expires_at: str = "2999-01-01T00:00:00Z") -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scope": "central",
+                "run_id": "test-run",
+                "evaluated_at": "2026-08-22T00:00:00Z",
+                "expires_at": expires_at,
+                "checks": {
+                    "projection_chain": True,
+                    "seat_isolation": True,
+                    "cited_graph_retrieval": True,
+                    "rollback": True,
+                    "free_model_budget": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_default_cognee_client_receives_configured_retry_queue_path(
@@ -3153,6 +3177,59 @@ async def test_improve_short_circuits_on_empty_graph() -> None:
 
     assert result["ok"] is True
     assert result["skipped"] == "empty_graph"
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_requires_current_central_evaluation(tmp_path: Path) -> None:
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(evaluation_gate_path=str(tmp_path / "evaluation_gate.json")),
+        cognee=fake,
+    )
+
+    with pytest.raises(ImprovementEvaluationError):
+        await kb.improve(automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_expired_evaluation(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path, expires_at="2020-01-01T00:00:00Z")
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementEvaluationError):
+        await kb.improve(automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_non_central_dataset(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path)
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementScopeError):
+        await kb.improve(dataset="seat:alice", automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_session_scope(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path)
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementScopeError):
+        await kb.improve(session_ids=["seat-session"], automation=True)
+
     assert fake.improve_calls == []
 
 
