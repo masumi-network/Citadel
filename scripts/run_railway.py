@@ -413,7 +413,7 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
         ),
         (
             "self_improve",
-            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=False),
+            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=True),
             _self_improve_stage,
         ),
         (
@@ -455,7 +455,7 @@ def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]
         ),
         (
             "self_improve",
-            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=False),
+            _bool(os.getenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED"), default=True),
             _self_improve_stage_async,
         ),
         (

@@ -8,7 +8,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from kb.config import CitadelConfig
-from kb.llm_enrichment import default_llm_model, openrouter_api_key, openrouter_endpoint
+from kb.llm_enrichment import DEFAULT_LLM_MODEL, openrouter_api_key, openrouter_endpoint
+from kb.model_routing import plugins_for_model
 from kb.retry import run_with_retries
 from kb.secure_http import open_secure
 from kb.security_scan import redact_secrets
@@ -163,7 +164,8 @@ def resolve_openrouter_model() -> tuple[str, str]:
     """Resolve the digest model id as ``(configured, sent)``.
 
     ``configured`` is the raw value of CITADEL_ORG_DIGEST_LLM_MODEL,
-    LLM_MODEL, or the enrichment default, in that order. ``sent`` is the id
+    LLM_MODEL, CITADEL_LLM_MODEL, or the enrichment default, in that order.
+    ``sent`` is the id
     actually sent to OpenRouter: cognee needs LLM_MODEL in litellm form
     ("openrouter/<vendor>/<model>"), which OpenRouter's own API rejects, so
     that prefix is stripped here instead of asking operators to keep two
@@ -173,7 +175,8 @@ def resolve_openrouter_model() -> tuple[str, str]:
     configured = (
         os.getenv("CITADEL_ORG_DIGEST_LLM_MODEL")
         or os.getenv("LLM_MODEL")
-        or default_llm_model()
+        or os.getenv("CITADEL_LLM_MODEL")
+        or DEFAULT_LLM_MODEL
     ).strip()
     sent = configured
     if sent.lower().startswith(LITELLM_OPENROUTER_PREFIX):
@@ -211,6 +214,7 @@ def _openrouter_chat_diagnosable(
     configured_model: str,
     max_tokens: int,
     timeout: int,
+    plugins: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
 ) -> str | None:
     """One OpenRouter chat completion whose failures are diagnosable.
 
@@ -228,6 +232,8 @@ def _openrouter_chat_diagnosable(
         "max_tokens": max_tokens,
         "messages": messages,
     }
+    if plugins:
+        payload["plugins"] = list(plugins)
     request = Request(
         f"{openrouter_endpoint()}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -268,6 +274,14 @@ def _openrouter_chat_diagnosable(
 
     if not isinstance(body, dict):
         return None
+    selected_model = body.get("model")
+    if isinstance(selected_model, str) and selected_model:
+        logger.info(
+            "%s LLM route selected: requested=%s selected=%s",
+            _OPERATION,
+            model,
+            selected_model,
+        )
     choices = body.get("choices") or []
     if not choices:
         return None
@@ -308,6 +322,7 @@ def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
         configured_model=configured,
         max_tokens=420,
         timeout=30,
+        plugins=plugins_for_model("digest", model),
     )
     if message is None:
         logger.warning(

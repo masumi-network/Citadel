@@ -225,6 +225,30 @@ def test_physical_collection_is_shared_by_datasets_within_generation() -> None:
     assert alice != physical_collection_name(GENERATION, ALICE, "Entity_name")
 
 
+def test_fastembed_env_keeps_legacy_collection_name(monkeypatch) -> None:
+    for name in (
+        "CITADEL_EMBEDDING_PROFILE",
+        "CITADEL_EMBEDDING_PROFILE_STATE_PATH",
+        "CITADEL_STATE_DIRECTORY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "384")
+
+    name = physical_collection_name(GENERATION, ALICE, LOGICAL_COLLECTION)
+
+    assert "fastembed" not in name
+
+
+def test_primary_embedding_profile_uses_separate_collection_name(monkeypatch) -> None:
+    monkeypatch.setenv("CITADEL_EMBEDDING_PROFILE", "nemotron")
+
+    name = physical_collection_name(GENERATION, ALICE, LOGICAL_COLLECTION)
+
+    assert "nemotron" in name
+
+
 @pytest.mark.asyncio
 async def test_new_collection_uses_tenant_hnsw_and_scope_indexes() -> None:
     client = _FakeClient()

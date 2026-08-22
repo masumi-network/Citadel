@@ -27,6 +27,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PORT=8000 \
     HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
+    CITADEL_LIFECYCLE_ENABLED=true \
+    CITADEL_EVOLVE_SCHEDULER_ENABLED=true \
     CITADEL_BUILD_ID_PATH=/opt/citadel/build-id \
     HF_HOME=/opt/hf-cache \
     FASTEMBED_CACHE_PATH=/opt/fastembed-cache
@@ -96,7 +98,7 @@ EXPOSE 8000
 # a bare VOLUME would create is unwanted. Persistence at /data is provided by
 # the platform mount, not the image.
 HEALTHCHECK --interval=15s --timeout=15s --start-period=120s --retries=5 \
-  CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; request = Request('http://127.0.0.1:8000/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
+  CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; port = os.environ.get('PORT', '8000'); request = Request(f'http://127.0.0.1:{port}/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "kb.lite_runtime"]
 

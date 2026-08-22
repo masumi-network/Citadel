@@ -32,7 +32,11 @@ A **security scan** runs first and blocks content matching secret patterns. This
 
 **Enrichment** sends document text to an external model provider to summarise and structure it. The code default is off (`CITADEL_LLM_ENRICHMENT_ENABLED`), but the sample environment file ships it enabled, so a deployment that copies `.env.example` gets it on. Check the value before assuming either way.
 
-**Structuring and indexing** chunks the document, embeds it, and writes the graph relationships that the knowledge mesh renders.
+**Structuring and indexing** chunks the document, writes source rows, embeds chunks, and projects graph relationships.
+
+- `accepted: true` means the source material was written and tracked.
+- Graph visibility in `/api/mesh/graph` is projection-driven (`cognify`) and may lag ingest.
+- Qdrant fast recall depends on projected chunks; a write can be accepted while vectors and edges are still queued.
 
 ## Promotion
 

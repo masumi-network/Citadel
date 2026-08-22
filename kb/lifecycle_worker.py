@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 import inspect
 import logging
+import re
 from typing import Any, Protocol
 
 from kb.lifecycle import (
@@ -20,6 +21,105 @@ from kb.lifecycle import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_PROVIDER_ERROR_MARKERS = (
+    "openrouter",
+    "litellm",
+    "free-models-per-day-high-balance",
+    "openrouter_free_tier_daily",
+    "authenticationerror",
+    "permissionerror",
+    "model unavailable",
+    "model_not_found",
+)
+_PROVIDER_TERMINAL_STATUS = re.compile(
+    r"(?:[\"']?status(?:_code)?[\"']?|[\"']?http(?:_status)?[\"']?|[\"']?code[\"']?)"
+    r"\s*[:=]\s*[\"']?(401|403|404)\b"
+)
+_PROVIDER_QUOTA_MARKERS = (
+    "free-models-per-day-high-balance",
+    "free-models-per-hour",
+    "free-models-per-min",
+    "openrouter_free_tier_daily",
+    "openrouter free-model daily quota",
+)
+_PROVIDER_RESET_MARKER = re.compile(
+    r"x-ratelimit-reset[\"']?\s*[:=]\s*[\"']?(\d{10,13})",
+    re.IGNORECASE,
+)
+
+
+def _is_provider_error(exc: BaseException) -> bool:
+    """Return true when an exception came from the configured model provider."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).lower()
+        if any(marker in text for marker in _PROVIDER_ERROR_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_non_retryable_provider_error(exc: BaseException) -> bool:
+    """Return true for provider authentication, permission, or model failures."""
+    if not _is_provider_error(exc):
+        return False
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).lower()
+        if _PROVIDER_TERMINAL_STATUS.search(text):
+            return True
+        if "model unavailable" in text or "model_not_found" in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_provider_quota_exhausted(exc: BaseException) -> bool:
+    """Return true for a provider quota that should retry after its reset."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).lower()
+        if any(marker in text for marker in _PROVIDER_QUOTA_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _provider_quota_backoff_seconds(
+    exc: BaseException,
+    *,
+    now: datetime,
+) -> float:
+    """Wait until the provider reset, with bounded fallback when absent."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        match = _PROVIDER_RESET_MARKER.search(str(current))
+        if match:
+            raw_reset = int(match.group(1))
+            reset_at = datetime.fromtimestamp(
+                raw_reset / (1000 if raw_reset > 10_000_000_000 else 1),
+                tz=UTC,
+            )
+            return max(60.0, min(24 * 60 * 60, (reset_at - now).total_seconds()))
+        current = current.__cause__ or current.__context__
+    return 60 * 60
+
+
+def _safe_error_message(exc: BaseException) -> str:
+    """Keep provider response bodies, keys, and URLs out of lifecycle records."""
+    if _is_provider_error(exc):
+        return f"{exc.__class__.__name__}: model provider request failed"
+    return str(exc)
 
 
 def _is_missing_local_path_error(exc: BaseException) -> bool:
@@ -196,18 +296,48 @@ class LifecycleProjectionWorker:
                 self._tombstone_missing_path(lease, exc, now=operation_time)
                 return True
             try:
+                if _is_provider_quota_exhausted(exc):
+                    backoff_seconds = _provider_quota_backoff_seconds(
+                        exc,
+                        now=operation_time,
+                    )
+                    self.store.reschedule_job(
+                        lease,
+                        error_code="provider_quota_exhausted",
+                        error_message=_safe_error_message(exc),
+                        now=operation_time,
+                        backoff_seconds=backoff_seconds,
+                    )
+                    logger.warning(
+                        "projection job delayed for provider quota reset: "
+                        "backoff_seconds=%.0f",
+                        backoff_seconds,
+                    )
+                    return True
+                if _is_non_retryable_provider_error(exc):
+                    self.store.fail_job(
+                        lease,
+                        error_code="provider_non_retryable",
+                        error_message=_safe_error_message(exc),
+                        now=operation_time,
+                    )
+                    logger.error(
+                        "projection job failed permanently: provider error type=%s",
+                        exc.__class__.__name__,
+                    )
+                    return True
                 if isinstance(exc, Exception) and lease.attempt >= self.max_attempts:
                     self.store.fail_job(
                         lease,
                         error_code=exc.__class__.__name__,
-                        error_message=str(exc),
+                        error_message=_safe_error_message(exc),
                         now=operation_time,
                     )
                 else:
                     self.store.reschedule_job(
                         lease,
                         error_code=exc.__class__.__name__,
-                        error_message=str(exc),
+                        error_message=_safe_error_message(exc),
                         now=operation_time,
                         backoff_seconds=self.retry_backoff_seconds,
                     )

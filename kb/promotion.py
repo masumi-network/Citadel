@@ -29,11 +29,11 @@ from kb.access import AccessIdentity, AccessStore, is_seat_dataset, now_iso
 from kb.config import CitadelConfig
 from kb.learning import LearningProcess
 from kb.llm_enrichment import (
-    default_llm_model,
     openrouter_chat,
     parse_json_payload,
     redacted_preview,
 )
+from kb.model_routing import route_for
 from kb.promotion_queue import (
     APPROVED_STATUS,
     PENDING_STATUS,
@@ -344,14 +344,16 @@ class PromotionEngine:
         stalls every other request for the duration of the call.
         """
         try:
+            route = route_for("promotion")
             content = openrouter_chat(
                 [
                     {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
                     {"role": "user", "content": text[:CLASSIFIER_MAX_INPUT_CHARS]},
                 ],
-                model=default_llm_model(),
+                model=route.model,
                 operation="promotion.classify",
                 max_tokens=300,
+                plugins=route.plugins,
             )
         except Exception as exc:  # pragma: no cover - openrouter_chat is itself guarded.
             logger.warning(

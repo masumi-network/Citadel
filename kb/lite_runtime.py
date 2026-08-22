@@ -47,15 +47,29 @@ def _build_id() -> str:
 
 
 # Must match the model the Dockerfile bakes into /opt/fastembed-cache and
-# /opt/hf-cache; under HF_HUB_OFFLINE=1 nothing else can load.
+# /opt/hf-cache when the FastEmbed provider runs under HF_HUB_OFFLINE=1.
 BAKED_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 def configure_lite_environment(data_root: Path | None = None) -> Path:
     root = (data_root or Path(os.getenv("CITADEL_LITE_DATA_ROOT", "/data"))).resolve()
-    # fastembed treats any of {1, true, yes, on} as offline; matching only "1"
-    # let HF_HUB_OFFLINE=true bypass this guard while still blocking downloads.
-    if (os.getenv("HF_HUB_OFFLINE") or "").strip().lower() in {"1", "true", "yes", "on"}:
+    # fastembed treats any of {1, true, yes, on} as offline. Remote providers
+    # do not use the image's baked FastEmbed model.
+    embedding_provider = os.getenv("EMBEDDING_PROVIDER", "fastembed").strip().lower()
+    embedding_endpoint = os.getenv("EMBEDDING_ENDPOINT", "").strip()
+    nemotron_enabled = (os.getenv("CITADEL_NEMOTRON_EMBEDDINGS_ENABLED") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if (
+        embedding_provider == "fastembed"
+        and not embedding_endpoint
+        and not nemotron_enabled
+        and (os.getenv("HF_HUB_OFFLINE") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
         model = os.getenv("EMBEDDING_MODEL", BAKED_EMBEDDING_MODEL)
         if model != BAKED_EMBEDDING_MODEL:
             # Without this, the drift surfaces later as fastembed's buried
@@ -99,7 +113,6 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
 
     expected = {
         "DB_PROVIDER": "sqlite",
-        "GRAPH_DATABASE_PROVIDER": "ladybug",
         "VECTOR_DB_PROVIDER": "qdrant",
         "VECTOR_DATASET_DATABASE_HANDLER": "qdrant",
         "ENABLE_BACKEND_ACCESS_CONTROL": "true",
@@ -111,6 +124,12 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
             raise LiteConfigurationError(
                 f"Lite profile requires {name}={wanted}; got {os.environ[name]!r}"
             )
+    graph_provider = os.environ["GRAPH_DATABASE_PROVIDER"].strip().lower()
+    if graph_provider not in ("ladybug", "postgres"):
+        raise LiteConfigurationError(
+            f"Lite profile requires GRAPH_DATABASE_PROVIDER in (ladybug, postgres); "
+            f"got {os.environ['GRAPH_DATABASE_PROVIDER']!r}"
+        )
     for name in (
         "CITADEL_GENERATION_ID",
         "VECTOR_DB_URL",

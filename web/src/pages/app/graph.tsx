@@ -1,4 +1,5 @@
 import dynamic from "next/dynamic";
+import { useEffect } from "react";
 
 import {
   AppShell,
@@ -10,7 +11,7 @@ import {
   PANEL_TITLE,
   VIEW_H1,
 } from "@/components/app/app-shell";
-import { useEndpoint, useSession } from "@/lib/dashboard";
+import { relativeTime, useEndpoint, useSession } from "@/lib/dashboard";
 import type { GraphPayload } from "@/components/app/knowledge-graph";
 
 const KnowledgeGraph = dynamic(() => import("@/components/app/knowledge-graph"), { ssr: false });
@@ -19,9 +20,27 @@ type ScopedGraphPayload = GraphPayload & {
   visible_nodes?: number;
 };
 
+type ProjectionOperation = {
+  projection_job_id?: string;
+  state?: string;
+  job?: { updated_at?: string | null; last_error_code?: string | null };
+  receipts?: Array<{ backend?: string; state?: string }>;
+};
+
+type ProjectionStatus = {
+  enabled?: boolean;
+  dataset?: string | null;
+  operations?: ProjectionOperation[];
+};
+
 export default function Graph() {
   const session = useSession();
-  const graph = useEndpoint<ScopedGraphPayload>("/api/mesh/graph?limit=200");
+  const graph = useEndpoint<ScopedGraphPayload>("/api/mesh/graph?limit=1000");
+  const projection = useEndpoint<ProjectionStatus>("/api/mesh/projection-status");
+  useEffect(() => {
+    const timer = window.setInterval(projection.reload, 5000);
+    return () => window.clearInterval(timer);
+  }, [projection.reload]);
   const renderedNodeCount = graph.data?.nodes?.length ?? 0;
   const hasScopedCount = typeof graph.data?.visible_nodes === "number";
   const visibleNodeCount = hasScopedCount
@@ -63,7 +82,7 @@ export default function Graph() {
         <div className={PANEL_HEAD}>
           <h2 className={PANEL_TITLE}>Mesh projection</h2>
           <span className={PANEL_NOTE}>
-            {graph.data?.truncated ? `Showing up to ${graph.data.limit ?? 200} nodes` : "Current view"}
+            {graph.data?.truncated ? `Showing up to ${graph.data.limit ?? 1000} nodes` : "Current view"}
           </span>
         </div>
         {graph.error ? <LoadError what="the knowledge graph" message={graph.error} /> : null}
@@ -101,6 +120,43 @@ export default function Graph() {
               </div>
             ) : null}
           </dl>
+        ) : null}
+      </section>
+
+      <section className={`${PANEL} mb-3`}>
+        <div className={PANEL_HEAD}>
+          <h2 className={PANEL_TITLE}>Cognee projection</h2>
+          <span className={PANEL_NOTE}>{projection.data?.dataset ?? "Current seat"}</span>
+        </div>
+        {projection.error ? <LoadError what="projection status" message={projection.error} /> : null}
+        {!projection.error && projection.data?.enabled === false ? (
+          <Empty>Projection status is unavailable for this session.</Empty>
+        ) : null}
+        {!projection.error && projection.data?.enabled !== false && !projection.data?.operations?.length ? (
+          <Empty>No seat projection writes recorded yet.</Empty>
+        ) : null}
+        {projection.data?.operations?.length ? (
+          <ul className="space-y-2">
+            {projection.data.operations.map((operation) => (
+              <li key={operation.projection_job_id} className="border border-border-2 bg-surface-2 px-3 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-mono text-[11px] text-ink-2">
+                    {operation.projection_job_id}
+                  </span>
+                  <span className="text-[12px] font-medium text-ink">{operation.state ?? "unknown"}</span>
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-3">
+                  {operation.job?.updated_at ? <span>{relativeTime(operation.job.updated_at)}</span> : null}
+                  {operation.job?.last_error_code ? <span>{operation.job.last_error_code}</span> : null}
+                  {operation.receipts?.map((receipt) => (
+                    <span key={`${operation.projection_job_id}-${receipt.backend}`}>
+                      {receipt.backend ?? "backend"}: {receipt.state ?? "unknown"}
+                    </span>
+                  ))}
+                </div>
+              </li>
+            ))}
+          </ul>
         ) : null}
       </section>
 

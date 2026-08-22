@@ -101,6 +101,9 @@ def test_new_deploy_writes_private_config_and_reuses_it(
     assert stat_mode(target) == 0o700
     assert stat_mode(target / ".env") == 0o600
     assert stat_mode(target / "docker-compose.yml") == 0o600
+    generated_env = (target / ".env").read_text(encoding="utf-8")
+    assert 'CITADEL_LIFECYCLE_ENABLED="true"' in generated_env
+    assert 'CITADEL_EVOLVE_SCHEDULER_ENABLED="true"' in generated_env
     assert "local-test-llm-key" not in str(first)
     assert compose_calls == [True, True]
 

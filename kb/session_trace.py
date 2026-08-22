@@ -7,10 +7,10 @@ import re
 
 from kb.llm_enrichment import (
     content_flagged_by_security_scan,
-    default_llm_model,
     enrichment_enabled,
     openrouter_chat,
 )
+from kb.model_routing import route_for
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -46,12 +46,14 @@ def enrich_shared_trace(data: str, *, has_tool_errors: bool) -> str:
         "Do not invent facts. Return markdown only.\n\n"
         f"{data}"
     )
+    route = route_for("session_trace")
     content = openrouter_chat(
         [{"role": "user", "content": prompt}],
-        model=default_llm_model(),
+        model=route.model,
         operation="session_trace_dead_ends",
         max_tokens=800,
         temperature=0.1,
+        plugins=route.plugins,
     )
     if not content:
         return data

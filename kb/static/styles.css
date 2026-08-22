@@ -1471,13 +1471,19 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  max-height: min(280px, 40vh);
+  max-height: min(420px, 55vh);
   overflow-y: auto;
   overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
 }
 
 .selection .node-connection {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(84px, 0.34fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
   width: 100%;
   min-height: 0;
   margin-top: 2px;
@@ -1490,13 +1496,25 @@ pre {
   text-align: left;
   cursor: pointer;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .selection .node-connection:hover {
   border-color: var(--primary);
   color: var(--text);
+}
+
+.selection .node-connection-relation {
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.selection .node-connection-label {
+  color: var(--muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .selection .node-connections-more {

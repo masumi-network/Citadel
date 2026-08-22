@@ -624,6 +624,35 @@ function datasetSourceBadge(dataset) {
   return { label: name, kind: "other" };
 }
 
+const RELATIONSHIP_LABELS = {
+  affects: "Affects",
+  assigned_to: "Assigned to",
+  assigned_to_team: "Assigned team",
+  belongs_to: "Belongs to",
+  belongs_to_team: "Team",
+  concerns: "Concerns",
+  creates_channel_in: "Creates channel in",
+  in_organization: "Organization",
+  involves: "Involves",
+  involves_organization: "Organization",
+  involves_platform: "Platform",
+  involves_system: "System",
+  mentions: "Mentions",
+  owned_by: "Owner",
+  owned_by_team: "Owner team",
+  related_to: "Related",
+  relates_to: "Related",
+  works_for: "Works for",
+};
+
+function humanRelationshipLabel(value) {
+  const key = String(value || "related").trim().toLowerCase();
+  if (!key) return "Related";
+  if (RELATIONSHIP_LABELS[key]) return RELATIONSHIP_LABELS[key];
+  const words = key.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Related";
+}
+
 function applyAccessControls() {
   const label = state.role ? roleLabel(state.role) : "Locked";
   sessionRole.textContent = label;
@@ -2139,11 +2168,9 @@ function selectNode(node) {
   updateNodeSelection();
 }
 
-const MAX_INSPECTOR_NEIGHBORS = 8;
-
 // Knowledge-mode inspector: label, kind + dataset, internal name when the
-// backend provides one, then up to MAX_INSPECTOR_NEIGHBORS clickable
-// connections from the unfiltered real graph (hidden kinds still listed).
+// backend provides one, then every clickable connection from the unfiltered
+// real graph (hidden kinds still listed).
 // loadNodeDocument appends the stored document text after this content.
 function renderKnowledgeInspector(node) {
   const kind = nodeKind(node);
@@ -2185,22 +2212,24 @@ function renderKnowledgeInspector(node) {
   heading.textContent = "Connections";
   const list = document.createElement("div");
   list.className = "node-connections-list";
-  const more = document.createElement("button");
-  more.type = "button";
-  more.className = "node-connections-more";
-
   container.append(heading, list);
 
-  const renderConnections = (showAll) => {
+  const renderConnections = () => {
     list.innerHTML = "";
-    const visibleNeighbors = showAll
-      ? neighbors
-      : neighbors.slice(0, MAX_INSPECTOR_NEIGHBORS);
-    visibleNeighbors.forEach((item) => {
+    neighbors.forEach((item) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "node-connection";
-      button.textContent = `${item.relationship} · ${item.node.label || item.node.id}`;
+      const relationship = humanRelationshipLabel(item.relationship);
+      const label = item.node.label || item.node.id;
+      button.title = `${relationship}: ${label}`;
+      const relationshipText = document.createElement("span");
+      relationshipText.className = "node-connection-relation";
+      relationshipText.textContent = relationship;
+      const labelText = document.createElement("span");
+      labelText.className = "node-connection-label";
+      labelText.textContent = label;
+      button.append(relationshipText, labelText);
       // Resolve by id at click time: a graph refresh replaces state.realGraph
       // while this button persists, so the captured node object may be stale.
       const targetId = item.node.id;
@@ -2212,18 +2241,9 @@ function renderKnowledgeInspector(node) {
       });
       list.append(button);
     });
-
-    if (neighbors.length > MAX_INSPECTOR_NEIGHBORS) {
-      more.textContent = showAll ? "Show fewer" : `Show all ${neighbors.length} connections`;
-      more.hidden = false;
-      more.onclick = () => renderConnections(!showAll);
-    } else {
-      more.hidden = true;
-    }
   };
 
-  container.append(more);
-  renderConnections(false);
+  renderConnections();
   selectedNode.append(container);
 }
 
@@ -2232,6 +2252,7 @@ function knowledgeNeighbors(nodeId) {
   const real = state.realGraph;
   if (!real) return [];
   const result = [];
+  const seen = new Set();
   for (const edge of real.edges) {
     let otherId = null;
     if (edge.source === nodeId) otherId = edge.target;
@@ -2239,7 +2260,11 @@ function knowledgeNeighbors(nodeId) {
     else continue;
     const other = real.nodes.get(otherId);
     if (!other) continue;
-    result.push({ relationship: edge.relationship || edge.label || "related", node: other });
+    const relationship = edge.relationship || edge.label || "related";
+    const key = `${relationship}:${other.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ relationship, node: other });
   }
   return result;
 }

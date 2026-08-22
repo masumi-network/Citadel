@@ -533,14 +533,17 @@ async def _ingest(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
-    from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
+    from kb.status import _COGNIFY_TIMEOUT, ingest_node
 
-    # Async by default: the Node accepts the note and the lifecycle drain makes
-    # it searchable within minutes. Inline cognify (--cognify) blocks the one
-    # request until the graph is built — long enough (~2 min on cold nodes) that
-    # proxy edges kill it with a 502 while the server still accepts the write.
-    cognify = bool(getattr(args, "cognify", False))
     as_json = getattr(args, "json", False)
+    if getattr(args, "no_cognify", False):
+        return _emit_error(
+            "ingest",
+            "Cognee projection is required for seat ingest; remove --no-cognify.",
+            as_json=as_json,
+            code="COGNIFY_REQUIRED",
+        )
+    cognify = True
     timeout_arg = getattr(args, "timeout", None)
     if timeout_arg is not None:
         timeout_s = max(1.0, float(timeout_arg))
@@ -3868,20 +3871,19 @@ def build_parser() -> argparse.ArgumentParser:
     cognify_group.add_argument(
         "--cognify",
         action="store_true",
-        help="Build the graph inline before returning (immediately searchable, but the "
-        "single blocking request can exceed proxy timeouts — a 502 does not mean the "
-        "write failed). Default: async, searchable within minutes",
+        help="Build the graph inline before returning (required for seat ingest; a "
+        "client timeout does not mean the write failed)",
     )
     cognify_group.add_argument(
         "--no-cognify",
         action="store_true",
-        help="Skip inline cognify (the default; kept for compatibility)",
+        help="Reject this request; seat ingest requires Cognee projection",
     )
     ingest.add_argument(
         "--timeout",
         type=float,
         metavar="SECONDS",
-        help="Max seconds to wait for the Node (default: 60, or 180 with --cognify)",
+        help="Max seconds to wait for the Node (default: 180)",
     )
     ingest.add_argument("--json", action="store_true", help="Machine-readable output")
     ingest.add_argument("--node-url", help="Override Node URL")

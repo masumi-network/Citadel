@@ -24,7 +24,9 @@ overview and quick start, see the [README](../README.md).
 
 [CORRECTED 2026-08-14] `railway.toml` for the web service is
 `startCommand = "python -m kb.lite_runtime"` (`railway.toml:13`) with
-`healthcheckPath = "/health/ready"` and `healthcheckTimeout = 300`. Lite
+`healthcheckPath = "/healthz"` and `healthcheckTimeout = 300`. This is a
+liveness gate. Projection readiness remains on `/health/ready` and
+authenticated `/readyz`. Lite
 defaults in `kb/lite_runtime.py:77-82` are `DB_PROVIDER=sqlite`,
 `GRAPH_DATABASE_PROVIDER=ladybug`, `VECTOR_DB_PROVIDER=qdrant`. Other Railway
 services may still select `scripts.run_railway` job modes in their own config
@@ -32,7 +34,7 @@ services may still select `scripts.run_railway` job modes in their own config
 with `python -m scripts.run_railway` as the web entry. That is the command that
 failed the 2026-08-11 cutover when `scripts/` was not importable.
 
-The Postgres + pgvector + Kuzu shape below is a self-host option. It is not
+The Postgres + pgvector + Ladybug shape below is a self-host option. It is not
 the live Railway web profile as of 2026-08-14.
 
 Dependencies for the image still need to be listed where the Dockerfile and
@@ -45,7 +47,7 @@ Railway Lite):
 - One cron service for daily GitHub syncs (`CITADEL_RUN_MODE=learning-agent`).
 - One cron service for Vault Backup Mirror manifest export (`backup-mirror`).
 - One Railway Postgres dedicated to Citadel, with `pgvector` enabled.
-- One Railway volume mounted at `/data` for Cognee's embedded Kuzu graph files.
+- One Railway volume mounted at `/data` for Cognee graph state files.
 
 Use Railway's private Postgres `DATABASE_URL` as the app database binding. At
 runtime Citadel derives Cognee's split `DB_*` settings from `DATABASE_URL`, and
@@ -54,7 +56,7 @@ maps `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD` into
 when the vector store uses a different Postgres target.
 
 ```bash
-GRAPH_DATABASE_PROVIDER=kuzu
+GRAPH_DATABASE_PROVIDER=ladybug
 SYSTEM_ROOT_DIRECTORY=/data/.cognee_system
 DATA_ROOT_DIRECTORY=/data/.data_storage
 ```
@@ -156,15 +158,18 @@ CITADEL_DEFAULT_DATASET=personal
 CITADEL_SEARCH_DEFAULT_DATASET=masumi-network
 ```
 
-For OpenRouter, Cognee expects the custom-provider form. **The model id must be
-`openrouter/`-prefixed** — a bare/invalid id (e.g. `openrouter/free`, or
-`google/gemini-2.5-flash` without the prefix) silently breaks every cognify call
-(`litellm: "LLM Provider NOT provided"`).
+[VERIFIED 2026-08-21] For OpenRouter, Cognee expects the custom-provider form.
+The model id must be `openrouter/`-prefixed. The direct API id
+`openrouter/free` becomes `openrouter/openrouter/free` for Cognee, but its pool
+can select models that do not return Cognee's required structured output. The
+current free Cognee route is the direct structured-output model
+`openrouter/nvidia/nemotron-nano-9b-v2:free`. A bare vendor/model id without the
+prefix breaks cognify (`litellm: "LLM Provider NOT provided"`).
 
 ```bash
 LLM_PROVIDER=custom
 LLM_ENDPOINT=https://openrouter.ai/api/v1
-LLM_MODEL=openrouter/deepseek/deepseek-v4-flash   # the default
+LLM_MODEL=openrouter/nvidia/nemotron-nano-9b-v2:free
 LLM_API_KEY=sk-or-...                             # or OPENROUTER_API_KEY
 ```
 
@@ -216,10 +221,12 @@ timestamp. Pass it as `Authorization: Bearer <token>`.
 
 Health probes are split on purpose:
 
-- `GET /healthz` is liveness. Unauthenticated. No corpus or canary work.
-- `GET /health/ready` is the Railway deploy gate (`railway.toml`
-  `healthcheckPath`). It checks dependency readiness, not the canary or
-  lifecycle invariants.
+- `GET /healthz` is liveness and the Railway deploy gate (`railway.toml`
+  `healthcheckPath`). It is unauthenticated and does not run corpus or canary
+  work.
+- `GET /health/ready` checks dependency readiness, including bounded corpus and
+  lifecycle probes. A backlog can keep it at `503` while the process serves
+  traffic.
 - `GET /readyz` is authenticated readiness (bounded corpus probe, lifecycle
   census, last canary). The image `HEALTHCHECK` targets this route.
 
@@ -264,7 +271,9 @@ curl -fsS -X POST "$CITADEL_BASE_URL/api/contribute" \
 
 `GET /api/mesh/graph` (reader+) returns `{nodes, edges, ...}` from Cognee's graph
 engine with a node cap (`CITADEL_MESH_GRAPH_MAX_NODES`, default 200, or `?limit=`).
-With no data or no graph access it returns an empty graph with `fallback: true`.
+It is a projection view with scope filtering and dataset visibility, not a raw
+ingest log. With no data or no graph access it returns an empty graph with
+`fallback: true`.
 
 ADR-0009 read isolation applies to non-admin tokens: content is scoped to the
 caller's datasets (own seat + Central + non-seat datasets), while every seat is
@@ -276,6 +285,13 @@ drill-down is scoped the same way, so a **404 can mean "not yours"** rather than
 "does not exist". Admin/env tokens bypass scoping. The same scoping applies to
 the `/api/mesh` and `/events` activity projection and, transitively, the
 `citadel_get_mesh` / `citadel_get_document` MCP tools that proxy them.
+
+[VERIFIED] `/api/ingest` may return `projection_job_id` in a successful write; poll
+`/api/operations/{projection_job_id}` to confirm queued projections before the
+node list appears in the graph cap.
+
+[VERIFIED] `GET /api/mesh/projection-status` returns recent projection states for the
+authenticated seat. The Next graph page polls this endpoint while open.
 
 Attribution/isolation tuning env vars (all optional): `CITADEL_GRAPH_DATA_CACHE_TTL_SECONDS`
 (raw graph read cache, default 30), `CITADEL_NODE_DATASET_MAP_TTL_SECONDS`
