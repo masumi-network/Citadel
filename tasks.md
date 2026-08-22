@@ -1,6 +1,6 @@
 # Citadel Tasks
 
-## Current (2026-08-17, after 0.5.1 PyPI)
+## Current (2026-08-19, after 0.5.1 PyPI)
 
 PyPI `citadel-archive==0.5.1` is live. Public node:
 https://citadel.utxo.ag. Source: https://github.com/masumi-network/Citadel.
@@ -11,16 +11,20 @@ Inside bench 0.4.0 vs 0.5.1 is recorded in `docs/performance.md`
 
 ### Do now
 
-1. **GHCR `:0.5.1`.** [VERIFIED] `docker buildx imagetools inspect
+1. **Write-to-mesh gap visibility for seats.** Ingest writes and graph growth are
+   different stages. Keep one action list for operators: capture `projection_job_id`
+   from `/ingest`, then poll `/api/operations/{projection_job_id}`, then validate
+   `outcome.projection_state` and `/api/mesh` node growth for `seat:<slug>`.
+2. **GHCR `:0.5.1`.** [VERIFIED] `docker buildx imagetools inspect
    ghcr.io/masumi-network/citadel:0.5.1` returned not found. Publish run
    `32051600953` skipped OCI stage/attest/smoke/promote on dispatch.
    Promote only after owner yes.
-2. **Data-plane #228 and #247.** [VERIFIED] both OPEN this session
+3. **Data-plane #228 and #247.** [VERIFIED] both OPEN this session
    (accepted-but-unindexed documents; tail recall 0 of 11).
-3. **Local leftover branch.** [VERIFIED] worktree is
+4. **Local leftover branch.** [VERIFIED] worktree is
    `fix/publish-main-fetch-depth`. `origin/main` already has #304 and #305.
    Checkout `main` when done with that branch.
-4. **Outside bench (not started).** OmniMemEval can run Mem0 / Zep / Letta /
+5. **Outside bench (not started).** OmniMemEval can run Mem0 / Zep / Letta /
    Cognee on LongMemEval and LoCoMo. Citadel needs a custom `add`/`search`
    adapter. Pick a rival before spending an afternoon. Elasticsearch belongs
    on BEIR, not those chat-memory sets. The 105-question `citadel bench run`
@@ -811,7 +815,13 @@ evolve scheduler. Only operational remainder: each dev runs `citadel onboard`.
 - `LLM_MODEL=openrouter/openai/gpt-4o-mini` on the web service (was the invalid
   `openrouter/free`, which had silently broken all cognify; fixed 2026-06-24).
   `EMBEDDING_PROVIDER=fastembed`, `VECTOR_DB_PROVIDER=pgvector`,
-  `GRAPH_DATABASE_PROVIDER=kuzu`, `CITADEL_SEARCH_DEFAULT_DATASET=masumi-network`.
+  `GRAPH_DATABASE_PROVIDER=ladybug`, `CITADEL_SEARCH_DEFAULT_DATASET=masumi-network`.
+- **2026-08-19 recovery:** fixed live startup blocker by setting
+  `GRAPH_DATABASE_PROVIDER=ladybug` in `Citadel-Archive` environment variables and
+  redeploying. New deploy `f115ba73-3a1e-453f-9932-5b3cb42e13bc` is `SUCCESS`;
+  `/health/ready` recovers to `200` after startup, and the previous
+  `Lite profile requires GRAPH_DATABASE_PROVIDER=ladybug; got 'postgres'` refusal is
+  absent from the redeploy logs.
 - Cron `Citadel-GitHub-Sync` (schedule `0 3 * * *`): now targets the internal
   domain `http://citadel-archive.railway.internal:8080` with
   `CITADEL_GITHUB_SYNC_TIMEOUT_SECONDS=2400` to avoid the public-proxy 5-min 502 on
@@ -819,7 +829,8 @@ evolve scheduler. Only operational remainder: each dev runs `citadel onboard`.
   moot in this mode (cognify runs in the web service).
 - Postgres healthy; pgvector working (ingest -> cognify -> search verified
   end-to-end 2026-06-24).
-- Live deploy is commit `171f386` (web deployment `e225c16a`, `SUCCESS`).
+- Live deploy is now commit `f115ba73-3a1e-453f-9932-5b3cb42e13bc` (deployment
+  status `SUCCESS`).
 - **LLM_MODEL fixed (2026-06-26):** was the prefix-less `google/gemini-2.5-flash`
   (broke all cognify with litellm "LLM Provider NOT provided"); now
   `openrouter/deepseek/deepseek-v4-flash`. cognify verified to build a

@@ -146,6 +146,8 @@ function graphEdges(payload: GraphPayload, nodes: KnowledgeNode[]): Edge[] {
 export default function KnowledgeGraph({ payload }: { payload: GraphPayload }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<KnowledgeNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const listNodes = graphNodes(payload);
+  const listEdges = graphEdges(payload, listNodes);
 
   useEffect(() => {
     const nextNodes = graphNodes(payload);
@@ -154,25 +156,53 @@ export default function KnowledgeGraph({ payload }: { payload: GraphPayload }) {
   }, [payload, setEdges, setNodes]);
 
   return (
-    <div className="knowledgecanvas" aria-label="Knowledge graph">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        elementsSelectable
-        fitView
-        fitViewOptions={{ padding: 0.2, minZoom: 0.35, maxZoom: 1.25 }}
-        minZoom={0.25}
-        maxZoom={1.5}
-        attributionPosition="bottom-left"
-      >
-        <Background gap={24} size={1} />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+    <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="knowledgecanvas" aria-label="Knowledge graph">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable
+          fitView
+          fitViewOptions={{ padding: 0.2, minZoom: 0.35, maxZoom: 1.25 }}
+          minZoom={0.25}
+          maxZoom={1.5}
+          attributionPosition="bottom-left"
+        >
+          <Background gap={24} size={1} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
+      <aside className="border border-border-2 bg-surface" aria-label="Visible graph nodes">
+        <div className="flex items-center justify-between border-b border-border-2 px-4 py-3">
+          <h2 className="text-[13px] font-semibold text-ink">Visible nodes</h2>
+          <span className="font-mono text-[12px] text-ink-3">{listNodes.length}</span>
+        </div>
+        <div className="max-h-[60vh] overflow-y-auto p-2" tabIndex={0}>
+          <ul className="space-y-1">
+            {listNodes.map((node) => {
+              const connections = listEdges.filter(
+                (edge) => edge.source === node.id || edge.target === node.id,
+              ).length;
+              return (
+                <li key={node.id} className="border border-border-2 bg-surface-2 px-3 py-2">
+                  <div className="break-words text-[12.5px] font-medium text-ink">{node.data.label}</div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-ink-3">
+                    <span>{node.data.kind}</span>
+                    <span>{connections} connections</span>
+                    {node.data.dataset ? <span>{node.data.dataset}</span> : null}
+                    {node.data.presence ? <span>{node.data.presence}</span> : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </aside>
     </div>
   );
 }

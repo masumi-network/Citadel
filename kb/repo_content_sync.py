@@ -1169,7 +1169,7 @@ class RepoContentSyncer:
         if not dry_run and ingested_files and self.config.repo_content_sync_run_improve:
             outcome = await self.learning.improve_once(
                 dataset=self.config.repo_content_sync_dataset,
-                session_ids=[self.config.repo_content_sync_session],
+                session_ids=None,
             )
             improved = not (isinstance(outcome, dict) and outcome.get("ok") is False)
             if not improved:

@@ -20,12 +20,13 @@ from typing import Any
 
 from kb.learning import LearningProcess
 from kb.llm_enrichment import (
-    default_llm_model,
     openrouter_api_key,
     openrouter_chat,
     parse_json_payload,
     redacted_preview,
 )
+from kb.improvement_policy import central_improvement_dataset
+from kb.model_routing import route_for
 from kb.mesh import MeshState
 from kb.service import Citadel
 
@@ -66,7 +67,8 @@ def propose_optimizations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Ask the LLM for better tags/summaries; deterministic no-op on failure."""
     if not items or not openrouter_api_key():
         return []
-    model = default_llm_model()
+    route = route_for("self_improve")
+    model = route.model
     content = openrouter_chat(
         [
             {"role": "system", "content": OPTIMIZE_SYSTEM_PROMPT},
@@ -81,6 +83,7 @@ def propose_optimizations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         model=model,
         operation="self_improve.propose",
         max_tokens=900,
+        plugins=route.plugins,
     )
     if content is None:
         return []
@@ -93,6 +96,7 @@ def propose_optimizations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         return []
     known_labels = {item["label"] for item in items}
+    known_items = {item["label"]: item for item in items}
     proposals: list[dict[str, Any]] = []
     for entry in raw_items:
         if not isinstance(entry, dict):
@@ -114,6 +118,10 @@ def propose_optimizations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "label": label,
                 "summary": " ".join(summary.split())[:200] if isinstance(summary, str) else None,
                 "tags": clean_tags,
+                "document_id": known_items[label].get("document_id"),
+                "source_key": known_items[label].get("source_key"),
+                "source_locator": known_items[label].get("source_locator"),
+                "source_revision_id": known_items[label].get("source_revision_id"),
             }
         )
     return proposals
@@ -144,17 +152,20 @@ class SelfImprovement:
         actor: Any | None = None,
     ) -> dict[str, Any]:
         limit = min(max(1, max_items or self_improve_max_items()), MAX_ITEMS_CEILING)
-        dataset = self.config.default_dataset
+        dataset = central_improvement_dataset(self.config)
 
-        recent = await self._recent_activity(limit)
+        recent = await self._recent_activity(limit, dataset=dataset)
         improve_result = await self._improve(dataset)
-        proposals = self._propose(recent["ingest_items"])
+        improve_ok = not (
+            isinstance(improve_result, dict) and improve_result.get("ok") is False
+        )
+        proposals = self._propose(recent["ingest_items"]) if improve_ok else []
         applied = 0
         if proposals and not dry_run:
             applied = await self._apply(proposals[:limit], dataset=dataset)
 
         result = {
-            "ok": True,
+            "ok": improve_ok,
             "dry_run": dry_run,
             "dataset": dataset,
             "max_items": limit,
@@ -180,7 +191,7 @@ class SelfImprovement:
                 self.access_store.record_event(
                     action="learning_agent.optimize",
                     actor=actor,
-                    success=True,
+                    success=result["ok"],
                     dataset=dataset,
                     detail={
                         "reviewed": result["reviewed"],
@@ -194,7 +205,7 @@ class SelfImprovement:
                 logger.warning("Self-improvement audit event could not be recorded")
         return result
 
-    async def _recent_activity(self, limit: int) -> dict[str, Any]:
+    async def _recent_activity(self, limit: int, *, dataset: str) -> dict[str, Any]:
         """Recent ingest records and feedback from the mesh projection."""
         if self.mesh is None:
             return {"ingest_items": [], "feedback_count": 0}
@@ -204,25 +215,37 @@ class SelfImprovement:
             for node in snapshot.get("nodes", [])
             if node.get("type") == "document"
             and node.get("label")
+            and (node.get("metadata") or {}).get("dataset") == dataset
             # Never feed previous optimization notes back into the loop.
             and OPTIMIZE_TAG not in ((node.get("metadata") or {}).get("tags") or [])
         ]
         ingest_items = [
             {
+                "document_id": node.get("id"),
                 "label": str(node.get("label") or "")[:120],
                 "tags": list((node.get("metadata") or {}).get("tags") or []),
-                "dataset": (node.get("metadata") or {}).get("dataset"),
+                "dataset": dataset,
+                "source_key": (node.get("metadata") or {}).get("source_key"),
+                "source_locator": (node.get("metadata") or {}).get("source_locator"),
+                "source_revision_id": (node.get("metadata") or {}).get("source_revision_id"),
             }
             for node in documents[-limit:]
         ]
         feedback_count = sum(
-            1 for event in snapshot.get("events", []) if event.get("type") == "feedback"
+            1
+            for event in snapshot.get("events", [])
+            if event.get("type") == "feedback"
+            and (event.get("details") or {}).get("dataset") == dataset
         )
         return {"ingest_items": ingest_items, "feedback_count": feedback_count}
 
     async def _improve(self, dataset: str) -> Any:
         try:
-            return await self.citadel.improve(dataset=dataset, session_ids=None)
+            return await self.citadel.improve(
+                dataset=dataset,
+                session_ids=None,
+                automation=True,
+            )
         except Exception as exc:
             logger.warning(
                 "Self-improvement improve step failed with %s; continuing",
@@ -245,8 +268,24 @@ class SelfImprovement:
         applied = 0
         for proposal in proposals:
             summary = proposal.get("summary") or proposal["label"]
+            source_key = " ".join(str(proposal.get("source_key") or "").split())[:240]
+            if not source_key:
+                source_key = "mesh-document:" + (
+                    str(proposal.get("document_id") or proposal["label"]).strip()
+                )[:180]
+            source_locator = " ".join(
+                str(proposal.get("source_locator") or "").split()
+            )[:500]
+            if not source_locator:
+                source_locator = (
+                    "mesh://document/"
+                    f"{proposal.get('document_id') or proposal['label']}"
+                )
             note = (
                 f"Knowledge optimization note: {proposal['label']}\n\n"
+                f"Source key: {source_key}\n"
+                f"Source locator: {source_locator}\n"
+                f"Source revision: {proposal.get('source_revision_id') or 'not recorded'}\n"
                 f"Summary: {summary}\n"
                 f"Proposed tags: {', '.join(proposal.get('tags') or []) or 'none'}"
             )
@@ -256,7 +295,11 @@ class SelfImprovement:
                     dataset=dataset,
                     tags=[*proposal.get("tags", []), OPTIMIZE_TAG],
                     operation="self_improve",
-                    detect_conflicts=False,
+                    detect_conflicts=True,
+                    source_key=f"self-improve:{source_key}",
+                    source_locator=source_locator,
+                    capture_actor_id="learning-agent",
+                    capture_run_id=f"self-improvement:{dataset}",
                 )
             except Exception as exc:
                 logger.warning(

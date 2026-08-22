@@ -624,6 +624,35 @@ function datasetSourceBadge(dataset) {
   return { label: name, kind: "other" };
 }
 
+const RELATIONSHIP_LABELS = {
+  affects: "Affects",
+  assigned_to: "Assigned to",
+  assigned_to_team: "Assigned team",
+  belongs_to: "Belongs to",
+  belongs_to_team: "Team",
+  concerns: "Concerns",
+  creates_channel_in: "Creates channel in",
+  in_organization: "Organization",
+  involves: "Involves",
+  involves_organization: "Organization",
+  involves_platform: "Platform",
+  involves_system: "System",
+  mentions: "Mentions",
+  owned_by: "Owner",
+  owned_by_team: "Owner team",
+  related_to: "Related",
+  relates_to: "Related",
+  works_for: "Works for",
+};
+
+function humanRelationshipLabel(value) {
+  const key = String(value || "related").trim().toLowerCase();
+  if (!key) return "Related";
+  if (RELATIONSHIP_LABELS[key]) return RELATIONSHIP_LABELS[key];
+  const words = key.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Related";
+}
+
 function applyAccessControls() {
   const label = state.role ? roleLabel(state.role) : "Locked";
   sessionRole.textContent = label;
@@ -2139,11 +2168,9 @@ function selectNode(node) {
   updateNodeSelection();
 }
 
-const MAX_INSPECTOR_NEIGHBORS = 8;
-
 // Knowledge-mode inspector: label, kind + dataset, internal name when the
-// backend provides one, then up to MAX_INSPECTOR_NEIGHBORS clickable
-// connections from the unfiltered real graph (hidden kinds still listed).
+// backend provides one, then every clickable connection from the unfiltered
+// real graph (hidden kinds still listed).
 // loadNodeDocument appends the stored document text after this content.
 function renderKnowledgeInspector(node) {
   const kind = nodeKind(node);
@@ -2178,33 +2205,45 @@ function renderKnowledgeInspector(node) {
 
   const neighbors = knowledgeNeighbors(node.id);
   if (!neighbors.length) return;
+
   const container = document.createElement("div");
   container.className = "node-connections";
   const heading = document.createElement("strong");
   heading.textContent = "Connections";
-  container.append(heading);
-  neighbors.slice(0, MAX_INSPECTOR_NEIGHBORS).forEach((item) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "node-connection";
-    button.textContent = `${item.relationship} · ${item.node.label || item.node.id}`;
-    // Resolve by id at click time: a graph refresh replaces state.realGraph
-    // while this button persists, so the captured node object may be stale.
-    const targetId = item.node.id;
-    button.addEventListener("click", () => {
-      const target = state.realGraph?.nodes.get(targetId);
-      if (!target) return;
-      focusGraphNode(targetId);
-      selectNode(target);
+  const list = document.createElement("div");
+  list.className = "node-connections-list";
+  container.append(heading, list);
+
+  const renderConnections = () => {
+    list.innerHTML = "";
+    neighbors.forEach((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "node-connection";
+      const relationship = humanRelationshipLabel(item.relationship);
+      const label = item.node.label || item.node.id;
+      button.title = `${relationship}: ${label}`;
+      const relationshipText = document.createElement("span");
+      relationshipText.className = "node-connection-relation";
+      relationshipText.textContent = relationship;
+      const labelText = document.createElement("span");
+      labelText.className = "node-connection-label";
+      labelText.textContent = label;
+      button.append(relationshipText, labelText);
+      // Resolve by id at click time: a graph refresh replaces state.realGraph
+      // while this button persists, so the captured node object may be stale.
+      const targetId = item.node.id;
+      button.addEventListener("click", () => {
+        const target = state.realGraph?.nodes.get(targetId);
+        if (!target) return;
+        focusGraphNode(targetId);
+        selectNode(target);
+      });
+      list.append(button);
     });
-    container.append(button);
-  });
-  if (neighbors.length > MAX_INSPECTOR_NEIGHBORS) {
-    const more = document.createElement("span");
-    more.className = "node-connections-more";
-    more.textContent = `+${neighbors.length - MAX_INSPECTOR_NEIGHBORS} more`;
-    container.append(more);
-  }
+  };
+
+  renderConnections();
   selectedNode.append(container);
 }
 
@@ -2213,6 +2252,7 @@ function knowledgeNeighbors(nodeId) {
   const real = state.realGraph;
   if (!real) return [];
   const result = [];
+  const seen = new Set();
   for (const edge of real.edges) {
     let otherId = null;
     if (edge.source === nodeId) otherId = edge.target;
@@ -2220,7 +2260,11 @@ function knowledgeNeighbors(nodeId) {
     else continue;
     const other = real.nodes.get(otherId);
     if (!other) continue;
-    result.push({ relationship: edge.relationship || edge.label || "related", node: other });
+    const relationship = edge.relationship || edge.label || "related";
+    const key = `${relationship}:${other.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ relationship, node: other });
   }
   return result;
 }

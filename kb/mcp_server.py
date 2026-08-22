@@ -1312,7 +1312,7 @@ def create_mcp_server(
         dataset: str | None = None,
         tags: list[str] | None = None,
         session_id: str | None = None,
-        cognify: bool = False,
+        cognify: bool = True,
     ) -> dict[str, Any]:
         """Stage durable context in the caller's personal seat node. Requires writer access.
 
@@ -1323,11 +1323,8 @@ def create_mcp_server(
         Never ingest secrets, tokens, passwords, keys, seed phrases, PII, or raw logs.
         Summarize and curate first; keep payloads small (cap ~200 KB).
 
-        By default the note is accepted immediately and becomes searchable within
-        minutes (the receipt says `queued_not_confirmed` until then; parity with the
-        `citadel ingest` CLI). Pass `cognify=true` to block until the graph is built —
-        that single request can exceed MCP client/proxy timeouts, and a timeout does
-        NOT mean the write failed.
+        Cognee projection is required for every seat write. The call waits until the
+        graph is built, and a client timeout does NOT mean the write failed.
 
         Shared Central is read-only from MCP. Org-wide memory updates via scheduled
         GitHub/Linear sync and selective promotion — not direct MCP ingest.
@@ -1336,6 +1333,8 @@ def create_mcp_server(
         def post_ingest() -> dict[str, Any]:
             normalized_data = _require_non_empty(data, "data")
             _validate_ingest_size(normalized_data)
+            if not cognify:
+                raise CitadelMcpError("Cognee projection is required for seat ingest.")
             try:
                 return resolve_client(ctx).post(
                     "/ingest",

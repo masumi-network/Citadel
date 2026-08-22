@@ -1467,8 +1467,23 @@ pre {
   font-size: 12px;
 }
 
+.selection .node-connections-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: min(420px, 55vh);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+}
+
 .selection .node-connection {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(84px, 0.34fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
   width: 100%;
   min-height: 0;
   margin-top: 2px;
@@ -1481,8 +1496,6 @@ pre {
   text-align: left;
   cursor: pointer;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .selection .node-connection:hover {
@@ -1490,11 +1503,36 @@ pre {
   color: var(--text);
 }
 
+.selection .node-connection-relation {
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.selection .node-connection-label {
+  color: var(--muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .selection .node-connections-more {
   display: block;
   margin-top: 4px;
-  color: var(--quiet);
+  color: var(--primary);
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
   font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.selection .node-connections-more:hover,
+.selection .node-connections-more:focus-visible {
+  color: var(--text);
 }
 
 /* Kind legend overlaid on the knowledge-graph canvas; chips toggle kinds

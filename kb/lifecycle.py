@@ -1506,6 +1506,27 @@ class LifecycleStore:
             state=self._operation_state(job, receipts),
         )
 
+    def latest_operations_for_dataset(
+        self, dataset: str, *, limit: int = 10
+    ) -> tuple[ProjectionOperation, ...]:
+        """Return the newest projection operations for one dataset."""
+        if not dataset.strip():
+            raise ValueError("dataset must be a non-empty string")
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT projection_job_id
+                FROM projection_jobs
+                WHERE dataset = ?
+                ORDER BY created_at DESC, projection_job_id DESC
+                LIMIT ?
+                """,
+                (dataset, limit),
+            ).fetchall()
+        return tuple(self.get_operation(str(row["projection_job_id"])) for row in rows)
+
     def retrieval_binding(
         self,
         source_revision_id: str,
@@ -1690,7 +1711,13 @@ class LifecycleStore:
                       ) OR (
                           state = 'running' AND leased_until IS NOT NULL AND leased_until <= ?
                       ))
-                    ORDER BY available_at, created_at, projection_job_id
+                    -- Seat projections must stay responsive while a generation
+                    -- rebuild drains Central and sync datasets. Keep the
+                    -- durable order inside each class so older work still
+                    -- completes after seat work.
+                    ORDER BY CASE WHEN dataset LIKE 'seat:%' THEN 0 ELSE 1 END,
+                             CASE WHEN dataset LIKE 'seat:%' THEN created_at END DESC,
+                             available_at, created_at, projection_job_id
                     LIMIT 1
                     """,
                     (

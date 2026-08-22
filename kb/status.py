@@ -566,22 +566,20 @@ def ingest_node(
     token: str,
     data: str,
     tags: list[str] | tuple[str, ...] = (),
-    cognify: bool = False,
+    cognify: bool = True,
     *,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """POST a note to the Node's /ingest (same endpoint MCP citadel_ingest uses).
 
     Sends no dataset, so the seat token routes the write to the dev's private
-    node (personal-by-default), mirroring the SessionEnd hook. With cognify=True
-    the Node builds the graph inline and blocks until done (so the note is
-    immediately searchable). Returns the response (``accepted``, ``reason``,
-    ``dataset``, and ``cognified`` when cognify was requested).
+    node (personal-by-default), mirroring the SessionEnd hook. Cognee builds the
+    graph inline and the note is reported searchable only after projection.
     """
-    payload: dict[str, Any] = {"data": data, "tags": list(tags)}
-    if cognify:
-        payload["cognify"] = True
-    resolved = timeout if timeout is not None else (_COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT)
+    if not cognify:
+        raise ValueError("Cognee projection is required for seat ingest")
+    payload: dict[str, Any] = {"data": data, "tags": list(tags), "cognify": True}
+    resolved = timeout if timeout is not None else _COGNIFY_TIMEOUT
     return _request(
         "POST",
         f"{base_url.rstrip('/')}/ingest",
