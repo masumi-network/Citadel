@@ -3981,10 +3981,10 @@ class CogneePublicClient:
         """One store's targeted read via the engine the active context resolves.
 
         Falls back to the full ``graph_data()`` read when the engine lacks the
-        targeted primitives or the read raises — a shape surprise degrades to
-        correct-but-slow, never a spurious 404. A node missing from this store
+        targeted primitives or the read raises. A shape surprise degrades to a
+        correct but slow read, never a spurious 404. A node missing from this store
         returns an empty result (``get_node`` -> None, ``get_connections`` ->
-        []) WITHOUT triggering that fallback: a full graph read cannot contain
+        []) without triggering that fallback: a full graph read cannot contain
         a node the graph lacks. Ids no store resolves are instead retried
         against the durable chunk store by ``get_document``
         (``_document_from_chunk_store``).
@@ -4058,9 +4058,21 @@ class CogneePublicClient:
         entities) behave as without the flag.
         """
         doc_id = str(document_id)
-        document = await self._document_from_graph(
-            doc_id, follow_parent=True, chunk_scope=chunk_scope
-        )
+        try:
+            document = await self._document_from_graph(
+                doc_id, follow_parent=True, chunk_scope=chunk_scope
+            )
+        except Exception as exc:
+            document = await self._document_from_chunk_store(
+                doc_id, chunk_scope=chunk_scope
+            )
+            if document is not None:
+                logger.warning(
+                    "graph document lookup failed; served retained chunk content: %s",
+                    exc.__class__.__name__,
+                )
+                return document
+            raise
         if document is not None:
             return document
         return await self._document_from_chunk_store(doc_id, chunk_scope=chunk_scope)
@@ -4091,9 +4103,17 @@ class CogneePublicClient:
         try:
             nodes, edges = await self._document_graph(doc_id)
         except Exception as exc:  # noqa: BLE001
-            if not self._is_no_data_error(exc):
-                raise
-            nodes, edges = [], []
+            owner_ids = await self._owner_ids_from_chunk_store(doc_id)
+            if owner_ids is not None:
+                if not self._is_no_data_error(exc):
+                    logger.warning(
+                        "graph owner lookup failed; resolved retained chunk ownership: %s",
+                        exc.__class__.__name__,
+                    )
+                return owner_ids
+            if self._is_no_data_error(exc):
+                return None
+            raise
         props, props_by_id, part_neighbor_ids = self._graph_projection(
             doc_id, nodes, edges
         )

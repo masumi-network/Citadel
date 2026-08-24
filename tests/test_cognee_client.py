@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID, uuid4
@@ -1351,6 +1352,7 @@ def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
     session with this tmp_path.
     """
     from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.graph.config import get_graph_config
     from cognee.infrastructure.databases.relational.config import get_relational_config
     from cognee.infrastructure.databases.relational.create_relational_engine import (
         create_relational_engine,
@@ -1371,6 +1373,7 @@ def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
 
     def _clear() -> None:
         get_base_config.cache_clear()
+        get_graph_config.cache_clear()
         get_relational_config.cache_clear()
         create_relational_engine.cache_clear()
 
@@ -5043,6 +5046,111 @@ async def test_document_graph_store_miss_is_not_a_fallback(monkeypatch: Any) -> 
     monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
 
     assert await client._document_graph("ghost-id") == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_document_graph_engine_failure_uses_fresh_cache(
+    monkeypatch: Any,
+) -> None:
+    """A failed targeted engine can still use a fresh full-graph cache."""
+    client = CogneePublicClient()
+    cached = ([("doc-1", {"text": "cached graph text"})], [])
+    client._graph_data_cache = (monotonic(), cached)
+
+    async def unavailable_engine() -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    monkeypatch.setattr(client, "_graph_engine", unavailable_engine)
+
+    assert await client._document_graph_current_context("doc-1") == cached
+
+
+@pytest.mark.asyncio
+async def test_get_document_uses_chunk_store_after_graph_failure(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """Retained content stays drillable while graph storage is unavailable."""
+    client = CogneePublicClient()
+    expected = {
+        "id": "doc-1",
+        "body": "retained source text",
+        "dataset_node_ids": ["doc-1"],
+    }
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def retained_document(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return expected
+
+    monkeypatch.setattr(client, "_document_from_graph", failed_graph)
+    monkeypatch.setattr(client, "_document_from_chunk_store", retained_document)
+
+    with caplog.at_level("WARNING", logger="kb.cognee_client"):
+        assert await client.get_document("doc-1") == expected
+    assert "served retained chunk content: PermissionError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_document_preserves_graph_failure_when_chunk_store_misses(
+    monkeypatch: Any,
+) -> None:
+    """A storage failure must not become a false missing-document result."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def missing_document(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_document_from_graph", failed_graph)
+    monkeypatch.setattr(client, "_document_from_chunk_store", missing_document)
+
+    with pytest.raises(PermissionError, match="graph storage is unavailable"):
+        await client.get_document("doc-1")
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_owner_ids_uses_chunk_store_after_graph_failure(
+    monkeypatch: Any,
+) -> None:
+    """Search keeps its drilldown hint when retained chunk ownership resolves."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def retained_owner_ids(*args: Any, **kwargs: Any) -> list[str]:
+        return ["doc-1", "chunk-1"]
+
+    monkeypatch.setattr(client, "_document_graph", failed_graph)
+    monkeypatch.setattr(client, "_owner_ids_from_chunk_store", retained_owner_ids)
+
+    assert await client.resolve_document_owner_ids("chunk-1") == [
+        "doc-1",
+        "chunk-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_owner_ids_preserves_graph_failure_on_chunk_miss(
+    monkeypatch: Any,
+) -> None:
+    """Search must not hide a graph failure as a missing drilldown target."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def missing_owner_ids(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_document_graph", failed_graph)
+    monkeypatch.setattr(client, "_owner_ids_from_chunk_store", missing_owner_ids)
+
+    with pytest.raises(PermissionError, match="graph storage is unavailable"):
+        await client.resolve_document_owner_ids("chunk-1")
 
 
 @pytest.mark.asyncio
