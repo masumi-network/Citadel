@@ -32,7 +32,7 @@ from kb.security_scan import SecurityScanEntry, redact_secrets, scan_text_entrie
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LLM_MODEL = "deepseek/deepseek-v4-flash"
+DEFAULT_LLM_MODEL = "openrouter/free"
 DEFAULT_THRESHOLD_CHARS = 4000
 DEFAULT_MAX_CHUNK_CHARS = 4000
 MAX_CHUNKS = 20

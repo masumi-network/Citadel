@@ -418,40 +418,48 @@ class _FakeCompletionResponse:
 
 def test_resolve_model_strips_litellm_prefix_from_llm_model(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
-    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-r1:free")
 
     assert resolve_openrouter_model() == (
-        "openrouter/deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-flash",
+        "openrouter/deepseek/deepseek-r1:free",
+        "deepseek/deepseek-r1:free",
     )
 
 
 def test_resolve_model_keeps_bare_openrouter_id(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
-    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-r1:free")
 
     assert resolve_openrouter_model() == (
-        "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-r1:free",
+        "deepseek/deepseek-r1:free",
     )
 
 
 def test_resolve_model_org_digest_override_wins_in_either_form(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
-    monkeypatch.setenv("LLM_MODEL", "openrouter/vendor/from-llm-model")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/vendor/from-llm-model:free")
 
-    monkeypatch.setenv("CITADEL_ORG_DIGEST_LLM_MODEL", "openrouter/qwen/qwen3-coder")
-    assert resolve_openrouter_model() == ("openrouter/qwen/qwen3-coder", "qwen/qwen3-coder")
+    monkeypatch.setenv(
+        "CITADEL_ORG_DIGEST_LLM_MODEL", "openrouter/qwen/qwen3-coder:free"
+    )
+    assert resolve_openrouter_model() == (
+        "openrouter/qwen/qwen3-coder:free",
+        "qwen/qwen3-coder:free",
+    )
 
-    monkeypatch.setenv("CITADEL_ORG_DIGEST_LLM_MODEL", "qwen/qwen3-coder")
-    assert resolve_openrouter_model() == ("qwen/qwen3-coder", "qwen/qwen3-coder")
+    monkeypatch.setenv("CITADEL_ORG_DIGEST_LLM_MODEL", "qwen/qwen3-coder:free")
+    assert resolve_openrouter_model() == (
+        "qwen/qwen3-coder:free",
+        "qwen/qwen3-coder:free",
+    )
 
 
-def test_resolve_model_keeps_native_openrouter_vendor_id(monkeypatch: Any) -> None:
+def test_resolve_model_rejects_paid_auto_router(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("LLM_MODEL", "openrouter/auto")
 
-    assert resolve_openrouter_model() == ("openrouter/auto", "openrouter/auto")
+    assert resolve_openrouter_model() == ("openrouter/auto", DEFAULT_LLM_MODEL)
 
 
 def test_resolve_model_default_and_citadel_llm_model_fallbacks(monkeypatch: Any) -> None:
@@ -459,7 +467,10 @@ def test_resolve_model_default_and_citadel_llm_model_fallbacks(monkeypatch: Any)
     assert resolve_openrouter_model() == (DEFAULT_LLM_MODEL, DEFAULT_LLM_MODEL)
 
     monkeypatch.setenv("CITADEL_LLM_MODEL", "openrouter/z-ai/glm-5")
-    assert resolve_openrouter_model() == ("openrouter/z-ai/glm-5", "z-ai/glm-5")
+    assert resolve_openrouter_model() == (
+        "openrouter/z-ai/glm-5",
+        DEFAULT_LLM_MODEL,
+    )
 
 
 def test_llm_agent_read_sends_stripped_model_to_openrouter(
@@ -467,7 +478,7 @@ def test_llm_agent_read_sends_stripped_model_to_openrouter(
 ) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
-    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-r1:free")
     seen: list[dict[str, Any]] = []
 
     def fake_open_secure(request: Any, *, timeout: float) -> _FakeCompletionResponse:
@@ -489,15 +500,15 @@ def test_llm_agent_read_sends_stripped_model_to_openrouter(
 
     assert lines == ["one", "two", "three"]
     assert len(seen) == 1
-    assert seen[0]["payload"]["model"] == "deepseek/deepseek-v4-flash"
+    assert seen[0]["payload"]["model"] == "deepseek/deepseek-r1:free"
     assert seen[0]["url"] == "https://openrouter.ai/api/v1/chat/completions"
-    assert "stripped litellm provider prefix" in caplog.text
+    assert "using allowed free OpenRouter model" in caplog.text
 
 
 def test_llm_agent_read_sends_bare_model_unchanged(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
-    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "deepseek/deepseek-r1:free")
     seen: list[dict[str, Any]] = []
 
     def fake_open_secure(request: Any, *, timeout: float) -> _FakeCompletionResponse:
@@ -509,7 +520,7 @@ def test_llm_agent_read_sends_bare_model_unchanged(monkeypatch: Any) -> None:
     monkeypatch.setattr("kb.organization_digest.open_secure", fake_open_secure)
 
     assert llm_agent_read(_digest_packet()) == ["one", "two", "three"]
-    assert seen[0]["model"] == "deepseek/deepseek-v4-flash"
+    assert seen[0]["model"] == "deepseek/deepseek-r1:free"
 
 
 def test_llm_agent_read_logs_model_and_response_body_on_http_400(
@@ -517,7 +528,7 @@ def test_llm_agent_read_logs_model_and_response_body_on_http_400(
 ) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
-    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-r1:free")
     calls: list[str] = []
 
     def fake_open_secure(request: Any, *, timeout: float) -> Any:
@@ -529,7 +540,7 @@ def test_llm_agent_read_logs_model_and_response_body_on_http_400(
             None,
             io.BytesIO(
                 b'{"error":{"message":'
-                b'"deepseek/deepseek-v4-flash is not a valid model ID","code":400}}'
+                b'"deepseek/deepseek-r1:free is not a valid model ID","code":400}}'
             ),
         )
 
@@ -543,8 +554,8 @@ def test_llm_agent_read_logs_model_and_response_body_on_http_400(
     assert "HTTP 400" in caplog.text
     # Resolved and configured ids are both recorded, distinguishably.
     assert (
-        "for model deepseek/deepseek-v4-flash "
-        "(configured openrouter/deepseek/deepseek-v4-flash)"
+        "for model deepseek/deepseek-r1:free "
+        "(configured openrouter/deepseek/deepseek-r1:free)"
     ) in caplog.text
     # The response body reaches the log, so the next occurrence is diagnosable.
     assert "is not a valid model ID" in caplog.text
@@ -555,7 +566,7 @@ def test_llm_agent_read_redacts_credentials_in_logged_error_body(
 ) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
-    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-r1:free")
     # Synthesized fixture: matches the ctdl_ token shape, never a real value.
     leaked = "ctdl_unit_test_fake_token_1234567890"
     body = json.dumps(
@@ -577,7 +588,7 @@ def test_llm_agent_read_redacts_credentials_in_logged_error_body(
 def test_digest_falls_back_deterministically_when_llm_call_400s(monkeypatch: Any) -> None:
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
-    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/deepseek/deepseek-r1:free")
 
     def fake_open_secure(request: Any, *, timeout: float) -> Any:
         raise HTTPError(request.full_url, 400, "Bad Request", None, io.BytesIO(b"{}"))

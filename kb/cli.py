@@ -982,9 +982,9 @@ async def _search(args: argparse.Namespace) -> int:
         return _emit_no_token("search", as_json=getattr(args, "json", False))
     from kb.search_format import (
         apply_query_ranking,
-        compact_search_payload_for_agent,
         is_docs_mode_query,
         is_spec_mode_query,
+        prepare_search_payload_for_agent,
         query_terms,
         shape_search_payload,
     )
@@ -1071,7 +1071,7 @@ async def _search(args: argparse.Namespace) -> int:
 
     shaped = shape_search_payload(raw, **shape_kw)
     if getattr(args, "json", False):
-        _print_json(compact_search_payload_for_agent(shaped))
+        _print_json(prepare_search_payload_for_agent(raw))
         return 0
 
     # Human view: always apply filters; for API/spec or docs/token queries also
@@ -1099,7 +1099,7 @@ async def _search(args: argparse.Namespace) -> int:
 async def _search_local(args: argparse.Namespace) -> int:
     from kb.agent_workflows import normalize_local_search_results
     from kb.search_format import (
-        compact_search_payload_for_agent,
+        prepare_search_payload_for_agent,
         search_query_clarification,
         shape_search_payload,
     )
@@ -1111,7 +1111,7 @@ async def _search_local(args: argparse.Namespace) -> int:
             {"results": [], **clarification},
             **_shape_kwargs(args),
         )
-        _print_json(compact_search_payload_for_agent(shaped))
+        _print_json(prepare_search_payload_for_agent(shaped))
         return 0
 
     kb = Citadel.from_env()
@@ -1128,7 +1128,7 @@ async def _search_local(args: argparse.Namespace) -> int:
 
     payload = normalize_local_search_results(results)
     shaped = shape_search_payload(payload, **_shape_kwargs(args))
-    _print_json(compact_search_payload_for_agent(shaped))
+    _print_json(prepare_search_payload_for_agent(shaped))
     return 0 if shaped.get("ok") else 1
 
 

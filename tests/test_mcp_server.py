@@ -1423,7 +1423,7 @@ def test_search_genuine_empty_is_a_normal_mcp_result() -> None:
 
     result = run_tool(create_mcp_server(EmptySearchClient()), "citadel_search", "absent", None)
 
-    assert result == {"results": []}
+    assert result == {"results": [], "ok": True}
 
 
 def test_get_document_removes_duplicate_content_fields() -> None:
@@ -1730,13 +1730,16 @@ def test_search_compaction_leaves_unexpected_shapes_alone() -> None:
     """
     from kb.mcp_server import _compact_search_for_agent
 
-    assert _compact_search_for_agent({"results": []}) == {"results": []}
+    assert _compact_search_for_agent({"results": []}) == {
+        "results": [],
+        "ok": True,
+    }
     assert _compact_search_for_agent({"sections": None}) == {"sections": None}
     assert _compact_search_for_agent("not a dict") == "not a dict"
     assert _compact_search_for_agent(None) is None
 
 
-def test_search_compaction_suppresses_unscored_zero_overlap_candidates() -> None:
+def test_search_compaction_keeps_unscored_zero_overlap_semantic_candidate() -> None:
     from kb.mcp_server import _compact_search_for_agent
 
     payload = {
@@ -1749,9 +1752,8 @@ def test_search_compaction_suppresses_unscored_zero_overlap_candidates() -> None
 
     compacted = _compact_search_for_agent(payload)
 
-    assert compacted["results"] == []
-    assert compacted["answerable"] is False
-    assert compacted["suppressed_result_count"] == 1
+    assert [item["id"] for item in compacted["results"]] == ["noise"]
+    assert compacted["answerable"] is True
 
 
 def test_search_compaction_rejects_forged_trust_tier() -> None:
@@ -1947,7 +1949,19 @@ def test_search_truncates_oversized_hit_text_and_says_so(monkeypatch: Any) -> No
     from kb.mcp_server import _compact_search_for_agent
 
     long_text = "\n".join(f"line {i} of the document body" for i in range(400))
-    payload = {"results": [{"id": "doc-1", "text": long_text}], "sections": {}}
+    payload = {
+        "results": [
+            {
+                "id": "chunk-1",
+                "document_id": "doc-1",
+                "text": long_text,
+                "_citadel": {
+                    "retrieval": {"document_drilldown_available": True}
+                },
+            }
+        ],
+        "sections": {},
+    }
 
     compacted = _compact_search_for_agent(payload)
     hit = compacted["results"][0]
@@ -1956,8 +1970,26 @@ def test_search_truncates_oversized_hit_text_and_says_so(monkeypatch: Any) -> No
     assert hit["text_truncated"] is True
     assert hit["text_full_chars"] == len(long_text)
     # The escape hatch has to be actionable, so the id must survive.
-    assert hit["id"] == "doc-1"
+    assert hit["id"] == "chunk-1"
     assert "citadel_get_document" in hit["text_hint"]
+    assert "`document_id`" in hit["text_hint"]
+
+
+def test_search_truncation_does_not_advertise_unavailable_drilldown(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", raising=False)
+    from kb.mcp_server import _compact_search_for_agent
+
+    long_text = "\n".join(f"line {i} of the document body" for i in range(400))
+    compacted = _compact_search_for_agent(
+        {"results": [{"id": "opaque-1", "text": long_text}]}
+    )
+
+    hit = compacted["results"][0]
+    assert hit["text_truncated"] is True
+    assert "unavailable" in hit["text_hint"]
+    assert "citadel_get_document" not in hit["text_hint"]
 
 
 def test_search_leaves_short_hits_and_honours_the_override(monkeypatch: Any) -> None:

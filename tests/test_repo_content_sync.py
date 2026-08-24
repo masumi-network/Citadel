@@ -392,6 +392,88 @@ async def test_all_text_sync_fails_closed_when_one_repository_errors(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_all_text_sync_reports_unreadable_and_oversized_files_as_unretained(
+    tmp_path: Path,
+) -> None:
+    class PartialRetentionClient(FakeRepoContentClient):
+        def fetch_file_text(
+            self, full_name: str, path: str, *, ref: str
+        ) -> RepoContentFile | None:
+            if path == "README.md":
+                return None
+            return super().fetch_file_text(full_name, path, ref=ref)
+
+    config = CitadelConfig(
+        repo_content_sync_all_text=True,
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_tree_extensions=(),
+        repo_content_sync_max_files_per_repo=0,
+        repo_content_sync_max_bytes_per_file=256,
+        repo_content_sync_run_improve=False,
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+    )
+    client = PartialRetentionClient()
+    client.files["masumi-network/sokosumi-cli/skills/sokosumi/SKILL.md"]["content"] = (
+        "x" * 257
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+    status = await syncer.status()
+
+    assert result["ok"] is False
+    assert result["reason"] == "repository_content_retention_incomplete"
+    assert result["retention_complete"] is False
+    assert result["files_unretained"] == 2
+    assert result["files_skipped_by_reason"] == {
+        "too_large": 1,
+        "unsupported_encoding": 1,
+    }
+    assert status["retention_complete"] is False
+    assert status["unretained_files"] == 2
+
+
+@pytest.mark.asyncio
+async def test_all_text_sync_reports_security_blocked_file_as_unretained(
+    tmp_path: Path,
+) -> None:
+    config = CitadelConfig(
+        repo_content_sync_all_text=True,
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_tree_extensions=(),
+        repo_content_sync_max_files_per_repo=0,
+        repo_content_sync_run_improve=False,
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+    )
+    client = FakeRepoContentClient()
+    client.files["masumi-network/sokosumi-cli/README.md"]["content"] = (
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+    status = await syncer.status()
+
+    assert result["ok"] is False
+    assert result["reason"] == "repository_content_retention_incomplete"
+    assert result["retention_complete"] is False
+    assert result["files_blocked"] == 1
+    assert result["files_unretained"] == 1
+    assert status["retention_complete"] is False
+    assert status["unretained_files"] == 1
+
+
+@pytest.mark.asyncio
 async def test_repo_content_syncer_ingests_changed_files(tmp_path: Path) -> None:
     config = CitadelConfig(
         repo_content_sync_enabled=True,

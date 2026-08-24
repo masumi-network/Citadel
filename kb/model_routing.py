@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from typing import Any
 
 from kb.embedding_profile import LOCAL_PROFILE, active_embedding_profile
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ROUTINE_MODEL = "openrouter/free"
 DEFAULT_REASONING_MODEL = "openrouter/free"
@@ -126,18 +129,64 @@ def routing_enabled() -> bool:
     return _bool_env("CITADEL_MODEL_ROUTING_ENABLED", default=True)
 
 
+def normalize_free_openrouter_model(
+    value: str | None,
+    *,
+    litellm: bool = False,
+) -> str | None:
+    """Return one free OpenRouter model id in direct or LiteLLM form."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    direct = value.strip()
+    lowered = direct.lower()
+    if lowered.startswith("openrouter/") and lowered != "openrouter/free":
+        remainder = direct[len("openrouter/") :]
+        if "/" in remainder:
+            direct = remainder
+            lowered = direct.lower()
+    if lowered != "openrouter/free" and (
+        not lowered.endswith(":free") or "/" not in direct
+    ):
+        return None
+    return f"openrouter/{direct}" if litellm else direct
+
+
+def enforce_free_openrouter_model(
+    value: str | None,
+    *,
+    fallback: str,
+    litellm: bool = False,
+) -> str:
+    """Use the configured model only when OpenRouter marks it as free."""
+
+    normalized = normalize_free_openrouter_model(value, litellm=litellm)
+    if normalized is not None:
+        return normalized
+    if isinstance(value, str) and value.strip():
+        logger.warning("Ignoring non-free OpenRouter model override: %s", value.strip())
+    return fallback
+
+
 def model_for_task(task: str) -> str:
     """Resolve a bare OpenRouter model id for a direct application task."""
 
-    if not routing_enabled():
-        return _env("CITADEL_LLM_MODEL") or DEFAULT_REASONING_MODEL
-
     normalized = task.strip().lower()
+    fallback = DEFAULT_ROUTINE_MODEL
+    configured: str | None
+    if not routing_enabled():
+        configured = _env("CITADEL_LLM_MODEL")
+        fallback = DEFAULT_REASONING_MODEL
+        return enforce_free_openrouter_model(configured, fallback=fallback)
     if normalized in {"research", "digest"}:
-        return _env("CITADEL_LLM_MODEL_RESEARCH") or DEFAULT_RESEARCH_MODEL
-    if normalized in {"reasoning", "self_improve"}:
-        return _env("CITADEL_LLM_MODEL_REASONING") or DEFAULT_REASONING_MODEL
-    return _env("CITADEL_LLM_MODEL_ROUTINE") or DEFAULT_ROUTINE_MODEL
+        configured = _env("CITADEL_LLM_MODEL_RESEARCH")
+        fallback = DEFAULT_RESEARCH_MODEL
+    elif normalized in {"reasoning", "self_improve"}:
+        configured = _env("CITADEL_LLM_MODEL_REASONING")
+        fallback = DEFAULT_REASONING_MODEL
+    else:
+        configured = _env("CITADEL_LLM_MODEL_ROUTINE")
+    return enforce_free_openrouter_model(configured, fallback=fallback)
 
 
 def _auto_cost_tier(task: str) -> str:
@@ -194,27 +243,24 @@ def _clear_cognee_embedding_caches() -> None:
 
 
 def configure_cognee_model_routes() -> dict[str, str]:
-    """Set free-first Cognee routes without overwriting operator LLM values.
-
-    Cognee expects the ``openrouter/`` LiteLLM prefix. Its stages use the
-    OpenRouter free router by default. Operators can override them through the
-    normal ``LLM_*_MODEL`` variables.
-    """
+    """Set free-only Cognee routes in LiteLLM form."""
 
     routes: dict[str, str] = {}
-    if routing_enabled():
-        defaults = {
-            "LLM_PROVIDER": "custom",
-            "LLM_MODEL": DEFAULT_COGNEE_EXTRACTION_MODEL,
-            "LLM_EXTRACTION_MODEL": DEFAULT_COGNEE_EXTRACTION_MODEL,
-            "LLM_SUMMARIZATION_MODEL": DEFAULT_COGNEE_SUMMARIZATION_MODEL,
-            "LLM_QUERY_MODEL": DEFAULT_COGNEE_QUERY_MODEL,
-        }
-        for name, value in defaults.items():
-            os.environ.setdefault(name, value)
-        if os.environ.get("LLM_MODEL", "").strip().lower().startswith("openrouter/"):
-            os.environ["LLM_PROVIDER"] = "custom"
-        routes.update({name: os.environ[name] for name in defaults})
+    model_defaults = {
+        "LLM_MODEL": DEFAULT_COGNEE_EXTRACTION_MODEL,
+        "LLM_EXTRACTION_MODEL": DEFAULT_COGNEE_EXTRACTION_MODEL,
+        "LLM_SUMMARIZATION_MODEL": DEFAULT_COGNEE_SUMMARIZATION_MODEL,
+        "LLM_QUERY_MODEL": DEFAULT_COGNEE_QUERY_MODEL,
+    }
+    os.environ["LLM_PROVIDER"] = "custom"
+    routes["LLM_PROVIDER"] = "custom"
+    for name, fallback in model_defaults.items():
+        os.environ[name] = enforce_free_openrouter_model(
+            os.environ.get(name),
+            fallback=fallback,
+            litellm=True,
+        )
+        routes[name] = os.environ[name]
 
     profile = active_embedding_profile()
     if profile.name == LOCAL_PROFILE:

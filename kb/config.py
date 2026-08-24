@@ -223,7 +223,9 @@ class CitadelConfig:
     github_sync_dataset: str = "masumi-network"
     github_sync_session: str = "masumi-github-daily"
     github_sync_state_path: str = ".citadel/github_sync_state.json"
-    github_sync_max_repos: int = 100
+    # Zero means every repository page. An organization sync must not silently
+    # stop at the first 100 repositories.
+    github_sync_max_repos: int = 0
     github_sync_max_events: int = 50
     github_sync_max_commits_per_repo: int = 5
     github_sync_max_pull_requests_per_repo: int = 5
@@ -376,7 +378,7 @@ class CitadelConfig:
             github_sync_dataset=os.getenv("CITADEL_GITHUB_SYNC_DATASET", "masumi-network"),
             github_sync_session=os.getenv("CITADEL_GITHUB_SYNC_SESSION", "masumi-github-daily"),
             github_sync_state_path=_github_state_path(os.getenv("CITADEL_GITHUB_SYNC_STATE_PATH")),
-            github_sync_max_repos=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_REPOS"), default=100),
+            github_sync_max_repos=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_REPOS"), default=0),
             github_sync_max_events=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_EVENTS"), default=50),
             github_sync_max_commits_per_repo=_int(
                 os.getenv("CITADEL_GITHUB_SYNC_MAX_COMMITS_PER_REPO"),

@@ -30,6 +30,7 @@ from kb.repository_update import (
     GitHubEvent,
     GitHubPullRequest,
     GitHubRepo,
+    RepositoryDailyUpdate,
     compose_repository_update,
     filter_changed_repos,
     format_digest,
@@ -59,6 +60,104 @@ STATE_VERSION = 1
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _github_activity_sources(update: RepositoryDailyUpdate) -> list[dict[str, Any]]:
+    """Render each GitHub change as one stable retained source."""
+    sources: list[dict[str, Any]] = []
+
+    def add(
+        *,
+        kind: str,
+        identity: str,
+        repo: str,
+        title: str,
+        url: str,
+        fields: list[tuple[str, Any]],
+    ) -> None:
+        lines = [
+            f"# GitHub {kind}: {title}",
+            "",
+            f"- **Repository:** {repo}",
+            f"- **Activity type:** {kind}",
+        ]
+        lines.extend(
+            f"- **{label}:** {value}"
+            for label, value in fields
+            if value is not None and str(value).strip()
+        )
+        lines.extend([f"- **URL:** {url}", ""])
+        sources.append(
+            {
+                "data": "\n".join(lines),
+                "source_key": f"github:{kind}:{repo}:{identity}",
+                "source_locator": url,
+                "repo": repo,
+                "kind": kind,
+            }
+        )
+
+    for repo in update.changed_repos:
+        add(
+            kind="repository",
+            identity="metadata",
+            repo=repo.full_name,
+            title=f"{repo.full_name} metadata update",
+            url=repo.html_url,
+            fields=[
+                ("Pushed", repo.pushed_at),
+                ("Updated", repo.updated_at),
+                ("Language", repo.language),
+                ("Description", repo.description),
+            ],
+        )
+    for commit in update.new_commits:
+        add(
+            kind="commit",
+            identity=commit.sha,
+            repo=commit.repo,
+            title=f"{commit.sha[:12]} {commit.message}",
+            url=commit.html_url,
+            fields=[
+                ("Actor", commit.author_login or commit.author_name),
+                ("Occurred", commit.authored_at),
+                ("Commit", commit.sha),
+                ("Message", commit.message),
+            ],
+        )
+    for pull_request in update.recent_pull_requests:
+        add(
+            kind="pull-request",
+            identity=str(pull_request.number),
+            repo=pull_request.repo,
+            title=f"{pull_request.repo}#{pull_request.number} {pull_request.title}",
+            url=pull_request.html_url,
+            fields=[
+                ("Actor", pull_request.user_login),
+                ("State", pull_request.state),
+                ("Draft", str(pull_request.draft).lower()),
+                ("Created", pull_request.created_at),
+                ("Updated", pull_request.updated_at),
+                ("Merged", pull_request.merged_at),
+            ],
+        )
+    for event in update.new_events:
+        repo_url = f"https://github.com/{event.repo}"
+        add(
+            kind="event",
+            identity=event.id,
+            repo=event.repo,
+            title=f"{event.type} by {event.actor}",
+            url=repo_url,
+            fields=[
+                ("Actor", event.actor),
+                ("Occurred", event.created_at),
+                ("Event ID", event.id),
+                ("Event", event.type),
+                ("Summary", event.summary),
+            ],
+        )
+    return sources
 
 
 def _matches_any(name: str, patterns: tuple[str, ...]) -> bool:
@@ -239,8 +338,12 @@ class GitHubOrgSyncer:
         self.client = client or GitHubOrgClient(token=self.config.github_token)
         self.learning = learning or LearningProcess(citadel)
         self.state_path = Path(state_path or self.config.github_sync_state_path)
-        self.max_repos = max_repos or self.config.github_sync_max_repos
-        self.max_events = max_events or self.config.github_sync_max_events
+        self.max_repos = (
+            self.config.github_sync_max_repos if max_repos is None else max_repos
+        )
+        self.max_events = (
+            self.config.github_sync_max_events if max_events is None else max_events
+        )
         self.max_commits_per_repo = (
             self.config.github_sync_max_commits_per_repo
             if max_commits_per_repo is None
@@ -294,6 +397,15 @@ class GitHubOrgSyncer:
             "tracked_repositories": len(state.get("repos") or {}),
             "seen_events": len(state.get("seen_event_ids") or []),
             "tracked_commit_repositories": len(state.get("commits") or {}),
+            "last_activity_records_discovered": state.get(
+                "last_activity_records_discovered", 0
+            ),
+            "last_activity_records_retained": state.get(
+                "last_activity_records_retained", 0
+            ),
+            "last_activity_records_rejected": state.get(
+                "last_activity_records_rejected", 0
+            ),
             "authenticated": bool(getattr(self.client, "token", None)),
             "include_commits": self.include_commits,
             "include_private": self.include_private,
@@ -376,6 +488,9 @@ class GitHubOrgSyncer:
 
         ingest_result = None
         improve_result = None
+        activity_sources = _github_activity_sources(update)
+        retained_activity_count = 0
+        rejected_activity_sources: list[str] = []
         if should_ingest and not dry_run:
             outcome = await self.learning.learn(
                 update.digest,
@@ -394,17 +509,48 @@ class GitHubOrgSyncer:
             )
             ingest_result = outcome.ingest
             improve_result = outcome.improve
+            for source in activity_sources:
+                activity_outcome = await self.learning.learn(
+                    str(source["data"]),
+                    dataset=self.config.github_sync_dataset,
+                    session_id=self.config.github_sync_session,
+                    tags=[
+                        "github",
+                        "repository-activity",
+                        f"github-{source['kind']}",
+                        str(source["repo"]),
+                    ],
+                    source_key=str(source["source_key"]),
+                    source_locator=str(source["source_locator"]),
+                    media_type="text/markdown",
+                    capture_actor_id="github-sync",
+                    capture_run_id=checked_at,
+                    operation="github_sync_activity",
+                    tier="light",
+                    allow_llm=False,
+                    detect_conflicts=False,
+                    defer_cognify=True,
+                )
+                if any(result.accepted for result in activity_outcome.all_ingests):
+                    retained_activity_count += 1
+                else:
+                    rejected_activity_sources.append(str(source["source_key"]))
 
         ingest_rejected = bool(
             should_ingest
             and not dry_run
             and (ingest_result is None or not ingest_result.accepted)
         )
+        activity_ingest_rejected = bool(
+            should_ingest and not dry_run and rejected_activity_sources
+        )
         sync_reason: str | None = None
         if security_blocked:
             sync_reason = "github_digest_security_blocked"
         elif ingest_rejected:
             sync_reason = "github_digest_ingest_rejected"
+        elif activity_ingest_rejected:
+            sync_reason = "github_activity_ingest_rejected"
         sync_ok = sync_reason is None
 
         if not dry_run:
@@ -415,6 +561,9 @@ class GitHubOrgSyncer:
                     "last_attempt_at": checked_at,
                     "last_run_ok": sync_ok,
                     "last_run_reason": sync_reason,
+                    "last_activity_records_discovered": len(activity_sources),
+                    "last_activity_records_retained": retained_activity_count,
+                    "last_activity_records_rejected": len(rejected_activity_sources),
                 }
             )
             if sync_ok:
@@ -482,11 +631,24 @@ class GitHubOrgSyncer:
             ],
             "active_repositories": update.active_repositories[:20],
             "recent_events": [event.summary_dict() for event in update.new_events[:20]],
-            "ingested": bool(ingest_result and ingest_result.accepted),
+            "ingested": bool(ingest_result and ingest_result.accepted)
+            or retained_activity_count > 0,
+            "digest_ingested": bool(ingest_result and ingest_result.accepted),
+            "activity_records_discovered": len(activity_sources),
+            "activity_records_retained": retained_activity_count,
+            "activity_records_rejected": len(rejected_activity_sources),
             "ingest_reason": (
                 "blocked_by_security_scan"
                 if security_blocked
-                else getattr(ingest_result, "reason", None)
+                else (
+                    getattr(ingest_result, "reason", None)
+                    if ingest_rejected
+                    else (
+                        "github_activity_ingest_rejected"
+                        if activity_ingest_rejected
+                        else getattr(ingest_result, "reason", None)
+                    )
+                )
             ),
             "improved": bool(improve_result)
             and not (isinstance(improve_result, dict) and improve_result.get("ok") is False),

@@ -6,6 +6,7 @@ Keeps a stable hit schema agents can filter on without a second fetch.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -71,6 +72,11 @@ REPO_CONTENT_HEADER_PARSE_RE = re.compile(
 LINEAR_HEADER_PARSE_RE = re.compile(
     r"\A\s*#\s+Linear[ \t]+(?P<issue>[A-Z][A-Z0-9]*-\d+):[ \t]*(?P<title>[^\n]+?)[ \t]*(?:\n|\Z)"
 )
+GITHUB_ACTIVITY_HEADER_PARSE_RE = re.compile(
+    r"\A\s*#\s+GitHub[ \t]+(?P<activity_type>repository|commit|pull-request|event):"
+    r"[ \t]*(?P<title>[^\n]+?)[ \t]*(?:\n|\Z)",
+    re.IGNORECASE,
+)
 # One "- **Key:** value" bullet from the block right under the Linear title.
 LINEAR_HEADER_FIELD_RE = re.compile(r"^-\s+\*\*(?P<key>[A-Za-z ]+):\*\*[ \t]*(?P<value>.+?)[ \t]*$")
 # Bound both user-controlled parts so fullmatch cannot backtrack across
@@ -130,6 +136,15 @@ def source_key_descriptor(source_key: Any) -> dict[str, str]:
             and all(char.isprintable() for char in path)
         ):
             return {"source": "repo-content", "repo": repo, "path": path}
+    if source_key.startswith("github:"):
+        parts = source_key.split(":", 3)
+        if (
+            len(parts) == 4
+            and parts[1] in {"repository", "commit", "pull-request", "event"}
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", parts[2])
+            and parts[3]
+        ):
+            return {"source": "github-activity", "repo": parts[2]}
     return {}
 
 
@@ -178,6 +193,29 @@ def parse_content_header(text: Any, *, chunk_index: Any = None) -> dict[str, str
         # rather than guessed.
         if header_path.lower().startswith(repo.lower() + "/"):
             parsed["path"] = header_path[len(repo) + 1 :]
+        return parsed
+    match = GITHUB_ACTIVITY_HEADER_PARSE_RE.match(text)
+    if match:
+        parsed = {
+            "kind": "github-activity",
+            "activity_type": match.group("activity_type").lower(),
+            "title": match.group("title"),
+        }
+        rest = text[match.end() :].splitlines()
+        index = 0
+        while index < len(rest) and not rest[index].strip():
+            index += 1
+        while index < len(rest):
+            field = LINEAR_HEADER_FIELD_RE.match(rest[index])
+            if not field:
+                break
+            key = field.group("key").strip().lower()
+            value = field.group("value")
+            if key == "repository":
+                parsed["repo"] = value
+            elif key == "url":
+                parsed["source_url"] = value
+            index += 1
         return parsed
     match = LINEAR_HEADER_PARSE_RE.match(text)
     if match:
@@ -509,6 +547,12 @@ def infer_doc_type(item: dict[str, Any]) -> str:
         return DOC_TYPE_TRACE
     text = _hit_text(item)
     lowered = text.lower()
+    header = parse_content_header(
+        _first_str(item.get("text"), item.get("content"), item.get("chunk"), item.get("body")),
+        chunk_index=_hit_chunk_index(item),
+    )
+    if header.get("kind") == "github-activity":
+        return DOC_TYPE_ACTIVITY
     # Checked before the ambient patterns, and only this one may be, because it
     # is structural rather than keyword-based: the full Repository/Source/Commit/
     # Blob header is written by the repo-content syncer and cannot be produced by
@@ -1772,6 +1816,7 @@ def compact_search_payload_for_agent(payload: Any) -> Any:
         compacted.pop("sections", None)
     results = compacted.get("results")
     if isinstance(results, list):
+        compacted.setdefault("ok", True)
         result_datasets: list[str] = []
         for result in results:
             if not isinstance(result, dict):
@@ -1799,19 +1844,72 @@ def compact_search_payload_for_agent(payload: Any) -> Any:
             compacted["answerable"] = True
     if compacted.get("took_ms") is None:
         compacted.pop("took_ms", None)
-    relevance = payload.get("relevance")
-    if (
-        isinstance(relevance, dict)
-        and relevance.get("no_lexical_match") is True
-        and relevance.get("retriever_scores_available") is not True
-    ):
-        results = compacted.get("results")
-        if isinstance(results, list) and results:
-            compacted["suppressed_result_count"] = len(results)
-            compacted["results"] = []
-            compacted.pop("result_datasets", None)
-            compacted["answerable"] = False
     return compacted
+
+
+def _agent_hit_text_limit() -> int:
+    raw = os.getenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", "").strip()
+    if not raw:
+        return 2000
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2000
+    return max(0, value)
+
+
+def _truncate_agent_hit_text(hit: dict[str, Any], limit: int) -> dict[str, Any]:
+    text = hit.get("text")
+    if not isinstance(text, str) or limit <= 0 or len(text) <= limit:
+        return hit
+    window = text[:limit]
+    cut = window.rfind("\n")
+    if cut < limit // 2:
+        cut = limit
+    trimmed = dict(hit)
+    trimmed["text"] = window[:cut]
+    trimmed["text_truncated"] = True
+    trimmed["text_full_chars"] = len(text)
+    if hit.get("document_drilldown_available") is True:
+        id_field = "document_id" if hit.get("document_id") else "id"
+        trimmed["text_hint"] = (
+            f"Truncated. Call citadel_get_document with this hit's `{id_field}` "
+            "for the full text."
+        )
+    else:
+        trimmed["text_hint"] = (
+            "Truncated. Full document drilldown is unavailable for this result."
+        )
+    return trimmed
+
+
+def prepare_search_payload_for_agent(payload: Any) -> Any:
+    """Return the same bounded public search payload for CLI and MCP."""
+
+    if not isinstance(payload, dict):
+        return payload
+    prepared = dict(payload)
+    results = payload.get("results")
+    if isinstance(results, list):
+        public_results = [
+            {
+                key: value
+                for key, value in shape_public_search_hit(hit, index=index).items()
+                if value is not None
+                and value != ""
+                and value != []
+                and (value != {} or key == "_citadel")
+            }
+            for index, hit in enumerate(results)
+            if is_search_content_hit(hit)
+        ]
+        limit = _agent_hit_text_limit()
+        prepared["results"] = (
+            [_truncate_agent_hit_text(hit, limit) for hit in public_results]
+            if limit > 0
+            else public_results
+        )
+    return compact_search_payload_for_agent(prepared)
 
 
 def _compact_search_hit_for_agent(hit: dict[str, Any]) -> dict[str, Any]:

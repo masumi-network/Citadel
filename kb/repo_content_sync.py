@@ -996,6 +996,7 @@ class RepoContentSyncer:
             "last_run_reason": state.get("last_run_reason"),
             "content_scan_complete": state.get("content_scan_complete"),
             "retention_complete": state.get("retention_complete"),
+            "unretained_files": state.get("files_unretained", 0),
             "repos_errored": state.get("repos_errored", 0),
             "tracked_files": len(files) - len(refused),
             "refused_files": len(refused),
@@ -1615,7 +1616,14 @@ class RepoContentSyncer:
             if reason.startswith("ingest_rejected:")
             or reason.startswith("refused_unchanged:")
         )
-        retention_complete = rejected_files == 0
+        unreadable_or_oversized_files = sum(
+            int(skip_totals.get(reason) or 0)
+            for reason in ("unsupported_encoding", "too_large")
+        )
+        unretained_files = (
+            rejected_files + unreadable_or_oversized_files + blocked_files
+        )
+        retention_complete = unretained_files == 0
         all_repos_errored = (
             bool(repo_results)
             and len(repos_errored) == len(repo_results)
@@ -1659,6 +1667,7 @@ class RepoContentSyncer:
             state["content_scan_complete"] = not coverage_incomplete
             state["retention_complete"] = retention_complete
             state["files_rejected"] = rejected_files
+            state["files_unretained"] = unretained_files
             state["repos_errored"] = len(repos_errored)
             state["files"] = tracked
             self._save_state(state)
@@ -1694,6 +1703,7 @@ class RepoContentSyncer:
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
             "files_rejected": rejected_files,
+            "files_unretained": unretained_files,
             "files_blocked": blocked_files,
             "files_blocked_by_reason": blocked_reasons,
             "improved": improved,

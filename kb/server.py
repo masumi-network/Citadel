@@ -2953,9 +2953,9 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     own ``.id`` (which is the document id, not the chunk id) will never match.
     Use ``document_id`` for anything that needs to key off the document.
 
-    The field is optional, not guaranteed: the GitHub digest fallback above
-    (``search_github_sync_state``) supplies its own ``id`` and no
-    ``document_id``, because a digest section is not a stored document.
+    The field is optional. The GitHub digest fallback supplies its own ``id``
+    and no ``document_id``. Its retained digest section still resolves through
+    ``/api/documents/{id}`` when the search result marks drilldown available.
     """
     raw_id = result.get("id")
     if isinstance(raw_id, str) and raw_id.strip():
@@ -3216,16 +3216,10 @@ def select_public_search_page(
     if ranked_query:
         candidates = apply_query_ranking(candidates, query, mode=mode)
 
-    # A fixed Central reservation made low-coverage personal notes displace a
-    # stronger Central match. When the page has observable lexical evidence,
-    # relevance must decide the page globally. Keep dataset diversity only when
-    # the retriever gives us no lexical signal; semantic order is then the only
-    # honest evidence and a Central sample prevents one dataset from hiding the
-    # others completely.
     terms = query_terms(query)
-    lexical_evidence = any(
-        hit_term_coverage(candidate, terms)[0] > 0 for candidate in candidates
-    )
+    coverages = [hit_term_coverage(candidate, terms)[0] for candidate in candidates]
+    lexical_evidence = any(coverage > 0 for coverage in coverages)
+
     def hit_dataset(hit: dict[str, Any]) -> Any:
         envelope = hit.get("_citadel")
         return envelope.get("dataset") if isinstance(envelope, dict) else None
@@ -3233,10 +3227,10 @@ def select_public_search_page(
     if limit <= 1 or len(datasets) <= 1:
         selected = candidates[:limit]
     elif ranked_query and lexical_evidence:
+        # Search reads every allowed dataset. It does not promise one result
+        # from each dataset. Preserve Central only when its lexical evidence is
+        # at least as strong as the weakest selected result.
         selected = candidates[:limit]
-        # Seat searches resolve as [seat, Central, session-traces]. Preserve
-        # the Central read contract without moving a stronger Central match
-        # below weaker personal results.
         central_dataset = datasets[1]
         if selected and not any(
             hit_dataset(hit) == central_dataset for hit in selected
@@ -3246,7 +3240,10 @@ def select_public_search_page(
                 None,
             )
             if central is not None:
-                selected[-1] = central
+                central_coverage = hit_term_coverage(central, terms)[0]
+                weakest_coverage = hit_term_coverage(selected[-1], terms)[0]
+                if central_coverage >= weakest_coverage:
+                    selected[-1] = central
     else:
         reserve = min(max(1, limit // 5), limit - 1)
         primary_dataset = datasets[0]
@@ -6631,11 +6628,12 @@ async def source_document(
         cognee_document = dict(cognee_document)
         owner_node_ids = cognee_document.pop("dataset_node_ids", None) or [document_id]
         lifecycle_dataset: str | None = None
-        if (
+        document_metadata = cognee_document.get("metadata")
+        if isinstance(document_metadata, dict) and (
             cognee_document.get("source_type") == "lifecycle"
-            and isinstance(cognee_document.get("metadata"), dict)
+            or document_metadata.get("storage_type") == "lifecycle"
         ):
-            candidate_dataset = cognee_document["metadata"].get("dataset")
+            candidate_dataset = document_metadata.get("dataset")
             if isinstance(candidate_dataset, str) and candidate_dataset.strip():
                 lifecycle_dataset = candidate_dataset.strip()
         lifecycle_visible = lifecycle_dataset is not None and dataset_visible_to(

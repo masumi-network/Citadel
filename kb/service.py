@@ -46,6 +46,7 @@ from kb.search_format import (
     exact_linear_issue_identifier,
     hit_term_coverage,
     linear_issue_identifier,
+    parse_content_header,
     query_terms,
 )
 from kb.security_scan import (
@@ -1978,6 +1979,49 @@ class Citadel:
         instead of the assembled parent. Passed through only when set so
         clients implementing the plain signature keep working.
         """
+        def retained_document(source: Any, content: str) -> dict[str, Any]:
+            header = parse_content_header(content, chunk_index=0)
+            source_type = str(header.get("kind") or "lifecycle")
+            title = str(header.get("title") or source.source_key)
+            issue = header.get("issue")
+            if isinstance(issue, str) and issue:
+                title = f"{issue}: {title}"
+            source_locator = source.source_locator or header.get("source_url")
+            provenance: dict[str, Any] = {
+                "source": source_type,
+                "basis": "content-header",
+            }
+            for key in ("repo", "path", "issue", "commit", "activity_type"):
+                value = header.get(key)
+                if isinstance(value, str) and value:
+                    provenance[key] = value
+            if isinstance(source_locator, str) and source_locator:
+                provenance["source_url"] = source_locator
+            metadata: dict[str, Any] = {
+                "retrieval_mode": "retained_source",
+                "storage_type": "lifecycle",
+                "dataset": source.dataset,
+                "source_key": source.source_key,
+                "media_type": source.media_type,
+                "content_sha256": source.content_sha256,
+            }
+            if isinstance(source_locator, str) and source_locator:
+                metadata["source_locator"] = source_locator
+            return {
+                "id": document_id,
+                "document_id": document_id,
+                "source": source_type,
+                "source_type": source_type,
+                "title": title,
+                "source_locator": source_locator,
+                "url": source_locator,
+                "provenance": provenance,
+                "body": content,
+                "content": content,
+                "text": content,
+                "metadata": metadata,
+            }
+
         if self.lifecycle_store is not None and not chunk_scope:
             source = self.lifecycle_store.get_source_revision(document_id)
             if source is not None:
@@ -1988,20 +2032,7 @@ class Citadel:
                 except (UnicodeDecodeError, LifecycleNotFoundError):
                     pass
                 else:
-                    return {
-                        "id": document_id,
-                        "document_id": document_id,
-                        "source": "lifecycle",
-                        "source_type": "lifecycle",
-                        "body": content,
-                        "content": content,
-                        "text": content,
-                        "metadata": {
-                            "retrieval_mode": "retained_source",
-                            "dataset": source.dataset,
-                            "source_key": source.source_key,
-                        },
-                    }
+                    return retained_document(source, content)
         cognee_error: Exception | None = None
         try:
             if chunk_scope:
@@ -2026,20 +2057,7 @@ class Citadel:
             if cognee_error is not None:
                 raise cognee_error
             return None
-        return {
-            "id": document_id,
-            "document_id": document_id,
-            "source": "lifecycle",
-            "source_type": "lifecycle",
-            "body": content,
-            "content": content,
-            "text": content,
-            "metadata": {
-                "retrieval_mode": "retained_source",
-                "dataset": source.dataset,
-                "source_key": source.source_key,
-            },
-        }
+        return retained_document(source, content)
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
         """Owner node ids for the drill-down visibility rule, body not assembled.

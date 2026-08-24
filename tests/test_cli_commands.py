@@ -388,6 +388,22 @@ def test_search_local_contextless_query_does_not_start_provider(
     assert payload["answerable"] is False
 
 
+def test_search_local_json_uses_bounded_agent_payload(monkeypatch, capsys) -> None:
+    class FakeCitadel:
+        async def search(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [{"id": "chunk-1", "text": "match\n" + ("x" * 3000)}]
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", lambda: FakeCitadel())
+
+    rc = asyncio.run(_search(_search_args(query="match", local=True)))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    hit = payload["results"][0]
+    assert len(hit["text"]) < 3006
+
+
 def test_search_human_output_explains_context_required(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     monkeypatch.setattr(
@@ -450,6 +466,42 @@ def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
     assert captured["path"] == "docs/MIP-003"
     assert captured["source"] == "repo-content"
     assert captured["canonical_only"] is True
+
+
+def test_search_json_matches_mcp_agent_payload(monkeypatch, capsys) -> None:
+    from kb.mcp_server import _compact_search_for_agent
+
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    long_text = "relevant source\n" + ("x" * 3000)
+    hit = {
+        "id": "chunk-1",
+        "document_id": "document-1",
+        "qa_id": "qa-1",
+        "text": long_text,
+        "repo": "masumi-network/sokosumi",
+        "path": "README.md",
+        "_citadel": {
+            "dataset": "masumi-network",
+            "document_endpoint": "/api/documents/document-1",
+            "provenance": {
+                "source": "repo-content",
+                "repo": "masumi-network/sokosumi",
+                "path": "README.md",
+            },
+            "retrieval": {"document_drilldown_available": True},
+        },
+    }
+    payload = {
+        "results": [hit],
+        "sections": {"central": [hit], "session_traces": [], "node": []},
+        "search_id": "search-1",
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *args, **kwargs: payload)
+
+    rc = asyncio.run(_search(_search_args(query="relevant source", json=True)))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == _compact_search_for_agent(payload)
 
 
 def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:

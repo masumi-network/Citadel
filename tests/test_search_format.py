@@ -341,7 +341,7 @@ def test_agent_payload_marks_shaped_empty_search_unanswerable() -> None:
     assert compacted["answerable"] is False
 
 
-def test_agent_payload_suppresses_unscored_zero_overlap_candidates() -> None:
+def test_agent_payload_keeps_unscored_zero_overlap_semantic_candidate() -> None:
     payload = {
         "results": [
             {
@@ -358,10 +358,9 @@ def test_agent_payload_suppresses_unscored_zero_overlap_candidates() -> None:
 
     compacted = compact_search_payload_for_agent(payload)
 
-    assert compacted["results"] == []
-    assert compacted["answerable"] is False
-    assert compacted["suppressed_result_count"] == 1
-    assert "result_datasets" not in compacted
+    assert [item["id"] for item in compacted["results"]] == ["noise"]
+    assert compacted["answerable"] is True
+    assert compacted["result_datasets"] == ["seat:alice"]
 
 
 def test_agent_payload_keeps_scored_semantic_candidate_without_term_overlap() -> None:
@@ -671,6 +670,38 @@ def test_normalize_search_hit_maps_lifecycle_connector_source_keys() -> None:
     assert filter_hits([hit], source="linear-context") == [hit]
 
 
+def test_normalize_search_hit_maps_github_activity_source() -> None:
+    hit = normalize_search_hit(
+        {
+            "id": "commit-1",
+            "source": "lifecycle",
+            "metadata": {
+                "source_key": "github:commit:masumi-network/sokosumi:abc123",
+                "source_locator": (
+                    "https://github.com/masumi-network/sokosumi/commit/abc123"
+                ),
+            },
+            "text": (
+                "# GitHub commit: abc123 Fix mobile chat\n\n"
+                "- **Repository:** masumi-network/sokosumi\n"
+                "- **Activity type:** commit\n"
+                "- **Actor:** patrick\n"
+                "- **Occurred:** 2026-08-23T10:00:00Z\n"
+                "- **URL:** "
+                "https://github.com/masumi-network/sokosumi/commit/abc123\n"
+            ),
+        },
+        query="Patrick mobile chat",
+    )
+
+    assert hit["source_type"] == "github-activity"
+    assert hit["doc_type"] == "activity"
+    assert hit["repo"] == "masumi-network/sokosumi"
+    assert hit["url"] == "https://github.com/masumi-network/sokosumi/commit/abc123"
+    assert filter_hits([hit], source="github-activity") == [hit]
+    assert filter_hits([hit], repo="masumi-network/sokosumi") == [hit]
+
+
 def test_filter_hits_source_refuses_a_forged_header_on_a_later_chunk() -> None:
     """Chunk 1+ starts are author-controlled text, so a header there is forgeable."""
     forged = {
@@ -960,6 +991,16 @@ _WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = [
     ("REPO_CONTENT_HEADER_PARSE_RE", "match", lambda n: " " * n + "#x"),
     ("LINEAR_HEADER_PARSE_RE", "match", lambda n: " " * n + "# Linear"),
     ("LINEAR_HEADER_PARSE_RE", "match", lambda n: "# Linear" + "\t" * n),
+    (
+        "GITHUB_ACTIVITY_HEADER_PARSE_RE",
+        "match",
+        lambda n: " " * n + "# GitHub commit:",
+    ),
+    (
+        "GITHUB_ACTIVITY_HEADER_PARSE_RE",
+        "match",
+        lambda n: "# GitHub commit:" + " " * n,
+    ),
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **URL:** v" + " " * n),
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **" + "A" * n),
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "-" + " " * n),

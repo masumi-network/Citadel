@@ -142,8 +142,8 @@ the same document, or compares a hit's id against a fetched document's `.id`, mu
 `Citadel.search` falls back to when the `github_sync` dataset returns no indexed results,
 emits digest sections with their own `id` and no `document_id` at all; `with_result_id`
 leaves any hit that already supplies an `id` untouched. A consumer must treat the field as
-optional: when it is absent the hit is not a stored document, so key on `id`, and expect
-`/api/documents/{id}` not to resolve it.
+optional. When it is absent, key on `id`. Follow `/api/documents/{id}` only when the hit
+marks document drilldown available.
 
 Errors: renders an error card with a Retry button that re-submits the form. 401/403 land
 there too, with no sign-in prompt. Empty: an empty-state card that lists

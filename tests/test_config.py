@@ -114,6 +114,16 @@ def test_linear_issue_sync_defaults_to_unbounded_listing() -> None:
     assert CitadelConfig().linear_sync_max_issues == 0
 
 
+def test_github_org_sync_defaults_to_unbounded_repository_listing(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_GITHUB_SYNC_MAX_REPOS", raising=False)
+
+    assert CitadelConfig().github_sync_max_repos == 0
+    assert CitadelConfig.from_env(env_file=None).github_sync_max_repos == 0
+
+    monkeypatch.setenv("CITADEL_GITHUB_SYNC_MAX_REPOS", "25")
+    assert CitadelConfig.from_env(env_file=None).github_sync_max_repos == 25
+
+
 def test_linear_context_sync_env(monkeypatch) -> None:
     monkeypatch.setenv("CITADEL_LINEAR_SYNC_MAX_CONTEXT_RECORDS", "7")
     monkeypatch.setenv("CITADEL_LINEAR_SYNC_INCLUDE_ARCHIVED", "true")

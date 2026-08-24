@@ -4960,6 +4960,61 @@ def test_search_selection_prefers_relevant_central_hit_over_dataset_reservation(
     ]
 
 
+def test_search_selection_drops_unscored_zero_overlap_hits_from_mixed_page() -> None:
+    candidates = [
+        {
+            "id": "exact-node",
+            "text": "Patrick is working on checkout retries",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "partial-node",
+            "text": "checkout retry notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "central-noise",
+            "text": "unrelated Linear issue",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, fetched, matched = server_module.select_public_search_page(
+        candidates,
+        query="Patrick checkout retries",
+        datasets=["seat:sarthi", "masumi-network", SESSION_TRACES_DATASET],
+        limit=2,
+    )
+
+    assert fetched == 3
+    assert matched == 3
+    assert [hit["id"] for hit in selected] == ["exact-node", "partial-node"]
+
+
+def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
+    candidates = [
+        {
+            "id": "lexical",
+            "text": "checkout retry notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "semantic",
+            "text": "payment recovery design",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, _fetched, _matched = server_module.select_public_search_page(
+        candidates,
+        query="checkout retries",
+        datasets=["seat:sarthi", "masumi-network"],
+        limit=2,
+    )
+
+    assert [hit["id"] for hit in selected] == ["lexical", "semantic"]
+
+
 def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
     # #50: at capacity the Node returns a 429 + Retry-After backpressure contract.
     client = authed_client("test-reader")
@@ -5868,17 +5923,23 @@ class LifecycleDocumentCitadel(FakeCitadel):
     documents = {
         "central-lifecycle": {
             "id": "central-lifecycle",
-            "source": "lifecycle",
-            "source_type": "lifecycle",
+            "source": "linear-issue",
+            "source_type": "linear-issue",
             "body": "central retained source",
-            "metadata": {"dataset": "masumi-network"},
+            "metadata": {
+                "dataset": "masumi-network",
+                "storage_type": "lifecycle",
+            },
         },
         "alice-lifecycle": {
             "id": "alice-lifecycle",
-            "source": "lifecycle",
-            "source_type": "lifecycle",
+            "source": "repo-content",
+            "source_type": "repo-content",
             "body": "alice retained source",
-            "metadata": {"dataset": "seat:alice"},
+            "metadata": {
+                "dataset": "seat:alice",
+                "storage_type": "lifecycle",
+            },
         },
     }
 

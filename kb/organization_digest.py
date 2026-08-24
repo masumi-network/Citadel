@@ -9,16 +9,12 @@ from urllib.request import Request
 
 from kb.config import CitadelConfig
 from kb.llm_enrichment import DEFAULT_LLM_MODEL, openrouter_api_key, openrouter_endpoint
-from kb.model_routing import plugins_for_model
+from kb.model_routing import enforce_free_openrouter_model, plugins_for_model
 from kb.retry import run_with_retries
 from kb.secure_http import open_secure
 from kb.security_scan import redact_secrets
 
 logger = logging.getLogger(__name__)
-
-# litellm's provider-routing form ("openrouter/<vendor>/<model>") that cognee
-# requires in LLM_MODEL. OpenRouter's own API rejects it as a model id.
-LITELLM_OPENROUTER_PREFIX = "openrouter/"
 
 _OPERATION = "organization_digest.llm_agent_read"
 _MODEL_LOG_CHARS = 160
@@ -165,12 +161,8 @@ def resolve_openrouter_model() -> tuple[str, str]:
 
     ``configured`` is the raw value of CITADEL_ORG_DIGEST_LLM_MODEL,
     LLM_MODEL, CITADEL_LLM_MODEL, or the enrichment default, in that order.
-    ``sent`` is the id
-    actually sent to OpenRouter: cognee needs LLM_MODEL in litellm form
-    ("openrouter/<vendor>/<model>"), which OpenRouter's own API rejects, so
-    that prefix is stripped here instead of asking operators to keep two
-    variables in sync. A native id whose vendor happens to be "openrouter"
-    (no second slash, e.g. "openrouter/auto") is left untouched.
+    ``sent`` is a free OpenRouter id. Cognee's LiteLLM provider prefix is
+    removed. Paid and automatic router ids fall back to ``openrouter/free``.
     """
     configured = (
         os.getenv("CITADEL_ORG_DIGEST_LLM_MODEL")
@@ -178,11 +170,10 @@ def resolve_openrouter_model() -> tuple[str, str]:
         or os.getenv("CITADEL_LLM_MODEL")
         or DEFAULT_LLM_MODEL
     ).strip()
-    sent = configured
-    if sent.lower().startswith(LITELLM_OPENROUTER_PREFIX):
-        remainder = sent[len(LITELLM_OPENROUTER_PREFIX) :]
-        if "/" in remainder:
-            sent = remainder
+    sent = enforce_free_openrouter_model(
+        configured,
+        fallback=DEFAULT_LLM_MODEL,
+    )
     return configured, sent
 
 
@@ -297,7 +288,7 @@ def llm_agent_read(packet: dict[str, Any]) -> list[str] | None:
     configured, model = resolve_openrouter_model()
     if model != configured:
         logger.info(
-            "%s using OpenRouter model %s (stripped litellm provider prefix from %s)",
+            "%s using allowed free OpenRouter model %s (configured %s)",
             _OPERATION,
             _redacted_line(model, length=_MODEL_LOG_CHARS),
             _redacted_line(configured, length=_MODEL_LOG_CHARS),

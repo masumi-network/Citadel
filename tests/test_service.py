@@ -601,6 +601,22 @@ async def test_exact_linear_search_uses_retained_identity_without_vector(
     assert missing == []
     assert fake.recall_calls == 0
     assert fake.cognify_calls == []
+    document = await kb.get_document(exact.source_revision_id)
+    assert document is not None
+    assert document["title"] == "SOK-563: Subscription credits"
+    assert document["source_type"] == "linear-issue"
+    assert document["source_locator"] == (
+        "https://linear.app/masumi/issue/SOK-563/subscription-credits"
+    )
+    assert document["provenance"] == {
+        "source": "linear-issue",
+        "basis": "content-header",
+        "issue": "SOK-563",
+        "source_url": (
+            "https://linear.app/masumi/issue/SOK-563/subscription-credits"
+        ),
+    }
+    assert document["metadata"]["storage_type"] == "lifecycle"
 
 
 @pytest.mark.asyncio

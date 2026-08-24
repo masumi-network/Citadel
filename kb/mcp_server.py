@@ -23,9 +23,7 @@ from kb.capture_config import load_capture_config
 from kb.retry import run_with_retries
 from kb.search_format import (
     compact_document_payload_for_agent,
-    compact_search_payload_for_agent,
-    is_search_content_hit,
-    shape_public_search_hit,
+    prepare_search_payload_for_agent,
 )
 from kb.security_scan import redact_secrets
 from kb.session_trace_distill import (
@@ -617,57 +615,6 @@ def _clamp_top_k(top_k: int) -> int:
     return min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
 
 
-def _max_hit_text_chars() -> int:
-    """How much of one hit's text an agent gets inline.
-
-    Measured on production: hits carry 6,220 to 7,319 characters each, so the
-    documented default ``top_k=10`` returned 209,109 characters and exceeded the
-    tool-result budget outright. Dropping the duplicate ``sections`` copy alone
-    still left ~103,000, so a cap is needed as well as the dedup.
-
-    2,000 characters is roughly 500 words: enough to judge whether a hit answers
-    the question, and the full text is one ``citadel_get_document`` call away
-    using the ``id`` that stays on every hit. Env-overridable, and 0 disables
-    truncation for a caller that genuinely wants everything.
-    """
-    raw = os.getenv("CITADEL_MCP_MAX_HIT_TEXT_CHARS", "").strip()
-    if not raw:
-        return 2000
-    try:
-        value = int(raw)
-    except ValueError:
-        return 2000
-    return max(0, value)
-
-
-def _truncate_hit_text(hit: Any, limit: int) -> Any:
-    """Trim one hit's text, telling the caller it happened and what it lost.
-
-    Silent truncation would be worse than the bloat: an agent that cannot tell a
-    3,000-word document from its first 500 words will summarise the fragment and
-    present it as the whole. The flags exist so it can decide to fetch the rest.
-    """
-    if not isinstance(hit, dict):
-        return hit
-    text = hit.get("text")
-    if not isinstance(text, str) or limit <= 0 or len(text) <= limit:
-        return hit
-    # Cut at a line boundary when one is close, so a truncated chunk does not
-    # end mid-token and read as corrupted.
-    window = text[:limit]
-    cut = window.rfind("\n")
-    if cut < limit // 2:
-        cut = limit
-    trimmed = dict(hit)
-    trimmed["text"] = window[:cut]
-    trimmed["text_truncated"] = True
-    trimmed["text_full_chars"] = len(text)
-    trimmed["text_hint"] = (
-        "Truncated. Call citadel_get_document with this hit's `id` for the full text."
-    )
-    return trimmed
-
-
 def _compact_search_for_agent(payload: Any) -> Any:
     """Drop the `sections` hit copies before handing a search back to an agent.
 
@@ -685,46 +632,7 @@ def _compact_search_for_agent(payload: Any) -> Any:
     The grouping is preserved as counts under ``section_counts``, so a caller
     can still see the Central/node split without a second copy of the text.
     """
-    if not isinstance(payload, dict):
-        return payload
-    compacted = dict(payload)
-
-    sections = payload.get("sections")
-    if isinstance(sections, dict):
-        compacted["section_counts"] = {
-            str(name): (
-                sum(1 for item in items if is_search_content_hit(item))
-                if isinstance(items, list)
-                else 0
-            )
-            for name, items in sections.items()
-        }
-        compacted.pop("sections", None)
-
-    # Dedup alone was not enough. At the documented default top_k=10 the response
-    # was still ~103,000 characters, because each hit carries 6,000 to 7,000 of
-    # its own.
-    limit = _max_hit_text_chars()
-    results = payload.get("results")
-    if isinstance(results, list):
-        public_results = [
-            {
-                key: value
-                for key, value in shape_public_search_hit(hit, index=index).items()
-                if value is not None
-                and value != ""
-                and value != []
-                and (value != {} or key == "_citadel")
-            }
-            for index, hit in enumerate(results)
-            if is_search_content_hit(hit)
-        ]
-        compacted["results"] = (
-            [_truncate_hit_text(hit, limit) for hit in public_results]
-            if limit > 0
-            else public_results
-        )
-    return compact_search_payload_for_agent(compacted)
+    return prepare_search_payload_for_agent(payload)
 
 
 def _audit_query(view: str, limit: int) -> str:
@@ -1184,13 +1092,10 @@ def create_mcp_server(
         document-scoped (dedup across hits from the same document, citing "this
         document", matching against citadel_ingest's result).
 
-        ``document_id`` is NOT on every hit. Hits that are not indexed corpus
-        documents supply their own ``id`` and no ``document_id`` — today that is
-        the github_sync digest fallback, which serves sections of the stored
-        sync digest when the github_sync dataset returns no indexed results. On
-        a hit with no ``document_id``, treat the hit's ``id`` as the unit and do
-        not synthesise a document id; ``citadel_get_document`` will not resolve
-        it either.
+        ``document_id`` is not on every hit. The github_sync digest fallback
+        supplies its own ``id``. Use that ``id`` for drilldown when
+        ``document_drilldown_available`` is true. Do not synthesize a document
+        id.
         """
         payload: dict[str, Any] = {
             "query": _require_non_empty(query, "query"),
@@ -1244,9 +1149,9 @@ def create_mcp_server(
         this response's ``document.id`` should not expect them to match; the
         hit's ``document_id`` is the one that will.
 
-        Only ids that came from the indexed corpus resolve. A hit with no
-        ``document_id`` (the github_sync digest fallback) is not a stored
-        document and has nothing to fetch here.
+        A retained github_sync digest fallback can resolve by its hit ``id``
+        without a ``document_id``. Follow the hit's
+        ``document_drilldown_available`` flag.
         """
         normalized_id = _require_non_empty(document_id, "document_id")
         result = await _call_async(
