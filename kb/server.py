@@ -1030,6 +1030,15 @@ class IngestBody(BaseModel):
 # are typed or composed by an agent, never built by concatenating file content,
 # so 2000 leaves a pasted paragraph plenty of room while still being a bound.
 MAX_SEARCH_QUERY_LENGTH = 2000
+CONNECTOR_SOURCE_FILTERS = frozenset(
+    {
+        "github-activity",
+        "repo-content",
+        "linear-issue",
+        "linear-context",
+        "linear-workspace",
+    }
+)
 
 
 class SearchBody(BaseModel):
@@ -1037,7 +1046,8 @@ class SearchBody(BaseModel):
     dataset: str | None = None
     session_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=100)
-    # Client/MCP filters — applied after retrieval so telemetry sees the same view.
+    # Client/MCP filters. Source identity scopes retained retrieval before
+    # ranking, then every filter is applied again at the public boundary.
     types: list[str] | None = None
     repo: str | None = Field(default=None, max_length=200)
     path: str | None = Field(default=None, max_length=400)
@@ -1049,11 +1059,31 @@ class SearchBody(BaseModel):
     exclude_ambient: bool = False
     mode: str | None = Field(default=None, max_length=32)
 
-    def cleaned_types(self) -> list[str] | None:
+    def _cleaned_type_values(self) -> list[str]:
         if not self.types:
-            return None
+            return []
         cleaned = [str(item).strip()[:64] for item in self.types if str(item).strip()]
-        return cleaned[:20] or None
+        return cleaned[:20]
+
+    def cleaned_types(self) -> list[str] | None:
+        cleaned = self._cleaned_type_values()
+        if self.cleaned_source() is not None:
+            cleaned = [
+                item
+                for item in cleaned
+                if item.lower() not in CONNECTOR_SOURCE_FILTERS
+            ]
+        return cleaned or None
+
+    def cleaned_source(self) -> str | None:
+        if isinstance(self.source, str) and self.source.strip():
+            return self.source.strip().lower()
+        aliases = {
+            item.lower()
+            for item in self._cleaned_type_values()
+            if item.lower() in CONNECTOR_SOURCE_FILTERS
+        }
+        return next(iter(aliases)) if len(aliases) == 1 else None
 
     def cleaned_mode(self) -> str | None:
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -1068,11 +1098,7 @@ class SearchBody(BaseModel):
             "types": self.cleaned_types(),
             "repo": self.repo.strip() if isinstance(self.repo, str) and self.repo.strip() else None,
             "path": self.path.strip() if isinstance(self.path, str) and self.path.strip() else None,
-            "source": (
-                self.source.strip().lower()
-                if isinstance(self.source, str) and self.source.strip()
-                else None
-            ),
+            "source": self.cleaned_source(),
             "canonical_only": bool(self.canonical_only),
             "exclude_ambient": exclude_ambient,
         }
@@ -2248,9 +2274,17 @@ async def search_across_datasets(
     sessions: Mapping[str, str | None],
     top_k: int,
     allow_vector_recall: bool = True,
+    repo: str | None = None,
+    path: str | None = None,
+    source: str | None = None,
 ) -> list[tuple[str, Any]]:
     if search_query_requires_context(query):
         return []
+    source_scope = {
+        key: value
+        for key, value in {"repo": repo, "path": path, "source": source}.items()
+        if value is not None
+    }
     # Query every dataset before merging so a result-rich primary node can never
     # short-circuit (and thereby silently drop) Central. The primary still wins
     # dedup. Final ranking, filtering, and dataset reservation happen after public
@@ -2267,6 +2301,7 @@ async def search_across_datasets(
                 dataset=dataset,
                 session_id=sessions.get(dataset),
                 top_k=top_k,
+                **source_scope,
                 **({"allow_vector_recall": False} if not allow_vector_recall else {}),
             )
             for dataset in datasets
@@ -8244,6 +8279,9 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 datasets=search_datasets,
                 sessions=search_sessions,
                 top_k=fetch_k,
+                repo=filter_kw.get("repo"),
+                path=filter_kw.get("path"),
+                source=filter_kw.get("source"),
             )
         except QdrantProviderError as exc:
             await mesh_state.record_error(

@@ -62,6 +62,11 @@ Use a source filter only when the connector is known:
 - `linear-context`
 - `linear-workspace`
 
+Use `source="repo-content"`, not `types=["repo-content"]`. `types` filters the
+content shape (`spec`, `skill`, `canonical-docs`, `issue`, `activity`,
+`session-trace`, or `other`). A single legacy connector value in `types` is
+normalized for compatibility, but new agent calls must use `source`.
+
 ## CLI path
 
 ```bash

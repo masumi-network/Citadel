@@ -508,6 +508,82 @@ async def test_lifecycle_search_returns_only_current_searchable_revision(
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_vector_search_scopes_repo_path_and_source_before_recall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class ScopedVectorCognee(FakeCognee):
+        recall_kwargs: dict[str, Any] | None = None
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_kwargs = dict(kwargs)
+            return [
+                {
+                    "id": f"chunk-{document_id}",
+                    "document_id": document_id,
+                    "text": query,
+                }
+                for document_id in kwargs["document_ids"]
+            ]
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = ScopedVectorCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    target = await kb.ingest(
+        "Sokosumi personal assistant entry point.",
+        source_key="github:masumi-network/sokosumi:path:src/assistant.ts",
+    )
+    wrong_path = await kb.ingest(
+        "Sokosumi general documentation.",
+        source_key="github:masumi-network/sokosumi:path:README.md",
+    )
+    wrong_repo = await kb.ingest(
+        "Another assistant entry point.",
+        source_key="github:masumi-network/other:path:src/assistant.ts",
+    )
+    activity = await kb.ingest(
+        "Assistant integration pull request activity.",
+        source_key="github:pull-request:masumi-network/sokosumi:123",
+    )
+    for accepted in (target, wrong_path, wrong_repo, activity):
+        await kb.wait_for_lifecycle_operation(accepted.projection_job_id)
+
+    results = await kb.search(
+        "assistant",
+        repo="masumi-network/sokosumi",
+        path="src/assistant.ts",
+        source="repo-content",
+        top_k=5,
+        allow_lexical_fallback=False,
+    )
+
+    assert fake.recall_kwargs is not None
+    assert fake.recall_kwargs["document_ids"] == [target.source_revision_id]
+    assert fake.recall_kwargs["allow_generative"] is False
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
+
+    activity_results = await kb.search(
+        "assistant",
+        source="github-activity",
+        top_k=5,
+        allow_lexical_fallback=False,
+    )
+
+    assert fake.recall_kwargs["document_ids"] == [activity.source_revision_id]
+    assert fake.recall_kwargs["allow_generative"] is False
+    assert [result["document_id"] for result in activity_results] == [
+        activity.source_revision_id
+    ]
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_search_uses_retained_source_without_vector_or_llm(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -562,6 +638,87 @@ async def test_lifecycle_search_uses_retained_source_without_vector_or_llm(
     assert document is not None
     assert document["text"] == "The deterministic lexical baseline is available before vector indexing."
     assert document["metadata"]["dataset"] == "seat:alice"
+
+
+@pytest.mark.asyncio
+async def test_repo_scoped_retained_search_filters_before_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    monkeypatch.setattr(kb, "_start_lifecycle_projection", lambda: False)
+    for index in range(12):
+        await kb.ingest(
+            "Personal assistant integration reference. " * 5,
+            source_key=(
+                f"github:masumi-network/aaa-noise-{index:02d}:path:README.md"
+            ),
+            source_locator=(
+                f"https://github.com/masumi-network/aaa-noise-{index:02d}/blob/main/README.md"
+            ),
+            defer_cognify=True,
+        )
+    target = await kb.ingest(
+        "Sokosumi connects its personal assistant through the coworker API.",
+        source_key="github:masumi-network/sokosumi:path:README.md",
+        source_locator="https://github.com/masumi-network/sokosumi/blob/main/README.md",
+        defer_cognify=True,
+    )
+
+    results = await kb.search(
+        "personal assistant",
+        repo="masumi-network/sokosumi",
+        top_k=5,
+    )
+
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
+    assert results[0]["metadata"]["source_key"] == (
+        "github:masumi-network/sokosumi:path:README.md"
+    )
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_issue_token_respects_explicit_repo_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    monkeypatch.setattr(kb, "_start_lifecycle_projection", lambda: False)
+    target = await kb.ingest(
+        "SOK-829 implements the personal assistant entry point.",
+        source_key="github:masumi-network/sokosumi:path:src/assistant.ts",
+        source_locator=(
+            "https://github.com/masumi-network/sokosumi/blob/main/src/assistant.ts"
+        ),
+        defer_cognify=True,
+    )
+
+    results = await kb.search(
+        "SOK-829",
+        repo="masumi-network/sokosumi",
+        top_k=5,
+    )
+
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
 
 
 @pytest.mark.asyncio

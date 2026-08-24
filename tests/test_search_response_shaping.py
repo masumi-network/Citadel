@@ -27,6 +27,7 @@ from kb.search_format import (
     shape_public_search_hit,
 )
 from kb.server import (
+    SearchBody,
     app,
     result_provenance,
     search_across_datasets,
@@ -78,9 +79,11 @@ class PageCitadel:
     def __init__(self, results: list[dict[str, Any]]) -> None:
         self.results = list(results)
         self.requested_top_k: list[int] = []
+        self.requested_kwargs: list[dict[str, Any]] = []
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         self.requested_top_k.append(kwargs["top_k"])
+        self.requested_kwargs.append(dict(kwargs))
         return self.results[: kwargs["top_k"]]
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
@@ -1052,13 +1055,20 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
 
     response = client.post(
         "/search",
-        json={"query": "widget docs", "top_k": 5, "repo": "masumi-network/widget"},
+        json={
+            "query": "widget docs",
+            "top_k": 5,
+            "repo": "masumi-network/widget",
+            "types": ["repo-content"],
+        },
     )
 
     assert response.status_code == 200
     body = response.json()
     # Over-fetched: the retriever was asked for more than top_k candidates.
     assert citadel.requested_top_k == [15]
+    assert citadel.requested_kwargs[0]["repo"] == "masumi-network/widget"
+    assert citadel.requested_kwargs[0]["source"] == "repo-content"
     # And the page is FULL, not the 0 of 5 the old order of operations left.
     assert len(body["results"]) == 5
     assert all(
@@ -1069,6 +1079,19 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
     assert body["filtering"]["candidates_matched"] == 7
     assert body["filtering"]["returned"] == 5
     assert body["filtering"]["applied"]["repo"] == "masumi-network/widget"
+    assert body["filtering"]["applied"]["source"] == "repo-content"
+    assert "types" not in body["filtering"]["applied"]
+
+
+def test_multiple_connector_type_aliases_fail_closed() -> None:
+    """Ambiguous legacy connector aliases must not broaden the search."""
+    filters = SearchBody(
+        query="recent work",
+        types=["repo-content", "linear-issue"],
+    ).filter_kwargs()
+
+    assert filters["source"] is None
+    assert filters["types"] == ["repo-content", "linear-issue"]
 
 
 def test_empty_retrieval_with_filters_gets_dataset_help_not_filter_blame() -> None:

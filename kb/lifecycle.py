@@ -19,7 +19,12 @@ import sqlite3
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from kb.search_format import linear_issue_url_identifier, parse_content_header
+from kb.search_format import (
+    linear_issue_url_identifier,
+    parse_content_header,
+    repo_filter_matches,
+    source_key_descriptor,
+)
 
 
 LIFECYCLE_SCHEMA_VERSION = 1
@@ -42,6 +47,29 @@ def _lexical_passages(text: str) -> tuple[str, ...]:
             for start in range(0, len(paragraph), _LEXICAL_PASSAGE_CHARS)
         )
     return tuple(passages)
+
+
+def _source_scope_matches(
+    source_key: str,
+    capture_metadata: Mapping[str, Any],
+    *,
+    repo: str | None = None,
+    path: str | None = None,
+    source: str | None = None,
+) -> bool:
+    parent_key = capture_metadata.get("lifecycle_parent_source_key")
+    descriptor = source_key_descriptor(
+        parent_key if isinstance(parent_key, str) and parent_key else source_key
+    )
+    if source and descriptor.get("source", "").lower() != source.strip().lower():
+        return False
+    if repo and not repo_filter_matches(descriptor.get("repo"), repo):
+        return False
+    if path:
+        needle = path.replace("**/", "").replace("/**", "").replace("*", "").lower()
+        if needle and needle not in descriptor.get("path", "").lower():
+            return False
+    return True
 
 
 class LifecycleError(RuntimeError):
@@ -1627,12 +1655,16 @@ class LifecycleStore:
         projection_version: str,
         config_digest: str,
         backend: str = "vector",
+        repo: str | None = None,
+        path: str | None = None,
+        source: str | None = None,
     ) -> tuple[str, ...]:
         """Enumerate current provider ids eligible for one scoped retrieval."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT DISTINCT revision.source_revision_id
+                SELECT DISTINCT revision.source_revision_id, revision.source_key,
+                                revision.capture_metadata_json
                 FROM source_heads AS head
                 JOIN source_revisions AS revision
                   ON revision.source_revision_id = head.source_revision_id
@@ -1658,7 +1690,20 @@ class LifecycleStore:
                     backend,
                 ),
             ).fetchall()
-        return tuple(str(row[0]) for row in rows)
+        if not any((repo, path, source)):
+            return tuple(str(row["source_revision_id"]) for row in rows)
+        scoped: list[str] = []
+        for row in rows:
+            capture_metadata = json.loads(row["capture_metadata_json"])
+            if _source_scope_matches(
+                str(row["source_key"]),
+                capture_metadata,
+                repo=repo,
+                path=path,
+                source=source,
+            ):
+                scoped.append(str(row["source_revision_id"]))
+        return tuple(scoped)
 
     def lexical_search(
         self,
@@ -1668,6 +1713,9 @@ class LifecycleStore:
         projection: ProjectionRequest,
         top_k: int = 10,
         required_linear_issue_identifier: str | None = None,
+        repo: str | None = None,
+        path: str | None = None,
+        source: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search retained current heads without a vector or language model."""
         if not query.strip():
@@ -1716,12 +1764,20 @@ class LifecycleStore:
 
         ranked: list[tuple[float, str, int, dict[str, Any]]] = []
         for row in rows:
+            revision = self._source_revision(row)
+            capture_metadata = revision.capture_metadata
+            if not _source_scope_matches(
+                revision.source_key,
+                capture_metadata,
+                repo=repo,
+                path=path,
+                source=source,
+            ):
+                continue
             try:
                 text = bytes(row["retained_content"]).decode("utf-8")
             except UnicodeDecodeError:
                 continue
-            revision = self._source_revision(row)
-            capture_metadata = revision.capture_metadata
             if required_linear_issue_identifier is not None:
                 tags = capture_metadata.get("tags")
                 required_tag = f"linear:{required_linear_issue_identifier}".casefold()

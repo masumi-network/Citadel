@@ -629,7 +629,7 @@ Citadel stores only the SHA-256 hash. The raw token is shown once at creation.
 |---|---|---|
 | `citadel_discovery` | Safe agent discovery metadata: MCP endpoint, skill hashes, tool policy | — |
 | `citadel_session` | Show authenticated role, actor, capabilities | — |
-| `citadel_search` | Search the Organization Vault; each hit includes `_citadel` provenance, hash, and retrieval metadata. Automatically records implicit search telemetry (query, top hit ids/scores/trust, latency) into the feedback mesh — non-blocking. Response may include `search_id` + `feedback` hint. | `query`, `dataset?`, `session_id?`, `top_k?` |
+| `citadel_search` | Search the Organization Vault; each hit includes `_citadel` provenance, hash, and retrieval metadata. Automatically records implicit search telemetry (query, top hit ids/scores/trust, latency) into the feedback mesh. Use `source=repo-content` for a connector; `types` filters content shapes. | `query`, `dataset?`, `session_id?`, `top_k?`, `source?`, `repo?`, `path?`, `types?`, `mode?` |
 | `citadel_get_document` | Fetch a full document by a search hit `id` when `_citadel.retrieval.document_drilldown_available` is true. A later 404 means the source changed, the caller scope changed, or the result is stale. | `document_id` |
 | `citadel_get_mesh` | Runtime-activity projection snapshot. Under ADR-0009 this is **caller-scoped** for non-admin tokens: other seats' document/query activity is stripped; seat presence (roster + counts) stays universal | — |
 | `citadel_list_sources` | Source-learning, GitHub sync, index status | — |

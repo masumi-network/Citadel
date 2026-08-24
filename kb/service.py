@@ -1085,6 +1085,9 @@ class Citadel:
         top_k: int = 10,
         allow_lexical_fallback: bool = True,
         allow_vector_recall: bool = True,
+        repo: str | None = None,
+        path: str | None = None,
+        source: str | None = None,
     ) -> list[Any]:
         top_k = min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
         target_dataset = dataset or self.config.default_dataset
@@ -1099,7 +1102,14 @@ class Citadel:
         if self.lifecycle_store is not None:
             lifecycle_projection = self._lifecycle_projection_request()
             exact_issue = exact_linear_issue_identifier(query)
-            if exact_issue and allow_lexical_fallback:
+            exact_linear_lookup = (
+                exact_issue
+                and allow_lexical_fallback
+                and not repo
+                and not path
+                and (not source or source.strip().lower() == "linear-issue")
+            )
+            if exact_linear_lookup:
                 try:
                     lexical_results = await asyncio.to_thread(
                         self.lifecycle_store.lexical_search,
@@ -1108,6 +1118,9 @@ class Citadel:
                         projection=lifecycle_projection,
                         top_k=top_k,
                         required_linear_issue_identifier=exact_issue,
+                        repo=repo,
+                        path=path,
+                        source=source,
                     )
                 except Exception as exc:  # noqa: BLE001 - exact lookup cannot degrade safely
                     logger.warning(
@@ -1138,6 +1151,9 @@ class Citadel:
                     generation_id=lifecycle_projection.generation_id,
                     projection_version=lifecycle_projection.projection_version,
                     config_digest=lifecycle_projection.config_digest,
+                    repo=repo,
+                    path=path,
+                    source=source,
                 )
             )
             recall_kwargs["document_ids"] = searchable_document_ids
@@ -1182,6 +1198,9 @@ class Citadel:
                         dataset=target_dataset,
                         projection=lifecycle_projection,
                         top_k=top_k,
+                        repo=repo,
+                        path=path,
+                        source=source,
                     )
                 except Exception as exc:  # noqa: BLE001 - vector results remain usable
                     logger.warning(

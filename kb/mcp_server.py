@@ -1077,6 +1077,12 @@ def create_mcp_server(
         ``unattested``). Token/asset-ID queries auto-boost docs; never treat vault
         hits as sole authority for Mainnet payment token units.
 
+        ``source`` selects a connector such as ``repo-content`` or
+        ``linear-issue``. ``types`` selects content shapes such as ``spec``,
+        ``skill``, ``canonical-docs``, ``issue``, or ``activity``. Do not put a
+        connector name in ``types``; the server normalizes one legacy connector
+        alias, but new calls should use ``source``.
+
         Each call automatically records implicit search telemetry (non-blocking)
         into the feedback mesh. Response may include ``search_id`` and a
         ``feedback`` hint for optional explicit ratings via citadel_record_feedback.
