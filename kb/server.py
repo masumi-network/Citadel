@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -94,6 +94,7 @@ from kb.search_format import (
     apply_query_ranking,
     best_match_window,
     compact_search_filters,
+    exact_linear_issue_identifier,
     filter_hits,
     hit_term_coverage,
     infer_content_hint,
@@ -102,10 +103,13 @@ from kb.search_format import (
     is_search_content_hit,
     is_docs_mode_query,
     is_spec_mode_query,
+    linear_issue_identifier,
     lexical_relevance_summary,
     parse_content_header,
     query_terms,
     shape_public_search_hit,
+    source_key_descriptor,
+    source_locator_from_result,
     token_asset_authority_warning,
 )
 from kb.security_scan import (
@@ -272,20 +276,44 @@ class _SearchSlot:
 
 async def _search_within_budget(
     citadel: Citadel, **kwargs: Any
-) -> tuple[list[tuple[str, Any]], bool]:
-    """Run search_across_datasets under the per-request time budget (#44).
+) -> tuple[list[tuple[str, Any]], bool, bool]:
+    """Run vector search under a bounded budget, then use lexical retrieval.
 
-    Returns (merged, timed_out). The HTTP boundary turns ``timed_out`` into a
-    typed 504 instead of misreporting an incomplete provider call as empty.
+    Returns ``(merged, timed_out, degraded)``. A provider timeout gets a
+    reserved lexical fallback budget. A fallback result is a successful,
+    degraded response. A timeout without a usable fallback remains a typed 504.
     """
+    total_budget = max(float(citadel.config.search_timeout_seconds), 0.001)
+    vector_budget = total_budget * 0.75
+    started = asyncio.get_running_loop().time()
     try:
         merged = await asyncio.wait_for(
             search_across_datasets(citadel, **kwargs),
-            timeout=citadel.config.search_timeout_seconds,
+            timeout=vector_budget,
         )
-        return merged, False
+        return merged, False, False
     except asyncio.TimeoutError:
-        return [], True
+        remaining = total_budget - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            return [], True, False
+        try:
+            fallback = await asyncio.wait_for(
+                search_across_datasets(
+                    citadel,
+                    **kwargs,
+                    allow_vector_recall=False,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            return [], True, False
+        except TypeError as exc:
+            # Keep the typed timeout contract for legacy test doubles and
+            # gateways that do not expose the vector-recall switch.
+            if "allow_vector_recall" not in str(exc):
+                raise
+            return [], True, False
+        return fallback, False, True
 
 mcp_server = create_mcp_server()
 mcp_app = mcp_server.streamable_http_app()
@@ -332,6 +360,20 @@ class _McpAcceptShim:
         await self.app({**scope, "headers": kept}, receive, send)
 
 
+def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> None:
+    """Resume lifecycle work across current and older gateway test doubles."""
+    resume = getattr(citadel, "resume_lifecycle_queue", None)
+    if not callable(resume):
+        return
+    try:
+        resume(include_deferred=include_deferred)
+    except TypeError as exc:
+        if include_deferred and "include_deferred" in str(exc):
+            resume()
+            return
+        raise
+
+
 async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
     """Run the evolve cycle every ``interval_seconds``: heavy stages in a
     subprocess, then cognify in-loop.
@@ -369,47 +411,55 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         await asyncio.sleep(delay)
         delay = float(interval_seconds)
         logger.info("Evolve scheduler: starting scheduled pass")
+        citadel = get_citadel()
+        pause = getattr(citadel, "pause_lifecycle_queue", None)
+        if callable(pause):
+            pause()
         # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
         # the writer lock so lifecycle cannot claim a lease and then wait inside
         # Cognee while this pass owns the graph.
-        async with get_citadel().cognee.maintenance():
-            writer_lock = getattr(
-                getattr(get_citadel(), "cognee", None), "writer_lock", None
-            )
-            acquired = False
-            try:
-                if writer_lock is not None:
-                    await writer_lock.acquire()
-                    acquired = True
-                # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
-                # A second process can never open the graph: cognee holds an exclusive
-                # OS file lock on cognee_graph_kuzu for the lifetime of whichever
-                # process opens it, and that is always this one. github_sync and
-                # linear_sync died on "Could not set lock on file" every hour because
-                # of it. Add-only for the duration so the per-ingest background
-                # cognify does not storm the writer lock; Phase 2 below cognifies once
-                # as the sole writer (#47).
-                with suppress_inline_cognify():
-                    code = await run_evolve_in_loop()
-                if code == 0:
-                    logger.info("Evolve scheduler: stages finished (exit=0)")
-                else:
-                    # A partial failure is the normal broken case, not an edge one:
-                    # the stage names are already on the "Evolve finished: ...
-                    # failed=..." line, so log at ERROR here to make the cycle
-                    # visibly bad rather than an INFO nobody reads (#89).
-                    logger.error(
-                        "Evolve scheduler: stages finished with failures (exit=%s) - "
-                        "see the 'Evolve finished' line above for which stages failed",
-                        code,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Evolve scheduler: stages failed")
-            finally:
-                if acquired:
-                    writer_lock.release()
+        try:
+            async with citadel.cognee.maintenance():
+                writer_lock = getattr(
+                    getattr(citadel, "cognee", None), "writer_lock", None
+                )
+                acquired = False
+                try:
+                    if writer_lock is not None:
+                        await writer_lock.acquire()
+                        acquired = True
+                    # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
+                    # A second process can never open the graph: cognee holds an exclusive
+                    # OS file lock on cognee_graph_kuzu for the lifetime of whichever
+                    # process opens it, and that is always this one. github_sync and
+                    # linear_sync died on "Could not set lock on file" every hour because
+                    # of it. Add-only for the duration so the per-ingest background
+                    # cognify does not storm the writer lock; Phase 2 below cognifies once
+                    # as the sole writer (#47).
+                    with suppress_inline_cognify():
+                        code = await run_evolve_in_loop()
+                    if code == 0:
+                        logger.info("Evolve scheduler: stages finished (exit=0)")
+                    else:
+                        # A partial failure is the normal broken case, not an edge one:
+                        # the stage names are already on the "Evolve finished: ...
+                        # failed=..." line, so log at ERROR here to make the cycle
+                        # visibly bad rather than an INFO nobody reads (#89).
+                        logger.error(
+                            "Evolve scheduler: stages finished with failures (exit=%s) - "
+                            "see the 'Evolve finished' line above for which stages failed",
+                            code,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Evolve scheduler: stages failed")
+                finally:
+                    if acquired:
+                        writer_lock.release()
+        except asyncio.CancelledError:
+            _resume_lifecycle_queue(citadel, include_deferred=True)
+            raise
         # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
         force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
             "1",
@@ -421,7 +471,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         try:
             # verify=True runs the end-to-end ingest+cognify+search canary and
             # records its verdict for /readyz (#27).
-            result = await get_citadel().cognify_dataset(force=force, verify=True)
+            result = await citadel.cognify_dataset(force=force, verify=True)
             verification = result.get("verification") or {}
             _record_canary_verdict(
                 ok=bool(result.get("ok")),
@@ -470,14 +520,10 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 # external ingest or the next pass. The lock is free and the
                 # suppression scope has ended by this point, and the call is a
                 # no-op when a drain is already running.
-                resume = getattr(get_citadel(), "resume_lifecycle_queue", None)
-                if callable(resume):
-                    try:
-                        resume()
-                    except Exception:
-                        logger.exception(
-                            "Evolve scheduler: post-pass projection resume failed"
-                        )
+                try:
+                    _resume_lifecycle_queue(citadel, include_deferred=True)
+                except Exception:
+                    logger.exception("Evolve scheduler: post-pass projection resume failed")
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
@@ -972,9 +1018,10 @@ class IngestBody(BaseModel):
     dataset: str | None = None
     tags: list[str] = Field(default_factory=list)
     session_id: str | None = None
-    # Seat and MCP writes must pass through Cognee before they are reported as
-    # searchable. The legacy opt-out is rejected at request validation time.
-    cognify: Literal[True] = True
+    # User ingest is capture-only. The scheduled knowledge-base job owns vector
+    # projection and graph enrichment. ``true`` remains accepted by the schema
+    # only so the endpoint can return a clear migration error to old clients.
+    cognify: bool | None = None
 
 
 # Upper bound on a search query, in the same spirit as SearchBody's other
@@ -2202,6 +2249,7 @@ async def search_across_datasets(
     datasets: list[str],
     sessions: Mapping[str, str | None],
     top_k: int,
+    allow_vector_recall: bool = True,
 ) -> list[tuple[str, Any]]:
     # Query every dataset before merging so a result-rich primary node can never
     # short-circuit (and thereby silently drop) Central. The primary still wins
@@ -2219,6 +2267,7 @@ async def search_across_datasets(
                 dataset=dataset,
                 session_id=sessions.get(dataset),
                 top_k=top_k,
+                **({"allow_vector_recall": False} if not allow_vector_recall else {}),
             )
             for dataset in datasets
         ]
@@ -2267,6 +2316,7 @@ async def execute_learning_writes(
     attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
+    allow_llm: bool = False,
     defer_cognify: bool = False,
     source_key: str | None = None,
     source_locator: str | None = None,
@@ -2285,6 +2335,7 @@ async def execute_learning_writes(
             "detect_conflicts": detect_conflicts and target.tier == "full",
             "run_improve": run_improve and target.tier == "full",
             "tier": target.tier,
+            "allow_llm": allow_llm,
             "defer_cognify": defer_cognify,
         }
         if source_key is not None:
@@ -2320,6 +2371,7 @@ async def retry_failed_learning_writes(
     attestation: Mapping[str, str] | None = None,
     detect_conflicts: bool = True,
     run_improve: bool = False,
+    allow_llm: bool = False,
     defer_cognify: bool = False,
 ) -> list[LearningOutcome]:
     """Retry once for targets whose initial write was not accepted."""
@@ -2340,6 +2392,7 @@ async def retry_failed_learning_writes(
             "detect_conflicts": detect_conflicts and target.tier == "full",
             "run_improve": run_improve and target.tier == "full",
             "tier": target.tier,
+            "allow_llm": allow_llm,
             "defer_cognify": defer_cognify,
         }
         if attestation is not None:
@@ -2744,6 +2797,15 @@ def first_string(*values: Any) -> str | None:
     return None
 
 
+def lifecycle_source_descriptor(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Recover connector identity from accepted lifecycle source metadata."""
+    source_key = first_string(
+        metadata.get("lifecycle_parent_source_key"),
+        metadata.get("source_key"),
+    )
+    return source_key_descriptor(source_key)
+
+
 def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     """Provenance for one hit: explicit keys first, then the parsed content header.
 
@@ -2759,27 +2821,33 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
     and must never feed ``trust_tier``.
     """
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    explicit_source = first_string(
+        result.get("source"),
+        result.get("source_type"),
+        metadata.get("source"),
+        metadata.get("source_type"),
+    )
+    connector = lifecycle_source_descriptor(metadata)
+    connector_source = connector.get("source")
     provenance = {
-        "source": first_string(
-            result.get("source"),
-            result.get("source_type"),
-            metadata.get("source"),
-            metadata.get("source_type"),
+        # The lifecycle backend is a retrieval implementation, not the source
+        # connector. Recover the connector scope from its accepted source key.
+        "source": (
+            connector_source
+            if connector_source and explicit_source and explicit_source.lower() == "lifecycle"
+            else explicit_source
         ),
-        "source_url": first_string(
-            result.get("source_url"),
-            result.get("url"),
-            result.get("uri"),
-            metadata.get("source_url"),
-            metadata.get("url"),
-            metadata.get("uri"),
-        ),
+        # ``lifecycle`` is a backend marker, not a citation. Prefer a real
+        # locator from source metadata, references, or the sync header.
+        "source_url": source_locator_from_result(result),
         "path": first_string(
             result.get("path"),
             result.get("normalized_path"),
             metadata.get("path"),
             metadata.get("normalized_path"),
+            connector.get("path"),
         ),
+        "repo": first_string(result.get("repo"), metadata.get("repo"), connector.get("repo")),
         "title": first_string(result.get("title"), metadata.get("title")),
         "session_id": first_string(result.get("session_id"), metadata.get("session_id")),
     }
@@ -2805,6 +2873,8 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
             if not provenance.get("source"):
                 provenance["source"] = header.get("kind")
             provenance["basis"] = "content-header"
+    if connector_source and provenance.get("source") == connector_source:
+        provenance.setdefault("basis", "lifecycle-source-key")
     return {key: value for key, value in provenance.items() if value}
 
 
@@ -2993,9 +3063,16 @@ def with_result_metadata(
     if isinstance(lifecycle, dict):
         source_revision_id = first_string(lifecycle.get("source_revision_id"))
         projection_receipt_id = first_string(lifecycle.get("projection_receipt_id"))
-        if source_revision_id and projection_receipt_id:
+        retrieval_mode = first_string(lifecycle.get("retrieval_mode"))
+        if retrieval_mode:
+            metadata["retrieval"]["mode"] = retrieval_mode
+        elif first_string(lifecycle.get("backend")) == "vector":
+            metadata["retrieval"]["mode"] = "vector"
+        if source_revision_id:
             metadata["source_revision_id"] = source_revision_id
+        if projection_receipt_id:
             metadata["projection_receipt_id"] = projection_receipt_id
+        if source_revision_id or projection_receipt_id:
             metadata["projection"] = {
                 key: lifecycle[key]
                 for key in (
@@ -3102,17 +3179,27 @@ def select_public_search_page(
     """Rank, filter, and select one public page from shaped candidates."""
     candidates = list(shaped_hits)
     candidates_fetched = len(candidates)
-    ranked_query = (
-        is_docs_mode_query(query, mode=mode)
-        or is_spec_mode_query(query)
-        or len(query_terms(query)) == 1
-    )
+    ranked_query = bool(query_terms(query))
     if filter_kwargs is not None:
         candidates = filter_hits(candidates, **dict(filter_kwargs))
+        requested_source = str(filter_kwargs.get("source") or "").strip().lower()
+        exact_issue = (
+            exact_linear_issue_identifier(query)
+            if requested_source == "linear-issue"
+            else None
+        )
+        if exact_issue:
+            # A Linear key is an identity query. Do not return a different issue
+            # only because its description mentions the requested key.
+            candidates = [
+                candidate
+                for candidate in candidates
+                if linear_issue_identifier(candidate) == exact_issue
+            ]
 
     # Keep collision alternatives through filtering. A primary Node hit that a
     # request filter rejects must not erase an eligible Central copy with the
-    # same text. Dataset order still decides the winner when both remain.
+    # same text. Dataset order is only a tie-breaker after ranking.
     unique_candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -3126,16 +3213,40 @@ def select_public_search_page(
     if ranked_query:
         candidates = apply_query_ranking(candidates, query, mode=mode)
 
-    if ranked_query or limit <= 1 or len(datasets) <= 1:
+    # A fixed Central reservation made low-coverage personal notes displace a
+    # stronger Central match. When the page has observable lexical evidence,
+    # relevance must decide the page globally. Keep dataset diversity only when
+    # the retriever gives us no lexical signal; semantic order is then the only
+    # honest evidence and a Central sample prevents one dataset from hiding the
+    # others completely.
+    terms = query_terms(query)
+    lexical_evidence = any(
+        hit_term_coverage(candidate, terms)[0] > 0 for candidate in candidates
+    )
+    def hit_dataset(hit: dict[str, Any]) -> Any:
+        envelope = hit.get("_citadel")
+        return envelope.get("dataset") if isinstance(envelope, dict) else None
+
+    if limit <= 1 or len(datasets) <= 1:
         selected = candidates[:limit]
+    elif ranked_query and lexical_evidence:
+        selected = candidates[:limit]
+        # Seat searches resolve as [seat, Central, session-traces]. Preserve
+        # the Central read contract without moving a stronger Central match
+        # below weaker personal results.
+        central_dataset = datasets[1]
+        if selected and not any(
+            hit_dataset(hit) == central_dataset for hit in selected
+        ):
+            central = next(
+                (hit for hit in candidates[limit:] if hit_dataset(hit) == central_dataset),
+                None,
+            )
+            if central is not None:
+                selected[-1] = central
     else:
-        primary_dataset = datasets[0]
         reserve = min(max(1, limit // 5), limit - 1)
-
-        def hit_dataset(hit: dict[str, Any]) -> Any:
-            envelope = hit.get("_citadel")
-            return envelope.get("dataset") if isinstance(envelope, dict) else None
-
+        primary_dataset = datasets[0]
         primary = [hit for hit in candidates if hit_dataset(hit) == primary_dataset]
         secondary = [
             hit
@@ -4769,6 +4880,24 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
     }
 
 
+def _linear_document_count(status: Mapping[str, Any]) -> int:
+    def count(key: str) -> int:
+        try:
+            return max(0, int(status.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return count("issue_count") + count("context_record_count")
+
+
+def _linear_source_status(status: Mapping[str, Any]) -> str:
+    if status.get("state_error") or status.get("last_error"):
+        return "error"
+    if status.get("context_error"):
+        return "degraded"
+    return "tracked" if status.get("last_synced_at") else "ready"
+
+
 @app.get("/api/state")
 async def public_state(request: Request, response: Response) -> dict[str, Any]:
     """Public, no-secrets snapshot for the /info page — safe aggregates only.
@@ -4815,8 +4944,8 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             {
                 "name": "Linear workspace",
                 "type": "linear",
-                "documents": ln.get("issue_count", 0),
-                "status": "tracked" if ln.get("last_synced_at") else "ready",
+                "documents": _linear_document_count(ln),
+                "status": _linear_source_status(ln),
                 "last_synced_at": ln.get("last_synced_at"),
             }
         )
@@ -4844,18 +4973,20 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
 
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
     lifecycle = await _bounded_lifecycle_health(get_citadel())
+    service_ok = lifecycle.get("ok") is not False
     return {
-        "ok": True,
+        "ok": service_ok,
         "service": "Citadel Archive",
         "version": _SERVICE_VERSION,
         "build_id": _BUILD_ID,
         "deployment_id": _DEPLOYMENT_ID,
-        "healthy": True,
+        "healthy": service_ok,
         "sources": sources,
         "totals": {
             "documents": docs_total,
             "github_repositories": int(gh.get("tracked_repositories", 0) or 0) if gh else 0,
             "linear_issues": int(ln.get("issue_count", 0) or 0) if ln else 0,
+            "linear_context_records": int(ln.get("context_record_count", 0) or 0) if ln else 0,
         },
         "lifecycle": lifecycle,
         "repo": repo_block,
@@ -5803,11 +5934,9 @@ async def sources(request: Request, type: str | None = None) -> Any:
                 "id": "linear-workspace",
                 "source_type": "linear",
                 "name": "Linear workspace",
-                "status": "error"
-                if linear_status.get("state_error")
-                else ("tracked" if linear_status.get("last_synced_at") else "ready"),
+                "status": _linear_source_status(linear_status),
                 "last_checked_at": linear_status.get("last_synced_at"),
-                "documents": linear_status.get("issue_count", 0),
+                "documents": _linear_document_count(linear_status),
                 "open_conflicts": 0,
                 # Linear is the one syncer that already persists its own failure,
                 # so prefer that over the audit trail: it is more specific.
@@ -5817,6 +5946,7 @@ async def sources(request: Request, type: str | None = None) -> Any:
             }
         )
         summary["linear_issues"] = linear_status.get("issue_count", 0)
+        summary["linear_context_records"] = linear_status.get("context_record_count", 0)
 
     if type in {None, "obsidian_vault"}:
         obsidian_status = get_obsidian_sync().source_status(source_type="obsidian_vault")
@@ -6455,9 +6585,23 @@ async def source_document(
         # part of the response — copy so cached fakes/documents stay intact.
         cognee_document = dict(cognee_document)
         owner_node_ids = cognee_document.pop("dataset_node_ids", None) or [document_id]
-        if not can_bypass_dataset_allowlist(identity) and not await cognee_document_visible(
-            identity, owner_node_ids
+        lifecycle_dataset: str | None = None
+        if (
+            cognee_document.get("source_type") == "lifecycle"
+            and isinstance(cognee_document.get("metadata"), dict)
         ):
+            candidate_dataset = cognee_document["metadata"].get("dataset")
+            if isinstance(candidate_dataset, str) and candidate_dataset.strip():
+                lifecycle_dataset = candidate_dataset.strip()
+        lifecycle_visible = lifecycle_dataset is not None and dataset_visible_to(
+            identity, lifecycle_dataset
+        )
+        document_visible = (
+            lifecycle_visible
+            if lifecycle_dataset is not None
+            else await cognee_document_visible(identity, owner_node_ids)
+        )
+        if not can_bypass_dataset_allowlist(identity) and not document_visible:
             # Same status, detail, and shape as a nonexistent id: a scoped
             # caller must not learn whether a foreign document exists.
             raise HTTPException(status_code=404, detail="Document not found.") from None
@@ -7113,6 +7257,11 @@ async def events(request: Request) -> StreamingResponse:
 async def ingest(body: IngestBody, request: Request) -> Any:
     actor = require_access(request, "writer", "kb:ingest")
     enforce_ingest_size(body.data)
+    if body.cognify is True:
+        raise HTTPException(
+            status_code=422,
+            detail="User ingest is capture-only; scheduled projection runs separately.",
+        )
     citadel = get_citadel()
     learning = get_learning_process()
     write_targets = resolve_write_targets(actor, body.dataset, body.tags, citadel.config)
@@ -7128,6 +7277,7 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             operation="ingest",
             capture_actor_id=actor.actor_id,
             capture_run_id=session_id,
+            defer_cognify=True,
         )
     except SecretContentError as exc:
         get_access_store().record_event(
@@ -7169,17 +7319,14 @@ async def ingest(body: IngestBody, request: Request) -> Any:
     # Lifecycle projection is durable and asynchronous. Return the operation
     # state without holding the HTTP request open while Cognee calls providers.
     # The source write remains intact when projection is pending or failed.
-    if body.cognify and result.accepted:
+    payload["projection_requested"] = False
+    if result.accepted:
         if result.projection_job_id:
             payload["projection_state"] = result.projection_state
-            payload["cognified"] = result.projection_state == "searchable"
+            payload["cognified"] = False
         else:
-            try:
-                await citadel.cognify_dataset(dataset=outcome.dataset)
-                payload["cognified"] = True
-            except Exception as exc:  # pragma: no cover - legacy runtime Cognee state
-                logger.error("legacy cognify after ingest failed: %s", exc.__class__.__name__)
-                payload["cognified"] = False
+            payload["projection_state"] = "deferred"
+            payload["cognified"] = False
     audit_detail = {
         "operation": "ingest",
         "accepted": result.accepted,
@@ -7187,6 +7334,7 @@ async def ingest(body: IngestBody, request: Request) -> Any:
         "projection_job_id": result.projection_job_id,
         "projection_state": payload.get("projection_state", result.projection_state),
         "cognified": payload.get("cognified"),
+        "projection_requested": False,
         "data_bytes": len(body.data.encode("utf-8")),
         "tag_count": len(body.tags),
         "write_targets": [target.dataset for target in write_targets],
@@ -7789,9 +7937,8 @@ async def recent_contributions(
 async def contribute(body: ContributeBody, request: Request) -> Any:
     """Simple write path for teammates and agents.
 
-    Routes through the Learning Process (with LLM enrichment when enabled)
-    and keeps conflict detection on, so a Vault Contribution behaves exactly
-    like any other accepted Source Material.
+    Routes through the Learning Process without LLM work and keeps conflict
+    detection on, so a Vault Contribution behaves like accepted Source Material.
     """
     actor = require_access(request, "writer", "kb:ingest")
     enforce_ingest_size(body.content)
@@ -7947,7 +8094,7 @@ async def knowledge(
         response.headers["X-RateLimit-Limit"] = str(max_concurrency)
         response.headers["X-RateLimit-Remaining"] = str(slot.remaining)
         try:
-            merged, timed_out = await _search_within_budget(
+            merged, timed_out, degraded = await _search_within_budget(
                 citadel,
                 query=query,
                 datasets=search_datasets,
@@ -8038,6 +8185,8 @@ async def knowledge(
         "datasets": search_datasets if len(search_datasets) > 1 else None,
         "results": public_results,
     }
+    if degraded:
+        payload["degraded"] = True
     if telemetry:
         payload["search_id"] = telemetry.get("search_id")
         payload["feedback"] = {
@@ -8114,7 +8263,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         response.headers["X-RateLimit-Limit"] = str(limit)
         response.headers["X-RateLimit-Remaining"] = str(slot.remaining)
         try:
-            merged, timed_out = await _search_within_budget(
+            merged, timed_out, degraded = await _search_within_budget(
                 citadel,
                 query=body.query,
                 datasets=search_datasets,
@@ -8241,19 +8390,36 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     drilldown_ms: float | None = None
     if not bypass_drilldown:
         drilldown_started = time.perf_counter()
-        drilldown_map = await load_node_dataset_map(warn_unavailable=False)
+        drilldown_map: dict[str, list[str]] | None = None
+        drilldown_map_loaded = False
         # This pass runs OUTSIDE _search_within_budget and the _SearchSlot, so
         # nothing else bounds it: give it its own deadline. On expiry the
         # remaining ids deny — the safe under-promise, never a hung request.
         drilldown_deadline = drilldown_started + citadel.config.search_timeout_seconds
 
-        async def _resolve_drilldown(drilldown_id: str) -> bool:
+        async def _resolve_drilldown(
+            drilldown_id: str, source_revision_id: str | None = None
+        ) -> bool:
+            nonlocal drilldown_map, drilldown_map_loaded
             if drilldown_id.startswith(f"{GITHUB_DOC_ID_PREFIX}:"):
                 # github drill-down has no ADR-0009 scope gate and resolves via a
                 # different endpoint branch (github_section_document, not
                 # get_document); the endpoint returns 200 for any reader with a
                 # resolvable id.
                 return True
+            lifecycle_store = getattr(citadel, "lifecycle_store", None)
+            get_source_revision = getattr(lifecycle_store, "get_source_revision", None)
+            if callable(get_source_revision):
+                try:
+                    source = get_source_revision(source_revision_id or drilldown_id)
+                except Exception:  # noqa: BLE001 - fail closed on lifecycle reads
+                    return False
+                if source is not None:
+                    dataset = getattr(source, "dataset", None)
+                    return isinstance(dataset, str) and dataset_visible_to(actor, dataset)
+            if not drilldown_map_loaded:
+                drilldown_map = await load_node_dataset_map(warn_unavailable=False)
+                drilldown_map_loaded = True
             # Native cognee id: an unresolvable id (None), a cold/empty map, or
             # an id whose owner nodes are all hidden each deny (fail-closed) so
             # the flag never promises a 404 — textless entities and foreign-seat
@@ -8276,6 +8442,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             result_id = str(envelope.get("result_id") or "")
             document_id = first_string(item.get("document_id"))
             drilldown_id = document_id or result_id
+            source_revision_id = first_string(envelope.get("source_revision_id"))
             document_endpoint = document_endpoint_for_result(
                 result_id, document_id=document_id
             )
@@ -8290,7 +8457,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 else:
                     try:
                         drilldown_hint[drilldown_id] = await asyncio.wait_for(
-                            _resolve_drilldown(drilldown_id), timeout=remaining
+                            _resolve_drilldown(drilldown_id, source_revision_id),
+                            timeout=remaining,
                         )
                     except asyncio.TimeoutError:
                         drilldown_hint[drilldown_id] = False
@@ -8331,6 +8499,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         "scope_override": scope_override_active(actor, search_datasets),
         "latency_ms": round(latency_ms, 1),
         "timed_out": timed_out,
+        "degraded": degraded,
     }
     if drilldown_ms is not None:
         audit_detail["drilldown_ms"] = round(drilldown_ms, 1)
@@ -8395,6 +8564,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         "spec_mode": is_spec_mode_query(body.query) and not docs_mode,
         "relevance": relevance_summary,
     }
+    if degraded:
+        payload["degraded"] = True
     if cleaned_mode:
         payload["mode"] = cleaned_mode
     if filters_active:

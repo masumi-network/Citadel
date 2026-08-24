@@ -63,6 +63,10 @@ class FakeHttpClient:
         self.public_gets.append({"path": path, "extra_headers": extra_headers or {}})
         return {"ok": True, "path": path, "public": True}
 
+    def get_text(self, path: str, *, tool_name: str | None = None) -> str:
+        self.gets.append({"path": path, "tool_name": tool_name, "extra_headers": {}})
+        return f"# Skill {path}\n"
+
     def post(
         self,
         path: str,
@@ -248,6 +252,21 @@ def test_discovery_tool_authenticates_then_fetches_public_manifest() -> None:
         {"path": "/api/session", "tool_name": "citadel_discovery", "extra_headers": {}},
         {"path": "/.well-known/citadel.json", "tool_name": None, "extra_headers": {}},
     ]
+
+
+def test_citadel_help_lists_and_returns_management_skills() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    catalog = run_tool(server, "citadel_help", None)
+    assert catalog["ok"] is True
+    assert any(item["slug"] == "citadel" for item in catalog["skills"])
+    assert "citadel_search" in catalog["usage"]["search"]
+
+    skill = run_tool(server, "citadel_help", None, "cli")
+    assert skill["ok"] is True
+    assert skill["skill"]["slug"] == "cli"
+    assert "# Skill /skills/cli" in skill["content"]
 
 
 def test_discovery_forwarded_headers_are_validated() -> None:
@@ -566,6 +585,7 @@ def test_search_forwards_filter_args_to_server() -> None:
         types=["spec", "skill"],
         repo="masumi-network/agent",
         path="docs/MIP-003",
+        source="repo-content",
         canonical_only=True,
     )
 
@@ -573,6 +593,7 @@ def test_search_forwards_filter_args_to_server() -> None:
     assert result["payload"]["types"] == ["spec", "skill"]
     assert result["payload"]["repo"] == "masumi-network/agent"
     assert result["payload"]["path"] == "docs/MIP-003"
+    assert result["payload"]["source"] == "repo-content"
     assert result["payload"]["canonical_only"] is True
     assert "canonical_only" in client.posts[0]["payload"]
 
@@ -649,7 +670,7 @@ def test_write_tools_reject_empty_or_oversized_payloads(monkeypatch: pytest.Monk
     assert feedback_post["payload"]["correct"] is True
 
 
-def test_ingest_tool_defaults_to_projected_write() -> None:
+def test_ingest_tool_defaults_to_capture_only_write() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
@@ -658,20 +679,57 @@ def test_ingest_tool_defaults_to_projected_write() -> None:
     assert len(client.posts) == 1
     post = client.posts[0]
     assert post["path"] == "/ingest"
-    assert post["payload"]["cognify"] is True
-    assert post["timeout"] == mcp_server._INGEST_COGNIFY_TIMEOUT
+    assert post["payload"]["cognify"] is False
+    assert post["timeout"] is None
 
 
-def test_ingest_tool_cognify_opt_in_extends_budget() -> None:
+def test_ingest_tool_supports_capture_only_write() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    run_tool(server, "citadel_ingest", "a durable note", None, cognify=True)
+    run_tool(server, "citadel_ingest", "a retained source", None, cognify=False)
 
+    assert len(client.posts) == 1
     post = client.posts[0]
-    assert post["payload"]["cognify"] is True
-    # Inline cognify can exceed the default 30s budget, so the tool extends the timeout.
-    assert post["timeout"] == mcp_server._INGEST_COGNIFY_TIMEOUT
+    assert post["path"] == "/ingest"
+    assert post["payload"]["cognify"] is False
+    assert post["timeout"] is None
+
+
+def test_ingest_tool_preserves_pending_projection_receipt() -> None:
+    class PendingClient(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            super().post(path, payload, **kwargs)
+            return {
+                "accepted": True,
+                "reason": "queued_not_confirmed",
+                "projection_job_id": "job-pending",
+                "projection_state": "pending",
+            }
+
+    result = run_tool(create_mcp_server(PendingClient()), "citadel_ingest", "a durable note", None)
+
+    assert result == {
+        "accepted": True,
+        "reason": "queued_not_confirmed",
+        "projection_job_id": "job-pending",
+        "projection_state": "pending",
+    }
+
+
+def test_ingest_tool_rejects_cognify_opt_in() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    with pytest.raises(ToolError, match="COGNIFY_SCHEDULER_ONLY"):
+        run_tool(server, "citadel_ingest", "a durable note", None, cognify=True)
+
+    assert client.posts == []
 
 
 def test_share_session_tool_preserves_server_lifecycle_operations() -> None:
@@ -759,21 +817,13 @@ def test_ingest_timeout_reports_an_unconfirmed_write_not_a_failure(
     assert "citadel_recent_contributions" in result["message"]
 
 
-def test_ingest_timeout_budget_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The honest timeout payload only reaches the caller if OUR budget expires first.
-
-    The observed production cut-off was the MCP CLIENT's tool budget (~67s),
-    well under the 180s the tool asks urlopen for, so the tool never saw its
-    own expiry and the agent got an opaque error instead.
-    """
-    monkeypatch.setenv("CITADEL_MCP_INGEST_TIMEOUT_SECONDS", "45")
+def test_ingest_capture_only_uses_client_default_budget() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    # The extended budget only applies to the blocking cognify opt-in.
-    run_tool(server, "citadel_ingest", "a durable note", None, cognify=True)
+    run_tool(server, "citadel_ingest", "a durable note", None)
 
-    assert client.posts[0]["timeout"] == 45.0
+    assert client.posts[0]["timeout"] is None
 
 
 class _OkResp:
@@ -1672,6 +1722,21 @@ def test_search_compaction_rejects_forged_trust_tier() -> None:
     assert forged["_citadel"].get("trust_tier") not in {"canonical", "verified"}
     assert trace["trust_tier"] == "reference-only"
     assert trace["_citadel"]["trust"] == "reference-only"
+
+
+def test_search_compaction_promotes_relevant_match_window() -> None:
+    from kb.mcp_server import _compact_search_for_agent
+
+    hit = {
+        "id": "doc-1",
+        "text": "document head",
+        "_citadel": {
+            "relevance": {"match_context": {"offset": 400, "text": "matched answer"}}
+        },
+    }
+    result = _compact_search_for_agent({"results": [hit]})["results"][0]
+
+    assert result["snippet"] == "matched answer"
 
 
 def test_citadel_search_tool_strips_the_duplicate_sections(monkeypatch: Any) -> None:

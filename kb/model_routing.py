@@ -12,10 +12,12 @@ DEFAULT_ROUTINE_MODEL = "openrouter/free"
 DEFAULT_REASONING_MODEL = "openrouter/free"
 DEFAULT_RESEARCH_MODEL = "openrouter/free"
 
-DEFAULT_COGNEE_EXTRACTION_MODEL = "openrouter/nvidia/nemotron-nano-9b-v2:free"
-DEFAULT_COGNEE_SUMMARIZATION_MODEL = "openrouter/nvidia/nemotron-nano-9b-v2:free"
-DEFAULT_COGNEE_QUERY_MODEL = "openrouter/nvidia/nemotron-nano-9b-v2:free"
-DEFAULT_COGNEE_FREE_ROUTER_MODEL = "openrouter/free"
+# Cognee passes these through LiteLLM. The first ``openrouter/`` selects the
+# LiteLLM provider; the second is part of OpenRouter's native model id.
+DEFAULT_COGNEE_FREE_ROUTER_MODEL = "openrouter/openrouter/free"
+DEFAULT_COGNEE_EXTRACTION_MODEL = DEFAULT_COGNEE_FREE_ROUTER_MODEL
+DEFAULT_COGNEE_SUMMARIZATION_MODEL = DEFAULT_COGNEE_FREE_ROUTER_MODEL
+DEFAULT_COGNEE_QUERY_MODEL = DEFAULT_COGNEE_FREE_ROUTER_MODEL
 DEFAULT_EMBEDDING_PROVIDER = "openai_compatible"
 DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b:free"
 DEFAULT_EMBEDDING_DIMENSIONS = "2048"

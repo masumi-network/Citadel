@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # The primary skill is ``skills/citadel/SKILL.md`` (not a repo-root file —
 # a root SKILL.md would shadow ``skills/*`` in the skills CLI).
 SKILL_FILES: dict[str, Path] = {
+    "citadel": REPO_ROOT / "skills/citadel/SKILL.md",
     "connect": REPO_ROOT / "skills/citadel-mcp-connector/SKILL.md",
     "vault": REPO_ROOT / "skills/citadel-vault/SKILL.md",
     "boundary": REPO_ROOT / "skills/citadel-data-boundary/SKILL.md",
@@ -88,12 +89,13 @@ def skill_catalog() -> list[dict[str, object]]:
 
 
 _SKILL_DESCRIPTIONS: dict[str, str] = {
+    "citadel": "Route Citadel search, capture, MCP, CLI, onboarding, boundaries, and debugging questions.",
     "connect": "Set up Citadel MCP in Claude Code, Codex, Cursor, or any MCP agent.",
     "vault": "Search, ingest, and use the Organization Vault after MCP is connected.",
     "boundary": "Public vs private data boundaries for Citadel code, vault, and tokens.",
     "proactive-ingest": "Autonomous Node sync — git push + Claude SessionEnd hooks to your personal seat.",
     "onboard": "One-command teammate onboarding for Citadel (token, hooks, MCP, capture roots).",
-    "cli": "citadel CLI: status, search, mcp add, update, onboard, doctor.",
+    "cli": "citadel CLI: status, search, document, skills, mcp add, update, onboard, doctor.",
     "debug": "Diagnose Citadel 502, corrupt sqlite, SEARCH_TIMEOUT, and health paths.",
 }
 

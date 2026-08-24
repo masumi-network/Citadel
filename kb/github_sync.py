@@ -97,9 +97,10 @@ class GitHubOrgClient:
         include_private: bool = True,
     ) -> list[GitHubRepo]:
         repos: list[GitHubRepo] = []
-        per_page = min(max(max_repos, 1), 100)
+        unlimited = max_repos <= 0
+        per_page = 100 if unlimited else min(max_repos, 100)
         page = 1
-        while len(repos) < max_repos:
+        while unlimited or len(repos) < max_repos:
             data = self._get_json(
                 f"/orgs/{org}/repos",
                 {
@@ -116,7 +117,7 @@ class GitHubOrgClient:
             if len(data) < per_page:
                 break
             page += 1
-        return repos[:max_repos]
+        return repos if unlimited else repos[:max_repos]
 
     def fetch_events(self, org: str, *, max_events: int) -> list[GitHubEvent]:
         events: list[GitHubEvent] = []

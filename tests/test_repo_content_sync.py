@@ -18,6 +18,7 @@ from kb.github_sync import GitHubAPIError
 from kb.models import IngestResult
 from kb.repo_content_sync import (
     DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS,
+    DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS,
     STATE_VERSION,
     _cognee_data_ids,
     RepoContentFile,
@@ -126,6 +127,7 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         self.tree_truncated = False
         self.tree_fails = False
         self.tree_calls = 0
+        self.complete_tree_calls = 0
         self.probe_calls = 0
         # The repo HEAD. Mutable so a test can push an unrelated commit —
         # HEAD moves, the tracked files do not.
@@ -143,6 +145,11 @@ class FakeRepoContentClient(RepoContentGitHubClient):
         prefix = f"{full_name}/"
         paths = [key[len(prefix) :] for key in self.files if key.startswith(prefix)]
         return sorted(paths), self.tree_truncated
+
+    def fetch_complete_tree(self, full_name: str, *, ref: str) -> list[str]:
+        self.complete_tree_calls += 1
+        prefix = f"{full_name}/"
+        return sorted(key[len(prefix) :] for key in self.files if key.startswith(prefix))
 
     def fetch_default_branch(self, full_name: str) -> str:
         return "main"
@@ -235,6 +242,148 @@ def test_discover_repo_paths_includes_root_and_tree_files() -> None:
         max_files=10,
     )
     assert paths == ["README.md", "skills/sokosumi/SKILL.md"]
+
+
+def test_all_text_discovery_uses_complete_tree_and_blocks_non_source_paths() -> None:
+    client = FakeRepoContentClient()
+    paths = {
+        ".env",
+        ".env.example",
+        "Dockerfile",
+        "Makefile",
+        "LICENSE",
+        "README.md",
+        "src/app.py",
+        "src/config.json",
+        "docs/guide.md",
+        "node_modules/pkg/index.js",
+        "dist/app.js",
+        "target/generated.rs",
+        "secrets/production.yaml",
+        "package-lock.json",
+        "image.png",
+        "src/app.pyc",
+        "src/app.min.js",
+    }
+    client.files = {
+        f"o/r/{path}": {"sha": path, "content": "text"} for path in paths
+    }
+
+    selected = discover_repo_paths(
+        client,
+        "o/r",
+        ref="sha",
+        root_paths=(),
+        tree_prefixes=(),
+        tree_extensions=DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS,
+        max_files=0,
+        all_text=True,
+    )
+
+    assert selected == [
+        ".env.example",
+        "Dockerfile",
+        "LICENSE",
+        "Makefile",
+        "README.md",
+        "docs/guide.md",
+        "src/app.py",
+        "src/config.json",
+    ]
+    assert client.complete_tree_calls == 1
+    assert client.tree_calls == 0
+    assert client.probe_calls == 0
+
+
+def test_all_text_discovery_respects_positive_cap_but_zero_is_unbounded() -> None:
+    client = FakeRepoContentClient()
+    client.files = {
+        f"o/r/file-{index}.py": {"sha": str(index), "content": "text"}
+        for index in range(3)
+    }
+
+    capped = discover_repo_paths(
+        client,
+        "o/r",
+        ref="sha",
+        root_paths=(),
+        tree_prefixes=(),
+        tree_extensions=(".py",),
+        max_files=2,
+        all_text=True,
+    )
+    unbounded = discover_repo_paths(
+        client,
+        "o/r",
+        ref="sha",
+        root_paths=(),
+        tree_prefixes=(),
+        tree_extensions=(".py",),
+        max_files=0,
+        all_text=True,
+    )
+
+    assert capped == ["file-0.py", "file-1.py"]
+    assert unbounded == ["file-0.py", "file-1.py", "file-2.py"]
+
+
+@pytest.mark.asyncio
+async def test_all_text_sync_uses_light_learning_tier(tmp_path: Path) -> None:
+    config = CitadelConfig(
+        repo_content_sync_all_text=True,
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_tree_extensions=(),
+        repo_content_sync_max_files_per_repo=0,
+        repo_content_sync_run_improve=False,
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+    )
+    client = FakeRepoContentClient()
+    client.files = {
+        "masumi-network/sokosumi-cli/src/app.py": {
+            "sha": "app",
+            "content": "print('ok')",
+        }
+    }
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=client,
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+
+    assert result["files_ingested"] == 1
+    assert learning.calls[0]["tier"] == "light"
+
+
+@pytest.mark.asyncio
+async def test_all_text_sync_fails_closed_when_one_repository_errors(tmp_path: Path) -> None:
+    class MixedClient(FakeRepoContentClient):
+        def fetch_default_branch(self, full_name: str) -> str:
+            if full_name.endswith("broken"):
+                raise GitHubAPIError("GitHub API returned 500")
+            return super().fetch_default_branch(full_name)
+
+    config = CitadelConfig(
+        repo_content_sync_all_text=True,
+        repo_content_sync_repos=("sokosumi-cli", "broken"),
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_run_improve=False,
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=MixedClient(),
+        state_path=config.repo_content_sync_state_path,
+        learning=FakeLearningProcess(),  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run()
+
+    assert result["repos_errored"] == 1
+    assert result["content_scan_complete"] is False
+    assert result["ok"] is False
 
 
 @pytest.mark.asyncio
@@ -466,6 +615,55 @@ def test_fetch_last_commit_sha_refuses_an_empty_history() -> None:
         EmptyHistoryClient(token=None).fetch_last_commit_sha("o/r", "README.md", ref="headsha")
 
 
+def test_fetch_complete_tree_walks_non_recursive_trees_after_truncation() -> None:
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    class CompleteTreeClient(RepoContentGitHubClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+            requests.append((path, params))
+            if path.endswith("/git/trees/headsha") and params == {"recursive": "1"}:
+                return {"truncated": True, "tree": [{"type": "blob", "path": "partial.py"}]}
+            if path.endswith("/git/commits/headsha"):
+                return {"tree": {"sha": "root-tree"}}
+            if path.endswith("/git/trees/root-tree"):
+                return {
+                    "truncated": False,
+                    "tree": [
+                        {"type": "tree", "path": "src", "sha": "src-tree"},
+                        {"type": "blob", "path": "README.md", "mode": "100644"},
+                    ],
+                }
+            if path.endswith("/git/trees/src-tree"):
+                return {
+                    "truncated": False,
+                    "tree": [{"type": "blob", "path": "app.py", "mode": "100644"}],
+                }
+            raise AssertionError(f"unexpected request: {path} {params}")
+
+    paths = CompleteTreeClient(token=None).fetch_complete_tree("o/r", ref="headsha")
+
+    assert paths == ["README.md", "src/app.py"]
+    assert requests == [
+        ("/repos/o/r/git/trees/headsha", {"recursive": "1"}),
+        ("/repos/o/r/git/commits/headsha", {}),
+        ("/repos/o/r/git/trees/root-tree", {}),
+        ("/repos/o/r/git/trees/src-tree", {}),
+    ]
+
+
+def test_fetch_complete_tree_refuses_truncated_non_recursive_tree() -> None:
+    class TruncatedChildClient(RepoContentGitHubClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+            if path.endswith("/git/trees/headsha") and params == {"recursive": "1"}:
+                return {"truncated": True, "tree": []}
+            if path.endswith("/git/commits/headsha"):
+                return {"tree": {"sha": "root-tree"}}
+            return {"truncated": True, "tree": []}
+
+    with pytest.raises(GitHubAPIError, match="non-recursive tree"):
+        TruncatedChildClient(token=None).fetch_complete_tree("o/r", ref="headsha")
+
+
 @pytest.mark.asyncio
 async def test_a_failed_pin_lookup_skips_the_file_instead_of_shipping_head(
     tmp_path: Path,
@@ -563,12 +761,13 @@ class FakeAutoJoinClient(RepoContentGitHubClient):
         )
 
     def fetch_repos(self, org: str, *, max_repos: int, include_private: bool = True) -> list[GitHubRepo]:
-        return [
+        repos = [
             self._repo("masumi-agent-messenger"),
             self._repo("no-markers-here"),
             self._repo("archived-repo", archived=True),
             self._repo("sokosumi-cli"),
-        ][:max_repos]
+        ]
+        return repos if max_repos <= 0 else repos[:max_repos]
 
     def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
         return f"{full_name}/{path}" in self.markers
@@ -583,6 +782,20 @@ def test_discover_org_repos_joins_only_non_archived_marker_repos() -> None:
     )
     assert joined == [
         "masumi-network/masumi-agent-messenger",
+        "masumi-network/sokosumi-cli",
+    ]
+
+
+def test_discover_org_repos_without_markers_returns_all_non_archived_repos() -> None:
+    joined = discover_org_repos(
+        FakeAutoJoinClient(),
+        "masumi-network",
+        markers=(),
+        max_repos=50,
+    )
+    assert joined == [
+        "masumi-network/masumi-agent-messenger",
+        "masumi-network/no-markers-here",
         "masumi-network/sokosumi-cli",
     ]
 
@@ -604,6 +817,78 @@ def test_resolved_repos_unions_autojoin_with_dedup() -> None:
         "masumi-network/sokosumi-cli",
         "masumi-network/masumi-agent-messenger",
     ]
+
+
+def test_resolved_repos_all_org_mode_skips_marker_filtering() -> None:
+    config = CitadelConfig(
+        repo_content_sync_all_repos=True,
+        repo_content_sync_autojoin_max_repos=50,
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeAutoJoinClient(),
+        state_path="unused",
+    )
+
+    assert syncer._resolved_repos() == [
+        "masumi-network/masumi-agent-messenger",
+        "masumi-network/no-markers-here",
+        "masumi-network/sokosumi-cli",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_all_org_sync_fails_when_repository_discovery_is_empty(tmp_path: Path) -> None:
+    class EmptyOrgClient(FakeAutoJoinClient):
+        def fetch_repos(
+            self,
+            org: str,
+            *,
+            max_repos: int,
+            include_private: bool = True,
+        ) -> list[GitHubRepo]:
+            return []
+
+    config = CitadelConfig(
+        repo_content_sync_all_repos=True,
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+    )
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=EmptyOrgClient(),
+        state_path=config.repo_content_sync_state_path,
+    )
+
+    result = await syncer.run()
+
+    assert result["ok"] is False
+    assert result["reason"] == "repo_discovery_empty"
+    assert result["repo_discovery_complete"] is False
+
+
+def test_all_org_mode_does_not_fall_back_to_explicit_repos() -> None:
+    config = CitadelConfig(
+        repo_content_sync_all_repos=True,
+        repo_content_sync_repos=("sokosumi-cli",),
+    )
+
+    class EmptyOrgClient(FakeAutoJoinClient):
+        def fetch_repos(
+            self,
+            org: str,
+            *,
+            max_repos: int,
+            include_private: bool = True,
+        ) -> list[GitHubRepo]:
+            return []
+
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=EmptyOrgClient(),
+        state_path="unused",
+    )
+
+    assert syncer._resolved_repos() == []
 
 
 def test_resolved_repos_autojoin_disabled_skips_discovery() -> None:

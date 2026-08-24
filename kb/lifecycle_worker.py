@@ -48,6 +48,7 @@ _PROVIDER_RESET_MARKER = re.compile(
     r"x-ratelimit-reset[\"']?\s*[:=]\s*[\"']?(\d{10,13})",
     re.IGNORECASE,
 )
+_GRAPH_OUTPUT_RETRY_BACKOFF_SECONDS = 60 * 60
 
 
 def _is_provider_error(exc: BaseException) -> bool:
@@ -136,6 +137,23 @@ def _is_missing_local_path_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_malformed_graph_output_error(exc: BaseException) -> bool:
+    """Return true for invalid structured output from the graph LLM pass."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).lower()
+        if (
+            "knowledgegraph" in text
+            and ("target_node_id" in text or "source_node_id" in text)
+            and ("validation error" in text or "input should be" in text)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class _LeaseHeartbeat:
     def __init__(
         self,
@@ -213,6 +231,14 @@ class ProjectionGateway(Protocol):
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any: ...
 
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any: ...
+
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]: ...
 
     async def corpus_chunk_counts(
@@ -226,6 +252,44 @@ class ProjectionGateway(Protocol):
         *,
         datasets: list[str] | None = None,
     ) -> set[str] | None: ...
+
+
+class _BatchVectorGateway:
+    """Reuse one vector projection result for a bounded source batch."""
+
+    _UNSET = object()
+
+    def __init__(self, gateway: ProjectionGateway, document_ids: list[str]) -> None:
+        self._gateway = gateway
+        self._document_ids = document_ids
+        self._result: Any = self._UNSET
+        self.error: BaseException | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._gateway, name)
+
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any:
+        del document_ids
+        if self._result is not self._UNSET:
+            return self._result
+        if self.error is not None:
+            raise self.error
+        try:
+            self._result = await self._gateway.vector_project(
+                datasets=datasets,
+                force=force,
+                document_ids=self._document_ids,
+            )
+        except BaseException as exc:
+            self.error = exc
+            raise
+        return self._result
 
 
 class ProjectionVerificationError(RuntimeError):
@@ -248,6 +312,9 @@ class LifecycleProjectionWorker:
         retry_backoff_seconds: float = 5,
         max_attempts: int = 5,
         fault_injector: Callable[[str], None] | None = None,
+        include_graph: bool = True,
+        include_deferred: bool = False,
+        deferred_only: bool = False,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -261,10 +328,120 @@ class LifecycleProjectionWorker:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.max_attempts = max_attempts
         self._fault_injector = fault_injector
+        self.include_graph = include_graph
+        self.include_deferred = include_deferred
+        self.deferred_only = deferred_only
 
     def _inject_fault(self, stage: str) -> None:
         if self._fault_injector is not None:
             self._fault_injector(stage)
+
+    def _record_projection_failure(
+        self,
+        lease: ProjectionLease,
+        exc: BaseException,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Record a failure and return whether the caller should re-raise it."""
+        if _is_missing_local_path_error(exc):
+            # Path-string notes (citadel ingest used to store the path, not
+            # the file). Cognee then tries to open that local path on the Node
+            # and retries forever. Missing paths are not retryable; tombstone
+            # the current head so requeue cannot resurrect them.
+            self._tombstone_missing_path(lease, exc, now=now)
+            return False
+        try:
+            if self.deferred_only and _is_malformed_graph_output_error(exc):
+                self.store.reschedule_job(
+                    lease,
+                    error_code="graph_output_invalid",
+                    error_message=_safe_error_message(exc),
+                    now=now,
+                    backoff_seconds=_GRAPH_OUTPUT_RETRY_BACKOFF_SECONDS,
+                    deferred=True,
+                )
+                logger.warning(
+                    "graph enrichment deferred after invalid structured output: "
+                    "retry_seconds=%d",
+                    _GRAPH_OUTPUT_RETRY_BACKOFF_SECONDS,
+                )
+                return False
+            if _is_provider_quota_exhausted(exc):
+                backoff_seconds = _provider_quota_backoff_seconds(
+                    exc,
+                    now=now,
+                )
+                self.store.reschedule_job(
+                    lease,
+                    error_code="provider_quota_exhausted",
+                    error_message=_safe_error_message(exc),
+                    now=now,
+                    backoff_seconds=backoff_seconds,
+                    deferred=self.deferred_only,
+                )
+                logger.warning(
+                    "projection job delayed for provider quota reset: "
+                    "backoff_seconds=%.0f",
+                    backoff_seconds,
+                )
+                return False
+            if _is_non_retryable_provider_error(exc):
+                self.store.fail_job(
+                    lease,
+                    error_code="provider_non_retryable",
+                    error_message=_safe_error_message(exc),
+                    now=now,
+                )
+                logger.error(
+                    "projection job failed permanently: provider error type=%s",
+                    exc.__class__.__name__,
+                )
+                return False
+            if isinstance(exc, Exception) and lease.attempt >= self.max_attempts:
+                self.store.fail_job(
+                    lease,
+                    error_code=exc.__class__.__name__,
+                    error_message=_safe_error_message(exc),
+                    now=now,
+                )
+            else:
+                self.store.reschedule_job(
+                    lease,
+                    error_code=exc.__class__.__name__,
+                    error_message=_safe_error_message(exc),
+                    now=now,
+                    backoff_seconds=self.retry_backoff_seconds,
+                    deferred=self.deferred_only,
+                )
+        except ProjectionLeaseError:
+            logger.warning(
+                "projection job lost its lease before retry could be recorded: %s",
+                lease.projection_job_id,
+            )
+        return True
+
+    def _release_cancelled_batch_leases(
+        self,
+        leases: list[ProjectionLease],
+        *,
+        now: datetime,
+    ) -> None:
+        for lease in leases:
+            try:
+                self.store.reschedule_job(
+                    lease,
+                    error_code="batch_cancelled",
+                    error_message="projection batch cancelled",
+                    now=now,
+                    backoff_seconds=self.retry_backoff_seconds,
+                    deferred=self.deferred_only,
+                )
+            except ProjectionLeaseError:
+                logger.warning(
+                    "cancelled batch lease was already settled: job=%s",
+                    lease.projection_job_id,
+                )
 
     async def run_once(self, *, now: datetime | None = None) -> bool:
         """Process one due job. Return false when no work is due."""
@@ -276,6 +453,8 @@ class LifecycleProjectionWorker:
             config_digest=self.config_digest,
             now=operation_time,
             lease_seconds=self.lease_seconds,
+            include_deferred=self.include_deferred,
+            deferred_only=self.deferred_only,
         )
         if lease is None:
             return False
@@ -288,65 +467,190 @@ class LifecycleProjectionWorker:
         try:
             await self._project(lease, heartbeat=heartbeat, now=operation_time)
         except BaseException as exc:
-            if _is_missing_local_path_error(exc):
-                # Path-string notes (citadel ingest used to store the path, not
-                # the file). Cognee then tries to open that local path on the
-                # Node and retries forever. Missing paths are not retryable;
-                # tombstone the current head so requeue cannot resurrect them.
-                self._tombstone_missing_path(lease, exc, now=operation_time)
-                return True
+            if self._record_projection_failure(lease, exc, now=operation_time):
+                raise
+        return True
+
+    async def run_batch(
+        self,
+        *,
+        max_jobs: int = 20,
+        now: datetime | None = None,
+    ) -> bool:
+        """Process a bounded same-dataset vector batch with per-source receipts."""
+        if max_jobs < 1:
+            raise ValueError("max_jobs must be positive")
+        if max_jobs == 1 or self.include_graph:
+            return await self.run_once(now=now)
+
+        operation_time = now or datetime.now(UTC)
+        first_lease = self.store.claim_next_job(
+            worker_id=self.worker_id,
+            generation_id=self.generation_id,
+            projection_version=self.projection_version,
+            config_digest=self.config_digest,
+            now=operation_time,
+            lease_seconds=self.lease_seconds,
+            include_deferred=self.include_deferred,
+            deferred_only=self.deferred_only,
+        )
+        if first_lease is None:
+            return False
+
+        first_source = self.store.get_operation(
+            first_lease.projection_job_id
+        ).source_revision
+        leases = [first_lease]
+        for _ in range(max_jobs - 1):
+            lease = self.store.claim_next_job(
+                worker_id=self.worker_id,
+                generation_id=self.generation_id,
+                projection_version=self.projection_version,
+                config_digest=self.config_digest,
+                dataset=first_source.dataset,
+                now=operation_time,
+                lease_seconds=self.lease_seconds,
+                include_deferred=self.include_deferred,
+                deferred_only=self.deferred_only,
+            )
+            if lease is None:
+                break
+            leases.append(lease)
+
+        active: list[ProjectionLease] = []
+        settled: set[str] = set()
+        for lease in leases:
+            heartbeat = _LeaseHeartbeat(
+                self.store,
+                lease,
+                lease_seconds=self.lease_seconds,
+                started_at=operation_time,
+            )
             try:
-                if _is_provider_quota_exhausted(exc):
-                    backoff_seconds = _provider_quota_backoff_seconds(
-                        exc,
-                        now=operation_time,
-                    )
-                    self.store.reschedule_job(
-                        lease,
-                        error_code="provider_quota_exhausted",
-                        error_message=_safe_error_message(exc),
-                        now=operation_time,
-                        backoff_seconds=backoff_seconds,
-                    )
-                    logger.warning(
-                        "projection job delayed for provider quota reset: "
-                        "backoff_seconds=%.0f",
-                        backoff_seconds,
-                    )
-                    return True
-                if _is_non_retryable_provider_error(exc):
-                    self.store.fail_job(
-                        lease,
-                        error_code="provider_non_retryable",
-                        error_message=_safe_error_message(exc),
-                        now=operation_time,
-                    )
-                    logger.error(
-                        "projection job failed permanently: provider error type=%s",
-                        exc.__class__.__name__,
-                    )
-                    return True
-                if isinstance(exc, Exception) and lease.attempt >= self.max_attempts:
-                    self.store.fail_job(
-                        lease,
-                        error_code=exc.__class__.__name__,
-                        error_message=_safe_error_message(exc),
-                        now=operation_time,
-                    )
-                else:
-                    self.store.reschedule_job(
-                        lease,
-                        error_code=exc.__class__.__name__,
-                        error_message=_safe_error_message(exc),
-                        now=operation_time,
-                        backoff_seconds=self.retry_backoff_seconds,
-                    )
-            except ProjectionLeaseError:
-                logger.warning(
-                    "projection job lost its lease before retry could be recorded: %s",
-                    lease.projection_job_id,
+                operation = self.store.get_operation(lease.projection_job_id)
+                source = operation.source_revision
+                if source.tombstone:
+                    self._project_tombstone(lease, operation, now=operation_time)
+                    settled.add(lease.projection_job_id)
+                    continue
+                content = self.store.read_retained_content(source.source_revision_id)
+                try:
+                    text = content.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ProjectionVerificationError(
+                        "lifecycle v1 cannot project non-UTF-8 media type "
+                        f"{source.media_type!r}"
+                    ) from exc
+                await self._project_relational(
+                    lease,
+                    operation,
+                    text,
+                    heartbeat=heartbeat,
+                    now=operation_time,
                 )
-            raise
+                active.append(lease)
+            except asyncio.CancelledError:
+                self._release_cancelled_batch_leases(
+                    [
+                        candidate
+                        for candidate in leases
+                        if candidate.projection_job_id not in settled
+                    ],
+                    now=operation_time,
+                )
+                raise
+            except BaseException as exc:
+                self._record_projection_failure(lease, exc, now=operation_time)
+                settled.add(lease.projection_job_id)
+                logger.warning(
+                    "batched lifecycle source was rescheduled: job=%s error=%s detail=%s",
+                    lease.projection_job_id,
+                    exc.__class__.__name__,
+                    _safe_error_message(exc),
+                )
+
+        if not active:
+            return True
+
+        document_ids = [
+            self.store.get_operation(lease.projection_job_id)
+            .source_revision.source_revision_id
+            for lease in active
+        ]
+        batch_gateway = _BatchVectorGateway(self.gateway, document_ids)
+        batch_worker = LifecycleProjectionWorker(
+            self.store,
+            batch_gateway,
+            worker_id=self.worker_id,
+            generation_id=self.generation_id,
+            projection_version=self.projection_version,
+            config_digest=self.config_digest,
+            lease_seconds=self.lease_seconds,
+            retry_backoff_seconds=self.retry_backoff_seconds,
+            max_attempts=self.max_attempts,
+            fault_injector=self._fault_injector,
+            include_graph=False,
+            include_deferred=self.include_deferred,
+            deferred_only=self.deferred_only,
+        )
+
+        async def renew_batch_leases() -> None:
+            while True:
+                await asyncio.sleep(max(0.5, self.lease_seconds / 3))
+                for lease in active:
+                    try:
+                        self.store.renew_lease(
+                            lease,
+                            now=datetime.now(UTC),
+                            lease_seconds=self.lease_seconds,
+                        )
+                    except ProjectionLeaseError:
+                        logger.warning(
+                            "batched lifecycle source lost its lease: job=%s",
+                            lease.projection_job_id,
+                        )
+
+        renewal_task = asyncio.create_task(renew_batch_leases())
+        try:
+            for index, lease in enumerate(active):
+                heartbeat = _LeaseHeartbeat(
+                    self.store,
+                    lease,
+                    lease_seconds=self.lease_seconds,
+                    started_at=operation_time,
+                )
+                try:
+                    await batch_worker._project(
+                        lease,
+                        heartbeat=heartbeat,
+                        now=operation_time,
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        self._release_cancelled_batch_leases(
+                            active[index:],
+                            now=operation_time,
+                        )
+                        raise
+                    provider_error = batch_gateway.error
+                    if provider_error is not None:
+                        for remaining in active[index:]:
+                            self._record_projection_failure(
+                                remaining,
+                                provider_error,
+                                now=operation_time,
+                            )
+                        break
+                    self._record_projection_failure(lease, exc, now=operation_time)
+                    logger.warning(
+                        "batched lifecycle source was rescheduled: job=%s error=%s detail=%s",
+                        lease.projection_job_id,
+                        exc.__class__.__name__,
+                        _safe_error_message(exc),
+                    )
+        finally:
+            renewal_task.cancel()
+            await asyncio.gather(renewal_task, return_exceptions=True)
         return True
 
     def matches_projection(
@@ -559,6 +863,133 @@ class LifecycleProjectionWorker:
         heartbeat: _LeaseHeartbeat,
         now: datetime,
     ) -> None:
+        if not callable(getattr(self.gateway, "vector_project", None)):
+            if not self.include_graph:
+                raise ProjectionVerificationError(
+                    "vector-only projection requires the gateway vector_project method"
+                )
+            await self._project_vector_and_graph_legacy(
+                lease,
+                operation,
+                heartbeat=heartbeat,
+                now=now,
+            )
+            return
+
+        source = operation.source_revision
+        requires_reprojection = self.store.has_completed_projection_other_than(
+            source_revision_id=source.source_revision_id,
+            projection_job_id=operation.job.projection_job_id,
+        )
+        await self._reconcile_existing_vector_and_graph(
+            lease,
+            operation,
+            heartbeat=heartbeat,
+            now=now,
+            reconcile_graph=self.include_graph and not requires_reprojection,
+        )
+        operation = self.store.get_operation(lease.projection_job_id)
+        vector = self._receipt(operation, "vector")
+        if vector.state not in {"completed", "searchable"}:
+            self.store.begin_backend(lease, "vector", now=now)
+            vector_result = await heartbeat.wait(
+                self.gateway.vector_project(
+                    datasets=[source.dataset],
+                    force=requires_reprojection,
+                    document_ids=[source.source_revision_id],
+                )
+            )
+            self._inject_fault("after_backend_write:vector")
+            self.store.complete_backend(
+                lease,
+                "vector",
+                provider_operation_id=self._provider_operation_id(vector_result),
+                affected_ids=(source.source_revision_id,),
+                affected_count=1,
+                metadata={"data_id": source.source_revision_id},
+                now=now,
+            )
+            self._inject_fault("after_receipt_write:vector")
+
+        operation = self.store.get_operation(lease.projection_job_id)
+        vector = self._receipt(operation, "vector")
+        if vector.state != "searchable":
+            chunk_counts = await heartbeat.wait(
+                self.gateway.corpus_chunk_counts([source.source_revision_id])
+            )
+            chunk_count = None if chunk_counts is None else chunk_counts.get(
+                source.source_revision_id
+            )
+            if chunk_count is None or chunk_count < 1:
+                raise ProjectionVerificationError(
+                    "vector read check returned no chunks for the accepted source revision"
+                )
+            self._inject_fault("after_searchability_check:vector")
+            self.store.complete_backend(
+                lease,
+                "vector",
+                provider_operation_id=vector.provider_operation_id,
+                affected_ids=vector.affected_ids or (source.source_revision_id,),
+                affected_count=chunk_count,
+                model=vector.model,
+                dimensions=vector.dimensions,
+                metadata=vector.metadata,
+                now=now,
+            )
+            self.store.mark_backend_searchable(lease, "vector", now=now)
+
+        if not self.include_graph:
+            self.store.defer_graph_enrichment(lease, now=now)
+            return
+
+        operation = self.store.get_operation(lease.projection_job_id)
+        graph = self._receipt(operation, "graph")
+        if graph.state not in {"completed", "searchable"}:
+            self.store.begin_backend(lease, "graph", now=now)
+            graph_result = await heartbeat.wait(
+                self.gateway.cognify(
+                    datasets=[source.dataset],
+                    force=requires_reprojection,
+                )
+            )
+            self._inject_fault("after_backend_write:graph")
+            self.store.complete_backend(
+                lease,
+                "graph",
+                provider_operation_id=self._provider_operation_id(graph_result),
+                affected_ids=(source.source_revision_id,),
+                affected_count=1,
+                metadata={"data_id": source.source_revision_id},
+                now=now,
+            )
+            self._inject_fault("after_receipt_write:graph")
+
+        operation = self.store.get_operation(lease.projection_job_id)
+        graph = self._receipt(operation, "graph")
+        if graph.state != "searchable":
+            graph_ids = await heartbeat.wait(
+                self.gateway.corpus_graph_presence(
+                    [source.source_revision_id],
+                    datasets=[source.dataset],
+                )
+            )
+            if graph_ids is None or source.source_revision_id not in {
+                str(item) for item in graph_ids
+            }:
+                raise ProjectionVerificationError(
+                    "graph read check did not return the accepted source revision"
+                )
+            self._inject_fault("after_searchability_check:graph")
+            self.store.mark_backend_searchable(lease, "graph", now=now)
+
+    async def _project_vector_and_graph_legacy(
+        self,
+        lease: ProjectionLease,
+        operation: ProjectionOperation,
+        *,
+        heartbeat: _LeaseHeartbeat,
+        now: datetime,
+    ) -> None:
         source = operation.source_revision
         receipts = {
             backend: self._receipt(operation, backend)
@@ -577,7 +1008,7 @@ class LifecycleProjectionWorker:
                 operation,
                 heartbeat=heartbeat,
                 now=now,
-                reconcile_graph=not requires_reprojection,
+                reconcile_graph=self.include_graph and not requires_reprojection,
             )
             operation = self.store.get_operation(lease.projection_job_id)
             receipts = {

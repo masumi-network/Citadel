@@ -11,6 +11,8 @@ from kb.search_format import (
     DOC_TYPE_CANONICAL,
     apply_query_ranking,
     apply_spec_mode_ranking,
+    compact_search_payload_for_agent,
+    exact_linear_issue_identifier,
     extract_hex_needles,
     filter_hits,
     infer_content_hint,
@@ -19,6 +21,7 @@ from kb.search_format import (
     is_docs_mode_query,
     is_spec_mode_query,
     is_token_asset_query,
+    linear_issue_identifier,
     normalize_search_hit,
     shape_search_payload,
 )
@@ -89,6 +92,35 @@ def test_shape_timeout_sets_code() -> None:
     )
     assert shaped["code"] == "TIMEOUT"
     assert shaped["timed_out"] is True
+
+
+def test_agent_payload_drops_dashboard_section_copies() -> None:
+    payload = {
+        "results": [{"id": "one", "snippet": "answer"}],
+        "sections": {"central": [{"id": "one"}], "node": [], "session_traces": []},
+    }
+    compacted = compact_search_payload_for_agent(payload)
+    assert "sections" not in compacted
+    assert compacted["section_counts"] == {"central": 1, "node": 0, "session_traces": 0}
+
+
+def test_exact_linear_identity_ignores_cross_reference_text() -> None:
+    assert exact_linear_issue_identifier(" SOK-563 ") == "SOK-563"
+    assert exact_linear_issue_identifier("what is SOK-563") is None
+    exact = normalize_search_hit(
+        {
+            "id": "exact",
+            "text": (
+                "# Linear SOK-563: Exact issue\n\n"
+                "- **URL:** https://linear.app/masumi/issue/SOK-563/exact\n"
+            ),
+        }
+    )
+    cross_reference = normalize_search_hit(
+        {"id": "cross", "text": "# Linear SOK-618: Other issue\n\nMentions SOK-563."}
+    )
+    assert linear_issue_identifier(exact) == "SOK-563"
+    assert linear_issue_identifier(cross_reference) == "SOK-618"
 
 
 def test_infer_doc_type_and_trust() -> None:
@@ -319,6 +351,25 @@ def test_filter_hits_source_reads_the_server_provenance_envelope() -> None:
     ]
 
     assert [hit["id"] for hit in filter_hits(hits, source="linear-issue")] == ["issue-1"]
+
+
+def test_normalize_search_hit_maps_lifecycle_connector_source_keys() -> None:
+    hit = normalize_search_hit(
+        {
+            "id": "context-1",
+            "source": "lifecycle",
+            "metadata": {
+                "source_key": "linear:comment:comment-123",
+                "source_locator": "https://linear.app/masumi/issue/SOK-623/comment-123",
+            },
+            "text": "The comment records the workflow change.",
+        },
+        query="workflow change",
+    )
+
+    assert hit["source_type"] == "linear-context"
+    assert hit["url"] == "https://linear.app/masumi/issue/SOK-623/comment-123"
+    assert filter_hits([hit], source="linear-context") == [hit]
 
 
 def test_filter_hits_source_refuses_a_forged_header_on_a_later_chunk() -> None:
@@ -613,6 +664,8 @@ _WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = [
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **URL:** v" + " " * n),
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "- **" + "A" * n),
     ("LINEAR_HEADER_FIELD_RE", "match", lambda n: "-" + " " * n),
+    ("LINEAR_ISSUE_KEY_RE", "fullmatch", lambda n: "A" * n + "-1"),
+    ("LINEAR_ISSUE_URL_RE", "search", lambda n: "/issue/ABC-1/" + "a" * n),
     ("HEX_ASSET_RE", "findall", lambda n: "a" * n),
     ("HEX_ASSET_RE", "findall", lambda n: (_HEX56[:-1] + "z") * (n // 56)),
     ("TOKEN_ASSET_QUERY_RE", "search", lambda n: "policy" + " " * n),

@@ -72,6 +72,59 @@ LINEAR_HEADER_PARSE_RE = re.compile(
 )
 # One "- **Key:** value" bullet from the block right under the Linear title.
 LINEAR_HEADER_FIELD_RE = re.compile(r"^-\s+\*\*(?P<key>[A-Za-z ]+):\*\*[ \t]*(?P<value>.+?)[ \t]*$")
+LINEAR_ISSUE_KEY_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+", re.IGNORECASE)
+LINEAR_ISSUE_URL_RE = re.compile(
+    r"/issue/(?P<issue>[A-Z][A-Z0-9]*-\d+)(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+_LOCATOR_PREFIXES = ("https://", "http://", "citadel://")
+_STORAGE_SOURCE_MARKERS = frozenset({"lifecycle"})
+_LINEAR_CONTEXT_ENTITY_TYPES = frozenset(
+    {
+        "project",
+        "project_update",
+        "document",
+        "comment",
+        "initiative",
+        "initiative_update",
+    }
+)
+
+
+def _public_source_type(value: Any) -> str | None:
+    candidate = _first_str(value)
+    if candidate and candidate.lower() not in _STORAGE_SOURCE_MARKERS:
+        return candidate
+    return None
+
+
+def source_key_descriptor(source_key: Any) -> dict[str, str]:
+    """Map a sync source key to public connector identity and scope."""
+    source_key = _first_str(source_key)
+    if not source_key:
+        return {}
+    if source_key.startswith("linear:issue:"):
+        issue_id = source_key[len("linear:issue:") :]
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", issue_id):
+            return {"source": "linear-issue"}
+        return {}
+    if source_key == "linear:workspace-digest":
+        return {"source": "linear-workspace"}
+    if source_key.startswith("linear:"):
+        parts = source_key.split(":")
+        if len(parts) == 3 and parts[1] in _LINEAR_CONTEXT_ENTITY_TYPES:
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", parts[2]):
+                return {"source": "linear-context"}
+        return {}
+    if source_key.startswith("github:") and ":path:" in source_key:
+        repo, path = source_key[len("github:") :].split(":path:", 1)
+        if (
+            re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            and path
+            and all(char.isprintable() for char in path)
+        ):
+            return {"source": "repo-content", "repo": repo, "path": path}
+    return {}
 
 
 def parse_content_header(text: Any, *, chunk_index: Any = None) -> dict[str, str]:
@@ -543,23 +596,29 @@ def apply_query_ranking(
     *,
     mode: str | None = None,
 ) -> list[Any]:
-    """Re-order hits for docs/spec queries and single-token literal searches."""
+    """Re-order hits by class and lexical coverage when evidence exists."""
     terms = query_terms(query)
     literal_query = len(terms) == 1
-    if not (
+    class_ranked = (
         extract_hex_needles(query)
         or is_docs_mode_query(query, mode=mode)
         or is_spec_mode_query(query)
         or literal_query
-    ):
+    )
+    if not terms and not class_ranked:
         return list(results)
     dict_hits = [item for item in results if isinstance(item, dict)]
     other = [item for item in results if not isinstance(item, dict)]
-    # Class boost first, then lexical term coverage as the tie-breaker. Without
-    # the second key a page of same-class hits (ten repo-content chunks, all
-    # `canonical-docs`) sorted into exactly its input order and mode=docs was
-    # indistinguishable from not passing it. Coverage can only reorder WITHIN a
-    # class — it never lifts an issue above documentation.
+    coverages = [hit_term_coverage(item, terms)[0] for item in dict_hits]
+    if not class_ranked and not any(coverages):
+        # Semantic matches often use synonyms. Keep the provider's order when
+        # lexical evidence cannot distinguish any candidate.
+        return list(results)
+
+    # Class boost first for docs/spec queries, then lexical term coverage. For a
+    # general query the class score is zero, so lexical coverage moves an
+    # observable match above unrelated provider candidates. Coverage never
+    # changes the order of a page with no lexical evidence.
     def rank_key(item: dict[str, Any]) -> tuple[float, float]:
         coverage, _matched = hit_term_coverage(item, terms)
         return query_rank_score(item, query, mode=mode), coverage
@@ -572,6 +631,142 @@ def _first_str(*values: Any) -> str | None:
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return None
+
+
+def _first_locator(*values: Any) -> str | None:
+    """Return the first URL-like source locator and ignore storage sentinels."""
+    for value in values:
+        candidate = _first_str(value)
+        if candidate and candidate.lower().startswith(_LOCATOR_PREFIXES):
+            return candidate
+    return None
+
+
+def source_locator_from_result(item: Any) -> str | None:
+    """Find a real source locator without exposing lifecycle storage markers."""
+    if not isinstance(item, dict):
+        return None
+    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
+    provenance = (
+        envelope.get("provenance")
+        if isinstance(envelope.get("provenance"), dict)
+        else {}
+    )
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    locator = _first_locator(
+        item.get("source_url"),
+        item.get("source_locator"),
+        provenance.get("source_url"),
+        provenance.get("source_locator"),
+        metadata.get("source_url"),
+        metadata.get("source_locator"),
+        item.get("url"),
+        item.get("uri"),
+        item.get("source"),
+    )
+    if locator:
+        return locator
+    references = envelope.get("references")
+    if not isinstance(references, list):
+        references = item.get("references")
+    if isinstance(references, list):
+        for reference in references[:10]:
+            if not isinstance(reference, dict):
+                continue
+            locator = _first_locator(
+                reference.get("source_locator"),
+                reference.get("source_url"),
+                reference.get("url"),
+            )
+            if locator:
+                return locator
+    header = parse_content_header(
+        _first_str(item.get("text"), item.get("content"), item.get("chunk"), item.get("body")),
+        chunk_index=_hit_chunk_index(item),
+    )
+    return _first_locator(header.get("source_url"))
+
+
+def exact_linear_issue_identifier(query: Any) -> str | None:
+    """Return a canonical Linear key only for a query that is exactly one key."""
+    value = _first_str(query)
+    if not value:
+        return None
+    match = LINEAR_ISSUE_KEY_RE.fullmatch(value)
+    return match.group(0).upper() if match else None
+
+
+def _linear_issue_key(value: Any) -> str | None:
+    candidate = _first_str(value)
+    if not candidate:
+        return None
+    match = LINEAR_ISSUE_KEY_RE.fullmatch(candidate)
+    return match.group(0).upper() if match else None
+
+
+def linear_issue_identifier(item: Any) -> str | None:
+    """Read Linear identity from structural fields, headers, tags, or source URLs.
+
+    Arbitrary body prose is excluded. A document that mentions ``SOK-563`` is
+    not treated as issue ``SOK-563`` unless its sync metadata or header says so.
+    """
+    if not isinstance(item, dict):
+        return None
+    envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
+    provenance = (
+        envelope.get("provenance")
+        if isinstance(envelope.get("provenance"), dict)
+        else {}
+    )
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for value in (
+        item.get("issue"),
+        item.get("identifier"),
+        item.get("key"),
+        provenance.get("issue"),
+    ):
+        issue = _linear_issue_key(value)
+        if issue:
+            return issue
+    header = parse_content_header(
+        _first_str(item.get("text"), item.get("content"), item.get("chunk"), item.get("body")),
+        chunk_index=_hit_chunk_index(item),
+    )
+    issue = _linear_issue_key(header.get("issue"))
+    if issue:
+        return issue
+    urls = [source_locator_from_result(item)]
+    urls.extend(
+        value
+        for value in (
+            item.get("url"),
+            item.get("source_url"),
+            provenance.get("source_url"),
+            metadata.get("url"),
+        )
+        if value
+    )
+    references = envelope.get("references")
+    if isinstance(references, list):
+        urls.extend(
+            reference.get("source_locator") or reference.get("source_url") or reference.get("url")
+            for reference in references[:10]
+            if isinstance(reference, dict)
+        )
+    for value in urls:
+        if not isinstance(value, str):
+            continue
+        match = LINEAR_ISSUE_URL_RE.search(value)
+        if match:
+            return match.group("issue").upper()
+    tags = item.get("tags") or metadata.get("citadel_tags") or metadata.get("tags")
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, str) and tag.lower().startswith("linear:"):
+                issue = _linear_issue_key(tag.split(":", 1)[1])
+                if issue:
+                    return issue
     return None
 
 
@@ -753,6 +948,8 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
             for key, value in provenance.items()
             if key in _PUBLIC_PROVENANCE_KEYS and isinstance(value, str) and value
         }
+        if clean_provenance.get("source", "").lower() in _STORAGE_SOURCE_MARKERS:
+            clean_provenance.pop("source", None)
         public["provenance"] = clean_provenance
 
     retrieval = envelope.get("retrieval")
@@ -767,6 +964,9 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
             )
             if isinstance(retrieval.get(key), bool)
         }
+        mode = retrieval.get("mode")
+        if isinstance(mode, str) and mode in {"vector", "lexical_fallback"}:
+            public["retrieval"]["mode"] = mode
 
     references = envelope.get("references")
     if isinstance(references, list):
@@ -854,15 +1054,11 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
     )
     if not title:
         title = text.split("\n", 1)[0][:120] if text else "Untitled result"
-    source_url = _first_str(
-        raw.get("url"),
-        raw.get("source_url"),
-        provenance.get("source_url"),
-    )
+    source_url = source_locator_from_result(raw)
     source = _first_str(
         source_url,
-        raw.get("source"),
-        provenance.get("source"),
+        _public_source_type(raw.get("source")),
+        _public_source_type(provenance.get("source")),
         provenance.get("path"),
     )
     tags_value = raw.get("tags") or metadata.get("citadel_tags") or metadata.get("tags")
@@ -901,7 +1097,38 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
         _first_str(public_envelope.get("trust_tier"), public_envelope.get("trust"))
         or infer_trust_tier(raw, doc_type)
     )
-    return {
+    raw_source = raw.get("source")
+    source_type = _public_source_type(provenance.get("source"))
+    if not source_type:
+        source_type = _public_source_type(raw.get("source_type"))
+    if not source_type and not _first_locator(raw_source):
+        source_type = _public_source_type(raw_source)
+    retrieval = (
+        public_envelope.get("retrieval")
+        if isinstance(public_envelope.get("retrieval"), dict)
+        else {}
+    )
+    references = (
+        public_envelope.get("references")
+        if isinstance(public_envelope.get("references"), list)
+        else []
+    )
+    document_endpoint = public_envelope.get("document_endpoint")
+    citation = {
+        key: value
+        for key, value in {
+            "title": title,
+            "source_locator": source_url,
+            "document_id": document_id,
+            "document_endpoint": document_endpoint,
+            "repo": _first_str(raw.get("repo"), provenance.get("repo"), metadata.get("repo")),
+            "path": _first_str(raw.get("path"), provenance.get("path"), metadata.get("path")),
+        }.items()
+        if isinstance(value, str) and value
+    }
+    if not (source_url or document_endpoint or document_id or references):
+        citation = {}
+    shaped = {
         "id": result_id,
         "document_id": document_id,
         "qa_id": qa_id,
@@ -910,6 +1137,8 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
         "source": source,
         "source_url": source_url,
         "url": source_url,
+        "source_locator": source_url,
+        "source_type": source_type,
         "repo": _first_str(raw.get("repo"), provenance.get("repo"), metadata.get("repo")),
         "path": _first_str(raw.get("path"), provenance.get("path"), metadata.get("path")),
         "tags": tags,
@@ -927,6 +1156,26 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
         "dataset": dataset,
         "_citadel": public_envelope,
     }
+    shaped["document_drilldown_available"] = bool(
+        retrieval.get("document_drilldown_available")
+    )
+    shaped["citation"] = citation
+    if provenance:
+        shaped["provenance"] = provenance
+    if retrieval:
+        shaped["retrieval"] = retrieval
+    if references:
+        shaped["references"] = references
+    if isinstance(document_endpoint, str) and document_endpoint:
+        shaped["document_endpoint"] = document_endpoint
+    relevance = public_envelope.get("relevance")
+    if isinstance(relevance, dict):
+        match_context = relevance.get("match_context")
+        if isinstance(match_context, dict):
+            match_text = match_context.get("text")
+            if isinstance(match_text, str) and match_text.strip():
+                shaped["snippet"] = match_text[:SNIPPET_CHARS]
+    return shaped
 
 
 def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None) -> dict[str, Any]:
@@ -957,8 +1206,19 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         }
 
     envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
-    provenance = envelope.get("provenance") if isinstance(envelope.get("provenance"), dict) else {}
+    public_envelope = _public_search_envelope(envelope)
+    provenance = (
+        public_envelope.get("provenance")
+        if isinstance(public_envelope.get("provenance"), dict)
+        else {}
+    )
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    source_descriptor = source_key_descriptor(
+        _first_str(
+            metadata.get("lifecycle_parent_source_key"),
+            metadata.get("source_key"),
+        )
+    )
 
     raw_text = _first_str(
         item.get("text"),
@@ -972,15 +1232,15 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
     header = parse_content_header(raw_text, chunk_index=_hit_chunk_index(item))
 
     path = _first_str(
-        item.get("path"), provenance.get("path"), metadata.get("path"), header.get("path")
+        item.get("path"),
+        provenance.get("path"),
+        metadata.get("path"),
+        source_descriptor.get("path"),
+        header.get("path"),
     )
-    url = _first_str(
-        item.get("url"),
-        item.get("source_url"),
-        provenance.get("source_url"),
-        item.get("source"),
-        header.get("source_url"),
-    )
+    url = source_locator_from_result(item)
+    if not url:
+        url = _first_str(header.get("source_url"))
     title = _first_str(
         item.get("title"),
         provenance.get("title"),
@@ -996,6 +1256,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         provenance.get("repo"),
         metadata.get("repo"),
         metadata.get("full_name"),
+        source_descriptor.get("repo"),
         header.get("repo"),
     )
     if not repo and isinstance(url, str) and "github.com/" in url:
@@ -1020,28 +1281,83 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
             snippet_source = "…" + window[1]
     snippet = " ".join(snippet_source.split())[:SNIPPET_CHARS]
 
+    result_id = _first_str(item.get("id"), public_envelope.get("result_id"))
+    document_id = _first_str(item.get("document_id"))
+    raw_source = item.get("source")
+    source_type = _public_source_type(provenance.get("source"))
+    if not source_type:
+        source_type = _public_source_type(item.get("source_type"))
+    if not source_type:
+        source_type = _public_source_type(source_descriptor.get("source"))
+    if not source_type:
+        source_type = _public_source_type(header.get("kind"))
+    if not source_type and not _first_locator(raw_source):
+        source_type = _public_source_type(raw_source)
+    retrieval = (
+        public_envelope.get("retrieval")
+        if isinstance(public_envelope.get("retrieval"), dict)
+        else {}
+    )
+    references = (
+        public_envelope.get("references")
+        if isinstance(public_envelope.get("references"), list)
+        else []
+    )
+    citation = {
+        key: value
+        for key, value in {
+            "title": title,
+            "source_locator": url,
+            "document_id": document_id,
+            "document_endpoint": public_envelope.get("document_endpoint"),
+            "repo": repo,
+            "path": path,
+        }.items()
+        if isinstance(value, str) and value
+    }
+    if not (url or public_envelope.get("document_endpoint") or document_id or references):
+        citation = {}
     normalized: dict[str, Any] = {
-        "id": item.get("id") or envelope.get("result_id"),
+        "id": result_id,
+        "document_id": document_id,
         "title": title,
         "url": url,
+        "source_locator": url,
+        "source_type": source_type,
         "repo": repo,
         "path": path,
         "doc_type": doc_type,
         "updated_at": _first_timestamp(
             item.get("updated_at"),
-            envelope.get("created_at"),
+            public_envelope.get("created_at"),
             metadata.get("updated_at"),
         ),
         "score": score,
         "snippet": snippet,
         # Alias kept for older agent parsers that read ``text``.
         "text": snippet,
-        "content_hint": infer_content_hint(item, doc_type),
+        "content_hint": _first_str(public_envelope.get("content_hint"))
+        or infer_content_hint(item, doc_type),
         "trust_tier": trust_tier,
-        "rank": envelope.get("rank") or (index + 1),
-        "dataset": envelope.get("dataset"),
-        "_citadel": envelope or None,
+        "rank": public_envelope.get("rank") or (index + 1),
+        "dataset": public_envelope.get("dataset"),
+        "document_drilldown_available": bool(
+            retrieval.get("document_drilldown_available")
+        ),
+        "citation": citation,
+        "_citadel": public_envelope or None,
     }
+    if document_id:
+        normalized["document_id"] = document_id
+    if provenance:
+        normalized["provenance"] = provenance
+    if retrieval:
+        normalized["retrieval"] = retrieval
+    if references:
+        normalized["references"] = references
+    document_endpoint = public_envelope.get("document_endpoint")
+    if isinstance(document_endpoint, str) and document_endpoint:
+        normalized["document_endpoint"] = document_endpoint
     if terms:
         coverage, matched = hit_term_coverage(item, terms)
         normalized["term_coverage"] = round(coverage, 3)
@@ -1266,6 +1582,7 @@ def shape_search_payload(
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
     mode: str | None = None,
@@ -1282,13 +1599,16 @@ def shape_search_payload(
     else:
         ordered = list(raw_results)
     hits = [normalize_search_hit(item, index=i, query=query) for i, item in enumerate(ordered)]
-    filters_active = bool(types or repo or path or canonical_only or exclude_ambient)
+    filters_active = bool(
+        types or repo or path or source or canonical_only or exclude_ambient
+    )
     before_filters = len(hits)
     hits = filter_hits(
         hits,
         types=types,
         repo=repo,
         path=path,
+        source=source,
         canonical_only=canonical_only,
         exclude_ambient=exclude_ambient,
     )
@@ -1338,3 +1658,18 @@ def shape_search_payload(
     elif payload.get("code"):
         out["code"] = payload["code"]
     return out
+
+
+def compact_search_payload_for_agent(payload: Any) -> Any:
+    """Remove dashboard-only section copies from an already shaped payload."""
+    if not isinstance(payload, dict):
+        return payload
+    compacted = dict(payload)
+    sections = payload.get("sections")
+    if isinstance(sections, dict):
+        compacted["section_counts"] = {
+            str(name): len(items) if isinstance(items, list) else 0
+            for name, items in sections.items()
+        }
+        compacted.pop("sections", None)
+    return compacted

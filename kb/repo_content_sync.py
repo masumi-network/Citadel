@@ -32,6 +32,7 @@ __all__ = [
     "DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS",
     "DEFAULT_REPO_CONTENT_REPOS",
     "DEFAULT_REPO_CONTENT_ROOT_PATHS",
+    "DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS",
     "DEFAULT_REPO_CONTENT_TREE_EXTENSIONS",
     "DEFAULT_REPO_CONTENT_TREE_PREFIXES",
     "RepoContentFile",
@@ -104,6 +105,148 @@ DEFAULT_REPO_CONTENT_TREE_PREFIXES = (
     "plugins/",
 )
 DEFAULT_REPO_CONTENT_TREE_EXTENSIONS = (".md", ".mdx", ".txt")
+DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS = (
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".py",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".java",
+    ".kt",
+    ".kts",
+    ".swift",
+    ".rs",
+    ".go",
+    ".sol",
+    ".sql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".rb",
+    ".php",
+    ".pl",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".hrl",
+    ".scala",
+    ".r",
+    ".dart",
+    ".vue",
+    ".svelte",
+    ".html",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".xml",
+    ".xsd",
+    ".proto",
+    ".graphql",
+    ".graphqls",
+    ".tf",
+    ".tfvars",
+    ".hcl",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".properties",
+    ".csv",
+    ".md",
+    ".mdx",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".ipynb",
+)
+DEFAULT_REPO_CONTENT_ALL_TEXT_NAMES = (
+    "AGENTS.md",
+    "AUTHORS",
+    "CHANGELOG",
+    "CODEOWNERS",
+    "CONTRIBUTING",
+    "Dockerfile",
+    "Gemfile",
+    "Justfile",
+    "LICENSE",
+    "Makefile",
+    "NOTICE",
+    "Procfile",
+    "Rakefile",
+    "README",
+    "SECURITY",
+    ".editorconfig",
+    ".env.example",
+    ".gitattributes",
+    ".gitignore",
+)
+_ALL_TEXT_EXCLUDED_DIRS = frozenset(
+    {
+        ".cache",
+        ".git",
+        ".next",
+        ".nuxt",
+        ".pytest_cache",
+        ".turbo",
+        ".venv",
+        "build",
+        "coverage",
+        "credentials",
+        "dist",
+        "node_modules",
+        "out",
+        "secrets",
+        "target",
+        "temp",
+        "tmp",
+        "vendor",
+        "__pycache__",
+    }
+)
+_ALL_TEXT_EXCLUDED_NAMES = frozenset(
+    {
+        "cargo.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "mix.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "pubspec.lock",
+        "uv.lock",
+        "yarn.lock",
+    }
+)
+_ALL_TEXT_EXCLUDED_SUFFIXES = (
+    ".cer",
+    ".crt",
+    ".der",
+    ".key",
+    ".map",
+    ".p12",
+    ".pfx",
+    ".pem",
+    ".pyc",
+)
 DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS = ("AGENTS.md", "CONTEXT.md", "SKILL.md")
 
 
@@ -214,6 +357,36 @@ def format_repo_content_document(file: RepoContentFile) -> str:
     )
 
 
+def _strict_tree_blob_paths(
+    data: dict[str, Any], *, full_name: str, ref: str
+) -> list[str]:
+    paths: list[str] = []
+    for entry in data["tree"]:
+        if not isinstance(entry, dict):
+            raise GitHubAPIError(
+                f"GitHub returned a malformed tree entry for {full_name}@{ref}."
+            )
+        entry_type = entry.get("type")
+        entry_path = entry.get("path")
+        if not isinstance(entry_path, str) or not entry_path:
+            raise GitHubAPIError(
+                f"GitHub returned a tree entry without a path for {full_name}@{ref}."
+            )
+        if entry_path.startswith("/") or any(
+            component in {"", ".", ".."} for component in entry_path.split("/")
+        ):
+            raise GitHubAPIError(
+                f"GitHub returned an unsafe tree path for {full_name}: {entry_path}."
+            )
+        if entry_type == "blob" and entry.get("mode") != "120000":
+            paths.append(entry_path)
+        elif entry_type not in {"tree", "commit", "blob"}:
+            raise GitHubAPIError(
+                f"GitHub returned an unknown tree entry type for {full_name}/{entry_path}."
+            )
+    return paths
+
+
 class RepoContentGitHubClient(GitHubOrgClient):
     def fetch_default_branch(self, full_name: str) -> str:
         data = self._get_json(f"/repos/{quote(full_name, safe='/')}", {})
@@ -296,6 +469,95 @@ class RepoContentGitHubClient(GitHubOrgClient):
         # GitHub truncates very large trees. A truncated tree is missing files,
         # so say so and let the caller decide rather than treating it as whole.
         return paths, bool(data.get("truncated"))
+
+    def fetch_complete_tree(self, full_name: str, *, ref: str) -> list[str]:
+        """Return every regular file path, including when GitHub truncates recursion.
+
+        GitHub's recursive tree response can be truncated for large repositories.
+        The all-text mode must not index that partial response because missing
+        files are indistinguishable from files that do not exist. It resolves the
+        commit's root tree, then walks each tree node without recursion.
+        """
+        recursive_data = self._get_json(
+            f"/repos/{quote(full_name, safe='/')}/git/trees/{quote(ref, safe='')}",
+            {"recursive": "1"},
+        )
+        if not isinstance(recursive_data, dict) or not isinstance(
+            recursive_data.get("tree"), list
+        ):
+            raise GitHubAPIError(f"GitHub returned an unexpected tree payload for {full_name}.")
+        if not bool(recursive_data.get("truncated")):
+            return _strict_tree_blob_paths(recursive_data, full_name=full_name, ref=ref)
+
+        commit_data = self._get_json(
+            f"/repos/{quote(full_name, safe='/')}/git/commits/{quote(ref, safe='')}",
+            {},
+        )
+        if not isinstance(commit_data, dict):
+            raise GitHubAPIError(
+                f"GitHub returned an unexpected commit payload for {full_name}@{ref}."
+            )
+        tree_info = commit_data.get("tree")
+        tree_sha = tree_info.get("sha") if isinstance(tree_info, dict) else None
+        if not isinstance(tree_sha, str) or not tree_sha:
+            raise GitHubAPIError(f"Could not resolve the root tree for {full_name}@{ref}.")
+
+        paths: list[str] = []
+        pending: list[tuple[str, str]] = [("", tree_sha)]
+        while pending:
+            prefix, current_sha = pending.pop()
+            data = self._get_json(
+                f"/repos/{quote(full_name, safe='/')}/git/trees/{quote(current_sha, safe='')}",
+                {},
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+                raise GitHubAPIError(
+                    f"GitHub returned an unexpected tree payload for {full_name}@{current_sha}."
+                )
+            if bool(data.get("truncated")):
+                raise GitHubAPIError(
+                    f"GitHub truncated a non-recursive tree for {full_name}@{current_sha}."
+                )
+            for entry in data["tree"]:
+                if not isinstance(entry, dict):
+                    raise GitHubAPIError(
+                        f"GitHub returned a malformed tree entry for {full_name}@{current_sha}."
+                    )
+                entry_type = entry.get("type")
+                entry_path = entry.get("path")
+                if not isinstance(entry_path, str) or not entry_path:
+                    raise GitHubAPIError(
+                        f"GitHub returned a tree entry without a path for {full_name}@{current_sha}."
+                    )
+                components = entry_path.split("/")
+                if entry_path.startswith("/") or any(
+                    component in {"", ".", ".."} for component in components
+                ):
+                    raise GitHubAPIError(
+                        f"GitHub returned an unsafe tree path for {full_name}: {entry_path}."
+                    )
+                path = f"{prefix}/{entry_path}" if prefix else entry_path
+                if entry_type == "tree":
+                    child_sha = entry.get("sha")
+                    if not isinstance(child_sha, str) or not child_sha:
+                        raise GitHubAPIError(
+                            f"GitHub returned a tree without a SHA for {full_name}/{path}."
+                        )
+                    pending.append((path, child_sha))
+                elif entry_type == "blob":
+                    # Mode 120000 is a symlink. The contents API can return the
+                    # link metadata instead of file bytes, so never treat it as
+                    # source text during an all-text scan.
+                    if entry.get("mode") != "120000":
+                        paths.append(path)
+                elif entry_type == "commit":
+                    # A submodule has no file tree in this repository.
+                    continue
+                else:
+                    raise GitHubAPIError(
+                        f"GitHub returned an unknown tree entry type for {full_name}/{path}."
+                    )
+        return paths
 
     def file_exists(self, full_name: str, path: str, *, ref: str) -> bool:
         try:
@@ -416,6 +678,56 @@ def _select_from_tree(
     return selected
 
 
+def _is_all_text_path(path: str, extensions: tuple[str, ...]) -> bool:
+    normalized = path.strip().lstrip("/")
+    if not normalized or normalized != path:
+        return False
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if any(part.lower() in _ALL_TEXT_EXCLUDED_DIRS for part in parts[:-1]):
+        return False
+
+    basename = parts[-1]
+    lowered = basename.lower()
+    if lowered in _ALL_TEXT_EXCLUDED_NAMES:
+        return False
+    if lowered == ".env" or (lowered.startswith(".env.") and lowered != ".env.example"):
+        return False
+    if lowered.startswith(("id_rsa", "id_ed25519", "id_ecdsa")):
+        return False
+    if lowered in {"credentials", "secrets", "secret.json", "secret.yaml", "secret.yml"}:
+        return False
+    if lowered.endswith(".lock") or lowered.endswith(".min.js"):
+        return False
+    if lowered.endswith(_ALL_TEXT_EXCLUDED_SUFFIXES):
+        return False
+
+    allowed_names = {name.lower() for name in DEFAULT_REPO_CONTENT_ALL_TEXT_NAMES}
+    return lowered in allowed_names or _matches_extension(normalized, extensions)
+
+
+def _select_all_text_from_tree(
+    paths: list[str], *, extensions: tuple[str, ...], max_files: int
+) -> list[str]:
+    """Select safe, source-like text paths from a complete Git tree.
+
+    This deliberately excludes dependency, generated, lock, and secret-shaped
+    paths before the contents endpoint downloads any bytes. The content scanner
+    remains the second boundary for secrets inside ordinary source files.
+    """
+    selected: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(paths):
+        if path in seen or not _is_all_text_path(path, extensions):
+            continue
+        selected.append(path)
+        seen.add(path)
+        if max_files > 0 and len(selected) >= max_files:
+            break
+    return selected
+
+
 def discover_repo_paths(
     client: RepoContentGitHubClient,
     full_name: str,
@@ -426,7 +738,15 @@ def discover_repo_paths(
     tree_extensions: tuple[str, ...],
     max_files: int,
     max_depth: int = 4,
+    all_text: bool = False,
 ) -> list[str]:
+    if all_text:
+        return _select_all_text_from_tree(
+            client.fetch_complete_tree(full_name, ref=ref),
+            extensions=tree_extensions or DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS,
+            max_files=max_files,
+        )
+
     tree = client.fetch_tree(full_name, ref=ref)
     if tree is not None:
         paths, truncated = tree
@@ -501,11 +821,11 @@ def discover_org_repos(
     """Auto-join org repos that carry a marker file (e.g. AGENTS.md/CONTEXT.md/
     SKILL.md) at their root, so the static allowlist never silently lags reality.
 
-    Returns the full names of non-archived repos in ``org`` that have at least one
-    ``markers`` file at their default-branch root. Failures degrade to an empty
-    result rather than aborting the sync.
+    Returns the full names of non-archived repos in ``org``. When ``markers`` is
+    non-empty, only repos with a marker at the default-branch root are returned.
+    Failures degrade to an empty result rather than aborting the sync.
     """
-    if not markers or max_repos <= 0:
+    if max_repos < 0:
         return []
     try:
         repos = client.fetch_repos(org, max_repos=max_repos)
@@ -517,6 +837,9 @@ def discover_org_repos(
         full_name = repo.full_name
         ref = repo.default_branch
         if not full_name or repo.archived or not ref:
+            continue
+        if not markers:
+            discovered.append(full_name)
             continue
         for marker in markers:
             normalized = marker.strip().lstrip("/")
@@ -571,20 +894,33 @@ class RepoContentSyncer:
         save_state_file(self.state_path, state)
 
     def _resolved_repos(self) -> list[str]:
-        repos = self.config.repo_content_sync_repos or DEFAULT_REPO_CONTENT_REPOS
+        if self.config.repo_content_sync_all_repos:
+            repos: tuple[str, ...] = ()
+        else:
+            repos = self.config.repo_content_sync_repos or DEFAULT_REPO_CONTENT_REPOS
         resolved = [resolve_repo_full_name(name, self.org) for name in repos if name.strip()]
-        if not self.config.repo_content_sync_autojoin_enabled:
+        if self.config.repo_content_sync_all_repos:
+            discovered = discover_org_repos(
+                self.client,
+                self.org,
+                markers=(),
+                # All-org mode must not silently stop at the marker auto-join
+                # cap. GitHub's zero limit means fetch every repository page.
+                max_repos=0,
+            )
+        elif not self.config.repo_content_sync_autojoin_enabled:
             return resolved
-        markers = (
-            self.config.repo_content_sync_autojoin_markers
-            or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
-        )
-        discovered = discover_org_repos(
-            self.client,
-            self.org,
-            markers=markers,
-            max_repos=self.config.repo_content_sync_autojoin_max_repos,
-        )
+        else:
+            markers = (
+                self.config.repo_content_sync_autojoin_markers
+                or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
+            )
+            discovered = discover_org_repos(
+                self.client,
+                self.org,
+                markers=markers,
+                max_repos=self.config.repo_content_sync_autojoin_max_repos,
+            )
         seen = set(resolved)
         for full_name in discovered:
             if full_name not in seen:
@@ -613,8 +949,13 @@ class RepoContentSyncer:
         # and GET /api/repo-content-sync is served from the web process's single
         # event loop.
         repos = await asyncio.to_thread(self._resolved_repos)
+        all_repos = self.config.repo_content_sync_all_repos
+        autojoin_markers = () if all_repos else (
+            self.config.repo_content_sync_autojoin_markers
+            or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
+        )
         return {
-            "ok": state_error is None,
+            "ok": state_error is None and (not all_repos or bool(repos)),
             "state_error": state_error,
             "authenticated": bool(getattr(self.client, "token", None)),
             "source_type": "github_repo_content",
@@ -622,11 +963,11 @@ class RepoContentSyncer:
             "enabled": self.config.repo_content_sync_enabled,
             "dataset": self.config.repo_content_sync_dataset,
             "session": self.config.repo_content_sync_session,
+            "all_repos": all_repos,
+            "repo_discovery_complete": not all_repos or bool(repos),
+            "all_text": self.config.repo_content_sync_all_text,
             "autojoin_enabled": self.config.repo_content_sync_autojoin_enabled,
-            "autojoin_markers": list(
-                self.config.repo_content_sync_autojoin_markers
-                or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
-            ),
+            "autojoin_markers": list(autojoin_markers),
             "repos": repos,
             "root_paths": list(
                 self.config.repo_content_sync_root_paths or DEFAULT_REPO_CONTENT_ROOT_PATHS
@@ -635,7 +976,12 @@ class RepoContentSyncer:
                 self.config.repo_content_sync_tree_prefixes or DEFAULT_REPO_CONTENT_TREE_PREFIXES
             ),
             "tree_extensions": list(
-                self.config.repo_content_sync_tree_extensions or DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
+                self.config.repo_content_sync_tree_extensions
+                or (
+                    DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS
+                    if self.config.repo_content_sync_all_text
+                    else DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
+                )
             ),
             "max_files_per_repo": self.config.repo_content_sync_max_files_per_repo,
             "max_bytes_per_file": self.config.repo_content_sync_max_bytes_per_file,
@@ -712,10 +1058,20 @@ class RepoContentSyncer:
         tracked: dict[str, Any] = dict(state.get("files") or {})
         root_paths = self.config.repo_content_sync_root_paths or DEFAULT_REPO_CONTENT_ROOT_PATHS
         tree_prefixes = self.config.repo_content_sync_tree_prefixes or DEFAULT_REPO_CONTENT_TREE_PREFIXES
+        all_text = self.config.repo_content_sync_all_text
         tree_extensions = (
-            self.config.repo_content_sync_tree_extensions or DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
+            self.config.repo_content_sync_tree_extensions
+            or (
+                DEFAULT_REPO_CONTENT_ALL_TEXT_EXTENSIONS
+                if all_text
+                else DEFAULT_REPO_CONTENT_TREE_EXTENSIONS
+            )
         )
-        max_files = max(1, self.config.repo_content_sync_max_files_per_repo)
+        max_files = (
+            self.config.repo_content_sync_max_files_per_repo
+            if all_text
+            else max(1, self.config.repo_content_sync_max_files_per_repo)
+        )
         max_bytes = max(256, self.config.repo_content_sync_max_bytes_per_file)
 
         repo_results: list[dict[str, Any]] = []
@@ -759,9 +1115,32 @@ class RepoContentSyncer:
         # DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS) up to 301 round trips, all of
         # them before the loop below reaches its first ``to_thread``.
         repos = await asyncio.to_thread(self._resolved_repos)
+        if self.config.repo_content_sync_all_repos and not repos:
+            logger.error(
+                "All-org repository discovery returned no repositories for %s",
+                self.org,
+            )
+            return {
+                "ok": False,
+                "enabled": True,
+                "authenticated": authenticated,
+                "org": self.org,
+                "checked_at": checked_at,
+                "reason": "repo_discovery_empty",
+                "repo_discovery_complete": False,
+                "all_repos": True,
+                "all_text": all_text,
+                "repos_scanned": 0,
+                "files_ingested": 0,
+                "files_tombstoned": 0,
+                "files_skipped": 0,
+                "files_blocked": 0,
+                "dry_run": dry_run,
+            }
         for full_name in repos:
             repo_result: dict[str, Any] = {
                 "repo": full_name,
+                "all_text": all_text,
                 "paths_discovered": 0,
                 "ingested": 0,
                 "skipped": 0,
@@ -798,6 +1177,7 @@ class RepoContentSyncer:
                     tree_prefixes=tree_prefixes,
                     tree_extensions=tree_extensions,
                     max_files=max_files,
+                    all_text=all_text,
                 )
                 repo_result["paths_discovered"] = len(paths)
                 repo_result["ref"] = ref
@@ -1066,6 +1446,10 @@ class RepoContentSyncer:
                         capture_actor_id="github-repo-content-sync",
                         capture_run_id=checked_at,
                         operation="repo_content_sync",
+                        # A full all-text scan can contain hundreds of source
+                        # files. Keep its per-file path deterministic and avoid
+                        # one optional OpenRouter enrichment call per file.
+                        tier="light" if all_text else "full",
                         # Improve ONCE after the whole sync, not per file. See
                         # LearningProcess.improve_once for why.
                         run_improve=False,
@@ -1190,6 +1574,9 @@ class RepoContentSyncer:
             and len(repos_errored) == len(repo_results)
             and ingested_files == 0
         )
+        coverage_incomplete = (
+            (self.config.repo_content_sync_all_repos or all_text) and bool(repos_errored)
+        )
 
         logger.info(
             "Repo content sync finished: repos=%d discovered=%d ingested=%d skipped=%d "
@@ -1203,12 +1590,17 @@ class RepoContentSyncer:
             dry_run,
         )
         return {
-            "ok": not all_repos_errored,
+            "ok": not all_repos_errored and not coverage_incomplete,
             "enabled": True,
             "authenticated": authenticated,
             "org": self.org,
             "checked_at": checked_at,
             "repos_scanned": len(repo_results),
+            "repo_discovery_complete": not self.config.repo_content_sync_all_repos
+            or bool(repo_results),
+            "content_scan_complete": not coverage_incomplete,
+            "all_repos": self.config.repo_content_sync_all_repos,
+            "all_text": all_text,
             "repos_errored": len(repos_errored),
             "files_ingested": ingested_files,
             "files_tombstoned": tombstoned_files,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
 import hashlib
@@ -30,6 +31,23 @@ class GenerationBackupError(RuntimeError):
     pass
 
 
+_CANONICAL_SYSTEM_ROOT = Path("cognee-system")
+_CANONICAL_DATA_ROOT = Path("data-storage")
+_CANONICAL_STATE_ROOT = Path("citadel-state")
+_CANONICAL_DATABASE = _CANONICAL_SYSTEM_ROOT / "databases/cognee.db"
+_CANONICAL_LIFECYCLE = _CANONICAL_STATE_ROOT / "lifecycle.sqlite3"
+
+
+@dataclass(frozen=True)
+class _LiteStorageLayout:
+    system_root: Path
+    data_storage_root: Path
+    state_root: Path
+    database_path: Path
+    database_file: Path
+    lifecycle_file: Path
+
+
 class SnapshotStore(Protocol):
     def list_generation_collections(self, generation_id: str) -> list[str]: ...
 
@@ -52,7 +70,7 @@ class SnapshotStore(Protocol):
     def delete_collection(self, collection: str) -> None: ...
 
 
-def _direct_destination(path: Path, *, label: str) -> Path:
+def _direct_path(path: Path, *, label: str) -> Path:
     absolute = Path(os.path.abspath(path))
     try:
         resolved = absolute.resolve(strict=False)
@@ -65,13 +83,135 @@ def _direct_destination(path: Path, *, label: str) -> Path:
     return absolute
 
 
-def _reject_nested_backup_destination(source_root: Path, destination: Path) -> None:
-    copied_roots = (
-        source_root / "cognee-system",
-        source_root / "data-storage",
-        source_root / "citadel-state",
+def _direct_destination(path: Path, *, label: str) -> Path:
+    return _direct_path(path, label=label)
+
+
+def _configured_volume_root(root: Path) -> Path:
+    configured = Path(os.getenv("CITADEL_LITE_DATA_ROOT", str(root)))
+    return _direct_path(configured, label="CITADEL_LITE_DATA_ROOT")
+
+
+def _map_configured_path(
+    *,
+    name: str,
+    configured_root: Path,
+    actual_root: Path,
+    fallback: Path,
+) -> Path:
+    raw = os.getenv(name)
+    configured_path = Path(raw) if raw else configured_root / fallback
+    if not configured_path.is_absolute():
+        configured_path = configured_root / configured_path
+    configured_path = _direct_path(configured_path, label=name)
+    if not configured_path.is_relative_to(configured_root):
+        raise GenerationBackupError(
+            f"{name} must resolve inside CITADEL_LITE_DATA_ROOT: {configured_path}"
+        )
+    return actual_root / configured_path.relative_to(configured_root)
+
+
+def _validate_layout_roots(layout: _LiteStorageLayout) -> None:
+    roots = {
+        "SYSTEM_ROOT_DIRECTORY": layout.system_root,
+        "DATA_ROOT_DIRECTORY": layout.data_storage_root,
+        "CITADEL_STATE_DIRECTORY": layout.state_root,
+    }
+    items = list(roots.items())
+    for index, (left_name, left) in enumerate(items):
+        for right_name, right in items[index + 1 :]:
+            if left == right or left.is_relative_to(right) or right.is_relative_to(left):
+                raise GenerationBackupError(
+                    f"{left_name} and {right_name} must be separate directories"
+                )
+    if not layout.database_path.is_relative_to(layout.system_root):
+        raise GenerationBackupError(
+            "DB_PATH must resolve inside SYSTEM_ROOT_DIRECTORY: "
+            f"{layout.database_path}"
+        )
+    if not layout.lifecycle_file.is_relative_to(layout.state_root):
+        raise GenerationBackupError(
+            "CITADEL_LIFECYCLE_STORE_PATH must resolve inside "
+            f"CITADEL_STATE_DIRECTORY: {layout.lifecycle_file}"
+        )
+    if layout.lifecycle_file == layout.state_root / "lite-runtime.lock":
+        raise GenerationBackupError(
+            "CITADEL_LIFECYCLE_STORE_PATH must not use the Lite runtime lock path"
+        )
+
+
+def _lite_storage_layout(root: Path) -> _LiteStorageLayout:
+    actual_root = Path(root)
+    configured_root = _configured_volume_root(actual_root)
+    system_root = _map_configured_path(
+        name="SYSTEM_ROOT_DIRECTORY",
+        configured_root=configured_root,
+        actual_root=actual_root,
+        fallback=_CANONICAL_SYSTEM_ROOT,
     )
-    excluded_backup_root = source_root / "citadel-state/backups"
+    data_storage_root = _map_configured_path(
+        name="DATA_ROOT_DIRECTORY",
+        configured_root=configured_root,
+        actual_root=actual_root,
+        fallback=_CANONICAL_DATA_ROOT,
+    )
+    state_root = _map_configured_path(
+        name="CITADEL_STATE_DIRECTORY",
+        configured_root=configured_root,
+        actual_root=actual_root,
+        fallback=_CANONICAL_STATE_ROOT,
+    )
+    database_path = _map_configured_path(
+        name="DB_PATH",
+        configured_root=configured_root,
+        actual_root=actual_root,
+        fallback=_CANONICAL_SYSTEM_ROOT / "databases",
+    )
+    database_name = os.getenv("DB_NAME", "cognee.db")
+    if (
+        not database_name
+        or database_name in {".", ".."}
+        or Path(database_name).name != database_name
+    ):
+        raise GenerationBackupError(f"DB_NAME must be a single file name: {database_name!r}")
+    database_file = database_path / database_name
+    if os.getenv("CITADEL_LIFECYCLE_STORE_PATH"):
+        lifecycle_file = _map_configured_path(
+            name="CITADEL_LIFECYCLE_STORE_PATH",
+            configured_root=configured_root,
+            actual_root=actual_root,
+            fallback=_CANONICAL_LIFECYCLE,
+        )
+    else:
+        lifecycle_file = state_root / "lifecycle.sqlite3"
+    layout = _LiteStorageLayout(
+        system_root=system_root,
+        data_storage_root=data_storage_root,
+        state_root=state_root,
+        database_path=database_path,
+        database_file=database_file,
+        lifecycle_file=lifecycle_file,
+    )
+    _validate_layout_roots(layout)
+    return layout
+
+
+def _sqlite_exclusions(database_file: Path, root: Path) -> frozenset[str]:
+    relative = database_file.relative_to(root).as_posix()
+    return frozenset({relative, f"{relative}-shm", f"{relative}-wal"})
+
+
+def _reject_nested_backup_destination(
+    source_root: Path,
+    destination: Path,
+    layout: _LiteStorageLayout,
+) -> None:
+    copied_roots = (
+        layout.system_root,
+        layout.data_storage_root,
+        layout.state_root,
+    )
+    excluded_backup_root = layout.state_root / "backups"
     if destination.is_relative_to(excluded_backup_root):
         return
     for copied_root in copied_roots:
@@ -257,50 +397,149 @@ def _verify_inventory(
 
 
 def _copy_lite_state(source_root: Path, destination_root: Path) -> None:
-    system_source = source_root / "cognee-system"
-    state_source = source_root / "citadel-state"
+    layout = _lite_storage_layout(source_root)
     _copy_tree(
-        system_source,
-        destination_root / "cognee-system",
-        excluded=frozenset(
-            {
-                "databases/cognee.db",
-                "databases/cognee.db-shm",
-                "databases/cognee.db-wal",
-            }
-        ),
+        layout.system_root,
+        destination_root / _CANONICAL_SYSTEM_ROOT,
+        excluded=_sqlite_exclusions(layout.database_file, layout.system_root),
     )
-    _copy_tree(source_root / "data-storage", destination_root / "data-storage")
     _copy_tree(
-        state_source,
-        destination_root / "citadel-state",
-        excluded=frozenset(
-            {
-                "backups",
-                "lite-runtime.lock",
-                "lifecycle.sqlite3",
-                "lifecycle.sqlite3-shm",
-                "lifecycle.sqlite3-wal",
-            }
-        ),
+        layout.data_storage_root,
+        destination_root / _CANONICAL_DATA_ROOT,
+    )
+    state_excluded = set(_sqlite_exclusions(layout.lifecycle_file, layout.state_root))
+    state_excluded.update({"backups", "lite-runtime.lock"})
+    _copy_tree(
+        layout.state_root,
+        destination_root / _CANONICAL_STATE_ROOT,
+        excluded=frozenset(state_excluded),
     )
     _sqlite_backup(
-        system_source / "databases/cognee.db",
-        destination_root / "cognee-system/databases/cognee.db",
+        layout.database_file,
+        destination_root / _CANONICAL_DATABASE,
     )
     _sqlite_backup(
-        state_source / "lifecycle.sqlite3",
-        destination_root / "citadel-state/lifecycle.sqlite3",
+        layout.lifecycle_file,
+        destination_root / _CANONICAL_LIFECYCLE,
     )
+
+
+def _archive_path_to_target(relative: str, layout: _LiteStorageLayout) -> Path:
+    path = Path(relative)
+    if not relative or path.is_absolute() or ".." in path.parts:
+        raise GenerationBackupError(f"unsafe manifest path: {relative!r}")
+    if path == _CANONICAL_DATABASE:
+        return layout.database_file
+    if path == _CANONICAL_LIFECYCLE:
+        return layout.lifecycle_file
+    for prefix, target_root in (
+        (_CANONICAL_SYSTEM_ROOT, layout.system_root),
+        (_CANONICAL_DATA_ROOT, layout.data_storage_root),
+        (_CANONICAL_STATE_ROOT, layout.state_root),
+    ):
+        if path == prefix or path.is_relative_to(prefix):
+            return target_root / path.relative_to(prefix)
+    raise GenerationBackupError(f"unsupported local backup path: {relative}")
+
+
+def _target_path_to_archive(path: Path, layout: _LiteStorageLayout) -> str:
+    if path == layout.database_file:
+        return _CANONICAL_DATABASE.as_posix()
+    if path == layout.lifecycle_file:
+        return _CANONICAL_LIFECYCLE.as_posix()
+    for prefix, source_root in (
+        (_CANONICAL_SYSTEM_ROOT, layout.system_root),
+        (_CANONICAL_DATA_ROOT, layout.data_storage_root),
+        (_CANONICAL_STATE_ROOT, layout.state_root),
+    ):
+        if path == source_root or path.is_relative_to(source_root):
+            return (prefix / path.relative_to(source_root)).as_posix()
+    raise GenerationBackupError(f"unsupported restore path: {path}")
+
+
+def _restore_lite_state(source_root: Path, target_layout: _LiteStorageLayout) -> None:
+    canonical_system = source_root / _CANONICAL_SYSTEM_ROOT
+    canonical_data = source_root / _CANONICAL_DATA_ROOT
+    canonical_state = source_root / _CANONICAL_STATE_ROOT
+    _copy_tree(
+        canonical_system,
+        target_layout.system_root,
+        excluded=_sqlite_exclusions(
+            _CANONICAL_DATABASE,
+            _CANONICAL_SYSTEM_ROOT,
+        ),
+    )
+    _copy_tree(canonical_data, target_layout.data_storage_root)
+    state_excluded = set(
+        _sqlite_exclusions(_CANONICAL_LIFECYCLE, _CANONICAL_STATE_ROOT)
+    )
+    state_excluded.update({"backups", "lite-runtime.lock"})
+    _copy_tree(
+        canonical_state,
+        target_layout.state_root,
+        excluded=frozenset(state_excluded),
+    )
+    _sqlite_backup(
+        source_root / _CANONICAL_DATABASE,
+        target_layout.database_file,
+    )
+    _sqlite_backup(
+        source_root / _CANONICAL_LIFECYCLE,
+        target_layout.lifecycle_file,
+    )
+
+
+def _verify_restored_inventory(
+    target_layout: _LiteStorageLayout,
+    inventory: list[dict[str, Any]],
+) -> None:
+    expected: dict[Path, tuple[str, int, str]] = {}
+    for item in inventory:
+        relative = str(item.get("path", ""))
+        target = _archive_path_to_target(relative, target_layout)
+        if target in expected:
+            raise GenerationBackupError(
+                f"duplicate restore target for local backup path: {relative}"
+            )
+        expected[target] = (relative, int(item["size"]), str(item["sha256"]))
+
+    actual_paths: set[Path] = set()
+    for root in (
+        target_layout.system_root,
+        target_layout.data_storage_root,
+        target_layout.state_root,
+    ):
+        if not root.exists():
+            continue
+        if root.is_symlink():
+            raise GenerationBackupError(f"restore path must not be a symlink: {root}")
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise GenerationBackupError(f"restore path must not be a symlink: {path}")
+            if path.is_file() and path != target_layout.state_root / "lite-runtime.lock":
+                _target_path_to_archive(path, target_layout)
+                actual_paths.add(path)
+    if actual_paths != set(expected):
+        raise GenerationBackupError("restored local-file inventory is incomplete")
+    for path, (relative, size, digest) in expected.items():
+        if not path.is_file():
+            raise GenerationBackupError(f"restored backup artifact is missing: {relative}")
+        if path.stat().st_size != size or _sha256(path) != digest:
+            raise GenerationBackupError(f"restored artifact digest mismatch: {relative}")
 
 
 def _manifest_bytes(manifest: Mapping[str, Any]) -> bytes:
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _acquire_lite_lock(data_root: Path, *, operation: str) -> Any:
+def _acquire_lite_lock(
+    data_root: Path,
+    *,
+    operation: str,
+    state_root: Path | None = None,
+) -> Any:
     try:
-        return acquire_single_instance_lock(data_root)
+        return acquire_single_instance_lock(data_root, state_root=state_root)
     except (LiteConfigurationError, OSError) as error:
         raise GenerationBackupError(
             f"Citadel writer is active or the Lite {operation} lock is unavailable"
@@ -318,11 +557,16 @@ def create_generation_backup(
     if not generation:
         raise GenerationBackupError("generation ID must not be empty")
     source_root = data_root.resolve()
+    source_layout = _lite_storage_layout(source_root)
     final_root = _direct_destination(destination, label="backup destination")
-    _reject_nested_backup_destination(source_root, final_root)
+    _reject_nested_backup_destination(source_root, final_root, source_layout)
     if final_root.exists():
         raise GenerationBackupError(f"backup destination already exists: {final_root}")
-    lock = _acquire_lite_lock(source_root, operation="backup")
+    lock = _acquire_lite_lock(
+        source_root,
+        operation="backup",
+        state_root=source_layout.state_root,
+    )
     temporary_root = final_root.with_name(f".{final_root.name}.tmp-{uuid4().hex}")
     created_parent_directories: list[Path] = []
     try:
@@ -462,6 +706,7 @@ def restore_generation_backup(
     source_root = backup_root.resolve()
     target_root = _direct_destination(target_data_root, label="restore target")
     _reject_nested_restore_target(source_root, target_root)
+    target_layout = _lite_storage_layout(target_root)
     manifest = _load_manifest(source_root)
     artifact_generation = manifest.get("generation_id")
     if artifact_generation != generation:
@@ -474,6 +719,8 @@ def restore_generation_backup(
     if not isinstance(local_files, list) or not isinstance(collections, list):
         raise GenerationBackupError("backup manifest inventory is malformed")
     _verify_inventory(source_root / "local", local_files)
+    for item in local_files:
+        _archive_path_to_target(str(item.get("path", "")), target_layout)
     _verify_qdrant_artifacts(source_root, collections)
     if target_root.exists():
         if not target_root.is_dir() or any(target_root.iterdir()):
@@ -493,8 +740,12 @@ def restore_generation_backup(
             )
             target_root.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
             target_root.chmod(_PRIVATE_DIRECTORY_MODE)
-        _make_private_directory(target_root / "citadel-state")
-        lock = _acquire_lite_lock(target_root, operation="restore")
+        _make_private_directory(target_layout.state_root)
+        lock = _acquire_lite_lock(
+            target_root,
+            operation="restore",
+            state_root=target_layout.state_root,
+        )
         owns_target_cleanup = True
 
         for item in collections:
@@ -515,12 +766,8 @@ def restore_generation_backup(
                 {"collection": collection, "point_count": point_count}
             )
 
-        _copy_tree(source_root / "local", target_root)
-        _verify_inventory(
-            target_root,
-            local_files,
-            ignored_paths=frozenset({"citadel-state/lite-runtime.lock"}),
-        )
+        _restore_lite_state(source_root / "local", target_layout)
+        _verify_restored_inventory(target_layout, local_files)
         return {
             "ok": True,
             "generation_id": str(manifest["generation_id"]),
@@ -536,8 +783,12 @@ def restore_generation_backup(
                 rollback_failures.append(collection)
         if owns_target_cleanup:
             if target_existed:
-                for name in ("cognee-system", "data-storage", "citadel-state"):
-                    _remove_operation_tree(target_root / name)
+                for path in (
+                    target_layout.system_root,
+                    target_layout.data_storage_root,
+                    target_layout.state_root,
+                ):
+                    _remove_operation_tree(path)
             else:
                 _remove_operation_tree(target_root)
                 for directory in created_parent_directories:

@@ -27,6 +27,7 @@ BUNDLED_TREES = (
 )
 CANONICAL_SKILLS = {
     "boundary": "citadel-data-boundary",
+    "citadel": "citadel",
     "cli": "citadel-cli",
     "connect": "citadel-mcp-connector",
     "debug": "citadel-debug",
@@ -36,6 +37,7 @@ CANONICAL_SKILLS = {
 }
 EXPECTED_SKILL_ALIASES = {
     "boundary": ["citadel-data-boundary", "policy", "privacy", "public-private"],
+    "citadel": [],
     "cli": ["citadel-cli"],
     "connect": ["citadel-mcp-connector", "mcp", "mcp-connector"],
     "debug": ["citadel-debug"],
@@ -52,6 +54,14 @@ def _tree_payload(root: Path) -> dict[str, bytes]:
         if path.is_file()
         and "__pycache__" not in path.parts
         and path.suffix not in {".pyc", ".pyo"}
+        and path.name != ".DS_Store"
+        and not (
+            root.name == "scripts"
+            and (
+                path.relative_to(root) == Path("ingest_masumi_workspace.py")
+                or path.relative_to(root).parts[:2] == ("bench", "runs")
+            )
+        )
     }
 
 

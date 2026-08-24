@@ -266,13 +266,16 @@ class CitadelConfig:
     # explicitly disabled.
     lifecycle_enabled: bool = False
     lifecycle_store_path: str = ".citadel/lifecycle.sqlite3"
+    lifecycle_projection_batch_size: int = 20
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
+    repo_content_sync_all_repos: bool = False
+    repo_content_sync_all_text: bool = False
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_extensions: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_max_files_per_repo: int = 40
     repo_content_sync_max_bytes_per_file: int = 120_000
-    repo_content_sync_run_improve: bool = True
+    repo_content_sync_run_improve: bool = False
     repo_content_sync_autojoin_enabled: bool = False
     repo_content_sync_autojoin_markers: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_autojoin_max_repos: int = 100
@@ -311,7 +314,12 @@ class CitadelConfig:
     linear_sync_dataset: str = "masumi-network"
     linear_sync_session: str = "masumi-linear"
     linear_sync_state_path: str = ".citadel/linear_sync_state.json"
-    linear_sync_max_issues: int = 200
+    # Zero means fetch every Linear issue page until hasNextPage is false.
+    linear_sync_max_issues: int = 0
+    # Zero means fetch every active Linear context record page. Archived records
+    # stay excluded unless explicitly enabled below.
+    linear_sync_max_context_records: int = 0
+    linear_sync_include_archived: bool = False
     linear_sync_run_improve: bool = False
     linear_user_map: dict[str, str] = field(default_factory=dict)
 
@@ -484,8 +492,23 @@ class CitadelConfig:
             lifecycle_store_path=_lifecycle_store_path(
                 os.getenv("CITADEL_LIFECYCLE_STORE_PATH")
             ),
+            lifecycle_projection_batch_size=max(
+                1,
+                _int(
+                    os.getenv("CITADEL_LIFECYCLE_PROJECTION_BATCH_SIZE"),
+                    default=20,
+                ),
+            ),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
+            ),
+            repo_content_sync_all_repos=_bool(
+                os.getenv("CITADEL_REPO_CONTENT_SYNC_ALL_REPOS"),
+                default=True,
+            ),
+            repo_content_sync_all_text=_bool(
+                os.getenv("CITADEL_REPO_CONTENT_SYNC_ALL_TEXT"),
+                default=True,
             ),
             repo_content_sync_root_paths=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_ROOT_PATHS"))
@@ -498,7 +521,7 @@ class CitadelConfig:
             ),
             repo_content_sync_max_files_per_repo=_int(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_MAX_FILES_PER_REPO"),
-                default=40,
+                default=0,
             ),
             repo_content_sync_max_bytes_per_file=_int(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_MAX_BYTES_PER_FILE"),
@@ -605,7 +628,13 @@ class CitadelConfig:
             linear_sync_state_path=_linear_sync_state_path(
                 os.getenv("CITADEL_LINEAR_SYNC_STATE_PATH")
             ),
-            linear_sync_max_issues=_int(os.getenv("CITADEL_LINEAR_SYNC_MAX_ISSUES"), default=200),
+            linear_sync_max_issues=_int(os.getenv("CITADEL_LINEAR_SYNC_MAX_ISSUES"), default=0),
+            linear_sync_max_context_records=_int(
+                os.getenv("CITADEL_LINEAR_SYNC_MAX_CONTEXT_RECORDS"), default=0
+            ),
+            linear_sync_include_archived=_bool(
+                os.getenv("CITADEL_LINEAR_SYNC_INCLUDE_ARCHIVED"), default=False
+            ),
             linear_sync_run_improve=_bool(os.getenv("CITADEL_LINEAR_SYNC_RUN_IMPROVE")),
             linear_user_map=_linear_user_map(os.getenv("CITADEL_LINEAR_USER_MAP")),
         )

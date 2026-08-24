@@ -26,3 +26,6 @@ def test_free_route_detection_matches_free_openrouter_routes(monkeypatch) -> Non
 
     monkeypatch.setenv("LLM_MODEL", "openrouter/free")
     assert _free_route_configured() is True
+
+    monkeypatch.setenv("LLM_MODEL", "openrouter/openrouter/free")
+    assert _free_route_configured() is True

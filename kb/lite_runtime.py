@@ -248,9 +248,13 @@ def drop_root_privileges(root: Path, *, user_name: str = "citadel") -> None:
     os.setuid(account.pw_uid)
 
 
-def acquire_single_instance_lock(root: Path) -> IO[str]:
+def acquire_single_instance_lock(
+    root: Path,
+    *,
+    state_root: Path | None = None,
+) -> IO[str]:
     global _LOCK_HANDLE
-    lock_path = root / "citadel-state" / "lite-runtime.lock"
+    lock_path = (state_root or root / "citadel-state") / "lite-runtime.lock"
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

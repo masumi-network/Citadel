@@ -113,6 +113,21 @@ class _FakeCitadel:
         }
 
 
+class _BlockingCognifyCitadel(_FakeCitadel):
+    def __init__(self, cognify_calls: list[bool]) -> None:
+        super().__init__(cognify_calls)
+        self.cognify_started = asyncio.Event()
+
+    async def cognify_dataset(
+        self, *, force: bool = False, verify: bool = False
+    ) -> dict[str, Any]:
+        self._cognify_calls.append(force)
+        assert verify is True
+        self.cognify_started.set()
+        await asyncio.Event().wait()
+        return {}
+
+
 def _patch_phase1(monkeypatch: Any, *, code: int = 0, raises: bool = False) -> list[bool]:
     """Replace Phase 1 with a stub and report whether it saw add-only mode.
 
@@ -183,6 +198,28 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     # without draining the lifecycle queue, so a job accepted mid-pass would
     # otherwise wait for the next external ingest or the next pass.
     assert len(fake_citadel.resume_calls) >= 1
+
+
+async def test_evolve_scheduler_does_not_resume_after_phase2_cancellation(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import kb.server as server
+
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert cognify_calls
+    assert fake_citadel.resume_calls == []
 
 
 class _RaisingCitadel:

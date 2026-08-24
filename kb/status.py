@@ -504,6 +504,7 @@ def search_node(
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
     mode: str | None = None,
@@ -512,7 +513,7 @@ def search_node(
 
     Zero-dep, HTTPS-only. The Node resolves the dataset from the token's seat by
     default. Optional filter fields (``types`` / ``repo`` / ``path`` /
-    ``canonical_only`` / ``exclude_ambient`` / ``mode``) are forwarded so
+    ``source`` / ``canonical_only`` / ``exclude_ambient`` / ``mode``) are forwarded so
     server-side telemetry sees the same narrowing the CLI applies. Returns the
     full search payload (``results``, ``sections``, ``dataset``, …) like MCP
     ``citadel_search`` — not a flattened list.
@@ -530,6 +531,8 @@ def search_node(
         payload["repo"] = str(repo).strip()
     if path and str(path).strip():
         payload["path"] = str(path).strip()
+    if source and str(source).strip():
+        payload["source"] = str(source).strip().lower()
     if canonical_only:
         payload["canonical_only"] = True
     if exclude_ambient:
@@ -566,20 +569,20 @@ def ingest_node(
     token: str,
     data: str,
     tags: list[str] | tuple[str, ...] = (),
-    cognify: bool = True,
+    cognify: bool = False,
     *,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """POST a note to the Node's /ingest (same endpoint MCP citadel_ingest uses).
 
     Sends no dataset, so the seat token routes the write to the dev's private
-    node (personal-by-default), mirroring the SessionEnd hook. Cognee builds the
-    graph inline and the note is reported searchable only after projection.
+    node (personal-by-default), mirroring the SessionEnd hook. User ingest only
+    captures the source. Scheduled projection builds vectors and the graph later.
     """
-    if not cognify:
-        raise ValueError("Cognee projection is required for seat ingest")
-    payload: dict[str, Any] = {"data": data, "tags": list(tags), "cognify": True}
-    resolved = timeout if timeout is not None else _COGNIFY_TIMEOUT
+    if cognify:
+        raise ValueError("User ingest is capture-only; run scheduled projection separately")
+    payload: dict[str, Any] = {"data": data, "tags": list(tags), "cognify": False}
+    resolved = timeout if timeout is not None else _INGEST_TIMEOUT
     return _request(
         "POST",
         f"{base_url.rstrip('/')}/ingest",
@@ -606,7 +609,21 @@ def fetch_operation(
     )
 
 
-_COGNIFY_TIMEOUT = 180.0  # /ingest cognifies inline; give the combined call room
+def fetch_document(
+    base_url: str,
+    token: str,
+    document_id: str,
+    *,
+    timeout: float = _TIMEOUT,
+) -> dict[str, Any]:
+    """Fetch one retained source document from the authenticated Node."""
+    encoded_id = urllib.parse.quote(document_id, safe="")
+    return _request(
+        "GET",
+        f"{base_url.rstrip('/')}/api/documents/{encoded_id}",
+        token=token,
+        timeout=timeout,
+    )
 
 
 def fetch_mesh(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> dict[str, Any]:
@@ -620,6 +637,23 @@ def fetch_mesh(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         # "couldn't reach the Node" instead of silently showing nothing (#101).
         return {"error": _humanize_net_error(exc)}
     return data if isinstance(data, dict) else {}
+
+
+def fetch_mesh_summary(
+    base_url: str, token: str | None, *, timeout: float = _TIMEOUT
+) -> dict[str, Any]:
+    """Fetch bounded index counters for agent-facing status JSON."""
+    if not token:
+        return {}
+    try:
+        data = _request(
+            "GET", f"{base_url.rstrip('/')}/api/indexes", token=token, timeout=timeout
+        )
+    except Exception as exc:
+        return {"error": _humanize_net_error(exc)}
+    if not isinstance(data, dict):
+        return {}
+    return {**data, "detail": "summary"}
 
 
 def fetch_events(

@@ -115,6 +115,17 @@ class FakeSyncer:
         return github_run_result(dry_run=dry_run)
 
 
+class FailedResultSyncer(FakeSyncer):
+    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        self.runs.append({"force": force, "dry_run": dry_run})
+        return github_run_result(ok=False, dry_run=dry_run)
+
+
+class UnhealthySyncer(FakeSyncer):
+    async def status(self) -> dict[str, Any]:
+        return {"ok": False, "reason": "sync state is stale"}
+
+
 class FakeRepoContentSyncer:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
@@ -234,6 +245,26 @@ async def test_vault_search_failure_degrades_to_empty_context() -> None:
     assert vault["recent_context"] == []
     assert vault["error_type"] == "RuntimeError"
     assert result["ok"] is True
+    assert result["degraded"] is True
+    assert result["degraded_reasons"] == ["vault_context_search"]
+
+
+async def test_run_reports_returned_source_failure() -> None:
+    learning_agent, _, _, _, _ = agent(syncer=FailedResultSyncer())
+
+    result = await learning_agent.run()
+
+    assert result["ok"] is False
+    assert result["source_sync_ok"] is False
+    assert result["degraded_reasons"] == ["github_sync"]
+
+
+async def test_status_reports_returned_source_failure() -> None:
+    learning_agent, _, _, _, _ = agent(syncer=UnhealthySyncer())
+
+    result = await learning_agent.status()
+
+    assert result["ok"] is False
 
 
 async def test_gateway_exception_is_reported_not_raised() -> None:

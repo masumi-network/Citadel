@@ -91,6 +91,7 @@ class LearningProcess:
         run_improve: bool = False,
         detect_conflicts: bool = True,
         tier: Literal["full", "light", "shared"] = "full",
+        allow_llm: bool = True,
         defer_cognify: bool = False,
         source_key: str | None = None,
         source_locator: str | None = None,
@@ -111,6 +112,7 @@ class LearningProcess:
         ``tier="light"`` skips enrichment and improvement for seat-node memory.
         ``tier="shared"`` skips full-document enrichment and improvement for
         volunteered Shared Session Traces (dead-end refinement happens upstream).
+        ``allow_llm=False`` skips every LLM-backed step for user-level writes.
         """
         target_dataset = dataset or self.config.default_dataset
         # ADR-0005 step 1: scan the WHOLE document up front — before enrichment
@@ -129,7 +131,7 @@ class LearningProcess:
                     block_severity=self.config.content_scan_block_severity,
                     findings=scan.get("findings", []),
                 )
-        if tier in {"light", "shared"}:
+        if not allow_llm or tier in {"light", "shared"}:
             enrichment = None
             effective_run_improve = False
         else:

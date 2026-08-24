@@ -8,10 +8,13 @@ import pytest
 from kb.access import AccessStore, seat_dataset
 from kb.config import CitadelConfig
 from kb.linear_sync import (
+    CONTEXT_QUERY_SPECS,
     LinearAPIError,
     LinearClient,
+    LinearContextRecord,
     LinearIssue,
     LinearSyncer,
+    format_context_note,
     format_issue_note,
     resolve_mirror_dataset,
     seat_email_index,
@@ -28,12 +31,218 @@ class FakeLinearClient(LinearClient):
         self._users = users or []
 
     def fetch_issues(self, *, max_issues: int) -> list[LinearIssue]:
-        self.last_issue_fetch_complete = len(self._issues) <= max_issues
+        self.last_issue_fetch_complete = max_issues <= 0 or len(self._issues) <= max_issues
         parsed = [LinearIssue.from_node(item) for item in self._issues]
-        return [item for item in parsed if item][:max_issues]
+        items = [item for item in parsed if item]
+        return items if max_issues <= 0 else items[:max_issues]
 
     def fetch_users(self, *, max_users: int = 250) -> list[dict[str, Any]]:
         return self._users
+
+    def fetch_context_records(
+        self,
+        *,
+        max_records: int = 0,
+        include_archived: bool = False,
+    ) -> list[Any]:
+        del max_records, include_archived
+        self.last_context_fetch_complete = True
+        self.last_context_fetch_error = None
+        return []
+
+
+def test_linear_client_zero_limit_fetches_every_page(monkeypatch: Any) -> None:
+    client = LinearClient(api_key="test-key")
+    pages = [
+        {
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "issue-1",
+                        "identifier": "ENG-1",
+                        "title": "First",
+                        "state": {},
+                        "team": {},
+                    }
+                ],
+                "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+            }
+        },
+        {
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "issue-2",
+                        "identifier": "ENG-2",
+                        "title": "Second",
+                        "state": {},
+                        "team": {},
+                    }
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": "cursor-2"},
+            }
+        },
+    ]
+    calls: list[dict[str, Any]] = []
+    queries: list[str] = []
+
+    def query(query_text: str, variables: dict[str, Any]) -> dict[str, Any]:
+        queries.append(query_text)
+        calls.append(variables)
+        return pages.pop(0)
+
+    monkeypatch.setattr(client, "query", query)
+
+    issues = client.fetch_issues(max_issues=0)
+
+    assert [issue.identifier for issue in issues] == ["ENG-1", "ENG-2"]
+    assert client.last_issue_fetch_complete is True
+    assert "orderBy: updatedAt" in queries[0]
+    assert calls == [
+        {"first": 100, "after": None},
+        {"first": 100, "after": "cursor-1"},
+    ]
+
+
+def test_linear_client_zero_user_limit_fetches_every_page(monkeypatch: Any) -> None:
+    client = LinearClient(api_key="test-key")
+    pages = [
+        {
+            "users": {
+                "nodes": [{"id": "user-1", "email": "one@example.com"}],
+                "pageInfo": {"hasNextPage": True, "endCursor": "user-cursor-1"},
+            }
+        },
+        {
+            "users": {
+                "nodes": [{"id": "user-2", "email": "two@example.com"}],
+                "pageInfo": {"hasNextPage": False, "endCursor": "user-cursor-2"},
+            }
+        },
+    ]
+    calls: list[dict[str, Any]] = []
+
+    def query(_query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append(variables)
+        return pages.pop(0)
+
+    monkeypatch.setattr(client, "query", query)
+
+    users = client.fetch_users(max_users=0)
+
+    assert [user["id"] for user in users] == ["user-1", "user-2"]
+    assert client.last_user_fetch_complete is True
+    assert calls == [
+        {"first": 100, "after": None},
+        {"first": 100, "after": "user-cursor-1"},
+    ]
+
+
+def test_linear_client_fetches_all_context_connections(monkeypatch: Any) -> None:
+    client = LinearClient(api_key="test-key")
+    roots = [root for _, _, root in CONTEXT_QUERY_SPECS]
+    calls: list[dict[str, Any]] = []
+
+    def query(query_text: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append(variables)
+        root = next(root for root in roots if root in query_text)
+        return {
+            root: {
+                "nodes": [
+                    {
+                        "id": f"{root}-1",
+                        "name": f"{root} title",
+                        "body": f"{root} body",
+                        "updatedAt": "2026-08-23T00:00:00Z",
+                    }
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+        }
+
+    monkeypatch.setattr(client, "query", query)
+
+    records = client.fetch_context_records(max_records=0, include_archived=True)
+
+    assert len(records) == 6
+    assert {record.entity_type for record in records} == {
+        "project",
+        "project_update",
+        "document",
+        "comment",
+        "initiative",
+        "initiative_update",
+    }
+    assert client.last_context_fetch_complete is True
+    assert len(calls) == 6
+    assert all(call["includeArchived"] is True for call in calls)
+
+
+def test_linear_client_keeps_available_context_when_one_connection_fails(
+    monkeypatch: Any,
+) -> None:
+    client = LinearClient(api_key="test-key")
+    failed_root = "documents"
+
+    def query(query_text: str, _variables: dict[str, Any]) -> dict[str, Any]:
+        root = next(root for _, _, root in CONTEXT_QUERY_SPECS if root in query_text)
+        if root == failed_root:
+            raise LinearAPIError("Linear HTTP 403: forbidden")
+        return {
+            root: {
+                "nodes": [{"id": f"{root}-1", "name": root}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+        }
+
+    monkeypatch.setattr(client, "query", query)
+
+    records = client.fetch_context_records()
+
+    assert len(records) == 5
+    assert all(record.entity_type != "document" for record in records)
+    assert client.last_context_fetch_complete is False
+    assert "document" in (client.last_context_fetch_error or "")
+
+
+def test_linear_client_marks_capped_context_listing_incomplete(monkeypatch: Any) -> None:
+    client = LinearClient(api_key="test-key")
+
+    def query(query_text: str, _variables: dict[str, Any]) -> dict[str, Any]:
+        root = next(root for _, _, root in CONTEXT_QUERY_SPECS if root in query_text)
+        return {
+            root: {
+                "nodes": [{"id": f"{root}-1", "name": root}],
+                "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+            }
+        }
+
+    monkeypatch.setattr(client, "query", query)
+
+    records = client.fetch_context_records(max_records=1)
+
+    assert len(records) == 1
+    assert client.last_context_fetch_complete is False
+    assert client.last_context_fetch_error is None
+
+
+def test_linear_context_note_keeps_body_and_stable_metadata() -> None:
+    record = LinearContextRecord.from_node(
+        "project_update",
+        {
+            "id": "update-1",
+            "body": "The project is on track.",
+            "health": "onTrack",
+            "updatedAt": "2026-08-23T00:00:00Z",
+            "project": {"id": "project-1", "name": "Archive"},
+        },
+    )
+
+    assert record is not None
+    note = format_context_note(record)
+    assert "The project is on track." in note
+    assert "project-1" in note
+    assert "onTrack" in note
 
 
 @pytest.fixture
@@ -169,9 +378,86 @@ async def test_linear_sync_ingests_central_and_mirror(
     # Every write is add-only (deferred), and exactly one coalesced cognify is
     # scheduled over Central + the seat mirror.
     assert all(item["defer_cognify"] is True for item in ingests)
+    assert all(item["tier"] == "light" for item in ingests)
     assert scheduled == [["masumi-network", seat_dataset("john")]]
     assert syncer.issues_for_scope(scope="my", seat_dataset_name=seat_dataset("john"))
     assert len(syncer.issues_for_scope(scope="org", seat_dataset_name=None)) == 2
+
+
+@pytest.mark.asyncio
+async def test_linear_sync_ingests_context_without_llm_enrichment(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    config = CitadelConfig(
+        linear_api_key="lin_test",
+        linear_sync_state_path=str(tmp_path / "linear_state.json"),
+    )
+    citadel = Citadel(config)
+    ingests: list[dict[str, Any]] = []
+
+    async def fake_learn(self: Any, data: str, **kwargs: Any) -> Any:
+        ingests.append({"data": data, **kwargs})
+
+        class Outcome:
+            class ingest:
+                accepted = True
+
+        return Outcome()
+
+    class ContextClient(FakeLinearClient):
+        def fetch_context_records(
+            self,
+            *,
+            max_records: int = 0,
+            include_archived: bool = False,
+        ) -> list[LinearContextRecord]:
+            del max_records, include_archived
+            self.last_context_fetch_complete = True
+            return [
+                LinearContextRecord.from_node(
+                    "project",
+                    {
+                        "id": "project-1",
+                        "name": "Archive",
+                        "description": "Search reliability",
+                        "updatedAt": "2026-08-23T00:00:00Z",
+                    },
+                ),
+                LinearContextRecord.from_node(
+                    "comment",
+                    {
+                        "id": "comment-1",
+                        "body": "Use the retained source fallback.",
+                        "updatedAt": "2026-08-23T00:00:00Z",
+                        "projectId": "project-1",
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr("kb.linear_sync.LearningProcess.learn", fake_learn)
+    monkeypatch.setattr(citadel.cognee, "schedule_cognify", lambda datasets: True)
+    syncer = LinearSyncer(citadel, client=ContextClient([]))
+
+    result = await syncer.run(force=True)
+
+    assert result["ok"] is True
+    assert result["context_record_count"] == 2
+    assert result["context_counts"] == {
+        "project": 1,
+        "project_update": 0,
+        "document": 0,
+        "comment": 1,
+        "initiative": 0,
+        "initiative_update": 0,
+    }
+    context_writes = [item for item in ingests if "linear-context" in item["tags"]]
+    assert len(context_writes) == 2
+    assert all(item["tier"] == "light" for item in context_writes)
+    assert all(item["defer_cognify"] is True for item in context_writes)
+    assert {item["source_key"] for item in context_writes} == {
+        "linear:project:project-1",
+        "linear:comment:comment-1",
+    }
 
 
 @pytest.mark.asyncio

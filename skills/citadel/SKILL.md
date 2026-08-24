@@ -3,7 +3,7 @@ name: citadel
 description: Route Citadel Organization Vault work to the right satellite skill. Use when a user asks about Citadel search, ingest, MCP setup, CLI commands, onboarding, data boundaries, or vault debugging. Triggers include "search citadel", "citadel vault", "connect citadel", "citadel mcp", "citadel onboard", "citadel update", and organization memory.
 ---
 
-# Citadel Archive — entry skill
+# Citadel Archive: entry skill
 
 Citadel is a hosted **Organization Vault**. Agents search it before coding on
 project questions, then ingest only when the user asks to keep a durable fact.
@@ -13,7 +13,7 @@ MCP: `https://citadel.utxo.ag/mcp/`
 Auth: `Authorization: Bearer ctdl_...`
 Install all satellites: `npx skills add masumi-network/citadel --skill '*'`
 
-CLI gate: `citadel --version` must be `>= 0.5.1`. Older: `citadel update`.
+CLI gate: `citadel --version` must be `>= 0.5.2`. Older: `citadel update`.
 
 ## Route here
 
@@ -21,7 +21,7 @@ CLI gate: `citadel --version` must be `>= 0.5.1`. Older: `citadel update`.
 |---|---|
 | Search, `citadel_get_document`, trust / `content_hint`, feedback | `citadel-vault` (`/skills/vault`) |
 | Wire Cursor / Claude / Codex / Windsurf MCP | `citadel-mcp-connector` (`/skills/connect`) |
-| `citadel` CLI (`status`, `search`, `mcp add`, `update`, `onboard`, `doctor`) | `citadel-cli` (`/skills/cli`) |
+| `citadel` CLI (`status`, `search`, `document`, `skills`, `mcp add`, `update`, `onboard`, `doctor`) | `citadel-cli` (`/skills/cli`) |
 | Git push / SessionEnd capture | `citadel-proactive-ingest` (`/skills/proactive-ingest`) |
 | Public vs private / tokens | `citadel-data-boundary` (`/skills/boundary`) |
 | One-command teammate setup | `citadel-onboard` (`/skills/onboard`) |

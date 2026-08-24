@@ -34,6 +34,7 @@ class FakeProjectionGateway:
         self.remember_calls: list[dict[str, Any]] = []
         self.cognify_calls: list[dict[str, Any]] = []
         self.document_id: str | None = None
+        self.document_ids: list[str] = []
         self.chunk_count = 2
         self.graph_present = True
         self.projected = False
@@ -41,6 +42,8 @@ class FakeProjectionGateway:
     async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
         self.remember_calls.append({"data": data, **kwargs})
         self.document_id = str(kwargs["data_id"])
+        if self.document_id not in self.document_ids:
+            self.document_ids.append(self.document_id)
         return {"added": [self.document_id], "cognify": "deferred"}
 
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
@@ -50,12 +53,16 @@ class FakeProjectionGateway:
 
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
         assert datasets == ["seat:alice"]
-        return [self.document_id] if self.document_id is not None else []
+        known_ids = list(self.document_ids)
+        if self.document_id is not None and self.document_id not in known_ids:
+            known_ids.append(self.document_id)
+        return known_ids
 
     async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
-        assert document_ids == [self.document_id]
         return {
-            str(self.document_id): self.chunk_count if self.projected else 0
+            str(document_id): self.chunk_count if self.projected else 0
+            for document_id in document_ids
+            if str(document_id) in await self.dataset_document_ids(["seat:alice"])
         }
 
     async def corpus_graph_presence(
@@ -64,13 +71,113 @@ class FakeProjectionGateway:
         *,
         datasets: list[str] | None = None,
     ) -> set[str]:
-        assert document_ids == [self.document_id]
         assert datasets == ["seat:alice"]
         return (
-            {str(self.document_id)}
+            {
+                str(document_id)
+                for document_id in document_ids
+                if str(document_id) in await self.dataset_document_ids(["seat:alice"])
+            }
             if self.projected and self.graph_present
             else set()
         )
+
+
+class VectorFirstProjectionGateway(FakeProjectionGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vector_project_calls: list[dict[str, Any]] = []
+
+    async def vector_project(self, **kwargs: Any) -> dict[str, Any]:
+        self.vector_project_calls.append(kwargs)
+        self.projected = True
+        return {"operation_id": "vector-projection-1"}
+
+
+class SlowBatchRememberGateway(VectorFirstProjectionGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.remember_started = asyncio.Event()
+        self.remember_cancelled = asyncio.Event()
+        self.release_remember = asyncio.Event()
+
+    async def remember(self, data: Any, **kwargs: Any) -> dict[str, Any]:
+        self.remember_started.set()
+        try:
+            await self.release_remember.wait()
+        except asyncio.CancelledError:
+            self.remember_cancelled.set()
+            raise
+        return await super().remember(data, **kwargs)
+
+
+class SlowBatchVectorGateway(VectorFirstProjectionGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vector_started = asyncio.Event()
+        self.vector_cancelled = asyncio.Event()
+        self.release_vector = asyncio.Event()
+
+    async def vector_project(self, **kwargs: Any) -> dict[str, Any]:
+        self.vector_started.set()
+        try:
+            await self.release_vector.wait()
+        except asyncio.CancelledError:
+            self.vector_cancelled.set()
+            raise
+        return await super().vector_project(**kwargs)
+
+
+class GraphQuotaProjectionGateway(VectorFirstProjectionGateway):
+    async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("OpenRouter free-model daily quota is exhausted")
+
+
+class MalformedGraphProjectionGateway(VectorFirstProjectionGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.graph_present = False
+
+    async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError(
+            "1 validation error for KnowledgeGraph: "
+            "edges.1.target_node_id Input should be a valid string "
+            "[type=string_type, input_value=None, input_type=None]"
+        )
+
+
+def _batch_projection() -> ProjectionRequest:
+    return ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+
+
+def _accept_batch_source(
+    store: LifecycleStore,
+    projection: ProjectionRequest,
+    source_key: str,
+) -> Any:
+    return store.accept_source(
+        f"content for {source_key}".encode(),
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key=source_key,
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id=source_key,
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
 
 
 class MissingLocalPathGateway(FakeProjectionGateway):
@@ -324,6 +431,413 @@ async def test_worker_projects_retained_source_and_attests_all_backends(
         for receipt in operation.receipts
         if receipt.backend == "vector"
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_runs_vector_projection_before_llm_graph_enrichment(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = store.accept_source(
+        b"vector first source",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:vector-first",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-vector-first",
+            captured_at=T0,
+        ),
+        projection=ProjectionRequest(
+            generation_id="generation-1",
+            projection_version="projection-v1",
+            config_digest="sha256:config-1",
+            providers={
+                "relational": "sqlite",
+                "vector": "qdrant",
+                "graph": "ladybug",
+            },
+        ),
+        now=T0,
+    )
+    gateway = VectorFirstProjectionGateway()
+    worker = LifecycleProjectionWorker(store, gateway, worker_id="worker-vector-first")
+
+    assert await worker.run_once(now=T0) is True
+
+    operation = store.get_operation(accepted.projection_job_id)
+    assert gateway.vector_project_calls == [
+        {
+            "datasets": ["seat:alice"],
+            "force": False,
+            "document_ids": [accepted.source_revision_id],
+        }
+    ]
+    assert gateway.cognify_calls == [{"datasets": ["seat:alice"], "force": False}]
+    assert [receipt.state for receipt in operation.receipts] == [
+        "searchable",
+        "searchable",
+        "searchable",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vector_lane_releases_graph_work_without_blocking_search(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted = store.accept_source(
+        b"vector lane does not wait for graph enrichment",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:vector-lane",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-vector-lane",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    gateway = VectorFirstProjectionGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-lane",
+        include_graph=False,
+    )
+
+    assert await worker.run_once(now=T0) is True
+
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "deferred"
+    assert operation.state == "pending"
+    assert gateway.vector_project_calls == [
+        {
+            "datasets": ["seat:alice"],
+            "force": False,
+            "document_ids": [accepted.source_revision_id],
+        }
+    ]
+    assert gateway.cognify_calls == []
+    assert store.searchable_source_revision_ids(
+        dataset="seat:alice",
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    ) == (accepted.source_revision_id,)
+    binding = store.retrieval_binding(
+        accepted.source_revision_id,
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    )
+    assert binding is not None
+    assert binding.receipt is not None
+    assert binding.receipt.backend == "vector"
+
+
+@pytest.mark.asyncio
+async def test_vector_lane_batches_same_dataset_sources_with_separate_receipts(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted_ids = []
+    accepted_jobs = []
+    for source_key in ("manual:batch:one", "manual:batch:two"):
+        accepted = store.accept_source(
+            source_key.encode(),
+            capture=CaptureContext(
+                dataset="seat:alice",
+                source_key=source_key,
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="alice",
+                capture_run_id=source_key,
+                captured_at=T0,
+            ),
+            projection=projection,
+            now=T0,
+        )
+        accepted_ids.append(accepted.source_revision_id)
+        accepted_jobs.append(accepted.projection_job_id)
+
+    gateway = VectorFirstProjectionGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-batch",
+        include_graph=False,
+    )
+
+    assert await worker.run_batch(max_jobs=2, now=T0) is True
+
+    assert len(gateway.vector_project_calls) == 1
+    assert set(gateway.vector_project_calls[0]["document_ids"]) == set(accepted_ids)
+    for source_id, projection_job_id in zip(accepted_ids, accepted_jobs):
+        operation = store.get_operation(projection_job_id)
+        assert operation.job.state == "deferred"
+        assert next(
+            receipt.state for receipt in operation.receipts if receipt.backend == "vector"
+        ) == "searchable"
+
+
+@pytest.mark.asyncio
+async def test_vector_batch_cancellation_releases_relational_leases(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = _batch_projection()
+    accepted = [
+        _accept_batch_source(store, projection, source_key)
+        for source_key in ("manual:cancel:one", "manual:cancel:two")
+    ]
+    gateway = SlowBatchRememberGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-batch-cancel-relational",
+        include_graph=False,
+    )
+
+    task = asyncio.create_task(worker.run_batch(max_jobs=2, now=T0))
+    await asyncio.wait_for(gateway.remember_started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    assert gateway.remember_cancelled.is_set()
+    for source in accepted:
+        operation = store.get_operation(source.projection_job_id)
+        assert operation.job.state == "pending"
+        assert operation.job.lease_id is None
+        assert {receipt.state for receipt in operation.receipts} == {"pending"}
+
+
+@pytest.mark.asyncio
+async def test_vector_batch_cancellation_releases_vector_leases(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = _batch_projection()
+    accepted = [
+        _accept_batch_source(store, projection, source_key)
+        for source_key in ("manual:cancel:vector:one", "manual:cancel:vector:two")
+    ]
+    gateway = SlowBatchVectorGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-batch-cancel-vector",
+        include_graph=False,
+    )
+
+    task = asyncio.create_task(worker.run_batch(max_jobs=2, now=T0))
+    await asyncio.wait_for(gateway.vector_started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    assert gateway.vector_cancelled.is_set()
+    for source in accepted:
+        operation = store.get_operation(source.projection_job_id)
+        assert operation.job.state == "pending"
+        assert operation.job.lease_id is None
+        receipt_states = {receipt.backend: receipt.state for receipt in operation.receipts}
+        assert receipt_states == {
+            "relational": "searchable",
+            "vector": "pending",
+            "graph": "pending",
+        }
+
+
+@pytest.mark.asyncio
+async def test_graph_lane_claims_deferred_work_after_vector_lane(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted = store.accept_source(
+        b"graph lane resumes deferred source",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:graph-lane",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-graph-lane",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    gateway = VectorFirstProjectionGateway()
+    vector_worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-lane",
+        include_graph=False,
+    )
+    graph_worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-graph-lane",
+        include_graph=True,
+        include_deferred=True,
+    )
+
+    assert await vector_worker.run_once(now=T0) is True
+    assert await graph_worker.run_once(now=T0 + timedelta(seconds=3601)) is True
+
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.state == "searchable"
+    # The provider already exposed the graph source after vector projection, so
+    # the graph lane closes its receipt through reconciliation without another
+    # LLM call.
+    assert gateway.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_vector_search_remains_available_while_graph_quota_retries(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted = store.accept_source(
+        b"vector remains usable during graph retry",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:graph-quota",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-graph-quota",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    gateway = GraphQuotaProjectionGateway()
+    worker = LifecycleProjectionWorker(store, gateway, worker_id="worker-graph-quota")
+
+    assert await worker.run_once(now=T0) is True
+
+    operation = store.get_operation(accepted.projection_job_id)
+    vector = next(receipt for receipt in operation.receipts if receipt.backend == "vector")
+    graph = next(receipt for receipt in operation.receipts if receipt.backend == "graph")
+    assert operation.job.state == "pending"
+    assert vector.state == "searchable"
+    assert graph.state == "pending"
+    assert store.searchable_source_revision_ids(
+        dataset="seat:alice",
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    ) == (accepted.source_revision_id,)
+
+
+@pytest.mark.asyncio
+async def test_malformed_graph_output_defers_without_failing_vector_search(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    accepted = store.accept_source(
+        b"vector remains searchable after malformed graph output",
+        capture=CaptureContext(
+            dataset="seat:alice",
+            source_key="manual:graph-structured-output",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="alice",
+            capture_run_id="run-graph-structured-output",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    gateway = MalformedGraphProjectionGateway()
+    vector_worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-vector-lane",
+        include_graph=False,
+    )
+    graph_worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-graph-lane",
+        include_graph=True,
+        include_deferred=True,
+        deferred_only=True,
+    )
+
+    assert await vector_worker.run_once(now=T0) is True
+    assert await graph_worker.run_once(now=T0 + timedelta(seconds=3601)) is True
+
+    operation = store.get_operation(accepted.projection_job_id)
+    vector = next(receipt for receipt in operation.receipts if receipt.backend == "vector")
+    graph = next(receipt for receipt in operation.receipts if receipt.backend == "graph")
+    assert operation.state == "pending"
+    assert operation.job.state == "deferred"
+    assert operation.job.last_error_code == "graph_output_invalid"
+    assert vector.state == "searchable"
+    assert graph.state == "pending"
+    assert store.searchable_source_revision_ids(
+        dataset="seat:alice",
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    ) == (accepted.source_revision_id,)
 
 
 async def test_worker_reconciles_existing_provider_projection_without_rewriting(
@@ -880,7 +1394,6 @@ async def test_slow_provider_write_renews_lease_before_second_worker_can_claim(
         assert len(gateway.remember_calls) == 1
         assert operation.state == "searchable"
         assert operation.job.state == "completed"
-        assert {receipt.state for receipt in operation.receipts} == {"searchable"}
     else:
         assert gateway.remember_cancelled.is_set()
         assert projection.cancelled()

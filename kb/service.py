@@ -42,6 +42,7 @@ from kb.lifecycle import (
 from kb.lifecycle_worker import LifecycleProjectionWorker
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
 from kb.repair_journal import RepairJournal, RepairJournalLeaseError
+from kb.search_format import exact_linear_issue_identifier, linear_issue_identifier
 from kb.security_scan import (
     SecretContentError,
     SecurityScanEntry,
@@ -101,7 +102,12 @@ class Citadel:
         self.cognee = cognee or CogneePublicClient(queue_path=self.config.cognify_queue_path)
         self.lifecycle_store: LifecycleStore | None = None
         self.lifecycle_worker: LifecycleProjectionWorker | None = None
+        self.lifecycle_graph_worker: LifecycleProjectionWorker | None = None
         self._lifecycle_projection_task: asyncio.Task[Any] | None = None
+        self._lifecycle_graph_projection_task: asyncio.Task[Any] | None = None
+        self._lifecycle_projection_gate = asyncio.Event()
+        self._lifecycle_projection_gate.set()
+        self._lifecycle_vector_only = False
         if self.config.lifecycle_enabled:
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
@@ -128,6 +134,9 @@ class Citadel:
                 # A gateway that rejects attribute injection (bare/slotted test
                 # doubles) simply keeps the fully fail-closed check.
                 pass
+            self._lifecycle_vector_only = callable(
+                getattr(self.cognee, "vector_project", None)
+            )
             self.lifecycle_worker = LifecycleProjectionWorker(
                 self.lifecycle_store,
                 self.cognee,
@@ -135,6 +144,7 @@ class Citadel:
                 generation_id=lifecycle_projection.generation_id,
                 projection_version=lifecycle_projection.projection_version,
                 config_digest=lifecycle_projection.config_digest,
+                include_graph=not self._lifecycle_vector_only,
             )
             # Queue current source heads on every boot. The operation id is
             # generation-scoped, so this is idempotent for normal restarts and
@@ -264,7 +274,10 @@ class Citadel:
                 ),
                 projection=self._lifecycle_projection_request(),
             )
-            if not self._inline_projection_suppressed():
+            if (
+                (not defer_cognify or self._lifecycle_vector_only)
+                and not self._inline_projection_suppressed()
+            ):
                 self._start_lifecycle_projection()
             return IngestResult(
                 True,
@@ -484,17 +497,82 @@ class Citadel:
                 "durable work will resume on server startup"
             )
             return False
-        self._lifecycle_projection_task = loop.create_task(self._drain_lifecycle())
+        task = loop.create_task(
+            self._drain_lifecycle(self.lifecycle_worker),
+            name="lifecycle-vector-projection",
+        )
+        self._lifecycle_projection_task = task
+        task.add_done_callback(self._log_lifecycle_task_done)
         return True
 
-    async def _drain_lifecycle(self) -> int:
-        if self.lifecycle_worker is None or self.lifecycle_store is None:
+    def _start_graph_lifecycle_projection(self) -> bool:
+        if (
+            not self._lifecycle_vector_only
+            or self.lifecycle_store is None
+            or self.lifecycle_worker is None
+        ):
+            return False
+        task = self._lifecycle_graph_projection_task
+        if task is not None and not task.done():
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error(
+                "lifecycle graph projection not started: no running event loop"
+            )
+            return False
+        self.lifecycle_graph_worker = LifecycleProjectionWorker(
+            self.lifecycle_store,
+            self.cognee,
+            worker_id=f"citadel-graph-{uuid4().hex}",
+            generation_id=self.lifecycle_worker.generation_id,
+            projection_version=self.lifecycle_worker.projection_version,
+            config_digest=self.lifecycle_worker.config_digest,
+            include_graph=True,
+            include_deferred=True,
+            deferred_only=True,
+        )
+        task = loop.create_task(
+            self._drain_lifecycle(self.lifecycle_graph_worker),
+            name="lifecycle-graph-projection",
+        )
+        self._lifecycle_graph_projection_task = task
+        task.add_done_callback(self._log_lifecycle_task_done)
+        return True
+
+    @staticmethod
+    def _log_lifecycle_task_done(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "lifecycle projection task stopped unexpectedly: %s",
+                error.__class__.__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _drain_lifecycle(
+        self,
+        worker: LifecycleProjectionWorker | None = None,
+    ) -> int:
+        worker = worker or self.lifecycle_worker
+        if worker is None or self.lifecycle_store is None:
             return 0
         processed_count = 0
         while True:
+            await self._lifecycle_projection_gate.wait()
             try:
-                async with self.cognee.maintenance():
-                    processed = await self.lifecycle_worker.run_once()
+                if worker.include_graph:
+                    async with self.cognee.maintenance():
+                        processed = await worker.run_once()
+                else:
+                    # The vector lane does not touch the graph writer. It must
+                    # stay runnable while the scheduled graph lane is slow.
+                    processed = await worker.run_batch(
+                        max_jobs=self.config.lifecycle_projection_batch_size
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -504,9 +582,11 @@ class Citadel:
                 processed_count += 1
                 continue
             delay = self.lifecycle_store.next_wakeup_delay(
-                generation_id=self.lifecycle_worker.generation_id,
-                projection_version=self.lifecycle_worker.projection_version,
-                config_digest=self.lifecycle_worker.config_digest,
+                generation_id=worker.generation_id,
+                projection_version=worker.projection_version,
+                config_digest=worker.config_digest,
+                include_deferred=worker.include_deferred,
+                deferred_only=worker.deferred_only,
             )
             if delay is None:
                 return processed_count
@@ -514,9 +594,18 @@ class Citadel:
                 # A long quota backoff must not hide newly accepted work.
                 await asyncio.sleep(min(delay, 5.0))
 
-    def resume_lifecycle_queue(self) -> bool:
-        """Resume durable projection jobs after process startup."""
-        return self._start_lifecycle_projection()
+    def pause_lifecycle_queue(self) -> bool:
+        """Pause new lifecycle claims while a maintenance pass owns the stores."""
+        self._lifecycle_projection_gate.clear()
+        return True
+
+    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
+        """Resume baseline work and optionally the scheduled graph lane."""
+        self._lifecycle_projection_gate.set()
+        started = self._start_lifecycle_projection()
+        if include_deferred:
+            started = self._start_graph_lifecycle_projection() or started
+        return started
 
     async def wait_for_lifecycle_idle(self) -> int:
         """Wait until every due lifecycle job finishes or reaches a retry delay."""
@@ -562,14 +651,18 @@ class Citadel:
             await asyncio.sleep(min(poll_seconds, remaining))
 
     async def stop_lifecycle_queue(self) -> None:
-        task = self._lifecycle_projection_task
-        if task is None or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        tasks = [
+            task
+            for task in (
+                self._lifecycle_projection_task,
+                self._lifecycle_graph_projection_task,
+            )
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
         """Return one bounded source-to-provider operation record."""
@@ -578,12 +671,17 @@ class Citadel:
         operation = self.lifecycle_store.get_operation(projection_job_id)
         source = operation.source_revision
         job = operation.job
+        backend_states = {receipt.backend: receipt.state for receipt in operation.receipts}
         return {
             "schema_version": job.schema_version,
             "projection_job_id": job.projection_job_id,
             "source_revision_id": source.source_revision_id,
             "dataset": job.dataset,
             "state": operation.state,
+            "retrieval_ready": backend_states.get("vector") == "searchable",
+            "vector_state": backend_states.get("vector", "not_started"),
+            "graph_state": backend_states.get("graph", "not_started"),
+            "enrichment_state": backend_states.get("graph", "not_started"),
             "source_revision": {
                 "schema_version": source.schema_version,
                 "source_revision_id": source.source_revision_id,
@@ -971,28 +1069,55 @@ class Citadel:
         dataset: str | None = None,
         session_id: str | None = None,
         top_k: int = 10,
+        allow_lexical_fallback: bool = True,
+        allow_vector_recall: bool = True,
     ) -> list[Any]:
         top_k = min(max(int(top_k), 1), MAX_SEARCH_TOP_K)
         target_dataset = dataset or self.config.default_dataset
-        provider_top_k = MAX_SEARCH_TOP_K if self.lifecycle_store is not None else top_k
+        # Lifecycle searches already pass the server's bounded fetch page. The
+        # document scope is applied by the vector adapter before recall, so a
+        # second hard-coded 100-hit page only increases provider work and timeout
+        # risk.
+        provider_top_k = top_k
         recall_kwargs: dict[str, Any] = {}
+        lifecycle_projection: ProjectionRequest | None = None
+        vector_recall_allowed = True
         if self.lifecycle_store is not None:
-            projection = self._lifecycle_projection_request()
-            recall_kwargs["document_ids"] = list(
+            lifecycle_projection = self._lifecycle_projection_request()
+            searchable_document_ids = list(
                 self.lifecycle_store.searchable_source_revision_ids(
                     dataset=target_dataset,
-                    generation_id=projection.generation_id,
-                    projection_version=projection.projection_version,
-                    config_digest=projection.config_digest,
+                    generation_id=lifecycle_projection.generation_id,
+                    projection_version=lifecycle_projection.projection_version,
+                    config_digest=lifecycle_projection.config_digest,
                 )
             )
-        results = await self.cognee.recall(
-            query,
-            dataset=target_dataset,
-            session_id=session_id or self._default_session_for_dataset(target_dataset),
-            top_k=provider_top_k,
-            **recall_kwargs,
-        )
+            recall_kwargs["document_ids"] = searchable_document_ids
+            # An empty current vector scope is a known degraded state. Do not
+            # send an unscoped provider query that can block on Qdrant or an
+            # embedding endpoint before the retained-source fallback runs.
+            vector_recall_allowed = bool(searchable_document_ids)
+        if vector_recall_allowed and allow_vector_recall:
+            try:
+                results = await self.cognee.recall(
+                    query,
+                    dataset=target_dataset,
+                    session_id=session_id or self._default_session_for_dataset(target_dataset),
+                    top_k=provider_top_k,
+                    allow_generative=False,
+                    **recall_kwargs,
+                )
+            except Exception as exc:
+                if self.lifecycle_store is None:
+                    raise
+                logger.warning(
+                    "Vector recall unavailable for lifecycle dataset %s: %s",
+                    safe_log_value(target_dataset),
+                    safe_log_value(str(exc)),
+                )
+                results = []
+        else:
+            results = []
         results = [
             {key: value for key, value in result.items() if key != "_lifecycle"}
             if isinstance(result, dict)
@@ -1001,6 +1126,55 @@ class Citadel:
         ]
         if self.lifecycle_store is not None:
             results = self._filter_lifecycle_search_results(results)[:top_k]
+            exact_issue = exact_linear_issue_identifier(query)
+            if exact_issue and allow_lexical_fallback and lifecycle_projection is not None:
+                try:
+                    lexical_results = await asyncio.to_thread(
+                        self.lifecycle_store.lexical_search,
+                        query,
+                        dataset=target_dataset,
+                        projection=lifecycle_projection,
+                        top_k=max(top_k, 10),
+                    )
+                except Exception as exc:  # noqa: BLE001 - vector results remain usable
+                    logger.warning(
+                        "Exact Linear lexical lookup failed for %s: %s",
+                        safe_log_value(exact_issue),
+                        safe_log_value(str(exc)),
+                    )
+                    lexical_results = []
+                exact_results = [
+                    result
+                    for result in results
+                    if linear_issue_identifier(result) == exact_issue
+                ]
+                exact_results.extend(
+                    result
+                    for result in lexical_results
+                    if linear_issue_identifier(result) == exact_issue
+                )
+                if exact_results:
+                    deduplicated: list[Any] = []
+                    seen_ids: set[str] = set()
+                    for result in exact_results:
+                        if not isinstance(result, dict):
+                            continue
+                        key = str(result.get("document_id") or result.get("id") or "")
+                        if not key or key in seen_ids:
+                            continue
+                        seen_ids.add(key)
+                        deduplicated.append(result)
+                    results = deduplicated[:top_k]
+            if not results and allow_lexical_fallback and lifecycle_projection is not None:
+                results = await asyncio.to_thread(
+                    self.lifecycle_store.lexical_search,
+                    query,
+                    dataset=target_dataset,
+                    projection=lifecycle_projection,
+                    top_k=top_k,
+                )
+                if results:
+                    return results
         if results or target_dataset != self.config.github_sync_dataset:
             return results
         return search_github_sync_state(query, self.config, top_k=top_k)
@@ -1045,7 +1219,17 @@ class Citadel:
             )
         return filtered
 
-    async def feedback(self, request: FeedbackRequest) -> FeedbackResult:
+    async def feedback(
+        self,
+        request: FeedbackRequest,
+        *,
+        allow_llm: bool = False,
+    ) -> FeedbackResult:
+        """Record feedback without implicit LLM work.
+
+        Scheduled internal callers may opt into configured automatic improvement.
+        User-facing MCP and CLI callers use the default, LLM-free path.
+        """
         session_id = request.session_id or self.config.default_session
         dataset = request.dataset or self.config.default_dataset
         # Try cognee's per-session QA cache first (preserves the QA linkage when a
@@ -1085,7 +1269,7 @@ class Citadel:
                 )
 
         improved = False
-        if recorded and self.config.auto_improve:
+        if recorded and allow_llm and self.config.auto_improve:
             try:
                 await self.improve(
                     dataset=central_improvement_dataset(self.config),
@@ -1735,9 +1919,44 @@ class Citadel:
         instead of the assembled parent. Passed through only when set so
         clients implementing the plain signature keep working.
         """
-        if chunk_scope:
-            return await self.cognee.get_document(document_id, chunk_scope=True)
-        return await self.cognee.get_document(document_id)
+        cognee_error: Exception | None = None
+        try:
+            if chunk_scope:
+                document = await self.cognee.get_document(document_id, chunk_scope=True)
+            else:
+                document = await self.cognee.get_document(document_id)
+        except Exception as exc:
+            cognee_error = exc
+            document = None
+        if document is not None or self.lifecycle_store is None:
+            if cognee_error is not None:
+                raise cognee_error
+            return document
+        try:
+            content = self.lifecycle_store.read_retained_content(document_id).decode("utf-8")
+        except (UnicodeDecodeError, LifecycleNotFoundError):
+            if cognee_error is not None:
+                raise cognee_error
+            return None
+        source = self.lifecycle_store.get_source_revision(document_id)
+        if source is None:
+            if cognee_error is not None:
+                raise cognee_error
+            return None
+        return {
+            "id": document_id,
+            "document_id": document_id,
+            "source": "lifecycle",
+            "source_type": "lifecycle",
+            "body": content,
+            "content": content,
+            "text": content,
+            "metadata": {
+                "retrieval_mode": "retained_source",
+                "dataset": source.dataset,
+                "source_key": source.source_key,
+            },
+        }
 
     async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
         """Owner node ids for the drill-down visibility rule, body not assembled.
@@ -1782,6 +2001,11 @@ class Citadel:
             marker = f"COGNIFY_TEST_MARKER_{uuid4().hex}"
             marker_ingest = await self.ingest(marker, dataset=target_dataset)
             await self.cognee.cognify(datasets=[target_dataset], force=force)
+            # The scheduled graph pass may have filled the provider already,
+            # but lifecycle receipts still need their bounded graph read check.
+            # Start that lane after the full graph write returns so it cannot
+            # compete with the graph writer while the canary is running.
+            self.resume_lifecycle_queue(include_deferred=True)
             search_hit = False
             attempts = 0
             failure_reason: str | None = None
@@ -1851,7 +2075,10 @@ class Citadel:
                 else:
                     attempts = 1
                     matches = await self.search(
-                        marker, dataset=target_dataset, top_k=10
+                        marker,
+                        dataset=target_dataset,
+                        top_k=10,
+                        allow_lexical_fallback=False,
                     )
                     search_hit = _marker_in_results(marker, matches)
                     if not search_hit:

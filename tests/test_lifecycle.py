@@ -159,6 +159,70 @@ def test_accept_source_persists_revision_job_and_receipts_in_one_operation(
     assert {receipt.state for receipt in accepted.operation.receipts} == {"pending"}
 
 
+def test_lexical_search_reads_current_retained_heads_before_projection(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="cognee-1.4.1-qdrant-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    capture = CaptureContext(
+        dataset="central",
+        source_key="manual:current-head",
+        source_locator="citadel://manual/current-head",
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="run-1",
+        captured_at=T0,
+        metadata={"title": "Current head"},
+    )
+
+    store.accept_source(
+        b"old content without the target phrase",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+    current = store.accept_source(
+        b"current content contains the target phrase",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+
+    results = store.lexical_search(
+        "target phrase",
+        dataset="central",
+        projection=projection,
+    )
+
+    assert len(results) == 1
+    assert results[0]["document_id"] == current.source_revision_id
+    assert results[0]["_lifecycle"]["backend"] == "lexical"
+    assert results[0]["_lifecycle"]["vector_state"] == "pending"
+    assert results[0]["metadata"]["source_locator"] == "citadel://manual/current-head"
+    assert results[0]["references"][0]["document_id"] == current.source_revision_id
+
+    store.accept_tombstone(
+        reason="removed for test",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+    assert store.lexical_search(
+        "target phrase",
+        dataset="central",
+        projection=projection,
+    ) == []
+
+
 def test_duplicate_submission_reuses_revision_job_and_receipts(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
     capture = CaptureContext(

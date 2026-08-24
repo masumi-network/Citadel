@@ -390,6 +390,7 @@ class CogneeGateway(Protocol):
         session_id: str | None = None,
         top_k: int = 10,
         document_ids: list[str] | None = None,
+        allow_generative: bool = False,
     ) -> list[Any]:
         raise NotImplementedError
 
@@ -413,6 +414,15 @@ class CogneeGateway(Protocol):
         raise NotImplementedError
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
+        raise NotImplementedError
+
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any:
         raise NotImplementedError
 
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
@@ -657,15 +667,22 @@ class CogneePublicClient:
         Set here rather than in Railway's environment on purpose. This fix has
         been written down in docs/progress.md, docs/uat-2026-07-23-findings.md
         and tasks.md since 2026-06-30 and was never applied to a running node,
-        because a variable nobody sets is not a fix. An explicit AUTO_FEEDBACK
-        in the environment still wins, so it can be turned back on without a
-        deploy.
+        because a variable nobody sets is not a fix. The user retrieval
+        contract forbids this LLM path. Background knowledge base stages use
+        explicit ``cognify`` and ``improve`` calls instead.
         """
-        os.environ.setdefault("AUTO_FEEDBACK", "false")
+        os.environ["AUTO_FEEDBACK"] = "false"
+
+    def _chunks_search_type(self, cognee: Any) -> Any:
+        search_type = getattr(cognee, "SearchType", None)
+        chunks = getattr(search_type, "CHUNKS", None)
+        if chunks is None:
+            raise RuntimeError("Cognee CHUNKS search type is unavailable")
+        return chunks
 
     def _configured_search_type(self, cognee: Any) -> Any | None:
         raw_value = os.getenv(
-            "CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION"
+            "CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS"
         ).strip().upper()
         if raw_value in {"", "AUTO", "RECALL"}:
             return None
@@ -677,7 +694,7 @@ class CogneePublicClient:
     def _graph_search_options(self, query_type: Any) -> dict[str, Any]:
         """Request cited graph context unless CHUNKS is explicitly selected."""
         raw_value = os.getenv(
-            "CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION"
+            "CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS"
         ).strip().upper()
         type_name = str(getattr(query_type, "name", query_type)).upper()
         if "GRAPH" not in raw_value and "GRAPH" not in type_name:
@@ -1070,6 +1087,7 @@ class CogneePublicClient:
         session_id: str | None = None,
         top_k: int = 10,
         document_ids: list[str] | None = None,
+        allow_generative: bool = False,
     ) -> list[Any]:
         if (
             document_ids is None
@@ -1080,6 +1098,7 @@ class CogneePublicClient:
                 dataset=dataset,
                 session_id=session_id,
                 top_k=top_k,
+                allow_generative=allow_generative,
             )
         from kb.qdrant_adapter import qdrant_document_scope
 
@@ -1089,6 +1108,7 @@ class CogneePublicClient:
                 dataset=dataset,
                 session_id=session_id,
                 top_k=top_k,
+                allow_generative=allow_generative,
             )
 
     async def _recall_unscoped(
@@ -1098,6 +1118,7 @@ class CogneePublicClient:
         dataset: str,
         session_id: str | None = None,
         top_k: int = 10,
+        allow_generative: bool = False,
     ) -> list[Any]:
         timing = _search_timing_enabled()
         t_start = perf_counter() if timing else 0.0
@@ -1110,7 +1131,12 @@ class CogneePublicClient:
         # stale "[DataItem]" scaffolds, so it is OFF by default — durable recall goes
         # straight to the chunk/vector store (#15/#52). Re-enable per-session reads
         # with CITADEL_COGNEE_SESSION_RECALL=true only if the cache is ever repaired.
-        if session_id and hasattr(cognee, "recall") and _session_recall_enabled():
+        if (
+            allow_generative
+            and session_id
+            and hasattr(cognee, "recall")
+            and _session_recall_enabled()
+        ):
             try:
                 session_results = await cognee.recall(
                     query,
@@ -1125,7 +1151,11 @@ class CogneePublicClient:
             if session_results:
                 return session_results
 
-        query_type = self._configured_search_type(cognee)
+        query_type = (
+            self._configured_search_type(cognee)
+            if allow_generative
+            else self._chunks_search_type(cognee)
+        )
         if query_type is None and hasattr(cognee, "recall"):
             try:
                 results = await cognee.recall(
@@ -1556,6 +1586,57 @@ class CogneePublicClient:
                 )
             )
         return sorted({str(data_id) for (data_id,) in rows.all() if data_id is not None})
+
+    async def _vector_projection_data(
+        self,
+        *,
+        dataset: str,
+        document_ids: list[str],
+    ) -> list[Any]:
+        """Load only authorized Cognee Data rows for one vector projection."""
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            raise ValueError("vector projection requires at least one document id")
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "vector projection document ids must be UUIDs"
+            ) from exc
+
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data, Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Data)
+                .join(DatasetData, DatasetData.data_id == Data.id)
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .where(
+                    Dataset.owner_id == user.id,
+                    Dataset.tenant_id == user.tenant_id,
+                    Dataset.name == dataset,
+                    Data.id.in_(wanted_ids),
+                )
+            )
+            by_id = {str(row.id): row for row in rows.scalars().all()}
+
+        missing = [document_id for document_id in wanted if document_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                "vector projection source is missing from the authorized dataset: "
+                + ", ".join(missing)
+            )
+        return [by_id[document_id] for document_id in wanted]
 
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
@@ -4623,6 +4704,83 @@ class CogneePublicClient:
         async with self.maintenance():
             return await self._cognify_unlocked(datasets=datasets, force=force)
 
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any:
+        """Build chunk embeddings without running Cognee's LLM graph stage."""
+        if not datasets:
+            raise ValueError("vector projection requires at least one dataset")
+        if document_ids is not None and len(datasets) != 1:
+            raise ValueError(
+                "document-scoped vector projection requires exactly one dataset"
+            )
+
+        async def run_unlocked() -> list[Any]:
+            self._prepare_cognee_environment()
+            chunk_window.require_bpe_encoding()
+            import cognee
+
+            run_custom_pipeline = getattr(cognee, "run_custom_pipeline", None)
+            if not callable(run_custom_pipeline):
+                raise RuntimeError(
+                    "Cognee 1.4.1 run_custom_pipeline API is unavailable"
+                )
+            await self._ensure_cognee_ready(cognee)
+
+            from cognee.modules.chunking.TextChunker import TextChunker
+            from cognee.modules.pipelines.tasks.task import Task
+            from cognee.tasks.documents import (
+                classify_documents,
+                extract_chunks_from_documents,
+            )
+            from cognee.tasks.storage.index_data_points import index_data_points
+
+            tasks = [
+                Task(classify_documents),
+                Task(
+                    extract_chunks_from_documents,
+                    max_chunk_size=chunk_window.resolve_chunk_budget(),
+                    chunker=TextChunker,
+                ),
+                Task(index_data_points, task_config={"batch_size": 32}),
+            ]
+            results: list[Any] = []
+            for dataset in datasets:
+                data = None
+                if document_ids is not None:
+                    data = await self._vector_projection_data(
+                        dataset=dataset,
+                        document_ids=document_ids,
+                    )
+                results.append(
+                    await run_custom_pipeline(
+                        tasks=tasks,
+                        data=data,
+                        dataset=dataset,
+                        use_pipeline_cache=False,
+                        # A document-scoped call is a repair for a source whose
+                        # lifecycle receipt is not searchable. Cognee's stored
+                        # per-data pipeline status may be stale, so do not let
+                        # incremental loading skip the requested source.
+                        incremental_loading=False if document_ids is not None else not force,
+                        data_cache=False if document_ids is not None else not force,
+                        data_per_batch=20,
+                        run_in_background=False,
+                        pipeline_name=f"citadel_vector_projection:{dataset}",
+                        skip_connection_test=True,
+                    )
+                )
+            return results
+
+        # This route only classifies sources, extracts chunks, and writes vector
+        # points. It does not open the graph writer, so it must remain available
+        # while scheduled graph enrichment holds the maintenance lock.
+        return await run_unlocked()
+
     async def _cognify_unlocked(
         self, *, datasets: list[str], force: bool = False
     ) -> Any:
@@ -4681,6 +4839,12 @@ class CogneePublicClient:
                 activate_cognee_free_router_fallback,
                 is_cognee_llm_provider_failure,
             )
+
+            if self.lifecycle_projection_state_lookup is not None:
+                raise RuntimeError(
+                    "Cognee provider fallback is disabled for the active lifecycle "
+                    "generation; change the route in a new generation"
+                ) from exc
 
             if is_embedding_provider_failure(exc):
                 if not activate_local_embedding_fallback(exc):

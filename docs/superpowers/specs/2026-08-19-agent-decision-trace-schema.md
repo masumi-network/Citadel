@@ -49,7 +49,7 @@ Every span and child span must include:
 - `agent.arbitration.candidate.generated`
 - `agent.arbitration.duplicate_matched`
 - `agent.arbitration.winner.selected`
-- `agent.arbitration.rejection`  
+- `agent.arbitration.rejection`
 
 ### 3.3 Maintenance events
 

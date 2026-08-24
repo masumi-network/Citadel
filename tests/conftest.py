@@ -19,6 +19,29 @@ def _isolate_claude_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_lite_runtime_state(tmp_path, monkeypatch):
+    """Give every test its own Lite volume and lifecycle database.
+
+    The lifecycle store records the active generation. A shared developer
+    volume makes tests depend on order and can make a healthy test process
+    reject a different configuration as a generation conflict.
+    """
+    state_root = tmp_path / "citadel-state"
+    system_root = tmp_path / "cognee-system"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SYSTEM_ROOT_DIRECTORY", str(system_root))
+    monkeypatch.setenv("DATA_ROOT_DIRECTORY", str(tmp_path / "data-storage"))
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(state_root))
+    monkeypatch.setenv("DB_PATH", str(system_root / "databases"))
+    monkeypatch.setenv("DB_NAME", "cognee.db")
+    monkeypatch.setenv(
+        "CITADEL_LIFECYCLE_STORE_PATH",
+        str(state_root / "lifecycle.sqlite3"),
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_macos_gui_setenv(monkeypatch):
     """Onboard publishes the token via `launchctl setenv` on Darwin.
 

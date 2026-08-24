@@ -160,6 +160,27 @@ def test_github_org_client_can_request_public_repositories_only() -> None:
     assert client.requests[0][1]["type"] == "public"
 
 
+def test_github_org_client_zero_limit_fetches_every_page() -> None:
+    class PagedClient(RecordingGitHubOrgClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+            self.requests.append((path, params))
+            if params["page"] == 1:
+                return [
+                    {"name": f"one-{index}", "full_name": f"masumi-network/one-{index}"}
+                    for index in range(100)
+                ]
+            return [{"name": "two", "full_name": "masumi-network/two"}]
+
+    client = PagedClient()
+
+    repos = client.fetch_repos("masumi-network", max_repos=0)
+
+    assert len(repos) == 101
+    assert repos[0].full_name == "masumi-network/one-0"
+    assert repos[-1].full_name == "masumi-network/two"
+    assert [request[1]["page"] for request in client.requests] == [1, 2]
+
+
 def test_github_org_client_requests_pull_requests_by_recent_updates() -> None:
     client = RecordingGitHubOrgClient()
     repo = GitHubRepo(

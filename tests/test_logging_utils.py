@@ -1,9 +1,11 @@
 import logging
+import os
 
 import pytest
 
 from kb.logging_utils import (
     COGNEE_LOGGER_NAMES,
+    LITELLM_LOGGER_NAMES,
     VALID_LEVELS,
     configure_cognee_logging,
     configure_logging,
@@ -109,6 +111,33 @@ def test_configure_cognee_logging_allows_explicit_diagnostics(
     assert all(
         logger.level == logging.DEBUG for logger in restore_cognee_loggers.values()
     )
+
+
+def test_configure_cognee_logging_can_restore_litellm_diagnostics():
+    loggers = {name: logging.getLogger(name) for name in LITELLM_LOGGER_NAMES}
+    previous = {name: (logger.level, logger.disabled) for name, logger in loggers.items()}
+    previous_env = {name: os.environ.get(name) for name in ("LITELLM_LOG", "LITELLM_SET_VERBOSE")}
+    try:
+        configure_cognee_logging()
+        assert all(logger.level == logging.ERROR and logger.disabled for logger in loggers.values())
+        assert os.getenv("LITELLM_LOG") == "ERROR"
+        assert os.getenv("LITELLM_SET_VERBOSE") == "False"
+
+        configure_cognee_logging("debug")
+        assert all(
+            logger.level == logging.DEBUG and not logger.disabled
+            for logger in loggers.values()
+        )
+        assert os.getenv("LITELLM_LOG") == "DEBUG"
+    finally:
+        for name, (level, disabled) in previous.items():
+            loggers[name].setLevel(level)
+            loggers[name].disabled = disabled
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # --------------------------------------------------------------------------

@@ -201,6 +201,8 @@ class FakeLinearSyncer:
             "dataset": "masumi-network",
             "last_synced_at": "2026-05-21T00:00:00Z",
             "issue_count": 2,
+            "context_record_count": 0,
+            "context_error": None,
             "mirror_count": 1,
             "state_path": "/tmp/linear-state.json",
         }
@@ -619,6 +621,27 @@ def test_public_state_uses_bounded_lifecycle_health(
 
     assert response.status_code == 200
     assert response.json()["lifecycle"]["marker"] == "bounded"
+
+
+def test_public_state_reports_lifecycle_failure_as_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failed_lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "ok": False,
+            "invariant_errors": ["failed_projection"],
+        }
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", failed_lifecycle_health)
+
+    response = TestClient(app).get("/api/state")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["healthy"] is False
+    assert response.json()["lifecycle"]["invariant_errors"] == ["failed_projection"]
 
 
 def test_lifecycle_health_rejects_unsearchable_current_generation() -> None:
@@ -1571,6 +1594,31 @@ def test_linear_sync_api_endpoints() -> None:
     assert linear_source["documents"] == 2
 
 
+def test_linear_context_gap_is_visible_in_source_status() -> None:
+    client = authed_client()
+
+    class PartialLinearSyncer(FakeLinearSyncer):
+        async def status(self) -> dict[str, Any]:
+            status = await super().status()
+            status.update(
+                {
+                    "context_record_count": 3,
+                    "context_error": "document: Linear HTTP 403: forbidden",
+                }
+            )
+            return status
+
+    app.state.linear_syncer = PartialLinearSyncer()
+
+    response = client.get("/api/sources?type=linear")
+
+    assert response.status_code == 200
+    source = response.json()["sources"][0]
+    assert source["status"] == "degraded"
+    assert source["documents"] == 5
+    assert response.json()["summary"]["linear_context_records"] == 3
+
+
 def test_admin_can_run_cognify_recovery_and_verification() -> None:
     client = authed_client()
 
@@ -2185,19 +2233,92 @@ def test_reader_access_can_view_and_search_but_not_mutate() -> None:
     assert sync_run.status_code == 403
 
 
-def test_ingest_inline_cognify_flag() -> None:
+def test_ingest_is_capture_only_by_default() -> None:
     client = authed_client()
-    # Default: every seat ingest requests projection.
+    # User ingest stores the source and leaves projection to the scheduler.
     plain = client.post("/ingest", json={"data": "note one", "tags": []})
     assert plain.status_code == 200
-    assert plain.json()["cognified"] is True
-    # cognify=True → the Node cognifies inline (server-side) and reports it.
-    with_cognify = client.post("/ingest", json={"data": "note two", "tags": [], "cognify": True})
-    assert with_cognify.status_code == 200
-    assert with_cognify.json()["cognified"] is True
+    assert plain.json()["cognified"] is False
+    assert plain.json()["projection_requested"] is False
 
 
-def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
+def test_user_capture_and_contribute_skip_llm_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = authed_client()
+    calls: list[str] = []
+
+    def fail_if_called(_learning: Any, _data: str) -> None:
+        calls.append("enrich")
+        raise AssertionError("user writes must not call enrichment")
+
+    monkeypatch.setattr(server_module.LearningProcess, "_enrich", fail_if_called)
+    monkeypatch.setenv("CITADEL_LLM_ENRICHMENT_ENABLED", "true")
+
+    ingest = client.post("/ingest", json={"data": "capture-only user note"})
+    contribute = client.post(
+        "/api/contribute",
+        json={"title": "User note", "content": "contribute without enrichment"},
+    )
+
+    assert ingest.status_code == 200
+    assert contribute.status_code == 200
+    assert calls == []
+
+
+def test_ingest_rejects_cognify_request() -> None:
+    client = authed_client()
+    response = client.post(
+        "/ingest",
+        json={"data": "note two", "tags": [], "cognify": True},
+    )
+
+    assert response.status_code == 422
+    assert "capture-only" in response.json()["detail"]
+
+
+def test_ingest_capture_only_defers_projection() -> None:
+    class CaptureOnlyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.ingest_calls: list[dict[str, Any]] = []
+            self.cognify_calls = 0
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            self.ingest_calls.append({"data": data, **kwargs})
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"] or "notes",
+                tuple(kwargs["tags"]),
+                source_revision_id="source-capture-only",
+                projection_job_id="job-capture-only",
+                projection_state="pending",
+            )
+
+        async def cognify_dataset(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            self.cognify_calls += 1
+            return {"ok": True}
+
+    client = authed_client()
+    citadel = CaptureOnlyCitadel()
+    app.state.citadel = citadel
+
+    response = client.post(
+        "/ingest",
+        json={"data": "capture without projection", "tags": [], "cognify": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert response.json()["projection_requested"] is False
+    assert response.json()["projection_state"] == "pending"
+    assert response.json()["cognified"] is False
+    assert citadel.ingest_calls[0]["defer_cognify"] is True
+    assert citadel.cognify_calls == 0
+
+
+def test_ingest_cognify_request_does_not_start_projection() -> None:
     class LifecycleCitadel(FakeCitadel):
         legacy_cognify_calls = 0
 
@@ -2232,9 +2353,7 @@ def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
         json={"data": "lifecycle note", "tags": [], "cognify": True},
     )
 
-    assert response.status_code == 200
-    assert response.json()["cognified"] is False
-    assert response.json()["projection_state"] == "pending"
+    assert response.status_code == 422
     assert citadel.legacy_cognify_calls == 0
 
 
@@ -4739,11 +4858,13 @@ def test_single_literal_search_preserves_each_dataset_candidate() -> None:
 
 def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any) -> None:
     """The API ranks the exact token before unrelated returned hits (#106)."""
-    async def fake_search(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, Any]], bool]:
+    async def fake_search(
+        *args: Any, **kwargs: Any
+    ) -> tuple[list[tuple[str, Any]], bool, bool]:
         return [
             ("central", {"id": "central", "text": "unrelated central note"}),
             ("node", {"id": "node", "text": "quokka-beacon-8823"}),
-        ], False
+        ], False, False
 
     monkeypatch.setattr(server_module, "_search_within_budget", fake_search)
     response = authed_client().post(
@@ -4754,6 +4875,54 @@ def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any)
     body = response.json()
     assert body["results"][0]["id"] == "node"
     assert body["results"][0]["_citadel"]["rank"] == 1
+
+
+def test_search_selection_prefers_relevant_central_hit_over_dataset_reservation() -> None:
+    """A weak personal hit must not displace a stronger Central match."""
+    candidates = [
+        {
+            "id": "seat-1",
+            "text": "projection notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-2",
+            "text": "MCP notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-3",
+            "text": "CLI notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-4",
+            "text": "unrelated personal note",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "central-1",
+            "text": "projection MCP CLI contract",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, fetched, matched = server_module.select_public_search_page(
+        candidates,
+        query="projection MCP CLI",
+        datasets=["seat:sarthi", "masumi-network", SESSION_TRACES_DATASET],
+        limit=5,
+    )
+
+    assert fetched == 5
+    assert matched == 5
+    assert [hit["id"] for hit in selected] == [
+        "central-1",
+        "seat-1",
+        "seat-2",
+        "seat-3",
+        "seat-4",
+    ]
 
 
 def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
@@ -4868,6 +5037,49 @@ def test_search_timeout_budget_is_a_typed_failure() -> None:
         "code": "SEARCH_TIMEOUT",
         "message": "Search exceeded the configured server budget.",
     }
+
+
+def test_search_provider_timeout_uses_lexical_fallback() -> None:
+    """A slow vector provider must not hide retained source retrieval."""
+    import asyncio as aio
+    import dataclasses
+
+    class RecoveringCitadel(FakeCitadel):
+        config = dataclasses.replace(FakeCitadel.config, search_timeout_seconds=0.02)
+
+        def __init__(self) -> None:
+            self.allow_vector_recall_calls: list[bool] = []
+
+        async def search(
+            self,
+            query: str,
+            *,
+            allow_vector_recall: bool = True,
+            **kwargs: Any,
+        ) -> list[Any]:
+            del query, kwargs
+            self.allow_vector_recall_calls.append(allow_vector_recall)
+            if allow_vector_recall:
+                await aio.sleep(0.3)
+            return [
+                {
+                    "id": "lexical-hit",
+                    "document_id": "retained-source-1",
+                    "text": "retained source context",
+                }
+            ]
+
+    client = authed_client("test-reader")
+    citadel = RecoveringCitadel()
+    app.state.citadel = citadel
+
+    response = client.post("/search", json={"query": "context", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["degraded"] is True
+    assert body["results"][0]["id"] == "lexical-hit"
+    assert citadel.allow_vector_recall_calls == [True, False]
 
 
 def test_search_genuine_empty_is_a_normal_success() -> None:
@@ -4985,8 +5197,10 @@ def test_search_provider_outage_inside_the_fanout_is_a_typed_failure(
 
 
 def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
-    async def timeout(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
-        return [], True
+    async def timeout(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[list[Any], bool, bool]:
+        return [], True, False
 
     monkeypatch.setattr(server_module, "_search_within_budget", timeout)
     client = authed_client("test-reader")
@@ -4998,7 +5212,9 @@ def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
 
 
 def test_knowledge_alias_qdrant_outage_is_a_typed_failure(monkeypatch) -> None:
-    async def unavailable(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+    async def unavailable(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[list[Any], bool, bool]:
         raise server_module.QdrantProviderError("provider detail")
 
     monkeypatch.setattr(server_module, "_search_within_budget", unavailable)
@@ -5613,6 +5829,95 @@ class DrilldownIsolationCitadel(FakeCitadel):
         return list(document.get("dataset_node_ids") or [document_id])
 
 
+class LifecycleDocumentCitadel(FakeCitadel):
+    documents = {
+        "central-lifecycle": {
+            "id": "central-lifecycle",
+            "source": "lifecycle",
+            "source_type": "lifecycle",
+            "body": "central retained source",
+            "metadata": {"dataset": "masumi-network"},
+        },
+        "alice-lifecycle": {
+            "id": "alice-lifecycle",
+            "source": "lifecycle",
+            "source_type": "lifecycle",
+            "body": "alice retained source",
+            "metadata": {"dataset": "seat:alice"},
+        },
+    }
+
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        raise AssertionError(
+            f"lifecycle document {document_id} must use dataset visibility"
+        )
+
+
+def test_lifecycle_document_drilldown_uses_dataset_visibility(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = LifecycleDocumentCitadel()
+    api = TestClient(app, base_url="https://testserver")
+    bob = {"Authorization": f"Bearer {bob_token}"}
+
+    try:
+        central = api.get("/api/documents/central-lifecycle", headers=bob)
+        foreign = api.get("/api/documents/alice-lifecycle", headers=bob)
+        admin_foreign = admin.get("/api/documents/alice-lifecycle")
+    finally:
+        app.state.citadel = None
+
+    assert central.status_code == 200
+    assert central.json()["document"]["body"] == "central retained source"
+    assert foreign.status_code == 404
+    assert admin_foreign.status_code == 200
+    assert admin_foreign.json()["document"]["body"] == "alice retained source"
+
+
+def test_public_search_exposes_lifecycle_retrieval_mode() -> None:
+    lexical = server_module.public_search_result(
+        {
+            "id": "lexical-hit",
+            "document_id": "source-lexical",
+            "text": "deterministic fallback context",
+            "source": "lifecycle",
+            "_lifecycle": {
+                "source_revision_id": "source-lexical",
+                "retrieval_mode": "lexical_fallback",
+                "backend": "lexical",
+            },
+        },
+        0,
+        "masumi-network",
+        query="fallback context",
+    )
+    vector = server_module.public_search_result(
+        {
+            "id": "vector-hit",
+            "document_id": "source-vector",
+            "text": "vector context",
+            "source": "lifecycle",
+            "_lifecycle": {
+                "source_revision_id": "source-vector",
+                "retrieval_mode": "vector",
+                "backend": "vector",
+            },
+        },
+        0,
+        "masumi-network",
+        query="vector context",
+    )
+
+    assert lexical is not None
+    assert vector is not None
+    assert lexical["_citadel"]["retrieval"]["mode"] == "lexical_fallback"
+    assert vector["_citadel"]["retrieval"]["mode"] == "vector"
+
+
 def test_document_drilldown_enforces_read_scope_without_existence_oracle(
     tmp_path: Any,
 ) -> None:
@@ -6185,9 +6490,12 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     payload = response.json()
     assert payload["ok"] is True
     assert payload["query"] == "rotate keys"
-    assert [set(result) for result in payload["results"]] == [
-        set(result) for result in search.json()["results"]
-    ]
+    # The compatibility alias keeps its documented under-promise for drilldown.
+    # Its results remain the same public shape, except /search may add a verified
+    # document_endpoint after its caller-scoped ownership pass.
+    alias_keys = [set(result) for result in payload["results"]]
+    search_keys = [set(result) for result in search.json()["results"]]
+    assert all(left <= right for left, right in zip(alias_keys, search_keys))
     assert len(payload["results"]) == 2
     assert payload["results"][0]["text"] == "Rotate keys quarterly"
     assert payload["results"][0]["source"] == "https://example.com/runbook"
@@ -9028,6 +9336,41 @@ def test_result_metadata_promotes_lifecycle_receipt_identity() -> None:
         "generation_id": "generation-1",
         "backend": "vector",
         "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
+
+
+def test_result_metadata_promotes_retained_source_identity_without_receipt() -> None:
+    result = server_module.with_result_metadata(
+        {
+            "id": "lexical-hit-1",
+            "document_id": "source-1",
+            "text": "retained source context",
+            "references": [{"document_id": "source-1", "source_locator": "citadel://source-1"}],
+            "_lifecycle": {
+                "schema_version": 1,
+                "source_revision_id": "source-1",
+                "generation_id": "generation-1",
+                "backend": "lexical",
+                "provider": "sqlite",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+                "retrieval_mode": "lexical_fallback",
+                "projection_state": "pending",
+                "vector_state": "pending",
+            },
+        },
+        0,
+        "central",
+    )
+
+    assert result["_citadel"]["source_revision_id"] == "source-1"
+    assert "projection_receipt_id" not in result["_citadel"]
+    assert result["_citadel"]["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "lexical",
+        "provider": "sqlite",
         "projection_version": "projection-v1",
         "state": "searchable",
     }

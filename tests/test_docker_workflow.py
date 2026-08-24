@@ -207,6 +207,7 @@ def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> 
         "/api/state",
         "/skills",
         "/skills/boundary",
+        "/skills/citadel",
         "/skills/cli",
         "/skills/connect",
         "/skills/debug",

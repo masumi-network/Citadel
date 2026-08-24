@@ -639,15 +639,15 @@ Citadel stores only the SHA-256 hash. The raw token is shown once at creation.
 
 | Tool | Description | Parameters |
 |---|---|---|
-| `citadel_ingest` | Store durable context and queue asynchronous graph projection | `data`, `dataset?`, `tags?`, `session_id?` |
+| `citadel_ingest` | Store durable context and queue background relational and vector projection; graph enrichment stays in the scheduled lane | `data`, `dataset?`, `tags?`, `session_id?` |
 | `citadel_record_feedback` | Explicit QA / hit rating (writer). Prefer after reading search hits: pass hit `id` or `search_id` as `qa_id`/`result_id`, plus `score` 1\|-1 or `correct` true\|false. Complements automatic search telemetry. | `qa_id?`, `result_id?`, `score?`, `text?`, `session_id?`, `dataset?`, `correct?` |
 | `citadel_share_session` | Volunteer a Shared Session Trace for teammates to find via search. Writes to `session-traces` (reference-only). Ask the user before calling | `cwd`, `data?`, `transcript_path?`, `capture_roots?`, `has_tool_errors?` |
 | `citadel_contribute` | Titled Vault Contribution to Central through the Learning Process, with conflict detection. Not available to seat-writer tokens (403) | `title`, `content`, `tags?`, `source_url?`, `dataset?` |
 
-`citadel_ingest` and CLI `citadel ingest` use asynchronous projection by
-default. A new note might not appear in search until projection finishes. Use
-CLI `citadel ingest --cognify` or MCP `cognify=true` only when the user
-explicitly needs the graph build to run inline.
+`citadel_ingest` and CLI `citadel ingest` use capture-only writes by default.
+The background vector lane may make a note searchable without a generative LLM.
+Graph enrichment runs in the scheduled lane. The user-facing MCP and CLI paths
+reject inline Cognify requests.
 
 ### Admin Tools
 
