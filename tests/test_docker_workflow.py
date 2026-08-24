@@ -15,6 +15,19 @@ PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements.txt"
 
 
+def test_image_build_marker_prefers_railway_git_revision() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    builder = dockerfile.split("FROM python", 2)[1].split("FROM python", 1)[0]
+    runtime = dockerfile.split("FROM python", 2)[2].split("FROM runtime AS test", 1)[0]
+
+    assert 'ARG RAILWAY_GIT_COMMIT_SHA=""' in builder
+    assert 'ARG CITADEL_BUILD_ID=""' in builder
+    assert "from kb.build_identity import write_build_id_marker" in builder
+    assert "write_build_id_marker('/wheels/citadel-build-id', os.environ)" in builder
+    assert "sha256sum" not in builder.split("citadel-build-id", 1)[1]
+    assert "install -m 0444 /wheels/citadel-build-id /opt/citadel/build-id" in runtime
+
+
 def test_runtime_dependency_pins_match_the_production_assertion() -> None:
     server_dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
         "optional-dependencies"

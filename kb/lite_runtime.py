@@ -32,18 +32,10 @@ def _required(name: str) -> str:
     return value
 
 
-def _build_id() -> str:
-    configured = os.getenv("CITADEL_BUILD_ID", "").strip()
-    if configured:
-        return configured
-    path = Path(os.getenv("CITADEL_BUILD_ID_PATH", "/opt/citadel/build-id"))
-    try:
-        value = path.read_text(encoding="ascii").strip()
-    except OSError as error:
-        raise LiteConfigurationError(f"Citadel build identity is unavailable at {path}") from error
-    if not value:
-        raise LiteConfigurationError(f"Citadel build identity is empty at {path}")
-    return value
+def _build_id() -> str | None:
+    from kb.build_identity import build_identity_from_runtime
+
+    return build_identity_from_runtime(os.environ).build_id
 
 
 # Must match the model the Dockerfile bakes into /opt/fastembed-cache and

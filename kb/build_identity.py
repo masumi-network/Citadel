@@ -28,8 +28,23 @@ class BuildIdentity:
     deployment_id: str | None
 
 
-_BUILD_MARKER_RE = re.compile(r"[0-9a-fA-F]{64}")
+_GIT_REVISION_RE = re.compile(r"[0-9a-fA-F]{40}")
 _DEFAULT_BUILD_ID_PATH = "/opt/citadel/build-id"
+
+
+def _git_revision(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if _GIT_REVISION_RE.fullmatch(candidate) is None:
+        return None
+    return candidate.lower()
+
+
+def _first_git_revision(env: Mapping[str, str], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        revision = _git_revision(env.get(name))
+        if revision is not None:
+            return revision
+    return None
 
 
 def build_identity_from_env(env: Mapping[str, str]) -> BuildIdentity:
@@ -43,7 +58,7 @@ def build_identity_from_env(env: Mapping[str, str]) -> BuildIdentity:
 
     return BuildIdentity(
         version=__version__,
-        build_id=_first_nonempty(env, ("RAILWAY_GIT_COMMIT_SHA", "CITADEL_BUILD_ID")),
+        build_id=_first_git_revision(env, ("RAILWAY_GIT_COMMIT_SHA", "CITADEL_BUILD_ID")),
         deployment_id=_first_nonempty(
             env,
             ("RAILWAY_DEPLOYMENT_ID", "RAILWAY_SNAPSHOT_ID", "CITADEL_DEPLOYMENT_ID"),
@@ -56,9 +71,14 @@ def _build_id_from_marker(path: str) -> str | None:
         value = Path(path).read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
         return None
-    if _BUILD_MARKER_RE.fullmatch(value) is None:
-        return None
-    return value.lower()
+    return _git_revision(value)
+
+
+def write_build_id_marker(path: str, env: Mapping[str, str]) -> str | None:
+    """Write the exact source revision, or an empty marker when unavailable."""
+    revision = build_identity_from_env(env).build_id
+    Path(path).write_text(f"{revision}\n" if revision is not None else "", encoding="ascii")
+    return revision
 
 
 def build_identity_from_runtime(

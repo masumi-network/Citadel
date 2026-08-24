@@ -2,6 +2,9 @@
 
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS builder
 
+ARG RAILWAY_GIT_COMMIT_SHA=""
+ARG CITADEL_BUILD_ID=""
+
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -11,9 +14,9 @@ RUN python -m pip install build==1.5.0 hatchling==1.31.0
 COPY . .
 RUN python scripts/build_secure_cognee.py --output /wheels
 RUN python -m build --no-isolation --wheel --outdir /wheels .
-RUN CITADEL_WHEEL="$(find /wheels -maxdepth 1 -type f -name 'citadel_archive-*.whl' -print -quit)" \
-    && test -n "$CITADEL_WHEEL" \
-    && sha256sum "$CITADEL_WHEEL" | cut -d ' ' -f1 > /wheels/citadel-build-id
+RUN RAILWAY_GIT_COMMIT_SHA="$RAILWAY_GIT_COMMIT_SHA" \
+    CITADEL_BUILD_ID="$CITADEL_BUILD_ID" \
+    python -c "import os; from kb.build_identity import write_build_id_marker; write_build_id_marker('/wheels/citadel-build-id', os.environ)"
 
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS runtime
 

@@ -54,7 +54,7 @@ def _configured_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> None
     monkeypatch.setenv("VECTOR_DB_KEY", "qdrant-secret")
     monkeypatch.setenv("LLM_API_KEY", "llm-secret")
     monkeypatch.setenv("CITADEL_ADMIN_KEY", "a" * 32)
-    monkeypatch.setenv("CITADEL_BUILD_ID", "candidate-wheel-sha256")
+    monkeypatch.setenv("CITADEL_BUILD_ID", "c" * 40)
     monkeypatch.setenv(
         "CITADEL_QDRANT_SERVER_IMAGE",
         "qdrant/qdrant:v1.19.0@sha256:test",
@@ -82,6 +82,23 @@ def _configured_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> None
         "REQUIRE_AUTHENTICATION",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def test_build_id_uses_shared_source_revision_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "build-id"
+    marker.write_text("d" * 40, encoding="ascii")
+    monkeypatch.setenv("CITADEL_BUILD_ID_PATH", str(marker))
+    monkeypatch.setenv("CITADEL_BUILD_ID", "b" * 40)
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "a" * 40)
+
+    assert lite_runtime._build_id() == "a" * 40
+
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "not-a-sha")
+    monkeypatch.setenv("CITADEL_BUILD_ID", "also-not-a-sha")
+    assert lite_runtime._build_id() == "d" * 40
 
 
 def test_configure_lite_environment_creates_sqlite_profile(
@@ -241,7 +258,7 @@ def test_bootstrap_receipt_excludes_secrets(
     receipt = json.loads(content)
 
     assert receipt["generation_id"] == "test-generation"
-    assert receipt["build_id"] == "candidate-wheel-sha256"
+    assert receipt["build_id"] == "c" * 40
     assert receipt["relational_provider"] == "sqlite"
     assert receipt["vector_provider"] == "qdrant"
     assert receipt["qdrant_server_image"].startswith("qdrant/qdrant:v1.19.0@sha256:")

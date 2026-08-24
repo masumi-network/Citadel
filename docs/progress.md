@@ -2992,6 +2992,9 @@ not as successful retrieval.
 - [VERIFIED] Runtime identity prefers Railway or explicit environment identity,
   then accepts a valid 64-hex image marker at
   `kb/build_identity.py:64-86`. Missing or malformed markers stay absent.
+- [CORRECTED] The 64-hex marker above was a wheel hash, not a source revision.
+  Runtime identity now accepts only an exact 40-hex Git revision from Railway,
+  `CITADEL_BUILD_ID`, or the baked marker. Missing identity stays absent.
 - [NOT DETERMINED] This local test proves that the vector task can run while an
   application graph maintenance context is held. It does not prove that the
   installed Cognee relational and vector providers tolerate concurrent writes.
