@@ -19,6 +19,8 @@ import sqlite3
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from kb.search_format import linear_issue_url_identifier, parse_content_header
+
 
 LIFECYCLE_SCHEMA_VERSION = 1
 REQUIRED_BACKENDS = ("relational", "vector", "graph")
@@ -1665,6 +1667,7 @@ class LifecycleStore:
         dataset: str,
         projection: ProjectionRequest,
         top_k: int = 10,
+        required_linear_issue_identifier: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search retained current heads without a vector or language model."""
         if not query.strip():
@@ -1719,9 +1722,32 @@ class LifecycleStore:
                 continue
             revision = self._source_revision(row)
             capture_metadata = revision.capture_metadata
+            if required_linear_issue_identifier is not None:
+                tags = capture_metadata.get("tags")
+                required_tag = f"linear:{required_linear_issue_identifier}".casefold()
+                tag_matches = isinstance(tags, list) and required_tag in {
+                    str(tag).casefold() for tag in tags
+                }
+                locator_matches = (
+                    linear_issue_url_identifier(revision.source_locator)
+                    == required_linear_issue_identifier
+                )
+                if not tag_matches and not locator_matches:
+                    continue
             title = capture_metadata.get("title")
             if not isinstance(title, str) or not title.strip():
-                title = revision.source_key
+                header = parse_content_header(text, chunk_index=0)
+                if header.get("kind") == "linear-issue" and header.get("issue"):
+                    issue_title = header.get("title")
+                    title = (
+                        f"{header['issue']}: {issue_title}"
+                        if issue_title
+                        else header["issue"]
+                    )
+                elif header.get("kind") == "repo-content" and header.get("path"):
+                    title = Path(header["path"]).name
+                else:
+                    title = header.get("title") or revision.source_key
             projection_state = str(row["projection_state"] or "not_started")
             receipt_states: dict[str, str] = {}
             for item in str(row["receipt_states"] or "").split("|"):

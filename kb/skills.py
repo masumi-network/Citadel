@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # a root SKILL.md would shadow ``skills/*`` in the skills CLI).
 SKILL_FILES: dict[str, Path] = {
     "citadel": REPO_ROOT / "skills/citadel/SKILL.md",
+    "search": REPO_ROOT / "skills/citadel-search/SKILL.md",
     "connect": REPO_ROOT / "skills/citadel-mcp-connector/SKILL.md",
     "vault": REPO_ROOT / "skills/citadel-vault/SKILL.md",
     "boundary": REPO_ROOT / "skills/citadel-data-boundary/SKILL.md",
@@ -30,6 +31,8 @@ SKILL_ALIASES: dict[str, str] = {
     "mcp-connector": "connect",
     "citadel-mcp-connector": "connect",
     "citadel-vault": "vault",
+    "citadel-search": "search",
+    "search-guide": "search",
     "policy": "boundary",
     "privacy": "boundary",
     "public-private": "boundary",
@@ -90,6 +93,7 @@ def skill_catalog() -> list[dict[str, object]]:
 
 _SKILL_DESCRIPTIONS: dict[str, str] = {
     "citadel": "Route Citadel search, capture, MCP, CLI, onboarding, boundaries, and debugging questions.",
+    "search": "Write effective Citadel queries and verify relevance, citations, and drilldown.",
     "connect": "Set up Citadel MCP in Claude Code, Codex, Cursor, or any MCP agent.",
     "vault": "Search, ingest, and use the Organization Vault after MCP is connected.",
     "boundary": "Public vs private data boundaries for Citadel code, vault, and tokens.",

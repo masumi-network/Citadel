@@ -21,7 +21,12 @@ from kb.access import ROLE_ORDER
 from kb.build_identity import SERVICE_BUILD_IDENTITY
 from kb.capture_config import load_capture_config
 from kb.retry import run_with_retries
-from kb.search_format import is_search_content_hit, shape_public_search_hit
+from kb.search_format import (
+    compact_document_payload_for_agent,
+    compact_search_payload_for_agent,
+    is_search_content_hit,
+    shape_public_search_hit,
+)
 from kb.security_scan import redact_secrets
 from kb.session_trace_distill import (
     distill_trace,
@@ -719,7 +724,7 @@ def _compact_search_for_agent(payload: Any) -> Any:
             if limit > 0
             else public_results
         )
-    return compacted
+    return compact_search_payload_for_agent(compacted)
 
 
 def _audit_query(view: str, limit: int) -> str:
@@ -1244,13 +1249,14 @@ def create_mcp_server(
         document and has nothing to fetch here.
         """
         normalized_id = _require_non_empty(document_id, "document_id")
-        return await _call_async(
+        result = await _call_async(
             "citadel_get_document",
             lambda: resolve_client(ctx).get(
                 f"/api/documents/{quote(normalized_id, safe='')}",
                 tool_name="citadel_get_document",
             ),
         )
+        return compact_document_payload_for_agent(result)
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_operation"].annotations)
     async def citadel_operation(
@@ -1381,10 +1387,10 @@ def create_mcp_server(
         the scheduled lane. The write path itself does not call a generative LLM,
         but the vector lane may use the configured embedding provider later. The
         HTTP lifecycle path may return after durable acceptance with
-        `projection_state=pending` or `retrieval_ready=false`; use
+        `projection_state=pending` while `source_searchable=true`; use
         `citadel_operation` with the returned job id to confirm `vector_state`,
-        `graph_state`, and `retrieval_ready`. A client timeout does NOT mean the
-        write failed.
+        `graph_state`, `projection_searchable`, and `mesh_ready`. A client timeout
+        does NOT mean the write failed.
 
         Shared Central is read-only from MCP. Org-wide memory updates via scheduled
         GitHub/Linear sync and selective promotion — not direct MCP ingest.
@@ -1589,14 +1595,16 @@ def create_mcp_server(
         recover: bool = False,
         oversized: bool = False,
     ) -> dict[str, Any]:
-        """Audit or repair accepted documents with missing or oversized chunks.
+        """Audit accepted documents with missing or oversized chunks.
 
-        The default is a combined read-only census. Applying a repair requires
-        admin access and repairs the zero-chunk and over-budget union in one
-        pass. Set ``recover`` with ``apply`` and ``force`` to rebuild an
-        interrupted operation from unchanged source rows. Set ``oversized`` for the legacy
-        over-budget-only path; it does not support recovery.
+        The MCP path is read-only. Projection repair runs only as a scheduled
+        operator job. Set ``oversized`` for the legacy over-budget-only census.
         """
+        if apply:
+            raise CitadelMcpError(
+                "Corpus repair projection runs only as a scheduled operator job.",
+                error_code="LLM_SCHEDULED_ONLY",
+            )
         payload: dict[str, Any] = {
             "dataset": dataset,
             "apply": apply,
@@ -1621,7 +1629,7 @@ def create_mcp_server(
         force: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Sync READMEs, skills, and docs from allowlisted repos through cognify."""
+        """Sync repository text and queue scheduled projection without LLM work."""
         return await _call_async(
             "citadel_run_repo_content_sync",
             lambda: resolve_client(ctx).post(
@@ -1696,14 +1704,10 @@ def create_mcp_server(
         dataset: str | None = None,
         session_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Run Cognee improvement for a dataset/session list. Requires admin access."""
-        return await _call_async(
-            "citadel_improve",
-            lambda: resolve_client(ctx).post(
-                "/improve",
-                {"dataset": dataset, "session_ids": session_ids},
-                tool_name="citadel_improve",
-            ),
+        """Explain that Cognee improvement is a scheduled-only operation."""
+        raise CitadelMcpError(
+            "Cognee improvement runs only in the scheduled evolve job.",
+            error_code="LLM_SCHEDULED_ONLY",
         )
 
     @mcp.tool(annotations=TOOL_POLICIES["citadel_promotion_pending"].annotations)

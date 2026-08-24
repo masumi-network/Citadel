@@ -279,7 +279,7 @@ class GitHubOrgSyncer:
             state = {}
             state_error = str(exc)
         return {
-            "ok": state_error is None,
+            "ok": state_error is None and state.get("last_run_ok") is not False,
             "state_error": state_error,
             "org": self.org,
             "source_url": SOURCE_URL_TEMPLATE.format(org=self.org),
@@ -287,6 +287,9 @@ class GitHubOrgSyncer:
             "session_id": self.config.github_sync_session,
             "state_path": str(self.state_path),
             "last_checked_at": state.get("last_checked_at"),
+            "last_attempt_at": state.get("last_attempt_at"),
+            "last_run_ok": state.get("last_run_ok"),
+            "last_run_reason": state.get("last_run_reason"),
             "last_digest_at": state.get("last_digest_at"),
             "tracked_repositories": len(state.get("repos") or {}),
             "seen_events": len(state.get("seen_event_ids") or []),
@@ -305,7 +308,13 @@ class GitHubOrgSyncer:
             "last_security_scan": state.get("last_security_scan"),
         }
 
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         checked_at = utc_now()
         authenticated = bool(getattr(self.client, "token", None))
         if not authenticated:
@@ -378,31 +387,55 @@ class GitHubOrgSyncer:
                 media_type="text/markdown",
                 capture_actor_id="github-sync",
                 capture_run_id=checked_at,
-                run_improve=self.run_improve,
+                run_improve=self.run_improve and allow_llm,
+                allow_llm=allow_llm,
                 detect_conflicts=False,
+                defer_cognify=not allow_llm,
             )
             ingest_result = outcome.ingest
             improve_result = outcome.improve
 
+        ingest_rejected = bool(
+            should_ingest
+            and not dry_run
+            and (ingest_result is None or not ingest_result.accepted)
+        )
+        sync_reason: str | None = None
+        if security_blocked:
+            sync_reason = "github_digest_security_blocked"
+        elif ingest_rejected:
+            sync_reason = "github_digest_ingest_rejected"
+        sync_ok = sync_reason is None
+
         if not dry_run:
-            tracked_commits = dict(previous_commits)
-            for repo_name, repo_commits in commits_by_repo.items():
-                tracked_commits[repo_name] = [commit.sha for commit in repo_commits if commit.sha][:500]
             state.update(
                 {
                     "version": STATE_VERSION,
                     "org": self.org,
-                    "last_checked_at": checked_at,
-                    "repos": {repo.full_name: repo.state() for repo in repos},
-                    "commits": tracked_commits,
-                    "seen_event_ids": [
-                        event.id for event in events if event.id
-                    ][:500],
+                    "last_attempt_at": checked_at,
+                    "last_run_ok": sync_ok,
+                    "last_run_reason": sync_reason,
                 }
             )
-            if should_ingest:
-                state["last_digest_at"] = checked_at
-                state["last_digest"] = update.digest
+            if sync_ok:
+                tracked_commits = dict(previous_commits)
+                for repo_name, repo_commits in commits_by_repo.items():
+                    tracked_commits[repo_name] = [
+                        commit.sha for commit in repo_commits if commit.sha
+                    ][:500]
+                state.update(
+                    {
+                        "last_checked_at": checked_at,
+                        "repos": {repo.full_name: repo.state() for repo in repos},
+                        "commits": tracked_commits,
+                        "seen_event_ids": [event.id for event in events if event.id][
+                            :500
+                        ],
+                    }
+                )
+                if should_ingest:
+                    state["last_digest_at"] = checked_at
+                    state["last_digest"] = update.digest
             state["last_security_scan"] = {
                 "checked_at": checked_at,
                 "ok": security_scan.get("ok"),
@@ -423,7 +456,8 @@ class GitHubOrgSyncer:
             bool(ingest_result and ingest_result.accepted),
         )
         return {
-            "ok": True,
+            "ok": sync_ok,
+            "reason": sync_reason,
             "authenticated": authenticated,
             "org": self.org,
             "source_url": SOURCE_URL_TEMPLATE.format(org=self.org),
@@ -631,7 +665,11 @@ async def _sync_github(args: argparse.Namespace) -> None:
         ingest_unchanged=not args.skip_unchanged,
         run_improve=not args.skip_improve,
     )
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     print(json.dumps(result, indent=2, default=str))
 
 

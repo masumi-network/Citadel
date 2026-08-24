@@ -19,6 +19,7 @@ CLI gate: `citadel --version` must be `>= 0.5.2`. Older: `citadel update`.
 
 | Need | Load |
 |---|---|
+| Query wording, source filters, relevance, citations, drilldown | `citadel-search` (`/skills/search`) |
 | Search, `citadel_get_document`, trust / `content_hint`, feedback | `citadel-vault` (`/skills/vault`) |
 | Wire Cursor / Claude / Codex / Windsurf MCP | `citadel-mcp-connector` (`/skills/connect`) |
 | `citadel` CLI (`status`, `search`, `document`, `skills`, `mcp add`, `update`, `onboard`, `doctor`) | `citadel-cli` (`/skills/cli`) |
@@ -42,7 +43,7 @@ If the client lists no `citadel_*` tools, use the CLI. Do not retry MCP forever.
 
 ## Rules
 
-1. Search at task start (`citadel_search` or `citadel search --json`).
+1. Load `/skills/search`, then search at task start.
 2. Trace hits are `_citadel.trust: reference-only`. Central is org-authoritative.
 3. After search, record feedback (`citadel_record_feedback`, score `1` or `-1`).
 4. Ingest only after explicit user approval. Never commit `ctdl_` tokens.

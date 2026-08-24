@@ -128,7 +128,7 @@ def _log_result(result: dict[str, Any]) -> None:
     )
 
 
-async def arun() -> int:
+async def arun(*, force_in_process: bool = False) -> int:
     """The body of :func:`run`, awaitable on the caller's own event loop.
 
     The evolve scheduler runs this inside the web process's loop (#88), where
@@ -138,7 +138,7 @@ async def arun() -> int:
     """
     dry_run = _bool(os.getenv("CITADEL_SELF_IMPROVE_DRY_RUN"), default=False)
     payload = {"dry_run": dry_run}
-    endpoint = _target_endpoint()
+    endpoint = None if force_in_process else _target_endpoint()
 
     if endpoint:
         access_key = _access_key()
@@ -171,13 +171,13 @@ async def arun() -> int:
     return 0
 
 
-def run() -> int:
+def run(*, force_in_process: bool = False) -> int:
     """Synchronous entrypoint for the CLI and the standalone cron service.
 
     run_async shares the evolve chain's single loop so cognee's cached engine
     is not bound to a throwaway loop (#69); standalone it is asyncio.run.
     """
-    return run_async(arun())
+    return run_async(arun(force_in_process=force_in_process))
 
 
 def main() -> None:

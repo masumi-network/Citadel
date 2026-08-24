@@ -100,6 +100,13 @@ class CollisionCitadel:
         ]
 
 
+class FailingSearchCitadel:
+    config = PageCitadel.config
+
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError(f"contextless query reached provider: {query} {kwargs}")
+
+
 def shaped_client(citadel: Any) -> TestClient:
     app.state.citadel = citadel
     app.state.mesh = MeshState()
@@ -297,6 +304,37 @@ def test_invalid_primary_row_cannot_hide_valid_secondary_hit() -> None:
     ]
 
 
+def test_contextless_decision_query_does_not_call_search_provider() -> None:
+    merged = asyncio.run(
+        search_across_datasets(
+            FailingSearchCitadel(),
+            query="What did we decide about this?",
+            datasets=["seat:alice", "central"],
+            sessions={},
+            top_k=5,
+        )
+    )
+
+    assert merged == []
+
+
+def test_contextless_decision_query_returns_clean_clarification() -> None:
+    response = shaped_client(FailingSearchCitadel()).post(
+        "/search",
+        json={"query": "What did we decide about this?", "top_k": 5},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"] == []
+    assert payload["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert payload["clarification_required"] is True
+    assert payload["answerable"] is False
+    assert "no subject" in payload["message"]
+    assert "known_datasets" not in payload
+    assert payload.get("warnings") in (None, [])
+
+
 def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
     document_id = "0c9d5df0-0000-4000-8000-000000000002"
     raw = {
@@ -462,6 +500,7 @@ def test_lifecycle_source_key_preserves_linear_context_after_public_shaping() ->
     assert public["source_type"] == "linear-context"
     assert public["source"] == public["source_locator"]
     assert public["citation"]["source_locator"] == public["source_locator"]
+    assert public["_citadel"]["retrieval"]["citations_available"] is True
     assert public["_citadel"]["provenance"] == {
         "source": "linear-context",
         "source_url": public["source_locator"],

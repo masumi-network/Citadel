@@ -319,7 +319,7 @@ def _suppress_inline_cognify() -> bool:
 
     Set by :func:`suppress_inline_cognify` around the in-loop evolve Phase 1, or
     process-wide by CITADEL_SUPPRESS_INLINE_COGNIFY for the standalone evolve
-    entrypoint. Either way the web cognifies in Phase 2 as the sole writer (#47).
+    entrypoint. Phase 2 then Cognifies on the same owner loop (#47).
     """
     if _SUPPRESS_INLINE_COGNIFY.get():
         return True
@@ -530,11 +530,10 @@ class CogneePublicClient:
         self._cognify_queue_retry_handle: asyncio.TimerHandle | None = None
         # Serializes graph writes within this process — Kuzu is a single-writer
         # embedded DB, so two overlapping cognify calls (an inline ingest cognify,
-        # the evolve scheduler, /api/cognify/run) must not collide (#47). One client
+        # the evolve scheduler) must not collide (#47). One client
         # per Citadel; the app uses a single Citadel singleton, so this is the
-        # process-wide writer gate. The evolve scheduler also holds it across its
-        # Phase-1 subprocess so the web never cognifies while the subprocess owns
-        # the on-disk Kuzu lock.
+        # process-wide writer gate. The evolve scheduler holds it across Phase 1
+        # so background work cannot Cognify before the scheduled Phase 2 pass.
         self.writer_lock = asyncio.Lock()
         # Serializes corpus repair with every regular cognify call in this
         # process. The repair context keeps this lock across census, deletion,
@@ -841,9 +840,8 @@ class CogneePublicClient:
         # process — so the evolve Phase-1 subprocess and the web cognified Kuzu at
         # the same time, the hourly "Lock is held by PID N" crash.
         #
-        # 1) In the Phase-1 evolve subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY=true)
-        #    we ADD ONLY and never write Kuzu — the web cognifies everything in
-        #    Phase 2 as the sole writer.
+        # 1) In evolve Phase 1, suppress_inline_cognify makes this ADD only. The
+        #    scheduler Cognifies everything once in Phase 2.
         # 2) Otherwise we schedule our OWN background cognify that serializes on the
         #    writer lock (kept non-blocking for the caller, #56), so concurrent
         #    in-process ingests and the evolve scheduler never collide.

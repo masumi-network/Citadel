@@ -63,6 +63,17 @@ class FailingImproveCitadel(FakeCitadel):
         raise RuntimeError("llm unavailable")
 
 
+class RefusingIngestCitadel(FakeCitadel):
+    async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+        self.ingest_calls.append({"data": data, **kwargs})
+        return IngestResult(
+            False,
+            "unchunkable_content",
+            kwargs["dataset"],
+            tuple(kwargs["tags"]),
+        )
+
+
 class FakeGitHubClient:
     def fetch_repos(
         self,
@@ -245,6 +256,57 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
     assert status["tracked_repositories"] == 1
     assert status["seen_events"] == 1
     assert status["tracked_commit_repositories"] == 1
+
+
+@pytest.mark.asyncio
+async def test_github_sync_retries_a_digest_that_ingest_rejected(tmp_path: Any) -> None:
+    config = CitadelConfig(
+        github_sync_dataset="masumi-network",
+        github_sync_session="masumi-github-daily",
+        github_sync_state_path=str(tmp_path / "github_state.json"),
+    )
+    citadel = RefusingIngestCitadel(config)
+    syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
+
+    first = await syncer.run(allow_llm=False)
+    state = json.loads(Path(config.github_sync_state_path).read_text(encoding="utf-8"))
+    second = await syncer.run(allow_llm=False)
+
+    assert first["ok"] is False
+    assert first["reason"] == "github_digest_ingest_rejected"
+    assert first["ingest_reason"] == "unchunkable_content"
+    assert "last_digest" not in state
+    assert state.get("repos") in (None, {})
+    assert len(citadel.ingest_calls) == 2
+    assert second["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_user_github_sync_disables_enrichment_and_improvement(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    config = CitadelConfig(
+        github_sync_dataset="masumi-network",
+        github_sync_session="masumi-github-daily",
+        github_sync_state_path=str(tmp_path / "github_state.json"),
+        github_sync_run_improve=True,
+    )
+    citadel = FakeCitadel(config)
+    syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
+
+    def explode(_data: str) -> Any:
+        raise AssertionError("user-triggered GitHub sync called an LLM")
+
+    monkeypatch.setattr("kb.learning.enrich_source_material", explode)
+    monkeypatch.setenv("CITADEL_LLM_ENRICHMENT_ENABLED", "true")
+
+    result = await syncer.run(allow_llm=False)
+
+    assert result["ingested"] is True
+    assert result["improved"] is False
+    assert citadel.improve_calls == []
+    assert citadel.ingest_calls[0]["defer_cognify"] is True
 
 
 @pytest.mark.asyncio

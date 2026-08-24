@@ -955,7 +955,11 @@ class RepoContentSyncer:
             or DEFAULT_REPO_CONTENT_AUTOJOIN_MARKERS
         )
         return {
-            "ok": state_error is None and (not all_repos or bool(repos)),
+            "ok": (
+                state_error is None
+                and (not all_repos or bool(repos))
+                and state.get("last_run_ok") is not False
+            ),
             "state_error": state_error,
             "authenticated": bool(getattr(self.client, "token", None)),
             "source_type": "github_repo_content",
@@ -987,12 +991,24 @@ class RepoContentSyncer:
             "max_bytes_per_file": self.config.repo_content_sync_max_bytes_per_file,
             "run_improve": self.config.repo_content_sync_run_improve,
             "last_checked_at": state.get("last_checked_at"),
+            "last_attempt_at": state.get("last_attempt_at"),
+            "last_run_ok": state.get("last_run_ok"),
+            "last_run_reason": state.get("last_run_reason"),
+            "content_scan_complete": state.get("content_scan_complete"),
+            "retention_complete": state.get("retention_complete"),
+            "repos_errored": state.get("repos_errored", 0),
             "tracked_files": len(files) - len(refused),
             "refused_files": len(refused),
             "state_path": str(self.state_path),
         }
 
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         """Serialise passes over one state file, then run.
 
         Two overlapping passes are a lost update, not just wasted work:
@@ -1036,9 +1052,19 @@ class RepoContentSyncer:
                 "dry_run": dry_run,
             }
         async with lock:
-            return await self._run_locked(force=force, dry_run=dry_run)
+            return await self._run_locked(
+                force=force,
+                dry_run=dry_run,
+                allow_llm=allow_llm,
+            )
 
-    async def _run_locked(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def _run_locked(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         if not self.config.repo_content_sync_enabled:
             return {
                 "ok": True,
@@ -1120,6 +1146,19 @@ class RepoContentSyncer:
                 "All-org repository discovery returned no repositories for %s",
                 self.org,
             )
+            if not dry_run:
+                state.update(
+                    {
+                        "version": STATE_VERSION,
+                        "last_attempt_at": checked_at,
+                        "last_run_ok": False,
+                        "last_run_reason": "repo_discovery_empty",
+                        "repo_discovery_complete": False,
+                        "content_scan_complete": False,
+                        "repos_errored": 0,
+                    }
+                )
+                self._save_state(state)
             return {
                 "ok": False,
                 "enabled": True,
@@ -1453,7 +1492,9 @@ class RepoContentSyncer:
                         # Improve ONCE after the whole sync, not per file. See
                         # LearningProcess.improve_once for why.
                         run_improve=False,
+                        allow_llm=allow_llm,
                         detect_conflicts=False,
+                        defer_cognify=not allow_llm,
                     )
                     ingest_results = tuple(outcome.all_ingests)
                     accepted_results = tuple(
@@ -1550,7 +1591,12 @@ class RepoContentSyncer:
         # One improve pass for the whole sync. Per-file improve made a full
         # forced sync cost ~2 min/file, so 60 files needed ~2 h against a 300 s
         # platform request ceiling and could never finish.
-        if not dry_run and ingested_files and self.config.repo_content_sync_run_improve:
+        if (
+            allow_llm
+            and not dry_run
+            and ingested_files
+            and self.config.repo_content_sync_run_improve
+        ):
             outcome = await self.learning.improve_once(
                 dataset=self.config.repo_content_sync_dataset,
                 session_ids=None,
@@ -1562,21 +1608,60 @@ class RepoContentSyncer:
                     ingested_files,
                 )
 
-        if not dry_run:
-            state["version"] = STATE_VERSION
-            state["last_checked_at"] = checked_at
-            state["files"] = tracked
-            self._save_state(state)
-
         repos_errored = [result for result in repo_results if result["errors"]]
+        rejected_files = sum(
+            count
+            for reason, count in skip_totals.items()
+            if reason.startswith("ingest_rejected:")
+            or reason.startswith("refused_unchanged:")
+        )
+        retention_complete = rejected_files == 0
         all_repos_errored = (
             bool(repo_results)
             and len(repos_errored) == len(repo_results)
             and ingested_files == 0
         )
-        coverage_incomplete = (
-            (self.config.repo_content_sync_all_repos or all_text) and bool(repos_errored)
+        # Every resolved repository is part of this run's declared source set.
+        # One failed repository means the scan is incomplete in all-org, all-text,
+        # and explicit allowlist modes alike.
+        coverage_incomplete = bool(repos_errored)
+        improve_failed = bool(
+            allow_llm
+            and self.config.repo_content_sync_run_improve
+            and ingested_files
+            and not improved
         )
+        run_ok = (
+            not all_repos_errored
+            and not coverage_incomplete
+            and not improve_failed
+            and retention_complete
+        )
+        run_reason: str | None = None
+        if all_repos_errored:
+            run_reason = "all_repository_scans_failed"
+        elif coverage_incomplete:
+            run_reason = "repository_content_scan_incomplete"
+        elif improve_failed:
+            run_reason = "repository_enrichment_failed"
+        elif not retention_complete:
+            run_reason = "repository_content_retention_incomplete"
+
+        if not dry_run:
+            state["version"] = STATE_VERSION
+            state["last_checked_at"] = checked_at
+            state["last_attempt_at"] = checked_at
+            state["last_run_ok"] = run_ok
+            state["last_run_reason"] = run_reason
+            state["repo_discovery_complete"] = (
+                not self.config.repo_content_sync_all_repos or bool(repo_results)
+            )
+            state["content_scan_complete"] = not coverage_incomplete
+            state["retention_complete"] = retention_complete
+            state["files_rejected"] = rejected_files
+            state["repos_errored"] = len(repos_errored)
+            state["files"] = tracked
+            self._save_state(state)
 
         logger.info(
             "Repo content sync finished: repos=%d discovered=%d ingested=%d skipped=%d "
@@ -1590,7 +1675,8 @@ class RepoContentSyncer:
             dry_run,
         )
         return {
-            "ok": not all_repos_errored and not coverage_incomplete,
+            "ok": run_ok,
+            "reason": run_reason,
             "enabled": True,
             "authenticated": authenticated,
             "org": self.org,
@@ -1599,6 +1685,7 @@ class RepoContentSyncer:
             "repo_discovery_complete": not self.config.repo_content_sync_all_repos
             or bool(repo_results),
             "content_scan_complete": not coverage_incomplete,
+            "retention_complete": retention_complete,
             "all_repos": self.config.repo_content_sync_all_repos,
             "all_text": all_text,
             "repos_errored": len(repos_errored),
@@ -1606,6 +1693,7 @@ class RepoContentSyncer:
             "files_tombstoned": tombstoned_files,
             "files_skipped": skipped_files,
             "files_skipped_by_reason": skip_totals,
+            "files_rejected": rejected_files,
             "files_blocked": blocked_files,
             "files_blocked_by_reason": blocked_reasons,
             "improved": improved,
@@ -1620,7 +1708,11 @@ async def _cli_main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     syncer = RepoContentSyncer(Citadel.from_env())
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     print(json.dumps(result, indent=2, default=str))
 
 

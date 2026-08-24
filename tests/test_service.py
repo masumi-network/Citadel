@@ -244,6 +244,7 @@ async def test_lifecycle_ingest_queues_durable_projection_and_returns_operation_
     assert result.source_revision_id is not None
     assert result.projection_job_id is not None
     assert result.projection_state == "pending"
+    assert result.source_searchable is True
     assert fake.remember_calls == [
         {
             "data": "A retained lifecycle note",
@@ -257,6 +258,9 @@ async def test_lifecycle_ingest_queues_durable_projection_and_returns_operation_
     operation = kb.lifecycle_store.get_operation(result.projection_job_id)
     assert operation.state == "searchable"
     assert operation_payload["state"] == "searchable"
+    assert operation_payload["source_searchable"] is True
+    assert operation_payload["projection_searchable"] is True
+    assert operation_payload["mesh_ready"] is True
     assert operation.source_revision.source_key == "manual:alice:note-1"
 
 
@@ -300,7 +304,11 @@ async def test_vector_lane_runs_during_capture_only_ingest_without_graph_call(
     assert next(
         receipt.state for receipt in operation.receipts if receipt.backend == "vector"
     ) == "searchable"
-    assert kb.lifecycle_operation(accepted.projection_job_id)["retrieval_ready"] is True
+    operation_payload = kb.lifecycle_operation(accepted.projection_job_id)
+    assert operation_payload["source_searchable"] is True
+    assert operation_payload["projection_searchable"] is True
+    assert operation_payload["mesh_ready"] is False
+    assert "retrieval_ready" not in operation_payload
 
 
 @pytest.mark.asyncio
@@ -530,7 +538,17 @@ async def test_lifecycle_search_uses_retained_source_without_vector_or_llm(
     )
     results = await kb.search("deterministic lexical baseline", top_k=1)
 
+    async def provider_document_must_not_run(document_id: str) -> None:
+        raise AssertionError(f"retained source {document_id} must bypass the provider")
+
+    monkeypatch.setattr(fake, "get_document", provider_document_must_not_run)
+
     assert accepted.projection_state == "pending"
+    assert accepted.source_searchable is True
+    pending_operation = kb.lifecycle_operation(accepted.projection_job_id)
+    assert pending_operation["source_searchable"] is True
+    assert pending_operation["projection_searchable"] is False
+    assert pending_operation["mesh_ready"] is False
     assert projection_starts == []
     assert fake.cognify_calls == []
     assert fake.recall_calls == 0
@@ -544,6 +562,171 @@ async def test_lifecycle_search_uses_retained_source_without_vector_or_llm(
     assert document is not None
     assert document["text"] == "The deterministic lexical baseline is available before vector indexing."
     assert document["metadata"]["dataset"] == "seat:alice"
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_uses_retained_identity_without_vector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    exact = await kb.ingest(
+        "# Linear SOK-563: Subscription credits\n\nExact issue body.",
+        source_key="linear:issue:issue-563",
+        source_locator="https://linear.app/masumi/issue/SOK-563/subscription-credits",
+        defer_cognify=True,
+    )
+    await kb.ingest(
+        "# Linear SOK-689: Mobile layout\n\nThis issue mentions SOK-563.",
+        source_key="linear:issue:issue-689",
+        source_locator="https://linear.app/masumi/issue/SOK-689/mobile-layout",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+    missing = await kb.search("SOK-999", top_k=5)
+
+    assert [result["document_id"] for result in results] == [exact.source_revision_id]
+    assert results[0]["title"] == "SOK-563: Subscription credits"
+    assert results[0]["_lifecycle"]["retrieval_mode"] == "lexical_fallback"
+    assert missing == []
+    assert fake.recall_calls == 0
+    assert fake.cognify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_validates_retained_locator_host_and_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    valid = await kb.ingest(
+        "SOK-563 decided to retain subscription credits.",
+        source_key="manual:linear-url",
+        source_locator="https://linear.app/masumi/issue/SOK-563?view=full",
+        defer_cognify=True,
+    )
+    await kb.ingest(
+        "SOK-563 appears in unrelated repository notes.",
+        source_key="manual:foreign-url",
+        source_locator="https://github.com/acme/repo/blob/abc/issue/SOK-563/notes",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+
+    assert [result["document_id"] for result in results] == [valid.source_revision_id]
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_is_not_capped_by_cross_references(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    for index in range(12):
+        await kb.ingest(
+            f"# Linear SOK-{700 + index}: Reference\n\n" + "SOK-563 " * 5,
+            tags=[f"linear:SOK-{700 + index}"],
+            source_key=f"linear:issue:cross-{index:02d}",
+            source_locator=(
+                f"https://linear.app/masumi/issue/SOK-{700 + index}/reference"
+            ),
+            defer_cognify=True,
+        )
+    exact = await kb.ingest(
+        "# Linear SOK-563: Subscription credits\n\nExact issue body.",
+        tags=["linear:SOK-563"],
+        source_key="linear:issue:target",
+        source_locator="https://linear.app/masumi/issue/SOK-563/subscription-credits",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+
+    assert [result["document_id"] for result in results] == [exact.source_revision_id]
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retained_lexical_hit_beats_unrelated_vector_page(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class NoisyRecallCognee(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.noise_document_id = ""
+            self.recall_calls = 0
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_calls += 1
+            assert self.noise_document_id in kwargs["document_ids"]
+            return [
+                {
+                    "id": "noise-chunk",
+                    "document_id": self.noise_document_id,
+                    "text": "unrelated dashboard note",
+                }
+            ]
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = NoisyRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    noise = await kb.ingest(
+        "unrelated dashboard note",
+        source_key="repo:noise/README.md",
+    )
+    await kb.wait_for_lifecycle_operation(noise.projection_job_id)
+    fake.noise_document_id = noise.source_revision_id
+    relevant = await kb.ingest(
+        "The repository exports OUTLOOK_SEND_EMAIL for mail delivery.",
+        source_key="repo:sokosumi/outlook.ts",
+        source_locator="https://github.com/masumi-network/sokosumi/blob/main/outlook.ts",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("OUTLOOK_SEND_EMAIL", top_k=5)
+
+    assert results[0]["document_id"] == relevant.source_revision_id
+    assert results[0]["_lifecycle"]["retrieval_mode"] == "lexical_fallback"
+    assert any(result.get("document_id") == noise.source_revision_id for result in results)
+    assert fake.recall_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2962,6 +3145,7 @@ async def test_feedback_falls_back_to_durable_write_when_session_cache_misses() 
     assert "wrong answer" in note["data"]
     assert "feedback" in note["tags"]
     assert "qa:qa-9" in note["tags"]
+    assert note["defer_cognify"] is True
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,6 @@ from kb.onboard import (
     claude_user_settings_path,
     detect_shell_rc,
     diagnose_mcp_config,
-    ensure_env_in_rc,
     ensure_token_in_rc,
     format_onboard_next_steps,
     git_root_or_cwd,
@@ -88,7 +87,6 @@ from kb.promotion_client import (
     list_pending,
     node_base_url,
     reject_pending,
-    run_promotion,
 )
 from kb.status import (
     MCP_STATE_MISSING,
@@ -626,12 +624,12 @@ async def _ingest(args: argparse.Namespace) -> int:
             # Capture-only default. "queued_not_confirmed" is the Node's honest
             # receipt: the note is stored durably and not yet searchable.
             job_id = result.get("projection_job_id")
-            track = f" — track: citadel operation {job_id}" if job_id else ""
+            track = f" Track with: citadel operation {job_id}" if job_id else ""
             if str(result.get("reason") or "") == "queued_not_confirmed":
                 print(
                     paint(
-                        f"  queued (not yet searchable) — the Node projects it "
-                        f"within minutes{track}",
+                        "  queued (not yet searchable). Scheduled projection owns this work."
+                        f"{track}",
                         "dim",
                         enable=color,
                     )
@@ -748,6 +746,9 @@ async def _document(args: argparse.Namespace) -> int:
         )
 
     if as_json:
+        from kb.search_format import compact_document_payload_for_agent
+
+        result = compact_document_payload_for_agent(result)
         _print_json(result)
         return _result_exit(result)
     document = result.get("document") if isinstance(result, dict) else None
@@ -773,6 +774,7 @@ async def _ingest_local(args: argparse.Namespace) -> int:
         dataset=args.dataset,
         tags=args.tag,
         session_id=args.session,
+        defer_cognify=True,
     )
     _print_json(result.__dict__)
     return _result_exit(result)
@@ -843,6 +845,11 @@ def _render_search(payload: dict[str, Any], query: str) -> None:
     if not isinstance(results, list):
         results = []
     if not results:
+        if payload.get("code") == "QUERY_CONTEXT_REQUIRED":
+            message = payload.get("message")
+            detail = message if isinstance(message, str) and message else "Name the search subject."
+            print(paint(f"QUERY_CONTEXT_REQUIRED: {detail}", "yellow", enable=color))
+            return
         print(paint(f'No results for "{query}".', "dim", enable=color))
         return
     print(f'{len(results)} result(s) for "{query}":\n')
@@ -1091,8 +1098,21 @@ async def _search(args: argparse.Namespace) -> int:
 @_needs_server
 async def _search_local(args: argparse.Namespace) -> int:
     from kb.agent_workflows import normalize_local_search_results
-    from kb.search_format import compact_search_payload_for_agent, shape_search_payload
+    from kb.search_format import (
+        compact_search_payload_for_agent,
+        search_query_clarification,
+        shape_search_payload,
+    )
     from kb.service import Citadel
+
+    clarification = search_query_clarification(args.query)
+    if clarification is not None:
+        shaped = shape_search_payload(
+            {"results": [], **clarification},
+            **_shape_kwargs(args),
+        )
+        _print_json(compact_search_payload_for_agent(shaped))
+        return 0
 
     kb = Citadel.from_env()
     top_k = getattr(args, "top_k", None) or 10
@@ -1259,32 +1279,41 @@ async def _feedback(args: argparse.Namespace) -> None:
 
 @_needs_server
 async def _improve(args: argparse.Namespace) -> None:
-    from kb.service import Citadel
-
-    kb = Citadel.from_env()
-    result = await kb.improve(dataset=args.dataset, session_ids=args.session_id)
-    _print_json(result)
-    return _result_exit(result)
+    _print_json(
+        {
+            "ok": False,
+            "reason": "llm_scheduled_only",
+            "message": "Cognee improvement runs only in the scheduled evolve job.",
+        }
+    )
+    return 2
 
 
 @_needs_server
 async def _cognify(args: argparse.Namespace) -> None:
-    from kb.service import Citadel
-
-    kb = Citadel.from_env()
-    result = await kb.cognify_dataset(
-        dataset=args.dataset,
-        verify=args.verify,
-        force=args.force,
+    _print_json(
+        {
+            "ok": False,
+            "reason": "llm_scheduled_only",
+            "message": "Cognee projection runs only in the scheduled evolve job.",
+        }
     )
-    _print_json(result)
-    return _result_exit(result)
+    return 2
 
 
 @_needs_server
 async def _reindex(args: argparse.Namespace) -> int:
     from kb.service import Citadel
 
+    if args.apply:
+        _print_json(
+            {
+                "ok": False,
+                "reason": "llm_scheduled_only",
+                "message": "Corpus repair projection must run as a scheduled operator job.",
+            }
+        )
+        return 2
     if args.force and not args.apply:
         raise ValueError("--force requires --apply")
     if args.recover and not args.apply:
@@ -1327,9 +1356,13 @@ async def _sync_github(args: argparse.Namespace) -> None:
         max_commits_per_repo=args.max_commits_per_repo,
         include_commits=not args.skip_commits,
         ingest_unchanged=not args.skip_unchanged,
-        run_improve=not args.skip_improve,
+        run_improve=False,
     )
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -1340,7 +1373,11 @@ async def _sync_repo_content(args: argparse.Namespace) -> None:
     from kb.service import Citadel
 
     syncer = RepoContentSyncer(Citadel.from_env())
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -1355,6 +1392,7 @@ async def _learn(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         post_to_chat=args.post_to_chat,
         include_digest_preview=not args.hide_digest_preview,
+        allow_llm=False,
     )
     _print_json(result)
     return _result_exit(result)
@@ -1709,28 +1747,16 @@ async def _promotion_reject(args: argparse.Namespace) -> int:
 @_needs_server
 async def _promotion_run(args: argparse.Namespace) -> int:
     as_json = args.json
-    dry_run = not args.execute
-    try:
-        result = run_promotion(
-            base_url=_promotion_base_url(args),
-            dataset=args.dataset,
-            dry_run=dry_run,
-            max_items=args.max_items,
-        )
-    except PromotionClientError as exc:
-        return _promotion_exit(exc, as_json=as_json)
+    result = {
+        "ok": False,
+        "reason": "llm_scheduled_only",
+        "message": "Promotion classification runs only in the scheduled evolve job.",
+    }
     if as_json:
         _print_json(result)
     else:
-        mode = "dry-run" if dry_run else "execute"
-        print(
-            f"Promotion {mode} on {result.get('dataset')}: "
-            f"candidates={result.get('candidates')} "
-            f"proposed={result.get('proposed')} "
-            f"promoted={result.get('promoted')} "
-            f"queued={result.get('queued')}"
-        )
-    return 0 if result.get("ok") else 1
+        print(f"citadel promotion: {result['message']}", file=sys.stderr)
+    return 2
 
 
 def _access_exit(exc: AccessClientError, *, as_json: bool) -> int:
@@ -2683,7 +2709,7 @@ async def _doctor(args: argparse.Namespace) -> int:
             "problem": f"data plane not ready ({corpus.detail}); Node and auth are healthy",
             "fix": (
                 "inspect the corpus probe in `citadel status --json`; "
-                "check the evolve scheduler / cognify; run `citadel cognify --verify`"
+                "check the scheduled evolve and projection jobs"
             ),
         })
 
@@ -3030,30 +3056,6 @@ async def _onboard(args: argparse.Namespace) -> int:
             steps.append((f"node url → {cfg_path}", node_url))
         except ValueError:
             pass
-
-    # Optionally collect an OpenRouter key so local `cognify`/`cognify --verify`
-    # and proactive-ingest work out of the box (#35). Interactive-only; written
-    # to the shell rc next to the seat token.
-    if interactive:
-        llm_key = _prompt_hidden(
-            "\nOpenRouter API key for local cognify — Enter to skip: "
-        )
-        if llm_key:
-            steps.append(
-                (
-                    f"OpenRouter key → {rc_path}",
-                    ensure_env_in_rc(
-                        rc_path,
-                        "OPENROUTER_API_KEY",
-                        llm_key,
-                        comment="OpenRouter key for Citadel local cognify (added by `citadel onboard`)",
-                    ),
-                )
-            )
-            # Only relevant once a key exists — noise for everyone who skipped.
-            print(
-                "  (local cognify also needs: pipx install 'citadel-archive[server]')"
-            )
 
     # Capture roots (unless --no-capture): the wizard asks about the repo
     # toplevel explicitly (declinable); if the config still ends up empty, it
@@ -4186,7 +4188,10 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--session", help="Session id the QA entry belongs to")
     feedback.set_defaults(handler=_feedback)
 
-    improve = subcommands.add_parser("improve", help="Run Cognee improvement")
+    improve = subcommands.add_parser(
+        "improve",
+        help="Show the scheduled-only Cognee improvement policy",
+    )
     improve.add_argument("--dataset", help="Dataset to improve")
     # Accept --session as an alias for parity with ingest/search/feedback.
     improve.add_argument("--session-id", "--session", action="append", dest="session_id",
@@ -4195,7 +4200,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cognify = subcommands.add_parser(
         "cognify",
-        help="Cognify already-added data in a dataset (recover uncognified data)",
+        help="Show the scheduled-only Cognee projection policy",
     )
     cognify.add_argument("--dataset")
     cognify.add_argument(
@@ -4255,7 +4260,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_repo_content = subcommands.add_parser(
         "sync-repo-content",
-        help="Fetch READMEs, skills, and docs from allowlisted repos and cognify them",
+        help="Fetch repository text and queue scheduled projection",
     )
     sync_repo_content.add_argument("--force", action="store_true")
     sync_repo_content.add_argument("--dry-run", action="store_true")
@@ -4263,7 +4268,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     learn = subcommands.add_parser(
         "learn",
-        help="Run the source learning agent across configured sources",
+        help="Run deterministic source sync without user-triggered LLM work",
     )
     learn.add_argument("--status", action="store_true")
     learn.add_argument("--force", action="store_true")

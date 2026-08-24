@@ -28,6 +28,7 @@ class IngestResult:
     source_revision_id: str | None = None
     projection_job_id: str | None = None
     projection_state: str | None = None
+    source_searchable: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -62,6 +62,8 @@ class FakeLearning:
                 "tier": kwargs.get("tier"),
                 "tags": kwargs.get("tags"),
                 "attestation": kwargs.get("attestation"),
+                "allow_llm": kwargs.get("allow_llm"),
+                "defer_cognify": kwargs.get("defer_cognify"),
             }
         )
         if self.central_reject_reason and dataset == CENTRAL:
@@ -802,3 +804,5 @@ async def test_approved_promotion_attests_the_approver(
     attestation = learning.central_writes[0]["attestation"]
     assert attestation["promoted_by"] == "admin-9"
     assert attestation["promoted_at"].endswith("+00:00")
+    assert learning.central_writes[0]["allow_llm"] is False
+    assert learning.central_writes[0]["defer_cognify"] is True

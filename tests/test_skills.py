@@ -25,6 +25,7 @@ def test_list_skills() -> None:
         "debug",
         "onboard",
         "proactive-ingest",
+        "search",
         "vault",
     }
     connect = next(item for item in payload["skills"] if item["slug"] == "connect")
@@ -255,7 +256,7 @@ def test_refresh_skill_catalog_tracks_changes(tmp_path) -> None:
 
     first = refresh_skill_catalog(state)
     assert first["ok"] is True
-    assert first["skills"] == 8
+    assert first["skills"] == 9
     assert first["added"] == [
         "boundary",
         "citadel",
@@ -264,6 +265,7 @@ def test_refresh_skill_catalog_tracks_changes(tmp_path) -> None:
         "debug",
         "onboard",
         "proactive-ingest",
+        "search",
         "vault",
     ]
     assert first["changed"] == []
@@ -299,5 +301,6 @@ def test_refresh_skill_catalog_recovers_from_corrupt_state(tmp_path) -> None:
         "debug",
         "onboard",
         "proactive-ingest",
+        "search",
         "vault",
     ]

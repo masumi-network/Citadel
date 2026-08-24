@@ -66,6 +66,7 @@ async def test_cognee_public_client_runs_migrations_once(monkeypatch: Any) -> No
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     await client.remember("note", dataset_name="notes")
     await client.recall("note", dataset="notes", allow_generative=True)
@@ -96,6 +97,7 @@ async def test_cognee_public_client_fails_closed_when_migrations_fail(
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     async def create_database() -> None:
         calls.append("create")
@@ -124,9 +126,11 @@ async def test_cognee_public_client_rejects_reported_migration_failures(
         "cognee",
         SimpleNamespace(run_migrations=run_migrations, add=add),
     )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     with pytest.raises(RuntimeError, match="migrations failed for 1 database"):
-        await CogneePublicClient().remember("note", dataset_name="notes")
+        await client.remember("note", dataset_name="notes")
 
 
 @pytest.mark.asyncio
@@ -153,6 +157,7 @@ async def test_cognee_public_client_does_not_pass_external_metadata_keyword(
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     await client.remember("note", dataset_name="notes", tags=("github", "daily-sync"))
 
@@ -198,8 +203,10 @@ async def test_remember_passes_explicit_lifecycle_data_id_to_cognee(
         "cognee",
         SimpleNamespace(run_migrations=run_migrations, add=add),
     )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
-    await CogneePublicClient().remember(
+    await client.remember(
         "retained lifecycle source",
         dataset_name="central",
         data_id=data_id,
@@ -2112,6 +2119,7 @@ async def test_failed_background_cognify_retries_without_new_ingest(
         SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
     client.schedule_cognify(["central"])
 
     await asyncio.wait_for(retried.wait(), timeout=3)
@@ -2257,6 +2265,7 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
     )
     monkeypatch.setattr(queue, "renew", fail_renewal)
     client = CogneePublicClient(retry_queue=queue)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
     client.schedule_cognify(["central"])
     task = client._cognify_queue_task
     assert task is not None

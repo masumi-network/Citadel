@@ -380,10 +380,15 @@ async def test_all_text_sync_fails_closed_when_one_repository_errors(tmp_path: P
     )
 
     result = await syncer.run()
+    status = await syncer.status()
 
     assert result["repos_errored"] == 1
     assert result["content_scan_complete"] is False
     assert result["ok"] is False
+    assert result["reason"] == "repository_content_scan_incomplete"
+    assert status["ok"] is False
+    assert status["last_run_ok"] is False
+    assert status["last_run_reason"] == "repository_content_scan_incomplete"
 
 
 @pytest.mark.asyncio
@@ -722,12 +727,16 @@ async def test_repo_content_syncer_marks_failure_when_all_repos_error(tmp_path: 
     )
 
     result = await syncer.run()
+    status = await syncer.status()
 
     assert result["ok"] is False
+    assert result["reason"] == "all_repository_scans_failed"
     assert result["authenticated"] is False
     assert result["repos_errored"] == 2
     assert result["files_ingested"] == 0
     assert all(repo["errors"] for repo in result["repositories"])
+    assert status["ok"] is False
+    assert status["last_run_reason"] == "all_repository_scans_failed"
 
 
 class FakeAutoJoinClient(RepoContentGitHubClient):
@@ -860,10 +869,14 @@ async def test_all_org_sync_fails_when_repository_discovery_is_empty(tmp_path: P
     )
 
     result = await syncer.run()
+    status = await syncer.status()
 
     assert result["ok"] is False
     assert result["reason"] == "repo_discovery_empty"
     assert result["repo_discovery_complete"] is False
+    assert status["ok"] is False
+    assert status["last_run_ok"] is False
+    assert status["last_run_reason"] == "repo_discovery_empty"
 
 
 def test_all_org_mode_does_not_fall_back_to_explicit_repos() -> None:
@@ -1115,6 +1128,37 @@ async def test_improve_runs_once_for_the_whole_sync_not_once_per_file(
     assert learning.improve_calls[0]["dataset"] == "masumi-network"
     assert learning.improve_calls[0]["session_ids"] is None
     assert result["improved"] is True
+
+
+@pytest.mark.asyncio
+async def test_user_repo_sync_disables_all_llm_work(tmp_path: Path) -> None:
+    config = CitadelConfig(
+        repo_content_sync_enabled=True,
+        repo_content_sync_dataset="masumi-network",
+        repo_content_sync_session="masumi-repo-content",
+        repo_content_sync_state_path=str(tmp_path / "state.json"),
+        repo_content_sync_repos=("sokosumi-cli",),
+        repo_content_sync_root_paths=("README.md",),
+        repo_content_sync_tree_prefixes=("skills/",),
+        repo_content_sync_tree_extensions=(".md",),
+        repo_content_sync_max_files_per_repo=10,
+        repo_content_sync_run_improve=True,
+    )
+    learning = FakeLearningProcess()
+    syncer = RepoContentSyncer(
+        FakeCitadel(config),
+        client=FakeRepoContentClient(),
+        state_path=config.repo_content_sync_state_path,
+        learning=learning,  # type: ignore[arg-type]
+    )
+
+    result = await syncer.run(allow_llm=False)
+
+    assert result["files_ingested"] == 2
+    assert all(call["allow_llm"] is False for call in learning.calls)
+    assert all(call["defer_cognify"] is True for call in learning.calls)
+    assert learning.improve_calls == []
+    assert result["improved"] is False
 
 
 @pytest.mark.asyncio
@@ -1957,7 +2001,7 @@ async def test_content_the_ingest_can_never_accept_is_not_resubmitted_every_sync
         learning=learning,  # type: ignore[arg-type]
     )
 
-    await syncer.run()
+    first = await syncer.run()
     assert len(learning.calls) == 2
 
     second = await syncer.run()
@@ -1972,6 +2016,12 @@ async def test_content_the_ingest_can_never_accept_is_not_resubmitted_every_sync
     assert entry["rejected_reason"] == "unchunkable_content"
     assert entry["sha"] and entry["content_hash"]
     assert not entry.get("cognee_data_ids"), "a refused file must not look ingested"
+    assert first["ok"] is False
+    assert first["reason"] == "repository_content_retention_incomplete"
+    assert first["retention_complete"] is False
+    assert first["files_rejected"] == 2
+    assert second["ok"] is False
+    assert second["retention_complete"] is False
 
 
 @pytest.mark.asyncio

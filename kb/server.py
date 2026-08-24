@@ -56,7 +56,7 @@ from kb.config import CitadelConfig
 from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
 from kb.google_chat import GoogleChatConfigError, GoogleChatDelivery
-from kb.improvement_policy import ImprovementScopeError, central_improvement_dataset
+from kb.improvement_policy import central_improvement_dataset
 from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
@@ -65,7 +65,7 @@ from kb.lifecycle import (
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
 )
-from kb.session_trace import enrich_shared_trace, force_shared_trace_author_seat
+from kb.session_trace import force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
 from kb.mcp_server import (
@@ -107,6 +107,8 @@ from kb.search_format import (
     lexical_relevance_summary,
     parse_content_header,
     query_terms,
+    search_query_clarification,
+    search_query_requires_context,
     shape_public_search_hit,
     source_key_descriptor,
     source_locator_from_result,
@@ -118,7 +120,6 @@ from kb.security_scan import (
     redact_secrets,
     scan_text_entries,
 )
-from kb.self_improve import SelfImprovement
 from kb.service import Citadel
 from kb.skills import skill_catalog, skill_integrity, skill_path
 from kb.source_search import GITHUB_DOC_ID_PREFIX, github_section_document
@@ -172,7 +173,7 @@ def _record_canary_verdict(
     projection_receipt_count: Any = None,
     error: str | None = None,
 ) -> None:
-    """Stamp the /readyz canary. Evolve and POST /api/cognify/run share this."""
+    """Stamp the /readyz canary after scheduled evolve verification."""
     global _LAST_CANARY
     payload: dict[str, Any] = {
         "ok": bool(ok),
@@ -375,22 +376,19 @@ def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> 
 
 
 async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
-    """Run the evolve cycle every ``interval_seconds``: heavy stages in a
-    subprocess, then cognify in-loop.
+    """Run every evolve stage and Cognify on the web server's event loop.
 
-    Two cognee/Kuzu constraints force this split:
-    - cognee binds its async resources to the loop that created them, so cognify
-      must run in the server's long-lived loop — a fresh ``asyncio.run()`` raises
+    Two Cognee and Kuzu constraints require one process and one loop:
+    - cognee binds its async resources to the loop that created them. Cognify
+      must run in the server's long-lived loop. A fresh ``asyncio.run()`` raises
       "got Future attached to a different loop".
     - Kuzu (the graph store) is a single-writer embedded DB, so only one process
-      may hold it. The subprocess opens Kuzu during its add stages and releases it
-      when it EXITS; only then can the web process cognify as the sole writer.
+      may hold it. A second sync or Cognify process would contend with the web
+      process for that lock.
 
-    Phase 1 runs github_sync → repo_content_sync → self_improve → promotion as a
-    subprocess (``CITADEL_EVOLVE_COGNIFY_ENABLED=false``) that exits. Phase 2
-    awaits cognify in-loop on the web's own Citadel. Serial and fail-soft; the
-    first pass waits one full interval so a redeploy never triggers a heavy cycle
-    on boot.
+    Phase 1 runs source sync, self-improvement, promotion, and Linear sync with
+    inline Cognify suppressed. Phase 2 runs one Cognify pass. The first pass
+    waits for the remaining interval so a redeploy does not start heavy work.
     """
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
@@ -2251,6 +2249,8 @@ async def search_across_datasets(
     top_k: int,
     allow_vector_recall: bool = True,
 ) -> list[tuple[str, Any]]:
+    if search_query_requires_context(query):
+        return []
     # Query every dataset before merging so a result-rich primary node can never
     # short-circuit (and thereby silently drop) Central. The primary still wins
     # dedup. Final ranking, filtering, and dataset reservation happen after public
@@ -3044,12 +3044,13 @@ def with_result_metadata(
         drilldown_available = True
     else:
         drilldown_available = bool(drilldown_predicate(drilldown_id))
+    provenance = result_provenance(normalized)
     metadata: dict[str, Any] = {
         "rank": index + 1,
         "dataset": dataset,
         "result_id": result_id,
         "content_sha256": result_content_sha256(normalized),
-        "provenance": result_provenance(normalized),
+        "provenance": provenance,
         "retrieval": {
             "untrusted_context": True,
             "citation_required": True,
@@ -3057,7 +3058,9 @@ def with_result_metadata(
         },
     }
     references = result_references(normalized)
-    metadata["retrieval"]["citations_available"] = bool(references)
+    metadata["retrieval"]["citations_available"] = bool(
+        references or provenance.get("source_url") or drilldown_available
+    )
     if references:
         metadata["references"] = references
     if isinstance(lifecycle, dict):
@@ -3504,7 +3507,7 @@ async def next_theme_js() -> FileResponse:
 #
 # Registered last, because `{page}` would otherwise swallow /next/app: FastAPI
 # matches routes in declaration order, and a path parameter matches anything.
-WEBUI_PAGES = frozenset({"info", "use-cases", "contact", "login"})
+WEBUI_PAGES = frozenset({"info", "use-cases", "contact", "login", "presentation"})
 
 
 @app.get("/next/{page}", include_in_schema=False)
@@ -4893,9 +4896,27 @@ def _linear_document_count(status: Mapping[str, Any]) -> int:
 def _linear_source_status(status: Mapping[str, Any]) -> str:
     if status.get("state_error") or status.get("last_error"):
         return "error"
-    if status.get("context_error"):
+    if (
+        status.get("last_run_ok") is False
+        or status.get("listing_complete") is False
+        or status.get("context_listing_complete") is False
+        or status.get("context_error")
+        or status.get("auto_map_error")
+    ):
         return "degraded"
     return "tracked" if status.get("last_synced_at") else "ready"
+
+
+def _repo_content_source_status(status: Mapping[str, Any]) -> str:
+    if status.get("state_error"):
+        return "error"
+    if (
+        status.get("last_run_ok") is False
+        or status.get("content_scan_complete") is False
+        or int(status.get("repos_errored") or 0) > 0
+    ):
+        return "degraded"
+    return "tracked" if status.get("last_checked_at") else "ready"
 
 
 @app.get("/api/state")
@@ -4934,7 +4955,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
                 "name": rc.get("org"),
                 "type": "repo_content",
                 "documents": rc.get("tracked_files", 0),
-                "status": "tracked" if rc.get("last_checked_at") else "ready",
+                "status": _repo_content_source_status(rc),
                 "last_synced_at": rc.get("last_checked_at"),
             }
         )
@@ -5908,9 +5929,7 @@ async def sources(request: Request, type: str | None = None) -> Any:
                 "id": "github-repo-content",
                 "source_type": "github_repo_content",
                 "name": repo_content_status.get("org"),
-                "status": "error"
-                if repo_content_status.get("state_error")
-                else ("tracked" if repo_content_status.get("last_checked_at") else "ready"),
+                "status": _repo_content_source_status(repo_content_status),
                 "last_checked_at": repo_content_status.get("last_checked_at"),
                 "documents": repo_content_status.get("tracked_files", 0),
                 "open_conflicts": 0,
@@ -5972,11 +5991,18 @@ async def run_github_sync(body: GitHubSyncBody, request: Request) -> Any:
     citadel = get_citadel()
     mesh_state = get_mesh()
     try:
-        result = await get_github_syncer().run(force=body.force)
+        result = await get_github_syncer().run(
+            force=body.force,
+            allow_llm=False,
+        )
     except Exception as exc:  # pragma: no cover - depends on GitHub and runtime Cognee config.
         logger.error("GitHub sync run failed: %s", exc.__class__.__name__)
         await mesh_state.record_error(citadel.config, operation="github_sync", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result.get("ok") is not True:
+        reason = str(result.get("reason") or "GitHub sync unavailable")
+        await mesh_state.record_error(citadel.config, operation="github_sync", error=reason)
+        raise HTTPException(status_code=503, detail=reason)
     await mesh_state.record_github_sync(citadel.config, result)
     return jsonable_encoder(result)
 
@@ -6018,7 +6044,7 @@ async def _run_webhook_reingest(syncer: GitHubOrgSyncer) -> None:
     seconds; the full sync is ~26min) and this runs detached. Never raises.
     """
     try:
-        await syncer.run(force=True)
+        await syncer.run(force=True, allow_llm=False)
     except Exception as exc:  # pragma: no cover - depends on GitHub + Cognee runtime.
         logger.error(
             "GitHub webhook re-ingest failed: %s: %s",
@@ -6114,7 +6140,10 @@ async def run_linear_sync(body: LinearSyncBody, request: Request) -> Any:
     citadel = get_citadel()
     mesh_state = get_mesh()
     try:
-        result = await get_linear_syncer().run(force=body.force)
+        result = await get_linear_syncer().run(
+            force=body.force,
+            allow_llm=False,
+        )
     except Exception as exc:  # pragma: no cover - depends on Linear API and runtime Cognee config.
         logger.error("Linear sync run failed: %s", exc.__class__.__name__)
         await mesh_state.record_error(citadel.config, operation="linear_sync", error=str(exc))
@@ -6130,7 +6159,11 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
     citadel = get_citadel()
     mesh_state = get_mesh()
     try:
-        result = await get_repo_content_syncer().run(force=body.force, dry_run=body.dry_run)
+        result = await get_repo_content_syncer().run(
+            force=body.force,
+            dry_run=body.dry_run,
+            allow_llm=False,
+        )
     except Exception as exc:  # pragma: no cover - depends on GitHub and runtime Cognee config.
         logger.error("Repo content sync run failed: %s", exc.__class__.__name__)
         await mesh_state.record_error(
@@ -6149,37 +6182,48 @@ async def run_repo_content_sync(body: RepoContentSyncBody, request: Request) -> 
             },
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result_ok = result.get("ok") is True
     # ``skipped`` means another pass held the state file and this call did no
     # work. Recording it would stamp the source "synced" with a null
     # checked_at and null counts, which is the bookkeeping-success failure
     # mode, not a sync.
-    if not body.dry_run and result.get("enabled") is not False and not result.get("skipped"):
+    if (
+        result_ok
+        and not body.dry_run
+        and result.get("enabled") is not False
+        and not result.get("skipped")
+    ):
         await mesh_state.record_repo_content_sync(citadel.config, result)
+    detail = {
+        "force": body.force,
+        "dry_run": body.dry_run,
+        "ok": result_ok,
+        "reason": result.get("reason"),
+        "files_ingested": result.get("files_ingested"),
+        "files_skipped": result.get("files_skipped"),
+        "improved": result.get("improved"),
+    }
     get_access_store().record_event(
         action="repo_content_sync.run",
         actor=actor,
-        success=True,
-        detail={
-            "force": body.force,
-            "dry_run": body.dry_run,
-            "files_ingested": result.get("files_ingested"),
-            "files_skipped": result.get("files_skipped"),
-            "improved": result.get("improved"),
-        },
+        success=result_ok,
+        detail=detail,
     )
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=citadel.config.repo_content_sync_dataset,
-        detail={
-            "operation": "repo_content_sync.run",
-            "force": body.force,
-            "dry_run": body.dry_run,
-            "files_ingested": result.get("files_ingested"),
-            "files_skipped": result.get("files_skipped"),
-        },
+        detail={"operation": "repo_content_sync.run", **detail},
     )
+    if not result_ok:
+        reason = str(result.get("reason") or "Repository content sync unavailable")
+        await mesh_state.record_error(
+            citadel.config,
+            operation="repo_content_sync",
+            error=reason,
+        )
+        raise HTTPException(status_code=503, detail=reason)
     return jsonable_encoder(result)
 
 
@@ -6350,6 +6394,7 @@ async def push_obsidian_sync(body: ObsidianPushBody, request: Request) -> Any:
                 capture_actor_id=actor.actor_id,
                 capture_run_id=push_session_id,
                 detect_conflicts=False,
+                defer_cognify=True,
             )
         except SecretContentError as exc:
             get_access_store().record_event(
@@ -6670,14 +6715,8 @@ async def promotion_status(request: Request) -> Any:
 
 @app.post("/api/promote/run")
 async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
-    # A seat previewing its own promotable candidates is the intended flow and
-    # stays at writer (can_run_promotion below also refuses another seat's
-    # dataset). But dry_run comes from the request body, and with it false this
-    # same call writes durably into the shared Central dataset under a
-    # synthetic admin identity, with no further approval on the auto-promote
-    # path. A caller may not grant itself that by flipping a flag, so the write
-    # half now requires what GET /api/promote already requires. The scheduled
-    # promotion path is unaffected.
+    # Promotion classification uses an LLM. User calls may validate access, but
+    # only the scheduled evolution path may run the engine.
     actor = require_access(request, "writer", "kb:ingest")
     if not body.dry_run:
         actor = require_access(request, "admin", "sources:sync")
@@ -6691,55 +6730,19 @@ async def run_promotion(body: PromoteRunBody, request: Request) -> Any:
             status_code=403,
             detail="Not allowed to run promotion for this seat dataset.",
         )
-    try:
-        result = await get_promotion_engine().run(
-            body.dataset,
-            dry_run=body.dry_run,
-            max_items=body.max_items,
-            actor=actor,
-        )
-    except SecretContentError as exc:
-        get_access_store().record_event(
-            action="promotion.run",
-            actor=actor,
-            success=False,
-            dataset=body.dataset,
-            detail={
-                "dry_run": body.dry_run,
-                "blocked": "secret_content",
-                "highest_severity": exc.highest_severity,
-            },
-        )
-        raise HTTPException(status_code=422, detail=exc.public_message) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - depends on Cognee runtime.
-        logger.error("Promotion run failed: %s", exc.__class__.__name__)
-        get_access_store().record_event(
-            action="promotion.run",
-            actor=actor,
-            success=False,
-            dataset=body.dataset,
-            detail={"dry_run": body.dry_run, "error_type": exc.__class__.__name__},
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    detail = {
+        "code": "LLM_SCHEDULED_ONLY",
+        "reason": "llm_scheduled_only",
+        "message": "Promotion runs only during scheduled self-evolution.",
+    }
     get_access_store().record_event(
         action="promotion.run",
         actor=actor,
-        success=True,
+        success=False,
         dataset=body.dataset,
-        detail={
-            "dry_run": body.dry_run,
-            "enabled": result.get("enabled"),
-            "candidates": result.get("candidates"),
-            "proposed": result.get("proposed"),
-            "promoted": result.get("promoted"),
-            "pending_approval": result.get("pending_approval"),
-            "queued": result.get("queued"),
-            "max_items": result.get("max_items"),
-        },
+        detail={"dry_run": body.dry_run, **detail},
     )
-    return jsonable_encoder(result)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 @app.get("/api/promotion/pending")
@@ -6840,6 +6843,7 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             dry_run=body.dry_run,
             post_to_chat=body.post_to_chat,
             include_digest_preview=body.include_digest_preview,
+            allow_llm=False,
         )
     except Exception as exc:  # pragma: no cover - depends on external sources and Cognee config.
         logger.error("Learning agent run failed: %s", exc.__class__.__name__)
@@ -6870,17 +6874,37 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    github_result = result.get("sources", {}).get("github")
-    if isinstance(github_result, dict):
+    sources = result.get("sources") if isinstance(result.get("sources"), dict) else {}
+    github_result = sources.get("github")
+    if (
+        isinstance(github_result, dict)
+        and github_result.get("ok") is True
+        and not github_result.get("skipped")
+        and not body.dry_run
+    ):
         await mesh_state.record_github_sync(citadel.config, github_result)
-    repo_content_result = result.get("sources", {}).get("repo_content")
+    elif isinstance(github_result, dict) and not body.dry_run:
+        reason = str(github_result.get("reason") or "GitHub sync unavailable")
+        await mesh_state.record_error(citadel.config, operation="github_sync", error=reason)
+    repo_content_result = sources.get("repo_content")
     if (
         isinstance(repo_content_result, dict)
+        and repo_content_result.get("ok") is True
         and repo_content_result.get("enabled") is not False
         and not repo_content_result.get("skipped")
         and not body.dry_run
     ):
         await mesh_state.record_repo_content_sync(citadel.config, repo_content_result)
+    elif (
+        isinstance(repo_content_result, dict)
+        and repo_content_result.get("enabled") is not False
+        and not repo_content_result.get("skipped")
+        and not body.dry_run
+    ):
+        reason = str(
+            repo_content_result.get("reason") or "Repository content sync unavailable"
+        )
+        await mesh_state.record_error(citadel.config, operation="repo_content_sync", error=reason)
     # The response body already carries WHY the gateway did or did not send
     # (`notifications.google_chat.reason`: "google_chat_disabled",
     # "no_meaningful_updates", "dry_run", "preview_only", or None on an actual
@@ -6888,10 +6912,11 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     # legitimate states into one boolean in the one place — the audit trail —
     # that survives after the response is gone (#149, #151).
     google_chat_notification = (result.get("notifications") or {}).get("google_chat") or {}
+    result_ok = result.get("ok") is True
     get_access_store().record_event(
         action="learning_agent.run",
         actor=actor,
-        success=True,
+        success=result_ok,
         detail={
             "force": body.force,
             "dry_run": body.dry_run,
@@ -6909,7 +6934,7 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
+        success=result_ok,
         dataset=citadel.config.github_sync_dataset,
         detail={
             "operation": "learning_agent.run",
@@ -6923,6 +6948,14 @@ async def run_learning_agent(body: LearningAgentRunBody, request: Request) -> An
             "google_chat_reason": google_chat_notification.get("reason"),
         },
     )
+    if not result_ok:
+        source_reasons = [
+            str(source.get("reason"))
+            for source in (github_result, repo_content_result)
+            if isinstance(source, dict) and source.get("ok") is not True and source.get("reason")
+        ]
+        reason = "; ".join(source_reasons) or "Learning agent source sync failed"
+        raise HTTPException(status_code=503, detail=reason)
     return jsonable_encoder(result)
 
 
@@ -6931,87 +6964,50 @@ async def run_cognify(body: CognifyRunBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
     citadel = get_citadel()
     dataset = body.dataset or citadel.config.default_dataset
-    try:
-        result = await citadel.cognify_dataset(dataset=dataset, verify=body.verify, force=body.force)
-    except Exception as exc:
-        logger.error("Cognify run failed: %s", exc.__class__.__name__)
-        if body.verify:
-            _record_canary_verdict(ok=False, error=exc.__class__.__name__)
-        get_access_store().record_event(
-            action="cognify.run",
-            actor=actor,
-            success=False,
-            dataset=dataset,
-            detail={"verify": body.verify, "force": body.force, "error": str(exc)},
-        )
-        record_mcp_audit(
-            request,
-            actor=actor,
-            success=False,
-            dataset=dataset,
-            detail={
-                "operation": "cognify.run",
-                "verify": body.verify,
-                "force": body.force,
-                "error_type": exc.__class__.__name__,
-            },
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    verification = result.get("verification") or {}
-    result_ok = result.get("ok", True) is True
-    if body.verify:
-        _record_canary_verdict(
-            ok=result_ok,
-            search_hit=verification.get("search_hit"),
-            graph_grew=result.get("graph_grew"),
-            marker=verification.get("marker"),
-            projection_chain_ok=verification.get("projection_chain_ok"),
-            projection_receipt_count=len(verification.get("projection_receipts") or []),
-        )
+    detail = {
+        "code": "LLM_SCHEDULED_ONLY",
+        "reason": "llm_scheduled_only",
+        "message": "Cognify runs only during scheduled self-evolution.",
+    }
     get_access_store().record_event(
         action="cognify.run",
         actor=actor,
-        success=result_ok,
+        success=False,
         dataset=dataset,
-        detail={
-            "verify": body.verify,
-            "force": body.force,
-            "ok": result_ok,
-            "graph_grew": result.get("graph_grew"),
-            "graph_before": result.get("graph_before"),
-            "graph_after": result.get("graph_after"),
-            "verification_ok": verification.get("ok") if body.verify else None,
-        },
+        detail={"verify": body.verify, "force": body.force, **detail},
     )
     record_mcp_audit(
         request,
         actor=actor,
-        success=result_ok,
+        success=False,
         dataset=dataset,
-        detail={
-            "operation": "cognify.run",
-            "verify": body.verify,
-            "force": body.force,
-            "ok": result_ok,
-            "graph_grew": result.get("graph_grew"),
-            "verification_ok": verification.get("ok") if body.verify else None,
-        },
+        detail={"operation": "cognify.run", "verify": body.verify, "force": body.force, **detail},
     )
-    if not result_ok:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "Cognify verification failed.",
-                "result": jsonable_encoder(result),
-            },
-        )
-    return jsonable_encoder(result)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 @app.post("/api/corpus/reconcile")
 async def reconcile_corpus(body: CorpusReconcileBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
+    if body.apply or body.recover:
+        detail = {
+            "code": "LLM_SCHEDULED_ONLY",
+            "reason": "llm_scheduled_only",
+            "message": "Corpus repair runs only during scheduled self-evolution.",
+        }
+        get_access_store().record_event(
+            action="corpus.reconcile",
+            actor=actor,
+            success=False,
+            dataset=body.dataset,
+            detail={
+                "apply": body.apply,
+                "recover": body.recover,
+                "oversized": body.oversized,
+                **detail,
+            },
+        )
+        raise HTTPException(status_code=409, detail=detail)
     citadel = get_citadel()
     try:
         if body.recover and body.oversized:
@@ -7708,8 +7704,6 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             )
             raise HTTPException(status_code=422, detail=exc.public_message) from exc
     data = force_shared_trace_author_seat(body.data, actor.seat_slug)
-    data = enrich_shared_trace(data, has_tool_errors=body.has_tool_errors)
-    data = force_shared_trace_author_seat(data, actor.seat_slug)
     tags = share_session_tags_from_body(actor.seat_slug, body)
     session_id = resolve_session_id(actor, None)
     try:
@@ -7777,6 +7771,11 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "source_revision_id": item.ingest.source_revision_id,
             "projection_job_id": item.ingest.projection_job_id,
             "projection_state": item.ingest.projection_state,
+            **(
+                {"source_searchable": item.ingest.source_searchable}
+                if item.ingest.source_searchable is not None
+                else {}
+            ),
         }
         for item in all_outcomes
     ]
@@ -7814,23 +7813,18 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             },
         )
 
-    cognify_datasets = [
+    accepted_datasets = [
         target.dataset
         for target, item in zip(write_targets, all_outcomes, strict=True)
         if item.ingest.accepted
     ]
-    cognify_queued = False
     lifecycle_queued = bool(
-        cognify_datasets and getattr(citadel, "lifecycle_store", None) is not None
+        accepted_datasets and getattr(citadel, "lifecycle_store", None) is not None
     )
-    if cognify_datasets and not lifecycle_queued:
-        cognify_queued = citadel.cognee.schedule_cognify(
-            list(dict.fromkeys(cognify_datasets))
-        )
     if lifecycle_queued:
         cognify_state = "queued_not_confirmed"
     else:
-        cognify_state = "deferred" if cognify_queued else "not_scheduled"
+        cognify_state = "not_scheduled"
     accepted = all(item.ingest.accepted for item in all_outcomes)
 
     record_mcp_audit(
@@ -7869,8 +7863,6 @@ async def share_session(body: ShareSessionBody, request: Request) -> Any:
             "message": (
                 "Shared Session Trace accepted; lifecycle projection queued."
                 if lifecycle_queued
-                else "Shared Session Trace accepted; searchable after coalesced cognify."
-                if cognify_queued
                 else "Shared Session Trace accepted, but indexing was not scheduled."
             ),
         }
@@ -7979,6 +7971,7 @@ async def contribute(body: ContributeBody, request: Request) -> Any:
             media_type="text/markdown",
             capture_actor_id=actor.actor_id,
             run_improve=citadel.config.contribute_run_improve,
+            defer_cognify=True,
         )
     except SecretContentError as exc:
         get_access_store().record_event(
@@ -8199,44 +8192,26 @@ async def knowledge(
 
 @app.post("/api/learning-agent/optimize")
 async def optimize_learning_agent(body: OptimizeBody, request: Request) -> Any:
-    """Bounded self-improvement pass. Admin only; never deletes knowledge."""
+    """Reject user-triggered LLM optimization. Scheduled evolution owns it."""
     actor = require_access(request, "admin", "sources:sync")
-    citadel = get_citadel()
-    mesh_state = get_mesh()
-    optimizer = SelfImprovement(
-        citadel,
-        mesh=mesh_state,
-        learning=get_learning_process(),
-        access_store=get_access_store(),
+    detail = {
+        "code": "LLM_SCHEDULED_ONLY",
+        "reason": "llm_scheduled_only",
+        "message": "Optimization runs only during scheduled self-evolution.",
+    }
+    get_access_store().record_event(
+        action="learning_agent.optimize",
+        actor=actor,
+        success=False,
+        detail={"dry_run": body.dry_run, "max_items": body.max_items, **detail},
     )
-    try:
-        result = await optimizer.run(
-            dry_run=body.dry_run,
-            max_items=body.max_items,
-            actor=actor,
-        )
-    except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="self_improve", error=str(exc))
-        get_access_store().record_event(
-            action="learning_agent.optimize",
-            actor=actor,
-            success=False,
-            detail={"dry_run": body.dry_run, "error_type": exc.__class__.__name__},
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
     record_mcp_audit(
         request,
         actor=actor,
-        success=True,
-        dataset=result.get("dataset"),
-        detail={
-            "operation": "learning_agent.optimize",
-            "reviewed": result.get("reviewed"),
-            "optimized": result.get("optimized"),
-            "dry_run": body.dry_run,
-        },
+        success=False,
+        detail={"operation": "learning_agent.optimize", **detail},
     )
-    return jsonable_encoder(result)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 @app.post("/search")
@@ -8248,6 +8223,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     search_sessions = resolve_search_sessions(actor, body.session_id, search_datasets)
     filter_kw = body.filter_kwargs()
     filters_active = any(filter_kw.values())
+    clarification = search_query_clarification(body.query)
+    clarification_required = clarification is not None
     # Filters run AFTER retrieval, so on a fixed candidate page they can only
     # shrink it: top_k=10 with a repo filter used to return 4 hits. Over-fetch
     # candidates when filters are active and trim back to top_k after
@@ -8467,6 +8444,14 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
                 retrieval = envelope.get("retrieval")
                 if isinstance(retrieval, dict):
                     retrieval["document_drilldown_available"] = True
+                    retrieval["citations_available"] = True
+                item["document_drilldown_available"] = True
+                item["document_endpoint"] = document_endpoint
+                citation = item.get("citation")
+                if not isinstance(citation, dict):
+                    citation = {}
+                    item["citation"] = citation
+                citation["document_endpoint"] = document_endpoint
         drilldown_ms = (time.perf_counter() - drilldown_started) * 1000.0
 
     # Measured AFTER the drill-down pass: taking it at the _SearchSlot exit made
@@ -8555,6 +8540,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     payload: dict[str, Any] = {
         "results": normalized,
         "dataset": primary_dataset,
+        "took_ms": round(latency_ms, 1),
         "sections": split_search_sections(
             normalized,
             central_dataset=central_dataset(citadel.config),
@@ -8564,6 +8550,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         "spec_mode": is_spec_mode_query(body.query) and not docs_mode,
         "relevance": relevance_summary,
     }
+    if clarification is not None:
+        payload.update(clarification)
     if degraded:
         payload["degraded"] = True
     if cleaned_mode:
@@ -8577,7 +8565,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
-    if not normalized and body.dataset is None and (
+    if not clarification_required and not normalized and body.dataset is None and (
         not filters_active or candidates_fetched == 0
     ):
         # With filters active this fires only when retrieval itself came back
@@ -8604,7 +8592,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             "candidates; the page is short because post-retrieval filters excluded "
             "the rest, not because the search found nothing else."
         )
-    if relevance_summary["no_lexical_match"]:
+    if relevance_summary["no_lexical_match"] and not clarification_required:
         warnings.append(NO_LEXICAL_MATCH_WARNING)
     authority = token_asset_authority_warning(body.query)
     if authority:
@@ -8695,70 +8683,34 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
 @app.post("/improve")
 async def improve(body: ImproveBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
-    return await run_improve(body, request=request, actor=actor)
+    return reject_user_improve(body, request=request, actor=actor)
 
 
 @app.post("/api/self-upgrade")
 async def self_upgrade(body: ImproveBody, request: Request) -> Any:
     actor = require_access(request, "admin", "sources:sync")
-    return await run_improve(body, request=request, actor=actor)
+    return reject_user_improve(body, request=request, actor=actor)
 
 
-async def run_improve(
+def reject_user_improve(
     body: ImproveBody,
     *,
     request: Request | None = None,
     actor: AccessIdentity | None = None,
 ) -> Any:
     citadel = get_citadel()
-    mesh_state = get_mesh()
     dataset = body.dataset or citadel.config.default_dataset
-    try:
-        result = await citadel.improve(
-            dataset=body.dataset,
-            session_ids=body.session_ids,
-        )
-    except ImprovementScopeError as exc:
-        await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
-        if request:
-            record_mcp_audit(
-                request,
-                actor=actor,
-                success=False,
-                dataset=dataset,
-                detail={
-                    "operation": "improve",
-                    "error_type": exc.__class__.__name__,
-                },
-            )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
-        await mesh_state.record_error(citadel.config, operation="improve", error=str(exc))
-        if request:
-            record_mcp_audit(
-                request,
-                actor=actor,
-                success=False,
-                dataset=dataset,
-                detail={"operation": "improve", "error_type": exc.__class__.__name__},
-            )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    central = central_dataset(citadel.config)
-    await mesh_state.record_upgrade(
-        citadel.config,
-        dataset=central,
-        session_ids=None,
-    )
+    detail = {
+        "code": "LLM_SCHEDULED_ONLY",
+        "reason": "llm_scheduled_only",
+        "message": "Improvement runs only during scheduled self-evolution.",
+    }
     if request:
         record_mcp_audit(
             request,
             actor=actor,
-            success=True,
+            success=False,
             dataset=dataset,
-            detail={
-                "operation": "improve",
-                "session_count": 0,
-            },
+            detail={"operation": "improve", **detail},
         )
-    return jsonable_encoder({"result": result})
+    raise HTTPException(status_code=409, detail=detail)

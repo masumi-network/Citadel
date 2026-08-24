@@ -12,6 +12,7 @@ from kb.search_format import (
     apply_query_ranking,
     apply_spec_mode_ranking,
     compact_search_payload_for_agent,
+    compact_document_payload_for_agent,
     exact_linear_issue_identifier,
     extract_hex_needles,
     filter_hits,
@@ -22,9 +23,37 @@ from kb.search_format import (
     is_spec_mode_query,
     is_token_asset_query,
     linear_issue_identifier,
+    search_query_requires_context,
     normalize_search_hit,
     shape_search_payload,
 )
+
+
+def test_contextless_decision_query_requires_clarification() -> None:
+    assert search_query_requires_context("What did we decide about this?") is True
+    assert search_query_requires_context("What did we decide?") is True
+    assert search_query_requires_context("What did the team decide about this?") is True
+    assert search_query_requires_context("What conclusion did we reach?") is True
+    assert search_query_requires_context("What did we decide about auth?") is False
+    assert search_query_requires_context("What is this OUTLOOK_SEND_EMAIL?") is False
+
+
+def test_cli_search_shape_keeps_context_required_contract() -> None:
+    shaped = shape_search_payload(
+        {
+            "results": [],
+            "code": "QUERY_CONTEXT_REQUIRED",
+            "clarification_required": True,
+            "message": "Name the decision topic.",
+        },
+        query="What did we decide about this?",
+    )
+    compacted = compact_search_payload_for_agent(shaped)
+
+    assert compacted["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert compacted["clarification_required"] is True
+    assert compacted["message"] == "Name the decision topic."
+    assert compacted["answerable"] is False
 
 
 def test_spec_mode_detects_api_cues() -> None:
@@ -96,12 +125,258 @@ def test_shape_timeout_sets_code() -> None:
 
 def test_agent_payload_drops_dashboard_section_copies() -> None:
     payload = {
-        "results": [{"id": "one", "snippet": "answer"}],
+        "results": [
+            {
+                "id": "one",
+                "snippet": "answer",
+                "_citadel": {"dataset": "central"},
+            }
+        ],
+        "dataset": "seat:alice",
+        "datasets": ["seat:alice", "central"],
         "sections": {"central": [{"id": "one"}], "node": [], "session_traces": []},
     }
     compacted = compact_search_payload_for_agent(payload)
     assert "sections" not in compacted
+    assert "dataset" not in compacted
+    assert "datasets" not in compacted
     assert compacted["section_counts"] == {"central": 1, "node": 0, "session_traces": 0}
+    assert compacted["primary_dataset"] == "seat:alice"
+    assert compacted["searched_datasets"] == ["seat:alice", "central"]
+    assert compacted["result_datasets"] == ["central"]
+
+
+def test_agent_payload_has_one_canonical_copy_of_source_metadata() -> None:
+    source_url = "https://github.com/masumi-network/Citadel/blob/abc/kb/service.py"
+    compacted = compact_search_payload_for_agent(
+        {
+            "results": [
+                {
+                    "id": "chunk-1",
+                    "document_id": "document-1",
+                    "title": "github:masumi-network/Citadel:path:kb/service.py",
+                    "text": "retained source",
+                    "snippet": "retained source",
+                    "source": source_url,
+                    "source_url": source_url,
+                    "url": source_url,
+                    "source_locator": source_url,
+                    "source_type": "repo-content",
+                    "repo": "masumi-network/Citadel",
+                    "path": "kb/service.py",
+                    "document_drilldown_available": True,
+                    "citation": {
+                        "title": "service.py",
+                        "source_locator": source_url,
+                        "document_id": "document-1",
+                        "document_endpoint": "/api/documents/document-1",
+                        "repo": "masumi-network/Citadel",
+                        "path": "kb/service.py",
+                    },
+                    "provenance": {
+                        "source": "repo-content",
+                        "source_url": source_url,
+                        "repo": "masumi-network/Citadel",
+                        "path": "kb/service.py",
+                        "commit": "abc",
+                        "title": "service.py",
+                    },
+                    "references": [{"source_locator": source_url}],
+                    "term_coverage": 1.0,
+                    "matched_terms": ["service"],
+                    "retrieval": {"mode": "lexical_fallback"},
+                    "document_endpoint": "/api/documents/document-1",
+                    "_citadel": {
+                        "dataset": "masumi-network",
+                        "result_id": "chunk-1",
+                        "rank": 1,
+                        "provenance": {
+                            "source": "repo-content",
+                            "source_url": source_url,
+                        },
+                        "references": [{"source_locator": source_url}],
+                        "retrieval": {"mode": "lexical_fallback"},
+                        "relevance": {
+                            "term_coverage": 1.0,
+                            "matched_terms": ["service"],
+                        },
+                        "document_endpoint": "/api/documents/document-1",
+                    },
+                }
+            ],
+            "ok": True,
+        }
+    )
+
+    hit = compacted["results"][0]
+    assert compacted["answerable"] is True
+    assert hit["title"] == "service.py"
+    assert hit["citation"] == {
+        "title": "service.py",
+        "source_locator": source_url,
+        "document_endpoint": "/api/documents/document-1",
+    }
+    assert hit["provenance"] == {
+        "source": "repo-content",
+        "repo": "masumi-network/Citadel",
+        "path": "kb/service.py",
+        "commit": "abc",
+    }
+    assert "references" not in hit
+    assert "snippet" not in hit
+    assert "term_coverage" not in hit
+    assert "matched_terms" not in hit
+    for duplicate in (
+        "source",
+        "source_url",
+        "url",
+        "source_locator",
+        "retrieval",
+        "document_endpoint",
+        "document_drilldown_available",
+    ):
+        assert duplicate not in hit
+    assert hit["_citadel"] == {
+        "retrieval": {"mode": "lexical_fallback"},
+        "relevance": {
+            "term_coverage": 1.0,
+            "matched_terms": ["service"],
+        },
+    }
+
+
+def test_agent_payload_keeps_unique_reference_evidence_without_duplicate_urls() -> None:
+    primary_url = "https://linear.app/masumi/issue/SOK-563/subscription-credits"
+    related_url = "https://github.com/masumi-network/Citadel/blob/abc/docs/credits.md"
+    compacted = compact_search_payload_for_agent(
+        {
+            "results": [
+                {
+                    "id": "chunk-1",
+                    "text": "Subscription credit decision.",
+                    "source_locator": primary_url,
+                    "references": [
+                        {
+                            "id": "same-source-note",
+                            "url": primary_url,
+                            "source_url": primary_url,
+                            "source_locator": primary_url,
+                            "snippet": "Decision comment from the same issue.",
+                            "text": "Decision comment from the same issue.",
+                        },
+                        {
+                            "id": "related-doc",
+                            "url": related_url,
+                            "source_url": related_url,
+                            "source_locator": related_url,
+                            "snippet": "Implementation details.",
+                            "text": "Implementation details.",
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert compacted["results"][0]["references"] == [
+        {
+            "id": "same-source-note",
+            "snippet": "Decision comment from the same issue.",
+        },
+        {
+            "id": "related-doc",
+            "source_locator": related_url,
+            "snippet": "Implementation details.",
+        },
+    ]
+
+
+def test_agent_document_payload_keeps_one_content_field() -> None:
+    compacted = compact_document_payload_for_agent(
+        {
+            "ok": True,
+            "document": {
+                "id": "document-1",
+                "body": "retained source",
+                "content": "retained source",
+                "text": "retained source",
+            },
+        }
+    )
+
+    assert compacted == {
+        "ok": True,
+        "document": {"id": "document-1", "body": "retained source"},
+    }
+
+
+def test_agent_document_payload_prefers_populated_content_over_empty_body() -> None:
+    compacted = compact_document_payload_for_agent(
+        {
+            "ok": True,
+            "document": {
+                "id": "document-1",
+                "body": "",
+                "content": "retained source",
+                "text": "retained source",
+            },
+        }
+    )
+
+    assert compacted["document"] == {"id": "document-1", "body": "retained source"}
+
+
+def test_agent_payload_drops_unknown_latency() -> None:
+    compacted = compact_search_payload_for_agent({"results": [], "took_ms": None})
+
+    assert "took_ms" not in compacted
+
+
+def test_agent_payload_marks_shaped_empty_search_unanswerable() -> None:
+    compacted = compact_search_payload_for_agent(
+        {"query": "SOK-999", "results": [], "ok": True}
+    )
+
+    assert compacted["ok"] is True
+    assert compacted["answerable"] is False
+
+
+def test_agent_payload_suppresses_unscored_zero_overlap_candidates() -> None:
+    payload = {
+        "results": [
+            {
+                "id": "noise",
+                "text": "unrelated dashboard note",
+                "_citadel": {"dataset": "seat:alice"},
+            }
+        ],
+        "relevance": {
+            "no_lexical_match": True,
+            "retriever_scores_available": False,
+        },
+    }
+
+    compacted = compact_search_payload_for_agent(payload)
+
+    assert compacted["results"] == []
+    assert compacted["answerable"] is False
+    assert compacted["suppressed_result_count"] == 1
+    assert "result_datasets" not in compacted
+
+
+def test_agent_payload_keeps_scored_semantic_candidate_without_term_overlap() -> None:
+    payload = {
+        "results": [{"id": "semantic", "text": "equivalent wording", "score": 0.9}],
+        "relevance": {
+            "no_lexical_match": True,
+            "retriever_scores_available": True,
+        },
+    }
+
+    compacted = compact_search_payload_for_agent(payload)
+
+    assert [item["id"] for item in compacted["results"]] == ["semantic"]
+    assert compacted["answerable"] is True
 
 
 def test_exact_linear_identity_ignores_cross_reference_text() -> None:
@@ -121,6 +396,28 @@ def test_exact_linear_identity_ignores_cross_reference_text() -> None:
     )
     assert linear_issue_identifier(exact) == "SOK-563"
     assert linear_issue_identifier(cross_reference) == "SOK-618"
+    assert (
+        linear_issue_identifier(
+            {"source_locator": "https://linear.app/masumi/issue/SOK-563?view=full"}
+        )
+        == "SOK-563"
+    )
+    assert (
+        linear_issue_identifier(
+            {"source_locator": "https://linear.app/masumi/issue/SOK-563#decision"}
+        )
+        == "SOK-563"
+    )
+    assert (
+        linear_issue_identifier(
+            {
+                "source_locator": (
+                    "https://github.com/acme/repo/blob/abc/issue/SOK-563/notes"
+                )
+            }
+        )
+        is None
+    )
 
 
 def test_infer_doc_type_and_trust() -> None:

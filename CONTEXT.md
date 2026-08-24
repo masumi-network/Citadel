@@ -28,6 +28,18 @@ _Avoid_: raw data, unprocessed sync, dump, retrieval-engine-owned
 A searchable organization of **Structured Knowledge** for fast retrieval.
 _Avoid_: database, file store, raw storage
 
+**Source Searchable**:
+A state where a retained **Source Snapshot** can be found by source search before derived projections finish.
+_Avoid_: fully indexed, mesh ready
+
+**Projection Searchable**:
+A state where the **Knowledge Index** can retrieve a retained **Source Snapshot**, while **Knowledge Mesh** work can still be pending.
+_Avoid_: source retained, mesh ready
+
+**Mesh Ready**:
+A state where the **Knowledge Mesh** projection for a retained **Source Snapshot** is available.
+_Avoid_: source searchable, projection searchable
+
 **Knowledge Mesh**:
 A relationship map that connects **Structured Knowledge** by source, concept, and provenance.
 _Avoid_: decorative graph, chat history, raw sync map, activity view
@@ -182,6 +194,8 @@ _Avoid_: approval status, promotion gate, workflow stage, review state
 - An **Organization Vault** contains **Structured Knowledge**.
 - **Source Material** becomes useful to the **Organization Vault** through a **Learning Process**.
 - A **Source Snapshot** preserves enough evidence to cite, audit, or reprocess **Structured Knowledge**.
+- An accepted retained **Source Snapshot** becomes **Source Searchable** before its derived projections finish.
+- A **Source Searchable** snapshot can become **Projection Searchable** before it becomes **Mesh Ready**.
 - A **Vault Backup Mirror** keeps a redundant copy of vault evidence without serving live retrieval.
 - A **Learning Process** produces **Structured Knowledge**, a **Knowledge Index**, and a **Knowledge Mesh**.
 - A **Vault Member** or **Agent Identity** uses an **Access Token** to access an **Organization Vault**.
@@ -262,7 +276,7 @@ mesh, including per-item drill-down.
 > **Domain expert:** "Add it as **Source Material**. It becomes **Structured Knowledge** only after the **Learning Process** extracts useful context from it."
 >
 > **Dev:** "Can we search new material immediately?"
-> **Domain expert:** "Only after the **Learning Process** has made it part of the **Knowledge Index** and **Knowledge Mesh**."
+> **Domain expert:** "Yes. A retained **Source Snapshot** is **Source Searchable** before it becomes **Projection Searchable** or **Mesh Ready**."
 >
 > **Dev:** "Do we keep the raw material forever?"
 > **Domain expert:** "No. Keep a **Source Snapshot** when it is needed for citation, audit, or reprocessing; keep the **Knowledge Index** and **Knowledge Mesh** rebuildable."
@@ -313,6 +327,7 @@ mesh, including per-item drill-down.
 - "knowledge sync repository" sounded like a source of truth; resolved: the canonical term is **Vault Backup Mirror**, a redundant copy for recovery, audit, and rebuilds.
 - "self-learning" was used to mean automatic structuring of raw inputs; resolved: the domain term is **Learning Process**.
 - "indexed mesh" was used to describe retrieval; resolved: **Knowledge Index** supports search, while **Knowledge Mesh** represents relationships.
+- "searchable" was used for both retained-source search and completed projections; resolved: **Source Searchable**, **Projection Searchable**, and **Mesh Ready** are separate states.
 - "MCP key" and "access token" were used for credentials; resolved: the domain term is **Access Token**.
 - "department-scoped access" was considered for the first version; resolved: initial **Access Tokens** grant whole-vault access constrained by **Access Role**.
 - "agent action approval" was broad; resolved: read/search is open to reader agents, writer agents may contribute, submit feedback, and provide updates, while sensitive admin actions stay gated.

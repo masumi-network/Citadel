@@ -108,16 +108,34 @@ class FakeSyncer:
     async def status(self) -> dict[str, Any]:
         return {"ok": True, "org": "masumi-network"}
 
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         if self.error:
             raise self.error
-        self.runs.append({"force": force, "dry_run": dry_run})
+        call = {"force": force, "dry_run": dry_run}
+        if not allow_llm:
+            call["allow_llm"] = False
+        self.runs.append(call)
         return github_run_result(dry_run=dry_run)
 
 
 class FailedResultSyncer(FakeSyncer):
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
-        self.runs.append({"force": force, "dry_run": dry_run})
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
+        call = {"force": force, "dry_run": dry_run}
+        if not allow_llm:
+            call["allow_llm"] = False
+        self.runs.append(call)
         return github_run_result(ok=False, dry_run=dry_run)
 
 
@@ -140,10 +158,19 @@ class FakeRepoContentSyncer:
             "tracked_files": 12,
         }
 
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         if self.error:
             raise self.error
-        self.runs.append({"force": force, "dry_run": dry_run})
+        call = {"force": force, "dry_run": dry_run}
+        if not allow_llm:
+            call["allow_llm"] = False
+        self.runs.append(call)
         return repo_content_run_result(dry_run=dry_run)
 
 
@@ -199,6 +226,28 @@ async def test_run_happy_path_builds_digest_and_posts_to_gateway() -> None:
     assert "Masumi Org Digest" in fake_gateway.posts[0]["text"]
     assert fake_citadel.search_calls[0]["top_k"] == 5
     assert "raw body must not leak" not in fake_gateway.posts[0]["text"]
+
+
+async def test_user_run_disables_source_and_digest_llm_work(monkeypatch: Any) -> None:
+    class UserCitadel(FakeCitadel):
+        config = CitadelConfig(
+            organization_digest_llm_enabled=True,
+            search_default_dataset="masumi-network",
+        )
+
+    def explode(_packet: dict[str, Any]) -> list[str]:
+        raise AssertionError("user-triggered learning-agent run called an LLM")
+
+    monkeypatch.setattr("kb.organization_digest.llm_agent_read", explode)
+    learning_agent, _, github, repo_content, _ = agent(citadel=UserCitadel())
+
+    result = await learning_agent.run(allow_llm=False)
+
+    assert github.runs == [{"force": False, "dry_run": False, "allow_llm": False}]
+    assert repo_content.runs == [
+        {"force": False, "dry_run": False, "allow_llm": False}
+    ]
+    assert result["organization_digest"]["agent_read_source"] == "deterministic_fallback"
 
 
 async def test_run_preview_mode_does_not_post() -> None:

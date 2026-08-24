@@ -329,16 +329,35 @@ def check_search(
             data={"code": CODE_SEARCH_UNAVAILABLE},
         )
     latency = int((time.monotonic() - started) * 1000)
+    if not isinstance(data, dict):
+        return Check(
+            "search",
+            ok=False,
+            detail="malformed search response",
+            latency_ms=latency,
+            data={"code": CODE_SEARCH_UNAVAILABLE, "response_valid": False},
+        )
+    explicit_error = data.get("error")
     results = data.get("results")
     if results is None:
         results = data.get("matches")
-    count = len(results) if isinstance(results, list) else 0
-    # A zero-result smoke search means the read path is up but the data plane is
-    # empty/broken — report it honestly instead of always-green (#27).
-    search_data: dict[str, Any] = {"count": count}
-    if count <= 0:
-        search_data["code"] = CODE_SEARCH_UNAVAILABLE
-    else:
+    if explicit_error or not isinstance(results, list):
+        return Check(
+            "search",
+            ok=False,
+            detail="malformed search response",
+            latency_ms=latency,
+            data={"code": CODE_SEARCH_UNAVAILABLE, "response_valid": False},
+        )
+    count = len(results)
+    # One arbitrary query cannot prove corpus recall. A structurally valid
+    # response proves search is available. The separate corpus check owns
+    # retained-source and projection readiness.
+    search_data: dict[str, Any] = {
+        "count": count,
+        "answerable": count > 0,
+    }
+    if count > 0:
         # A non-empty nearest-neighbour page can still contain zero relevant
         # hits.  The search endpoint already reports lexical overlap at the
         # response and hit levels; use it when present so status cannot call an
@@ -374,7 +393,7 @@ def check_search(
                 search_data["code"] = CODE_SEARCH_NO_LEXICAL_MATCH
     return Check(
         "search",
-        ok=count > 0 and search_data.get("lexical_match", True),
+        ok=search_data.get("lexical_match", True),
         detail=(
             f"{count} result(s); no lexical match"
             if search_data.get("lexical_match") is False

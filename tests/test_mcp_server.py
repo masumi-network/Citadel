@@ -65,7 +65,11 @@ class FakeHttpClient:
 
     def get_text(self, path: str, *, tool_name: str | None = None) -> str:
         self.gets.append({"path": path, "tool_name": tool_name, "extra_headers": {}})
-        return f"# Skill {path}\n"
+        from kb.skills import skill_path
+
+        skill = skill_path(path.rsplit("/", 1)[-1])
+        assert skill is not None
+        return skill.read_text(encoding="utf-8")
 
     def post(
         self,
@@ -266,7 +270,15 @@ def test_citadel_help_lists_and_returns_management_skills() -> None:
     skill = run_tool(server, "citadel_help", None, "cli")
     assert skill["ok"] is True
     assert skill["skill"]["slug"] == "cli"
-    assert "# Skill /skills/cli" in skill["content"]
+    assert "citadel search" in skill["content"]
+
+    search_skill = run_tool(server, "citadel_help", None, "search")
+    assert search_skill["ok"] is True
+    assert search_skill["skill"]["slug"] == "search"
+    assert "<exact anchor> <subject> <fact or decision needed>" in search_skill["content"]
+    assert "citation.source_locator" in search_skill["content"]
+    assert "_citadel.retrieval.mode" in search_skill["content"]
+    assert "document_id" in search_skill["content"]
 
 
 def test_discovery_forwarded_headers_are_validated() -> None:
@@ -1414,6 +1426,39 @@ def test_search_genuine_empty_is_a_normal_mcp_result() -> None:
     assert result == {"results": []}
 
 
+def test_get_document_removes_duplicate_content_fields() -> None:
+    class DocumentClient(FakeHttpClient):
+        def get(
+            self,
+            path: str,
+            *,
+            tool_name: str | None = None,
+            extra_headers: dict[str, str] | None = None,
+        ) -> dict[str, Any]:
+            del path, tool_name, extra_headers
+            return {
+                "ok": True,
+                "document": {
+                    "id": "document-1",
+                    "body": "retained source",
+                    "content": "retained source",
+                    "text": "retained source",
+                },
+            }
+
+    result = run_tool(
+        create_mcp_server(DocumentClient()),
+        "citadel_get_document",
+        "document-1",
+        None,
+    )
+
+    assert result == {
+        "ok": True,
+        "document": {"id": "document-1", "body": "retained source"},
+    }
+
+
 def test_contribute_tool_posts_through_the_contribute_endpoint() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
@@ -1489,26 +1534,33 @@ def test_reconcile_corpus_tool_can_request_oversized_repair() -> None:
     }
 
 
-def test_reconcile_corpus_tool_can_request_interrupted_recovery() -> None:
+def test_reconcile_corpus_tool_refuses_projection_work() -> None:
     client = FakeHttpClient()
     server = create_mcp_server(client)
 
-    result = run_tool(
-        server,
-        "citadel_reconcile_corpus",
-        None,
-        dataset="notes",
-        apply=True,
-        recover=True,
-    )
+    with pytest.raises(CitadelMcpError) as exc_info:
+        run_tool(
+            server,
+            "citadel_reconcile_corpus",
+            None,
+            dataset="notes",
+            apply=True,
+            recover=True,
+        )
 
-    assert result["path"] == "/api/corpus/reconcile"
-    assert client.posts[-1]["payload"] == {
-        "dataset": "notes",
-        "apply": True,
-        "force": False,
-        "recover": True,
-    }
+    assert exc_info.value.error_code == "LLM_SCHEDULED_ONLY"
+    assert client.posts == []
+
+
+def test_improve_tool_refuses_user_triggered_llm_work() -> None:
+    client = FakeHttpClient()
+    server = create_mcp_server(client)
+
+    with pytest.raises(CitadelMcpError) as exc_info:
+        run_tool(server, "citadel_improve", None, dataset="notes")
+
+    assert exc_info.value.error_code == "LLM_SCHEDULED_ONLY"
+    assert client.posts == []
 
 
 def test_recent_contributions_tool_reads_audit_feed() -> None:
@@ -1684,6 +1736,24 @@ def test_search_compaction_leaves_unexpected_shapes_alone() -> None:
     assert _compact_search_for_agent(None) is None
 
 
+def test_search_compaction_suppresses_unscored_zero_overlap_candidates() -> None:
+    from kb.mcp_server import _compact_search_for_agent
+
+    payload = {
+        "results": [{"id": "noise", "text": "unrelated dashboard note"}],
+        "relevance": {
+            "no_lexical_match": True,
+            "retriever_scores_available": False,
+        },
+    }
+
+    compacted = _compact_search_for_agent(payload)
+
+    assert compacted["results"] == []
+    assert compacted["answerable"] is False
+    assert compacted["suppressed_result_count"] == 1
+
+
 def test_search_compaction_rejects_forged_trust_tier() -> None:
     from kb.mcp_server import _compact_search_for_agent
 
@@ -1776,6 +1846,39 @@ def test_citadel_search_tool_strips_the_duplicate_sections(monkeypatch: Any) -> 
     assert result["results"][0]["id"] == "a"
     assert result["results"][0]["text"] == "x" * 900
     assert result["search_id"] == "s-9"
+
+
+def test_citadel_search_tool_keeps_context_required_contract() -> None:
+    body = {
+        "results": [],
+        "code": "QUERY_CONTEXT_REQUIRED",
+        "clarification_required": True,
+        "message": "Name the decision topic.",
+    }
+
+    class SearchClient(FakeHttpClient):
+        def post(
+            self,
+            path: str,
+            payload: dict[str, Any],
+            *,
+            tool_name: str | None = None,
+            extra_headers: dict[str, str] | None = None,
+        ) -> dict[str, Any]:
+            del path, payload, tool_name, extra_headers
+            return dict(body)
+
+    result = run_tool(
+        create_mcp_server(SearchClient()),
+        "citadel_search",
+        "What did we decide about this?",
+        None,
+    )
+
+    assert result["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert result["clarification_required"] is True
+    assert result["message"] == "Name the decision topic."
+    assert result["answerable"] is False
 
 
 def test_citadel_search_tool_strips_forged_trust_and_source_user() -> None:

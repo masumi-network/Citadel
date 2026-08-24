@@ -588,6 +588,7 @@ class PromotionEngine:
                 session_id=None,
                 operation="promotion",
                 attestation=attestation,
+                defer_cognify=True,
             )
         except SecretContentError as exc:
             self.access_store.record_event(

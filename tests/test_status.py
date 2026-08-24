@@ -362,14 +362,35 @@ def test_check_local_setup_corrupt_config_does_not_raise(tmp_path: Path) -> None
     assert "corrupt" in checks["capture_roots"].detail
 
 
-def test_check_search_empty_list_is_zero(monkeypatch) -> None:
+def test_check_search_empty_list_proves_read_path_without_claiming_a_hit(monkeypatch) -> None:
     monkeypatch.setattr(status_mod._OPENER, "open", _route({"/search": {"results": []}}))
     check = status_mod.check_search("https://node.example", "ctdl_tok")
-    # #27: a zero-result smoke search is RED (read path up but data plane empty),
-    # not always-green.
-    assert check.ok is False and check.data["count"] == 0
-    assert check.data.get("code") == status_mod.CODE_SEARCH_UNAVAILABLE
+    # One arbitrary query cannot prove corpus recall. A valid search response
+    # proves the read path is available; the separate corpus check owns corpus
+    # readiness and projection truth.
+    assert check.ok is True and check.data["count"] == 0
+    assert check.data["answerable"] is False
+    assert "code" not in check.data
     assert "0 result(s)" in check.detail
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"error": "provider crashed"},
+        {"results": {}},
+        {"matches": "wrong"},
+    ],
+)
+def test_check_search_rejects_malformed_success_payload(monkeypatch, payload) -> None:
+    monkeypatch.setattr(status_mod._OPENER, "open", _route({"/search": payload}))
+
+    check = status_mod.check_search("https://node.example", "ctdl_tok")
+
+    assert check.ok is False
+    assert check.data["code"] == status_mod.CODE_SEARCH_UNAVAILABLE
+    assert check.data["response_valid"] is False
 
 
 def test_check_search_rejects_non_lexical_page(monkeypatch) -> None:

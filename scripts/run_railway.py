@@ -58,13 +58,13 @@ def web_command(*, port: str) -> list[str]:
 def _github_sync_stage() -> int:
     from scripts.run_github_sync import run as run_github_sync
 
-    return run_github_sync()
+    return run_github_sync(force_in_process=True)
 
 
 async def _github_sync_stage_async() -> int:
     from scripts.run_github_sync import arun
 
-    return await arun()
+    return await arun(force_in_process=True)
 
 
 def _skills_refresh_stage() -> int:
@@ -84,13 +84,13 @@ def _skills_refresh_stage() -> int:
 def _self_improve_stage() -> int:
     from scripts.run_self_improve import run as run_self_improve
 
-    return run_self_improve()
+    return run_self_improve(force_in_process=True)
 
 
 async def _self_improve_stage_async() -> int:
     from scripts.run_self_improve import arun
 
-    return await arun()
+    return await arun(force_in_process=True)
 
 
 def _backup_mirror_stage() -> int:
@@ -142,96 +142,21 @@ def _cognify_mode(*, verify: bool) -> int:
     return 0
 
 
-def _cognify_timeout() -> int:
-    raw = os.getenv("CITADEL_COGNIFY_TIMEOUT_SECONDS")
-    if not raw:
-        return 1800
-    try:
-        return int(raw)
-    except ValueError:
-        return 1800
-
-
-def _cognify_via_api(url: str, *, force: bool) -> int:
-    """Drive cognify through the running web service's ``/api/cognify/run``.
-
-    Cognee binds its async DB/graph resources to the event loop that created
-    them, so cognify only runs cleanly inside the web server's long-lived loop — a
-    fresh ``asyncio.run()`` in a script/subprocess raises "got Future attached to
-    a different loop". The evolve scheduler runs on the web container and sets
-    ``CITADEL_COGNIFY_TARGET_URL`` (e.g. ``http://localhost:8080``) so its cognify
-    stage POSTs to the local API instead of cognifying in-process.
-    """
-    import json
-    from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
-
-    access_key = os.getenv("CITADEL_ADMIN_KEY")
-    if not access_key:
-        logger.error("CITADEL_COGNIFY_TARGET_URL is set but CITADEL_ADMIN_KEY is missing")
-        return 1
-
-    endpoint = url.rstrip("/")
-    if not endpoint.endswith("/api/cognify/run"):
-        endpoint = f"{endpoint}/api/cognify/run"
-
-    payload = {"force": force, "verify": False}
-    dataset = os.getenv("CITADEL_COGNIFY_DATASET")
-    if dataset:
-        payload["dataset"] = dataset
-
-    request = Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {access_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "citadel-evolve-cognify",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=_cognify_timeout()) as response:
-            result = json.loads(response.read().decode("utf-8") or "{}")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        logger.error("Cognify API failed: HTTP %s: %s", exc.code, detail[:500])
-        return 1
-    except URLError as exc:
-        logger.error("Cognify API unreachable at %s: %s", endpoint, exc.reason)
-        return 1
-    except TimeoutError as exc:
-        # A read-phase timeout is a bare TimeoutError, not a URLError, and
-        # would otherwise escape this handler as a raw traceback (#39/#116).
-        logger.error("Cognify API timed out after %ss: %s", _cognify_timeout(), exc)
-        return 1
-
-    logger.info(
-        "Cognify (API) finished: graph_before=%s graph_after=%s grew=%s",
-        result.get("graph_before"),
-        result.get("graph_after"),
-        result.get("graph_grew"),
-    )
-    if result.get("ok") is False:
-        logger.error("Cognify API reported failure: %s", result.get("verification"))
-        return 1
-    return 0
-
-
 def _cognify_stage() -> int:
     url = os.getenv("CITADEL_COGNIFY_TARGET_URL")
     if url:
-        return _cognify_via_api(url, force=_bool(os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE")))
-    # Two OS processes must never write Kuzu at once (#47): if the web's in-process
-    # evolve scheduler is enabled, the web owns the single Kuzu writer. An external
-    # cognify cron that opens Kuzu in-process here would collide ("Lock is held by
-    # PID N"). Refuse and require routing through the API instead.
+        logger.error(
+            "Refusing Cognify over the user API. Remove CITADEL_COGNIFY_TARGET_URL "
+            "and use the in-process evolve scheduler."
+        )
+        return 1
+    # Two OS processes must never write Kuzu at once (#47). If the web's
+    # in-process evolve scheduler is enabled, the web owns the single Kuzu
+    # writer. An external Cognify process would collide with that lock.
     if _bool(os.getenv("CITADEL_EVOLVE_SCHEDULER_ENABLED")):
         logger.error(
             "Refusing in-process cognify: CITADEL_EVOLVE_SCHEDULER_ENABLED is set, so the "
-            "web process owns the Kuzu writer. Set CITADEL_COGNIFY_TARGET_URL to the API "
-            "(e.g. http://citadel-archive.railway.internal:8080) to cognify via the web."
+            "web process owns the Kuzu writer. Let that scheduler run Cognify in its own loop."
         )
         return 1
     return _cognify_mode(verify=False)
@@ -242,8 +167,9 @@ async def _promotion_stage_async() -> int:
 
     Reuses :class:`kb.promotion.PromotionEngine`, honoring its opt-in
     (``CITADEL_PROMOTION_ENABLED``) and dry-run (``CITADEL_PROMOTION_DRY_RUN``,
-    default on) config. Each seat node is promoted independently; a failure on one
-    seat never aborts the others, and the stage only fails when EVERY seat raised.
+    default on) config. Each seat node is promoted independently. A failure on one
+    seat does not abort the others, but it does fail the stage because Central is
+    then incomplete for that scheduled pass.
     """
     from kb.access import AccessStore, is_seat_dataset
     from kb.improvement_policy import automation_evaluation_passed
@@ -300,10 +226,7 @@ async def _promotion_stage_async() -> int:
         failures,
         config.promotion_dry_run,
     )
-    # One flaky seat must not fail the stage; only a total wipeout counts as failure.
-    if failures and failures == len(seats):
-        return 1
-    return 0
+    return 1 if failures else 0
 
 
 def _promotion_stage() -> int:
@@ -613,9 +536,9 @@ def run_evolve() -> int:
     # later loop, so every cognee-touching stage (github_sync, repo_content_sync,
     # self_improve, promotion, linear_sync) must run on the SAME loop or all but the
     # first silently fail while the pass still exits 0 (#69). Pipeline mode keeps its
-    # per-stage loops: it is not the evolve subprocess and does not set
-    # CITADEL_SUPPRESS_INLINE_COGNIFY, so a shared loop there could let one stage's
-    # background cognify straddle into the next stage.
+    # per-stage loops. It is not the in-loop evolve scheduler and does not suppress
+    # inline Cognify, so a shared loop there could let one stage's background work
+    # straddle into the next stage.
     with stage_loop():
         return _run_stages(evolve_stages(), label="Evolve")
 
@@ -628,7 +551,7 @@ def run(mode: str | None = None) -> int:
     if resolved_mode in {"github-sync", "learning-agent"}:
         from scripts.run_github_sync import run as run_github_sync
 
-        return run_github_sync()
+        return run_github_sync(force_in_process=True)
     if resolved_mode == "backup-mirror":
         from scripts.run_backup_mirror import run as run_backup_mirror
 

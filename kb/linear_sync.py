@@ -675,6 +675,8 @@ class LinearSyncer:
             # visible instead of a stale green last_synced_at (#46).
             "last_error": state.get("last_error"),
             "last_attempt_at": state.get("last_attempt_at"),
+            "last_run_ok": state.get("last_run_ok"),
+            "last_run_reason": state.get("last_run_reason"),
             "issue_count": len(issues),
             "max_issues": self.config.linear_sync_max_issues,
             "unbounded_issue_listing": self.config.linear_sync_max_issues <= 0,
@@ -716,7 +718,13 @@ class LinearSyncer:
             ]
         return []
 
-    async def run(self, *, force: bool = False, await_cognify: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        await_cognify: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         """Sync Linear issues into Central (+ assignee seat mirrors).
 
         Incremental by default (#90): an issue is rewritten only when its
@@ -962,6 +970,9 @@ class LinearSyncer:
         # Blocked items are recorded by identifier only, never content, and
         # simply retried whenever the issue next changes.
         blocked: list[str] = []
+        rejected_writes: list[dict[str, str]] = []
+        rejected_issue_identifiers: set[str] = set()
+        rejected_context_keys: set[str] = set()
 
         central_outcome = None
         if force or changed_ids or removed_ids or changed_context_keys or removed_context_keys:
@@ -977,12 +988,25 @@ class LinearSyncer:
                     capture_actor_id="linear-sync",
                     capture_run_id=sync_started_at,
                     operation="linear_sync",
-                    run_improve=self.config.linear_sync_run_improve,
+                    run_improve=self.config.linear_sync_run_improve and allow_llm,
                     # Baseline Linear capture is deterministic. Full enrichment
                     # remains an explicit opt-in with linear_sync_run_improve.
-                    tier=("full" if self.config.linear_sync_run_improve else "light"),
+                    tier=(
+                        "full"
+                        if self.config.linear_sync_run_improve and allow_llm
+                        else "light"
+                    ),
+                    allow_llm=allow_llm,
                     defer_cognify=True,
                 )
+                if not central_outcome.ingest.accepted:
+                    rejected_writes.append(
+                        {
+                            "source": "workspace-digest",
+                            "dataset": central_dataset,
+                            "reason": str(central_outcome.ingest.reason),
+                        }
+                    )
             except SecretContentError as exc:
                 blocked.append("workspace-digest")
                 logger.warning(
@@ -1011,10 +1035,20 @@ class LinearSyncer:
                     operation="linear_sync",
                     run_improve=False,
                     tier="light",
+                    allow_llm=allow_llm,
                     defer_cognify=True,
                 )
                 if context_outcome.ingest.accepted:
                     central_context_written = True
+                else:
+                    rejected_context_keys.add(source_key)
+                    rejected_writes.append(
+                        {
+                            "source": source_key,
+                            "dataset": central_dataset,
+                            "reason": str(context_outcome.ingest.reason),
+                        }
+                    )
             except SecretContentError as exc:
                 blocked.append(source_key)
                 logger.warning(
@@ -1072,6 +1106,7 @@ class LinearSyncer:
                         operation="linear_sync",
                         run_improve=False,
                         tier="light",
+                        allow_llm=allow_llm,
                         defer_cognify=True,
                     )
                     if issue_outcome.ingest.accepted:
@@ -1079,6 +1114,16 @@ class LinearSyncer:
                         # in-process duplicate returns accepted=False without
                         # raising and stores nothing.
                         central_issue_written = True
+                    else:
+                        central_blocked = True
+                        rejected_issue_identifiers.add(issue.identifier)
+                        rejected_writes.append(
+                            {
+                                "source": issue.identifier,
+                                "dataset": central_dataset,
+                                "reason": str(issue_outcome.ingest.reason),
+                            }
+                        )
                 except SecretContentError as exc:
                     central_blocked = True
                     blocked.append(issue.identifier)
@@ -1116,7 +1161,7 @@ class LinearSyncer:
 
             note = format_issue_note(issue)
             try:
-                await learning.learn(
+                mirror_outcome = await learning.learn(
                     note,
                     dataset=mirror_dataset,
                     tags=[
@@ -1134,6 +1179,7 @@ class LinearSyncer:
                     operation="linear_mirror",
                     run_improve=False,
                     tier="light",
+                    allow_llm=allow_llm,
                     defer_cognify=True,
                 )
             except SecretContentError as exc:
@@ -1144,6 +1190,18 @@ class LinearSyncer:
                     issue.identifier,
                     mirror_dataset,
                     exc.public_message,
+                )
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
+            if not mirror_outcome.ingest.accepted:
+                rejected_writes.append(
+                    {
+                        "source": issue.identifier,
+                        "dataset": mirror_dataset,
+                        "reason": str(mirror_outcome.ingest.reason),
+                    }
                 )
                 if mirror_has_note:
                     mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
@@ -1177,12 +1235,14 @@ class LinearSyncer:
                 elif not listing_complete:
                     mirrors.setdefault(str(mirror_dataset), []).append(identifier)
 
-        # One coalesced cognify over Central + every seat mirror we wrote — unless
-        # nothing was written (a fully-unchanged incremental pass has nothing to
-        # fold in) or inline cognify is suppressed (the evolve Phase-1 subprocess
-        # is add-only and the web cognifies in Phase 2 as the sole Kuzu writer, #47).
+        # Run one coalesced Cognify over Central and every seat mirror we wrote.
+        # Skip it when nothing changed or evolve Phase 1 suppresses inline work.
+        # The scheduler runs one Cognify pass in Phase 2 (#47).
         touched_datasets: list[str] = []
-        if central_outcome is not None or central_issue_written or central_context_written:
+        if (
+            central_outcome is not None
+            and central_outcome.ingest.accepted
+        ) or central_issue_written or central_context_written:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
         touched_datasets.extend(sorted(tombstoned_datasets))
@@ -1204,6 +1264,10 @@ class LinearSyncer:
                     cognify_observed = "cognified"
             else:
                 cognify_observed = "queued_not_confirmed"
+        elif touched_datasets and not allow_llm:
+            # User-triggered sync retains sources but cannot start the LLM-backed
+            # legacy Cognify queue. Scheduled evolution will project this work.
+            cognify_observed = "not_scheduled"
         elif touched_datasets and not _suppress_inline_cognify():
             cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
@@ -1227,8 +1291,7 @@ class LinearSyncer:
                 queued = self.citadel.cognee.schedule_cognify(cognify_datasets)
                 cognify_observed = "queued_not_confirmed" if queued else "not_scheduled"
         elif touched_datasets:
-            # Evolve Phase-1 subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY): add-only
-            # by design; the web cognifies in Phase 2 as the sole Kuzu writer.
+            # Evolve Phase 1 is add-only. The scheduler Cognifies in Phase 2.
             cognify_observed = "suppressed"
 
         # Advance the cursor to the newest updatedAt seen (keep the prior one
@@ -1282,7 +1345,10 @@ class LinearSyncer:
             )
 
         persisted_issues = [
-            asdict(issue) for issue in issues if issue.identifier not in blocked
+            asdict(issue)
+            for issue in issues
+            if issue.identifier not in blocked
+            and issue.identifier not in rejected_issue_identifiers
         ]
         if not listing_complete:
             fetched_ids = {issue.id for issue in issues}
@@ -1295,6 +1361,8 @@ class LinearSyncer:
             asdict(record)
             for record in context_records
             if linear_context_source_key(record.entity_type, record.id) not in blocked
+            and linear_context_source_key(record.entity_type, record.id)
+            not in rejected_context_keys
         ]
         if not context_listing_complete:
             fetched_context_keys = set(current_context_by_key)
@@ -1303,14 +1371,31 @@ class LinearSyncer:
                 for key, item in prior_context_by_key.items()
                 if key not in fetched_context_keys and isinstance(item, dict)
             )
+        sync_reason: str | None = None
+        if not listing_complete:
+            sync_reason = "linear_issue_listing_incomplete"
+        elif not context_listing_complete:
+            sync_reason = "linear_context_listing_incomplete"
+        elif auto_map_error:
+            sync_reason = "linear_user_listing_failed"
+        elif rejected_writes:
+            sync_reason = "linear_ingest_rejected"
+        sync_ok = sync_reason is None
+        if rejected_writes:
+            new_cursor = prior_state.get("last_seen_updated_at")
+
+        attempt_at = utc_now()
+
         payload = {
             "version": STATE_VERSION,
-            "last_synced_at": utc_now(),
+            "last_synced_at": (
+                attempt_at if sync_ok else prior_state.get("last_synced_at")
+            ),
             "last_seen_updated_at": new_cursor,
             "unchanged_pass_streak": streak,
-            "last_error": None,  # clear any prior failure on a successful sync
+            "last_error": sync_reason,
             "context_error": context_error,
-            "last_attempt_at": utc_now(),
+            "last_attempt_at": attempt_at,
             "auto_map_error": auto_map_error,
             "auto_map_members_fetched": auto_map_members_fetched,
             "auto_mapped_assignees": auto_mapped,
@@ -1325,11 +1410,15 @@ class LinearSyncer:
             "context_records": persisted_context_records,
             "mirrors": mirrors,
             "context_listing_complete": context_listing_complete,
+            "last_run_ok": sync_ok,
+            "last_run_reason": sync_reason,
+            "rejected_writes": rejected_writes,
         }
         self._save_state(payload)
 
         return {
-            "ok": True,
+            "ok": sync_ok,
+            "reason": sync_reason,
             "enabled": True,
             "issue_count": len(issues),
             "context_record_count": len(context_records),
@@ -1383,5 +1472,7 @@ class LinearSyncer:
             # contained, not silently dropped.
             "blocked": blocked,
             "blocked_count": len(blocked),
+            "rejected_writes": rejected_writes,
+            "rejected_write_count": len(rejected_writes),
             "last_synced_at": payload["last_synced_at"],
         }

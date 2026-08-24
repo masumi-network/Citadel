@@ -208,7 +208,7 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     assert out["section_counts"] == {"central": 1, "session_traces": 0, "node": 0}
     assert "sections" not in out
     assert out["results"][0]["text"] == "hello vault"
-    assert out["results"][0]["snippet"] == "hello vault"
+    assert "snippet" not in out["results"][0]
     assert out["ok"] is True
 
 
@@ -223,6 +223,15 @@ def test_skills_command_lists_and_shows_management_skill(capsys) -> None:
     shown = json.loads(capsys.readouterr().out)
     assert shown["skill"] == "cli"
     assert "citadel search" in shown["content"]
+
+    search_args = argparse.Namespace(skills_command="show", slug="search", json=True)
+    assert asyncio.run(_skills(search_args)) == 0
+    search_skill = json.loads(capsys.readouterr().out)
+    assert search_skill["skill"] == "search"
+    assert "<exact anchor> <subject> <fact or decision needed>" in search_skill["content"]
+    assert "citation.source_locator" in search_skill["content"]
+    assert "_citadel.retrieval.mode" in search_skill["content"]
+    assert "document_id" in search_skill["content"]
 
 
 def test_operation_command_fetches_projection_receipts(monkeypatch, capsys) -> None:
@@ -277,7 +286,13 @@ def test_document_command_fetches_retained_source(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     payload = {
         "ok": True,
-        "document": {"id": "document-1", "title": "Runbook", "body": "Rotate keys."},
+        "document": {
+            "id": "document-1",
+            "title": "Runbook",
+            "body": "Rotate keys.",
+            "content": "Rotate keys.",
+            "text": "Rotate keys.",
+        },
     }
     monkeypatch.setattr("kb.status.fetch_document", lambda *args, **kwargs: payload)
     args = build_parser().parse_args(
@@ -287,7 +302,10 @@ def test_document_command_fetches_retained_source(monkeypatch, capsys) -> None:
     rc = asyncio.run(_document(args))
 
     assert rc == 0
-    assert json.loads(capsys.readouterr().out) == payload
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "document": {"id": "document-1", "title": "Runbook", "body": "Rotate keys."},
+    }
 
 
 def _search_args(**kw):
@@ -343,6 +361,55 @@ def test_search_local_still_accepts_dataset(monkeypatch) -> None:
     rc = asyncio.run(_search(_search_args(local=True, dataset="seat:alice")))
     assert rc == 0
     assert seen["dataset"] == "seat:alice"
+
+
+def test_search_local_contextless_query_does_not_start_provider(
+    monkeypatch,
+    capsys,
+) -> None:
+    def explode() -> Any:
+        raise AssertionError("contextless local search started Citadel")
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", explode)
+
+    rc = asyncio.run(
+        _search(
+            _search_args(
+                query="What did we decide about this?",
+                local=True,
+            )
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert payload["clarification_required"] is True
+    assert payload["answerable"] is False
+
+
+def test_search_human_output_explains_context_required(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.search_node",
+        lambda *_args, **_kwargs: {
+            "results": [],
+            "code": "QUERY_CONTEXT_REQUIRED",
+            "clarification_required": True,
+            "answerable": False,
+            "message": "Name the decision topic, issue, repository, file, symbol, or feature.",
+        },
+    )
+
+    rc = asyncio.run(
+        _search(_search_args(query="What did the team decide about this?", json=False))
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "QUERY_CONTEXT_REQUIRED" in output
+    assert "Name the decision topic" in output
+    assert "No results" not in output
 
 
 def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
@@ -826,6 +893,28 @@ def test_ingest_default_is_async(monkeypatch, capsys) -> None:
     assert seen["cognify"] is False
 
 
+def test_ingest_local_defers_projection(monkeypatch, capsys) -> None:
+    seen: dict[str, Any] = {}
+
+    class FakeLocalCitadel:
+        async def ingest(self, data: str, **kwargs: Any) -> SimpleNamespace:
+            seen.update({"data": data, **kwargs})
+            return SimpleNamespace(
+                accepted=True,
+                reason="queued_not_confirmed",
+                dataset=kwargs.get("dataset") or "notes",
+                tags=tuple(kwargs.get("tags") or ()),
+            )
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", lambda: FakeLocalCitadel())
+
+    rc = asyncio.run(_ingest(_ingest_args(local=True, dataset="notes")))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["accepted"] is True
+    assert seen["defer_cognify"] is True
+
+
 def test_ingest_no_cognify_flag_is_capture_only(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
@@ -855,6 +944,24 @@ def test_ingest_cognify_flag_is_scheduler_only(monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["code"] == "COGNIFY_SCHEDULER_ONLY"
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["improve"],
+        ["cognify"],
+        ["reindex", "--apply"],
+        ["promotion", "run", "--json"],
+    ],
+)
+def test_cli_llm_jobs_are_scheduler_only(argv: list[str], capsys) -> None:
+    args = build_parser().parse_args(argv)
+
+    rc = asyncio.run(args.handler(args))
+
+    assert rc == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "llm_scheduled_only"
+
+
 def test_ingest_pending_receipt_says_scheduled_projection_will_follow(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     monkeypatch.setattr(
@@ -870,7 +977,9 @@ def test_ingest_pending_receipt_says_scheduled_projection_will_follow(monkeypatc
     rc = asyncio.run(_ingest(_ingest_args(json=False)))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "projects it" in out
+    assert "Scheduled projection owns this work" in out
+    assert "within minutes" not in out
+    assert "citadel operation job-7" in out
     assert "didn't finish" not in out
 
 

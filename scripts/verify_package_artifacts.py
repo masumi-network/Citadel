@@ -33,6 +33,7 @@ CANONICAL_SKILLS = {
     "debug": "citadel-debug",
     "onboard": "citadel-onboard",
     "proactive-ingest": "citadel-proactive-ingest",
+    "search": "citadel-search",
     "vault": "citadel-vault",
 }
 EXPECTED_SKILL_ALIASES = {
@@ -43,6 +44,7 @@ EXPECTED_SKILL_ALIASES = {
     "debug": ["citadel-debug"],
     "onboard": ["citadel-onboard"],
     "proactive-ingest": ["autosync", "citadel-proactive-ingest"],
+    "search": ["citadel-search", "search-guide"],
     "vault": ["citadel-vault"],
 }
 

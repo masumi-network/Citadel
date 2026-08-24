@@ -42,7 +42,12 @@ from kb.lifecycle import (
 from kb.lifecycle_worker import LifecycleProjectionWorker
 from kb.models import FeedbackRequest, FeedbackResult, IngestResult
 from kb.repair_journal import RepairJournal, RepairJournalLeaseError
-from kb.search_format import exact_linear_issue_identifier, linear_issue_identifier
+from kb.search_format import (
+    exact_linear_issue_identifier,
+    hit_term_coverage,
+    linear_issue_identifier,
+    query_terms,
+)
 from kb.security_scan import (
     SecretContentError,
     SecurityScanEntry,
@@ -288,10 +293,12 @@ class Citadel:
                     "source_revision_id": acceptance.source_revision_id,
                     "projection_job_id": acceptance.projection_job_id,
                     "state": acceptance.operation.state,
+                    "source_searchable": True,
                 },
                 source_revision_id=acceptance.source_revision_id,
                 projection_job_id=acceptance.projection_job_id,
                 projection_state=acceptance.operation.state,
+                source_searchable=True,
             )
         if ingest_key in self._seen_ingest_keys:
             logger.info(
@@ -413,10 +420,12 @@ class Citadel:
                         "source_revision_id": acceptance.source_revision_id,
                         "projection_job_id": acceptance.projection_job_id,
                         "state": acceptance.operation.state,
+                        "source_searchable": False,
                     },
                     source_revision_id=acceptance.source_revision_id,
                     projection_job_id=acceptance.projection_job_id,
                     projection_state=acceptance.operation.state,
+                    source_searchable=False,
                 )
             )
         if results and not self._inline_projection_suppressed():
@@ -672,13 +681,17 @@ class Citadel:
         source = operation.source_revision
         job = operation.job
         backend_states = {receipt.backend: receipt.state for receipt in operation.receipts}
+        projection_searchable = backend_states.get("vector") == "searchable"
+        mesh_ready = backend_states.get("graph") == "searchable"
         return {
             "schema_version": job.schema_version,
             "projection_job_id": job.projection_job_id,
             "source_revision_id": source.source_revision_id,
             "dataset": job.dataset,
             "state": operation.state,
-            "retrieval_ready": backend_states.get("vector") == "searchable",
+            "source_searchable": not source.tombstone,
+            "projection_searchable": projection_searchable,
+            "mesh_ready": mesh_ready,
             "vector_state": backend_states.get("vector", "not_started"),
             "graph_state": backend_states.get("graph", "not_started"),
             "enrichment_state": backend_states.get("graph", "not_started"),
@@ -1084,6 +1097,40 @@ class Citadel:
         vector_recall_allowed = True
         if self.lifecycle_store is not None:
             lifecycle_projection = self._lifecycle_projection_request()
+            exact_issue = exact_linear_issue_identifier(query)
+            if exact_issue and allow_lexical_fallback:
+                try:
+                    lexical_results = await asyncio.to_thread(
+                        self.lifecycle_store.lexical_search,
+                        query,
+                        dataset=target_dataset,
+                        projection=lifecycle_projection,
+                        top_k=top_k,
+                        required_linear_issue_identifier=exact_issue,
+                    )
+                except Exception as exc:  # noqa: BLE001 - exact lookup cannot degrade safely
+                    logger.warning(
+                        "Exact Linear lexical lookup failed for %s: %s",
+                        safe_log_value(exact_issue),
+                        safe_log_value(str(exc)),
+                    )
+                    raise
+                exact_results: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                for result in lexical_results:
+                    if not isinstance(result, dict):
+                        continue
+                    if linear_issue_identifier(result) != exact_issue:
+                        continue
+                    key = str(result.get("document_id") or result.get("id") or "")
+                    if not key or key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    exact_results.append(result)
+                # An issue key is an identity lookup. Returning a different issue
+                # is worse than an honest empty page, and vector recall cannot add
+                # a current lifecycle hit that the retained-source lookup cannot see.
+                return exact_results[:top_k]
             searchable_document_ids = list(
                 self.lifecycle_store.searchable_source_revision_ids(
                     dataset=target_dataset,
@@ -1126,55 +1173,66 @@ class Citadel:
         ]
         if self.lifecycle_store is not None:
             results = self._filter_lifecycle_search_results(results)[:top_k]
-            exact_issue = exact_linear_issue_identifier(query)
-            if exact_issue and allow_lexical_fallback and lifecycle_projection is not None:
+            if allow_lexical_fallback and lifecycle_projection is not None:
                 try:
                     lexical_results = await asyncio.to_thread(
                         self.lifecycle_store.lexical_search,
                         query,
                         dataset=target_dataset,
                         projection=lifecycle_projection,
-                        top_k=max(top_k, 10),
+                        top_k=top_k,
                     )
                 except Exception as exc:  # noqa: BLE001 - vector results remain usable
                     logger.warning(
-                        "Exact Linear lexical lookup failed for %s: %s",
-                        safe_log_value(exact_issue),
+                        "Retained-source lexical lookup failed for dataset %s: %s",
+                        safe_log_value(target_dataset),
                         safe_log_value(str(exc)),
                     )
                     lexical_results = []
-                exact_results = [
-                    result
-                    for result in results
-                    if linear_issue_identifier(result) == exact_issue
-                ]
-                exact_results.extend(
-                    result
-                    for result in lexical_results
-                    if linear_issue_identifier(result) == exact_issue
-                )
-                if exact_results:
-                    deduplicated: list[Any] = []
+                if lexical_results:
+                    merged_results: list[Any] = []
                     seen_ids: set[str] = set()
-                    for result in exact_results:
+                    terms = query_terms(query)
+                    vector_by_id: dict[str, dict[str, Any]] = {}
+                    vector_order: list[str] = []
+                    unkeyed_vector_results: list[dict[str, Any]] = []
+                    for result in results:
                         if not isinstance(result, dict):
                             continue
                         key = str(result.get("document_id") or result.get("id") or "")
-                        if not key or key in seen_ids:
+                        if not key:
+                            unkeyed_vector_results.append(result)
+                            continue
+                        current = vector_by_id.get(key)
+                        if current is None:
+                            vector_by_id[key] = result
+                            vector_order.append(key)
+                        elif hit_term_coverage(result, terms)[0] > hit_term_coverage(
+                            current, terms
+                        )[0]:
+                            vector_by_id[key] = result
+                    for result in lexical_results:
+                        if not isinstance(result, dict):
+                            continue
+                        key = str(result.get("document_id") or result.get("id") or "")
+                        if key and key in seen_ids:
+                            continue
+                        vector_result = vector_by_id.pop(key, None)
+                        if vector_result is not None:
+                            lexical_coverage = hit_term_coverage(result, terms)[0]
+                            vector_coverage = hit_term_coverage(vector_result, terms)[0]
+                            if vector_coverage >= lexical_coverage:
+                                result = vector_result
+                        if key:
+                            seen_ids.add(key)
+                        merged_results.append(result)
+                    for key in vector_order:
+                        if key in seen_ids:
                             continue
                         seen_ids.add(key)
-                        deduplicated.append(result)
-                    results = deduplicated[:top_k]
-            if not results and allow_lexical_fallback and lifecycle_projection is not None:
-                results = await asyncio.to_thread(
-                    self.lifecycle_store.lexical_search,
-                    query,
-                    dataset=target_dataset,
-                    projection=lifecycle_projection,
-                    top_k=top_k,
-                )
-                if results:
-                    return results
+                        merged_results.append(vector_by_id[key])
+                    merged_results.extend(unkeyed_vector_results)
+                    return merged_results[:top_k]
         if results or target_dataset != self.config.github_sync_dataset:
             return results
         return search_github_sync_state(query, self.config, top_k=top_k)
@@ -1260,6 +1318,7 @@ class Citadel:
                 note,
                 dataset=dataset,
                 tags=("feedback", f"qa:{request.qa_id}", f"score:{request.score}"),
+                defer_cognify=True,
             )
             recorded = durable.accepted
             if not recorded:
@@ -1919,6 +1978,30 @@ class Citadel:
         instead of the assembled parent. Passed through only when set so
         clients implementing the plain signature keep working.
         """
+        if self.lifecycle_store is not None and not chunk_scope:
+            source = self.lifecycle_store.get_source_revision(document_id)
+            if source is not None:
+                try:
+                    content = self.lifecycle_store.read_retained_content(document_id).decode(
+                        "utf-8"
+                    )
+                except (UnicodeDecodeError, LifecycleNotFoundError):
+                    pass
+                else:
+                    return {
+                        "id": document_id,
+                        "document_id": document_id,
+                        "source": "lifecycle",
+                        "source_type": "lifecycle",
+                        "body": content,
+                        "content": content,
+                        "text": content,
+                        "metadata": {
+                            "retrieval_mode": "retained_source",
+                            "dataset": source.dataset,
+                            "source_key": source.source_key,
+                        },
+                    }
         cognee_error: Exception | None = None
         try:
             if chunk_scope:

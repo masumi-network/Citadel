@@ -404,6 +404,7 @@ def build_organization_digest(
     config: CitadelConfig,
     *,
     include_preview: bool,
+    allow_llm: bool = True,
 ) -> dict[str, Any]:
     if not config.organization_digest_enabled:
         return {
@@ -418,10 +419,10 @@ def build_organization_digest(
     if meaningful:
         contains_private = bool(packet["summary"].get("contains_private_repositories"))
         llm_allowed = not contains_private or config.organization_digest_llm_allow_private
-        if config.organization_digest_llm_enabled and llm_allowed:
+        if allow_llm and config.organization_digest_llm_enabled and llm_allowed:
             agent_read = llm_agent_read(packet) or []
             agent_read_source = "llm" if agent_read else "deterministic_fallback"
-        elif config.organization_digest_llm_enabled and contains_private:
+        elif allow_llm and config.organization_digest_llm_enabled and contains_private:
             agent_read_source = "deterministic_private_metadata"
         if not agent_read:
             agent_read = deterministic_agent_read(packet)

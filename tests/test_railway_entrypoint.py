@@ -61,7 +61,8 @@ def test_learning_agent_mode_runs_github_sync(monkeypatch: Any) -> None:
 
     calls: list[str] = []
 
-    def run_sync() -> int:
+    def run_sync(*, force_in_process: bool = False) -> int:
+        assert force_in_process is True
         calls.append("github-sync")
         return 0
 
@@ -104,8 +105,8 @@ def test_cognify_mode_runs_cognify_without_verify(monkeypatch: Any) -> None:
 
 
 def test_cognify_stage_refuses_in_process_when_scheduler_enabled(monkeypatch: Any) -> None:
-    # #47: a second OS process must not open Kuzu while the web's in-process evolve
-    # scheduler owns it — refuse and require routing through the API.
+    # #47: a second OS process must not open Kuzu while the web's in-process
+    # evolve scheduler owns it.
     monkeypatch.delenv("CITADEL_COGNIFY_TARGET_URL", raising=False)
     monkeypatch.setenv("CITADEL_EVOLVE_SCHEDULER_ENABLED", "true")
 
@@ -155,7 +156,8 @@ def _patch_stages(
 
     import kb.skills as skills
 
-    def fake_github() -> int:
+    def fake_github(*, force_in_process: bool = False) -> int:
+        assert force_in_process is True
         calls.append("github_sync")
         if github_raises:
             raise RuntimeError("github exploded")
@@ -167,7 +169,8 @@ def _patch_stages(
             raise RuntimeError("skills exploded")
         return {"ok": True, "skills": 3, "changed": [], "added": [], "removed": []}
 
-    def fake_self_improve() -> int:
+    def fake_self_improve(*, force_in_process: bool = False) -> int:
+        assert force_in_process is True
         calls.append("self_improve")
         return self_improve_code
 
@@ -355,6 +358,56 @@ def test_evolve_continues_past_a_failed_stage(monkeypatch: Any) -> None:
     ]
 
 
+def test_promotion_stage_fails_after_partial_seat_failure(monkeypatch: Any) -> None:
+    import kb.access as access
+    import kb.improvement_policy as improvement_policy
+    import kb.learning as learning
+    import kb.promotion as promotion
+    import kb.service as service
+
+    calls: list[str] = []
+
+    class FakeConfig:
+        promotion_enabled = True
+        promotion_dry_run = False
+        access_store_path = "unused.json"
+
+    class FakeCitadel:
+        config = FakeConfig()
+
+    class FakeAccessStore:
+        def __init__(self, path: str) -> None:
+            assert path == "unused.json"
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "principals": [
+                    {"seat_slug": "alice", "default_dataset": "seat:alice"},
+                    {"seat_slug": "bob", "default_dataset": "seat:bob"},
+                ]
+            }
+
+    class FakePromotionEngine:
+        def __init__(self, *args: Any) -> None:
+            pass
+
+        async def run(self, seat: str, *, dry_run: bool) -> dict[str, int]:
+            assert dry_run is False
+            calls.append(seat)
+            if seat == "seat:alice":
+                raise RuntimeError("alice failed")
+            return {"promoted": 1}
+
+    monkeypatch.setattr(service.Citadel, "from_env", classmethod(lambda cls: FakeCitadel()))
+    monkeypatch.setattr(access, "AccessStore", FakeAccessStore)
+    monkeypatch.setattr(improvement_policy, "automation_evaluation_passed", lambda config: True)
+    monkeypatch.setattr(learning, "LearningProcess", lambda citadel: object())
+    monkeypatch.setattr(promotion, "PromotionEngine", FakePromotionEngine)
+
+    assert run_railway.run_async(run_railway._promotion_stage_async()) == 1
+    assert calls == ["seat:alice", "seat:bob"]
+
+
 def test_evolve_exits_nonzero_when_all_enabled_stages_fail(monkeypatch: Any) -> None:
     _clear_evolve_env(monkeypatch)
     for name in (
@@ -372,27 +425,19 @@ def test_evolve_exits_nonzero_when_all_enabled_stages_fail(monkeypatch: Any) -> 
     assert calls == ["github_sync"]
 
 
-# --- Evolve cognify stage routing (web-API vs in-process) ------------------
+# --- Evolve cognify stage routing -------------------------------------------
 
 
-def test_cognify_stage_routes_to_api_when_target_url_set(monkeypatch: Any) -> None:
+def test_cognify_stage_rejects_user_api_target(monkeypatch: Any) -> None:
     monkeypatch.setenv("CITADEL_COGNIFY_TARGET_URL", "http://localhost:8080")
     monkeypatch.delenv("CITADEL_EVOLVE_COGNIFY_FORCE", raising=False)
 
-    api_calls: list[tuple[str, bool]] = []
-
-    def fake_api(url: str, *, force: bool) -> int:
-        api_calls.append((url, force))
-        return 0
-
     def fail_mode(*, verify: bool) -> int:
-        raise AssertionError("cognify must go through the API, not asyncio.run")
+        raise AssertionError("rejected API target must not run Cognify")
 
-    monkeypatch.setattr(run_railway, "_cognify_via_api", fake_api)
     monkeypatch.setattr(run_railway, "_cognify_mode", fail_mode)
 
-    assert run_railway._cognify_stage() == 0
-    assert api_calls == [("http://localhost:8080", False)]
+    assert run_railway._cognify_stage() == 1
 
 
 def test_cognify_stage_runs_in_process_without_target_url(monkeypatch: Any) -> None:
@@ -409,62 +454,6 @@ def test_cognify_stage_runs_in_process_without_target_url(monkeypatch: Any) -> N
 
     assert run_railway._cognify_stage() == 0
     assert mode_calls == [False]
-
-
-def test_cognify_via_api_posts_to_endpoint(monkeypatch: Any) -> None:
-    import json
-    import urllib.request
-
-    captured: dict[str, Any] = {}
-
-    class _FakeResp:
-        def __enter__(self) -> "_FakeResp":
-            return self
-
-        def __exit__(self, *exc: Any) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b'{"graph_before": 1, "graph_after": 9, "graph_grew": true}'
-
-    def fake_urlopen(request: Any, timeout: Any = None) -> "_FakeResp":
-        captured["url"] = request.full_url
-        captured["data"] = request.data
-        captured["auth"] = request.headers.get("Authorization")
-        return _FakeResp()
-
-    monkeypatch.setenv("CITADEL_ADMIN_KEY", "test-admin-key")
-    monkeypatch.delenv("CITADEL_COGNIFY_DATASET", raising=False)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    assert run_railway._cognify_via_api("http://localhost:8080", force=True) == 0
-    assert captured["url"] == "http://localhost:8080/api/cognify/run"
-    assert json.loads(captured["data"]) == {"force": True, "verify": False}
-    assert captured["auth"] == "Bearer test-admin-key"
-
-
-def test_cognify_via_api_fails_when_response_reports_failure(monkeypatch: Any) -> None:
-    import urllib.request
-
-    class _FakeResp:
-        def __enter__(self) -> "_FakeResp":
-            return self
-
-        def __exit__(self, *exc: Any) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b'{"ok": false, "verification": {"ok": false}}'
-
-    monkeypatch.setenv("CITADEL_ADMIN_KEY", "test-admin-key")
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: _FakeResp())
-
-    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
-
-
-def test_cognify_via_api_fails_without_admin_key(monkeypatch: Any) -> None:
-    monkeypatch.delenv("CITADEL_ADMIN_KEY", raising=False)
-    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
 
 
 # --- Evolve single-loop restructure (#69) ----------------------------------
@@ -543,19 +532,3 @@ def test_evolve_async_stages_are_all_coroutine_functions() -> None:
 
     for name, _, runner in run_railway.evolve_stages_async():
         assert inspect.iscoroutinefunction(runner), f"{name} is not awaitable"
-
-
-def test_cognify_via_api_converts_read_timeout_to_clean_failure(monkeypatch: Any) -> None:
-    # #116: a read-phase timeout is a bare TimeoutError, not a URLError, and
-    # would otherwise escape this helper's HTTPError/URLError-only handling
-    # as a raw traceback (the #39 bug, unbackported to this copy). The
-    # urlopen import is function-local, so patch the stdlib symbol itself.
-    import urllib.request
-
-    def boom(request: Any, timeout: int) -> None:
-        raise TimeoutError("the read operation timed out")
-
-    monkeypatch.setenv("CITADEL_ADMIN_KEY", "admin-key")
-    monkeypatch.setattr(urllib.request, "urlopen", boom)
-
-    assert run_railway._cognify_via_api("http://localhost:8080", force=False) == 1
