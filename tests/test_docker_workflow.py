@@ -213,6 +213,7 @@ def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> 
         "/skills/debug",
         "/skills/onboard",
         "/skills/proactive-ingest",
+        "/skills/search",
         "/skills/vault",
     )
     skill_names = (
@@ -222,6 +223,7 @@ def test_ci_proves_public_skills_from_installed_wheel_and_production_image() -> 
         "citadel-mcp-connector",
         "citadel-onboard",
         "citadel-proactive-ingest",
+        "citadel-search",
         "citadel-vault",
     )
 

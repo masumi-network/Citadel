@@ -73,7 +73,12 @@ LINEAR_HEADER_PARSE_RE = re.compile(
 )
 # One "- **Key:** value" bullet from the block right under the Linear title.
 LINEAR_HEADER_FIELD_RE = re.compile(r"^-\s+\*\*(?P<key>[A-Za-z ]+):\*\*[ \t]*(?P<value>.+?)[ \t]*$")
-LINEAR_ISSUE_KEY_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+", re.IGNORECASE)
+# Bound both user-controlled parts so fullmatch cannot backtrack across
+# arbitrary query input.
+LINEAR_ISSUE_KEY_RE = re.compile(
+    r"[A-Z][A-Z0-9]{0,127}-[0-9]{1,20}",
+    re.IGNORECASE,
+)
 LINEAR_ISSUE_URL_RE = re.compile(
     r"/issue/(?P<issue>[A-Z][A-Z0-9]*-\d+)(?:[/?#]|$)",
     re.IGNORECASE,

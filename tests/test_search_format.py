@@ -382,6 +382,8 @@ def test_agent_payload_keeps_scored_semantic_candidate_without_term_overlap() ->
 def test_exact_linear_identity_ignores_cross_reference_text() -> None:
     assert exact_linear_issue_identifier(" SOK-563 ") == "SOK-563"
     assert exact_linear_issue_identifier("what is SOK-563") is None
+    assert exact_linear_issue_identifier("A" * 129 + "-1") is None
+    assert exact_linear_issue_identifier("SOK-" + "1" * 21) is None
     exact = normalize_search_hit(
         {
             "id": "exact",

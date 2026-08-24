@@ -156,9 +156,9 @@ class SelfImprovement:
 
         recent = await self._recent_activity(limit, dataset=dataset)
         improve_result = await self._improve(dataset)
-        improve_ok = not (
-            isinstance(improve_result, dict) and improve_result.get("ok") is False
-        )
+        improve_ok = True
+        if isinstance(improve_result, dict) and improve_result.get("ok") is False:
+            improve_ok = False
         proposals = self._propose(recent["ingest_items"]) if improve_ok else []
         applied = 0
         if proposals and not dry_run:
