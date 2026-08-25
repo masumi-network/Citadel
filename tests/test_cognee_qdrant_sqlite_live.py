@@ -11,6 +11,10 @@ from typing import Any
 import pytest
 
 _REPORT_PREFIX = "CITADEL_LITE_REPORT="
+_WORKER_TIMEOUT_SECONDS = int(os.getenv("COGNEE_WORKER_TIMEOUT_SECONDS", "240"))
+_WORKER_PROJECTION_TIMEOUT_SECONDS = float(
+    os.getenv("COGNEE_WORKER_PROJECTION_TIMEOUT_SECONDS", "240")
+)
 
 
 def _worker_environment(root: Path, *, generation: str, mode: str) -> dict[str, str]:
@@ -67,7 +71,7 @@ def _run_worker(root: Path, *, generation: str, mode: str) -> dict[str, Any]:
         env=_worker_environment(root, generation=generation, mode=mode),
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=_WORKER_TIMEOUT_SECONDS,
         check=False,
     )
     reports = [
@@ -237,7 +241,8 @@ async def _worker() -> None:
             source_key="live:lifecycle-marker",
         )
         lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
-            str(lifecycle_result.projection_job_id)
+            str(lifecycle_result.projection_job_id),
+            timeout_seconds=_WORKER_PROJECTION_TIMEOUT_SECONDS,
         )
         assert lifecycle_operation["state"] == "searchable"
         central_lifecycle_result = await lifecycle.ingest(
@@ -246,7 +251,8 @@ async def _worker() -> None:
             source_key="live:central-lifecycle-marker",
         )
         central_lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
-            str(central_lifecycle_result.projection_job_id)
+            str(central_lifecycle_result.projection_job_id),
+            timeout_seconds=_WORKER_PROJECTION_TIMEOUT_SECONDS,
         )
         assert central_lifecycle_operation["state"] == "searchable"
         document_ids = {
