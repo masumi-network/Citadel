@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
 DEFAULT_COGNIFY_QUEUE_PATH = Path(".citadel/cognify_queue.json")
 COGNIFY_EXECUTION_LOCK_POLL_SECONDS = 1.0
+_PREPARED_COGNEE_STORAGE_SIGNATURE: tuple[str, ...] | None = None
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -608,7 +609,89 @@ class CogneePublicClient:
         if not os.getenv("LLM_API_KEY") and os.getenv("OPENROUTER_API_KEY"):
             os.environ["LLM_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
 
+    @staticmethod
+    def _cognee_storage_root_signature() -> tuple[str, ...]:
+        names = (
+            "SYSTEM_ROOT_DIRECTORY",
+            "DATA_ROOT_DIRECTORY",
+            "CACHE_ROOT_DIRECTORY",
+            "COGNEE_LOGS_DIR",
+            "DB_PATH",
+        )
+        return tuple(os.getenv(name, "").strip() for name in names)
+
+    @staticmethod
+    def _clear_cognee_config_caches() -> None:
+        try:
+            from cognee.base_config import get_base_config
+            from cognee.infrastructure.databases.cache.config import get_cache_config
+            from cognee.infrastructure.databases.cache.get_cache_engine import (
+                create_cache_engine,
+            )
+            from cognee.infrastructure.databases.graph.config import get_graph_config
+            from cognee.infrastructure.databases.relational.config import (
+                get_relational_config,
+            )
+            from cognee.infrastructure.databases.relational.create_relational_engine import (
+                create_relational_engine,
+            )
+            from cognee.infrastructure.databases.vector.create_vector_engine import (
+                _create_vector_engine,
+            )
+            from cognee.infrastructure.databases.vector.embeddings.config import (
+                get_embedding_config,
+            )
+            from cognee.infrastructure.databases.vector.embeddings.get_embedding_engine import (
+                create_embedding_engine,
+            )
+        except Exception:
+            logger.exception(
+                "Could not import cognee config factories for cache reset"
+            )
+            return
+
+        for factory in (
+            get_base_config,
+            get_cache_config,
+            create_cache_engine,
+            get_graph_config,
+            get_relational_config,
+            create_relational_engine,
+            get_embedding_config,
+            create_embedding_engine,
+            _create_vector_engine,
+        ):
+            clear = getattr(factory, "cache_clear", None)
+            if callable(clear):
+                clear()
+
+    def _ensure_cognee_storage_roots(self) -> None:
+        """Use env-backed writable roots instead of site-packages defaults.
+
+        Cognee's ``get_base_config`` defaults ``system_root_directory`` to
+        ``{package}/.cognee_system``. That path is writable in a local venv but
+        read-only in the Docker test image (uid 10001). Tests set
+        ``SYSTEM_ROOT_DIRECTORY`` via fixtures; without a cache reset the first
+        cached config keeps pointing at the package tree and graph/vector init
+        fails with ``PermissionError`` on drill-down reads.
+        """
+        global _PREPARED_COGNEE_STORAGE_SIGNATURE
+
+        signature = self._cognee_storage_root_signature()
+        if not any(signature):
+            return
+
+        for raw in signature:
+            if raw:
+                Path(raw).mkdir(parents=True, exist_ok=True)
+
+        if signature == _PREPARED_COGNEE_STORAGE_SIGNATURE:
+            return
+        _PREPARED_COGNEE_STORAGE_SIGNATURE = signature
+        self._clear_cognee_config_caches()
+
     def _prepare_cognee_environment(self) -> None:
+        self._ensure_cognee_storage_roots()
         install_cognee_retry_guard()
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()

@@ -1365,11 +1365,18 @@ def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
         "DATA_ROOT_DIRECTORY": str(tmp_path / "data"),
         "CACHE_ROOT_DIRECTORY": str(tmp_path / "cache"),
         "COGNEE_LOGS_DIR": str(tmp_path / "logs"),
+        "DB_PATH": str(tmp_path / "system" / "databases"),
         "DEFAULT_USER_EMAIL": "citadel_test@example.com",
         "DEFAULT_USER_PASSWORD": "citadel-test-password",
         "LLM_API_KEY": "unused-by-this-test",
     }.items():
         monkeypatch.setenv(key, value)
+
+    import kb.cognee_client as cognee_client_module
+
+    cognee_client_module._PREPARED_COGNEE_STORAGE_SIGNATURE = None
+    for relative in ("system", "data", "cache", "logs", "system/databases"):
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
 
     def _clear() -> None:
         get_base_config.cache_clear()
