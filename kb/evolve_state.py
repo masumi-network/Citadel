@@ -71,14 +71,22 @@ def read_last_completed(path: str | Path) -> datetime | None:
     return _parse(data.get("last_completed_at"))
 
 
-def record_completed(path: str | Path, when: datetime | None = None) -> None:
-    """Stamp a completed pass. Never raises: bookkeeping must not fail a cycle."""
+def record_completed(
+    path: str | Path,
+    when: datetime | None = None,
+    *,
+    ok: bool = True,
+    reason: str | None = None,
+) -> None:
+    """Stamp a finished pass and its truthful outcome."""
     try:
         save_state_file(
             Path(path),
             {
                 "version": STATE_VERSION,
                 "last_completed_at": (when or _now()).isoformat().replace("+00:00", "Z"),
+                "last_run_ok": ok,
+                "last_run_reason": reason,
             },
         )
     except (StateFileError, OSError) as exc:
@@ -130,12 +138,24 @@ def staleness(
     merely started late does not read as broken while a cycle that genuinely
     stopped does.
     """
-    last = read_last_completed(path)
+    try:
+        state = load_state_file(Path(path))
+    except (StateFileError, OSError):
+        state = {}
+    last = _parse(state.get("last_completed_at")) if isinstance(state, dict) else None
     if last is None:
-        return {"last_completed_at": None, "age_seconds": None, "overdue": None}
+        return {
+            "last_completed_at": None,
+            "age_seconds": None,
+            "overdue": None,
+            "last_run_ok": None,
+            "last_run_reason": None,
+        }
     age = max(0.0, ((now or _now()) - last).total_seconds())
     return {
         "last_completed_at": last.isoformat().replace("+00:00", "Z"),
         "age_seconds": int(age),
         "overdue": age > 2 * max(1, int(interval_seconds)),
+        "last_run_ok": state.get("last_run_ok"),
+        "last_run_reason": state.get("last_run_reason"),
     }

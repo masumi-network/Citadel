@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,19 @@ class _AsyncNullContext:
 class _FakeCognee:
     def maintenance(self) -> _AsyncNullContext:
         return _AsyncNullContext()
+
+
+class _RaisingMaintenance:
+    async def __aenter__(self) -> None:
+        raise RuntimeError("maintenance failed")
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _RaisingMaintenanceCognee:
+    def maintenance(self) -> _RaisingMaintenance:
+        return _RaisingMaintenance()
 
 
 # --- config parsing --------------------------------------------------------
@@ -109,7 +123,12 @@ class _FakeCitadel:
             "ok": True,
             "graph_after": {"nodes": 7, "edges": 4},
             "graph_grew": True,
-            "verification": {"marker": "COGNIFY_TEST_MARKER_x", "search_hit": True, "ok": True},
+            "verification": {
+                "marker": "COGNIFY_TEST_MARKER_x",
+                "search_hit": True,
+                "projection_chain_ok": None,
+                "ok": True,
+            },
         }
 
 
@@ -337,6 +356,36 @@ async def test_evolve_scheduler_loop_cognifies_even_if_phase1_raises(
     assert len(cognify_calls) >= 2
 
 
+async def test_evolve_scheduler_records_failed_maintenance_entry(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import kb.server as server
+
+    cognify_calls: list[bool] = []
+    _patch_phase1(monkeypatch)
+    fake_citadel = _FakeCitadel(cognify_calls)
+    fake_citadel.cognee = _RaisingMaintenanceCognee()
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    state_path = tmp_path / "evolve_state.json"
+    task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(state_path)))
+    try:
+        for _ in range(300):
+            if state_path.exists() and cognify_calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_run_ok"] is False
+    assert state["last_run_reason"] == "maintenance_exception"
+    assert cognify_calls, "the recovery projection pass was not attempted"
+    assert fake_citadel.resume_calls, "the paused lifecycle queue was not resumed"
+
+
 async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     monkeypatch: Any, caplog: Any, tmp_path: Path
 ) -> None:
@@ -354,11 +403,12 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     _patch_phase1(monkeypatch, code=1)
     monkeypatch.setattr(server, "get_citadel", lambda: _FakeCitadel(cognify_calls))
 
+    state_path = tmp_path / "evolve_state.json"
     with caplog.at_level(logging.ERROR, logger=server.logger.name):
-        task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json")))
+        task = asyncio.create_task(server._evolve_scheduler_loop(0.001, str(state_path)))
         try:
             for _ in range(300):
-                if cognify_calls:
+                if state_path.exists():
                     break
                 await asyncio.sleep(0.01)
         finally:
@@ -369,6 +419,9 @@ async def test_evolve_scheduler_logs_error_when_stages_exit_nonzero(
     failures = [r for r in caplog.records if "stages finished with failures" in r.message]
     assert failures, "a nonzero stages exit must be logged at ERROR"
     assert failures[0].levelno == logging.ERROR
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_run_ok"] is False
+    assert state["last_run_reason"] == "stages_exit_1"
 
 
 async def test_a_dying_scheduler_task_is_logged(monkeypatch: Any, caplog: Any) -> None:

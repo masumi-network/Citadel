@@ -413,6 +413,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         pause = getattr(citadel, "pause_lifecycle_queue", None)
         if callable(pause):
             pause()
+        phase1_ok = True
+        phase1_reason: str | None = None
         # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
         # the writer lock so lifecycle cannot claim a lease and then wait inside
         # Cognee while this pass owns the graph.
@@ -439,6 +441,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                     if code == 0:
                         logger.info("Evolve scheduler: stages finished (exit=0)")
                     else:
+                        phase1_ok = False
+                        phase1_reason = f"stages_exit_{code}"
                         # A partial failure is the normal broken case, not an edge one:
                         # the stage names are already on the "Evolve finished: ...
                         # failed=..." line, so log at ERROR here to make the cycle
@@ -451,6 +455,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    phase1_ok = False
+                    phase1_reason = "stages_exception"
                     logger.exception("Evolve scheduler: stages failed")
                 finally:
                     if acquired:
@@ -458,6 +464,10 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         except asyncio.CancelledError:
             _resume_lifecycle_queue(citadel, include_deferred=True)
             raise
+        except Exception:
+            phase1_ok = False
+            phase1_reason = "maintenance_exception"
+            logger.exception("Evolve scheduler: maintenance entry failed")
         # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
         force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
             "1",
@@ -466,6 +476,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             "on",
         }
         cancelled = False
+        phase2_ok = False
+        phase2_reason: str | None = None
         try:
             # verify=True runs the end-to-end ingest+cognify+search canary and
             # records its verdict for /readyz (#27).
@@ -479,6 +491,12 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 projection_chain_ok=verification.get("projection_chain_ok"),
                 projection_receipt_count=len(verification.get("projection_receipts") or []),
             )
+            projection_chain_ok = verification.get(
+                "projection_chain_ok", verification.get("ok", True)
+            )
+            phase2_ok = bool(result.get("ok")) and projection_chain_ok is not False
+            if not phase2_ok:
+                phase2_reason = "cognify_verification_failed"
             logger.info(
                 "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
                 result.get("graph_after"),
@@ -494,6 +512,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             cancelled = True
             raise
         except Exception as exc:
+            phase2_reason = "cognify_exception"
             logger.exception("Evolve scheduler: cognify failed")
             # A crash in the cognify pass is precisely the failure #27's canary
             # exists to surface. Recording only clean passes above would leave
@@ -510,7 +529,14 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 # clock forever, which is the bug this fixes (#153). A CANCELLED
                 # pass is the one exception: it did not run, so it must not
                 # stamp (see the CancelledError branch above).
-                record_completed(state_path)
+                cycle_ok = phase1_ok and phase2_ok
+                record_completed(
+                    state_path,
+                    ok=cycle_ok,
+                    reason=None
+                    if cycle_ok
+                    else (phase1_reason or phase2_reason or "scheduled_cycle_failed"),
+                )
                 # Drain whatever the pass deferred. Projection starts are
                 # suppressed while Phase 1 holds the writer lock, and Phase 2
                 # cognifies directly without touching the lifecycle queue, so

@@ -98,7 +98,13 @@ def test_staleness_is_reportable_so_a_stopped_cycle_is_visible(tmp_path: Path) -
     path = tmp_path / "evolve_state.json"
 
     fresh = staleness(path, HOUR, now=NOW)
-    assert fresh == {"last_completed_at": None, "age_seconds": None, "overdue": None}
+    assert fresh == {
+        "last_completed_at": None,
+        "age_seconds": None,
+        "overdue": None,
+        "last_run_ok": None,
+        "last_run_reason": None,
+    }
 
     record_completed(path, when=NOW - timedelta(minutes=5))
     recent = staleness(path, HOUR, now=NOW)
@@ -109,6 +115,16 @@ def test_staleness_is_reportable_so_a_stopped_cycle_is_visible(tmp_path: Path) -
     stopped = staleness(path, HOUR, now=NOW)
     assert stopped["overdue"] is True
     assert stopped["age_seconds"] == 7 * 24 * HOUR
+
+
+def test_failed_cycle_is_recorded_as_failed(tmp_path: Path) -> None:
+    path = tmp_path / "evolve_state.json"
+
+    record_completed(path, when=NOW, ok=False, reason="stages_exit_1")
+
+    state = staleness(path, HOUR, now=NOW)
+    assert state["last_run_ok"] is False
+    assert state["last_run_reason"] == "stages_exit_1"
 
 
 def test_a_failed_stamp_is_logged_rather_than_swallowed(tmp_path: Path, caplog) -> None:
