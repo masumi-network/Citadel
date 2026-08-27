@@ -115,6 +115,12 @@ class Citadel:
         self._lifecycle_projection_gate.set()
         self._lifecycle_vector_only = False
         if self.config.lifecycle_enabled:
+            prepare_cognee_environment = getattr(
+                self.cognee, "_prepare_cognee_environment", None
+            )
+            if callable(prepare_cognee_environment):
+                # Bind the lifecycle identity after Cognee applies its routed defaults.
+                prepare_cognee_environment()
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
@@ -1280,12 +1286,41 @@ class Citadel:
             receipt = binding.receipt
             if not binding.current or binding.source_revision.tombstone or receipt is None:
                 continue
+            source_revision = binding.source_revision
+            metadata = (
+                dict(result.get("metadata"))
+                if isinstance(result.get("metadata"), dict)
+                else {}
+            )
+            metadata.update(
+                {
+                    "source_revision_id": source_revision.source_revision_id,
+                    "source_key": source_revision.source_key,
+                    "source_locator": source_revision.source_locator,
+                    "media_type": source_revision.media_type,
+                    "content_sha256": source_revision.content_sha256,
+                    "capture_actor_id": source_revision.capture_actor_id,
+                    "capture_run_id": source_revision.capture_run_id,
+                    "captured_at": source_revision.captured_at,
+                    "accepted_at": source_revision.accepted_at,
+                }
+            )
+            for key in (
+                "tags",
+                "title",
+                "session_id",
+                "lifecycle_parent_source_key",
+                "lifecycle_chunk_index",
+            ):
+                if key in source_revision.capture_metadata:
+                    metadata[key] = source_revision.capture_metadata[key]
             filtered.append(
                 {
                     **result,
+                    "metadata": metadata,
                     "_lifecycle": {
                         "schema_version": receipt.schema_version,
-                        "source_revision_id": binding.source_revision.source_revision_id,
+                        "source_revision_id": source_revision.source_revision_id,
                         "projection_receipt_id": receipt.projection_receipt_id,
                         "generation_id": receipt.generation_id,
                         "backend": receipt.backend,
