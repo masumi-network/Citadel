@@ -11,12 +11,10 @@ import re
 from typing import Any, Protocol
 
 from kb.lifecycle import (
-    CaptureContext,
     LifecycleStore,
     ProjectionLease,
     ProjectionLeaseError,
     ProjectionOperation,
-    ProjectionRequest,
 )
 
 
@@ -121,20 +119,6 @@ def _safe_error_message(exc: BaseException) -> str:
     if _is_provider_error(exc):
         return f"{exc.__class__.__name__}: model provider request failed"
     return str(exc)
-
-
-def _is_missing_local_path_error(exc: BaseException) -> bool:
-    """True when Cognee failed because a path-string note is not on disk."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, FileNotFoundError):
-            return True
-        if "Storage directory does not exist" in str(current):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _is_malformed_graph_output_error(exc: BaseException) -> bool:
@@ -344,13 +328,6 @@ class LifecycleProjectionWorker:
         now: datetime,
     ) -> bool:
         """Record a failure and return whether the caller should re-raise it."""
-        if _is_missing_local_path_error(exc):
-            # Path-string notes (citadel ingest used to store the path, not
-            # the file). Cognee then tries to open that local path on the Node
-            # and retries forever. Missing paths are not retryable; tombstone
-            # the current head so requeue cannot resurrect them.
-            self._tombstone_missing_path(lease, exc, now=now)
-            return False
         try:
             if self.deferred_only and _is_malformed_graph_output_error(exc):
                 self.store.reschedule_job(
@@ -664,59 +641,6 @@ class LifecycleProjectionWorker:
             self.generation_id == generation_id
             and self.projection_version == projection_version
             and self.config_digest == config_digest
-        )
-
-    def _tombstone_missing_path(
-        self,
-        lease: ProjectionLease,
-        exc: BaseException,
-        *,
-        now: datetime,
-    ) -> None:
-        """Fail the poison job, then replace the current head with a tombstone."""
-        self.store.fail_job(
-            lease,
-            error_code="FileNotFoundError",
-            error_message=str(exc),
-            now=now,
-        )
-        operation = self.store.get_operation(lease.projection_job_id)
-        source = operation.source_revision
-        if source.tombstone:
-            return
-        self.store.accept_tombstone(
-            reason=f"FileNotFoundError: {str(exc)[:200]}",
-            capture=CaptureContext(
-                dataset=source.dataset,
-                source_key=source.source_key,
-                source_locator=source.source_locator,
-                media_type=source.media_type,
-                capture_actor_id=source.capture_actor_id,
-                capture_run_id=source.capture_run_id,
-                captured_at=now,
-                metadata=dict(source.capture_metadata),
-            ),
-            projection=self._projection_request(operation),
-            now=now,
-        )
-        logger.warning(
-            "tombstoned source %s after non-retryable FileNotFoundError: %s",
-            source.source_key,
-            exc,
-        )
-
-    @staticmethod
-    def _projection_request(operation: ProjectionOperation) -> ProjectionRequest:
-        job = operation.job
-        return ProjectionRequest(
-            generation_id=job.generation_id,
-            projection_version=job.projection_version,
-            config_digest=job.config_digest,
-            providers={
-                receipt.backend: receipt.provider
-                for receipt in operation.receipts
-                if receipt.backend and receipt.provider
-            },
         )
 
     async def _project(
