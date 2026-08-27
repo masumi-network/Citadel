@@ -3,11 +3,23 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 COGNEE_LOG_LEVEL_ENV = "CITADEL_COGNEE_LOG_LEVEL"
 DEFAULT_COGNEE_LOG_LEVEL = "WARNING"
+LITELLM_LOGGER_NAMES = (
+    "litellm",
+    "litellm.litellm_core_utils.logging_worker",
+    "litellm.litellm_core_utils",
+    "litellm.proxy",
+    "litellm.router",
+    "litellm.logging_worker",
+    "LiteLLM",
+    "LiteLLM.core",
+    "LiteLLM.logging_worker",
+)
 
 # Cognee 1.2.x and its task/retriever helpers emit high-volume INFO records.
 # Keep the names explicit because some helpers log outside the ``cognee.*``
@@ -73,6 +85,31 @@ def configure_cognee_logging(level: str | None = None) -> None:
     numeric_level = logging.getLevelNamesMapping()[resolved]
     for name in COGNEE_LOGGER_NAMES:
         logging.getLogger(name).setLevel(numeric_level)
+
+    # Cognee's import-time helper can run before the application logger is
+    # configured. Enforce LiteLLM suppression again after import so model
+    # responses and request bodies cannot flood Railway logs. Explicit DEBUG
+    # is a temporary diagnostic mode and must be reversible in the same process.
+    diagnostic = resolved == "DEBUG"
+    litellm_level = logging.DEBUG if diagnostic else logging.ERROR
+    os.environ["LITELLM_LOG"] = "DEBUG" if diagnostic else "ERROR"
+    os.environ["LITELLM_SET_VERBOSE"] = "False"
+    for name in LITELLM_LOGGER_NAMES:
+        logger = logging.getLogger(name)
+        logger.setLevel(litellm_level)
+        logger.disabled = not diagnostic
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        setattr(litellm, "set_verbose", False)
+        for attribute in (
+            "suppress_debug_info",
+            "turn_off_message",
+            "turn_off_message_logging",
+        ):
+            if hasattr(litellm, attribute):
+                setattr(litellm, attribute, not diagnostic)
+        if hasattr(litellm, "_turn_on_debug"):
+            setattr(litellm, "_turn_on_debug", diagnostic)
 
 
 def configure_logging(level: str | None = None) -> None:

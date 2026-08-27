@@ -329,16 +329,35 @@ def check_search(
             data={"code": CODE_SEARCH_UNAVAILABLE},
         )
     latency = int((time.monotonic() - started) * 1000)
+    if not isinstance(data, dict):
+        return Check(
+            "search",
+            ok=False,
+            detail="malformed search response",
+            latency_ms=latency,
+            data={"code": CODE_SEARCH_UNAVAILABLE, "response_valid": False},
+        )
+    explicit_error = data.get("error")
     results = data.get("results")
     if results is None:
         results = data.get("matches")
-    count = len(results) if isinstance(results, list) else 0
-    # A zero-result smoke search means the read path is up but the data plane is
-    # empty/broken — report it honestly instead of always-green (#27).
-    search_data: dict[str, Any] = {"count": count}
-    if count <= 0:
-        search_data["code"] = CODE_SEARCH_UNAVAILABLE
-    else:
+    if explicit_error or not isinstance(results, list):
+        return Check(
+            "search",
+            ok=False,
+            detail="malformed search response",
+            latency_ms=latency,
+            data={"code": CODE_SEARCH_UNAVAILABLE, "response_valid": False},
+        )
+    count = len(results)
+    # One arbitrary query cannot prove corpus recall. A structurally valid
+    # response proves search is available. The separate corpus check owns
+    # retained-source and projection readiness.
+    search_data: dict[str, Any] = {
+        "count": count,
+        "answerable": count > 0,
+    }
+    if count > 0:
         # A non-empty nearest-neighbour page can still contain zero relevant
         # hits.  The search endpoint already reports lexical overlap at the
         # response and hit levels; use it when present so status cannot call an
@@ -374,7 +393,7 @@ def check_search(
                 search_data["code"] = CODE_SEARCH_NO_LEXICAL_MATCH
     return Check(
         "search",
-        ok=count > 0 and search_data.get("lexical_match", True),
+        ok=search_data.get("lexical_match", True),
         detail=(
             f"{count} result(s); no lexical match"
             if search_data.get("lexical_match") is False
@@ -504,6 +523,7 @@ def search_node(
     types: list[str] | None = None,
     repo: str | None = None,
     path: str | None = None,
+    source: str | None = None,
     canonical_only: bool = False,
     exclude_ambient: bool = False,
     mode: str | None = None,
@@ -512,7 +532,7 @@ def search_node(
 
     Zero-dep, HTTPS-only. The Node resolves the dataset from the token's seat by
     default. Optional filter fields (``types`` / ``repo`` / ``path`` /
-    ``canonical_only`` / ``exclude_ambient`` / ``mode``) are forwarded so
+    ``source`` / ``canonical_only`` / ``exclude_ambient`` / ``mode``) are forwarded so
     server-side telemetry sees the same narrowing the CLI applies. Returns the
     full search payload (``results``, ``sections``, ``dataset``, …) like MCP
     ``citadel_search`` — not a flattened list.
@@ -530,6 +550,8 @@ def search_node(
         payload["repo"] = str(repo).strip()
     if path and str(path).strip():
         payload["path"] = str(path).strip()
+    if source and str(source).strip():
+        payload["source"] = str(source).strip().lower()
     if canonical_only:
         payload["canonical_only"] = True
     if exclude_ambient:
@@ -573,15 +595,13 @@ def ingest_node(
     """POST a note to the Node's /ingest (same endpoint MCP citadel_ingest uses).
 
     Sends no dataset, so the seat token routes the write to the dev's private
-    node (personal-by-default), mirroring the SessionEnd hook. With cognify=True
-    the Node builds the graph inline and blocks until done (so the note is
-    immediately searchable). Returns the response (``accepted``, ``reason``,
-    ``dataset``, and ``cognified`` when cognify was requested).
+    node (personal-by-default), mirroring the SessionEnd hook. User ingest only
+    captures the source. Scheduled projection builds vectors and the graph later.
     """
-    payload: dict[str, Any] = {"data": data, "tags": list(tags)}
     if cognify:
-        payload["cognify"] = True
-    resolved = timeout if timeout is not None else (_COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT)
+        raise ValueError("User ingest is capture-only; run scheduled projection separately")
+    payload: dict[str, Any] = {"data": data, "tags": list(tags), "cognify": False}
+    resolved = timeout if timeout is not None else _INGEST_TIMEOUT
     return _request(
         "POST",
         f"{base_url.rstrip('/')}/ingest",
@@ -608,7 +628,21 @@ def fetch_operation(
     )
 
 
-_COGNIFY_TIMEOUT = 180.0  # /ingest cognifies inline; give the combined call room
+def fetch_document(
+    base_url: str,
+    token: str,
+    document_id: str,
+    *,
+    timeout: float = _TIMEOUT,
+) -> dict[str, Any]:
+    """Fetch one retained source document from the authenticated Node."""
+    encoded_id = urllib.parse.quote(document_id, safe="")
+    return _request(
+        "GET",
+        f"{base_url.rstrip('/')}/api/documents/{encoded_id}",
+        token=token,
+        timeout=timeout,
+    )
 
 
 def fetch_mesh(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -> dict[str, Any]:
@@ -622,6 +656,23 @@ def fetch_mesh(base_url: str, token: str | None, *, timeout: float = _TIMEOUT) -
         # "couldn't reach the Node" instead of silently showing nothing (#101).
         return {"error": _humanize_net_error(exc)}
     return data if isinstance(data, dict) else {}
+
+
+def fetch_mesh_summary(
+    base_url: str, token: str | None, *, timeout: float = _TIMEOUT
+) -> dict[str, Any]:
+    """Fetch bounded index counters for agent-facing status JSON."""
+    if not token:
+        return {}
+    try:
+        data = _request(
+            "GET", f"{base_url.rstrip('/')}/api/indexes", token=token, timeout=timeout
+        )
+    except Exception as exc:
+        return {"error": _humanize_net_error(exc)}
+    if not isinstance(data, dict):
+        return {}
+    return {**data, "detail": "summary"}
 
 
 def fetch_events(

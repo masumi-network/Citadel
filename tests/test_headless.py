@@ -109,7 +109,7 @@ def test_bench_help_reaches_nested_parser(monkeypatch, capsys) -> None:
     assert "{run,lint,ci,compare,enforce,report}" in out
 
 
-def test_cognify_force_reaches_service(monkeypatch, capsys) -> None:
+def test_cognify_force_is_scheduled_only(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCitadel:
@@ -122,12 +122,14 @@ def test_cognify_force_reaches_service(monkeypatch, capsys) -> None:
         classmethod(lambda cls: FakeCitadel()),
     )
 
-    assert _run(["cognify", "--dataset", "masumi-network", "--force"]) == 0
-    assert calls == [{"dataset": "masumi-network", "verify": False, "force": True}]
-    assert '"ok": true' in capsys.readouterr().out
+    assert _run(["cognify", "--dataset", "masumi-network", "--force"]) == 2
+    assert calls == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["reason"] == "llm_scheduled_only"
 
 
-def test_reindex_defaults_to_combined_reconciliation(monkeypatch, capsys) -> None:
+def test_reindex_apply_is_scheduled_only(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCitadel:
@@ -140,9 +142,11 @@ def test_reindex_defaults_to_combined_reconciliation(monkeypatch, capsys) -> Non
         classmethod(lambda cls: FakeCitadel()),
     )
 
-    assert _run(["reindex", "--dataset", "notes", "--apply", "--force"]) == 0
-    assert calls == [{"dataset": "notes", "apply": True, "force": True}]
-    assert '"ok": true' in capsys.readouterr().out
+    assert _run(["reindex", "--dataset", "notes", "--apply", "--force"]) == 2
+    assert calls == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["reason"] == "llm_scheduled_only"
 
 
 def test_reindex_force_requires_apply(capsys) -> None:
@@ -150,7 +154,7 @@ def test_reindex_force_requires_apply(capsys) -> None:
     assert "--force requires --apply" in capsys.readouterr().err
 
 
-def test_reindex_recover_passes_explicit_recovery_flag(monkeypatch, capsys) -> None:
+def test_reindex_recover_is_scheduled_only(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCitadel:
@@ -163,9 +167,11 @@ def test_reindex_recover_passes_explicit_recovery_flag(monkeypatch, capsys) -> N
         classmethod(lambda cls: FakeCitadel()),
     )
 
-    assert _run(["reindex", "--apply", "--force", "--recover"]) == 0
-    assert calls == [{"dataset": None, "apply": True, "force": True, "recover": True}]
-    assert '"ok": true' in capsys.readouterr().out
+    assert _run(["reindex", "--apply", "--force", "--recover"]) == 2
+    assert calls == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["reason"] == "llm_scheduled_only"
 
 
 def test_reindex_recover_requires_apply(capsys) -> None:
@@ -173,7 +179,7 @@ def test_reindex_recover_requires_apply(capsys) -> None:
     assert "--recover requires --apply" in capsys.readouterr().err
 
 
-def test_reindex_oversized_reaches_oversized_service(monkeypatch, capsys) -> None:
+def test_reindex_oversized_apply_is_scheduled_only(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCitadel:
@@ -186,9 +192,11 @@ def test_reindex_oversized_reaches_oversized_service(monkeypatch, capsys) -> Non
         classmethod(lambda cls: FakeCitadel()),
     )
 
-    assert _run(["reindex", "--oversized", "--apply", "--force"]) == 0
-    assert calls == [{"dataset": None, "apply": True, "force": True}]
-    assert '"ok": true' in capsys.readouterr().out
+    assert _run(["reindex", "--oversized", "--apply", "--force"]) == 2
+    assert calls == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["reason"] == "llm_scheduled_only"
 
 
 def test_setup_json_never_prompts_even_on_tty(tmp_path: Path, monkeypatch, capsys) -> None:

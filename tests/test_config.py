@@ -78,3 +78,63 @@ def test_repo_content_autojoin_defaults_off() -> None:
     assert config.repo_content_sync_autojoin_enabled is False
     assert config.repo_content_sync_autojoin_markers == ()
     assert config.repo_content_sync_autojoin_max_repos == 100
+    assert config.repo_content_sync_all_repos is False
+    assert config.repo_content_sync_run_improve is False
+
+
+def test_repo_content_from_env_defaults_to_complete_org_text_sync(monkeypatch) -> None:
+    for name in (
+        "CITADEL_REPO_CONTENT_SYNC_ALL_REPOS",
+        "CITADEL_REPO_CONTENT_SYNC_ALL_TEXT",
+        "CITADEL_REPO_CONTENT_SYNC_MAX_FILES_PER_REPO",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = CitadelConfig.from_env(env_file=None)
+
+    assert config.repo_content_sync_all_repos is True
+    assert config.repo_content_sync_all_text is True
+    assert config.repo_content_sync_max_files_per_repo == 0
+
+
+def test_repo_content_all_repos_env(monkeypatch) -> None:
+    monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_ALL_REPOS", "true")
+    assert CitadelConfig.from_env(env_file=None).repo_content_sync_all_repos is True
+
+
+def test_repo_content_all_text_env(monkeypatch) -> None:
+    monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_ALL_TEXT", "true")
+    monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_MAX_FILES_PER_REPO", "0")
+    config = CitadelConfig.from_env(env_file=None)
+    assert config.repo_content_sync_all_text is True
+    assert config.repo_content_sync_max_files_per_repo == 0
+
+
+def test_linear_issue_sync_defaults_to_unbounded_listing() -> None:
+    assert CitadelConfig().linear_sync_max_issues == 0
+
+
+def test_github_org_sync_defaults_to_unbounded_repository_listing(monkeypatch) -> None:
+    monkeypatch.delenv("CITADEL_GITHUB_SYNC_MAX_REPOS", raising=False)
+
+    assert CitadelConfig().github_sync_max_repos == 0
+    assert CitadelConfig.from_env(env_file=None).github_sync_max_repos == 0
+
+    monkeypatch.setenv("CITADEL_GITHUB_SYNC_MAX_REPOS", "25")
+    assert CitadelConfig.from_env(env_file=None).github_sync_max_repos == 25
+
+
+def test_linear_context_sync_env(monkeypatch) -> None:
+    monkeypatch.setenv("CITADEL_LINEAR_SYNC_MAX_CONTEXT_RECORDS", "7")
+    monkeypatch.setenv("CITADEL_LINEAR_SYNC_INCLUDE_ARCHIVED", "true")
+    config = CitadelConfig.from_env(env_file=None)
+    assert config.linear_sync_max_context_records == 7
+    assert config.linear_sync_include_archived is True
+
+
+def test_lifecycle_projection_batch_size_has_positive_floor(monkeypatch) -> None:
+    monkeypatch.setenv("CITADEL_LIFECYCLE_PROJECTION_BATCH_SIZE", "0")
+    assert CitadelConfig.from_env(env_file=None).lifecycle_projection_batch_size == 1
+
+    monkeypatch.setenv("CITADEL_LIFECYCLE_PROJECTION_BATCH_SIZE", "-4")
+    assert CitadelConfig.from_env(env_file=None).lifecycle_projection_batch_size == 1

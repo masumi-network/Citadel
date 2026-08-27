@@ -7,21 +7,69 @@ and initial backend receipts commit together.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
+
+from kb.search_format import (
+    linear_issue_url_identifier,
+    parse_content_header,
+    repo_filter_matches,
+    source_key_descriptor,
+)
 
 
 LIFECYCLE_SCHEMA_VERSION = 1
 REQUIRED_BACKENDS = ("relational", "vector", "graph")
 LIFECYCLE_CHUNK_SOURCE_PREFIX = "citadel:chunk:v1:"
 _RECEIPT_STATES = {"pending", "running", "completed", "searchable", "failed", "stale"}
+_DEFERRED_GRAPH_ERROR = "graph_enrichment_deferred"
+_LEXICAL_TOKEN_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
+_LEXICAL_PASSAGE_CHARS = 2400
+
+
+def _lexical_passages(text: str) -> tuple[str, ...]:
+    passages: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        passages.extend(
+            paragraph[start : start + _LEXICAL_PASSAGE_CHARS]
+            for start in range(0, len(paragraph), _LEXICAL_PASSAGE_CHARS)
+        )
+    return tuple(passages)
+
+
+def _source_scope_matches(
+    source_key: str,
+    capture_metadata: Mapping[str, Any],
+    *,
+    repo: str | None = None,
+    path: str | None = None,
+    source: str | None = None,
+) -> bool:
+    parent_key = capture_metadata.get("lifecycle_parent_source_key")
+    descriptor = source_key_descriptor(
+        parent_key if isinstance(parent_key, str) and parent_key else source_key
+    )
+    if source and descriptor.get("source", "").lower() != source.strip().lower():
+        return False
+    if repo and not repo_filter_matches(descriptor.get("repo"), repo):
+        return False
+    if path:
+        needle = path.replace("**/", "").replace("/**", "").replace("*", "").lower()
+        if needle and needle not in descriptor.get("path", "").lower():
+            return False
+    return True
 
 
 class LifecycleError(RuntimeError):
@@ -1150,6 +1198,15 @@ class LifecycleStore:
             raise LifecycleNotFoundError(f"source revision not found: {source_revision_id}")
         return bytes(row[0])
 
+    def get_source_revision(self, source_revision_id: str) -> SourceRevision | None:
+        """Return retained-source metadata without exposing its content."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM source_revisions WHERE source_revision_id = ?",
+                (source_revision_id,),
+            ).fetchone()
+        return None if row is None else self._source_revision(row)
+
     def has_completed_projection_other_than(
         self,
         *,
@@ -1506,6 +1563,27 @@ class LifecycleStore:
             state=self._operation_state(job, receipts),
         )
 
+    def latest_operations_for_dataset(
+        self, dataset: str, *, limit: int = 10
+    ) -> tuple[ProjectionOperation, ...]:
+        """Return the newest projection operations for one dataset."""
+        if not dataset.strip():
+            raise ValueError("dataset must be a non-empty string")
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT projection_job_id
+                FROM projection_jobs
+                WHERE dataset = ?
+                ORDER BY created_at DESC, projection_job_id DESC
+                LIMIT ?
+                """,
+                (dataset, limit),
+            ).fetchall()
+        return tuple(self.get_operation(str(row["projection_job_id"])) for row in rows)
+
     def retrieval_binding(
         self,
         source_revision_id: str,
@@ -1548,7 +1626,7 @@ class LifecycleStore:
                       AND job.config_digest = ?
                       AND receipt.backend = ?
                       AND receipt.state = 'searchable'
-                      AND job.state = 'completed'
+                      AND job.state IN ('pending', 'running', 'completed', 'failed', 'deferred')
                     LIMIT 1
                     """,
                     (
@@ -1577,12 +1655,16 @@ class LifecycleStore:
         projection_version: str,
         config_digest: str,
         backend: str = "vector",
+        repo: str | None = None,
+        path: str | None = None,
+        source: str | None = None,
     ) -> tuple[str, ...]:
         """Enumerate current provider ids eligible for one scoped retrieval."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT DISTINCT revision.source_revision_id
+                SELECT DISTINCT revision.source_revision_id, revision.source_key,
+                                revision.capture_metadata_json
                 FROM source_heads AS head
                 JOIN source_revisions AS revision
                   ON revision.source_revision_id = head.source_revision_id
@@ -1595,7 +1677,7 @@ class LifecycleStore:
                   AND job.generation_id = ?
                   AND job.projection_version = ?
                   AND job.config_digest = ?
-                  AND job.state = 'completed'
+                  AND job.state IN ('pending', 'running', 'completed', 'failed', 'deferred')
                   AND receipt.backend = ?
                   AND receipt.state = 'searchable'
                 ORDER BY revision.source_revision_id
@@ -1608,7 +1690,203 @@ class LifecycleStore:
                     backend,
                 ),
             ).fetchall()
-        return tuple(str(row[0]) for row in rows)
+        if not any((repo, path, source)):
+            return tuple(str(row["source_revision_id"]) for row in rows)
+        scoped: list[str] = []
+        for row in rows:
+            capture_metadata = json.loads(row["capture_metadata_json"])
+            if _source_scope_matches(
+                str(row["source_key"]),
+                capture_metadata,
+                repo=repo,
+                path=path,
+                source=source,
+            ):
+                scoped.append(str(row["source_revision_id"]))
+        return tuple(scoped)
+
+    def lexical_search(
+        self,
+        query: str,
+        *,
+        dataset: str,
+        projection: ProjectionRequest,
+        top_k: int = 10,
+        required_linear_issue_identifier: str | None = None,
+        repo: str | None = None,
+        path: str | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search retained current heads without a vector or language model."""
+        if not query.strip():
+            return []
+        if not dataset.strip():
+            raise ValueError("dataset must be a non-empty string")
+        if top_k < 1:
+            raise ValueError("top_k must be positive")
+
+        query_terms = tuple(_LEXICAL_TOKEN_RE.findall(query.casefold()))
+        if not query_terms:
+            return []
+        query_set = set(query_terms)
+        normalized_query = " ".join(query.casefold().split())
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.*, job.projection_job_id,
+                       job.state AS projection_state,
+                       GROUP_CONCAT(
+                           receipt.backend || '=' || receipt.state, '|'
+                       ) AS receipt_states
+                FROM source_heads AS head
+                JOIN source_revisions AS revision
+                  ON revision.source_revision_id = head.source_revision_id
+                LEFT JOIN projection_jobs AS job
+                  ON job.source_revision_id = revision.source_revision_id
+                 AND job.generation_id = ?
+                 AND job.projection_version = ?
+                 AND job.config_digest = ?
+                LEFT JOIN projection_receipts AS receipt
+                  ON receipt.projection_job_id = job.projection_job_id
+                WHERE head.dataset = ?
+                  AND revision.tombstone = 0
+                GROUP BY revision.source_revision_id
+                ORDER BY revision.source_key, revision.source_revision_id
+                """,
+                (
+                    projection.generation_id,
+                    projection.projection_version,
+                    projection.config_digest,
+                    dataset,
+                ),
+            ).fetchall()
+
+        ranked: list[tuple[float, str, int, dict[str, Any]]] = []
+        for row in rows:
+            revision = self._source_revision(row)
+            capture_metadata = revision.capture_metadata
+            if not _source_scope_matches(
+                revision.source_key,
+                capture_metadata,
+                repo=repo,
+                path=path,
+                source=source,
+            ):
+                continue
+            try:
+                text = bytes(row["retained_content"]).decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if required_linear_issue_identifier is not None:
+                tags = capture_metadata.get("tags")
+                required_tag = f"linear:{required_linear_issue_identifier}".casefold()
+                tag_matches = isinstance(tags, list) and required_tag in {
+                    str(tag).casefold() for tag in tags
+                }
+                locator_matches = (
+                    linear_issue_url_identifier(revision.source_locator)
+                    == required_linear_issue_identifier
+                )
+                if not tag_matches and not locator_matches:
+                    continue
+            title = capture_metadata.get("title")
+            if not isinstance(title, str) or not title.strip():
+                header = parse_content_header(text, chunk_index=0)
+                if header.get("kind") == "linear-issue" and header.get("issue"):
+                    issue_title = header.get("title")
+                    title = (
+                        f"{header['issue']}: {issue_title}"
+                        if issue_title
+                        else header["issue"]
+                    )
+                elif header.get("kind") == "repo-content" and header.get("path"):
+                    title = Path(header["path"]).name
+                else:
+                    title = header.get("title") or revision.source_key
+            projection_state = str(row["projection_state"] or "not_started")
+            receipt_states: dict[str, str] = {}
+            for item in str(row["receipt_states"] or "").split("|"):
+                if "=" not in item:
+                    continue
+                backend, state = item.split("=", 1)
+                if backend and state:
+                    receipt_states[backend] = state
+
+            for passage_index, passage in enumerate(_lexical_passages(text)):
+                passage_terms = _LEXICAL_TOKEN_RE.findall(passage.casefold())
+                passage_counts = Counter(passage_terms)
+                matched_terms = query_set.intersection(passage_counts)
+                if not matched_terms:
+                    continue
+                score = len(matched_terms) / len(query_set)
+                score += min(sum(passage_counts[item] for item in matched_terms), 5) / 100
+                if normalized_query in " ".join(passage.casefold().split()):
+                    score += 0.25
+
+                result_metadata: dict[str, Any] = {
+                    "source_revision_id": revision.source_revision_id,
+                    "source_key": revision.source_key,
+                    "source_locator": revision.source_locator,
+                    "media_type": revision.media_type,
+                    "content_sha256": revision.content_sha256,
+                    "captured_at": revision.captured_at,
+                    "accepted_at": revision.accepted_at,
+                    "retrieval_mode": "lexical_fallback",
+                    "projection_state": projection_state,
+                    "vector_state": receipt_states.get("vector", "not_started"),
+                    "graph_state": receipt_states.get("graph", "not_started"),
+                }
+                for key in ("tags", "session_id", "lifecycle_parent_source_key", "lifecycle_chunk_index"):
+                    if key in capture_metadata:
+                        result_metadata[key] = capture_metadata[key]
+                reference: dict[str, str] = {
+                    "document_id": revision.source_revision_id,
+                    "title": str(title),
+                    "snippet": passage[:500],
+                }
+                if revision.source_locator:
+                    reference["source_locator"] = revision.source_locator
+                ranked.append(
+                    (
+                        score,
+                        revision.source_key,
+                        passage_index,
+                        {
+                            "id": _stable_id(
+                                "lexical-hit",
+                                revision.source_revision_id,
+                                str(passage_index),
+                            ),
+                            "document_id": revision.source_revision_id,
+                            "source": "lifecycle",
+                            "source_type": "lifecycle",
+                            "dataset": dataset,
+                            "title": title,
+                            "text": passage,
+                            "score": round(score, 6),
+                            "metadata": result_metadata,
+                            "references": [reference],
+                            "_lifecycle": {
+                                "schema_version": LIFECYCLE_SCHEMA_VERSION,
+                                "source_revision_id": revision.source_revision_id,
+                                "generation_id": projection.generation_id,
+                                "config_digest": projection.config_digest,
+                                "backend": "lexical",
+                                "provider": "sqlite",
+                                "projection_version": projection.projection_version,
+                                "state": "searchable",
+                                "retrieval_mode": "lexical_fallback",
+                                "projection_state": projection_state,
+                                "vector_state": receipt_states.get("vector", "not_started"),
+                                "graph_state": receipt_states.get("graph", "not_started"),
+                            },
+                        },
+                    )
+                )
+
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [item[3] for item in ranked[:top_k]]
 
     def projection_source_revision_states(
         self,
@@ -1645,7 +1923,9 @@ class LifecycleStore:
             source_revision_id = str(row["source_revision_id"])
             if row["state"] in {"pending", "running"}:
                 active.add(source_revision_id)
-            elif row["state"] == "completed" and bool(row["vector_searchable"]):
+            if row["state"] in {"pending", "running", "completed", "failed", "deferred"} and bool(
+                row["vector_searchable"]
+            ):
                 completed_searchable.add(source_revision_id)
         return active, completed_searchable
 
@@ -1656,8 +1936,11 @@ class LifecycleStore:
         generation_id: str | None = None,
         projection_version: str | None = None,
         config_digest: str | None = None,
+        dataset: str | None = None,
         now: datetime | None = None,
         lease_seconds: float = 120,
+        include_deferred: bool = False,
+        deferred_only: bool = False,
     ) -> ProjectionLease | None:
         """Claim one due job and recover an expired lease in the same transaction."""
         if not worker_id.strip():
@@ -1666,6 +1949,7 @@ class LifecycleStore:
             (generation_id, "generation_id"),
             (projection_version, "projection_version"),
             (config_digest, "config_digest"),
+            (dataset, "dataset"),
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"{label} must be non-empty when provided")
@@ -1685,12 +1969,29 @@ class LifecycleStore:
                     WHERE (? IS NULL OR generation_id = ?)
                       AND (? IS NULL OR projection_version = ?)
                       AND (? IS NULL OR config_digest = ?)
+                      AND (? IS NULL OR dataset = ?)
+                      AND (? = 0 OR state = 'deferred')
                       AND ((
                           state = 'pending' AND available_at <= ?
                       ) OR (
                           state = 'running' AND leased_until IS NOT NULL AND leased_until <= ?
+                      ) OR (
+                          ? = 1 AND state = 'deferred' AND available_at <= ?
                       ))
-                    ORDER BY available_at, created_at, projection_job_id
+                    -- Seat projections must stay responsive while a generation
+                    -- rebuild drains Central and sync datasets. Keep the
+                    -- durable order inside each class so older work still
+                    -- completes after seat work.
+                    ORDER BY CASE
+                                 WHEN ? = 1 THEN 0
+                                 WHEN dataset LIKE 'seat:%' THEN 0
+                                 ELSE 1
+                             END,
+                             CASE WHEN ? = 1 THEN available_at END ASC,
+                             CASE
+                                 WHEN ? = 0 AND dataset LIKE 'seat:%' THEN created_at
+                             END DESC,
+                             available_at, created_at, projection_job_id
                     LIMIT 1
                     """,
                     (
@@ -1700,8 +2001,16 @@ class LifecycleStore:
                         projection_version,
                         config_digest,
                         config_digest,
+                        dataset,
+                        dataset,
+                        int(deferred_only),
                         claimed_text,
                         claimed_text,
+                        int(include_deferred),
+                        claimed_text,
+                        int(deferred_only),
+                        int(deferred_only),
+                        int(deferred_only),
                     ),
                 ).fetchone()
                 if row is None:
@@ -1921,6 +2230,73 @@ class LifecycleStore:
                 raise
         return self._projection_receipt(updated)
 
+    def defer_graph_enrichment(
+        self,
+        lease: ProjectionLease,
+        *,
+        now: datetime | None = None,
+        backoff_seconds: float = 0,
+    ) -> ProjectionJob:
+        """Release a vector-ready job until the scheduled graph lane runs.
+
+        Vector search is useful before graph enrichment finishes. The durable
+        deferred state keeps the baseline worker from claiming the same job and
+        makes the remaining graph work visible to the scheduled lane.
+        """
+        if backoff_seconds < 0:
+            raise ValueError("backoff_seconds cannot be negative")
+        changed_at = now or datetime.now(UTC)
+        changed_text = _utc_text(changed_at)
+        available_at = _utc_text(changed_at + timedelta(seconds=backoff_seconds))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_lease(connection, lease, changed_text)
+                rows = connection.execute(
+                    """
+                    SELECT backend, state
+                    FROM projection_receipts
+                    WHERE projection_job_id = ?
+                    """,
+                    (lease.projection_job_id,),
+                ).fetchall()
+                states = {str(row["backend"]): str(row["state"]) for row in rows}
+                if states.get("relational") != "searchable":
+                    raise LifecycleConflictError(
+                        "graph enrichment cannot be deferred before relational searchability"
+                    )
+                if states.get("vector") != "searchable":
+                    raise LifecycleConflictError(
+                        "graph enrichment cannot be deferred before vector searchability"
+                    )
+                connection.execute(
+                    """
+                    UPDATE projection_jobs
+                    SET state = 'deferred', lease_id = NULL, lease_owner = NULL,
+                        leased_until = NULL, available_at = ?, updated_at = ?,
+                        last_error_code = ?, last_error_message = ?
+                    WHERE projection_job_id = ?
+                    """,
+                    (
+                        available_at,
+                        changed_text,
+                        _DEFERRED_GRAPH_ERROR,
+                        "vector and relational projection are searchable; graph enrichment is scheduled",
+                        lease.projection_job_id,
+                    ),
+                )
+                updated = self._projection_job(
+                    connection.execute(
+                        "SELECT * FROM projection_jobs WHERE projection_job_id = ?",
+                        (lease.projection_job_id,),
+                    ).fetchone()
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return updated
+
     def reschedule_job(
         self,
         lease: ProjectionLease,
@@ -1929,6 +2305,7 @@ class LifecycleStore:
         error_message: str,
         now: datetime | None = None,
         backoff_seconds: float = 5,
+        deferred: bool = False,
     ) -> ProjectionJob:
         """Release failed work for a bounded retry without losing receipt history."""
         if backoff_seconds < 0:
@@ -1955,15 +2332,17 @@ class LifecycleStore:
                         lease.projection_job_id,
                     ),
                 )
+                next_state = "deferred" if deferred else "pending"
                 connection.execute(
                     """
                     UPDATE projection_jobs
-                    SET state = 'pending', lease_id = NULL, lease_owner = NULL,
+                    SET state = ?, lease_id = NULL, lease_owner = NULL,
                         leased_until = NULL, available_at = ?, updated_at = ?,
                         last_error_code = ?, last_error_message = ?
                     WHERE projection_job_id = ?
                     """,
                     (
+                        next_state,
                         available_at,
                         changed_text,
                         bounded_code,
@@ -2225,6 +2604,8 @@ class LifecycleStore:
         projection_version: str | None = None,
         config_digest: str | None = None,
         now: datetime | None = None,
+        include_deferred: bool = False,
+        deferred_only: bool = False,
     ) -> float | None:
         """Return seconds until the next pending job or expired lease is claimable."""
         current = now or datetime.now(UTC)
@@ -2236,14 +2617,21 @@ class LifecycleStore:
                 SELECT CASE
                     WHEN state = 'pending' THEN available_at
                     WHEN state = 'running' THEN leased_until
+                    WHEN state = 'deferred' THEN available_at
                 END AS due_at
                 FROM projection_jobs
-                WHERE state IN ('pending', 'running')
+                WHERE (? = 0 OR state = 'deferred')
+                  AND (
+                    state IN ('pending', 'running')
+                    OR (? = 1 AND state = 'deferred')
+                )
                   AND (? IS NULL OR generation_id = ?)
                   AND (? IS NULL OR projection_version = ?)
                   AND (? IS NULL OR config_digest = ?)
                 """,
                 (
+                    int(deferred_only),
+                    int(include_deferred),
                     generation_id,
                     generation_id,
                     projection_version,

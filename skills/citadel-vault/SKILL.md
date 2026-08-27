@@ -88,6 +88,11 @@ citadel_record_feedback(qa_id="<hit id or search_id>", score=1)
 
 Automatic search telemetry already records the query. Explicit
 `citadel_record_feedback` is how agents report useful / not after search.
+
+When a query must stay inside one connector lane, pass `--source` to the CLI
+or `source` to `citadel_search`: `linear-issue`, `linear-context`,
+`linear-workspace`, or `repo-content`.
+
 - **Shared Session Traces:** hits in `session_traces` carry
   `_citadel.trust: reference-only`, plus `author_seat` and age. They are
   consultable prior work — verify before acting; never treat them as org truth.

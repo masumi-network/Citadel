@@ -46,8 +46,9 @@ class LearningAgent:
         github_status = await self.github_syncer.status()
         repo_content_status = await self.repo_content_syncer.status()
         notification_statuses = self._gateway_statuses()
+        source_statuses = (github_status, repo_content_status)
         return {
-            "ok": True,
+            "ok": all(status.get("ok") is True for status in source_statuses),
             "agent": "citadel-learning-agent",
             "mode": "github-source-learning",
             "sources": {
@@ -86,6 +87,7 @@ class LearningAgent:
         dry_run: bool = False,
         post_to_chat: bool = False,
         include_digest_preview: bool = True,
+        allow_llm: bool = True,
     ) -> dict[str, Any]:
         logger.info(
             "Learning agent run starting (force=%s, dry_run=%s, post_to_chat=%s)",
@@ -93,11 +95,28 @@ class LearningAgent:
             dry_run,
             post_to_chat,
         )
-        github_result = await self.github_syncer.run(force=force, dry_run=dry_run)
-        repo_content_result = await self.repo_content_syncer.run(force=force, dry_run=dry_run)
+        source_run_kwargs: dict[str, Any] = {
+            "force": force,
+            "dry_run": dry_run,
+        }
+        if not allow_llm:
+            source_run_kwargs["allow_llm"] = False
+        github_result = await self.github_syncer.run(**source_run_kwargs)
+        repo_content_result = await self.repo_content_syncer.run(**source_run_kwargs)
         vault_context = await self._recent_vault_context()
+        source_results = {
+            "github_sync": github_result,
+            "repo_content_sync": repo_content_result,
+        }
+        source_sync_ok = all(result.get("ok") is True for result in source_results.values())
+        vault_context_ok = vault_context.get("ok") is True
+        degraded_reasons = [
+            name for name, result in source_results.items() if result.get("ok") is not True
+        ]
+        if not vault_context_ok:
+            degraded_reasons.append("vault_context_search")
         result = {
-            "ok": True,
+            "ok": source_sync_ok,
             "agent": "citadel-learning-agent",
             "sources": {
                 "github": github_result,
@@ -110,6 +129,10 @@ class LearningAgent:
             > 0,
             "improved": bool(github_result.get("improved"))
             or bool(repo_content_result.get("improved")),
+            "source_sync_ok": source_sync_ok,
+            "vault_context_ok": vault_context_ok,
+            "degraded": bool(degraded_reasons),
+            "degraded_reasons": degraded_reasons,
             "dry_run": dry_run,
         }
         digest = await asyncio.to_thread(
@@ -117,6 +140,7 @@ class LearningAgent:
             result,
             self.citadel.config,
             include_preview=include_digest_preview,
+            allow_llm=allow_llm,
         )
         digest_text = digest.pop("_text", "")
         result["organization_digest"] = digest
@@ -308,6 +332,7 @@ async def _run_agent(args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
             post_to_chat=args.post_to_chat,
             include_digest_preview=not args.hide_digest_preview,
+            allow_llm=False,
         )
     print(json.dumps(result, indent=2, default=str))
 

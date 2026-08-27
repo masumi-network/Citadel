@@ -6,6 +6,11 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Knowledge-graph inspector now supports long connection lists.** Selected
+  nodes render up to 8 neighbor links and a `Show all N connections` control.
+  Expanded mode shows the full set with a scrollable list so users can reach
+  all relations in dense graphs.
+
 - **Public tiles** quote self-host cost as a range (`~$23–$58/mo`): 24h
   Railway average 2026-08-17 about $23, trailing-7-day 2026-08-14 about
   $58. Memory dominates. Not a fixed bill. Search 25 s stays in the

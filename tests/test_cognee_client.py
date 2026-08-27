@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID, uuid4
@@ -66,9 +67,10 @@ async def test_cognee_public_client_runs_migrations_once(monkeypatch: Any) -> No
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     await client.remember("note", dataset_name="notes")
-    await client.recall("note", dataset="notes")
+    await client.recall("note", dataset="notes", allow_generative=True)
 
     assert calls == ["migrate"]
 
@@ -96,6 +98,7 @@ async def test_cognee_public_client_fails_closed_when_migrations_fail(
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     async def create_database() -> None:
         calls.append("create")
@@ -124,9 +127,11 @@ async def test_cognee_public_client_rejects_reported_migration_failures(
         "cognee",
         SimpleNamespace(run_migrations=run_migrations, add=add),
     )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     with pytest.raises(RuntimeError, match="migrations failed for 1 database"):
-        await CogneePublicClient().remember("note", dataset_name="notes")
+        await client.remember("note", dataset_name="notes")
 
 
 @pytest.mark.asyncio
@@ -153,6 +158,7 @@ async def test_cognee_public_client_does_not_pass_external_metadata_keyword(
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
     await client.remember("note", dataset_name="notes", tags=("github", "daily-sync"))
 
@@ -198,8 +204,10 @@ async def test_remember_passes_explicit_lifecycle_data_id_to_cognee(
         "cognee",
         SimpleNamespace(run_migrations=run_migrations, add=add),
     )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
-    await CogneePublicClient().remember(
+    await client.remember(
         "retained lifecycle source",
         dataset_name="central",
         data_id=data_id,
@@ -221,6 +229,139 @@ async def test_cognify_raises_without_llm_key(monkeypatch: Any) -> None:
 
     with pytest.raises(RuntimeError, match="LLM_API_KEY"):
         await client.cognify(datasets=["notes"])
+
+
+@pytest.mark.asyncio
+async def test_vector_project_uses_chunk_embedding_pipeline_without_llm(
+    monkeypatch: Any,
+) -> None:
+    import cognee
+
+    captured: list[dict[str, Any]] = []
+
+    async def run_custom_pipeline(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return {"status": "completed"}
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(cognee, "run_custom_pipeline", run_custom_pipeline)
+
+    result = await client.vector_project(datasets=["notes"], force=False)
+
+    assert result == [{"status": "completed"}]
+    assert len(captured) == 1
+    assert captured[0]["skip_connection_test"] is True
+    assert captured[0]["incremental_loading"] is True
+    assert captured[0]["data_cache"] is True
+    assert [task.executable.__name__ for task in captured[0]["tasks"]] == [
+        "classify_documents",
+        "extract_chunks_from_documents",
+        "index_data_points",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vector_project_limits_pipeline_to_requested_document_ids(
+    monkeypatch: Any,
+) -> None:
+    import cognee
+
+    captured: list[dict[str, Any]] = []
+    selected = object()
+    document_id = "508228e3-bd9d-59fb-a0cb-a69362976e9d"
+
+    async def run_custom_pipeline(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return {"status": "completed"}
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    async def vector_projection_data(**kwargs: Any) -> list[Any]:
+        assert kwargs == {"dataset": "notes", "document_ids": [document_id]}
+        return [selected]
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_vector_projection_data", vector_projection_data)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(cognee, "run_custom_pipeline", run_custom_pipeline)
+
+    await client.vector_project(
+        datasets=["notes"],
+        document_ids=[document_id],
+    )
+
+    assert captured[0]["data"] == [selected]
+    assert captured[0]["incremental_loading"] is False
+    assert captured[0]["data_cache"] is False
+
+
+@pytest.mark.asyncio
+async def test_vector_projection_data_reads_authorized_rows_in_requested_order(
+    monkeypatch: Any,
+) -> None:
+    import cognee.infrastructure.databases.relational as relational
+    import cognee.modules.users.methods as user_methods
+
+    first_id = UUID("508228e3-bd9d-59fb-a0cb-a69362976e9d")
+    second_id = UUID("608228e3-bd9d-59fb-a0cb-a69362976e9d")
+    first = SimpleNamespace(id=first_id)
+    second = SimpleNamespace(id=second_id)
+
+    class FakeResult:
+        def scalars(self) -> "FakeResult":
+            return self
+
+        def all(self) -> list[Any]:
+            return [first, second]
+
+    class FakeSession:
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def execute(self, _query: Any) -> FakeResult:
+            return FakeResult()
+
+    class FakeEngine:
+        def get_async_session(self) -> FakeSession:
+            return FakeSession()
+
+    user = SimpleNamespace(
+        id=UUID("708228e3-bd9d-59fb-a0cb-a69362976e9d"),
+        tenant_id=UUID("808228e3-bd9d-59fb-a0cb-a69362976e9d"),
+    )
+    monkeypatch.setattr(relational, "get_relational_engine", lambda: FakeEngine())
+
+    async def get_default_user() -> Any:
+        return user
+
+    monkeypatch.setattr(user_methods, "get_default_user", get_default_user)
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+
+    selected = await client._vector_projection_data(
+        dataset="notes",
+        document_ids=[str(second_id), str(first_id)],
+    )
+
+    assert selected == [second, first]
 
 
 @pytest.mark.asyncio
@@ -298,6 +439,32 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
     await client.graph_data()
 
     assert reads == 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cognify_does_not_change_provider_route_on_failure(
+    monkeypatch: Any,
+) -> None:
+    client = CogneePublicClient()
+    client.lifecycle_projection_state_lookup = lambda _: (set(), set())
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.delenv("CITADEL_EMBEDDING_PROFILE", raising=False)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def ensure_ready(_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+
+    async def cognify(**_: Any) -> dict[str, Any]:
+        raise RuntimeError("embedding provider quota")
+
+    monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace(cognify=cognify))
+
+    with pytest.raises(RuntimeError, match="new generation"):
+        await client.cognify(datasets=["notes"])
+
+    assert os.getenv("CITADEL_EMBEDDING_PROFILE") is None
 
 
 @pytest.mark.asyncio
@@ -1039,12 +1206,14 @@ def test_auto_feedback_is_off_by_default_in_cognees_own_config(
             factory.cache_clear()
 
 
-def test_an_explicit_auto_feedback_setting_wins(monkeypatch: Any) -> None:
-    """The default must be overridable without a deploy, so it stays reversible."""
+def test_auto_feedback_stays_disabled_even_when_environment_enables_it(
+    monkeypatch: Any,
+) -> None:
+    """User retrieval must not regain a search-time LLM through environment drift."""
     monkeypatch.setenv("AUTO_FEEDBACK", "true")
     CogneePublicClient()._prepare_cognee_environment()
 
-    assert os.environ["AUTO_FEEDBACK"] == "true"
+    assert os.environ["AUTO_FEEDBACK"] == "false"
 
 
 def test_qdrant_provider_loads_citadel_adapter(monkeypatch: Any) -> None:
@@ -1183,6 +1352,7 @@ def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
     session with this tmp_path.
     """
     from cognee.base_config import get_base_config
+    from cognee.infrastructure.databases.graph.config import get_graph_config
     from cognee.infrastructure.databases.relational.config import get_relational_config
     from cognee.infrastructure.databases.relational.create_relational_engine import (
         create_relational_engine,
@@ -1195,14 +1365,22 @@ def cognee_sqlite(tmp_path: Any, monkeypatch: Any) -> Any:
         "DATA_ROOT_DIRECTORY": str(tmp_path / "data"),
         "CACHE_ROOT_DIRECTORY": str(tmp_path / "cache"),
         "COGNEE_LOGS_DIR": str(tmp_path / "logs"),
+        "DB_PATH": str(tmp_path / "system" / "databases"),
         "DEFAULT_USER_EMAIL": "citadel_test@example.com",
         "DEFAULT_USER_PASSWORD": "citadel-test-password",
         "LLM_API_KEY": "unused-by-this-test",
     }.items():
         monkeypatch.setenv(key, value)
 
+    import kb.cognee_client as cognee_client_module
+
+    cognee_client_module._PREPARED_COGNEE_STORAGE_SIGNATURE = None
+    for relative in ("system", "data", "cache", "logs", "system/databases"):
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
+
     def _clear() -> None:
         get_base_config.cache_clear()
+        get_graph_config.cache_clear()
         get_relational_config.cache_clear()
         create_relational_engine.cache_clear()
 
@@ -1951,6 +2129,7 @@ async def test_failed_background_cognify_retries_without_new_ingest(
         SimpleNamespace(run_migrations=run_migrations, cognify=cognify),
     )
     client = CogneePublicClient(retry_queue=queue)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
     client.schedule_cognify(["central"])
 
     await asyncio.wait_for(retried.wait(), timeout=3)
@@ -2096,6 +2275,7 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
     )
     monkeypatch.setattr(queue, "renew", fail_renewal)
     client = CogneePublicClient(retry_queue=queue)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
     client.schedule_cognify(["central"])
     task = client._cognify_queue_task
     assert task is not None
@@ -2498,13 +2678,19 @@ async def test_cognee_public_client_uses_chunk_search_by_default(monkeypatch: An
         sys.modules,
         "cognee",
         SimpleNamespace(
-            SearchType=SimpleNamespace(CHUNKS="chunks"),
+            SearchType=SimpleNamespace(
+                CHUNKS="chunks",
+                GRAPH_COMPLETION="graph_completion",
+            ),
             run_migrations=run_migrations,
             recall=recall,
             search=search,
         ),
     )
     client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setenv("CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION")
+    monkeypatch.setenv("AUTO_FEEDBACK", "true")
 
     result = await client.recall("note", dataset="notes")
 
@@ -2512,6 +2698,42 @@ async def test_cognee_public_client_uses_chunk_search_by_default(monkeypatch: An
     assert "recall" not in received
     assert received["search"]["query_type"] == "chunks"
     assert received["search"]["datasets"] == ["notes"]
+
+
+@pytest.mark.asyncio
+async def test_cognee_public_client_honors_explicit_graph_search(
+    monkeypatch: Any,
+) -> None:
+    received: dict[str, Any] = {}
+
+    async def run_migrations() -> None:
+        return None
+
+    async def search(**kwargs: Any) -> list[dict[str, Any]]:
+        received["search"] = kwargs
+        return [{"ok": True}]
+
+    monkeypatch.setenv("CITADEL_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION")
+    monkeypatch.setitem(
+        sys.modules,
+        "cognee",
+        SimpleNamespace(
+            SearchType=SimpleNamespace(
+                CHUNKS="chunks",
+                GRAPH_COMPLETION="graph_completion",
+            ),
+            run_migrations=run_migrations,
+            search=search,
+        ),
+    )
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    result = await client.recall("note", dataset="notes", allow_generative=True)
+
+    assert result == [{"ok": True}]
+    assert received["search"]["query_type"] == "graph_completion"
+    assert received["search"]["include_references"] is True
 
 
 @pytest.mark.asyncio
@@ -2578,7 +2800,12 @@ async def test_session_recall_off_by_default_and_opt_in(monkeypatch: Any) -> Non
 
     # Default OFF: the session cache is never read; the durable chunk search runs.
     monkeypatch.delenv("CITADEL_COGNEE_SESSION_RECALL", raising=False)
-    result = await client.recall("note", dataset="notes", session_id="source-session")
+    result = await client.recall(
+        "note",
+        dataset="notes",
+        session_id="source-session",
+        allow_generative=True,
+    )
     assert result == [{"source": "graph"}]
     assert "recall" not in received  # session QA cache never touched
     assert "search" in received
@@ -2586,7 +2813,12 @@ async def test_session_recall_off_by_default_and_opt_in(monkeypatch: Any) -> Non
     # Opt-in: session recall runs first only when explicitly enabled.
     received.clear()
     monkeypatch.setenv("CITADEL_COGNEE_SESSION_RECALL", "true")
-    result = await client.recall("note", dataset="notes", session_id="source-session")
+    result = await client.recall(
+        "note",
+        dataset="notes",
+        session_id="source-session",
+        allow_generative=True,
+    )
     assert result == [{"source": "session"}]
     assert received["recall"]["kwargs"]["scope"] == "session"
     assert "search" not in received
@@ -2716,7 +2948,12 @@ async def test_cognee_public_client_falls_back_when_session_has_no_data(
 
     # The session-recall fallback only applies when session recall is opted in.
     monkeypatch.setenv("CITADEL_COGNEE_SESSION_RECALL", "true")
-    result = await client.recall("note", dataset="notes", session_id="source-session")
+    result = await client.recall(
+        "note",
+        dataset="notes",
+        session_id="source-session",
+        allow_generative=True,
+    )
 
     assert result == [{"source": "chunks"}]
     assert received["recall"]["kwargs"]["scope"] == "session"
@@ -4816,6 +5053,111 @@ async def test_document_graph_store_miss_is_not_a_fallback(monkeypatch: Any) -> 
     monkeypatch.setitem(sys.modules, "cognee", SimpleNamespace())
 
     assert await client._document_graph("ghost-id") == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_document_graph_engine_failure_uses_fresh_cache(
+    monkeypatch: Any,
+) -> None:
+    """A failed targeted engine can still use a fresh full-graph cache."""
+    client = CogneePublicClient()
+    cached = ([("doc-1", {"text": "cached graph text"})], [])
+    client._graph_data_cache = (monotonic(), cached)
+
+    async def unavailable_engine() -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    monkeypatch.setattr(client, "_graph_engine", unavailable_engine)
+
+    assert await client._document_graph_current_context("doc-1") == cached
+
+
+@pytest.mark.asyncio
+async def test_get_document_uses_chunk_store_after_graph_failure(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """Retained content stays drillable while graph storage is unavailable."""
+    client = CogneePublicClient()
+    expected = {
+        "id": "doc-1",
+        "body": "retained source text",
+        "dataset_node_ids": ["doc-1"],
+    }
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def retained_document(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return expected
+
+    monkeypatch.setattr(client, "_document_from_graph", failed_graph)
+    monkeypatch.setattr(client, "_document_from_chunk_store", retained_document)
+
+    with caplog.at_level("WARNING", logger="kb.cognee_client"):
+        assert await client.get_document("doc-1") == expected
+    assert "served retained chunk content: PermissionError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_document_preserves_graph_failure_when_chunk_store_misses(
+    monkeypatch: Any,
+) -> None:
+    """A storage failure must not become a false missing-document result."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def missing_document(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_document_from_graph", failed_graph)
+    monkeypatch.setattr(client, "_document_from_chunk_store", missing_document)
+
+    with pytest.raises(PermissionError, match="graph storage is unavailable"):
+        await client.get_document("doc-1")
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_owner_ids_uses_chunk_store_after_graph_failure(
+    monkeypatch: Any,
+) -> None:
+    """Search keeps its drilldown hint when retained chunk ownership resolves."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def retained_owner_ids(*args: Any, **kwargs: Any) -> list[str]:
+        return ["doc-1", "chunk-1"]
+
+    monkeypatch.setattr(client, "_document_graph", failed_graph)
+    monkeypatch.setattr(client, "_owner_ids_from_chunk_store", retained_owner_ids)
+
+    assert await client.resolve_document_owner_ids("chunk-1") == [
+        "doc-1",
+        "chunk-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_owner_ids_preserves_graph_failure_on_chunk_miss(
+    monkeypatch: Any,
+) -> None:
+    """Search must not hide a graph failure as a missing drilldown target."""
+    client = CogneePublicClient()
+
+    async def failed_graph(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("graph storage is unavailable")
+
+    async def missing_owner_ids(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_document_graph", failed_graph)
+    monkeypatch.setattr(client, "_owner_ids_from_chunk_store", missing_owner_ids)
+
+    with pytest.raises(PermissionError, match="graph storage is unavailable"):
+        await client.resolve_document_owner_ids("chunk-1")
 
 
 @pytest.mark.asyncio

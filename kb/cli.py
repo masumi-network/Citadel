@@ -49,7 +49,6 @@ from kb.onboard import (
     claude_user_settings_path,
     detect_shell_rc,
     diagnose_mcp_config,
-    ensure_env_in_rc,
     ensure_token_in_rc,
     format_onboard_next_steps,
     git_root_or_cwd,
@@ -88,7 +87,6 @@ from kb.promotion_client import (
     list_pending,
     node_base_url,
     reject_pending,
-    run_promotion,
 )
 from kb.status import (
     MCP_STATE_MISSING,
@@ -98,6 +96,7 @@ from kb.status import (
     check_auth,
     fetch_events,
     fetch_mesh,
+    fetch_mesh_summary,
     fetch_presence,
     gather_status,
     render_text,
@@ -533,19 +532,22 @@ async def _ingest(args: argparse.Namespace) -> int:
     token = capture_token()
     if not token:
         return _emit_no_token("ingest", as_json=getattr(args, "json", False))
-    from kb.status import _COGNIFY_TIMEOUT, _INGEST_TIMEOUT, ingest_node
+    from kb.status import _INGEST_TIMEOUT, ingest_node
 
-    # Async by default: the Node accepts the note and the lifecycle drain makes
-    # it searchable within minutes. Inline cognify (--cognify) blocks the one
-    # request until the graph is built — long enough (~2 min on cold nodes) that
-    # proxy edges kill it with a 502 while the server still accepts the write.
-    cognify = bool(getattr(args, "cognify", False))
     as_json = getattr(args, "json", False)
+    if getattr(args, "cognify", False):
+        return _emit_error(
+            "ingest",
+            "User ingest is capture-only; run scheduled projection separately.",
+            as_json=as_json,
+            code="COGNIFY_SCHEDULER_ONLY",
+        )
+    cognify = False
     timeout_arg = getattr(args, "timeout", None)
     if timeout_arg is not None:
         timeout_s = max(1.0, float(timeout_arg))
     else:
-        timeout_s = _COGNIFY_TIMEOUT if cognify else _INGEST_TIMEOUT
+        timeout_s = _INGEST_TIMEOUT
 
     def _timeout_exit() -> int:
         # A client timeout proves only that no response arrived in the budget.
@@ -554,7 +556,7 @@ async def _ingest(args: argparse.Namespace) -> int:
         return _emit_error(
             "ingest",
             f"no response after {timeout_s:g}s — the Node may still be processing "
-            "(cognify is slow on cold nodes). A client timeout does not prove the "
+            "the capture. A client timeout does not prove the "
             "write failed: check `citadel activity` (or search for the note) to "
             "confirm, or retry with a longer --timeout.",
             as_json=as_json,
@@ -615,21 +617,19 @@ async def _ingest(args: argparse.Namespace) -> int:
         )
         if cognified is True:
             print(f"  {mark(True, enable=color)} cognified — now searchable")
-        elif cognified is False:
-            print(f"  {paint(SKIP, 'yellow', enable=color)} ingested, but cognify didn't finish — the next Node sync will pick it up")
-        elif cognify:
+        elif cognified is False and cognify:
             # Requested cognify but the Node didn't report it (older Node, pre inline-cognify).
             print(paint("  (graph update will happen on the next Node sync)", "dim", enable=color))
         else:
-            # Async default. "queued_not_confirmed" is the Node's honest receipt:
-            # the note is stored durably and not yet searchable.
+            # Capture-only default. "queued_not_confirmed" is the Node's honest
+            # receipt: the note is stored durably and not yet searchable.
             job_id = result.get("projection_job_id")
-            track = f" — track: citadel operation {job_id}" if job_id else ""
+            track = f" Track with: citadel operation {job_id}" if job_id else ""
             if str(result.get("reason") or "") == "queued_not_confirmed":
                 print(
                     paint(
-                        f"  queued (not yet searchable) — the Node projects it "
-                        f"within minutes{track}",
+                        "  queued (not yet searchable). Scheduled projection owns this work."
+                        f"{track}",
                         "dim",
                         enable=color,
                     )
@@ -686,8 +686,17 @@ async def _operation(args: argparse.Namespace) -> int:
             code="NODE_UNREACHABLE",
         )
     if as_json:
+        if getattr(args, "require_searchable", False) and result.get("state") != "searchable":
+            result = {
+                **result,
+                "ok": False,
+                "code": "OPERATION_NOT_SEARCHABLE",
+                "error": f"operation state is {result.get('state', 'unknown')}",
+            }
         _print_json(result)
-        return 0
+        return 0 if result.get("state") == "searchable" or not getattr(
+            args, "require_searchable", False
+        ) else 1
     print(f"Operation {result.get('projection_job_id', args.projection_job_id)}")
     print(f"State: {result.get('state', 'unknown')}")
     for receipt in result.get("receipts", []):
@@ -697,7 +706,62 @@ async def _operation(args: argparse.Namespace) -> int:
                 f"{receipt.get('state', 'unknown')} "
                 f"({receipt.get('provider', 'unknown')})"
             )
+    if getattr(args, "require_searchable", False) and result.get("state") != "searchable":
+        return 1
     return 0
+
+
+async def _document(args: argparse.Namespace) -> int:
+    """Fetch one retained source document from a search hit."""
+    token = capture_token()
+    as_json = getattr(args, "json", False)
+    if not token:
+        return _emit_no_token("document", as_json=as_json)
+    from kb.status import fetch_document
+
+    try:
+        result = await asyncio.to_thread(
+            fetch_document,
+            node_base_url(getattr(args, "node_url", None)),
+            token,
+            args.document_id,
+        )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        if not as_json:
+            _print_auth_hint("document", exc.code)
+        return _emit_error(
+            "document",
+            f"HTTP {exc.code} {detail}",
+            as_json=as_json,
+            code="HTTP_ERROR",
+            extra={"http_status": exc.code},
+        )
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        return _emit_error(
+            "document",
+            str(exc),
+            as_json=as_json,
+            code="NODE_UNREACHABLE",
+        )
+
+    if as_json:
+        from kb.search_format import compact_document_payload_for_agent
+
+        result = compact_document_payload_for_agent(result)
+        _print_json(result)
+        return _result_exit(result)
+    document = result.get("document") if isinstance(result, dict) else None
+    if isinstance(document, dict):
+        print(f"Document {document.get('id', args.document_id)}")
+        body = document.get("body") or document.get("text")
+        if isinstance(body, str) and body:
+            print(body)
+        else:
+            print(json.dumps(document, default=str, indent=2))
+    else:
+        print(json.dumps(result, default=str, indent=2))
+    return _result_exit(result)
 
 
 @_needs_server
@@ -710,6 +774,7 @@ async def _ingest_local(args: argparse.Namespace) -> int:
         dataset=args.dataset,
         tags=args.tag,
         session_id=args.session,
+        defer_cognify=True,
     )
     _print_json(result.__dict__)
     return _result_exit(result)
@@ -736,16 +801,39 @@ def _search_item_text(item: Any) -> str:
 
 
 def _search_item_meta(item: dict[str, Any], *, color: bool) -> str:
+    from kb.search_format import shape_public_search_hit
+
     envelope = item.get("_citadel")
     if not isinstance(envelope, dict):
-        return ""
+        envelope = {}
+    public = shape_public_search_hit(item)
     parts: list[str] = []
     trust = envelope.get("trust")
+    if not trust and public.get("trust_tier") == "reference-only":
+        trust = public["trust_tier"]
     if trust:
         parts.append(f"trust: {trust}")
     author = envelope.get("author_seat")
     if author:
         parts.append(f"author: {author}")
+    source_type = public.get("source_type")
+    if source_type:
+        parts.append(f"source: {source_type}")
+    retrieval = public.get("retrieval")
+    if isinstance(retrieval, dict):
+        mode = retrieval.get("mode")
+        if mode:
+            parts.append(f"mode: {mode}")
+    locator = public.get("source_locator") or public.get("source")
+    if locator:
+        parts.append(f"citation: {locator}")
+    elif source_type:
+        parts.append("citation: unavailable")
+    document_id = public.get("document_id")
+    if public.get("document_drilldown_available") and document_id:
+        parts.append(f"drilldown: citadel document {document_id}")
+    elif source_type:
+        parts.append("drilldown: unavailable")
     if not parts:
         return ""
     return paint(f"({' · '.join(parts)}) ", "yellow", enable=color)
@@ -757,6 +845,11 @@ def _render_search(payload: dict[str, Any], query: str) -> None:
     if not isinstance(results, list):
         results = []
     if not results:
+        if payload.get("code") == "QUERY_CONTEXT_REQUIRED":
+            message = payload.get("message")
+            detail = message if isinstance(message, str) and message else "Name the search subject."
+            print(paint(f"QUERY_CONTEXT_REQUIRED: {detail}", "yellow", enable=color))
+            return
         print(paint(f'No results for "{query}".', "dim", enable=color))
         return
     print(f'{len(results)} result(s) for "{query}":\n')
@@ -809,6 +902,7 @@ def _shape_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "types": _search_type_filters(args),
         "repo": getattr(args, "repo", None),
         "path": getattr(args, "path", None),
+        "source": getattr(args, "source", None),
         "canonical_only": bool(getattr(args, "canonical_only", False)),
         "exclude_ambient": exclude_ambient,
         "mode": mode.strip().lower() if isinstance(mode, str) and mode.strip() else None,
@@ -890,6 +984,7 @@ async def _search(args: argparse.Namespace) -> int:
         apply_query_ranking,
         is_docs_mode_query,
         is_spec_mode_query,
+        prepare_search_payload_for_agent,
         query_terms,
         shape_search_payload,
     )
@@ -904,6 +999,7 @@ async def _search(args: argparse.Namespace) -> int:
         shape_kw["types"]
         or shape_kw["repo"]
         or shape_kw["path"]
+        or shape_kw["source"]
         or shape_kw["canonical_only"]
         or shape_kw["exclude_ambient"]
         or shape_kw.get("mode")
@@ -921,6 +1017,7 @@ async def _search(args: argparse.Namespace) -> int:
                 types=shape_kw["types"],
                 repo=shape_kw["repo"],
                 path=shape_kw["path"],
+                source=shape_kw["source"],
                 canonical_only=shape_kw["canonical_only"],
                 exclude_ambient=shape_kw["exclude_ambient"],
                 mode=shape_kw.get("mode"),
@@ -974,7 +1071,7 @@ async def _search(args: argparse.Namespace) -> int:
 
     shaped = shape_search_payload(raw, **shape_kw)
     if getattr(args, "json", False):
-        _print_json(shaped)
+        _print_json(prepare_search_payload_for_agent(raw))
         return 0
 
     # Human view: always apply filters; for API/spec or docs/token queries also
@@ -1001,8 +1098,21 @@ async def _search(args: argparse.Namespace) -> int:
 @_needs_server
 async def _search_local(args: argparse.Namespace) -> int:
     from kb.agent_workflows import normalize_local_search_results
-    from kb.search_format import shape_search_payload
+    from kb.search_format import (
+        prepare_search_payload_for_agent,
+        search_query_clarification,
+        shape_search_payload,
+    )
     from kb.service import Citadel
+
+    clarification = search_query_clarification(args.query)
+    if clarification is not None:
+        shaped = shape_search_payload(
+            {"results": [], **clarification},
+            **_shape_kwargs(args),
+        )
+        _print_json(prepare_search_payload_for_agent(shaped))
+        return 0
 
     kb = Citadel.from_env()
     top_k = getattr(args, "top_k", None) or 10
@@ -1018,7 +1128,7 @@ async def _search_local(args: argparse.Namespace) -> int:
 
     payload = normalize_local_search_results(results)
     shaped = shape_search_payload(payload, **_shape_kwargs(args))
-    _print_json(shaped)
+    _print_json(prepare_search_payload_for_agent(shaped))
     return 0 if shaped.get("ok") else 1
 
 
@@ -1169,32 +1279,41 @@ async def _feedback(args: argparse.Namespace) -> None:
 
 @_needs_server
 async def _improve(args: argparse.Namespace) -> None:
-    from kb.service import Citadel
-
-    kb = Citadel.from_env()
-    result = await kb.improve(dataset=args.dataset, session_ids=args.session_id)
-    _print_json(result)
-    return _result_exit(result)
+    _print_json(
+        {
+            "ok": False,
+            "reason": "llm_scheduled_only",
+            "message": "Cognee improvement runs only in the scheduled evolve job.",
+        }
+    )
+    return 2
 
 
 @_needs_server
 async def _cognify(args: argparse.Namespace) -> None:
-    from kb.service import Citadel
-
-    kb = Citadel.from_env()
-    result = await kb.cognify_dataset(
-        dataset=args.dataset,
-        verify=args.verify,
-        force=args.force,
+    _print_json(
+        {
+            "ok": False,
+            "reason": "llm_scheduled_only",
+            "message": "Cognee projection runs only in the scheduled evolve job.",
+        }
     )
-    _print_json(result)
-    return _result_exit(result)
+    return 2
 
 
 @_needs_server
 async def _reindex(args: argparse.Namespace) -> int:
     from kb.service import Citadel
 
+    if args.apply:
+        _print_json(
+            {
+                "ok": False,
+                "reason": "llm_scheduled_only",
+                "message": "Corpus repair projection must run as a scheduled operator job.",
+            }
+        )
+        return 2
     if args.force and not args.apply:
         raise ValueError("--force requires --apply")
     if args.recover and not args.apply:
@@ -1237,9 +1356,13 @@ async def _sync_github(args: argparse.Namespace) -> None:
         max_commits_per_repo=args.max_commits_per_repo,
         include_commits=not args.skip_commits,
         ingest_unchanged=not args.skip_unchanged,
-        run_improve=not args.skip_improve,
+        run_improve=False,
     )
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -1250,7 +1373,11 @@ async def _sync_repo_content(args: argparse.Namespace) -> None:
     from kb.service import Citadel
 
     syncer = RepoContentSyncer(Citadel.from_env())
-    result = await syncer.run(force=args.force, dry_run=args.dry_run)
+    result = await syncer.run(
+        force=args.force,
+        dry_run=args.dry_run,
+        allow_llm=False,
+    )
     _print_json(result)
     return _result_exit(result)
 
@@ -1265,6 +1392,7 @@ async def _learn(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         post_to_chat=args.post_to_chat,
         include_digest_preview=not args.hide_digest_preview,
+        allow_llm=False,
     )
     _print_json(result)
     return _result_exit(result)
@@ -1619,28 +1747,16 @@ async def _promotion_reject(args: argparse.Namespace) -> int:
 @_needs_server
 async def _promotion_run(args: argparse.Namespace) -> int:
     as_json = args.json
-    dry_run = not args.execute
-    try:
-        result = run_promotion(
-            base_url=_promotion_base_url(args),
-            dataset=args.dataset,
-            dry_run=dry_run,
-            max_items=args.max_items,
-        )
-    except PromotionClientError as exc:
-        return _promotion_exit(exc, as_json=as_json)
+    result = {
+        "ok": False,
+        "reason": "llm_scheduled_only",
+        "message": "Promotion classification runs only in the scheduled evolve job.",
+    }
     if as_json:
         _print_json(result)
     else:
-        mode = "dry-run" if dry_run else "execute"
-        print(
-            f"Promotion {mode} on {result.get('dataset')}: "
-            f"candidates={result.get('candidates')} "
-            f"proposed={result.get('proposed')} "
-            f"promoted={result.get('promoted')} "
-            f"queued={result.get('queued')}"
-        )
-    return 0 if result.get("ok") else 1
+        print(f"citadel promotion: {result['message']}", file=sys.stderr)
+    return 2
 
 
 def _access_exit(exc: AccessClientError, *, as_json: bool) -> int:
@@ -2186,6 +2302,44 @@ async def _mcp_list(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _skills(args: argparse.Namespace) -> int:
+    """List or print the bundled Citadel management skills without network calls."""
+    from kb.skills import resolve_skill_slug, skill_catalog, skill_path
+
+    command = getattr(args, "skills_command", None) or "list"
+    if command == "list":
+        skills = skill_catalog()
+        if getattr(args, "json", False):
+            _print_json({"ok": True, "skills": skills})
+        else:
+            for skill in skills:
+                print(f"{skill['slug']}: {skill['description']}")
+        return 0
+
+    slug = resolve_skill_slug(getattr(args, "slug", ""))
+    path = skill_path(getattr(args, "slug", ""))
+    if slug is None or path is None:
+        message = f"Unknown skill: {getattr(args, 'slug', '')}"
+        if getattr(args, "json", False):
+            _print_json({"ok": False, "error": message})
+        else:
+            print(f"citadel skills: {message}", file=sys.stderr)
+        return 1
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        if getattr(args, "json", False):
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            print(f"citadel skills: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        _print_json({"ok": True, "skill": slug, "content": content})
+    else:
+        print(content, end="")
+    return 0
+
+
 async def _status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).expanduser() if args.repo else git_root_or_cwd()
     config_path = Path(args.config).expanduser() if args.config else capture_config_path()
@@ -2211,7 +2365,12 @@ async def _status(args: argparse.Namespace) -> int:
 
     if args.json:
         report, mesh = await asyncio.gather(
-            _gather(), asyncio.to_thread(fetch_mesh, node_url, token)
+            _gather(),
+            asyncio.to_thread(
+                fetch_mesh if getattr(args, "full", False) else fetch_mesh_summary,
+                node_url,
+                token,
+            ),
         )
         payload = report.to_dict()
         payload["mesh"] = mesh
@@ -2550,7 +2709,7 @@ async def _doctor(args: argparse.Namespace) -> int:
             "problem": f"data plane not ready ({corpus.detail}); Node and auth are healthy",
             "fix": (
                 "inspect the corpus probe in `citadel status --json`; "
-                "check the evolve scheduler / cognify; run `citadel cognify --verify`"
+                "check the scheduled evolve and projection jobs"
             ),
         })
 
@@ -2897,30 +3056,6 @@ async def _onboard(args: argparse.Namespace) -> int:
             steps.append((f"node url → {cfg_path}", node_url))
         except ValueError:
             pass
-
-    # Optionally collect an OpenRouter key so local `cognify`/`cognify --verify`
-    # and proactive-ingest work out of the box (#35). Interactive-only; written
-    # to the shell rc next to the seat token.
-    if interactive:
-        llm_key = _prompt_hidden(
-            "\nOpenRouter API key for local cognify — Enter to skip: "
-        )
-        if llm_key:
-            steps.append(
-                (
-                    f"OpenRouter key → {rc_path}",
-                    ensure_env_in_rc(
-                        rc_path,
-                        "OPENROUTER_API_KEY",
-                        llm_key,
-                        comment="OpenRouter key for Citadel local cognify (added by `citadel onboard`)",
-                    ),
-                )
-            )
-            # Only relevant once a key exists — noise for everyone who skipped.
-            print(
-                "  (local cognify also needs: pipx install 'citadel-archive[server]')"
-            )
 
     # Capture roots (unless --no-capture): the wizard asks about the repo
     # toplevel explicitly (declinable); if the config still ends up empty, it
@@ -3532,6 +3667,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the search smoke check (default; kept for script compatibility)",
     )
     status.add_argument("--no-recent", action="store_true", help="Skip recent-activity fetch")
+    status.add_argument(
+        "--full",
+        action="store_true",
+        help="Include the full mesh graph in JSON output (large; agents usually need the summary)",
+    )
     status.set_defaults(handler=_status)
 
     activity = subcommands.add_parser(
@@ -3857,6 +3997,20 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_list = mcp_sub.add_parser("list", help="List detected coding tools and how each is wired")
     mcp_list.set_defaults(handler=_mcp_list)
 
+    skills = subcommands.add_parser(
+        "skills",
+        help="List or show Citadel management skills for agents",
+    )
+    skills.set_defaults(handler=_skills, skills_command="list", json=False)
+    skills_sub = skills.add_subparsers(dest="skills_command", required=False)
+    skills_list = skills_sub.add_parser("list", help="List bundled skills")
+    skills_list.add_argument("--json", action="store_true", help="Machine-readable output")
+    skills_list.set_defaults(handler=_skills)
+    skills_show = skills_sub.add_parser("show", help="Print one bundled skill")
+    skills_show.add_argument("slug", help="Skill slug or alias, for example citadel or vault")
+    skills_show.add_argument("--json", action="store_true", help="Machine-readable output")
+    skills_show.set_defaults(handler=_skills)
+
     ingest = subcommands.add_parser(
         "ingest", help="Add a durable note to your Node (HTTP; --local for the server stack)"
     )
@@ -3868,20 +4022,18 @@ def build_parser() -> argparse.ArgumentParser:
     cognify_group.add_argument(
         "--cognify",
         action="store_true",
-        help="Build the graph inline before returning (immediately searchable, but the "
-        "single blocking request can exceed proxy timeouts — a 502 does not mean the "
-        "write failed). Default: async, searchable within minutes",
+        help="Reject this request; projection runs in the scheduled knowledge-base job",
     )
     cognify_group.add_argument(
         "--no-cognify",
         action="store_true",
-        help="Skip inline cognify (the default; kept for compatibility)",
+        help="Deprecated alias; user ingest is capture-only",
     )
     ingest.add_argument(
         "--timeout",
         type=float,
         metavar="SECONDS",
-        help="Max seconds to wait for the Node (default: 60, or 180 with --cognify)",
+        help="Max seconds to wait for the Node (default: 180)",
     )
     ingest.add_argument("--json", action="store_true", help="Machine-readable output")
     ingest.add_argument("--node-url", help="Override Node URL")
@@ -3901,7 +4053,22 @@ def build_parser() -> argparse.ArgumentParser:
     operation.add_argument("projection_job_id", help="Projection job id returned by ingest")
     operation.add_argument("--json", action="store_true", help="Machine-readable output")
     operation.add_argument("--node-url", help="Override Node URL")
+    operation.add_argument(
+        "--require-searchable",
+        action="store_true",
+        help="Exit non-zero unless every required projection is searchable",
+    )
     operation.set_defaults(handler=_operation)
+
+    document = subcommands.add_parser(
+        "document",
+        aliases=["get-document"],
+        help="Fetch a retained source document by search-hit id",
+    )
+    document.add_argument("document_id", help="Search hit id or document_id")
+    document.add_argument("--json", action="store_true", help="Machine-readable output")
+    document.add_argument("--node-url", help="Override Node URL")
+    document.set_defaults(handler=_document)
 
     search = subcommands.add_parser("search", help="Search the Organization Vault (via the Node)")
     search.add_argument("query", help="Search query")
@@ -3922,6 +4089,10 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--path",
         help="Filter hits whose path/url/snippet contain this string (glob markers stripped)",
+    )
+    search.add_argument(
+        "--source",
+        help="Filter by syncer: linear-issue, linear-context, linear-workspace, or repo-content",
     )
     search.add_argument(
         "--canonical-only",
@@ -4017,7 +4188,10 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--session", help="Session id the QA entry belongs to")
     feedback.set_defaults(handler=_feedback)
 
-    improve = subcommands.add_parser("improve", help="Run Cognee improvement")
+    improve = subcommands.add_parser(
+        "improve",
+        help="Show the scheduled-only Cognee improvement policy",
+    )
     improve.add_argument("--dataset", help="Dataset to improve")
     # Accept --session as an alias for parity with ingest/search/feedback.
     improve.add_argument("--session-id", "--session", action="append", dest="session_id",
@@ -4026,7 +4200,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cognify = subcommands.add_parser(
         "cognify",
-        help="Cognify already-added data in a dataset (recover uncognified data)",
+        help="Show the scheduled-only Cognee projection policy",
     )
     cognify.add_argument("--dataset")
     cognify.add_argument(
@@ -4086,7 +4260,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_repo_content = subcommands.add_parser(
         "sync-repo-content",
-        help="Fetch READMEs, skills, and docs from allowlisted repos and cognify them",
+        help="Fetch repository text and queue scheduled projection",
     )
     sync_repo_content.add_argument("--force", action="store_true")
     sync_repo_content.add_argument("--dry-run", action="store_true")
@@ -4094,7 +4268,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     learn = subcommands.add_parser(
         "learn",
-        help="Run the source learning agent across configured sources",
+        help="Run deterministic source sync without user-triggered LLM work",
     )
     learn.add_argument("--status", action="store_true")
     learn.add_argument("--force", action="store_true")

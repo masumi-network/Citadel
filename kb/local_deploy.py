@@ -154,6 +154,8 @@ def _new_environment(
             "CITADEL_ADMIN_KEY": f"ctdl_{secrets.token_urlsafe(48)}",
             "QDRANT_API_KEY": secrets.token_urlsafe(48),
             "LLM_API_KEY": llm_api_key,
+            "CITADEL_LIFECYCLE_ENABLED": "true",
+            "CITADEL_EVOLVE_SCHEDULER_ENABLED": "true",
             "CITADEL_SOURCE_DIR": str(source) if source is not None else "",
             "CITADEL_IMAGE": selected_image,
         },

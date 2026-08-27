@@ -11,8 +11,8 @@ Two rules, and they are deliberately different:
 **Scheme.** Only ``LLM_ENDPOINT`` is operator-configurable, and pointing it at
 ``http://`` sends ``OPENROUTER_API_KEY`` in cleartext. So plain HTTP is refused,
 with an exception for loopback and Railway's private network, because
-``CITADEL_COGNIFY_TARGET_URL=http://localhost:8080`` is a real, correct
-production value and ``*.railway.internal`` traffic never leaves the project.
+local service checks use ``http://localhost:8080`` and
+``*.railway.internal`` traffic never leaves the project.
 
 **Redirects.** NOT blocked. GitHub 301s a renamed repository, and refusing that
 would break `github_sync` for any repo the org renames. Redirects are followed

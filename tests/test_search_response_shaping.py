@@ -27,6 +27,7 @@ from kb.search_format import (
     shape_public_search_hit,
 )
 from kb.server import (
+    SearchBody,
     app,
     result_provenance,
     search_across_datasets,
@@ -78,9 +79,11 @@ class PageCitadel:
     def __init__(self, results: list[dict[str, Any]]) -> None:
         self.results = list(results)
         self.requested_top_k: list[int] = []
+        self.requested_kwargs: list[dict[str, Any]] = []
 
     async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         self.requested_top_k.append(kwargs["top_k"])
+        self.requested_kwargs.append(dict(kwargs))
         return self.results[: kwargs["top_k"]]
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
@@ -98,6 +101,13 @@ class CollisionCitadel:
                 "text": "shared answer",
             }
         ]
+
+
+class FailingSearchCitadel:
+    config = PageCitadel.config
+
+    async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError(f"contextless query reached provider: {query} {kwargs}")
 
 
 def shaped_client(citadel: Any) -> TestClient:
@@ -155,6 +165,64 @@ def test_public_search_hit_drops_engine_fields_and_keeps_drilldown() -> None:
     assert forbidden.isdisjoint(shaped)
     assert "unexpected_internal" not in shaped["_citadel"]
     assert "projection" not in shaped["_citadel"]
+
+
+def test_public_search_hit_uses_real_reference_locator() -> None:
+    shaped = shape_public_search_hit(
+        {
+            "id": "linear-1",
+            "source": "lifecycle",
+            "text": "Subscription credits are missing.",
+            "_citadel": {
+                "provenance": {"source": "linear-issue"},
+                "references": [
+                    {
+                        "title": "SOK-563",
+                        "source_locator": "https://linear.app/masumi/issue/SOK-563/credits",
+                    }
+                ],
+            },
+        }
+    )
+    assert shaped["url"] == "https://linear.app/masumi/issue/SOK-563/credits"
+    assert shaped["source_locator"] == shaped["url"]
+    assert shaped["source_type"] == "linear-issue"
+    assert shaped["citation"]["source_locator"] == shaped["url"]
+    assert shaped["source"] != "lifecycle"
+
+
+def test_public_search_hit_drops_unresolved_lifecycle_marker() -> None:
+    shaped = shape_public_search_hit(
+        {
+            "id": "lifecycle-1",
+            "source": "lifecycle",
+            "source_type": "lifecycle",
+            "text": "Retained source without connector metadata.",
+            "_citadel": {"provenance": {"source": "lifecycle"}},
+        }
+    )
+
+    assert shaped["source"] is None
+    assert shaped["source_type"] is None
+    assert shaped["url"] is None
+    assert shaped["citation"] == {}
+    assert shaped["_citadel"]["provenance"] == {}
+
+
+def test_public_search_hit_uses_retained_source_locator_metadata() -> None:
+    shaped = shape_public_search_hit(
+        {
+            "id": "linear-1",
+            "source": "lifecycle",
+            "metadata": {
+                "source_locator": "https://linear.app/masumi/issue/SOK-563/credits"
+            },
+            "text": "# Linear SOK-563: Subscription credits",
+        }
+    )
+
+    assert shaped["source_locator"] == "https://linear.app/masumi/issue/SOK-563/credits"
+    assert shaped["citation"]["source_locator"] == shaped["source_locator"]
 
 
 def test_public_search_hit_drops_nonfinite_relevance_and_keeps_finite_values() -> None:
@@ -237,6 +305,37 @@ def test_invalid_primary_row_cannot_hide_valid_secondary_hit() -> None:
             },
         )
     ]
+
+
+def test_contextless_decision_query_does_not_call_search_provider() -> None:
+    merged = asyncio.run(
+        search_across_datasets(
+            FailingSearchCitadel(),
+            query="What did we decide about this?",
+            datasets=["seat:alice", "central"],
+            sessions={},
+            top_k=5,
+        )
+    )
+
+    assert merged == []
+
+
+def test_contextless_decision_query_returns_clean_clarification() -> None:
+    response = shaped_client(FailingSearchCitadel()).post(
+        "/search",
+        json={"query": "What did we decide about this?", "top_k": 5},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"] == []
+    assert payload["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert payload["clarification_required"] is True
+    assert payload["answerable"] is False
+    assert "no subject" in payload["message"]
+    assert "known_datasets" not in payload
+    assert payload.get("warnings") in (None, [])
 
 
 def test_search_endpoint_keeps_recorded_document_chunk_shape() -> None:
@@ -364,6 +463,277 @@ def test_linear_header_populates_issue_id_and_url() -> None:
     )
     # The URL quoted inside the description was not credited.
     assert "evil.example" not in provenance["source_url"]
+
+
+def test_lifecycle_source_key_preserves_linear_scope_after_public_shaping() -> None:
+    raw = {
+        "id": "linear-lifecycle-1",
+        "source": "lifecycle",
+        "source_type": "lifecycle",
+        "metadata": {
+            "source_key": "linear:issue:issue-123",
+            "tags": ["linear-issue", "linear-sync"],
+        },
+        "text": "Subscription credits are missing from the issue description.",
+    }
+
+    enriched = with_result_metadata(raw, 0, "masumi-network", query="subscription credits")
+    public = shape_public_search_hit(enriched)
+
+    assert public["_citadel"]["provenance"]["source"] == "linear-issue"
+    assert public["_citadel"]["provenance"]["basis"] == "lifecycle-source-key"
+    assert filter_hits([public], source="linear-issue") == [public]
+
+
+def test_lifecycle_source_key_preserves_linear_context_after_public_shaping() -> None:
+    raw = {
+        "id": "linear-context-lifecycle-1",
+        "source": "lifecycle",
+        "source_type": "lifecycle",
+        "metadata": {
+            "source_key": "linear:comment:comment-123",
+            "source_locator": "https://linear.app/masumi/issue/SOK-623/coworker-init-ux",
+        },
+        "text": "The comment records the requested workflow change.",
+    }
+
+    enriched = with_result_metadata(raw, 0, "masumi-network", query="workflow change")
+    public = shape_public_search_hit(enriched)
+
+    assert public["source_type"] == "linear-context"
+    assert public["source"] == public["source_locator"]
+    assert public["citation"]["source_locator"] == public["source_locator"]
+    assert public["_citadel"]["retrieval"]["citations_available"] is True
+    assert public["_citadel"]["provenance"] == {
+        "source": "linear-context",
+        "source_url": public["source_locator"],
+        "basis": "lifecycle-source-key",
+    }
+    assert filter_hits([public], source="linear-context") == [public]
+
+
+def test_search_endpoint_applies_linear_scope_to_lifecycle_results() -> None:
+    client = shaped_client(
+        PageCitadel(
+            [
+                {
+                    "id": "linear-lifecycle-2",
+                    "source": "lifecycle",
+                    "source_type": "lifecycle",
+                    "metadata": {"source_key": "linear:issue:issue-456"},
+                    "text": "Subscription credits are missing from the issue description.",
+                }
+            ]
+        )
+    )
+
+    response = client.post(
+        "/search",
+        json={"query": "subscription credits", "top_k": 1, "source": "linear-issue"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [hit["id"] for hit in body["results"]] == ["linear-lifecycle-2"]
+    assert body["filtering"]["candidates_matched"] == 1
+
+
+def test_search_endpoint_applies_linear_context_scope_to_lifecycle_results() -> None:
+    client = shaped_client(
+        PageCitadel(
+            [
+                {
+                    "id": "linear-context-lifecycle-2",
+                    "source": "lifecycle",
+                    "source_type": "lifecycle",
+                    "metadata": {
+                        "source_key": "linear:comment:comment-456",
+                        "source_locator": "https://linear.app/masumi/issue/SOK-623/coworker-init-ux",
+                    },
+                    "text": "The comment records the requested workflow change.",
+                }
+            ]
+        )
+    )
+
+    response = client.post(
+        "/search",
+        json={"query": "workflow change", "top_k": 1, "source": "linear-context"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [hit["id"] for hit in body["results"]] == ["linear-context-lifecycle-2"]
+    assert body["results"][0]["source_type"] == "linear-context"
+    assert body["filtering"]["applied"]["source"] == "linear-context"
+    assert body["filtering"]["candidates_matched"] == 1
+
+
+def test_search_endpoint_exact_linear_key_rejects_cross_reference() -> None:
+    exact = LINEAR_NOTE_TEXT.replace("SOK-623", "SOK-563")
+    client = shaped_client(
+        PageCitadel(
+            [
+                {
+                    "id": "cross-reference",
+                    "source": "lifecycle",
+                    "source_type": "lifecycle",
+                    "metadata": {"source_key": "linear:issue:issue-618"},
+                    "text": (
+                        "# Linear SOK-618: Other issue\n\n"
+                        "The description mentions SOK-563."
+                    ),
+                },
+                {
+                    "id": "exact-issue",
+                    "source": "lifecycle",
+                    "source_type": "lifecycle",
+                    "metadata": {"source_key": "linear:issue:issue-563"},
+                    "text": exact,
+                },
+            ]
+        )
+    )
+
+    response = client.post(
+        "/search",
+        json={"query": "SOK-563", "top_k": 5, "source": "linear-issue"},
+    )
+
+    assert response.status_code == 200
+    assert [hit["id"] for hit in response.json()["results"]] == ["exact-issue"]
+
+
+def test_lifecycle_search_marks_retained_document_drilldown_available() -> None:
+    class Source:
+        dataset = "notes"
+
+    class Store:
+        def get_source_revision(self, source_revision_id: str) -> Any:
+            return Source() if source_revision_id == "source-1" else None
+
+    citadel = PageCitadel(
+        [
+            {
+                "id": "chunk-1",
+                "document_id": "source-1",
+                "source": "lifecycle",
+                "_lifecycle": {
+                    "source_revision_id": "source-1",
+                    "projection_receipt_id": "receipt-1",
+                    "backend": "vector",
+                    "provider": "qdrant",
+                    "projection_version": "v1",
+                    "state": "searchable",
+                },
+                "text": "A retained source.",
+            }
+        ]
+    )
+    citadel.lifecycle_store = Store()
+    client = shaped_client(citadel)
+
+    response = client.post("/search", json={"query": "retained source", "top_k": 1})
+
+    assert response.status_code == 200
+    hit = response.json()["results"][0]
+    assert hit["document_drilldown_available"] is True
+    assert hit["_citadel"]["document_endpoint"] == "/api/documents/source-1"
+
+
+def test_lifecycle_source_key_preserves_repo_scope_after_public_shaping() -> None:
+    raw = {
+        "id": "repo-lifecycle-1",
+        "source": "lifecycle",
+        "source_type": "lifecycle",
+        "metadata": {
+            "source_key": "github:masumi-network/Sokosumi-MCP:path:README.md",
+        },
+        "text": "MCP payment integration details.",
+    }
+
+    enriched = with_result_metadata(raw, 0, "masumi-network", query="MCP payment")
+    public = shape_public_search_hit(enriched)
+
+    assert public["_citadel"]["provenance"]["source"] == "repo-content"
+    assert public["_citadel"]["provenance"]["repo"] == "masumi-network/Sokosumi-MCP"
+    assert public["_citadel"]["provenance"]["path"] == "README.md"
+    assert filter_hits([public], repo="masumi-network/Sokosumi-MCP") == [public]
+    assert filter_hits([public], path="README.md") == [public]
+
+
+def test_lifecycle_source_descriptor_fails_closed_for_malformed_keys() -> None:
+    malformed = [
+        "linear:issue:issue:123",
+        "github:masumi-network/Sokosumi-MCP:unexpected:path:README.md",
+        "github:masumi-network/Sokosumi-MCP:path:README.md\nforged",
+        "github:masumi-network/Sokosumi-MCP:path:README.md\u0085forged",
+    ]
+
+    for source_key in malformed:
+        provenance = result_provenance(
+            {
+                "id": "malformed-source-key",
+                "source": "lifecycle",
+                "metadata": {"source_key": source_key},
+                "text": "untrusted lifecycle result",
+            }
+        )
+        assert provenance["source"] == "lifecycle"
+        assert "repo" not in provenance
+        assert "path" not in provenance
+
+
+def test_lifecycle_parent_source_key_wins_for_chunked_results() -> None:
+    provenance = result_provenance(
+        {
+            "id": "chunked-repo",
+            "source": "lifecycle",
+            "metadata": {
+                "source_key": "chunk-parent:opaque:0",
+                "lifecycle_parent_source_key": (
+                    "github:masumi-network/Sokosumi-MCP:path:docs/README.md"
+                ),
+            },
+            "text": "chunk body",
+        }
+    )
+
+    assert provenance["source"] == "repo-content"
+    assert provenance["repo"] == "masumi-network/Sokosumi-MCP"
+    assert provenance["path"] == "docs/README.md"
+
+
+def test_search_endpoint_applies_repo_scope_to_lifecycle_results() -> None:
+    client = shaped_client(
+        PageCitadel(
+            [
+                {
+                    "id": "repo-lifecycle-2",
+                    "source": "lifecycle",
+                    "source_type": "lifecycle",
+                    "metadata": {
+                        "source_key": "github:masumi-network/Sokosumi-MCP:path:README.md"
+                    },
+                    "text": "MCP payment integration details.",
+                }
+            ]
+        )
+    )
+
+    response = client.post(
+        "/search",
+        json={
+            "query": "MCP payment",
+            "top_k": 1,
+            "repo": "masumi-network/Sokosumi-MCP",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [hit["id"] for hit in body["results"]] == ["repo-lifecycle-2"]
+    assert body["filtering"]["candidates_matched"] == 1
 
 
 def test_a_header_quoted_mid_body_is_not_credited() -> None:
@@ -529,6 +899,21 @@ def test_matching_content_is_not_flagged() -> None:
     )
 
 
+def test_general_search_ranks_lexical_match_before_provider_noise() -> None:
+    citadel = PageCitadel(
+        [
+            {"id": "noise", "text": "unrelated deployment note"},
+            {"id": "answer", "text": "subscription credits are missing"},
+        ]
+    )
+    client = shaped_client(citadel)
+
+    response = client.post("/search", json={"query": "subscription credits", "top_k": 1})
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["id"] == "answer"
+
+
 # --- defect 4: mode=docs was a no-op and filters matched body text ----------
 
 
@@ -598,6 +983,24 @@ def test_single_literal_query_ranks_exact_match_above_unrelated_hit() -> None:
     assert ranked[0] is match
 
 
+def test_general_query_uses_lexical_evidence_when_provider_order_is_weak() -> None:
+    miss = {"id": "miss", "text": "unrelated deployment note"}
+    match = {"id": "hit", "text": "subscription credits are missing"}
+
+    ranked = apply_query_ranking([miss, match], "subscription credits")
+
+    assert ranked[0] is match
+
+
+def test_general_query_keeps_provider_order_without_lexical_evidence() -> None:
+    first = {"id": "first", "text": "semantic neighbor one"}
+    second = {"id": "second", "text": "semantic neighbor two"}
+
+    ranked = apply_query_ranking([first, second], "subscription credits")
+
+    assert [item["id"] for item in ranked] == ["first", "second"]
+
+
 def test_repo_filter_is_identity_not_body_substring() -> None:
     """repo="sokosumi-cli" returned a sokosumi-DOCS file that mentioned the CLI."""
     docs_file = normalize_search_hit(
@@ -652,13 +1055,20 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
 
     response = client.post(
         "/search",
-        json={"query": "widget docs", "top_k": 5, "repo": "masumi-network/widget"},
+        json={
+            "query": "widget docs",
+            "top_k": 5,
+            "repo": "masumi-network/widget",
+            "types": ["repo-content"],
+        },
     )
 
     assert response.status_code == 200
     body = response.json()
     # Over-fetched: the retriever was asked for more than top_k candidates.
     assert citadel.requested_top_k == [15]
+    assert citadel.requested_kwargs[0]["repo"] == "masumi-network/widget"
+    assert citadel.requested_kwargs[0]["source"] == "repo-content"
     # And the page is FULL, not the 0 of 5 the old order of operations left.
     assert len(body["results"]) == 5
     assert all(
@@ -669,6 +1079,19 @@ def test_filtered_search_over_fetches_and_fills_the_page() -> None:
     assert body["filtering"]["candidates_matched"] == 7
     assert body["filtering"]["returned"] == 5
     assert body["filtering"]["applied"]["repo"] == "masumi-network/widget"
+    assert body["filtering"]["applied"]["source"] == "repo-content"
+    assert "types" not in body["filtering"]["applied"]
+
+
+def test_multiple_connector_type_aliases_fail_closed() -> None:
+    """Ambiguous legacy connector aliases must not broaden the search."""
+    filters = SearchBody(
+        query="recent work",
+        types=["repo-content", "linear-issue"],
+    ).filter_kwargs()
+
+    assert filters["source"] is None
+    assert filters["types"] == ["repo-content", "linear-issue"]
 
 
 def test_empty_retrieval_with_filters_gets_dataset_help_not_filter_blame() -> None:

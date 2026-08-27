@@ -373,6 +373,11 @@ class MeshState:
         data: str,
         dataset: str,
         tags: list[str],
+        source_key: str | None = None,
+        source_locator: str | None = None,
+        capture_actor_id: str | None = None,
+        capture_run_id: str | None = None,
+        captured_at: datetime | None = None,
     ) -> None:
         async with self._lock:
             self._ensure_base_graph(config)
@@ -401,6 +406,14 @@ class MeshState:
                         "dataset": dataset,
                         "tags": list(result.tags),
                         "characters": len(data),
+                        "source_key": source_key,
+                        "source_locator": source_locator,
+                        "source_revision_id": result.source_revision_id,
+                        "projection_job_id": result.projection_job_id,
+                        "projection_state": result.projection_state,
+                        "capture_actor_id": capture_actor_id,
+                        "capture_run_id": capture_run_id,
+                        "captured_at": captured_at.isoformat() if captured_at else None,
                     },
                 }
                 self._edge(dataset_id, document_id, "contains")

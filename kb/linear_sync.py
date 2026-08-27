@@ -109,9 +109,81 @@ class LinearIssue:
         )
 
 
+@dataclass(frozen=True)
+class LinearContextRecord:
+    """A searchable, non-issue Linear workspace record."""
+
+    entity_type: str
+    id: str
+    title: str
+    body: str
+    url: str
+    created_at: str
+    updated_at: str
+    archived_at: str | None
+    metadata: dict[str, Any]
+
+    @classmethod
+    def from_node(cls, entity_type: str, node: dict[str, Any]) -> LinearContextRecord | None:
+        if not isinstance(node, dict) or not node.get("id"):
+            return None
+        entity_id = str(node["id"])
+        title = str(
+            node.get("title")
+            or node.get("name")
+            or node.get("identifier")
+            or f"{entity_type} {entity_id}"
+        ).strip()
+        body = str(
+            node.get("content")
+            or node.get("description")
+            or node.get("body")
+            or ""
+        ).strip()
+        metadata: dict[str, Any] = {}
+        for key in (
+            "project",
+            "initiative",
+            "issue",
+            "team",
+            "user",
+        ):
+            value = node.get(key)
+            if isinstance(value, dict) and value.get("id"):
+                metadata[key] = {
+                    item: value[item]
+                    for item in ("id", "name", "key", "identifier", "title", "url")
+                    if value.get(item) is not None
+                }
+        for key in (
+            "issueId",
+            "projectId",
+            "projectUpdateId",
+            "documentContentId",
+            "initiativeId",
+            "initiativeUpdateId",
+            "parentId",
+            "quotedText",
+            "health",
+        ):
+            if node.get(key) is not None:
+                metadata[key] = node[key]
+        return cls(
+            entity_type=entity_type,
+            id=entity_id,
+            title=title,
+            body=body,
+            url=str(node.get("url") or "").strip(),
+            created_at=str(node.get("createdAt") or ""),
+            updated_at=str(node.get("updatedAt") or ""),
+            archived_at=(str(node["archivedAt"]) if node.get("archivedAt") else None),
+            metadata=metadata,
+        )
+
+
 ISSUES_QUERY = """
 query Issues($first: Int!, $after: String) {
-  issues(first: $first, after: $after) {
+  issues(first: $first, after: $after, orderBy: updatedAt) {
     pageInfo { hasNextPage endCursor }
     nodes {
       id
@@ -131,12 +203,146 @@ query Issues($first: Int!, $after: String) {
 
 
 USERS_QUERY = """
-query Users($first: Int!) {
-  users(first: $first) {
+query Users($first: Int!, $after: String) {
+  users(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
     nodes { id name email active }
   }
 }
 """
+
+
+PROJECTS_QUERY = """
+query Projects($first: Int!, $after: String, $includeArchived: Boolean!) {
+  projects(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      name
+      description
+      content
+      url
+      createdAt
+      updatedAt
+      archivedAt
+    }
+  }
+}
+"""
+
+
+PROJECT_UPDATES_QUERY = """
+query ProjectUpdates($first: Int!, $after: String, $includeArchived: Boolean!) {
+  projectUpdates(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      body
+      health
+      createdAt
+      updatedAt
+      archivedAt
+      url
+      project { id name url }
+    }
+  }
+}
+"""
+
+
+DOCUMENTS_QUERY = """
+query Documents($first: Int!, $after: String, $includeArchived: Boolean!) {
+  documents(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      title
+      content
+      createdAt
+      updatedAt
+      archivedAt
+      documentContentId
+      url
+      project { id name }
+      initiative { id name }
+      issue { id identifier title }
+      team { id name key }
+    }
+  }
+}
+"""
+
+
+COMMENTS_QUERY = """
+query Comments($first: Int!, $after: String, $includeArchived: Boolean!) {
+  comments(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      body
+      createdAt
+      updatedAt
+      archivedAt
+      url
+      issueId
+      projectId
+      projectUpdateId
+      documentContentId
+      initiativeId
+      initiativeUpdateId
+      parentId
+      quotedText
+      user { id name }
+    }
+  }
+}
+"""
+
+
+INITIATIVES_QUERY = """
+query Initiatives($first: Int!, $after: String, $includeArchived: Boolean!) {
+  initiatives(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      name
+      description
+      content
+      updatedAt
+      archivedAt
+    }
+  }
+}
+"""
+
+
+INITIATIVE_UPDATES_QUERY = """
+query InitiativeUpdates($first: Int!, $after: String, $includeArchived: Boolean!) {
+  initiativeUpdates(first: $first, after: $after, includeArchived: $includeArchived, orderBy: updatedAt) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      body
+      health
+      createdAt
+      updatedAt
+      archivedAt
+      url
+      initiative { id name }
+    }
+  }
+}
+"""
+
+
+CONTEXT_QUERY_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("project", PROJECTS_QUERY, "projects"),
+    ("project_update", PROJECT_UPDATES_QUERY, "projectUpdates"),
+    ("document", DOCUMENTS_QUERY, "documents"),
+    ("comment", COMMENTS_QUERY, "comments"),
+    ("initiative", INITIATIVES_QUERY, "initiatives"),
+    ("initiative_update", INITIATIVE_UPDATES_QUERY, "initiativeUpdates"),
+)
 
 
 class LinearClient:
@@ -144,6 +350,9 @@ class LinearClient:
         self.api_key = api_key
         self.timeout = timeout
         self.last_issue_fetch_complete = True
+        self.last_user_fetch_complete = True
+        self.last_context_fetch_complete = True
+        self.last_context_fetch_error: str | None = None
 
     def query(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
@@ -171,13 +380,13 @@ class LinearClient:
             raise LinearAPIError("Linear response missing data")
         return data
 
-    def fetch_issues(self, *, max_issues: int) -> list[LinearIssue]:
+    def fetch_issues(self, *, max_issues: int = 0) -> list[LinearIssue]:
         issues: list[LinearIssue] = []
         cursor: str | None = None
-        max_issues = max(max_issues, 1)
+        unlimited = max_issues <= 0
         self.last_issue_fetch_complete = False
-        while len(issues) < max_issues:
-            page_size = min(max_issues - len(issues), 100)
+        while unlimited or len(issues) < max_issues:
+            page_size = 100 if unlimited else min(max_issues - len(issues), 100)
             data = self.query(
                 ISSUES_QUERY,
                 {"first": page_size, "after": cursor},
@@ -192,7 +401,7 @@ class LinearClient:
                 parsed = LinearIssue.from_node(raw)
                 if parsed:
                     issues.append(parsed)
-                    if len(issues) >= max_issues:
+                    if not unlimited and len(issues) >= max_issues:
                         break
             page_info = block.get("pageInfo") if isinstance(block.get("pageInfo"), dict) else {}
             if not page_info.get("hasNextPage"):
@@ -203,14 +412,99 @@ class LinearClient:
                 break
         return issues
 
-    def fetch_users(self, *, max_users: int = 250) -> list[dict[str, Any]]:
-        """List workspace members (id/name/email) for assignee→seat auto-mapping."""
-        data = self.query(USERS_QUERY, {"first": min(max(max_users, 1), 250)})
-        block = data.get("users") if isinstance(data.get("users"), dict) else {}
-        nodes = block.get("nodes")
-        if not isinstance(nodes, list):
-            return []
-        return [node for node in nodes if isinstance(node, dict) and node.get("id")]
+    def fetch_users(self, *, max_users: int = 0) -> list[dict[str, Any]]:
+        """List every workspace member for assignee-to-seat auto-mapping."""
+        users: list[dict[str, Any]] = []
+        cursor: str | None = None
+        unlimited = max_users <= 0
+        self.last_user_fetch_complete = False
+        while unlimited or len(users) < max_users:
+            page_size = 100 if unlimited else min(max_users - len(users), 100)
+            data = self.query(USERS_QUERY, {"first": page_size, "after": cursor})
+            block = data.get("users") if isinstance(data.get("users"), dict) else {}
+            nodes = block.get("nodes")
+            if not isinstance(nodes, list):
+                break
+            for node in nodes:
+                if isinstance(node, dict) and node.get("id"):
+                    users.append(node)
+                    if not unlimited and len(users) >= max_users:
+                        break
+            page_info = block.get("pageInfo") if isinstance(block.get("pageInfo"), dict) else {}
+            if not page_info.get("hasNextPage"):
+                self.last_user_fetch_complete = True
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+        return users
+
+    def fetch_context_records(
+        self,
+        *,
+        max_records: int = 0,
+        include_archived: bool = False,
+    ) -> list[LinearContextRecord]:
+        """Fetch searchable workspace context outside the issue model."""
+        records: list[LinearContextRecord] = []
+        unlimited = max_records <= 0
+        complete = True
+        errors: list[str] = []
+        self.last_context_fetch_complete = False
+        self.last_context_fetch_error = None
+        for entity_type, query, root in CONTEXT_QUERY_SPECS:
+            cursor: str | None = None
+            while unlimited or len(records) < max_records:
+                page_size = 100 if unlimited else min(max_records - len(records), 100)
+                try:
+                    data = self.query(
+                        query,
+                        {
+                            "first": page_size,
+                            "after": cursor,
+                            "includeArchived": include_archived,
+                        },
+                    )
+                except LinearAPIError as exc:
+                    complete = False
+                    errors.append(f"{entity_type}: {str(exc)[:240]}")
+                    break
+                block = data.get(root)
+                if not isinstance(block, dict):
+                    complete = False
+                    errors.append(f"{entity_type}: response missing {root}")
+                    break
+                nodes = block.get("nodes")
+                if not isinstance(nodes, list):
+                    complete = False
+                    errors.append(f"{entity_type}: response missing {root}.nodes")
+                    break
+                for raw in nodes:
+                    record = LinearContextRecord.from_node(entity_type, raw)
+                    if record:
+                        records.append(record)
+                        if not unlimited and len(records) >= max_records:
+                            break
+                page_info = (
+                    block.get("pageInfo") if isinstance(block.get("pageInfo"), dict) else {}
+                )
+                if not page_info.get("hasNextPage"):
+                    break
+                cursor = page_info.get("endCursor")
+                if not cursor:
+                    complete = False
+                    errors.append(f"{entity_type}: page has no endCursor")
+                    break
+                if not unlimited and len(records) >= max_records:
+                    complete = False
+                    self.last_context_fetch_complete = False
+                    self.last_context_fetch_error = "; ".join(errors)[:1000] or None
+                    return records
+        self.last_context_fetch_complete = complete and not (
+            not unlimited and len(records) >= max_records
+        )
+        self.last_context_fetch_error = "; ".join(errors)[:1000] or None
+        return records
 
 
 def format_issue_note(issue: LinearIssue) -> str:
@@ -232,8 +526,46 @@ def format_issue_note(issue: LinearIssue) -> str:
     return "\n".join(lines).strip()
 
 
-def format_workspace_digest(issues: list[LinearIssue]) -> str:
-    lines = ["# Linear workspace sync", "", f"Synced {len(issues)} issues.", ""]
+def format_context_note(record: LinearContextRecord) -> str:
+    lines = [
+        f"# Linear {record.entity_type}: {record.title}",
+        "",
+        f"- **Type:** {record.entity_type}",
+        f"- **Updated:** {record.updated_at or 'unknown'}",
+    ]
+    if record.created_at:
+        lines.append(f"- **Created:** {record.created_at}")
+    if record.archived_at:
+        lines.append(f"- **Archived:** {record.archived_at}")
+    for key, value in record.metadata.items():
+        if isinstance(value, dict):
+            rendered = ", ".join(
+                f"{item}={item_value}" for item, item_value in value.items()
+            )
+        else:
+            rendered = str(value)
+        lines.append(f"- **{key}:** {rendered}")
+    if record.url:
+        lines.append(f"- **URL:** {record.url}")
+    if record.body:
+        lines.extend(["", record.body[:8000]])
+    return "\n".join(lines).strip()
+
+
+def linear_context_source_key(entity_type: str, entity_id: str) -> str:
+    return f"linear:{entity_type}:{entity_id}"
+
+
+def format_workspace_digest(
+    issues: list[LinearIssue], context_records: list[LinearContextRecord] | None = None
+) -> str:
+    context_records = context_records or []
+    lines = [
+        "# Linear workspace sync",
+        "",
+        f"Synced {len(issues)} issues and {len(context_records)} context records.",
+        "",
+    ]
     for issue in issues[:120]:
         assignee = issue.assignee_name or "unassigned"
         lines.append(
@@ -299,7 +631,12 @@ class LinearSyncer:
         # issues" with a green source status (#148).
         payload = load_state_file(self.state_path)
         if payload is None:
-            return {"version": STATE_VERSION, "issues": [], "mirrors": {}}
+            return {
+                "version": STATE_VERSION,
+                "issues": [],
+                "context_records": [],
+                "mirrors": {},
+            }
         return payload
 
     def _save_state(self, payload: dict[str, Any]) -> None:
@@ -316,8 +653,19 @@ class LinearSyncer:
             state = {}
             state_error = str(exc)
         issues = state.get("issues") if isinstance(state.get("issues"), list) else []
+        context_records = (
+            state.get("context_records")
+            if isinstance(state.get("context_records"), list)
+            else []
+        )
         mirrors = state.get("mirrors") if isinstance(state.get("mirrors"), dict) else {}
         mirror_count = sum(len(v) for v in mirrors.values() if isinstance(v, list))
+        context_counts: dict[str, int] = {}
+        for item in context_records:
+            if not isinstance(item, dict) or not item.get("entity_type"):
+                continue
+            entity_type = str(item["entity_type"])
+            context_counts[entity_type] = context_counts.get(entity_type, 0) + 1
         return {
             "state_error": state_error,
             "enabled": bool(self.config.linear_api_key),
@@ -327,8 +675,18 @@ class LinearSyncer:
             # visible instead of a stale green last_synced_at (#46).
             "last_error": state.get("last_error"),
             "last_attempt_at": state.get("last_attempt_at"),
+            "last_run_ok": state.get("last_run_ok"),
+            "last_run_reason": state.get("last_run_reason"),
             "issue_count": len(issues),
+            "max_issues": self.config.linear_sync_max_issues,
+            "unbounded_issue_listing": self.config.linear_sync_max_issues <= 0,
             "listing_complete": state.get("listing_complete"),
+            "context_counts": context_counts,
+            "context_record_count": len(context_records),
+            "max_context_records": self.config.linear_sync_max_context_records,
+            "context_listing_complete": state.get("context_listing_complete"),
+            "context_error": state.get("context_error"),
+            "include_archived": self.config.linear_sync_include_archived,
             "mirror_count": mirror_count,
             "auto_map_members_fetched": state.get("auto_map_members_fetched", 0),
             "auto_mapped_assignees": state.get("auto_mapped_assignees", 0),
@@ -360,7 +718,13 @@ class LinearSyncer:
             ]
         return []
 
-    async def run(self, *, force: bool = False, await_cognify: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        await_cognify: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
         """Sync Linear issues into Central (+ assignee seat mirrors).
 
         Incremental by default (#90): an issue is rewritten only when its
@@ -380,6 +744,13 @@ class LinearSyncer:
                 max_issues=self.config.linear_sync_max_issues,
             )
             listing_complete = client.last_issue_fetch_complete
+            context_records = await asyncio.to_thread(
+                client.fetch_context_records,
+                max_records=self.config.linear_sync_max_context_records,
+                include_archived=self.config.linear_sync_include_archived,
+            )
+            context_listing_complete = client.last_context_fetch_complete
+            context_error = client.last_context_fetch_error
         except LinearAPIError as exc:
             # Persist the failure so status()/list_sources surface a reason instead
             # of a stale green last_synced_at, and the evolve stage logs it (#46).
@@ -468,6 +839,21 @@ class LinearSyncer:
             for item in (prior_issues if isinstance(prior_issues, list) else [])
             if isinstance(item, dict) and item.get("id")
         }
+        prior_context_records = prior_state.get("context_records")
+        prior_context_by_key = {
+            linear_context_source_key(
+                str(item.get("entity_type")),
+                str(item.get("id")),
+            ): item
+            for item in (
+                prior_context_records if isinstance(prior_context_records, list) else []
+            )
+            if isinstance(item, dict) and item.get("entity_type") and item.get("id")
+        }
+        current_context_by_key = {
+            linear_context_source_key(record.entity_type, record.id): record
+            for record in context_records
+        }
         prior_mirrors = (
             prior_state.get("mirrors") if isinstance(prior_state.get("mirrors"), dict) else {}
         )
@@ -481,6 +867,26 @@ class LinearSyncer:
             return updated is None or updated > prior_cursor
 
         changed_ids = {issue.id for issue in issues if _changed(issue)}
+        def _context_changed(record: LinearContextRecord) -> bool:
+            prior = prior_context_by_key.get(linear_context_source_key(record.entity_type, record.id))
+            if prior is None:
+                return True
+            updated = _parse_iso(record.updated_at)
+            prior_updated = _parse_iso(prior.get("updated_at")) if isinstance(prior, dict) else None
+            # A malformed timestamp fails open. Rewriting is visible; skipping
+            # changed context would hide a workspace update.
+            return updated is None or prior_updated is None or updated > prior_updated
+
+        changed_context_keys = {
+            linear_context_source_key(record.entity_type, record.id)
+            for record in context_records
+            if _context_changed(record)
+        }
+        removed_context_keys = (
+            set(prior_context_by_key) - set(current_context_by_key)
+            if context_listing_complete
+            else set()
+        )
         # A deletion changes the digest (the issue drops out of the listing)
         # without moving any surviving issue's updatedAt, so it refreshes the
         # digest too.
@@ -492,10 +898,10 @@ class LinearSyncer:
         tombstoned_count = 0
         tombstoned_datasets: set[str] = set()
 
-        async def _tombstone_linear_issue(
+        async def _tombstone_linear_source(
             *,
             dataset: str,
-            issue_id: str,
+            source_key: str,
             reason: str,
         ) -> None:
             nonlocal tombstoned_count
@@ -503,7 +909,7 @@ class LinearSyncer:
                 return
             tombstones = await self.citadel.tombstone_source(
                 dataset=dataset,
-                source_key=f"linear:issue:{issue_id}",
+                source_key=source_key,
                 reason=reason,
                 capture_actor_id="linear-sync",
                 capture_run_id=sync_started_at,
@@ -511,6 +917,18 @@ class LinearSyncer:
             tombstoned_count += len(tombstones)
             if tombstones:
                 tombstoned_datasets.add(dataset)
+
+        async def _tombstone_linear_issue(
+            *,
+            dataset: str,
+            issue_id: str,
+            reason: str,
+        ) -> None:
+            await _tombstone_linear_source(
+                dataset=dataset,
+                source_key=f"linear:issue:{issue_id}",
+                reason=reason,
+            )
 
         for removed_id in sorted(removed_ids):
             await _tombstone_linear_issue(
@@ -531,6 +949,13 @@ class LinearSyncer:
                             reason="Linear issue removed from synchronized scope",
                         )
 
+        for source_key in sorted(removed_context_keys):
+            await _tombstone_linear_source(
+                dataset=central_dataset,
+                source_key=source_key,
+                reason="Linear context record removed from synchronized scope",
+            )
+
         # Coalesce cognify (#46/#52): a full resync writes the digest + ~200 issues +
         # seat mirrors. Each write used to schedule its OWN background cognify, so
         # the on-demand POST /api/linear-sync/run fired ~200 Kuzu-writing cognifies
@@ -545,10 +970,13 @@ class LinearSyncer:
         # Blocked items are recorded by identifier only, never content, and
         # simply retried whenever the issue next changes.
         blocked: list[str] = []
+        rejected_writes: list[dict[str, str]] = []
+        rejected_issue_identifiers: set[str] = set()
+        rejected_context_keys: set[str] = set()
 
         central_outcome = None
-        if force or changed_ids or removed_ids:
-            digest = format_workspace_digest(issues)
+        if force or changed_ids or removed_ids or changed_context_keys or removed_context_keys:
+            digest = format_workspace_digest(issues, context_records)
             try:
                 central_outcome = await learning.learn(
                     digest,
@@ -560,14 +988,73 @@ class LinearSyncer:
                     capture_actor_id="linear-sync",
                     capture_run_id=sync_started_at,
                     operation="linear_sync",
-                    run_improve=self.config.linear_sync_run_improve,
-                    tier="full",
+                    run_improve=self.config.linear_sync_run_improve and allow_llm,
+                    # Baseline Linear capture is deterministic. Full enrichment
+                    # remains an explicit opt-in with linear_sync_run_improve.
+                    tier=(
+                        "full"
+                        if self.config.linear_sync_run_improve and allow_llm
+                        else "light"
+                    ),
+                    allow_llm=allow_llm,
                     defer_cognify=True,
                 )
+                if not central_outcome.ingest.accepted:
+                    rejected_writes.append(
+                        {
+                            "source": "workspace-digest",
+                            "dataset": central_dataset,
+                            "reason": str(central_outcome.ingest.reason),
+                        }
+                    )
             except SecretContentError as exc:
                 blocked.append("workspace-digest")
                 logger.warning(
                     "Linear workspace digest blocked by the secret scanner: %s",
+                    exc.public_message,
+                )
+
+        central_context_written = False
+        for source_key in sorted(changed_context_keys):
+            record = current_context_by_key[source_key]
+            try:
+                context_outcome = await learning.learn(
+                    format_context_note(record),
+                    dataset=central_dataset,
+                    tags=[
+                        "linear-context",
+                        "linear-sync",
+                        f"linear:{record.entity_type}",
+                    ],
+                    session_id=session_id,
+                    source_key=source_key,
+                    source_locator=record.url or None,
+                    media_type="text/markdown",
+                    capture_actor_id="linear-sync",
+                    capture_run_id=sync_started_at,
+                    operation="linear_sync",
+                    run_improve=False,
+                    tier="light",
+                    allow_llm=allow_llm,
+                    defer_cognify=True,
+                )
+                if context_outcome.ingest.accepted:
+                    central_context_written = True
+                else:
+                    rejected_context_keys.add(source_key)
+                    rejected_writes.append(
+                        {
+                            "source": source_key,
+                            "dataset": central_dataset,
+                            "reason": str(context_outcome.ingest.reason),
+                        }
+                    )
+            except SecretContentError as exc:
+                blocked.append(source_key)
+                logger.warning(
+                    "Linear %s %s blocked by the secret scanner; content not stored: %s",
+                    record.entity_type,
+                    record.id,
                     exc.public_message,
                 )
 
@@ -619,6 +1106,7 @@ class LinearSyncer:
                         operation="linear_sync",
                         run_improve=False,
                         tier="light",
+                        allow_llm=allow_llm,
                         defer_cognify=True,
                     )
                     if issue_outcome.ingest.accepted:
@@ -626,6 +1114,16 @@ class LinearSyncer:
                         # in-process duplicate returns accepted=False without
                         # raising and stores nothing.
                         central_issue_written = True
+                    else:
+                        central_blocked = True
+                        rejected_issue_identifiers.add(issue.identifier)
+                        rejected_writes.append(
+                            {
+                                "source": issue.identifier,
+                                "dataset": central_dataset,
+                                "reason": str(issue_outcome.ingest.reason),
+                            }
+                        )
                 except SecretContentError as exc:
                     central_blocked = True
                     blocked.append(issue.identifier)
@@ -663,7 +1161,7 @@ class LinearSyncer:
 
             note = format_issue_note(issue)
             try:
-                await learning.learn(
+                mirror_outcome = await learning.learn(
                     note,
                     dataset=mirror_dataset,
                     tags=[
@@ -681,6 +1179,7 @@ class LinearSyncer:
                     operation="linear_mirror",
                     run_improve=False,
                     tier="light",
+                    allow_llm=allow_llm,
                     defer_cognify=True,
                 )
             except SecretContentError as exc:
@@ -691,6 +1190,18 @@ class LinearSyncer:
                     issue.identifier,
                     mirror_dataset,
                     exc.public_message,
+                )
+                if mirror_has_note:
+                    mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
+                continue
+
+            if not mirror_outcome.ingest.accepted:
+                rejected_writes.append(
+                    {
+                        "source": issue.identifier,
+                        "dataset": mirror_dataset,
+                        "reason": str(mirror_outcome.ingest.reason),
+                    }
                 )
                 if mirror_has_note:
                     mirrors.setdefault(mirror_dataset, []).append(issue.identifier)
@@ -724,12 +1235,14 @@ class LinearSyncer:
                 elif not listing_complete:
                     mirrors.setdefault(str(mirror_dataset), []).append(identifier)
 
-        # One coalesced cognify over Central + every seat mirror we wrote — unless
-        # nothing was written (a fully-unchanged incremental pass has nothing to
-        # fold in) or inline cognify is suppressed (the evolve Phase-1 subprocess
-        # is add-only and the web cognifies in Phase 2 as the sole Kuzu writer, #47).
+        # Run one coalesced Cognify over Central and every seat mirror we wrote.
+        # Skip it when nothing changed or evolve Phase 1 suppresses inline work.
+        # The scheduler runs one Cognify pass in Phase 2 (#47).
         touched_datasets: list[str] = []
-        if central_outcome is not None or central_issue_written:
+        if (
+            central_outcome is not None
+            and central_outcome.ingest.accepted
+        ) or central_issue_written or central_context_written:
             touched_datasets.append(central_dataset)
         touched_datasets.extend(written_mirror_datasets)
         touched_datasets.extend(sorted(tombstoned_datasets))
@@ -751,6 +1264,10 @@ class LinearSyncer:
                     cognify_observed = "cognified"
             else:
                 cognify_observed = "queued_not_confirmed"
+        elif touched_datasets and not allow_llm:
+            # User-triggered sync retains sources but cannot start the LLM-backed
+            # legacy Cognify queue. Scheduled evolution will project this work.
+            cognify_observed = "not_scheduled"
         elif touched_datasets and not _suppress_inline_cognify():
             cognify_datasets = list(dict.fromkeys(touched_datasets))
             if await_cognify:
@@ -774,8 +1291,7 @@ class LinearSyncer:
                 queued = self.citadel.cognee.schedule_cognify(cognify_datasets)
                 cognify_observed = "queued_not_confirmed" if queued else "not_scheduled"
         elif touched_datasets:
-            # Evolve Phase-1 subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY): add-only
-            # by design; the web cognifies in Phase 2 as the sole Kuzu writer.
+            # Evolve Phase 1 is add-only. The scheduler Cognifies in Phase 2.
             cognify_observed = "suppressed"
 
         # Advance the cursor to the newest updatedAt seen (keep the prior one
@@ -829,7 +1345,10 @@ class LinearSyncer:
             )
 
         persisted_issues = [
-            asdict(issue) for issue in issues if issue.identifier not in blocked
+            asdict(issue)
+            for issue in issues
+            if issue.identifier not in blocked
+            and issue.identifier not in rejected_issue_identifiers
         ]
         if not listing_complete:
             fetched_ids = {issue.id for issue in issues}
@@ -838,13 +1357,45 @@ class LinearSyncer:
                 for item in (prior_issues if isinstance(prior_issues, list) else [])
                 if isinstance(item, dict) and str(item.get("id")) not in fetched_ids
             )
+        persisted_context_records = [
+            asdict(record)
+            for record in context_records
+            if linear_context_source_key(record.entity_type, record.id) not in blocked
+            and linear_context_source_key(record.entity_type, record.id)
+            not in rejected_context_keys
+        ]
+        if not context_listing_complete:
+            fetched_context_keys = set(current_context_by_key)
+            persisted_context_records.extend(
+                item
+                for key, item in prior_context_by_key.items()
+                if key not in fetched_context_keys and isinstance(item, dict)
+            )
+        sync_reason: str | None = None
+        if not listing_complete:
+            sync_reason = "linear_issue_listing_incomplete"
+        elif not context_listing_complete:
+            sync_reason = "linear_context_listing_incomplete"
+        elif auto_map_error:
+            sync_reason = "linear_user_listing_failed"
+        elif rejected_writes:
+            sync_reason = "linear_ingest_rejected"
+        sync_ok = sync_reason is None
+        if rejected_writes:
+            new_cursor = prior_state.get("last_seen_updated_at")
+
+        attempt_at = utc_now()
+
         payload = {
             "version": STATE_VERSION,
-            "last_synced_at": utc_now(),
+            "last_synced_at": (
+                attempt_at if sync_ok else prior_state.get("last_synced_at")
+            ),
             "last_seen_updated_at": new_cursor,
             "unchanged_pass_streak": streak,
-            "last_error": None,  # clear any prior failure on a successful sync
-            "last_attempt_at": utc_now(),
+            "last_error": sync_reason,
+            "context_error": context_error,
+            "last_attempt_at": attempt_at,
             "auto_map_error": auto_map_error,
             "auto_map_members_fetched": auto_map_members_fetched,
             "auto_mapped_assignees": auto_mapped,
@@ -856,14 +1407,29 @@ class LinearSyncer:
             # refused content through Linear search — identifier only (via
             # `blocked` above), never content.
             "issues": persisted_issues,
+            "context_records": persisted_context_records,
             "mirrors": mirrors,
+            "context_listing_complete": context_listing_complete,
+            "last_run_ok": sync_ok,
+            "last_run_reason": sync_reason,
+            "rejected_writes": rejected_writes,
         }
         self._save_state(payload)
 
         return {
-            "ok": True,
+            "ok": sync_ok,
+            "reason": sync_reason,
             "enabled": True,
             "issue_count": len(issues),
+            "context_record_count": len(context_records),
+            "context_counts": {
+                entity_type: sum(
+                    1 for record in context_records if record.entity_type == entity_type
+                )
+                for entity_type, _, _ in CONTEXT_QUERY_SPECS
+            },
+            "context_listing_complete": context_listing_complete,
+            "context_error": context_error,
             "listing_complete": listing_complete,
             # Incrementality diagnostics (#90): how many issues this pass actually
             # rewrote vs skipped as unchanged since the stored cursor.
@@ -896,6 +1462,7 @@ class LinearSyncer:
                 if (
                     (central_outcome is not None and central_outcome.ingest.accepted)
                     or central_issue_written
+                    or central_context_written
                 )
                 else None
             ),
@@ -905,5 +1472,7 @@ class LinearSyncer:
             # contained, not silently dropped.
             "blocked": blocked,
             "blocked_count": len(blocked),
+            "rejected_writes": rejected_writes,
+            "rejected_write_count": len(rejected_writes),
             "last_synced_at": payload["last_synced_at"],
         }

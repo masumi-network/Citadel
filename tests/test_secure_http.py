@@ -59,7 +59,7 @@ def test_plain_http_to_the_public_internet_is_refused() -> None:
 @pytest.mark.parametrize(
     "url",
     [
-        "http://localhost:8080/api/cognify",  # the real CITADEL_COGNIFY_TARGET_URL
+        "http://localhost:8080/readyz",
         "http://127.0.0.1:8000/search",
         "http://citadel-archive.railway.internal:8080/ingest",
     ],

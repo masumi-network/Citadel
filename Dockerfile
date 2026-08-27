@@ -2,6 +2,9 @@
 
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS builder
 
+ARG RAILWAY_GIT_COMMIT_SHA=""
+ARG CITADEL_BUILD_ID=""
+
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -11,8 +14,9 @@ RUN python -m pip install build==1.5.0 hatchling==1.31.0
 COPY . .
 RUN python scripts/build_secure_cognee.py --output /wheels
 RUN python -m build --no-isolation --wheel --outdir /wheels .
-RUN sha256sum /wheels/citadel_archive-0.5.1-py3-none-any.whl \
-    | cut -d ' ' -f1 > /wheels/citadel-build-id
+RUN RAILWAY_GIT_COMMIT_SHA="$RAILWAY_GIT_COMMIT_SHA" \
+    CITADEL_BUILD_ID="$CITADEL_BUILD_ID" \
+    python -c "import os; from kb.build_identity import write_build_id_marker; write_build_id_marker('/wheels/citadel-build-id', os.environ)"
 
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS runtime
 
@@ -27,6 +31,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PORT=8000 \
     HOME=/home/citadel \
     CITADEL_LITE_DATA_ROOT=/data \
+    CITADEL_LIFECYCLE_ENABLED=true \
+    CITADEL_EVOLVE_SCHEDULER_ENABLED=true \
     CITADEL_BUILD_ID_PATH=/opt/citadel/build-id \
     HF_HOME=/opt/hf-cache \
     FASTEMBED_CACHE_PATH=/opt/fastembed-cache
@@ -36,9 +42,11 @@ RUN groupadd --gid 10001 citadel \
     && install -d -o citadel -g citadel /data
 COPY --from=builder /wheels /wheels
 RUN install -d /opt/citadel \
+    && CITADEL_WHEEL="$(find /wheels -maxdepth 1 -type f -name 'citadel_archive-*.whl' -print -quit)" \
+    && test -n "$CITADEL_WHEEL" \
     && install -m 0444 /wheels/citadel-build-id /opt/citadel/build-id \
     && python -m pip install /wheels/cognee-1.4.1-py3-none-any.whl \
-    "/wheels/citadel_archive-0.5.1-py3-none-any.whl[server]" \
+    "${CITADEL_WHEEL}[server]" \
     && python -m pip check \
     && python -c "from importlib.metadata import version; assert (version('cognee'), version('ladybug'), version('qdrant-client')) == ('1.4.1', '0.18.2', '1.19.0')" \
     && rm -rf /wheels
@@ -96,7 +104,7 @@ EXPOSE 8000
 # a bare VOLUME would create is unwanted. Persistence at /data is provided by
 # the platform mount, not the image.
 HEALTHCHECK --interval=15s --timeout=15s --start-period=120s --retries=5 \
-  CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; request = Request('http://127.0.0.1:8000/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
+  CMD ["python", "-c", "import os; from urllib.request import Request, urlopen; port = os.environ.get('PORT', '8000'); request = Request(f'http://127.0.0.1:{port}/readyz', headers={'Authorization': 'Bearer ' + os.environ['CITADEL_ADMIN_KEY']}); assert urlopen(request, timeout=12).status == 200"]
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "kb.lite_runtime"]
 

@@ -99,8 +99,19 @@ def test_parser_exposes_generation_backup_and_restore() -> None:
 
 
 def test_generation_backup_restores_every_provider_from_downloaded_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    for name in (
+        "CITADEL_LITE_DATA_ROOT",
+        "SYSTEM_ROOT_DIRECTORY",
+        "DATA_ROOT_DIRECTORY",
+        "CITADEL_STATE_DIRECTORY",
+        "DB_PATH",
+        "DB_NAME",
+        "CITADEL_LIFECYCLE_STORE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
     source_root = tmp_path / "source"
     _lite_root(source_root)
     snapshots = {
@@ -141,6 +152,96 @@ def test_generation_backup_restores_every_provider_from_downloaded_artifacts(
     with sqlite3.connect(restore_root / "citadel-state/lifecycle.sqlite3") as connection:
         assert connection.execute("SELECT value FROM revisions").fetchall() == [
             ("revision-1",)
+        ]
+
+
+def test_generation_backup_maps_configured_lite_roots_and_database_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configured_root = tmp_path / "configured-volume"
+    source_root = tmp_path / "source"
+    system_root = configured_root / ".cognee_system"
+    data_root = configured_root / ".data_storage"
+    state_root = configured_root / "citadel-state"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", str(configured_root))
+    monkeypatch.setenv("SYSTEM_ROOT_DIRECTORY", str(system_root))
+    monkeypatch.setenv("DATA_ROOT_DIRECTORY", str(data_root))
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(state_root))
+    monkeypatch.setenv("DB_PATH", str(system_root / "databases"))
+    monkeypatch.setenv("DB_NAME", "runtime.sqlite3")
+    monkeypatch.setenv(
+        "CITADEL_LIFECYCLE_STORE_PATH",
+        str(state_root / "runtime-lifecycle.sqlite3"),
+    )
+    _sqlite(
+        source_root / ".cognee_system/databases/runtime.sqlite3",
+        "documents",
+        "dot-root-doc",
+    )
+    _sqlite(
+        source_root / "citadel-state/runtime-lifecycle.sqlite3",
+        "revisions",
+        "dot-root-revision",
+    )
+    (source_root / ".cognee_system/databases/central_graph.lbug").parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (source_root / ".cognee_system/databases/central_graph.lbug").write_bytes(
+        b"ladybug"
+    )
+    (source_root / ".data_storage/source.txt").parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (source_root / ".data_storage/source.txt").write_text(
+        "configured source",
+        encoding="utf-8",
+    )
+    (source_root / "citadel-state/auth.json").parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (source_root / "citadel-state/auth.json").write_text(
+        '{"key":"hash-only"}\n',
+        encoding="utf-8",
+    )
+
+    backup_root = tmp_path / "generation-backup"
+    create_generation_backup(
+        generation_id="generation-1",
+        data_root=source_root,
+        destination=backup_root,
+        snapshot_store=MemorySnapshotStore({"collection-1": b"snapshot"}),
+    )
+
+    assert (backup_root / "local/cognee-system/databases/cognee.db").is_file()
+    assert (backup_root / "local/citadel-state/lifecycle.sqlite3").is_file()
+    assert not (backup_root / "local/.cognee_system").exists()
+    assert not (backup_root / "local/.data_storage").exists()
+
+    restore_root = tmp_path / "restore"
+    restore_generation_backup(
+        generation_id="generation-1",
+        backup_root=backup_root,
+        target_data_root=restore_root,
+        snapshot_store=MemorySnapshotStore({}),
+    )
+
+    restored_database = restore_root / ".cognee_system/databases/runtime.sqlite3"
+    restored_lifecycle = restore_root / "citadel-state/runtime-lifecycle.sqlite3"
+    assert restored_database.is_file()
+    assert restored_lifecycle.is_file()
+    assert (restore_root / "citadel-state/lite-runtime.lock").is_file()
+    assert not (restore_root / "cognee-system").exists()
+    with sqlite3.connect(restored_database) as connection:
+        assert connection.execute("SELECT value FROM documents").fetchall() == [
+            ("dot-root-doc",)
+        ]
+    with sqlite3.connect(restored_lifecycle) as connection:
+        assert connection.execute("SELECT value FROM revisions").fetchall() == [
+            ("dot-root-revision",)
         ]
 
 
@@ -412,14 +513,24 @@ def test_generation_restore_losing_lite_lock_preserves_winning_runtime_state(
     original_acquire = generation_backup._acquire_lite_lock
     winning_lock = None
 
-    def lose_lock_after_runtime_wins(data_root: Path, *, operation: str) -> Any:
+    def lose_lock_after_runtime_wins(
+        data_root: Path,
+        *,
+        operation: str,
+        state_root: Path | None = None,
+    ) -> Any:
         nonlocal winning_lock
-        winning_lock = acquire_single_instance_lock(data_root)
-        (data_root / "citadel-state/winner-owned.txt").write_text(
+        winning_lock = acquire_single_instance_lock(data_root, state_root=state_root)
+        winning_state_root = state_root or data_root / "citadel-state"
+        (winning_state_root / "winner-owned.txt").write_text(
             "active runtime state\n",
             encoding="utf-8",
         )
-        return original_acquire(data_root, operation=operation)
+        return original_acquire(
+            data_root,
+            operation=operation,
+            state_root=state_root,
+        )
 
     monkeypatch.setattr(
         generation_backup,

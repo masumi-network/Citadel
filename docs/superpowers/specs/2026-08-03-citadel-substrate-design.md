@@ -90,6 +90,8 @@ Plan the re-cognify as one job with the existing unreachable-document backlog, s
 
 **Agent trace.** Which sources an assistant retrieved and which shaped its output. This is the differentiated one; very little on the market answers "which document made the model say that".
 
+**Slice-1 contract:** `2026-08-19-agent-decision-trace-schema.md` defines the first durable event model for autonomous decision loops. It links model calls, arbitration outcomes, replacement events, and repair attempts in one trace.
+
 **Integrity mechanism:** a hand-rolled SHA-256 signed hash chain, with the W3C PROV entity/activity/agent model as the vocabulary. The `prov` Python library is MIT and actively released. Marquez, DataHub, and OpenMetadata were all rejected: Marquez has no tagged release in nearly two years, DataHub needs Kafka plus MySQL plus OpenSearch and phones home by default, and OpenMetadata's Python client is under a non-OSI licence. **VERIFIED** by licence and release-date checks.
 
 **The threat model the chain does not close:** a signed chain proves nobody outside altered the evidence. It does not prove the operator did not rewrite and re-sign it. The cheap upgrade is submitting the chain head to the **public Rekor transparency log**, whose Python client is Apache-2.0 and currently released. Self-hosting Rekor means Trillian plus a database plus a signer, to prove what a signed chain plus one public submission proves.

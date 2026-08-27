@@ -201,11 +201,19 @@ class FakeLinearSyncer:
             "dataset": "masumi-network",
             "last_synced_at": "2026-05-21T00:00:00Z",
             "issue_count": 2,
+            "context_record_count": 0,
+            "context_error": None,
             "mirror_count": 1,
             "state_path": "/tmp/linear-state.json",
         }
 
-    async def run(self, *, force: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
+        assert allow_llm is False
         return {
             "ok": True,
             "enabled": True,
@@ -249,7 +257,13 @@ class FakeGitHubSyncer:
             "ingest_unchanged": True,
         }
 
-    async def run(self, *, force: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
+        assert allow_llm is False
         return {
             "ok": True,
             "org": "masumi-network",
@@ -304,13 +318,20 @@ class FakeLearningAgent:
         dry_run: bool = False,
         post_to_chat: bool = False,
         include_digest_preview: bool = True,
+        allow_llm: bool = True,
     ) -> dict[str, Any]:
+        assert allow_llm is False
         return {
             "ok": True,
             "agent": "citadel-learning-agent",
             "sources": {
                 "github": {
-                    **(await FakeGitHubSyncer().run(force=force)),
+                    **(
+                        await FakeGitHubSyncer().run(
+                            force=force,
+                            allow_llm=allow_llm,
+                        )
+                    ),
                     "dry_run": dry_run,
                 },
                 "repo_content": {
@@ -375,7 +396,14 @@ class FakeRepoContentSyncer:
             "tracked_files": 0,
         }
 
-    async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
+        assert allow_llm is False
         return {
             "ok": True,
             "enabled": True,
@@ -619,6 +647,27 @@ def test_public_state_uses_bounded_lifecycle_health(
 
     assert response.status_code == 200
     assert response.json()["lifecycle"]["marker"] == "bounded"
+
+
+def test_public_state_reports_lifecycle_failure_as_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failed_lifecycle_health(_citadel: Any) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "ok": False,
+            "invariant_errors": ["failed_projection"],
+        }
+
+    app.state.citadel = FakeCitadel()
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", failed_lifecycle_health)
+
+    response = TestClient(app).get("/api/state")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["healthy"] is False
+    assert response.json()["lifecycle"]["invariant_errors"] == ["failed_projection"]
 
 
 def test_lifecycle_health_rejects_unsearchable_current_generation() -> None:
@@ -1444,6 +1493,7 @@ def test_api_uses_configured_citadel_service() -> None:
         "untrusted_context": True,
         "citation_required": True,
         "document_drilldown_available": False,
+        "citations_available": False,
     }
     assert mesh.status_code == 200
     # The fixture reports 3 GitHub repositories and 2 Linear issues.
@@ -1463,7 +1513,8 @@ def test_api_uses_configured_citadel_service() -> None:
     assert updated_mesh.status_code == 200
     # Search telemetry (implicit) + explicit /feedback both land in the feedback index.
     assert updated_mesh.json()["stats"]["since_restart"]["feedback"] >= 2
-    assert upgrade.status_code == 200
+    assert upgrade.status_code == 409
+    assert upgrade.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
 
 
 def test_authed_client_ignores_on_disk_repo_content_files(
@@ -1570,7 +1621,33 @@ def test_linear_sync_api_endpoints() -> None:
     assert linear_source["documents"] == 2
 
 
-def test_admin_can_run_cognify_recovery_and_verification() -> None:
+def test_linear_context_gap_is_visible_in_source_status() -> None:
+    client = authed_client()
+
+    class PartialLinearSyncer(FakeLinearSyncer):
+        async def status(self) -> dict[str, Any]:
+            status = await super().status()
+            status.update(
+                {
+                    "context_record_count": 3,
+                    "context_listing_complete": False,
+                    "context_error": "document: Linear HTTP 403: forbidden",
+                }
+            )
+            return status
+
+    app.state.linear_syncer = PartialLinearSyncer()
+
+    response = client.get("/api/sources?type=linear")
+
+    assert response.status_code == 200
+    source = response.json()["sources"][0]
+    assert source["status"] == "degraded"
+    assert source["documents"] == 5
+    assert response.json()["summary"]["linear_context_records"] == 3
+
+
+def test_admin_cognify_is_scheduler_only() -> None:
     client = authed_client()
 
     recover = client.post("/api/cognify/run", json={"dataset": "masumi-network"})
@@ -1583,19 +1660,15 @@ def test_admin_can_run_cognify_recovery_and_verification() -> None:
     }
     verify = client.post("/api/cognify/run", json={"verify": True})
 
-    assert recover.status_code == 200
-    assert recover.json()["dataset"] == "masumi-network"
-    assert recover.json()["graph_grew"] is True
-    assert recover.json()["verification"] is None
-    assert verify.status_code == 200
-    assert verify.json()["verify"] is True
-    assert verify.json()["verification"]["ok"] is True
+    assert recover.status_code == 409
+    assert recover.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
+    assert verify.status_code == 409
+    assert verify.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
     assert server_module._LAST_CANARY is not None
-    assert server_module._LAST_CANARY["ok"] is True
-    assert "error" not in server_module._LAST_CANARY
+    assert server_module._LAST_CANARY["ok"] is False
 
 
-def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
+def test_scheduler_only_cognify_does_not_run_verification() -> None:
     class FailingCognify(FakeCitadel):
         async def cognify_dataset(
             self, *, dataset: Any = None, verify: bool = False, force: bool = False
@@ -1621,13 +1694,13 @@ def test_cognify_verification_failure_is_a_failed_api_operation() -> None:
 
     response = client.post("/api/cognify/run", json={"verify": True})
 
-    assert response.status_code == 503
-    assert response.json()["detail"]["result"]["ok"] is False
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
     events = app.state.access_store.snapshot()["audit_events"]
     cognify_events = [event for event in events if event["action"] == "cognify.run"]
     assert cognify_events[-1]["success"] is False
     assert server_module._LAST_CANARY is not None
-    assert server_module._LAST_CANARY["ok"] is False
+    assert server_module._LAST_CANARY["ok"] is True
 
 
 def test_cognify_run_verify_exception_stamps_canary() -> None:
@@ -1648,10 +1721,10 @@ def test_cognify_run_verify_exception_stamps_canary() -> None:
 
     response = client.post("/api/cognify/run", json={"verify": True})
 
-    assert response.status_code == 500
+    assert response.status_code == 409
     assert server_module._LAST_CANARY is not None
-    assert server_module._LAST_CANARY["ok"] is False
-    assert server_module._LAST_CANARY.get("error") == "RuntimeError"
+    assert server_module._LAST_CANARY["ok"] is True
+    assert server_module._LAST_CANARY.get("error") is None
 
 
 def test_authed_client_clears_a_failed_canary_before_readyz() -> None:
@@ -2014,7 +2087,7 @@ def test_admin_can_audit_oversized_chunk_reconciliation() -> None:
     assert response.json()["apply"] is False
 
 
-def test_admin_can_request_interrupted_recovery() -> None:
+def test_user_corpus_repair_is_scheduler_only() -> None:
     client = authed_client()
 
     response = client.post(
@@ -2022,13 +2095,15 @@ def test_admin_can_request_interrupted_recovery() -> None:
         json={"apply": True, "recover": True},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
     events = app.state.access_store.snapshot()["audit_events"]
     reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
+    assert reconcile_events[-1]["success"] is False
     assert reconcile_events[-1]["detail"]["recover"] is True
 
 
-def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
+def test_user_corpus_apply_does_not_call_reconciliation() -> None:
     class FailingReconcile(FakeCitadel):
         async def reconcile_corpus(
             self,
@@ -2037,42 +2112,26 @@ def test_failed_zero_chunk_apply_is_a_failed_api_operation() -> None:
             apply: bool = False,
             force: bool = False,
         ) -> dict[str, Any]:
-            return {
-                "ok": False,
-                "dataset": dataset,
-                "apply": apply,
-                "force": force,
-                "reason": "reconciliation_invariants_remain",
-                "repair_operation_id": "repair-op-123",
-                "repair_phase": "post_index_check",
-                "repair_journal_error": "OSError",
-                "post_repair_indexed": False,
-                "post_repair_stored_budget_ok": True,
-            }
+            del dataset, apply, force
+            raise AssertionError("user corpus apply called reconciliation")
 
     client = authed_client()
     app.state.citadel = FailingReconcile()
 
     response = client.post("/api/corpus/reconcile", json={"apply": True})
 
-    assert response.status_code == 503
-    assert response.json()["detail"]["result"]["reason"] == "reconciliation_invariants_remain"
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
     events = app.state.access_store.snapshot()["audit_events"]
     reconcile_events = [event for event in events if event["action"] == "corpus.reconcile"]
     assert reconcile_events[-1]["success"] is False
     assert reconcile_events[-1]["detail"] == {
-        "operation": "corpus.reconcile",
         "apply": True,
-        "force": False,
+        "recover": False,
         "oversized": False,
-        "ok": False,
-        "reason": "reconciliation_invariants_remain",
-        "repair_required": None,
-        "repair_operation_id": "repair-op-123",
-        "repair_phase": "post_index_check",
-        "repair_journal_error": "OSError",
-        "post_repair_indexed": False,
-        "post_repair_stored_budget_ok": True,
+        "code": "LLM_SCHEDULED_ONLY",
+        "reason": "llm_scheduled_only",
+        "message": "Corpus repair runs only during scheduled self-evolution.",
     }
 
 
@@ -2184,19 +2243,98 @@ def test_reader_access_can_view_and_search_but_not_mutate() -> None:
     assert sync_run.status_code == 403
 
 
-def test_ingest_inline_cognify_flag() -> None:
+def test_ingest_is_capture_only_by_default() -> None:
     client = authed_client()
-    # Default: no inline cognify, no `cognified` in the response.
+    # User ingest stores the source and leaves projection to the scheduler.
     plain = client.post("/ingest", json={"data": "note one", "tags": []})
     assert plain.status_code == 200
-    assert "cognified" not in plain.json()
-    # cognify=True → the Node cognifies inline (server-side) and reports it.
-    with_cognify = client.post("/ingest", json={"data": "note two", "tags": [], "cognify": True})
-    assert with_cognify.status_code == 200
-    assert with_cognify.json()["cognified"] is True
+    assert plain.json()["cognified"] is False
+    assert plain.json()["projection_requested"] is False
 
 
-def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
+def test_user_capture_and_contribute_skip_llm_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = authed_client()
+    citadel = TrackingCitadel()
+    app.state.citadel = citadel
+    calls: list[str] = []
+
+    def fail_if_called(_learning: Any, _data: str) -> None:
+        calls.append("enrich")
+        raise AssertionError("user writes must not call enrichment")
+
+    monkeypatch.setattr(server_module.LearningProcess, "_enrich", fail_if_called)
+    monkeypatch.setenv("CITADEL_LLM_ENRICHMENT_ENABLED", "true")
+
+    ingest = client.post("/ingest", json={"data": "capture-only user note"})
+    contribute = client.post(
+        "/api/contribute",
+        json={"title": "User note", "content": "contribute without enrichment"},
+    )
+
+    assert ingest.status_code == 200
+    assert contribute.status_code == 200
+    assert calls == []
+    assert len(citadel.ingest_calls) == 2
+    assert all(call["defer_cognify"] is True for call in citadel.ingest_calls)
+
+
+def test_ingest_rejects_cognify_request() -> None:
+    client = authed_client()
+    response = client.post(
+        "/ingest",
+        json={"data": "note two", "tags": [], "cognify": True},
+    )
+
+    assert response.status_code == 422
+    assert "capture-only" in response.json()["detail"]
+
+
+def test_ingest_capture_only_defers_projection() -> None:
+    class CaptureOnlyCitadel(FakeCitadel):
+        def __init__(self) -> None:
+            self.ingest_calls: list[dict[str, Any]] = []
+            self.cognify_calls = 0
+
+        async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+            self.ingest_calls.append({"data": data, **kwargs})
+            return IngestResult(
+                True,
+                "queued_not_confirmed",
+                kwargs["dataset"] or "notes",
+                tuple(kwargs["tags"]),
+                source_revision_id="source-capture-only",
+                projection_job_id="job-capture-only",
+                projection_state="pending",
+                source_searchable=True,
+            )
+
+        async def cognify_dataset(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            self.cognify_calls += 1
+            return {"ok": True}
+
+    client = authed_client()
+    citadel = CaptureOnlyCitadel()
+    app.state.citadel = citadel
+
+    response = client.post(
+        "/ingest",
+        json={"data": "capture without projection", "tags": [], "cognify": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert response.json()["projection_requested"] is False
+    assert response.json()["projection_state"] == "pending"
+    assert response.json()["source_searchable"] is True
+    assert response.json()["cognified"] is False
+    assert citadel.ingest_calls[0]["defer_cognify"] is True
+    assert citadel.cognify_calls == 0
+
+
+def test_ingest_cognify_request_does_not_start_projection() -> None:
     class LifecycleCitadel(FakeCitadel):
         legacy_cognify_calls = 0
 
@@ -2231,9 +2369,7 @@ def test_ingest_inline_cognify_waits_for_its_lifecycle_operation() -> None:
         json={"data": "lifecycle note", "tags": [], "cognify": True},
     )
 
-    assert response.status_code == 200
-    assert response.json()["cognified"] is True
-    assert response.json()["projection_state"] == "searchable"
+    assert response.status_code == 422
     assert citadel.legacy_cognify_calls == 0
 
 
@@ -2334,6 +2470,22 @@ def test_writer_access_can_ingest_and_feedback_but_not_admin_actions() -> None:
     assert ingest.status_code == 200
     assert feedback.status_code == 200
     assert upgrade.status_code == 403
+
+
+@pytest.mark.parametrize("path", ["/improve", "/api/self-upgrade"])
+def test_user_improvement_routes_are_scheduler_only(path: str) -> None:
+    class NoImproveCitadel(FakeCitadel):
+        async def improve(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise AssertionError("user route called improve")
+
+    client = authed_client()
+    app.state.citadel = NoImproveCitadel()
+
+    response = client.post(path, json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
 
 
 def test_ui_requires_admin_key() -> None:
@@ -3319,6 +3471,8 @@ def test_obsidian_vault_sync_registers_pushes_pulls_and_lists_sources(tmp_path: 
     app.state.access_store = AccessStore(tmp_path / "access.json")
     app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
     client = authed_client("test-writer")
+    citadel = TrackingCitadel()
+    app.state.citadel = citadel
 
     registered = client.post(
         "/api/obsidian/vaults",
@@ -3350,6 +3504,7 @@ def test_obsidian_vault_sync_registers_pushes_pulls_and_lists_sources(tmp_path: 
     assert payload["accepted"][0]["path"] == "Team/Architecture.md"
     assert payload["accepted"][0]["rev"] == 1
     assert payload["ingest_results"][0]["accepted"] is True
+    assert citadel.ingest_calls[0]["defer_cognify"] is True
     document_id = payload["accepted"][0]["document_id"]
 
     document = client.get(f"/api/documents/{document_id}")
@@ -4738,11 +4893,13 @@ def test_single_literal_search_preserves_each_dataset_candidate() -> None:
 
 def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any) -> None:
     """The API ranks the exact token before unrelated returned hits (#106)."""
-    async def fake_search(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, Any]], bool]:
+    async def fake_search(
+        *args: Any, **kwargs: Any
+    ) -> tuple[list[tuple[str, Any]], bool, bool]:
         return [
             ("central", {"id": "central", "text": "unrelated central note"}),
             ("node", {"id": "node", "text": "quokka-beacon-8823"}),
-        ], False
+        ], False, False
 
     monkeypatch.setattr(server_module, "_search_within_budget", fake_search)
     response = authed_client().post(
@@ -4753,6 +4910,109 @@ def test_search_single_literal_query_ranks_cross_dataset_match(monkeypatch: Any)
     body = response.json()
     assert body["results"][0]["id"] == "node"
     assert body["results"][0]["_citadel"]["rank"] == 1
+
+
+def test_search_selection_prefers_relevant_central_hit_over_dataset_reservation() -> None:
+    """A weak personal hit must not displace a stronger Central match."""
+    candidates = [
+        {
+            "id": "seat-1",
+            "text": "projection notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-2",
+            "text": "MCP notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-3",
+            "text": "CLI notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "seat-4",
+            "text": "unrelated personal note",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "central-1",
+            "text": "projection MCP CLI contract",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, fetched, matched = server_module.select_public_search_page(
+        candidates,
+        query="projection MCP CLI",
+        datasets=["seat:sarthi", "masumi-network", SESSION_TRACES_DATASET],
+        limit=5,
+    )
+
+    assert fetched == 5
+    assert matched == 5
+    assert [hit["id"] for hit in selected] == [
+        "central-1",
+        "seat-1",
+        "seat-2",
+        "seat-3",
+        "seat-4",
+    ]
+
+
+def test_search_selection_drops_unscored_zero_overlap_hits_from_mixed_page() -> None:
+    candidates = [
+        {
+            "id": "exact-node",
+            "text": "Patrick is working on checkout retries",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "partial-node",
+            "text": "checkout retry notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "central-noise",
+            "text": "unrelated Linear issue",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, fetched, matched = server_module.select_public_search_page(
+        candidates,
+        query="Patrick checkout retries",
+        datasets=["seat:sarthi", "masumi-network", SESSION_TRACES_DATASET],
+        limit=2,
+    )
+
+    assert fetched == 3
+    assert matched == 3
+    assert [hit["id"] for hit in selected] == ["exact-node", "partial-node"]
+
+
+def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
+    candidates = [
+        {
+            "id": "lexical",
+            "text": "checkout retry notes",
+            "_citadel": {"dataset": "seat:sarthi"},
+        },
+        {
+            "id": "semantic",
+            "text": "payment recovery design",
+            "_citadel": {"dataset": "masumi-network"},
+        },
+    ]
+
+    selected, _fetched, _matched = server_module.select_public_search_page(
+        candidates,
+        query="checkout retries",
+        datasets=["seat:sarthi", "masumi-network"],
+        limit=2,
+    )
+
+    assert [hit["id"] for hit in selected] == ["lexical", "semantic"]
 
 
 def test_search_returns_429_when_at_capacity(monkeypatch: Any) -> None:
@@ -4867,6 +5127,49 @@ def test_search_timeout_budget_is_a_typed_failure() -> None:
         "code": "SEARCH_TIMEOUT",
         "message": "Search exceeded the configured server budget.",
     }
+
+
+def test_search_provider_timeout_uses_lexical_fallback() -> None:
+    """A slow vector provider must not hide retained source retrieval."""
+    import asyncio as aio
+    import dataclasses
+
+    class RecoveringCitadel(FakeCitadel):
+        config = dataclasses.replace(FakeCitadel.config, search_timeout_seconds=0.02)
+
+        def __init__(self) -> None:
+            self.allow_vector_recall_calls: list[bool] = []
+
+        async def search(
+            self,
+            query: str,
+            *,
+            allow_vector_recall: bool = True,
+            **kwargs: Any,
+        ) -> list[Any]:
+            del query, kwargs
+            self.allow_vector_recall_calls.append(allow_vector_recall)
+            if allow_vector_recall:
+                await aio.sleep(0.3)
+            return [
+                {
+                    "id": "lexical-hit",
+                    "document_id": "retained-source-1",
+                    "text": "retained source context",
+                }
+            ]
+
+    client = authed_client("test-reader")
+    citadel = RecoveringCitadel()
+    app.state.citadel = citadel
+
+    response = client.post("/search", json={"query": "context", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["degraded"] is True
+    assert body["results"][0]["id"] == "lexical-hit"
+    assert citadel.allow_vector_recall_calls == [True, False]
 
 
 def test_search_genuine_empty_is_a_normal_success() -> None:
@@ -4984,8 +5287,10 @@ def test_search_provider_outage_inside_the_fanout_is_a_typed_failure(
 
 
 def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
-    async def timeout(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
-        return [], True
+    async def timeout(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[list[Any], bool, bool]:
+        return [], True, False
 
     monkeypatch.setattr(server_module, "_search_within_budget", timeout)
     client = authed_client("test-reader")
@@ -4997,7 +5302,9 @@ def test_knowledge_alias_timeout_is_a_typed_failure(monkeypatch) -> None:
 
 
 def test_knowledge_alias_qdrant_outage_is_a_typed_failure(monkeypatch) -> None:
-    async def unavailable(*_args: Any, **_kwargs: Any) -> tuple[list[Any], bool]:
+    async def unavailable(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[list[Any], bool, bool]:
         raise server_module.QdrantProviderError("provider detail")
 
     monkeypatch.setattr(server_module, "_search_within_budget", unavailable)
@@ -5503,12 +5810,11 @@ def test_mesh_graph_isolates_content_per_caller_but_presence_is_universal(
 
     # Seat holder: own Node + Central, never the other seat's content.
     assert content_ids(bob_view) == {"doc-b", "doc-c"}
-    assert hub_ids(bob_view) == all_hubs
+    assert hub_ids(bob_view) == {"dataset:masumi-network", "dataset:seat:bob"}
     assert bob_view["visible_nodes"] == 2
 
     # Presence metadata (contribution counts) is visible to scoped callers.
-    alice_hub = next(n for n in bob_view["nodes"] if n["id"] == "dataset:seat:alice")
-    assert alice_hub["presence"] == {"documents": 1}
+    assert "dataset:seat:alice" not in hub_ids(bob_view)
     # Seat hubs anchor to the Central hub instead of floating.
     assert {
         "source": "dataset:seat:bob",
@@ -5611,6 +5917,101 @@ class DrilldownIsolationCitadel(FakeCitadel):
         if document is None:
             return None
         return list(document.get("dataset_node_ids") or [document_id])
+
+
+class LifecycleDocumentCitadel(FakeCitadel):
+    documents = {
+        "central-lifecycle": {
+            "id": "central-lifecycle",
+            "source": "linear-issue",
+            "source_type": "linear-issue",
+            "body": "central retained source",
+            "metadata": {
+                "dataset": "masumi-network",
+                "storage_type": "lifecycle",
+            },
+        },
+        "alice-lifecycle": {
+            "id": "alice-lifecycle",
+            "source": "repo-content",
+            "source_type": "repo-content",
+            "body": "alice retained source",
+            "metadata": {
+                "dataset": "seat:alice",
+                "storage_type": "lifecycle",
+            },
+        },
+    }
+
+    async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+        raise AssertionError(
+            f"lifecycle document {document_id} must use dataset visibility"
+        )
+
+
+def test_lifecycle_document_drilldown_uses_dataset_visibility(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    app.state.obsidian_sync = ObsidianSyncStore(tmp_path / "obsidian.json")
+    admin = authed_client()
+    bob_token = admin.post(
+        "/api/access/seats", json={"name": "Bob", "slug": "bob"}
+    ).json()["token"]
+    app.state.citadel = LifecycleDocumentCitadel()
+    api = TestClient(app, base_url="https://testserver")
+    bob = {"Authorization": f"Bearer {bob_token}"}
+
+    try:
+        central = api.get("/api/documents/central-lifecycle", headers=bob)
+        foreign = api.get("/api/documents/alice-lifecycle", headers=bob)
+        admin_foreign = admin.get("/api/documents/alice-lifecycle")
+    finally:
+        app.state.citadel = None
+
+    assert central.status_code == 200
+    assert central.json()["document"]["body"] == "central retained source"
+    assert foreign.status_code == 404
+    assert admin_foreign.status_code == 200
+    assert admin_foreign.json()["document"]["body"] == "alice retained source"
+
+
+def test_public_search_exposes_lifecycle_retrieval_mode() -> None:
+    lexical = server_module.public_search_result(
+        {
+            "id": "lexical-hit",
+            "document_id": "source-lexical",
+            "text": "deterministic fallback context",
+            "source": "lifecycle",
+            "_lifecycle": {
+                "source_revision_id": "source-lexical",
+                "retrieval_mode": "lexical_fallback",
+                "backend": "lexical",
+            },
+        },
+        0,
+        "masumi-network",
+        query="fallback context",
+    )
+    vector = server_module.public_search_result(
+        {
+            "id": "vector-hit",
+            "document_id": "source-vector",
+            "text": "vector context",
+            "source": "lifecycle",
+            "_lifecycle": {
+                "source_revision_id": "source-vector",
+                "retrieval_mode": "vector",
+                "backend": "vector",
+            },
+        },
+        0,
+        "masumi-network",
+        query="vector context",
+    )
+
+    assert lexical is not None
+    assert vector is not None
+    assert lexical["_citadel"]["retrieval"]["mode"] == "lexical_fallback"
+    assert vector["_citadel"]["retrieval"]["mode"] == "vector"
 
 
 def test_document_drilldown_enforces_read_scope_without_existence_oracle(
@@ -5783,6 +6184,7 @@ def test_search_drilldown_hint_matches_document_endpoint_per_caller(
     bob_hint = _search_hint(bob_body)
     admin_hint = _search_hint(admin_body)
     bob_meta = {h["_citadel"]["result_id"]: h["_citadel"] for h in bob_body["results"]}
+    bob_public = {h["_citadel"]["result_id"]: h for h in bob_body["results"]}
 
     # Scoped reader: Central doc AND own-doc chunk drillable (the chunk resolves
     # through its is_part_of parent doc-b -> seat:bob); foreign-seat doc and
@@ -5803,6 +6205,14 @@ def test_search_drilldown_hint_matches_document_endpoint_per_caller(
     assert "document_endpoint" in bob_meta["chunk-b"]
     assert "document_endpoint" not in bob_meta["doc-a"]
     assert "document_endpoint" not in bob_meta["entity-x"]
+    assert bob_public["doc-c"]["document_drilldown_available"] is True
+    assert bob_public["chunk-b"]["document_endpoint"] == "/api/documents/chunk-b"
+    assert bob_public["chunk-b"]["citation"]["document_endpoint"] == (
+        "/api/documents/chunk-b"
+    )
+    assert bob_public["chunk-b"]["retrieval"]["citations_available"] is True
+    assert bob_public["doc-a"]["document_drilldown_available"] is False
+    assert "document_endpoint" not in bob_public["doc-a"]
 
     # Admin bypass: every resolvable id is drillable, consistent with the endpoint.
     assert admin_hint == {
@@ -6012,7 +6422,14 @@ def test_repo_content_sync_status_and_run(tmp_path: Any) -> None:
                 "tracked_files": 14,
             }
 
-        async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        async def run(
+            self,
+            *,
+            force: bool = False,
+            dry_run: bool = False,
+            allow_llm: bool = True,
+        ) -> dict[str, Any]:
+            assert allow_llm is False
             return {
                 "ok": True,
                 "enabled": True,
@@ -6185,9 +6602,12 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     payload = response.json()
     assert payload["ok"] is True
     assert payload["query"] == "rotate keys"
-    assert [set(result) for result in payload["results"]] == [
-        set(result) for result in search.json()["results"]
-    ]
+    # The compatibility alias keeps its documented under-promise for drilldown.
+    # Its results remain the same public shape, except /search may add a verified
+    # document_endpoint after its caller-scoped ownership pass.
+    alias_keys = [set(result) for result in payload["results"]]
+    search_keys = [set(result) for result in search.json()["results"]]
+    assert all(left <= right for left, right in zip(alias_keys, search_keys))
     assert len(payload["results"]) == 2
     assert payload["results"][0]["text"] == "Rotate keys quarterly"
     assert payload["results"][0]["source"] == "https://example.com/runbook"
@@ -6214,12 +6634,7 @@ def test_knowledge_alias_validates_query_and_limit() -> None:
     )
 
 
-def test_optimize_endpoint_is_admin_only_bounded_and_audited(
-    tmp_path: Any, monkeypatch: Any
-) -> None:
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
-
+def test_optimize_endpoint_is_admin_only_and_scheduler_only(tmp_path: Any) -> None:
     writer = authed_client("test-writer")
     assert writer.post("/api/learning-agent/optimize", json={}).status_code == 403
 
@@ -6232,20 +6647,15 @@ def test_optimize_endpoint_is_admin_only_bounded_and_audited(
         json={"dry_run": True, "max_items": 5},
     )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["ok"] is True
-    assert payload["dry_run"] is True
-    assert payload["max_items"] == 5
-    assert payload["optimized"] == 0  # no LLM key -> deterministic no-op fallback
-    assert payload["llm_used"] is False
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
 
     events = store.snapshot()["audit_events"]
     optimize_events = [
         event for event in events if event["action"] == "learning_agent.optimize"
     ]
     assert len(optimize_events) == 1
-    assert optimize_events[0]["success"] is True
+    assert optimize_events[0]["success"] is False
     assert optimize_events[0]["detail"]["dry_run"] is True
 
 
@@ -7841,7 +8251,7 @@ def test_promotion_run_rejects_non_seat_dataset() -> None:
     assert "seat" in response.json()["detail"].lower()
 
 
-def test_promotion_run_disabled_returns_status_and_audits() -> None:
+def test_promotion_run_is_scheduler_only_and_audits() -> None:
     client = authed_client()
     app.state.access_store = AccessStore(Path(tempfile.mkdtemp()) / "access.json")
 
@@ -7850,17 +8260,16 @@ def test_promotion_run_disabled_returns_status_and_audits() -> None:
         json={"dataset": "seat:alice", "dry_run": True},
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["enabled"] is False
-    assert body["reason"] == "disabled"
-    assert body["promoted"] == 0
+    assert response.status_code == 409
+    body = response.json()["detail"]
+    assert body["code"] == "LLM_SCHEDULED_ONLY"
+    assert body["reason"] == "llm_scheduled_only"
     events = app.state.access_store.snapshot()["audit_events"]
     runs = [e for e in events if e["action"] == "promotion.run"]
-    assert runs and runs[-1]["success"] is True
+    assert runs and runs[-1]["success"] is False
 
 
-def test_seat_writer_can_run_own_promotion(tmp_path: Any) -> None:
+def test_seat_writer_own_promotion_is_scheduler_only(tmp_path: Any) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
     created = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"})
@@ -7873,8 +8282,8 @@ def test_seat_writer_can_run_own_promotion(tmp_path: Any) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 200
-    assert response.json()["dataset"] == "seat:alice"
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "LLM_SCHEDULED_ONLY"
 
 
 def test_seat_writer_cannot_run_a_live_promotion(tmp_path: Any) -> None:
@@ -7899,7 +8308,7 @@ def test_seat_writer_cannot_run_a_live_promotion(tmp_path: Any) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert preview.status_code == 200
+    assert preview.status_code == 409
     assert live.status_code == 403
 
 
@@ -8062,7 +8471,13 @@ class _WebhookSyncer:
     def __init__(self) -> None:
         self.ran = False
 
-    async def run(self, *, force: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        force: bool = False,
+        allow_llm: bool = True,
+    ) -> dict[str, Any]:
+        assert allow_llm is False
         self.ran = True
         return {"ok": True, "force": force}
 
@@ -8086,7 +8501,13 @@ def test_webhook_reingest_records_mesh_error_on_failure(tmp_path: Path) -> None:
     app.state.mesh = mesh
 
     class _FailingSyncer:
-        async def run(self, *, force: bool = False) -> dict[str, Any]:
+        async def run(
+            self,
+            *,
+            force: bool = False,
+            allow_llm: bool = True,
+        ) -> dict[str, Any]:
+            assert allow_llm is False
             raise RuntimeError("GitHub API returned 403: rate limit exceeded")
 
     asyncio.run(server_module._run_webhook_reingest(_FailingSyncer()))
@@ -8459,6 +8880,8 @@ class ShareCitadel(FakeCitadel):
 
 
 class LifecycleShareCitadel(ShareCitadel):
+    lifecycle_store = object()
+
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         self.ingest_calls.append({"data": data, **kwargs})
         dataset = kwargs.get("dataset") or "notes"
@@ -8507,7 +8930,10 @@ class CrossSeatTraceCitadel(FakeCitadel):
         return [{"query": query, "dataset": dataset, "text": f"{query} in {dataset}"}]
 
 
-def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
+def test_share_session_dual_writes_without_llm_or_inline_cognify(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
     app.state.access_store = AccessStore(tmp_path / "access.json")
     admin = authed_client()
     token = admin.post("/api/access/seats", json={"name": "Alice", "slug": "alice"}).json()["token"]
@@ -8515,6 +8941,12 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
     client = TestClient(app, base_url="https://testserver")
     root = str(tmp_path)
     register_seat_capture_roots(admin, "alice", [root])
+
+    def explode(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("user-triggered session sharing called an LLM")
+
+    monkeypatch.setattr("kb.session_trace.enrichment_enabled", lambda: True)
+    monkeypatch.setattr("kb.session_trace.openrouter_chat", explode)
     data = (
         "# Shared Session Trace\nAuthor-Seat: alice\nCreated-At: 2026-07-20T12:00:00Z\n\n"
         "Task: fix lock\nApproach: in-process cognify"
@@ -8530,10 +8962,11 @@ def test_share_session_dual_writes_and_schedules_cognify(tmp_path: Any) -> None:
     payload = response.json()
     assert payload["ok"] is True
     assert payload["accepted"] is True
-    assert payload["cognify"] == "deferred"
+    assert payload["cognify"] == "not_scheduled"
     datasets = [call["dataset"] for call in app.state.citadel.ingest_calls]
     assert datasets == ["seat:alice", SESSION_TRACES_DATASET]
-    assert app.state.citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+    assert all(call["defer_cognify"] is True for call in app.state.citadel.ingest_calls)
+    assert app.state.citadel.cognee.scheduled == []
 
 
 def test_share_session_returns_one_lifecycle_operation_per_target(tmp_path: Any) -> None:
@@ -8854,14 +9287,15 @@ def test_share_session_retries_session_traces_then_succeeds(tmp_path: Any) -> No
     payload = response.json()
     assert payload["ok"] is True
     assert payload["accepted"] is True
-    assert payload["cognify"] == "deferred"
+    assert payload["cognify"] == "not_scheduled"
     assert [call["dataset"] for call in citadel.ingest_calls] == [
         "seat:alice",
         SESSION_TRACES_DATASET,
         SESSION_TRACES_DATASET,
     ]
     assert citadel.session_traces_attempts == 2
-    assert citadel.cognee.scheduled == [["seat:alice", SESSION_TRACES_DATASET]]
+    assert all(call["defer_cognify"] is True for call in citadel.ingest_calls)
+    assert citadel.cognee.scheduled == []
     events = app.state.access_store.snapshot()["audit_events"]
     successful = [
         event
@@ -9028,6 +9462,41 @@ def test_result_metadata_promotes_lifecycle_receipt_identity() -> None:
         "generation_id": "generation-1",
         "backend": "vector",
         "provider": "qdrant",
+        "projection_version": "projection-v1",
+        "state": "searchable",
+    }
+
+
+def test_result_metadata_promotes_retained_source_identity_without_receipt() -> None:
+    result = server_module.with_result_metadata(
+        {
+            "id": "lexical-hit-1",
+            "document_id": "source-1",
+            "text": "retained source context",
+            "references": [{"document_id": "source-1", "source_locator": "citadel://source-1"}],
+            "_lifecycle": {
+                "schema_version": 1,
+                "source_revision_id": "source-1",
+                "generation_id": "generation-1",
+                "backend": "lexical",
+                "provider": "sqlite",
+                "projection_version": "projection-v1",
+                "state": "searchable",
+                "retrieval_mode": "lexical_fallback",
+                "projection_state": "pending",
+                "vector_state": "pending",
+            },
+        },
+        0,
+        "central",
+    )
+
+    assert result["_citadel"]["source_revision_id"] == "source-1"
+    assert "projection_receipt_id" not in result["_citadel"]
+    assert result["_citadel"]["projection"] == {
+        "generation_id": "generation-1",
+        "backend": "lexical",
+        "provider": "sqlite",
         "projection_version": "projection-v1",
         "state": "searchable",
     }
@@ -10014,7 +10483,14 @@ def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
         async def status(self) -> dict[str, Any]:
             return {"tracked_files": 0}
 
-        async def run(self, *, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        async def run(
+            self,
+            *,
+            force: bool = False,
+            dry_run: bool = False,
+            allow_llm: bool = True,
+        ) -> dict[str, Any]:
+            assert allow_llm is False
             return dict(self._result, dry_run=dry_run)
 
     admin = authed_client("test-admin")
@@ -10054,6 +10530,160 @@ def test_a_skipped_repo_content_sync_is_not_recorded_as_a_sync() -> None:
         "a skipped pass was recorded to the mesh, stamping the source 'synced' "
         f"with no checked_at and no counts: {recorded[1:]}"
     )
+
+
+def test_failed_repo_content_sync_is_not_recorded_as_success() -> None:
+    recorded: list[dict[str, Any]] = []
+
+    class FailedSyncer:
+        async def status(self) -> dict[str, Any]:
+            return {"last_run_ok": False, "last_run_reason": "repository_content_scan_incomplete"}
+
+        async def run(
+            self,
+            *,
+            force: bool = False,
+            dry_run: bool = False,
+            allow_llm: bool = True,
+        ) -> dict[str, Any]:
+            assert allow_llm is False
+            return {
+                "ok": False,
+                "enabled": True,
+                "reason": "repository_content_scan_incomplete",
+                "files_ingested": 3,
+                "files_skipped": 0,
+                "dry_run": dry_run,
+            }
+
+    admin = authed_client("test-admin")
+    mesh = server_module.get_mesh()
+    original = mesh.record_repo_content_sync
+
+    async def spy(config: Any, result: dict[str, Any]) -> None:
+        recorded.append(result)
+
+    mesh.record_repo_content_sync = spy  # type: ignore[method-assign]
+    try:
+        app.state.repo_content_syncer = FailedSyncer()
+        response = admin.post("/api/repo-content-sync/run", json={})
+    finally:
+        mesh.record_repo_content_sync = original  # type: ignore[method-assign]
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "repository_content_scan_incomplete"
+    assert recorded == []
+    events = server_module.get_access_store().snapshot()["audit_events"]
+    run_event = [event for event in events if event["action"] == "repo_content_sync.run"][-1]
+    assert run_event["success"] is False
+    assert run_event["detail"]["reason"] == "repository_content_scan_incomplete"
+
+
+def test_failed_github_sync_is_not_recorded_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    class FailedSyncer:
+        async def run(self, *, force: bool = False, allow_llm: bool = True) -> dict[str, Any]:
+            assert allow_llm is False
+            return {
+                "ok": False,
+                "reason": "github_digest_ingest_rejected",
+                "org": "masumi-network",
+                "repos_scanned": 49,
+            }
+
+    client = authed_client("test-admin")
+    app.state.github_syncer = FailedSyncer()
+    mesh = server_module.get_mesh()
+
+    async def record_sync(config: Any, result: dict[str, Any]) -> None:
+        recorded.append(result)
+
+    async def record_error(config: Any, *, operation: str, error: str) -> None:
+        errors.append({"operation": operation, "error": error})
+
+    monkeypatch.setattr(mesh, "record_github_sync", record_sync)
+    monkeypatch.setattr(mesh, "record_error", record_error)
+
+    response = client.post("/api/github-sync/run", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "github_digest_ingest_rejected"
+    assert recorded == []
+    assert errors == [
+        {"operation": "github_sync", "error": "github_digest_ingest_rejected"}
+    ]
+
+
+def test_failed_learning_sources_are_not_recorded_or_audited_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[str] = []
+    errors: list[dict[str, str]] = []
+    mcp_audits: list[dict[str, Any]] = []
+
+    class FailedLearningAgent:
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs["allow_llm"] is False
+            return {
+                "ok": False,
+                "sources": {
+                    "github": {
+                        "ok": False,
+                        "reason": "github_digest_ingest_rejected",
+                    },
+                    "repo_content": {
+                        "ok": False,
+                        "enabled": True,
+                        "reason": "repository_content_scan_incomplete",
+                    },
+                },
+                "notifications": {"google_chat": {"sent": False, "reason": "degraded"}},
+            }
+
+    client = authed_client("test-admin")
+    app.state.learning_agent = FailedLearningAgent()
+    mesh = server_module.get_mesh()
+
+    async def record_github(config: Any, result: dict[str, Any]) -> None:
+        recorded.append("github")
+
+    async def record_repo(config: Any, result: dict[str, Any]) -> None:
+        recorded.append("repo_content")
+
+    async def record_error(config: Any, *, operation: str, error: str) -> None:
+        errors.append({"operation": operation, "error": error})
+
+    monkeypatch.setattr(mesh, "record_github_sync", record_github)
+    monkeypatch.setattr(mesh, "record_repo_content_sync", record_repo)
+    monkeypatch.setattr(mesh, "record_error", record_error)
+    monkeypatch.setattr(
+        server_module,
+        "record_mcp_audit",
+        lambda request, **kwargs: mcp_audits.append(kwargs),
+    )
+
+    response = client.post("/api/learning-agent/run", json={})
+
+    assert response.status_code == 503
+    assert recorded == []
+    assert errors == [
+        {"operation": "github_sync", "error": "github_digest_ingest_rejected"},
+        {
+            "operation": "repo_content_sync",
+            "error": "repository_content_scan_incomplete",
+        },
+    ]
+    run_event = [
+        event
+        for event in server_module.get_access_store().snapshot()["audit_events"]
+        if event["action"] == "learning_agent.run"
+    ][-1]
+    assert run_event["success"] is False
+    assert mcp_audits[-1]["success"] is False
 
 
 def test_mesh_graph_dataset_param_filters_and_validates(tmp_path: Any) -> None:

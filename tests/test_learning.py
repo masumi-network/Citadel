@@ -15,6 +15,28 @@ from kb.mesh import MeshState
 from kb.models import IngestResult
 
 
+def write_evaluation_gate(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scope": "central",
+                "run_id": "test-run",
+                "evaluated_at": "2026-08-22T00:00:00Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "checks": {
+                    "projection_chain": True,
+                    "seat_isolation": True,
+                    "cited_graph_retrieval": True,
+                    "rollback": True,
+                    "free_model_budget": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class FakeCitadel:
     def __init__(self, config: CitadelConfig) -> None:
         self.config = config
@@ -86,6 +108,7 @@ def config_for(tmp_path: Path) -> CitadelConfig:
         github_sync_state_path=str(tmp_path / "github_state.json"),
         obsidian_sync_state_path=str(tmp_path / "obsidian.json"),
         conflicts_store_path=str(tmp_path / "conflicts.json"),
+        evaluation_gate_path=str(tmp_path / "evaluation_gate.json"),
     )
 
 
@@ -169,6 +192,7 @@ async def test_learn_tombstones_chunks_removed_by_content_contraction(
 
 async def test_learn_runs_improve_only_for_accepted_material(tmp_path: Path) -> None:
     config = config_for(tmp_path)
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FakeCitadel(config)
     learning = LearningProcess(citadel)
 
@@ -179,12 +203,12 @@ async def test_learn_runs_improve_only_for_accepted_material(tmp_path: Path) -> 
         run_improve=True,
     )
     citadel.accept = False
-    rejected = await learning.learn("x", run_improve=True)
+    rejected = await learning.learn("x", dataset="masumi-network", run_improve=True)
 
     assert accepted.improved is True
     assert accepted.improve == {"ok": True}
     assert citadel.improve_calls == [
-        {"dataset": "masumi-network", "session_ids": ["masumi-github-daily"]}
+        {"dataset": "masumi-network", "session_ids": None, "automation": True}
     ]
     assert rejected.improve is None
     assert rejected.improved is False
@@ -215,12 +239,42 @@ async def test_light_tier_skips_enrichment_and_improve(tmp_path: Path, monkeypat
     assert citadel.improve_calls == []
 
 
+async def test_user_write_gate_skips_all_llm_steps_for_full_tier(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = config_for(tmp_path)
+    citadel = FakeCitadel(config)
+    learning = LearningProcess(citadel)
+    called = {"enrich": 0}
+
+    def fake_enrich(_data: str) -> None:
+        called["enrich"] += 1
+        raise AssertionError("user writes must not call enrichment")
+
+    monkeypatch.setattr(learning, "_enrich", fake_enrich)
+
+    outcome = await learning.learn(
+        "Central user contribution",
+        dataset="masumi-network",
+        run_improve=True,
+        allow_llm=False,
+    )
+
+    assert outcome.ingest.accepted is True
+    assert outcome.improve is None
+    assert outcome.enrichment is None
+    assert called["enrich"] == 0
+    assert citadel.improve_calls == []
+
+
 async def test_learn_keeps_going_when_improve_fails(tmp_path: Path) -> None:
     config = config_for(tmp_path)
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FailingImproveCitadel(config)
     learning = LearningProcess(citadel)
 
-    outcome = await learning.learn("Digest", run_improve=True)
+    outcome = await learning.learn("Digest", dataset="masumi-network", run_improve=True)
 
     assert outcome.ingest.accepted is True
     assert outcome.improved is False

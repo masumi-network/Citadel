@@ -116,6 +116,8 @@ async def _run_local(
     dry_run: bool,
     post_to_chat: bool,
     include_digest_preview: bool,
+    *,
+    allow_llm: bool = True,
 ) -> dict[str, Any]:
     from kb.learning_agent import LearningAgent
 
@@ -124,6 +126,7 @@ async def _run_local(
         dry_run=dry_run,
         post_to_chat=post_to_chat,
         include_digest_preview=include_digest_preview,
+        allow_llm=allow_llm,
     )
 
 
@@ -231,7 +234,7 @@ def _print_result(result: dict[str, Any]) -> None:
     print(json.dumps(_public_summary(result), indent=2, default=str))
 
 
-async def arun() -> int:
+async def arun(*, force_in_process: bool = False) -> int:
     """The body of :func:`run`, awaitable on the caller's own event loop.
 
     The evolve scheduler runs this inside the web process's loop (#88), where
@@ -252,7 +255,7 @@ async def arun() -> int:
         "post_to_chat": post_to_chat,
         "include_digest_preview": include_digest_preview,
     }
-    endpoint = _target_endpoint()
+    endpoint = None if force_in_process else _target_endpoint()
     logger.info("GitHub sync mode: %s", "HTTP endpoint" if endpoint else "in-process")
 
     if endpoint:
@@ -285,6 +288,7 @@ async def arun() -> int:
             dry_run=dry_run,
             post_to_chat=post_to_chat,
             include_digest_preview=include_digest_preview,
+            allow_llm=True,
         )
 
     if result.get("ok") is False:
@@ -296,14 +300,14 @@ async def arun() -> int:
     return 0
 
 
-def run() -> int:
+def run(*, force_in_process: bool = False) -> int:
     """Synchronous entrypoint for the CLI and the standalone cron service.
 
     run_async, not asyncio.run: in the evolve chain this shares the one stage
     loop so cognee's cached engine is not bound to a throwaway loop (#69).
     Standalone (no shared loop) it falls back to asyncio.run.
     """
-    return run_async(arun())
+    return run_async(arun(force_in_process=force_in_process))
 
 
 def main() -> None:

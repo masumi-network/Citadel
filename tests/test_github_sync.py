@@ -17,7 +17,30 @@ from kb.github_sync import (
     GitHubPullRequest,
     GitHubRepo,
 )
+from kb.learning import LearningProcess
 from kb.models import IngestResult
+
+
+def write_evaluation_gate(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scope": "central",
+                "run_id": "test-run",
+                "evaluated_at": "2026-08-22T00:00:00Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "checks": {
+                    "projection_chain": True,
+                    "seat_isolation": True,
+                    "cited_graph_retrieval": True,
+                    "rollback": True,
+                    "free_model_budget": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class FakeCitadel:
@@ -41,6 +64,27 @@ class FailingImproveCitadel(FakeCitadel):
         raise RuntimeError("llm unavailable")
 
 
+class RefusingIngestCitadel(FakeCitadel):
+    async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
+        self.ingest_calls.append({"data": data, **kwargs})
+        return IngestResult(
+            False,
+            "unchunkable_content",
+            kwargs["dataset"],
+            tuple(kwargs["tags"]),
+        )
+
+
+class RecordingLearningProcess(LearningProcess):
+    def __init__(self, citadel: FakeCitadel) -> None:
+        super().__init__(citadel)  # type: ignore[arg-type]
+        self.learn_calls: list[dict[str, Any]] = []
+
+    async def learn(self, data: str, **kwargs: Any) -> Any:
+        self.learn_calls.append({"data": data, **kwargs})
+        return await super().learn(data, **kwargs)
+
+
 class FakeGitHubClient:
     def fetch_repos(
         self,
@@ -49,7 +93,7 @@ class FakeGitHubClient:
         max_repos: int,
         include_private: bool = True,
     ) -> list[GitHubRepo]:
-        return [
+        repos = [
             GitHubRepo(
                 name="agent",
                 full_name=f"{org}/agent",
@@ -67,7 +111,8 @@ class FakeGitHubClient:
                 topics=("masumi", "agent"),
                 license_name="Apache License 2.0",
             )
-        ][:max_repos]
+        ]
+        return repos if max_repos <= 0 else repos[:max_repos]
 
     def fetch_events(self, org: str, *, max_events: int) -> list[GitHubEvent]:
         return [
@@ -138,6 +183,27 @@ def test_github_org_client_can_request_public_repositories_only() -> None:
     assert client.requests[0][1]["type"] == "public"
 
 
+def test_github_org_client_zero_limit_fetches_every_page() -> None:
+    class PagedClient(RecordingGitHubOrgClient):
+        def _get_json(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+            self.requests.append((path, params))
+            if params["page"] == 1:
+                return [
+                    {"name": f"one-{index}", "full_name": f"masumi-network/one-{index}"}
+                    for index in range(100)
+                ]
+            return [{"name": "two", "full_name": "masumi-network/two"}]
+
+    client = PagedClient()
+
+    repos = client.fetch_repos("masumi-network", max_repos=0)
+
+    assert len(repos) == 101
+    assert repos[0].full_name == "masumi-network/one-0"
+    assert repos[-1].full_name == "masumi-network/two"
+    assert [request[1]["page"] for request in client.requests] == [1, 2]
+
+
 def test_github_org_client_requests_pull_requests_by_recent_updates() -> None:
     client = RecordingGitHubOrgClient()
     repo = GitHubRepo(
@@ -178,9 +244,17 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
         github_sync_session="masumi-github-daily",
         github_sync_state_path=str(tmp_path / "github_state.json"),
         github_sync_run_improve=True,
+        evaluation_gate_path=str(tmp_path / "evaluation_gate.json"),
     )
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FakeCitadel(config)
-    syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
+    learning = RecordingLearningProcess(citadel)
+    syncer = GitHubOrgSyncer(
+        citadel,
+        client=FakeGitHubClient(),
+        org="masumi-network",
+        learning=learning,
+    )
 
     result = await syncer.run()
     status = await syncer.status()
@@ -190,16 +264,92 @@ async def test_github_sync_ingests_daily_digest_and_persists_state(tmp_path: Any
     assert result["event_count"] == 1
     assert result["commit_count"] == 1
     assert result["ingested"] is True
+    assert result["digest_ingested"] is True
+    assert result["activity_records_discovered"] == 3
+    assert result["activity_records_retained"] == 3
+    assert result["activity_records_rejected"] == 0
     assert result["improved"] is True
+    assert len(citadel.ingest_calls) == 4
     assert "masumi-network/agent" in citadel.ingest_calls[0]["data"]
     assert "teach the archive about commits" in citadel.ingest_calls[0]["data"]
     assert citadel.ingest_calls[0]["dataset"] == "masumi-network"
-    assert citadel.improve_calls[0]["session_ids"] == ["masumi-github-daily"]
+    activity_calls = learning.learn_calls[1:]
+    assert [call["source_key"] for call in activity_calls] == [
+        "github:repository:masumi-network/agent:metadata",
+        "github:commit:masumi-network/agent:abc123def456",
+        "github:event:masumi-network/agent:evt-1",
+    ]
+    assert all(call["allow_llm"] is False for call in activity_calls)
+    assert all(call["defer_cognify"] is True for call in activity_calls)
+    assert all(call["tier"] == "light" for call in activity_calls)
+    assert citadel.improve_calls[0]["session_ids"] is None
     state = json.loads(Path(config.github_sync_state_path).read_text(encoding="utf-8"))
     assert "teach the archive about commits" in state["last_digest"]
     assert status["tracked_repositories"] == 1
     assert status["seen_events"] == 1
     assert status["tracked_commit_repositories"] == 1
+    assert status["last_activity_records_discovered"] == 3
+    assert status["last_activity_records_retained"] == 3
+    assert status["last_activity_records_rejected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_github_sync_retries_a_digest_that_ingest_rejected(tmp_path: Any) -> None:
+    config = CitadelConfig(
+        github_sync_dataset="masumi-network",
+        github_sync_session="masumi-github-daily",
+        github_sync_state_path=str(tmp_path / "github_state.json"),
+    )
+    citadel = RefusingIngestCitadel(config)
+    syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
+
+    first = await syncer.run(allow_llm=False)
+    state = json.loads(Path(config.github_sync_state_path).read_text(encoding="utf-8"))
+    second = await syncer.run(allow_llm=False)
+
+    assert first["ok"] is False
+    assert first["reason"] == "github_digest_ingest_rejected"
+    assert first["ingest_reason"] == "unchunkable_content"
+    assert "last_digest" not in state
+    assert state.get("repos") in (None, {})
+    assert len(citadel.ingest_calls) == 8
+    assert second["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_user_github_sync_disables_enrichment_and_improvement(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    config = CitadelConfig(
+        github_sync_dataset="masumi-network",
+        github_sync_session="masumi-github-daily",
+        github_sync_state_path=str(tmp_path / "github_state.json"),
+        github_sync_run_improve=True,
+    )
+    citadel = FakeCitadel(config)
+    learning = RecordingLearningProcess(citadel)
+    syncer = GitHubOrgSyncer(
+        citadel,
+        client=FakeGitHubClient(),
+        org="masumi-network",
+        learning=learning,
+    )
+
+    def explode(_data: str) -> Any:
+        raise AssertionError("user-triggered GitHub sync called an LLM")
+
+    monkeypatch.setattr("kb.learning.enrich_source_material", explode)
+    monkeypatch.setenv("CITADEL_LLM_ENRICHMENT_ENABLED", "true")
+
+    result = await syncer.run(allow_llm=False)
+
+    assert result["ingested"] is True
+    assert result["improved"] is False
+    assert citadel.improve_calls == []
+    assert len(citadel.ingest_calls) == 4
+    assert all(call["allow_llm"] is False for call in learning.learn_calls)
+    assert all(call["defer_cognify"] is True for call in learning.learn_calls)
 
 
 @pytest.mark.asyncio
@@ -209,7 +359,9 @@ async def test_github_sync_persists_digest_when_improve_fails(tmp_path: Any) -> 
         github_sync_session="masumi-github-daily",
         github_sync_state_path=str(tmp_path / "github_state.json"),
         github_sync_run_improve=True,
+        evaluation_gate_path=str(tmp_path / "evaluation_gate.json"),
     )
+    write_evaluation_gate(Path(config.evaluation_gate_path))
     citadel = FailingImproveCitadel(config)
     syncer = GitHubOrgSyncer(citadel, client=FakeGitHubClient(), org="masumi-network")
 
@@ -221,7 +373,7 @@ async def test_github_sync_persists_digest_when_improve_fails(tmp_path: Any) -> 
     assert result["improve_error"] == "llm unavailable"
     assert status["tracked_repositories"] == 1
     assert status["seen_events"] == 1
-    assert citadel.improve_calls[0]["session_ids"] == ["masumi-github-daily"]
+    assert citadel.improve_calls[0]["session_ids"] is None
 
 
 @pytest.mark.asyncio
@@ -244,7 +396,7 @@ async def test_github_sync_can_skip_unchanged_ingest(tmp_path: Any) -> None:
     assert second["changed_count"] == 0
     assert second["event_count"] == 0
     assert second["commit_count"] == 0
-    assert len(citadel.ingest_calls) == 1
+    assert len(citadel.ingest_calls) == 4
 
 
 @pytest.mark.asyncio
@@ -307,9 +459,19 @@ async def test_github_sync_returns_open_and_merged_pull_requests(tmp_path: Any) 
 
     assert result["open_pull_request_count"] == 1
     assert result["merged_pull_request_count"] == 1
+    assert result["activity_records_discovered"] == 5
+    assert result["activity_records_retained"] == 5
     assert result["open_pull_requests"][0]["number"] == 42
     assert result["merged_pull_requests"][0]["number"] == 41
     assert result["active_repositories"][0]["repo"] == "masumi-network/agent"
+    assert {
+        call["source_key"]
+        for call in citadel.ingest_calls
+        if call.get("source_key", "").startswith("github:pull-request:")
+    } == {
+        "github:pull-request:masumi-network/agent:42",
+        "github:pull-request:masumi-network/agent:41",
+    }
 
 
 @pytest.mark.asyncio
@@ -505,7 +667,7 @@ async def test_corrupt_state_raises_instead_of_everything_changed(tmp_path: Any)
 
     # No digest was fabricated from the corrupt state, and the file was left
     # untouched as evidence.
-    assert len(citadel.ingest_calls) == 1
+    assert len(citadel.ingest_calls) == 4
     assert Path(config.github_sync_state_path).read_text(encoding="utf-8") == corrupt
 
 

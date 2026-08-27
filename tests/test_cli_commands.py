@@ -19,11 +19,13 @@ from kb.cli import (
     _cached_pypi_latest,
     _capture_has_custom_node_url,
     _declined_recently,
+    _document,
     _doctor,
     _ingest,
     _maybe_prompt_update,
     _operation,
     _search,
+    _skills,
     _should_prompt_update,
     _token_set,
     _update,
@@ -203,10 +205,33 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     rc = asyncio.run(_search(args))
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["sections"]["central"][0]["text"] == "hello vault"
+    assert out["section_counts"] == {"central": 1, "session_traces": 0, "node": 0}
+    assert "sections" not in out
     assert out["results"][0]["text"] == "hello vault"
-    assert out["results"][0]["snippet"] == "hello vault"
+    assert "snippet" not in out["results"][0]
     assert out["ok"] is True
+
+
+def test_skills_command_lists_and_shows_management_skill(capsys) -> None:
+    list_args = argparse.Namespace(skills_command="list", json=True)
+    assert asyncio.run(_skills(list_args)) == 0
+    listing = json.loads(capsys.readouterr().out)
+    assert any(item["slug"] == "citadel" for item in listing["skills"])
+
+    show_args = argparse.Namespace(skills_command="show", slug="cli", json=True)
+    assert asyncio.run(_skills(show_args)) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["skill"] == "cli"
+    assert "citadel search" in shown["content"]
+
+    search_args = argparse.Namespace(skills_command="show", slug="search", json=True)
+    assert asyncio.run(_skills(search_args)) == 0
+    search_skill = json.loads(capsys.readouterr().out)
+    assert search_skill["skill"] == "search"
+    assert "<exact anchor> <subject> <fact or decision needed>" in search_skill["content"]
+    assert "citation.source_locator" in search_skill["content"]
+    assert "_citadel.retrieval.mode" in search_skill["content"]
+    assert "document_id" in search_skill["content"]
 
 
 def test_operation_command_fetches_projection_receipts(monkeypatch, capsys) -> None:
@@ -225,6 +250,62 @@ def test_operation_command_fetches_projection_receipts(monkeypatch, capsys) -> N
 
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_operation_command_can_require_searchable_state(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.fetch_operation",
+        lambda *args, **kwargs: {
+            "projection_job_id": "job-pending",
+            "state": "pending",
+            "receipts": [{"backend": "vector", "state": "pending"}],
+        },
+    )
+    args = build_parser().parse_args(
+        [
+            "operation",
+            "job-pending",
+            "--require-searchable",
+            "--node-url",
+            "https://node.example",
+            "--json",
+        ]
+    )
+
+    rc = asyncio.run(_operation(args))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["code"] == "OPERATION_NOT_SEARCHABLE"
+    assert payload["state"] == "pending"
+
+
+def test_document_command_fetches_retained_source(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    payload = {
+        "ok": True,
+        "document": {
+            "id": "document-1",
+            "title": "Runbook",
+            "body": "Rotate keys.",
+            "content": "Rotate keys.",
+            "text": "Rotate keys.",
+        },
+    }
+    monkeypatch.setattr("kb.status.fetch_document", lambda *args, **kwargs: payload)
+    args = build_parser().parse_args(
+        ["document", "document-1", "--node-url", "https://node.example", "--json"]
+    )
+
+    rc = asyncio.run(_document(args))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "document": {"id": "document-1", "title": "Runbook", "body": "Rotate keys."},
+    }
 
 
 def _search_args(**kw):
@@ -282,6 +363,71 @@ def test_search_local_still_accepts_dataset(monkeypatch) -> None:
     assert seen["dataset"] == "seat:alice"
 
 
+def test_search_local_contextless_query_does_not_start_provider(
+    monkeypatch,
+    capsys,
+) -> None:
+    def explode() -> Any:
+        raise AssertionError("contextless local search started Citadel")
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", explode)
+
+    rc = asyncio.run(
+        _search(
+            _search_args(
+                query="What did we decide about this?",
+                local=True,
+            )
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "QUERY_CONTEXT_REQUIRED"
+    assert payload["clarification_required"] is True
+    assert payload["answerable"] is False
+
+
+def test_search_local_json_uses_bounded_agent_payload(monkeypatch, capsys) -> None:
+    class FakeCitadel:
+        async def search(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [{"id": "chunk-1", "text": "match\n" + ("x" * 3000)}]
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", lambda: FakeCitadel())
+
+    rc = asyncio.run(_search(_search_args(query="match", local=True)))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    hit = payload["results"][0]
+    assert len(hit["text"]) < 3006
+
+
+def test_search_human_output_explains_context_required(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    monkeypatch.setattr(
+        "kb.status.search_node",
+        lambda *_args, **_kwargs: {
+            "results": [],
+            "code": "QUERY_CONTEXT_REQUIRED",
+            "clarification_required": True,
+            "answerable": False,
+            "message": "Name the decision topic, issue, repository, file, symbol, or feature.",
+        },
+    )
+
+    rc = asyncio.run(
+        _search(_search_args(query="What did the team decide about this?", json=False))
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "QUERY_CONTEXT_REQUIRED" in output
+    assert "Name the decision topic" in output
+    assert "No results" not in output
+
+
 def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     captured: dict[str, Any] = {}
@@ -304,6 +450,7 @@ def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
         type="spec,skill",
         repo="masumi-network/agent",
         path="docs/MIP-003",
+        source="repo-content",
         canonical_only=True,
         exclude_ambient=False,
         mode=None,
@@ -317,7 +464,44 @@ def test_search_http_forwards_cli_filters(monkeypatch, capsys) -> None:
     assert captured["types"] == ["spec", "skill"]
     assert captured["repo"] == "masumi-network/agent"
     assert captured["path"] == "docs/MIP-003"
+    assert captured["source"] == "repo-content"
     assert captured["canonical_only"] is True
+
+
+def test_search_json_matches_mcp_agent_payload(monkeypatch, capsys) -> None:
+    from kb.mcp_server import _compact_search_for_agent
+
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    long_text = "relevant source\n" + ("x" * 3000)
+    hit = {
+        "id": "chunk-1",
+        "document_id": "document-1",
+        "qa_id": "qa-1",
+        "text": long_text,
+        "repo": "masumi-network/sokosumi",
+        "path": "README.md",
+        "_citadel": {
+            "dataset": "masumi-network",
+            "document_endpoint": "/api/documents/document-1",
+            "provenance": {
+                "source": "repo-content",
+                "repo": "masumi-network/sokosumi",
+                "path": "README.md",
+            },
+            "retrieval": {"document_drilldown_available": True},
+        },
+    }
+    payload = {
+        "results": [hit],
+        "sections": {"central": [hit], "session_traces": [], "node": []},
+        "search_id": "search-1",
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *args, **kwargs: payload)
+
+    rc = asyncio.run(_search(_search_args(query="relevant source", json=True)))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == _compact_search_for_agent(payload)
 
 
 def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
@@ -351,6 +535,42 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     assert "trust: reference-only" in out
     assert "author: alice" in out
     assert "fixed the kuzu lock" in out
+
+
+def test_search_human_output_includes_provenance_and_drilldown(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    hit = {
+        "id": "repo-chunk-1",
+        "document_id": "repo-document-1",
+        "text": "Repository token context",
+        "_citadel": {
+            "dataset": "masumi-network",
+            "provenance": {
+                "source": "repo-content",
+                "repo": "masumi-network/sokosumi",
+                "path": "apps/core/token.ts",
+                "source_url": "https://github.com/masumi-network/sokosumi/blob/abc/apps/core/token.ts",
+            },
+            "retrieval": {
+                "mode": "vector",
+                "document_drilldown_available": True,
+            },
+        },
+    }
+    payload = {
+        "results": [hit],
+        "sections": {"central": [hit], "session_traces": [], "node": []},
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
+
+    rc = asyncio.run(_search(_search_args(query="token", json=False)))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "source: repo-content" in out
+    assert "mode: vector" in out
+    assert "citation: https://github.com/masumi-network/sokosumi/blob/abc/apps/core/token.ts" in out
+    assert "drilldown: citadel document repo-document-1" in out
 
 
 def test_search_human_literal_query_flattens_ranked_results(monkeypatch, capsys) -> None:
@@ -708,9 +928,7 @@ def test_ingest_no_token_exits_one(monkeypatch, capsys) -> None:
 
 
 def test_ingest_default_is_async(monkeypatch, capsys) -> None:
-    # The old default (inline cognify) blocked one request until the proxy edge
-    # 502'd it while the Node accepted the write twice (edge retry). The parser
-    # default must therefore be async: cognify only on explicit opt-in.
+    # User ingest captures the source. Scheduled projection runs separately.
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
 
@@ -727,9 +945,29 @@ def test_ingest_default_is_async(monkeypatch, capsys) -> None:
     assert seen["cognify"] is False
 
 
-def test_ingest_no_cognify_flag_still_parses(monkeypatch, capsys) -> None:
-    # --no-cognify used to be the only way to skip inline cognify; it now names
-    # the default and must keep working for existing scripts.
+def test_ingest_local_defers_projection(monkeypatch, capsys) -> None:
+    seen: dict[str, Any] = {}
+
+    class FakeLocalCitadel:
+        async def ingest(self, data: str, **kwargs: Any) -> SimpleNamespace:
+            seen.update({"data": data, **kwargs})
+            return SimpleNamespace(
+                accepted=True,
+                reason="queued_not_confirmed",
+                dataset=kwargs.get("dataset") or "notes",
+                tags=tuple(kwargs.get("tags") or ()),
+            )
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", lambda: FakeLocalCitadel())
+
+    rc = asyncio.run(_ingest(_ingest_args(local=True, dataset="notes")))
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["accepted"] is True
+    assert seen["defer_cognify"] is True
+
+
+def test_ingest_no_cognify_flag_is_capture_only(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
 
@@ -742,32 +980,41 @@ def test_ingest_no_cognify_flag_still_parses(monkeypatch, capsys) -> None:
         ["ingest", "a durable note", "--no-cognify", "--json", "--node-url", "https://node.example"]
     )
     rc = asyncio.run(_ingest(args))
+    payload = json.loads(capsys.readouterr().out)
     assert rc == 0
+    assert payload["accepted"] is True
     assert seen["cognify"] is False
 
 
-def test_ingest_cognify_flag_opts_in(monkeypatch, capsys) -> None:
+def test_ingest_cognify_flag_is_scheduler_only(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
-    seen: dict = {}
-
-    def fake_ingest(base_url, token, data, tags, cognify=False, **k):
-        seen["cognify"] = cognify  # the Node is asked to cognify inline
-        return {"accepted": True, "dataset": "seat:alice", "cognified": True}
-
-    monkeypatch.setattr("kb.status.ingest_node", fake_ingest)
     args = build_parser().parse_args(
         ["ingest", "a durable note", "--cognify", "--json", "--node-url", "https://node.example"]
     )
     rc = asyncio.run(_ingest(args))
-    assert rc == 0
-    assert seen["cognify"] is True
-    assert json.loads(capsys.readouterr().out)["cognified"] is True
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["code"] == "COGNIFY_SCHEDULER_ONLY"
 
 
-def test_ingest_async_receipt_says_when_searchable(monkeypatch, capsys) -> None:
-    # The async default must not leave the user guessing: surface the Node's
-    # queued_not_confirmed receipt as "searchable within minutes" plus the
-    # projection-job handle to track it.
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["improve"],
+        ["cognify"],
+        ["reindex", "--apply"],
+        ["promotion", "run", "--json"],
+    ],
+)
+def test_cli_llm_jobs_are_scheduler_only(argv: list[str], capsys) -> None:
+    args = build_parser().parse_args(argv)
+
+    rc = asyncio.run(args.handler(args))
+
+    assert rc == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "llm_scheduled_only"
+
+
+def test_ingest_pending_receipt_says_scheduled_projection_will_follow(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     monkeypatch.setattr(
         "kb.status.ingest_node",
@@ -775,14 +1022,17 @@ def test_ingest_async_receipt_says_when_searchable(monkeypatch, capsys) -> None:
             "accepted": True,
             "dataset": "seat:alice",
             "reason": "queued_not_confirmed",
+            "cognified": False,
             "projection_job_id": "job-7",
         },
     )
     rc = asyncio.run(_ingest(_ingest_args(json=False)))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "within minutes" in out
+    assert "Scheduled projection owns this work" in out
+    assert "within minutes" not in out
     assert "citadel operation job-7" in out
+    assert "didn't finish" not in out
 
 
 # ---- citadel ingest <path> reads the file -------------------------------------
@@ -1845,4 +2095,3 @@ def test_mcp_install_help_contains_add_help(capsys) -> None:
     out = capsys.readouterr().out
     assert "add (install)" in out
     assert "Add Citadel MCP to a tool" in out
-

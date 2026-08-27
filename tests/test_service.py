@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kb.config import CitadelConfig
+from kb.improvement_policy import ImprovementEvaluationError, ImprovementScopeError
 from kb.lifecycle import (
     LifecycleConflictError,
     LifecycleRequeueIdentityMismatchError,
@@ -87,9 +90,94 @@ class FakeCognee:
         return set(document_ids)
 
 
+class VectorLaneCognee(FakeCognee):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vector_ids: set[str] = set()
+        self.graph_ids: set[str] = set()
+        self.vector_project_calls: list[dict[str, Any]] = []
+
+    async def vector_project(self, **kwargs: Any) -> dict[str, Any]:
+        self.vector_project_calls.append(kwargs)
+        self.vector_ids.update(
+            kwargs.get("document_ids")
+            or await self.dataset_document_ids(kwargs["datasets"])
+        )
+        return {"operation_id": "vector-1"}
+
+    async def corpus_chunk_counts(self, document_ids: list[str]) -> dict[str, int]:
+        return {
+            document_id: 1
+            for document_id in document_ids
+            if document_id in self.vector_ids
+        }
+
+    async def corpus_graph_presence(
+        self,
+        document_ids: list[str],
+        *,
+        datasets: list[str] | None = None,
+    ) -> set[str]:
+        del datasets
+        return {document_id for document_id in document_ids if document_id in self.graph_ids}
+
+
+class BlockingMaintenanceVectorLaneCognee(VectorLaneCognee):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maintenance_started = asyncio.Event()
+        self.release_maintenance = asyncio.Event()
+
+    @asynccontextmanager
+    async def maintenance(self):
+        self.maintenance_started.set()
+        await self.release_maintenance.wait()
+        yield
+
+    async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        result = await super().cognify(**kwargs)
+        self.graph_ids.update(await self.dataset_document_ids(kwargs["datasets"]))
+        return result
+
+
 class EmptyCognee(FakeCognee):
     async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
         return []
+
+
+class UnavailableRecallCognee(EmptyCognee):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recall_calls = 0
+
+    async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.recall_calls += 1
+        raise RuntimeError("qdrant unavailable")
+
+    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+        return None
+
+
+def write_evaluation_gate(path: Path, *, expires_at: str = "2999-01-01T00:00:00Z") -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "scope": "central",
+                "run_id": "test-run",
+                "evaluated_at": "2026-08-22T00:00:00Z",
+                "expires_at": expires_at,
+                "checks": {
+                    "projection_chain": True,
+                    "seat_isolation": True,
+                    "cited_graph_retrieval": True,
+                    "rollback": True,
+                    "free_model_budget": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_default_cognee_client_receives_configured_retry_queue_path(
@@ -156,6 +244,7 @@ async def test_lifecycle_ingest_queues_durable_projection_and_returns_operation_
     assert result.source_revision_id is not None
     assert result.projection_job_id is not None
     assert result.projection_state == "pending"
+    assert result.source_searchable is True
     assert fake.remember_calls == [
         {
             "data": "A retained lifecycle note",
@@ -169,7 +258,137 @@ async def test_lifecycle_ingest_queues_durable_projection_and_returns_operation_
     operation = kb.lifecycle_store.get_operation(result.projection_job_id)
     assert operation.state == "searchable"
     assert operation_payload["state"] == "searchable"
+    assert operation_payload["source_searchable"] is True
+    assert operation_payload["projection_searchable"] is True
+    assert operation_payload["mesh_ready"] is True
     assert operation.source_revision.source_key == "manual:alice:note-1"
+
+
+@pytest.mark.asyncio
+async def test_vector_lane_runs_during_capture_only_ingest_without_graph_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("DB_PROVIDER", "sqlite")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("GRAPH_DATABASE_PROVIDER", "ladybug")
+    fake = VectorLaneCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+
+    accepted = await kb.ingest(
+        "capture-only content is vector searchable without graph LLM work",
+        source_key="manual:alice:vector-lane",
+        defer_cognify=True,
+    )
+    await kb.wait_for_lifecycle_idle()
+
+    operation = kb.lifecycle_store.get_operation(accepted.projection_job_id)
+    assert fake.vector_project_calls == [
+        {
+            "datasets": ["seat:alice"],
+            "force": False,
+            "document_ids": [accepted.source_revision_id],
+        }
+    ]
+    assert fake.cognify_calls == []
+    assert operation.job.state == "deferred"
+    assert next(
+        receipt.state for receipt in operation.receipts if receipt.backend == "vector"
+    ) == "searchable"
+    operation_payload = kb.lifecycle_operation(accepted.projection_job_id)
+    assert operation_payload["source_searchable"] is True
+    assert operation_payload["projection_searchable"] is True
+    assert operation_payload["mesh_ready"] is False
+    assert "retrieval_ready" not in operation_payload
+
+
+@pytest.mark.asyncio
+async def test_paused_lifecycle_queue_does_not_claim_capture_until_resumed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = VectorLaneCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    kb.pause_lifecycle_queue()
+
+    accepted = await kb.ingest(
+        "paused source stays durable and unclaimed",
+        source_key="manual:alice:paused",
+        defer_cognify=True,
+    )
+    await asyncio.sleep(0)
+    operation = kb.lifecycle_store.get_operation(accepted.projection_job_id)
+    assert operation.job.attempt == 0
+
+    kb.resume_lifecycle_queue()
+    await kb.wait_for_lifecycle_idle()
+    assert kb.lifecycle_store.get_operation(accepted.projection_job_id).job.state == "deferred"
+
+
+@pytest.mark.asyncio
+async def test_vector_lane_runs_while_graph_lane_holds_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("DB_PROVIDER", "sqlite")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("GRAPH_DATABASE_PROVIDER", "ladybug")
+    fake = BlockingMaintenanceVectorLaneCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+
+    first = await kb.ingest(
+        "first source waits for graph enrichment",
+        source_key="manual:alice:graph-lane",
+        defer_cognify=True,
+    )
+    await kb.wait_for_lifecycle_idle()
+    kb.resume_lifecycle_queue(include_deferred=True)
+    await asyncio.wait_for(fake.maintenance_started.wait(), timeout=1)
+
+    second = await kb.ingest(
+        "second source must reach vector search while graph is busy",
+        source_key="manual:alice:vector-lane",
+        defer_cognify=True,
+    )
+    await kb.wait_for_lifecycle_idle()
+
+    try:
+        second_operation = kb.lifecycle_store.get_operation(second.projection_job_id)
+        assert second_operation.job.state == "deferred"
+        assert second_operation.state == "pending"
+        assert second.source_revision_id in fake.vector_ids
+        assert len(fake.vector_project_calls) == 2
+        assert first.source_revision_id in fake.vector_ids
+    finally:
+        fake.release_maintenance.set()
+        await kb.stop_lifecycle_queue()
 
 
 def test_lifecycle_config_digest_tracks_projection_affecting_environment(
@@ -278,7 +497,7 @@ async def test_lifecycle_search_returns_only_current_searchable_revision(
 
     results = await kb.search("revision", top_k=1)
 
-    assert fake.recall_top_k == MAX_SEARCH_TOP_K
+    assert fake.recall_top_k == 1
     assert fake.allowed_document_ids == [second.source_revision_id]
     assert [result["document_id"] for result in results] == [
         second.source_revision_id
@@ -286,6 +505,401 @@ async def test_lifecycle_search_returns_only_current_searchable_revision(
     assert results[0]["_lifecycle"]["source_revision_id"] == second.source_revision_id
     assert results[0]["_lifecycle"]["backend"] == "vector"
     assert results[0]["_lifecycle"]["state"] == "searchable"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vector_search_scopes_repo_path_and_source_before_recall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class ScopedVectorCognee(FakeCognee):
+        recall_kwargs: dict[str, Any] | None = None
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_kwargs = dict(kwargs)
+            return [
+                {
+                    "id": f"chunk-{document_id}",
+                    "document_id": document_id,
+                    "text": query,
+                }
+                for document_id in kwargs["document_ids"]
+            ]
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = ScopedVectorCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    target = await kb.ingest(
+        "Sokosumi personal assistant entry point.",
+        source_key="github:masumi-network/sokosumi:path:src/assistant.ts",
+    )
+    wrong_path = await kb.ingest(
+        "Sokosumi general documentation.",
+        source_key="github:masumi-network/sokosumi:path:README.md",
+    )
+    wrong_repo = await kb.ingest(
+        "Another assistant entry point.",
+        source_key="github:masumi-network/other:path:src/assistant.ts",
+    )
+    activity = await kb.ingest(
+        "Assistant integration pull request activity.",
+        source_key="github:pull-request:masumi-network/sokosumi:123",
+    )
+    for accepted in (target, wrong_path, wrong_repo, activity):
+        await kb.wait_for_lifecycle_operation(accepted.projection_job_id)
+
+    results = await kb.search(
+        "assistant",
+        repo="masumi-network/sokosumi",
+        path="src/assistant.ts",
+        source="repo-content",
+        top_k=5,
+        allow_lexical_fallback=False,
+    )
+
+    assert fake.recall_kwargs is not None
+    assert fake.recall_kwargs["document_ids"] == [target.source_revision_id]
+    assert fake.recall_kwargs["allow_generative"] is False
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
+
+    activity_results = await kb.search(
+        "assistant",
+        source="github-activity",
+        top_k=5,
+        allow_lexical_fallback=False,
+    )
+
+    assert fake.recall_kwargs["document_ids"] == [activity.source_revision_id]
+    assert fake.recall_kwargs["allow_generative"] is False
+    assert [result["document_id"] for result in activity_results] == [
+        activity.source_revision_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_search_uses_retained_source_without_vector_or_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    projection_starts: list[bool] = []
+    monkeypatch.setattr(
+        kb,
+        "_start_lifecycle_projection",
+        lambda: projection_starts.append(True) or False,
+    )
+
+    accepted = await kb.ingest(
+        "The deterministic lexical baseline is available before vector indexing.",
+        source_key="manual:alice:llm-independent",
+        source_locator="citadel://manual/llm-independent",
+        defer_cognify=True,
+    )
+    results = await kb.search("deterministic lexical baseline", top_k=1)
+
+    async def provider_document_must_not_run(document_id: str) -> None:
+        raise AssertionError(f"retained source {document_id} must bypass the provider")
+
+    monkeypatch.setattr(fake, "get_document", provider_document_must_not_run)
+
+    assert accepted.projection_state == "pending"
+    assert accepted.source_searchable is True
+    pending_operation = kb.lifecycle_operation(accepted.projection_job_id)
+    assert pending_operation["source_searchable"] is True
+    assert pending_operation["projection_searchable"] is False
+    assert pending_operation["mesh_ready"] is False
+    assert projection_starts == []
+    assert fake.cognify_calls == []
+    assert fake.recall_calls == 0
+    assert len(results) == 1
+    assert results[0]["document_id"] == accepted.source_revision_id
+    assert results[0]["_lifecycle"]["backend"] == "lexical"
+    assert results[0]["_lifecycle"]["retrieval_mode"] == "lexical_fallback"
+    assert results[0]["_lifecycle"]["projection_state"] == "pending"
+    assert results[0]["_lifecycle"]["vector_state"] == "pending"
+    document = await kb.get_document(accepted.source_revision_id)
+    assert document is not None
+    assert document["text"] == "The deterministic lexical baseline is available before vector indexing."
+    assert document["metadata"]["dataset"] == "seat:alice"
+
+
+@pytest.mark.asyncio
+async def test_repo_scoped_retained_search_filters_before_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    monkeypatch.setattr(kb, "_start_lifecycle_projection", lambda: False)
+    for index in range(12):
+        await kb.ingest(
+            "Personal assistant integration reference. " * 5,
+            source_key=(
+                f"github:masumi-network/aaa-noise-{index:02d}:path:README.md"
+            ),
+            source_locator=(
+                f"https://github.com/masumi-network/aaa-noise-{index:02d}/blob/main/README.md"
+            ),
+            defer_cognify=True,
+        )
+    target = await kb.ingest(
+        "Sokosumi connects its personal assistant through the coworker API.",
+        source_key="github:masumi-network/sokosumi:path:README.md",
+        source_locator="https://github.com/masumi-network/sokosumi/blob/main/README.md",
+        defer_cognify=True,
+    )
+
+    results = await kb.search(
+        "personal assistant",
+        repo="masumi-network/sokosumi",
+        top_k=5,
+    )
+
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
+    assert results[0]["metadata"]["source_key"] == (
+        "github:masumi-network/sokosumi:path:README.md"
+    )
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_issue_token_respects_explicit_repo_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="masumi-network",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    monkeypatch.setattr(kb, "_start_lifecycle_projection", lambda: False)
+    target = await kb.ingest(
+        "SOK-829 implements the personal assistant entry point.",
+        source_key="github:masumi-network/sokosumi:path:src/assistant.ts",
+        source_locator=(
+            "https://github.com/masumi-network/sokosumi/blob/main/src/assistant.ts"
+        ),
+        defer_cognify=True,
+    )
+
+    results = await kb.search(
+        "SOK-829",
+        repo="masumi-network/sokosumi",
+        top_k=5,
+    )
+
+    assert [result["document_id"] for result in results] == [target.source_revision_id]
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_uses_retained_identity_without_vector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    exact = await kb.ingest(
+        "# Linear SOK-563: Subscription credits\n\nExact issue body.",
+        source_key="linear:issue:issue-563",
+        source_locator="https://linear.app/masumi/issue/SOK-563/subscription-credits",
+        defer_cognify=True,
+    )
+    await kb.ingest(
+        "# Linear SOK-689: Mobile layout\n\nThis issue mentions SOK-563.",
+        source_key="linear:issue:issue-689",
+        source_locator="https://linear.app/masumi/issue/SOK-689/mobile-layout",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+    missing = await kb.search("SOK-999", top_k=5)
+
+    assert [result["document_id"] for result in results] == [exact.source_revision_id]
+    assert results[0]["title"] == "SOK-563: Subscription credits"
+    assert results[0]["_lifecycle"]["retrieval_mode"] == "lexical_fallback"
+    assert missing == []
+    assert fake.recall_calls == 0
+    assert fake.cognify_calls == []
+    document = await kb.get_document(exact.source_revision_id)
+    assert document is not None
+    assert document["title"] == "SOK-563: Subscription credits"
+    assert document["source_type"] == "linear-issue"
+    assert document["source_locator"] == (
+        "https://linear.app/masumi/issue/SOK-563/subscription-credits"
+    )
+    assert document["provenance"] == {
+        "source": "linear-issue",
+        "basis": "content-header",
+        "issue": "SOK-563",
+        "source_url": (
+            "https://linear.app/masumi/issue/SOK-563/subscription-credits"
+        ),
+    }
+    assert document["metadata"]["storage_type"] == "lifecycle"
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_validates_retained_locator_host_and_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    valid = await kb.ingest(
+        "SOK-563 decided to retain subscription credits.",
+        source_key="manual:linear-url",
+        source_locator="https://linear.app/masumi/issue/SOK-563?view=full",
+        defer_cognify=True,
+    )
+    await kb.ingest(
+        "SOK-563 appears in unrelated repository notes.",
+        source_key="manual:foreign-url",
+        source_locator="https://github.com/acme/repo/blob/abc/issue/SOK-563/notes",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+
+    assert [result["document_id"] for result in results] == [valid.source_revision_id]
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_linear_search_is_not_capped_by_cross_references(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = UnavailableRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    for index in range(12):
+        await kb.ingest(
+            f"# Linear SOK-{700 + index}: Reference\n\n" + "SOK-563 " * 5,
+            tags=[f"linear:SOK-{700 + index}"],
+            source_key=f"linear:issue:cross-{index:02d}",
+            source_locator=(
+                f"https://linear.app/masumi/issue/SOK-{700 + index}/reference"
+            ),
+            defer_cognify=True,
+        )
+    exact = await kb.ingest(
+        "# Linear SOK-563: Subscription credits\n\nExact issue body.",
+        tags=["linear:SOK-563"],
+        source_key="linear:issue:target",
+        source_locator="https://linear.app/masumi/issue/SOK-563/subscription-credits",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("SOK-563", top_k=5)
+
+    assert [result["document_id"] for result in results] == [exact.source_revision_id]
+    assert fake.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retained_lexical_hit_beats_unrelated_vector_page(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class NoisyRecallCognee(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.noise_document_id = ""
+            self.recall_calls = 0
+
+        async def recall(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.recall_calls += 1
+            assert self.noise_document_id in kwargs["document_ids"]
+            return [
+                {
+                    "id": "noise-chunk",
+                    "document_id": self.noise_document_id,
+                    "text": "unrelated dashboard note",
+                }
+            ]
+
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    fake = NoisyRecallCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="central",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+    noise = await kb.ingest(
+        "unrelated dashboard note",
+        source_key="repo:noise/README.md",
+    )
+    await kb.wait_for_lifecycle_operation(noise.projection_job_id)
+    fake.noise_document_id = noise.source_revision_id
+    relevant = await kb.ingest(
+        "The repository exports OUTLOOK_SEND_EMAIL for mail delivery.",
+        source_key="repo:sokosumi/outlook.ts",
+        source_locator="https://github.com/masumi-network/sokosumi/blob/main/outlook.ts",
+        defer_cognify=True,
+    )
+
+    results = await kb.search("OUTLOOK_SEND_EMAIL", top_k=5)
+
+    assert results[0]["document_id"] == relevant.source_revision_id
+    assert results[0]["_lifecycle"]["retrieval_mode"] == "lexical_fallback"
+    assert any(result.get("document_id") == noise.source_revision_id for result in results)
+    assert fake.recall_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2650,16 +3264,34 @@ async def test_ingest_reports_not_scheduled_when_retry_queue_rejects() -> None:
 
 
 @pytest.mark.asyncio
-async def test_feedback_can_auto_improve() -> None:
+async def test_feedback_auto_improve_requires_llm_opt_in() -> None:
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(auto_improve=True), cognee=fake)
+
+    result = await kb.feedback(
+        FeedbackRequest(qa_id="qa-1", score=1, text="useful"),
+        allow_llm=True,
+    )
+
+    assert result.recorded
+    assert not result.improved
+    assert result.reason is not None
+    assert "automated Cognee improvement is disabled" in result.reason
+    assert fake.feedback_calls[0]["qa_id"] == "qa-1"
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_feedback_user_path_never_auto_improves() -> None:
     fake = FakeCognee()
     kb = Citadel(CitadelConfig(auto_improve=True), cognee=fake)
 
     result = await kb.feedback(FeedbackRequest(qa_id="qa-1", score=1, text="useful"))
 
-    assert result.recorded
-    assert result.improved
-    assert fake.feedback_calls[0]["qa_id"] == "qa-1"
-    assert fake.improve_calls[0]["session_ids"] == ["personal-session"]
+    assert result.recorded is True
+    assert result.improved is False
+    assert result.reason is None
+    assert fake.improve_calls == []
 
 
 class _SessionMissCognee(FakeCognee):
@@ -2686,6 +3318,7 @@ async def test_feedback_falls_back_to_durable_write_when_session_cache_misses() 
     assert "wrong answer" in note["data"]
     assert "feedback" in note["tags"]
     assert "qa:qa-9" in note["tags"]
+    assert note["defer_cognify"] is True
 
 
 @pytest.mark.asyncio
@@ -3151,6 +3784,59 @@ async def test_improve_short_circuits_on_empty_graph() -> None:
 
     assert result["ok"] is True
     assert result["skipped"] == "empty_graph"
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_requires_current_central_evaluation(tmp_path: Path) -> None:
+    fake = FakeCognee()
+    kb = Citadel(
+        CitadelConfig(evaluation_gate_path=str(tmp_path / "evaluation_gate.json")),
+        cognee=fake,
+    )
+
+    with pytest.raises(ImprovementEvaluationError):
+        await kb.improve(automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_expired_evaluation(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path, expires_at="2020-01-01T00:00:00Z")
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementEvaluationError):
+        await kb.improve(automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_non_central_dataset(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path)
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementScopeError):
+        await kb.improve(dataset="seat:alice", automation=True)
+
+    assert fake.improve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_automation_improve_rejects_session_scope(tmp_path: Path) -> None:
+    gate_path = tmp_path / "evaluation_gate.json"
+    write_evaluation_gate(gate_path)
+    fake = FakeCognee()
+    kb = Citadel(CitadelConfig(evaluation_gate_path=str(gate_path)), cognee=fake)
+
+    with pytest.raises(ImprovementScopeError):
+        await kb.improve(session_ids=["seat-session"], automation=True)
+
     assert fake.improve_calls == []
 
 

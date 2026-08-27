@@ -23,6 +23,10 @@ from kb.lifecycle import lifecycle_chunk_source_key
 from kb.mesh import MeshState
 from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
 from kb.models import IngestResult
+from kb.improvement_policy import (
+    require_automation_evaluation,
+    validate_central_improvement_scope,
+)
 from kb.service import Citadel
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,7 @@ class LearningProcess:
         run_improve: bool = False,
         detect_conflicts: bool = True,
         tier: Literal["full", "light", "shared"] = "full",
+        allow_llm: bool = True,
         defer_cognify: bool = False,
         source_key: str | None = None,
         source_locator: str | None = None,
@@ -107,6 +112,7 @@ class LearningProcess:
         ``tier="light"`` skips enrichment and improvement for seat-node memory.
         ``tier="shared"`` skips full-document enrichment and improvement for
         volunteered Shared Session Traces (dead-end refinement happens upstream).
+        ``allow_llm=False`` skips every LLM-backed step for user-level writes.
         """
         target_dataset = dataset or self.config.default_dataset
         # ADR-0005 step 1: scan the WHOLE document up front — before enrichment
@@ -125,12 +131,19 @@ class LearningProcess:
                     block_severity=self.config.content_scan_block_severity,
                     findings=scan.get("findings", []),
                 )
-        if tier in {"light", "shared"}:
+        if not allow_llm or tier in {"light", "shared"}:
             enrichment = None
             effective_run_improve = False
         else:
             enrichment = self._enrich(data)
             effective_run_improve = run_improve
+        if effective_run_improve:
+            validate_central_improvement_scope(
+                self.config,
+                dataset=target_dataset,
+                session_ids=None,
+            )
+            require_automation_evaluation(self.config)
         chunk_inputs = self._chunk_inputs(data, list(tags or []), enrichment)
         active_source_keys = {
             source_key
@@ -151,6 +164,7 @@ class LearningProcess:
 
         results: list[IngestResult] = []
         for chunk_index, (chunk_data, chunk_tags) in enumerate(chunk_inputs):
+            chunk_source_key = None
             try:
                 ingest_kwargs: dict[str, Any] = {
                     "dataset": dataset,
@@ -162,12 +176,14 @@ class LearningProcess:
                     ingest_kwargs["attestation"] = attestation
                 if source_key is not None:
                     if len(chunk_inputs) == 1:
-                        ingest_kwargs["source_key"] = source_key
+                        chunk_source_key = source_key
                     else:
-                        ingest_kwargs["source_key"] = lifecycle_chunk_source_key(
+                        chunk_source_key = lifecycle_chunk_source_key(
                             source_key,
                             chunk_index,
                         )
+                    ingest_kwargs["source_key"] = chunk_source_key
+                    if len(chunk_inputs) > 1:
                         ingest_kwargs["_lifecycle_parent_source_key"] = source_key
                         ingest_kwargs["_lifecycle_chunk_index"] = chunk_index
                 if source_locator is not None:
@@ -195,6 +211,11 @@ class LearningProcess:
                     data=chunk_data,
                     dataset=target_dataset,
                     tags=list(chunk_tags),
+                    source_key=chunk_source_key,
+                    source_locator=source_locator,
+                    capture_actor_id=capture_actor_id,
+                    capture_run_id=capture_run_id,
+                    captured_at=captured_at,
                 )
 
         if enrichment is not None and self.mesh:
@@ -234,7 +255,7 @@ class LearningProcess:
         if effective_run_improve and accepted_any:
             improve_result = await self._improve(
                 dataset=target_dataset,
-                session_ids=[session_id] if session_id else None,
+                session_ids=None,
             )
 
         return LearningOutcome(
@@ -327,7 +348,11 @@ class LearningProcess:
         session_ids: list[str] | None,
     ) -> Any:
         try:
-            return await self.citadel.improve(dataset=dataset, session_ids=session_ids)
+            return await self.citadel.improve(
+                dataset=dataset,
+                session_ids=session_ids,
+                automation=True,
+            )
         except Exception as exc:
             logger.warning(
                 "Learning process improve step failed with %s; continuing without improve",

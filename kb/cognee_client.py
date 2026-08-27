@@ -19,6 +19,7 @@ from uuid import NAMESPACE_OID, UUID, uuid5
 
 from kb import chunk_window
 from kb.cognify_queue import CognifyLease, CognifyRetryQueue
+from kb.cognee_retry_guard import install_cognee_retry_guard
 from kb.logging_utils import configure_cognee_logging
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 _BACKGROUND_COGNIFY_TASKS: set[Any] = set()
 DEFAULT_COGNIFY_QUEUE_PATH = Path(".citadel/cognify_queue.json")
 COGNIFY_EXECUTION_LOCK_POLL_SECONDS = 1.0
+_PREPARED_COGNEE_STORAGE_SIGNATURE: tuple[str, ...] | None = None
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -318,7 +320,7 @@ def _suppress_inline_cognify() -> bool:
 
     Set by :func:`suppress_inline_cognify` around the in-loop evolve Phase 1, or
     process-wide by CITADEL_SUPPRESS_INLINE_COGNIFY for the standalone evolve
-    entrypoint. Either way the web cognifies in Phase 2 as the sole writer (#47).
+    entrypoint. Phase 2 then Cognifies on the same owner loop (#47).
     """
     if _SUPPRESS_INLINE_COGNIFY.get():
         return True
@@ -389,6 +391,7 @@ class CogneeGateway(Protocol):
         session_id: str | None = None,
         top_k: int = 10,
         document_ids: list[str] | None = None,
+        allow_generative: bool = False,
     ) -> list[Any]:
         raise NotImplementedError
 
@@ -412,6 +415,15 @@ class CogneeGateway(Protocol):
         raise NotImplementedError
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
+        raise NotImplementedError
+
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any:
         raise NotImplementedError
 
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
@@ -519,11 +531,10 @@ class CogneePublicClient:
         self._cognify_queue_retry_handle: asyncio.TimerHandle | None = None
         # Serializes graph writes within this process — Kuzu is a single-writer
         # embedded DB, so two overlapping cognify calls (an inline ingest cognify,
-        # the evolve scheduler, /api/cognify/run) must not collide (#47). One client
+        # the evolve scheduler) must not collide (#47). One client
         # per Citadel; the app uses a single Citadel singleton, so this is the
-        # process-wide writer gate. The evolve scheduler also holds it across its
-        # Phase-1 subprocess so the web never cognifies while the subprocess owns
-        # the on-disk Kuzu lock.
+        # process-wide writer gate. The evolve scheduler holds it across Phase 1
+        # so background work cannot Cognify before the scheduled Phase 2 pass.
         self.writer_lock = asyncio.Lock()
         # Serializes corpus repair with every regular cognify call in this
         # process. The repair context keeps this lock across census, deletion,
@@ -598,12 +609,100 @@ class CogneePublicClient:
         if not os.getenv("LLM_API_KEY") and os.getenv("OPENROUTER_API_KEY"):
             os.environ["LLM_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
 
+    @staticmethod
+    def _cognee_storage_root_signature() -> tuple[str, ...]:
+        names = (
+            "SYSTEM_ROOT_DIRECTORY",
+            "DATA_ROOT_DIRECTORY",
+            "CACHE_ROOT_DIRECTORY",
+            "COGNEE_LOGS_DIR",
+            "DB_PATH",
+        )
+        return tuple(os.getenv(name, "").strip() for name in names)
+
+    @staticmethod
+    def _clear_cognee_config_caches() -> None:
+        try:
+            from cognee.base_config import get_base_config
+            from cognee.infrastructure.databases.cache.config import get_cache_config
+            from cognee.infrastructure.databases.cache.get_cache_engine import (
+                create_cache_engine,
+            )
+            from cognee.infrastructure.databases.graph.config import get_graph_config
+            from cognee.infrastructure.databases.relational.config import (
+                get_relational_config,
+            )
+            from cognee.infrastructure.databases.relational.create_relational_engine import (
+                create_relational_engine,
+            )
+            from cognee.infrastructure.databases.vector.create_vector_engine import (
+                _create_vector_engine,
+            )
+            from cognee.infrastructure.databases.vector.embeddings.config import (
+                get_embedding_config,
+            )
+            from cognee.infrastructure.databases.vector.embeddings.get_embedding_engine import (
+                create_embedding_engine,
+            )
+        except Exception:
+            logger.exception(
+                "Could not import cognee config factories for cache reset"
+            )
+            return
+
+        for factory in (
+            get_base_config,
+            get_cache_config,
+            create_cache_engine,
+            get_graph_config,
+            get_relational_config,
+            create_relational_engine,
+            get_embedding_config,
+            create_embedding_engine,
+            _create_vector_engine,
+        ):
+            clear = getattr(factory, "cache_clear", None)
+            if callable(clear):
+                clear()
+
+    def _ensure_cognee_storage_roots(self) -> None:
+        """Use env-backed writable roots instead of site-packages defaults.
+
+        Cognee's ``get_base_config`` defaults ``system_root_directory`` to
+        ``{package}/.cognee_system``. That path is writable in a local venv but
+        read-only in the Docker test image (uid 10001). Tests set
+        ``SYSTEM_ROOT_DIRECTORY`` via fixtures; without a cache reset the first
+        cached config keeps pointing at the package tree and graph/vector init
+        fails with ``PermissionError`` on drill-down reads.
+        """
+        global _PREPARED_COGNEE_STORAGE_SIGNATURE
+
+        signature = self._cognee_storage_root_signature()
+        if not any(signature):
+            return
+
+        for raw in signature:
+            if raw:
+                Path(raw).mkdir(parents=True, exist_ok=True)
+
+        if signature == _PREPARED_COGNEE_STORAGE_SIGNATURE:
+            return
+        _PREPARED_COGNEE_STORAGE_SIGNATURE = signature
+        self._clear_cognee_config_caches()
+
     def _prepare_cognee_environment(self) -> None:
+        self._ensure_cognee_storage_roots()
+        install_cognee_retry_guard()
         self._ensure_llm_api_key()
         self._ensure_cognee_database_env()
         self._ensure_qdrant_adapter_registered()
         self._ensure_auto_feedback_default()
         self._ensure_chunk_budget()
+        from kb.model_routing import configure_cognee_model_routes
+
+        routes = configure_cognee_model_routes()
+        if routes:
+            logger.debug("Cognee LLM stage routes active: %s", routes)
 
     def _ensure_qdrant_adapter_registered(self) -> None:
         """Register Citadel's Qdrant adapter before Cognee creates an engine."""
@@ -650,20 +749,53 @@ class CogneePublicClient:
         Set here rather than in Railway's environment on purpose. This fix has
         been written down in docs/progress.md, docs/uat-2026-07-23-findings.md
         and tasks.md since 2026-06-30 and was never applied to a running node,
-        because a variable nobody sets is not a fix. An explicit AUTO_FEEDBACK
-        in the environment still wins, so it can be turned back on without a
-        deploy.
+        because a variable nobody sets is not a fix. The user retrieval
+        contract forbids this LLM path. Background knowledge base stages use
+        explicit ``cognify`` and ``improve`` calls instead.
         """
-        os.environ.setdefault("AUTO_FEEDBACK", "false")
+        os.environ["AUTO_FEEDBACK"] = "false"
+
+    def _chunks_search_type(self, cognee: Any) -> Any:
+        search_type = getattr(cognee, "SearchType", None)
+        chunks = getattr(search_type, "CHUNKS", None)
+        if chunks is None:
+            raise RuntimeError("Cognee CHUNKS search type is unavailable")
+        return chunks
 
     def _configured_search_type(self, cognee: Any) -> Any | None:
-        raw_value = os.getenv("CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS").strip().upper()
+        raw_value = os.getenv(
+            "CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS"
+        ).strip().upper()
         if raw_value in {"", "AUTO", "RECALL"}:
             return None
         search_type = getattr(cognee, "SearchType", None)
         if search_type is None:
             return None
         return getattr(search_type, raw_value, getattr(search_type, "CHUNKS", None))
+
+    def _graph_search_options(self, query_type: Any) -> dict[str, Any]:
+        """Request cited graph context unless CHUNKS is explicitly selected."""
+        raw_value = os.getenv(
+            "CITADEL_COGNEE_SEARCH_TYPE", "CHUNKS"
+        ).strip().upper()
+        type_name = str(getattr(query_type, "name", query_type)).upper()
+        if "GRAPH" not in raw_value and "GRAPH" not in type_name:
+            return {}
+
+        include_global = (os.getenv("CITADEL_COGNEE_INCLUDE_GLOBAL_CONTEXT") or "")\
+            .strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            global_top_k = int(os.getenv("CITADEL_COGNEE_GLOBAL_CONTEXT_TOP_K", "3"))
+        except ValueError:
+            global_top_k = 3
+        global_top_k = min(max(1, global_top_k), 10)
+        return {
+            "include_references": True,
+            "retriever_specific_config": {
+                "include_global_context_index": include_global,
+                "global_context_index_top_k": global_top_k,
+            },
+        }
 
     def _is_no_data_error(self, exc: Exception) -> bool:
         return exc.__class__.__name__ in {
@@ -791,9 +923,8 @@ class CogneePublicClient:
         # process — so the evolve Phase-1 subprocess and the web cognified Kuzu at
         # the same time, the hourly "Lock is held by PID N" crash.
         #
-        # 1) In the Phase-1 evolve subprocess (CITADEL_SUPPRESS_INLINE_COGNIFY=true)
-        #    we ADD ONLY and never write Kuzu — the web cognifies everything in
-        #    Phase 2 as the sole writer.
+        # 1) In evolve Phase 1, suppress_inline_cognify makes this ADD only. The
+        #    scheduler Cognifies everything once in Phase 2.
         # 2) Otherwise we schedule our OWN background cognify that serializes on the
         #    writer lock (kept non-blocking for the caller, #56), so concurrent
         #    in-process ingests and the evolve scheduler never collide.
@@ -1037,6 +1168,7 @@ class CogneePublicClient:
         session_id: str | None = None,
         top_k: int = 10,
         document_ids: list[str] | None = None,
+        allow_generative: bool = False,
     ) -> list[Any]:
         if (
             document_ids is None
@@ -1047,6 +1179,7 @@ class CogneePublicClient:
                 dataset=dataset,
                 session_id=session_id,
                 top_k=top_k,
+                allow_generative=allow_generative,
             )
         from kb.qdrant_adapter import qdrant_document_scope
 
@@ -1056,6 +1189,7 @@ class CogneePublicClient:
                 dataset=dataset,
                 session_id=session_id,
                 top_k=top_k,
+                allow_generative=allow_generative,
             )
 
     async def _recall_unscoped(
@@ -1065,6 +1199,7 @@ class CogneePublicClient:
         dataset: str,
         session_id: str | None = None,
         top_k: int = 10,
+        allow_generative: bool = False,
     ) -> list[Any]:
         timing = _search_timing_enabled()
         t_start = perf_counter() if timing else 0.0
@@ -1077,7 +1212,12 @@ class CogneePublicClient:
         # stale "[DataItem]" scaffolds, so it is OFF by default — durable recall goes
         # straight to the chunk/vector store (#15/#52). Re-enable per-session reads
         # with CITADEL_COGNEE_SESSION_RECALL=true only if the cache is ever repaired.
-        if session_id and hasattr(cognee, "recall") and _session_recall_enabled():
+        if (
+            allow_generative
+            and session_id
+            and hasattr(cognee, "recall")
+            and _session_recall_enabled()
+        ):
             try:
                 session_results = await cognee.recall(
                     query,
@@ -1092,7 +1232,11 @@ class CogneePublicClient:
             if session_results:
                 return session_results
 
-        query_type = self._configured_search_type(cognee)
+        query_type = (
+            self._configured_search_type(cognee)
+            if allow_generative
+            else self._chunks_search_type(cognee)
+        )
         if query_type is None and hasattr(cognee, "recall"):
             try:
                 results = await cognee.recall(
@@ -1129,6 +1273,7 @@ class CogneePublicClient:
         }
         if query_type is not None:
             search_kwargs["query_type"] = query_type
+            search_kwargs.update(self._graph_search_options(query_type))
         try:
             results = await cognee.search(**search_kwargs)
         except Exception as exc:
@@ -1146,9 +1291,26 @@ class CogneePublicClient:
             flattened: list[Any] = []
             for result in results:
                 search_result = result["search_result"]
+                references = result.get("references")
                 if isinstance(search_result, list):
-                    flattened.extend(search_result)
+                    flattened.extend(
+                        {
+                            **item,
+                            "references": references,
+                        }
+                        if isinstance(item, dict)
+                        and references is not None
+                        and "references" not in item
+                        else item
+                        for item in search_result
+                    )
                 elif search_result is not None:
+                    if (
+                        isinstance(search_result, dict)
+                        and references is not None
+                        and "references" not in search_result
+                    ):
+                        search_result = {**search_result, "references": references}
                     flattened.append(search_result)
             return flattened
         return results
@@ -1505,6 +1667,57 @@ class CogneePublicClient:
                 )
             )
         return sorted({str(data_id) for (data_id,) in rows.all() if data_id is not None})
+
+    async def _vector_projection_data(
+        self,
+        *,
+        dataset: str,
+        document_ids: list[str],
+    ) -> list[Any]:
+        """Load only authorized Cognee Data rows for one vector projection."""
+        wanted = list(dict.fromkeys(str(document_id) for document_id in document_ids))
+        if not wanted:
+            raise ValueError("vector projection requires at least one document id")
+        try:
+            wanted_ids = [UUID(document_id) for document_id in wanted]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "vector projection document ids must be UUIDs"
+            ) from exc
+
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data, Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Data)
+                .join(DatasetData, DatasetData.data_id == Data.id)
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .where(
+                    Dataset.owner_id == user.id,
+                    Dataset.tenant_id == user.tenant_id,
+                    Dataset.name == dataset,
+                    Data.id.in_(wanted_ids),
+                )
+            )
+            by_id = {str(row.id): row for row in rows.scalars().all()}
+
+        missing = [document_id for document_id in wanted if document_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                "vector projection source is missing from the authorized dataset: "
+                + ", ".join(missing)
+            )
+        return [by_id[document_id] for document_id in wanted]
 
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
@@ -3851,10 +4064,10 @@ class CogneePublicClient:
         """One store's targeted read via the engine the active context resolves.
 
         Falls back to the full ``graph_data()`` read when the engine lacks the
-        targeted primitives or the read raises — a shape surprise degrades to
-        correct-but-slow, never a spurious 404. A node missing from this store
+        targeted primitives or the read raises. A shape surprise degrades to a
+        correct but slow read, never a spurious 404. A node missing from this store
         returns an empty result (``get_node`` -> None, ``get_connections`` ->
-        []) WITHOUT triggering that fallback: a full graph read cannot contain
+        []) without triggering that fallback: a full graph read cannot contain
         a node the graph lacks. Ids no store resolves are instead retried
         against the durable chunk store by ``get_document``
         (``_document_from_chunk_store``).
@@ -3928,9 +4141,21 @@ class CogneePublicClient:
         entities) behave as without the flag.
         """
         doc_id = str(document_id)
-        document = await self._document_from_graph(
-            doc_id, follow_parent=True, chunk_scope=chunk_scope
-        )
+        try:
+            document = await self._document_from_graph(
+                doc_id, follow_parent=True, chunk_scope=chunk_scope
+            )
+        except Exception as exc:
+            document = await self._document_from_chunk_store(
+                doc_id, chunk_scope=chunk_scope
+            )
+            if document is not None:
+                logger.warning(
+                    "graph document lookup failed; served retained chunk content: %s",
+                    exc.__class__.__name__,
+                )
+                return document
+            raise
         if document is not None:
             return document
         return await self._document_from_chunk_store(doc_id, chunk_scope=chunk_scope)
@@ -3961,9 +4186,17 @@ class CogneePublicClient:
         try:
             nodes, edges = await self._document_graph(doc_id)
         except Exception as exc:  # noqa: BLE001
-            if not self._is_no_data_error(exc):
-                raise
-            nodes, edges = [], []
+            owner_ids = await self._owner_ids_from_chunk_store(doc_id)
+            if owner_ids is not None:
+                if not self._is_no_data_error(exc):
+                    logger.warning(
+                        "graph owner lookup failed; resolved retained chunk ownership: %s",
+                        exc.__class__.__name__,
+                    )
+                return owner_ids
+            if self._is_no_data_error(exc):
+                return None
+            raise
         props, props_by_id, part_neighbor_ids = self._graph_projection(
             doc_id, nodes, edges
         )
@@ -4572,6 +4805,83 @@ class CogneePublicClient:
         async with self.maintenance():
             return await self._cognify_unlocked(datasets=datasets, force=force)
 
+    async def vector_project(
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        document_ids: list[str] | None = None,
+    ) -> Any:
+        """Build chunk embeddings without running Cognee's LLM graph stage."""
+        if not datasets:
+            raise ValueError("vector projection requires at least one dataset")
+        if document_ids is not None and len(datasets) != 1:
+            raise ValueError(
+                "document-scoped vector projection requires exactly one dataset"
+            )
+
+        async def run_unlocked() -> list[Any]:
+            self._prepare_cognee_environment()
+            chunk_window.require_bpe_encoding()
+            import cognee
+
+            run_custom_pipeline = getattr(cognee, "run_custom_pipeline", None)
+            if not callable(run_custom_pipeline):
+                raise RuntimeError(
+                    "Cognee 1.4.1 run_custom_pipeline API is unavailable"
+                )
+            await self._ensure_cognee_ready(cognee)
+
+            from cognee.modules.chunking.TextChunker import TextChunker
+            from cognee.modules.pipelines.tasks.task import Task
+            from cognee.tasks.documents import (
+                classify_documents,
+                extract_chunks_from_documents,
+            )
+            from cognee.tasks.storage.index_data_points import index_data_points
+
+            tasks = [
+                Task(classify_documents),
+                Task(
+                    extract_chunks_from_documents,
+                    max_chunk_size=chunk_window.resolve_chunk_budget(),
+                    chunker=TextChunker,
+                ),
+                Task(index_data_points, task_config={"batch_size": 32}),
+            ]
+            results: list[Any] = []
+            for dataset in datasets:
+                data = None
+                if document_ids is not None:
+                    data = await self._vector_projection_data(
+                        dataset=dataset,
+                        document_ids=document_ids,
+                    )
+                results.append(
+                    await run_custom_pipeline(
+                        tasks=tasks,
+                        data=data,
+                        dataset=dataset,
+                        use_pipeline_cache=False,
+                        # A document-scoped call is a repair for a source whose
+                        # lifecycle receipt is not searchable. Cognee's stored
+                        # per-data pipeline status may be stale, so do not let
+                        # incremental loading skip the requested source.
+                        incremental_loading=False if document_ids is not None else not force,
+                        data_cache=False if document_ids is not None else not force,
+                        data_per_batch=20,
+                        run_in_background=False,
+                        pipeline_name=f"citadel_vector_projection:{dataset}",
+                        skip_connection_test=True,
+                    )
+                )
+            return results
+
+        # This route only classifies sources, extracts chunks, and writes vector
+        # points. It does not open the graph writer, so it must remain available
+        # while scheduled graph enrichment holds the maintenance lock.
+        return await run_unlocked()
+
     async def _cognify_unlocked(
         self, *, datasets: list[str], force: bool = False
     ) -> Any:
@@ -4604,13 +4914,56 @@ class CogneePublicClient:
         expected_ids = await self.dataset_document_ids(datasets) if force else []
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
-        async with self.writer_lock:
-            result = await cognee.cognify(
-                datasets=datasets,
+        async def run_cognify(
+            *, incremental_loading: bool, data_cache: bool
+        ) -> Any:
+            async with self.writer_lock:
+                cognify_result = await cognee.cognify(
+                    datasets=datasets,
+                    incremental_loading=incremental_loading,
+                    data_cache=data_cache,
+                )
+                self._invalidate_graph_data_cache()
+                return cognify_result
+
+        try:
+            result = await run_cognify(
                 incremental_loading=not force,
                 data_cache=not force,
             )
-            self._invalidate_graph_data_cache()
+        except Exception as exc:
+            from kb.embedding_profile import (
+                activate_local_embedding_fallback,
+                is_embedding_provider_failure,
+            )
+            from kb.model_routing import (
+                activate_cognee_free_router_fallback,
+                is_cognee_llm_provider_failure,
+            )
+
+            if self.lifecycle_projection_state_lookup is not None:
+                raise RuntimeError(
+                    "Cognee provider fallback is disabled for the active lifecycle "
+                    "generation; change the route in a new generation"
+                ) from exc
+
+            if is_embedding_provider_failure(exc):
+                if not activate_local_embedding_fallback(exc):
+                    raise
+                logger.warning(
+                    "Cognee embedding provider failed; retrying cognify with local FastEmbed"
+                )
+            elif is_cognee_llm_provider_failure(exc):
+                if not activate_cognee_free_router_fallback(exc):
+                    raise
+                logger.warning(
+                    "Cognee LLM provider failed; retrying cognify with openrouter/free"
+                )
+            else:
+                raise
+
+            self._prepare_cognee_environment()
+            result = await run_cognify(incremental_loading=False, data_cache=False)
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
         processed_ids = _cognify_data_ids(result)

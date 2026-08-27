@@ -84,6 +84,8 @@ jobs:
           "$venv/bin/python" -m pip install --no-index --no-deps dist/*.whl
           "$venv/bin/python" scripts/verify_package_artifacts.py --dist dist
           "$venv/bin/citadel" bench --help >/dev/null
+          "$venv/bin/citadel" skills list --json >/dev/null
+          "$venv/bin/citadel" document --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: dist

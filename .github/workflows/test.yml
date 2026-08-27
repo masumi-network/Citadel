@@ -579,11 +579,13 @@ jobs:
               "/api/state" \
               "/skills" \
               "/skills/boundary" \
+              "/skills/citadel" \
               "/skills/cli" \
               "/skills/connect" \
               "/skills/debug" \
               "/skills/onboard" \
               "/skills/proactive-ingest" \
+              "/skills/search" \
               "/skills/vault"; do
               if ! grep -Fq -- \
                 "GET $public_path HTTP/1.1\" 200 OK" "$log_dir/citadel.log"; then
@@ -662,6 +664,7 @@ jobs:
               "skills/citadel-onboard/SKILL.md",
               "skills/citadel-proactive-ingest/README.md",
               "skills/citadel-proactive-ingest/SKILL.md",
+              "skills/citadel-search/SKILL.md",
               "skills/citadel-vault/SKILL.md",
               "skills/citadel/SKILL.md",
           }
@@ -704,20 +707,24 @@ jobs:
 
           expected = {
               "boundary": "citadel-data-boundary",
+              "citadel": "citadel",
               "cli": "citadel-cli",
               "connect": "citadel-mcp-connector",
               "debug": "citadel-debug",
               "onboard": "citadel-onboard",
               "proactive-ingest": "citadel-proactive-ingest",
+              "search": "citadel-search",
               "vault": "citadel-vault",
           }
           expected_aliases = {
               "boundary": ["citadel-data-boundary", "policy", "privacy", "public-private"],
+              "citadel": [],
               "cli": ["citadel-cli"],
               "connect": ["citadel-mcp-connector", "mcp", "mcp-connector"],
               "debug": ["citadel-debug"],
               "onboard": ["citadel-onboard"],
               "proactive-ingest": ["autosync", "citadel-proactive-ingest"],
+              "search": ["citadel-search", "search-guide"],
               "vault": ["citadel-vault"],
           }
           rows = {row["slug"]: row for row in catalog["skills"]}

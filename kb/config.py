@@ -223,12 +223,14 @@ class CitadelConfig:
     github_sync_dataset: str = "masumi-network"
     github_sync_session: str = "masumi-github-daily"
     github_sync_state_path: str = ".citadel/github_sync_state.json"
-    github_sync_max_repos: int = 100
+    # Zero means every repository page. An organization sync must not silently
+    # stop at the first 100 repositories.
+    github_sync_max_repos: int = 0
     github_sync_max_events: int = 50
     github_sync_max_commits_per_repo: int = 5
     github_sync_max_pull_requests_per_repo: int = 5
     github_sync_include_commits: bool = True
-    github_sync_run_improve: bool = True
+    github_sync_run_improve: bool = False
     github_sync_ingest_unchanged: bool = True
     github_sync_include_private: bool = True
     github_sync_repo_allowlist: tuple[str, ...] = field(default_factory=tuple)
@@ -258,6 +260,7 @@ class CitadelConfig:
     repo_content_sync_session: str = "masumi-repo-content"
     repo_content_sync_state_path: str = ".citadel/repo_content_sync_state.json"
     evolve_state_path: str = ".citadel/evolve_state.json"
+    evaluation_gate_path: str = ".citadel/evaluation_gate.json"
     repair_journal_path: str = ".citadel/repair_journal.jsonl"
     cognify_queue_path: str = ".citadel/cognify_queue.json"
     # Direct dataclass construction is used by isolated unit tests and embedded
@@ -265,13 +268,16 @@ class CitadelConfig:
     # explicitly disabled.
     lifecycle_enabled: bool = False
     lifecycle_store_path: str = ".citadel/lifecycle.sqlite3"
+    lifecycle_projection_batch_size: int = 20
     repo_content_sync_repos: tuple[str, ...] = field(default_factory=tuple)
+    repo_content_sync_all_repos: bool = False
+    repo_content_sync_all_text: bool = False
     repo_content_sync_root_paths: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_prefixes: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_tree_extensions: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_max_files_per_repo: int = 40
     repo_content_sync_max_bytes_per_file: int = 120_000
-    repo_content_sync_run_improve: bool = True
+    repo_content_sync_run_improve: bool = False
     repo_content_sync_autojoin_enabled: bool = False
     repo_content_sync_autojoin_markers: tuple[str, ...] = field(default_factory=tuple)
     repo_content_sync_autojoin_max_repos: int = 100
@@ -310,7 +316,12 @@ class CitadelConfig:
     linear_sync_dataset: str = "masumi-network"
     linear_sync_session: str = "masumi-linear"
     linear_sync_state_path: str = ".citadel/linear_sync_state.json"
-    linear_sync_max_issues: int = 200
+    # Zero means fetch every Linear issue page until hasNextPage is false.
+    linear_sync_max_issues: int = 0
+    # Zero means fetch every active Linear context record page. Archived records
+    # stay excluded unless explicitly enabled below.
+    linear_sync_max_context_records: int = 0
+    linear_sync_include_archived: bool = False
     linear_sync_run_improve: bool = False
     linear_user_map: dict[str, str] = field(default_factory=dict)
 
@@ -367,7 +378,7 @@ class CitadelConfig:
             github_sync_dataset=os.getenv("CITADEL_GITHUB_SYNC_DATASET", "masumi-network"),
             github_sync_session=os.getenv("CITADEL_GITHUB_SYNC_SESSION", "masumi-github-daily"),
             github_sync_state_path=_github_state_path(os.getenv("CITADEL_GITHUB_SYNC_STATE_PATH")),
-            github_sync_max_repos=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_REPOS"), default=100),
+            github_sync_max_repos=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_REPOS"), default=0),
             github_sync_max_events=_int(os.getenv("CITADEL_GITHUB_SYNC_MAX_EVENTS"), default=50),
             github_sync_max_commits_per_repo=_int(
                 os.getenv("CITADEL_GITHUB_SYNC_MAX_COMMITS_PER_REPO"),
@@ -381,7 +392,7 @@ class CitadelConfig:
                 os.getenv("CITADEL_GITHUB_SYNC_INCLUDE_COMMITS"),
                 default=True,
             ),
-            github_sync_run_improve=_bool(os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=True),
+            github_sync_run_improve=_bool(os.getenv("CITADEL_GITHUB_SYNC_RUN_IMPROVE"), default=False),
             github_sync_ingest_unchanged=_bool(
                 os.getenv("CITADEL_GITHUB_SYNC_INGEST_UNCHANGED"),
                 default=True,
@@ -470,6 +481,8 @@ class CitadelConfig:
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_STATE_PATH")
             ),
             evolve_state_path=_evolve_state_path(os.getenv("CITADEL_EVOLVE_STATE_PATH")),
+            evaluation_gate_path=os.getenv("CITADEL_EVALUATION_GATE_PATH")
+            or str(Path(_state_root()) / "evaluation_gate.json"),
             repair_journal_path=_repair_journal_path(
                 os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
             ),
@@ -481,8 +494,23 @@ class CitadelConfig:
             lifecycle_store_path=_lifecycle_store_path(
                 os.getenv("CITADEL_LIFECYCLE_STORE_PATH")
             ),
+            lifecycle_projection_batch_size=max(
+                1,
+                _int(
+                    os.getenv("CITADEL_LIFECYCLE_PROJECTION_BATCH_SIZE"),
+                    default=20,
+                ),
+            ),
             repo_content_sync_repos=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_REPOS"))
+            ),
+            repo_content_sync_all_repos=_bool(
+                os.getenv("CITADEL_REPO_CONTENT_SYNC_ALL_REPOS"),
+                default=True,
+            ),
+            repo_content_sync_all_text=_bool(
+                os.getenv("CITADEL_REPO_CONTENT_SYNC_ALL_TEXT"),
+                default=True,
             ),
             repo_content_sync_root_paths=tuple(
                 _csv(os.getenv("CITADEL_REPO_CONTENT_SYNC_ROOT_PATHS"))
@@ -495,7 +523,7 @@ class CitadelConfig:
             ),
             repo_content_sync_max_files_per_repo=_int(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_MAX_FILES_PER_REPO"),
-                default=40,
+                default=0,
             ),
             repo_content_sync_max_bytes_per_file=_int(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_MAX_BYTES_PER_FILE"),
@@ -503,7 +531,7 @@ class CitadelConfig:
             ),
             repo_content_sync_run_improve=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_RUN_IMPROVE"),
-                default=True,
+                default=False,
             ),
             repo_content_sync_autojoin_enabled=_bool(
                 os.getenv("CITADEL_REPO_CONTENT_SYNC_AUTOJOIN_ENABLED"),
@@ -602,7 +630,13 @@ class CitadelConfig:
             linear_sync_state_path=_linear_sync_state_path(
                 os.getenv("CITADEL_LINEAR_SYNC_STATE_PATH")
             ),
-            linear_sync_max_issues=_int(os.getenv("CITADEL_LINEAR_SYNC_MAX_ISSUES"), default=200),
+            linear_sync_max_issues=_int(os.getenv("CITADEL_LINEAR_SYNC_MAX_ISSUES"), default=0),
+            linear_sync_max_context_records=_int(
+                os.getenv("CITADEL_LINEAR_SYNC_MAX_CONTEXT_RECORDS"), default=0
+            ),
+            linear_sync_include_archived=_bool(
+                os.getenv("CITADEL_LINEAR_SYNC_INCLUDE_ARCHIVED"), default=False
+            ),
             linear_sync_run_improve=_bool(os.getenv("CITADEL_LINEAR_SYNC_RUN_IMPROVE")),
             linear_user_map=_linear_user_map(os.getenv("CITADEL_LINEAR_USER_MAP")),
         )

@@ -32,30 +32,36 @@ def _required(name: str) -> str:
     return value
 
 
-def _build_id() -> str:
-    configured = os.getenv("CITADEL_BUILD_ID", "").strip()
-    if configured:
-        return configured
-    path = Path(os.getenv("CITADEL_BUILD_ID_PATH", "/opt/citadel/build-id"))
-    try:
-        value = path.read_text(encoding="ascii").strip()
-    except OSError as error:
-        raise LiteConfigurationError(f"Citadel build identity is unavailable at {path}") from error
-    if not value:
-        raise LiteConfigurationError(f"Citadel build identity is empty at {path}")
-    return value
+def _build_id() -> str | None:
+    from kb.build_identity import build_identity_from_runtime
+
+    return build_identity_from_runtime(os.environ).build_id
 
 
 # Must match the model the Dockerfile bakes into /opt/fastembed-cache and
-# /opt/hf-cache; under HF_HUB_OFFLINE=1 nothing else can load.
+# /opt/hf-cache when the FastEmbed provider runs under HF_HUB_OFFLINE=1.
 BAKED_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 def configure_lite_environment(data_root: Path | None = None) -> Path:
     root = (data_root or Path(os.getenv("CITADEL_LITE_DATA_ROOT", "/data"))).resolve()
-    # fastembed treats any of {1, true, yes, on} as offline; matching only "1"
-    # let HF_HUB_OFFLINE=true bypass this guard while still blocking downloads.
-    if (os.getenv("HF_HUB_OFFLINE") or "").strip().lower() in {"1", "true", "yes", "on"}:
+    # fastembed treats any of {1, true, yes, on} as offline. Remote providers
+    # do not use the image's baked FastEmbed model.
+    embedding_provider = os.getenv("EMBEDDING_PROVIDER", "fastembed").strip().lower()
+    embedding_endpoint = os.getenv("EMBEDDING_ENDPOINT", "").strip()
+    nemotron_enabled = (os.getenv("CITADEL_NEMOTRON_EMBEDDINGS_ENABLED") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if (
+        embedding_provider == "fastembed"
+        and not embedding_endpoint
+        and not nemotron_enabled
+        and (os.getenv("HF_HUB_OFFLINE") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
         model = os.getenv("EMBEDDING_MODEL", BAKED_EMBEDDING_MODEL)
         if model != BAKED_EMBEDDING_MODEL:
             # Without this, the drift surfaces later as fastembed's buried
@@ -99,7 +105,6 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
 
     expected = {
         "DB_PROVIDER": "sqlite",
-        "GRAPH_DATABASE_PROVIDER": "ladybug",
         "VECTOR_DB_PROVIDER": "qdrant",
         "VECTOR_DATASET_DATABASE_HANDLER": "qdrant",
         "ENABLE_BACKEND_ACCESS_CONTROL": "true",
@@ -111,6 +116,12 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
             raise LiteConfigurationError(
                 f"Lite profile requires {name}={wanted}; got {os.environ[name]!r}"
             )
+    graph_provider = os.environ["GRAPH_DATABASE_PROVIDER"].strip().lower()
+    if graph_provider not in ("ladybug", "postgres"):
+        raise LiteConfigurationError(
+            f"Lite profile requires GRAPH_DATABASE_PROVIDER in (ladybug, postgres); "
+            f"got {os.environ['GRAPH_DATABASE_PROVIDER']!r}"
+        )
     for name in (
         "CITADEL_GENERATION_ID",
         "VECTOR_DB_URL",
@@ -229,9 +240,13 @@ def drop_root_privileges(root: Path, *, user_name: str = "citadel") -> None:
     os.setuid(account.pw_uid)
 
 
-def acquire_single_instance_lock(root: Path) -> IO[str]:
+def acquire_single_instance_lock(
+    root: Path,
+    *,
+    state_root: Path | None = None,
+) -> IO[str]:
     global _LOCK_HANDLE
-    lock_path = root / "citadel-state" / "lite-runtime.lock"
+    lock_path = (state_root or root / "citadel-state") / "lite-runtime.lock"
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

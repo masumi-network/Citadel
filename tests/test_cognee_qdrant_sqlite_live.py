@@ -11,6 +11,16 @@ from typing import Any
 import pytest
 
 _REPORT_PREFIX = "CITADEL_LITE_REPORT="
+# Outer backstop for the whole worker subprocess. It must stay well above the
+# inner projection waits below: the ingest pass runs three cognify calls plus
+# two sequential lifecycle projections, so a 240s cap equal to a single inner
+# wait leaves no headroom and a slow CI runner gets SIGKILLed mid-ingest (-9)
+# instead of surfacing the diagnosable TimeoutError from
+# wait_for_lifecycle_operation.
+_WORKER_TIMEOUT_SECONDS = int(os.getenv("COGNEE_WORKER_TIMEOUT_SECONDS", "900"))
+_WORKER_PROJECTION_TIMEOUT_SECONDS = float(
+    os.getenv("COGNEE_WORKER_PROJECTION_TIMEOUT_SECONDS", "240")
+)
 
 
 def _worker_environment(root: Path, *, generation: str, mode: str) -> dict[str, str]:
@@ -67,7 +77,7 @@ def _run_worker(root: Path, *, generation: str, mode: str) -> dict[str, Any]:
         env=_worker_environment(root, generation=generation, mode=mode),
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=_WORKER_TIMEOUT_SECONDS,
         check=False,
     )
     reports = [
@@ -236,8 +246,11 @@ async def _worker() -> None:
             f"{lifecycle_marker} source record",
             source_key="live:lifecycle-marker",
         )
+        await lifecycle.wait_for_lifecycle_idle()
+        lifecycle.resume_lifecycle_queue(include_deferred=True)
         lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
-            str(lifecycle_result.projection_job_id)
+            str(lifecycle_result.projection_job_id),
+            timeout_seconds=_WORKER_PROJECTION_TIMEOUT_SECONDS,
         )
         assert lifecycle_operation["state"] == "searchable"
         central_lifecycle_result = await lifecycle.ingest(
@@ -245,8 +258,11 @@ async def _worker() -> None:
             dataset="central",
             source_key="live:central-lifecycle-marker",
         )
+        await lifecycle.wait_for_lifecycle_idle()
+        lifecycle.resume_lifecycle_queue(include_deferred=True)
         central_lifecycle_operation = await lifecycle.wait_for_lifecycle_operation(
-            str(central_lifecycle_result.projection_job_id)
+            str(central_lifecycle_result.projection_job_id),
+            timeout_seconds=_WORKER_PROJECTION_TIMEOUT_SECONDS,
         )
         assert central_lifecycle_operation["state"] == "searchable"
         document_ids = {
