@@ -4956,7 +4956,6 @@ def test_search_selection_prefers_relevant_central_hit_over_dataset_reservation(
         "seat-1",
         "seat-2",
         "seat-3",
-        "seat-4",
     ]
 
 
@@ -4991,7 +4990,7 @@ def test_search_selection_drops_unscored_zero_overlap_hits_from_mixed_page() -> 
     assert [hit["id"] for hit in selected] == ["exact-node", "partial-node"]
 
 
-def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
+def test_search_selection_keeps_scored_zero_overlap_semantic_hit() -> None:
     candidates = [
         {
             "id": "lexical",
@@ -5001,6 +5000,12 @@ def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
         {
             "id": "semantic",
             "text": "payment recovery design",
+            "score": 0.82,
+            "_citadel": {"dataset": "masumi-network"},
+        },
+        {
+            "id": "noise",
+            "text": "unrelated quarterly planning",
             "_citadel": {"dataset": "masumi-network"},
         },
     ]
@@ -5009,9 +5014,11 @@ def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
         candidates,
         query="checkout retries",
         datasets=["seat:sarthi", "masumi-network"],
-        limit=2,
+        limit=5,
     )
 
+    # The scored semantic hit survives; the unscored zero-overlap noise is
+    # dropped even with room to spare, so removing the gate fails this test.
     assert [hit["id"] for hit in selected] == ["lexical", "semantic"]
 
 
@@ -5188,6 +5195,64 @@ def test_search_genuine_empty_is_a_normal_success() -> None:
     assert "code" not in body
     assert body.get("timed_out") in (None, False)
 
+
+def test_search_selection_keeps_scored_semantic_hit_without_token_overlap() -> None:
+    from kb.server import select_public_search_page, with_result_metadata
+    from kb.search_format import shape_public_search_hit
+
+    semantic = shape_public_search_hit(
+        with_result_metadata(
+            {
+                "id": "vector-hit",
+                "document_id": "document-1",
+                "text": "semantic result without query words",
+                "distance": 0.12,
+            },
+            0,
+            "notes",
+            query="Patrick current work",
+        )
+    )
+    unrelated = shape_public_search_hit(
+        with_result_metadata(
+            {"id": "unrelated", "document_id": "document-2", "text": "other text"},
+            1,
+            "notes",
+            query="Patrick current work",
+        )
+    )
+
+    selected, _fetched, _matched = select_public_search_page(
+        [semantic, unrelated],
+        query="Patrick current work",
+        datasets=["notes"],
+        limit=5,
+    )
+
+    assert [hit["id"] for hit in selected] == ["vector-hit"]
+    relevance = selected[0]["_citadel"]["relevance"]
+    assert relevance["retriever_score"] == 0.12
+    assert relevance["retriever_score_kind"] == "distance"
+    assert relevance["retriever_score_direction"] == "lower-is-better"
+
+
+
+def test_search_without_relevance_signal_returns_typed_empty() -> None:
+    class NoSignalCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return [{"id": "noise", "document_id": "doc-1", "text": "unrelated text"}]
+
+    client = authed_client("test-reader")
+    app.state.citadel = NoSignalCitadel()
+
+    response = client.post("/search", json={"query": "Patrick current work", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"] == []
+    assert body["code"] == "NO_RELEVANT_RESULTS"
+    assert body["answerable"] is False
+    assert body["relevance"]["no_lexical_match"] is True
 
 def test_search_qdrant_outage_is_a_typed_failure() -> None:
     class UnavailableCitadel(FakeCitadel):
@@ -6608,7 +6673,7 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     alias_keys = [set(result) for result in payload["results"]]
     search_keys = [set(result) for result in search.json()["results"]]
     assert all(left <= right for left, right in zip(alias_keys, search_keys))
-    assert len(payload["results"]) == 2
+    assert len(payload["results"]) == 1
     assert payload["results"][0]["text"] == "Rotate keys quarterly"
     assert payload["results"][0]["source"] == "https://example.com/runbook"
     assert payload["results"][0]["score"] == 0.92
@@ -6616,8 +6681,6 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     assert payload["results"][0]["document_id"] == "rotate-keys-document"
     assert "metadata" not in payload["results"][0]
     assert "source_user" not in payload["results"][0]
-    assert payload["results"][1]["text"] == "bare string result"
-    assert payload["results"][1]["source"] is None
 
 
 def test_knowledge_alias_validates_query_and_limit() -> None:

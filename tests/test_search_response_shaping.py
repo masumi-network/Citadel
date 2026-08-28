@@ -25,6 +25,7 @@ from kb.search_format import (
     normalize_search_hit,
     parse_content_header,
     shape_public_search_hit,
+    shape_search_payload,
 )
 from kb.server import (
     SearchBody,
@@ -831,6 +832,28 @@ def test_retriever_score_is_passed_through_when_the_payload_has_one() -> None:
     assert envelope["relevance"]["retriever_score"] == 0.42
 
 
+def test_local_shape_keeps_distance_only_vector_hit() -> None:
+    from kb.search_format import shape_search_payload
+
+    shaped = shape_search_payload(
+        {
+            "results": [
+                {
+                    "id": "vector-hit",
+                    "text": "semantic result without query words",
+                    "distance": 0.12,
+                },
+                {"id": "unrelated", "text": "other text"},
+            ]
+        },
+        query="Patrick current work",
+    )
+
+    assert [hit["id"] for hit in shaped["results"]] == ["vector-hit"]
+    assert shaped["results"][0]["retriever_score"] == 0.12
+    assert shaped["relevance"]["retriever_scores_available"] is True
+
+
 def test_github_digest_fallback_score_is_not_a_retriever_score() -> None:
     """search_github_sync_state attaches a token-overlap COUNT under ``score``.
 
@@ -872,14 +895,14 @@ def test_absent_content_query_is_flagged_not_confident() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert len(body["results"]) == 3
+    assert body["results"] == []
+    assert body["code"] == "NO_RELEVANT_RESULTS"
+    assert body["answerable"] is False
     relevance = body["relevance"]
     assert relevance["retriever_scores_available"] is False
     assert relevance["max_term_coverage"] == 0.0
     assert relevance["no_lexical_match"] is True
     assert any("No result contains any query term" in w for w in body["warnings"])
-    for hit in body["results"]:
-        assert hit["_citadel"]["relevance"]["term_coverage"] == 0.0
 
 
 def test_matching_content_is_not_flagged() -> None:
@@ -1211,3 +1234,34 @@ def test_cli_snippet_windows_long_texts_around_the_match() -> None:
     # Short texts keep the whole-head snippet: nothing to window.
     short = normalize_search_hit({"id": "y", "text": "kupo retry policy"}, query="kupo")
     assert short["snippet"] == "kupo retry policy"
+
+
+def test_top_level_retriever_score_reaches_relevance() -> None:
+    # A provider hit that reports its own retriever_score must survive the
+    # server signal dispatch, or the zero-overlap gate drops it as unscored.
+    envelope = with_result_metadata(
+        {
+            "id": "c-retriever",
+            "text": "decode and validate the bearer token",
+            "retriever_score": 0.91,
+        },
+        0,
+        "masumi-network",
+        query="parseJwt",
+    )["_citadel"]
+
+    assert envelope["relevance"]["retriever_score"] == 0.91
+
+
+def test_filtered_out_page_reports_filter_stats_not_missing_relevance() -> None:
+    # A repo filter empties the page: the cause is the filter (in filter_stats),
+    # not missing lexical overlap, so no_lexical_match / NO_RELEVANT_RESULTS must
+    # not misdiagnose it.
+    payload = {"results": [{"id": "h", "text": "rotation runbook", "repo": "org/other"}]}
+
+    out = shape_search_payload(payload, query="rotation", repo="org/target")
+
+    assert out["results"] == []
+    assert out["relevance"]["no_lexical_match"] is False
+    assert out["filter_stats"] == {"before": 1, "after": 0}
+    assert out.get("code") != "NO_RELEVANT_RESULTS"

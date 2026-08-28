@@ -1122,6 +1122,9 @@ async def _search_local(args: argparse.Namespace) -> int:
             dataset=args.dataset,
             session_id=args.session,
             top_k=top_k,
+            repo=getattr(args, "repo", None),
+            path=getattr(args, "path", None),
+            source=getattr(args, "source", None),
         )
     except TimeoutError as exc:
         return _emit_search_timeout(args, note=str(exc) or "local search timed out")

@@ -118,6 +118,29 @@ def test_cognee_sqlite_qdrant_survives_restart_and_keeps_dataset_scope(
     assert second["lifecycle_texts"] == first["lifecycle_texts"]
     assert second["central_lifecycle_texts"] == first["central_lifecycle_texts"]
     assert (tmp_path / "cognee-system" / "databases" / "cognee.db").is_file()
+    # A fresh capture -> Cognee projection -> Qdrant receipt -> recall carries
+    # the live vector distance end-to-end (a fake client cannot prove the
+    # cognee -> Qdrant boundary), and the public HTTP/MCP formatter
+    # (public_search_result) surfaces it as a typed retriever score.
+    distance = first["central_vector_distance"]
+    assert isinstance(distance, (int, float)) and not isinstance(distance, bool)
+    retriever = first["central_public_retriever"]
+    assert retriever["retriever_score_kind"] in {"distance", "cosine-distance"}
+    assert retriever["retriever_score_direction"] == "lower-is-better"
+    assert retriever["retriever_score"] == pytest.approx(distance)
+    # The public path reports vector retrieval plus the searchable Qdrant receipt.
+    receipt = first["lifecycle_receipt"]
+    assert receipt["provider"] == "qdrant"
+    assert receipt["backend"] == "vector"
+    assert receipt["state"] == "searchable"
+    assert first["lifecycle_public_mode"] == "vector"
+    assert (
+        first["lifecycle_public_retriever"]["retriever_score_direction"]
+        == "lower-is-better"
+    )
+    # Restart: the SAME chunk recalls the SAME vector distance after restart.
+    restart_distance = second["central_vector_distance"]
+    assert restart_distance == pytest.approx(distance)
 
 
 def _result_texts(results: list[Any]) -> list[str]:
@@ -137,11 +160,47 @@ def _matching_texts(results: list[Any], marker: str) -> list[str]:
     return sorted(text for text in _result_texts(results) if marker in text)
 
 
+def _result_hits(results: list[Any]) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for result in results:
+        payload = (
+            result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("search_result"), list):
+            hits.extend(
+                item for item in payload["search_result"] if isinstance(item, dict)
+            )
+        elif isinstance(payload, dict):
+            hits.append(payload)
+    return hits
+
+
+def _first_marker_hit(results: list[Any], marker: str) -> dict[str, Any] | None:
+    for hit in _result_hits(results):
+        if marker in str(hit.get("text") or ""):
+            return hit
+    return None
+
+
+def _public_relevance(shaped: dict[str, Any] | None) -> dict[str, Any]:
+    citadel = shaped.get("_citadel") if isinstance(shaped, dict) else None
+    relevance = citadel.get("relevance") if isinstance(citadel, dict) else None
+    return relevance if isinstance(relevance, dict) else {}
+
+
+def _public_retrieval_mode(shaped: dict[str, Any] | None) -> str | None:
+    citadel = shaped.get("_citadel") if isinstance(shaped, dict) else None
+    retrieval = citadel.get("retrieval") if isinstance(citadel, dict) else None
+    mode = retrieval.get("mode") if isinstance(retrieval, dict) else None
+    return mode if isinstance(mode, str) else None
+
+
 async def _worker() -> None:
     from cognee.infrastructure.llm import LLMGateway
     from cognee.shared.data_models import KnowledgeGraph, Node, SummarizedContent
     from kb.cognee_client import CogneePublicClient, _cognify_data_ids
     from kb.config import CitadelConfig
+    from kb.server import public_search_result
     from kb.service import Citadel
 
     async def mock_llm(text_input: str, system_prompt: str, response_model, **kwargs):
@@ -303,6 +362,20 @@ async def _worker() -> None:
         assert present == set(expected_ids)
         graph_presence[dataset] = sorted(present)
     await lifecycle.stop_lifecycle_queue()
+    central_probe_hit = _first_marker_hit(central_hits, central_marker)
+    lifecycle_probe_hit = _first_marker_hit(lifecycle_hits, lifecycle_marker)
+    central_public = (
+        public_search_result(central_probe_hit, 0, "central", query=central_marker)
+        if central_probe_hit
+        else None
+    )
+    lifecycle_public = (
+        public_search_result(
+            lifecycle_probe_hit, 0, "lifecycle-live", query=lifecycle_marker
+        )
+        if lifecycle_probe_hit
+        else None
+    )
     report = {
         "central_texts": _matching_texts(central_hits, central_marker),
         "central_cross_texts": _matching_texts(central_cross_hits, alice_marker),
@@ -313,6 +386,29 @@ async def _worker() -> None:
             central_lifecycle_marker,
         ),
         "graph_presence": graph_presence,
+        "central_vector_distance": (
+            central_probe_hit.get("distance") if central_probe_hit else None
+        ),
+        "central_public_retriever": {
+            key: _public_relevance(central_public).get(key)
+            for key in (
+                "retriever_score",
+                "retriever_score_kind",
+                "retriever_score_direction",
+            )
+        },
+        "lifecycle_receipt": (
+            lifecycle_probe_hit.get("_lifecycle") if lifecycle_probe_hit else None
+        ),
+        "lifecycle_public_mode": _public_retrieval_mode(lifecycle_public),
+        "lifecycle_public_retriever": {
+            key: _public_relevance(lifecycle_public).get(key)
+            for key in (
+                "retriever_score",
+                "retriever_score_kind",
+                "retriever_score_direction",
+            )
+        },
     }
     print(_REPORT_PREFIX + json.dumps(report, sort_keys=True))
 

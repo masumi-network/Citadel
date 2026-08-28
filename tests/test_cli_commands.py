@@ -404,6 +404,43 @@ def test_search_local_json_uses_bounded_agent_payload(monkeypatch, capsys) -> No
     assert len(hit["text"]) < 3006
 
 
+
+def test_search_local_forwards_source_scope_before_recall(monkeypatch, capsys) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCitadel:
+        async def search(self, *_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            captured.update(kwargs)
+            return [
+                {
+                    "id": "hit",
+                    "text": "match",
+                    "repo": "masumi-network/sokosumi",
+                    "path": "docs/retry.md",
+                    "source": "repo-content",
+                }
+            ]
+
+    monkeypatch.setattr("kb.service.Citadel.from_env", lambda: FakeCitadel())
+
+    rc = asyncio.run(
+        _search(
+            _search_args(
+                query="match",
+                local=True,
+                repo="masumi-network/sokosumi",
+                path="docs/retry.md",
+                source="repo-content",
+            )
+        )
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["id"] == "hit"
+    assert captured["repo"] == "masumi-network/sokosumi"
+    assert captured["path"] == "docs/retry.md"
+    assert captured["source"] == "repo-content"
+
 def test_search_human_output_explains_context_required(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     monkeypatch.setattr(
