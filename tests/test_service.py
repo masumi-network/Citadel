@@ -415,6 +415,223 @@ def test_lifecycle_config_digest_tracks_projection_affecting_environment(
     assert budget_changed != provider_changed
 
 
+def test_lifecycle_config_digest_tracks_effective_stage_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Receipts must attest the models that produced them. Cognee routes
+    extraction/summarization/query through the stage vars, so under the v2
+    digest a stage-model swap is a projection config change and must move the
+    digest instead of hiding inside an existing generation binding. Values are
+    frozen per process, so each variant binds through a fresh instance.
+    """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+
+    def digest_for() -> str:
+        kb = Citadel(
+            CitadelConfig(
+                lifecycle_enabled=True,
+                lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+            ),
+            cognee=FakeCognee(),
+        )
+        return kb._lifecycle_projection_request().config_digest
+
+    digests = [digest_for()]
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.setenv(name, f"openrouter/test/{name.lower()}:free")
+        digests.append(digest_for())
+
+    assert len(set(digests)) == len(digests), digests
+
+    # Equal-length replacement per field: the digest must attest the exact
+    # value, so a length-preserving model swap still moves it.
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.setenv(name, "openrouter/vendor/model-aaaa:free")
+        before = digest_for()
+        monkeypatch.setenv(name, "openrouter/vendor/model-bbbb:free")
+        assert digest_for() != before, name
+
+
+def test_lifecycle_config_digest_v1_default_keeps_existing_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Expand phase: without the v2 opt-in, stage vars must NOT move the
+    digest, so this code deploys green against every existing generation
+    binding and rollback is a pure variable change.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/test/other:free")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+def test_lifecycle_digest_gate_is_frozen_at_init(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A mid-process gate flip must not change the digest: otherwise ingest()
+    would accept jobs whose digest the already-bound worker never claims.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """With v2 on, a mid-process route change (operator edit or the
+    free-router fallback) must fail NEW projection work fast: a silently
+    frozen digest would strand jobs, and a moving digest would let receipts
+    attest a model that did not run. Read paths (search, readyz) and
+    route-independent tombstones keep working: the builder never raises, and
+    a blocked tombstone would leave deleted content searchable.
+    """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/frozen:free")
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    preview = kb.lifecycle_requeue_failed_preview()
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/flipped:free")
+    # Read-safe: the builder still answers, with the frozen attestation.
+    assert kb._lifecycle_projection_request().config_digest == before
+    # Write paths refuse new work with an actionable error.
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        await kb.ingest("drifted source", source_key="manual:drift")
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        kb.queue_lifecycle_rebuild(generation_id="generation-drift-target")
+    # Requeue apply validates the preview identity FIRST (its 409 contract),
+    # then refuses the drifted write.
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        kb.lifecycle_requeue_failed(
+            generation_id=preview["generation_id"],
+            projection_version=preview["projection_version"],
+            config_digest=preview["config_digest"],
+            expected_count=0,
+            candidate_ids=(),
+        )
+    # Tombstones are route-independent and must stay available under drift.
+    tombstoned = await kb.tombstone_source(
+        dataset="notes", source_key="manual:absent", reason="test"
+    )
+    assert tombstoned == ()
+
+
+def test_lifecycle_v1_freezes_llm_model_against_fallback_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Under the default v1 digest, the free-router fallback rewriting
+    LLM_MODEL at runtime must not move the digest: jobs accepted after the
+    rewrite would otherwise never match the bound worker's digest.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/vendor/primary:free")
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_MODEL", "openrouter/free/fallback:free")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_binding_attests_routed_stage_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The binding must track the EFFECTIVE routed models: Citadel.__init__
+    runs the cognee client's _prepare_cognee_environment (which rewrites the
+    stage vars) BEFORE computing the binding digest, so a change in the routed
+    value trips the generation binding even when the raw pre-init environment
+    never changed.
+    """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-routed")
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store_path = str(tmp_path / "lifecycle.sqlite3")
+
+    class RoutedCognee(FakeCognee):
+        routed_model = "openrouter/vendor/routed-aaaa:free"
+
+        def _prepare_cognee_environment(self) -> None:
+            for name in (
+                "LLM_EXTRACTION_MODEL",
+                "LLM_SUMMARIZATION_MODEL",
+                "LLM_QUERY_MODEL",
+            ):
+                # Write through monkeypatch so the variables are restored after
+                # this test even though they were absent before it.
+                monkeypatch.setenv(name, self.routed_model)
+
+    original = Citadel(
+        CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+        cognee=RoutedCognee(),
+    )
+    accepted = await original.ingest(
+        "routed-model bound source", source_key="manual:routed"
+    )
+    await original.wait_for_lifecycle_operation(accepted.projection_job_id)
+
+    # Same routed values rebind cleanly on restart.
+    Citadel(
+        CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+        cognee=RoutedCognee(),
+    )
+
+    changed = RoutedCognee()
+    changed.routed_model = "openrouter/vendor/routed-bbbb:free"
+    with pytest.raises(
+        LifecycleConflictError, match="CITADEL_PROJECTION_DIGEST_V2"
+    ):
+        Citadel(
+            CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+            cognee=changed,
+        )
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_restart_rejects_config_drift_until_generation_changes(
     monkeypatch: pytest.MonkeyPatch,

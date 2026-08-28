@@ -32,6 +32,7 @@ from kb.logging_utils import safe_log_value
 from kb.lifecycle import (
     CaptureContext,
     LIFECYCLE_CHUNK_SOURCE_PREFIX,
+    LifecycleConflictError,
     LifecycleNotFoundError,
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
@@ -97,6 +98,25 @@ def _canary_timeout_seconds() -> float:
     return value
 
 
+def _read_llm_routes() -> dict[str, str]:
+    """Snapshot the effective LLM routes for digest attestation.
+
+    Covers every LLM field the digest hashes AND every field
+    ``activate_cognee_free_router_fallback`` rewrites at runtime, so the
+    frozen snapshot and the fallback mutation set stay in lockstep.
+    """
+    return {
+        name: os.getenv(name, "")
+        for name in (
+            "LLM_PROVIDER",
+            "LLM_MODEL",
+            "LLM_EXTRACTION_MODEL",
+            "LLM_SUMMARIZATION_MODEL",
+            "LLM_QUERY_MODEL",
+        )
+    }
+
+
 class Citadel:
     def __init__(
         self,
@@ -114,6 +134,14 @@ class Citadel:
         self._lifecycle_projection_gate = asyncio.Event()
         self._lifecycle_projection_gate.set()
         self._lifecycle_vector_only = False
+        # Freeze the digest-gate decision AND the attested LLM routes for this
+        # process: a mid-process env change (operator edit or the free-router
+        # fallback rewriting LLM_* at runtime) must not let ingest() accept
+        # jobs whose digest the already bound worker will never claim.
+        self._projection_digest_v2 = os.getenv(
+            "CITADEL_PROJECTION_DIGEST_V2", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._projection_llm_routes = _read_llm_routes()
         if self.config.lifecycle_enabled:
             prepare_cognee_environment = getattr(
                 self.cognee, "_prepare_cognee_environment", None
@@ -121,6 +149,9 @@ class Citadel:
             if callable(prepare_cognee_environment):
                 # Bind the lifecycle identity after Cognee applies its routed defaults.
                 prepare_cognee_environment()
+            # Re-freeze AFTER routing so the binding attests the effective
+            # routed models, not the raw pre-routing environment.
+            self._projection_llm_routes = _read_llm_routes()
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
@@ -272,6 +303,7 @@ class Citadel:
                 capture_metadata["session_id"] = session_id
             if attestation:
                 capture_metadata["attestation"] = dict(attestation)
+            self._assert_projection_routes_stable()
             acceptance = self.lifecycle_store.accept_source(
                 data.encode("utf-8"),
                 capture=CaptureContext(
@@ -383,6 +415,10 @@ class Citadel:
         """Tombstone current exact and optional chunk revisions for one source."""
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        # Tombstones are deliberately NOT route-guarded: they run through the
+        # route-independent worker path (no LLM), and blocking them under v2
+        # route drift would leave deleted content searchable (the Obsidian
+        # delete path does not retry a failed tombstone).
         projection = self._lifecycle_projection_request()
         current = self.lifecycle_store.current_revisions_for_source(
             dataset,
@@ -467,13 +503,40 @@ class Citadel:
             "generation_id": generation_id,
             "projection_version": projection_version,
             "providers": providers,
-            "llm_provider": os.getenv("LLM_PROVIDER", ""),
-            "llm_model": os.getenv("LLM_MODEL", ""),
+            "llm_provider": self._projection_llm_routes["LLM_PROVIDER"],
+            "llm_model": self._projection_llm_routes["LLM_MODEL"],
             "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
             "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
             "chunk_budget_tokens": chunk_window.resolve_chunk_budget(),
         }
+        if self._projection_digest_v2:
+            # Expand/migrate/contract: v2 is opt-in so this code deploys green
+            # against existing generation bindings (expand). The migration flips
+            # CITADEL_PROJECTION_DIGEST_V2 together with a new
+            # CITADEL_GENERATION_ID in one variable change (migrate); a later
+            # change makes v2 unconditional (contract). Rollback is the same
+            # variable change reversed: the old binding still matches v1.
+            #
+            # Why v2 exists: Cognee routes the actual LLM calls through the
+            # stage vars (model_routing.configure_cognee_model_routes), so
+            # receipts must attest the models that really produced the
+            # projection. Changing any of them is a projection config change:
+            # the generation binding rejects it until a new generation is set.
+            digest_fields.update(
+                {
+                    "digest_version": 2,
+                    "llm_extraction_model": self._projection_llm_routes[
+                        "LLM_EXTRACTION_MODEL"
+                    ],
+                    "llm_summarization_model": self._projection_llm_routes[
+                        "LLM_SUMMARIZATION_MODEL"
+                    ],
+                    "llm_query_model": self._projection_llm_routes[
+                        "LLM_QUERY_MODEL"
+                    ],
+                }
+            )
         config_digest = sha256(
             json.dumps(digest_fields, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
@@ -484,6 +547,26 @@ class Citadel:
             projection_version=projection_version or "lifecycle-v1:cognee-1.4.1",
             config_digest=f"sha256:{config_digest}",
             providers=providers,
+        )
+
+    def _assert_projection_routes_stable(self) -> None:
+        """Refuse NEW projection work after a runtime route change under v2.
+
+        Write-path only: the digest builder itself must stay read-safe (search,
+        readyz, tombstone, and requeue also build projection identities), so a
+        route drift must never take read paths down. Accepting NEW jobs would
+        either strand them (frozen digest, live worker) or lie (receipts
+        attesting a model that did not run), so ingest and rebuild fail fast.
+        """
+        if not self._projection_digest_v2:
+            return
+        if _read_llm_routes() == self._projection_llm_routes:
+            return
+        raise LifecycleConflictError(
+            "LLM routes changed at runtime (free-router fallback or "
+            "operator edit) while CITADEL_PROJECTION_DIGEST_V2 pins "
+            "them per generation; restart the node to re-bind, and set "
+            "a new CITADEL_GENERATION_ID if the change is intentional"
         )
 
     @staticmethod
@@ -814,6 +897,9 @@ class Citadel:
             or config_digest != projection.config_digest
         ):
             raise LifecycleRequeueIdentityMismatchError(projection)
+        # Drift check AFTER identity validation so stale previews keep their
+        # 409 identity-mismatch contract; the guard protects only the write.
+        self._assert_projection_routes_stable()
         assert self.lifecycle_store is not None
         requeued_ids = self.lifecycle_store.requeue_failed_projections(
             projection,
@@ -987,6 +1073,7 @@ class Citadel:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
         if not generation_id.strip():
             raise ValueError("generation_id must be a non-empty string")
+        self._assert_projection_routes_stable()
         projection = self._lifecycle_projection_request(
             generation_id=generation_id,
             projection_version=projection_version,
