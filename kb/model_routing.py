@@ -106,6 +106,17 @@ def activate_cognee_free_router_fallback(error: BaseException) -> bool:
 
     if not cognee_free_router_fallback_enabled():
         return False
+    if os.getenv("CITADEL_PROJECTION_DIGEST_V2", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        # v2 pins the projection models per generation: a silent mid-process
+        # model swap would let receipts attest a model that did not run
+        # (check-at-accept, mutate-at-execute). Fail the provider call
+        # honestly instead; the operator migrates with a new generation.
+        return False
     if not routing_enabled() or is_free_model_daily_quota_error(error):
         return False
     if os.getenv("CITADEL_COGNEE_FREE_ROUTER_ACTIVE", "").strip().lower() == "true":
