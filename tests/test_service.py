@@ -502,13 +502,14 @@ def test_lifecycle_digest_gate_is_frozen_at_init(
     assert kb._lifecycle_projection_request().config_digest == before
 
 
-def test_lifecycle_stage_model_values_are_frozen_at_init(
+def test_lifecycle_v2_rejects_runtime_route_drift(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
-    """With v2 on, a mid-process stage-var change (operator or the free-router
-    fallback) must not change the digest, or ingest() would mint jobs the
-    bound worker never claims on an empty generation.
+    """With v2 on, a mid-process route change (operator edit or the
+    free-router fallback) must fail fast with an actionable error: a silently
+    frozen digest would strand jobs, and a moving digest would let receipts
+    attest a model that did not run.
     """
     monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/frozen:free")
@@ -519,8 +520,31 @@ def test_lifecycle_stage_model_values_are_frozen_at_init(
         ),
         cognee=FakeCognee(),
     )
-    before = kb._lifecycle_projection_request().config_digest
+    kb._lifecycle_projection_request()
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/flipped:free")
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        kb._lifecycle_projection_request()
+
+
+def test_lifecycle_v1_freezes_llm_model_against_fallback_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Under the default v1 digest, the free-router fallback rewriting
+    LLM_MODEL at runtime must not move the digest: jobs accepted after the
+    rewrite would otherwise never match the bound worker's digest.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/vendor/primary:free")
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_MODEL", "openrouter/free/fallback:free")
     assert kb._lifecycle_projection_request().config_digest == before
 
 

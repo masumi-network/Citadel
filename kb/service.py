@@ -32,6 +32,7 @@ from kb.logging_utils import safe_log_value
 from kb.lifecycle import (
     CaptureContext,
     LIFECYCLE_CHUNK_SOURCE_PREFIX,
+    LifecycleConflictError,
     LifecycleNotFoundError,
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
@@ -97,11 +98,18 @@ def _canary_timeout_seconds() -> float:
     return value
 
 
-def _read_stage_models() -> dict[str, str]:
-    """Snapshot the effective Cognee stage-model routes for digest attestation."""
+def _read_llm_routes() -> dict[str, str]:
+    """Snapshot the effective LLM routes for digest attestation.
+
+    Covers every LLM field the digest hashes AND every field
+    ``activate_cognee_free_router_fallback`` rewrites at runtime, so the
+    frozen snapshot and the fallback mutation set stay in lockstep.
+    """
     return {
         name: os.getenv(name, "")
         for name in (
+            "LLM_PROVIDER",
+            "LLM_MODEL",
             "LLM_EXTRACTION_MODEL",
             "LLM_SUMMARIZATION_MODEL",
             "LLM_QUERY_MODEL",
@@ -126,14 +134,14 @@ class Citadel:
         self._lifecycle_projection_gate = asyncio.Event()
         self._lifecycle_projection_gate.set()
         self._lifecycle_vector_only = False
-        # Freeze the digest-gate decision AND the attested stage-model values
-        # for this process: a mid-process env change (operator or the free
-        # router fallback rewriting LLM_* at runtime) must not let ingest()
-        # accept jobs whose digest the already bound worker will never claim.
+        # Freeze the digest-gate decision AND the attested LLM routes for this
+        # process: a mid-process env change (operator edit or the free-router
+        # fallback rewriting LLM_* at runtime) must not let ingest() accept
+        # jobs whose digest the already bound worker will never claim.
         self._projection_digest_v2 = os.getenv(
             "CITADEL_PROJECTION_DIGEST_V2", ""
         ).strip().lower() in {"1", "true", "yes", "on"}
-        self._projection_stage_models = _read_stage_models()
+        self._projection_llm_routes = _read_llm_routes()
         if self.config.lifecycle_enabled:
             prepare_cognee_environment = getattr(
                 self.cognee, "_prepare_cognee_environment", None
@@ -142,8 +150,8 @@ class Citadel:
                 # Bind the lifecycle identity after Cognee applies its routed defaults.
                 prepare_cognee_environment()
             # Re-freeze AFTER routing so the binding attests the effective
-            # routed stage models, not the raw pre-routing environment.
-            self._projection_stage_models = _read_stage_models()
+            # routed models, not the raw pre-routing environment.
+            self._projection_llm_routes = _read_llm_routes()
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
@@ -486,12 +494,26 @@ class Citadel:
             "vector": os.getenv("VECTOR_DB_PROVIDER", "qdrant").strip().lower(),
             "graph": os.getenv("GRAPH_DATABASE_PROVIDER", "ladybug").strip().lower(),
         }
+        if self._projection_digest_v2:
+            live_routes = _read_llm_routes()
+            if live_routes != self._projection_llm_routes:
+                # Fail fast instead of stranding jobs (frozen digest, live
+                # worker) or lying (receipts attesting a model that did not run):
+                # under v2 the models are generation-pinned, so a runtime route
+                # change requires a restart, and a new generation if the change
+                # is intentional.
+                raise LifecycleConflictError(
+                    "LLM routes changed at runtime (free-router fallback or "
+                    "operator edit) while CITADEL_PROJECTION_DIGEST_V2 pins "
+                    "them per generation; restart the node to re-bind, and set "
+                    "a new CITADEL_GENERATION_ID if the change is intentional"
+                )
         digest_fields = {
             "generation_id": generation_id,
             "projection_version": projection_version,
             "providers": providers,
-            "llm_provider": os.getenv("LLM_PROVIDER", ""),
-            "llm_model": os.getenv("LLM_MODEL", ""),
+            "llm_provider": self._projection_llm_routes["LLM_PROVIDER"],
+            "llm_model": self._projection_llm_routes["LLM_MODEL"],
             "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
             "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
@@ -513,13 +535,13 @@ class Citadel:
             digest_fields.update(
                 {
                     "digest_version": 2,
-                    "llm_extraction_model": self._projection_stage_models[
+                    "llm_extraction_model": self._projection_llm_routes[
                         "LLM_EXTRACTION_MODEL"
                     ],
-                    "llm_summarization_model": self._projection_stage_models[
+                    "llm_summarization_model": self._projection_llm_routes[
                         "LLM_SUMMARIZATION_MODEL"
                     ],
-                    "llm_query_model": self._projection_stage_models[
+                    "llm_query_model": self._projection_llm_routes[
                         "LLM_QUERY_MODEL"
                     ],
                 }
