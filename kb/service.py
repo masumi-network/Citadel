@@ -469,6 +469,14 @@ class Citadel:
             "providers": providers,
             "llm_provider": os.getenv("LLM_PROVIDER", ""),
             "llm_model": os.getenv("LLM_MODEL", ""),
+            # Cognee routes the actual LLM calls through the stage vars
+            # (model_routing.configure_cognee_model_routes), so receipts must
+            # attest the models that really produced the projection. Changing
+            # any of them is a projection config change: the generation binding
+            # rejects it until a new CITADEL_GENERATION_ID is set.
+            "llm_extraction_model": os.getenv("LLM_EXTRACTION_MODEL", ""),
+            "llm_summarization_model": os.getenv("LLM_SUMMARIZATION_MODEL", ""),
+            "llm_query_model": os.getenv("LLM_QUERY_MODEL", ""),
             "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
             "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),

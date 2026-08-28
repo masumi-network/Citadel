@@ -415,6 +415,46 @@ def test_lifecycle_config_digest_tracks_projection_affecting_environment(
     assert budget_changed != provider_changed
 
 
+def test_lifecycle_config_digest_tracks_effective_stage_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Receipts must attest the models that produced them. Cognee routes
+    extraction/summarization/query through the stage vars, so a stage-model
+    swap is a projection config change and must move the digest instead of
+    hiding inside an existing generation binding.
+    """
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    digests = [kb._lifecycle_projection_request().config_digest]
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.setenv(name, f"openrouter/test/{name.lower()}:free")
+        digests.append(kb._lifecycle_projection_request().config_digest)
+
+    assert len(set(digests)) == len(digests), digests
+
+    # Equal-length replacement per field: the digest must attest the exact
+    # value, so a length-preserving model swap still moves it.
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.setenv(name, "openrouter/vendor/model-aaaa:free")
+        before = kb._lifecycle_projection_request().config_digest
+        monkeypatch.setenv(name, "openrouter/vendor/model-bbbb:free")
+        assert kb._lifecycle_projection_request().config_digest != before, name
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_restart_rejects_config_drift_until_generation_changes(
     monkeypatch: pytest.MonkeyPatch,
