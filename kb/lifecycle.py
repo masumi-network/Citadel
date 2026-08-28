@@ -854,7 +854,9 @@ class LifecycleStore:
             ):
                 raise LifecycleConflictError(
                     "projection configuration changed within an existing generation; "
-                    "set a new CITADEL_GENERATION_ID"
+                    "verify CITADEL_PROJECTION_DIGEST_V2 matches the generation's "
+                    "digest mode, then set a new CITADEL_GENERATION_ID if the "
+                    "change is intentional"
                 )
         stored_providers = {
             (str(row["backend"]), str(row["provider"]))

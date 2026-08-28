@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -423,24 +422,29 @@ def test_lifecycle_config_digest_tracks_effective_stage_models(
     """Receipts must attest the models that produced them. Cognee routes
     extraction/summarization/query through the stage vars, so under the v2
     digest a stage-model swap is a projection config change and must move the
-    digest instead of hiding inside an existing generation binding.
+    digest instead of hiding inside an existing generation binding. Values are
+    frozen per process, so each variant binds through a fresh instance.
     """
     monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
-    kb = Citadel(
-        CitadelConfig(
-            lifecycle_enabled=True,
-            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
-        ),
-        cognee=FakeCognee(),
-    )
-    digests = [kb._lifecycle_projection_request().config_digest]
+
+    def digest_for() -> str:
+        kb = Citadel(
+            CitadelConfig(
+                lifecycle_enabled=True,
+                lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+            ),
+            cognee=FakeCognee(),
+        )
+        return kb._lifecycle_projection_request().config_digest
+
+    digests = [digest_for()]
     for name in (
         "LLM_EXTRACTION_MODEL",
         "LLM_SUMMARIZATION_MODEL",
         "LLM_QUERY_MODEL",
     ):
         monkeypatch.setenv(name, f"openrouter/test/{name.lower()}:free")
-        digests.append(kb._lifecycle_projection_request().config_digest)
+        digests.append(digest_for())
 
     assert len(set(digests)) == len(digests), digests
 
@@ -452,9 +456,9 @@ def test_lifecycle_config_digest_tracks_effective_stage_models(
         "LLM_QUERY_MODEL",
     ):
         monkeypatch.setenv(name, "openrouter/vendor/model-aaaa:free")
-        before = kb._lifecycle_projection_request().config_digest
+        before = digest_for()
         monkeypatch.setenv(name, "openrouter/vendor/model-bbbb:free")
-        assert kb._lifecycle_projection_request().config_digest != before, name
+        assert digest_for() != before, name
 
 
 def test_lifecycle_config_digest_v1_default_keeps_existing_bindings(
@@ -475,6 +479,48 @@ def test_lifecycle_config_digest_v1_default_keeps_existing_bindings(
     )
     before = kb._lifecycle_projection_request().config_digest
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/test/other:free")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+def test_lifecycle_digest_gate_is_frozen_at_init(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A mid-process gate flip must not change the digest: otherwise ingest()
+    would accept jobs whose digest the already-bound worker never claims.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+def test_lifecycle_stage_model_values_are_frozen_at_init(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """With v2 on, a mid-process stage-var change (operator or the free-router
+    fallback) must not change the digest, or ingest() would mint jobs the
+    bound worker never claims on an empty generation.
+    """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/frozen:free")
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/flipped:free")
     assert kb._lifecycle_projection_request().config_digest == before
 
 
@@ -508,7 +554,9 @@ async def test_lifecycle_binding_attests_routed_stage_models(
                 "LLM_SUMMARIZATION_MODEL",
                 "LLM_QUERY_MODEL",
             ):
-                os.environ[name] = self.routed_model
+                # Write through monkeypatch so the variables are restored after
+                # this test even though they were absent before it.
+                monkeypatch.setenv(name, self.routed_model)
 
     original = Citadel(
         CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
@@ -527,7 +575,9 @@ async def test_lifecycle_binding_attests_routed_stage_models(
 
     changed = RoutedCognee()
     changed.routed_model = "openrouter/vendor/routed-bbbb:free"
-    with pytest.raises(LifecycleConflictError, match="CITADEL_GENERATION_ID"):
+    with pytest.raises(
+        LifecycleConflictError, match="CITADEL_PROJECTION_DIGEST_V2"
+    ):
         Citadel(
             CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
             cognee=changed,

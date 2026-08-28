@@ -97,6 +97,18 @@ def _canary_timeout_seconds() -> float:
     return value
 
 
+def _read_stage_models() -> dict[str, str]:
+    """Snapshot the effective Cognee stage-model routes for digest attestation."""
+    return {
+        name: os.getenv(name, "")
+        for name in (
+            "LLM_EXTRACTION_MODEL",
+            "LLM_SUMMARIZATION_MODEL",
+            "LLM_QUERY_MODEL",
+        )
+    }
+
+
 class Citadel:
     def __init__(
         self,
@@ -114,6 +126,14 @@ class Citadel:
         self._lifecycle_projection_gate = asyncio.Event()
         self._lifecycle_projection_gate.set()
         self._lifecycle_vector_only = False
+        # Freeze the digest-gate decision AND the attested stage-model values
+        # for this process: a mid-process env change (operator or the free
+        # router fallback rewriting LLM_* at runtime) must not let ingest()
+        # accept jobs whose digest the already bound worker will never claim.
+        self._projection_digest_v2 = os.getenv(
+            "CITADEL_PROJECTION_DIGEST_V2", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._projection_stage_models = _read_stage_models()
         if self.config.lifecycle_enabled:
             prepare_cognee_environment = getattr(
                 self.cognee, "_prepare_cognee_environment", None
@@ -121,6 +141,9 @@ class Citadel:
             if callable(prepare_cognee_environment):
                 # Bind the lifecycle identity after Cognee applies its routed defaults.
                 prepare_cognee_environment()
+            # Re-freeze AFTER routing so the binding attests the effective
+            # routed stage models, not the raw pre-routing environment.
+            self._projection_stage_models = _read_stage_models()
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
@@ -474,12 +497,7 @@ class Citadel:
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
             "chunk_budget_tokens": chunk_window.resolve_chunk_budget(),
         }
-        if os.getenv("CITADEL_PROJECTION_DIGEST_V2", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
+        if self._projection_digest_v2:
             # Expand/migrate/contract: v2 is opt-in so this code deploys green
             # against existing generation bindings (expand). The migration flips
             # CITADEL_PROJECTION_DIGEST_V2 together with a new
@@ -495,11 +513,15 @@ class Citadel:
             digest_fields.update(
                 {
                     "digest_version": 2,
-                    "llm_extraction_model": os.getenv("LLM_EXTRACTION_MODEL", ""),
-                    "llm_summarization_model": os.getenv(
-                        "LLM_SUMMARIZATION_MODEL", ""
-                    ),
-                    "llm_query_model": os.getenv("LLM_QUERY_MODEL", ""),
+                    "llm_extraction_model": self._projection_stage_models[
+                        "LLM_EXTRACTION_MODEL"
+                    ],
+                    "llm_summarization_model": self._projection_stage_models[
+                        "LLM_SUMMARIZATION_MODEL"
+                    ],
+                    "llm_query_model": self._projection_stage_models[
+                        "LLM_QUERY_MODEL"
+                    ],
                 }
             )
         config_digest = sha256(
