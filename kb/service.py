@@ -469,19 +469,39 @@ class Citadel:
             "providers": providers,
             "llm_provider": os.getenv("LLM_PROVIDER", ""),
             "llm_model": os.getenv("LLM_MODEL", ""),
-            # Cognee routes the actual LLM calls through the stage vars
-            # (model_routing.configure_cognee_model_routes), so receipts must
-            # attest the models that really produced the projection. Changing
-            # any of them is a projection config change: the generation binding
-            # rejects it until a new CITADEL_GENERATION_ID is set.
-            "llm_extraction_model": os.getenv("LLM_EXTRACTION_MODEL", ""),
-            "llm_summarization_model": os.getenv("LLM_SUMMARIZATION_MODEL", ""),
-            "llm_query_model": os.getenv("LLM_QUERY_MODEL", ""),
             "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
             "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
             "chunk_budget_tokens": chunk_window.resolve_chunk_budget(),
         }
+        if os.getenv("CITADEL_PROJECTION_DIGEST_V2", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            # Expand/migrate/contract: v2 is opt-in so this code deploys green
+            # against existing generation bindings (expand). The migration flips
+            # CITADEL_PROJECTION_DIGEST_V2 together with a new
+            # CITADEL_GENERATION_ID in one variable change (migrate); a later
+            # change makes v2 unconditional (contract). Rollback is the same
+            # variable change reversed: the old binding still matches v1.
+            #
+            # Why v2 exists: Cognee routes the actual LLM calls through the
+            # stage vars (model_routing.configure_cognee_model_routes), so
+            # receipts must attest the models that really produced the
+            # projection. Changing any of them is a projection config change:
+            # the generation binding rejects it until a new generation is set.
+            digest_fields.update(
+                {
+                    "digest_version": 2,
+                    "llm_extraction_model": os.getenv("LLM_EXTRACTION_MODEL", ""),
+                    "llm_summarization_model": os.getenv(
+                        "LLM_SUMMARIZATION_MODEL", ""
+                    ),
+                    "llm_query_model": os.getenv("LLM_QUERY_MODEL", ""),
+                }
+            )
         config_digest = sha256(
             json.dumps(digest_fields, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"

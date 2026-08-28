@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -420,10 +421,11 @@ def test_lifecycle_config_digest_tracks_effective_stage_models(
     tmp_path: Any,
 ) -> None:
     """Receipts must attest the models that produced them. Cognee routes
-    extraction/summarization/query through the stage vars, so a stage-model
-    swap is a projection config change and must move the digest instead of
-    hiding inside an existing generation binding.
+    extraction/summarization/query through the stage vars, so under the v2
+    digest a stage-model swap is a projection config change and must move the
+    digest instead of hiding inside an existing generation binding.
     """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
     kb = Citadel(
         CitadelConfig(
             lifecycle_enabled=True,
@@ -453,6 +455,83 @@ def test_lifecycle_config_digest_tracks_effective_stage_models(
         before = kb._lifecycle_projection_request().config_digest
         monkeypatch.setenv(name, "openrouter/vendor/model-bbbb:free")
         assert kb._lifecycle_projection_request().config_digest != before, name
+
+
+def test_lifecycle_config_digest_v1_default_keeps_existing_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Expand phase: without the v2 opt-in, stage vars must NOT move the
+    digest, so this code deploys green against every existing generation
+    binding and rollback is a pure variable change.
+    """
+    monkeypatch.delenv("CITADEL_PROJECTION_DIGEST_V2", raising=False)
+    kb = Citadel(
+        CitadelConfig(
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=FakeCognee(),
+    )
+    before = kb._lifecycle_projection_request().config_digest
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/test/other:free")
+    assert kb._lifecycle_projection_request().config_digest == before
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_binding_attests_routed_stage_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The binding must track the EFFECTIVE routed models: Citadel.__init__
+    runs the cognee client's _prepare_cognee_environment (which rewrites the
+    stage vars) BEFORE computing the binding digest, so a change in the routed
+    value trips the generation binding even when the raw pre-init environment
+    never changed.
+    """
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-routed")
+    for name in (
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store_path = str(tmp_path / "lifecycle.sqlite3")
+
+    class RoutedCognee(FakeCognee):
+        routed_model = "openrouter/vendor/routed-aaaa:free"
+
+        def _prepare_cognee_environment(self) -> None:
+            for name in (
+                "LLM_EXTRACTION_MODEL",
+                "LLM_SUMMARIZATION_MODEL",
+                "LLM_QUERY_MODEL",
+            ):
+                os.environ[name] = self.routed_model
+
+    original = Citadel(
+        CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+        cognee=RoutedCognee(),
+    )
+    accepted = await original.ingest(
+        "routed-model bound source", source_key="manual:routed"
+    )
+    await original.wait_for_lifecycle_operation(accepted.projection_job_id)
+
+    # Same routed values rebind cleanly on restart.
+    Citadel(
+        CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+        cognee=RoutedCognee(),
+    )
+
+    changed = RoutedCognee()
+    changed.routed_model = "openrouter/vendor/routed-bbbb:free"
+    with pytest.raises(LifecycleConflictError, match="CITADEL_GENERATION_ID"):
+        Citadel(
+            CitadelConfig(lifecycle_enabled=True, lifecycle_store_path=store_path),
+            cognee=changed,
+        )
 
 
 @pytest.mark.asyncio
