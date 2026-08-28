@@ -502,14 +502,17 @@ def test_lifecycle_digest_gate_is_frozen_at_init(
     assert kb._lifecycle_projection_request().config_digest == before
 
 
-def test_lifecycle_v2_rejects_runtime_route_drift(
+@pytest.mark.asyncio
+async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
     """With v2 on, a mid-process route change (operator edit or the
-    free-router fallback) must fail fast with an actionable error: a silently
+    free-router fallback) must fail NEW projection work fast: a silently
     frozen digest would strand jobs, and a moving digest would let receipts
-    attest a model that did not run.
+    attest a model that did not run. Read paths (search, readyz, tombstone)
+    build projection identities through the same builder and must keep
+    working, so the builder itself never raises.
     """
     monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/frozen:free")
@@ -520,10 +523,15 @@ def test_lifecycle_v2_rejects_runtime_route_drift(
         ),
         cognee=FakeCognee(),
     )
-    kb._lifecycle_projection_request()
+    before = kb._lifecycle_projection_request().config_digest
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/flipped:free")
+    # Read-safe: the builder still answers, with the frozen attestation.
+    assert kb._lifecycle_projection_request().config_digest == before
+    # Write paths refuse new work with an actionable error.
     with pytest.raises(LifecycleConflictError, match="restart the node"):
-        kb._lifecycle_projection_request()
+        await kb.ingest("drifted source", source_key="manual:drift")
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        kb.queue_lifecycle_rebuild(generation_id="generation-drift-target")
 
 
 def test_lifecycle_v1_freezes_llm_model_against_fallback_rewrite(

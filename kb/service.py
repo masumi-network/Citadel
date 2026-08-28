@@ -303,6 +303,7 @@ class Citadel:
                 capture_metadata["session_id"] = session_id
             if attestation:
                 capture_metadata["attestation"] = dict(attestation)
+            self._assert_projection_routes_stable()
             acceptance = self.lifecycle_store.accept_source(
                 data.encode("utf-8"),
                 capture=CaptureContext(
@@ -494,20 +495,6 @@ class Citadel:
             "vector": os.getenv("VECTOR_DB_PROVIDER", "qdrant").strip().lower(),
             "graph": os.getenv("GRAPH_DATABASE_PROVIDER", "ladybug").strip().lower(),
         }
-        if self._projection_digest_v2:
-            live_routes = _read_llm_routes()
-            if live_routes != self._projection_llm_routes:
-                # Fail fast instead of stranding jobs (frozen digest, live
-                # worker) or lying (receipts attesting a model that did not run):
-                # under v2 the models are generation-pinned, so a runtime route
-                # change requires a restart, and a new generation if the change
-                # is intentional.
-                raise LifecycleConflictError(
-                    "LLM routes changed at runtime (free-router fallback or "
-                    "operator edit) while CITADEL_PROJECTION_DIGEST_V2 pins "
-                    "them per generation; restart the node to re-bind, and set "
-                    "a new CITADEL_GENERATION_ID if the change is intentional"
-                )
         digest_fields = {
             "generation_id": generation_id,
             "projection_version": projection_version,
@@ -556,6 +543,26 @@ class Citadel:
             projection_version=projection_version or "lifecycle-v1:cognee-1.4.1",
             config_digest=f"sha256:{config_digest}",
             providers=providers,
+        )
+
+    def _assert_projection_routes_stable(self) -> None:
+        """Refuse NEW projection work after a runtime route change under v2.
+
+        Write-path only: the digest builder itself must stay read-safe (search,
+        readyz, tombstone, and requeue also build projection identities), so a
+        route drift must never take read paths down. Accepting NEW jobs would
+        either strand them (frozen digest, live worker) or lie (receipts
+        attesting a model that did not run), so ingest and rebuild fail fast.
+        """
+        if not self._projection_digest_v2:
+            return
+        if _read_llm_routes() == self._projection_llm_routes:
+            return
+        raise LifecycleConflictError(
+            "LLM routes changed at runtime (free-router fallback or "
+            "operator edit) while CITADEL_PROJECTION_DIGEST_V2 pins "
+            "them per generation; restart the node to re-bind, and set "
+            "a new CITADEL_GENERATION_ID if the change is intentional"
         )
 
     @staticmethod
@@ -1059,6 +1066,7 @@ class Citadel:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
         if not generation_id.strip():
             raise ValueError("generation_id must be a non-empty string")
+        self._assert_projection_routes_stable()
         projection = self._lifecycle_projection_request(
             generation_id=generation_id,
             projection_version=projection_version,
