@@ -9,7 +9,12 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from kb.access import SESSION_TRACES_DATASET, AccessStore
-from kb.server import SHARED_TRACE_MARKER, app, with_result_metadata
+from kb.server import (
+    SHARED_TRACE_MARKER,
+    app,
+    with_result_id,
+    with_result_metadata,
+)
 
 
 def test_with_result_metadata_marks_session_traces() -> None:
@@ -90,3 +95,30 @@ def test_deduped_node_copy_of_a_shared_trace_keeps_reference_only() -> None:
     assert envelope["trust_tier"] == "reference-only"
     # The internal marker must never reach a caller.
     assert SHARED_TRACE_MARKER not in hits[0]
+
+
+def test_content_sha256_stable_across_query_dependent_distance() -> None:
+    """The same chunk served for two queries carries two cosine distances.
+
+    content_sha256 must identify the chunk, not the query, or
+    retrieval_eval.trust_observations stops seeing the same (id, sha) pair
+    across questions and silently loses the metadata-stability check.
+    """
+    base = {"id": "chunk-1", "document_id": "doc-1", "text": "same chunk body"}
+    near = with_result_metadata({**base, "distance": 0.10}, 0, "central")
+    far = with_result_metadata({**base, "distance": 0.90}, 0, "central")
+
+    assert near["_citadel"]["content_sha256"] == far["_citadel"]["content_sha256"]
+    # The distance itself still reaches the caller for ranking.
+    assert near["distance"] == 0.10
+    assert far["distance"] == 0.90
+
+
+def test_chunk_id_fallback_stable_across_query_dependent_distance() -> None:
+    """An id-less hit derives ``chunk:<hash>`` from content, never the query."""
+    near = with_result_id({"text": "same chunk body", "distance": 0.10})
+    far = with_result_id({"text": "same chunk body", "distance": 0.90})
+
+    assert near["id"] == far["id"]
+    assert near["id"].startswith("chunk:")
+    assert near["distance"] == 0.10

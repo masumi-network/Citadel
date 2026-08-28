@@ -264,6 +264,7 @@ CODE_TIMEOUT = "TIMEOUT"
 CODE_AUTH_REQUIRED = "AUTH_REQUIRED"
 CODE_SEARCH_UNAVAILABLE = "SEARCH_UNAVAILABLE"
 CODE_QUERY_CONTEXT_REQUIRED = "QUERY_CONTEXT_REQUIRED"
+CODE_NO_RELEVANT_RESULTS = "NO_RELEVANT_RESULTS"
 QUERY_CONTEXT_REQUIRED_MESSAGE = (
     "Name the issue, repository, file, feature, person, or decision topic you mean. "
     "Citadel did not search because the prompt has no subject."
@@ -1128,6 +1129,17 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
             value = relevance.get(key)
             if _is_finite_number(value):
                 clean_relevance[key] = value
+        kind = relevance.get("retriever_score_kind")
+        if isinstance(kind, str) and kind in {
+            "cosine-distance",
+            "distance",
+            "similarity",
+            "score",
+        }:
+            clean_relevance["retriever_score_kind"] = kind
+        direction = relevance.get("retriever_score_direction")
+        if direction in {"lower-is-better", "higher-is-better", "unknown"}:
+            clean_relevance["retriever_score_direction"] = direction
         matched_terms = relevance.get("matched_terms")
         if isinstance(matched_terms, list):
             clean_relevance["matched_terms"] = [
@@ -1306,15 +1318,74 @@ def shape_public_search_hit(item: Any, *, index: int = 0) -> dict[str, Any]:
     return shaped
 
 
+def _search_hit_retriever_signal(
+    item: dict[str, Any], public_envelope: dict[str, Any]
+) -> tuple[float, str, str] | None:
+    """Return a finite retriever value with its metric meaning."""
+    provenance = (
+        public_envelope.get("provenance")
+        if isinstance(public_envelope.get("provenance"), dict)
+        else {}
+    )
+    if "github_sync_state" in {
+        item.get("source"),
+        item.get("source_type"),
+        provenance.get("source"),
+    }:
+        return None
+    relevance = public_envelope.get("relevance")
+    if isinstance(relevance, dict):
+        value = relevance.get("retriever_score")
+        if _is_finite_number(value):
+            return (
+                float(value),
+                str(relevance.get("retriever_score_kind") or "score"),
+                str(relevance.get("retriever_score_direction") or "unknown"),
+            )
+    lifecycle = item.get("_lifecycle")
+    for key, kind, direction in (
+        ("distance", "distance", "lower-is-better"),
+        ("similarity", "similarity", "higher-is-better"),
+        ("retriever_score", "score", "unknown"),
+        ("score", "score", "unknown"),
+    ):
+        value = item.get(key)
+        if not _is_finite_number(value):
+            continue
+        if key == "score" and isinstance(lifecycle, dict) and lifecycle.get("backend") == "vector":
+            kind = "cosine-distance"
+            direction = "lower-is-better"
+        return float(value), kind, direction
+    return None
+
+
+def _normalized_retriever_score(hit: dict[str, Any]) -> float | None:
+    signal = _search_hit_retriever_signal(hit, _hit_envelope(hit))
+    return signal[0] if signal is not None else None
+
+
+def _retriever_score_fields(
+    signal: tuple[float, str, str] | None,
+) -> dict[str, Any]:
+    if signal is None:
+        return {}
+    score, kind, direction = signal
+    return {
+        "retriever_score": score,
+        "retriever_score_kind": kind,
+        "retriever_score_direction": direction,
+    }
+
+
 def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None) -> dict[str, Any]:
     """Stable agent hit schema for CLI --json output.
 
     With ``query`` given, each hit also carries ``term_coverage`` /
-    ``matched_terms`` (observable lexical overlap — see
-    ``lexical_relevance_summary`` for why there is no retriever score), and the
-    snippet of a LONG text is a window around the densest query-term cluster
-    instead of the head: the head of a repo-content chunk is its provenance
-    header, which is exactly where the answer is not.
+    ``matched_terms`` and, when available, a typed retriever score with its
+    metric meaning and sort direction. The snippet of a LONG text is a window
+    around the densest query-term cluster instead of the head: the head of a
+    repo-content chunk is its provenance header, which is exactly where the
+    answer is not.
     """
     if not isinstance(item, dict):
         text = str(item)
@@ -1400,6 +1471,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
     score = item.get("score")
     if not isinstance(score, (int, float)) or isinstance(score, bool):
         score = None
+    retriever_signal = _search_hit_retriever_signal(item, public_envelope)
 
     terms = query_terms(query) if query else []
     snippet_source = text
@@ -1483,6 +1555,7 @@ def normalize_search_hit(item: Any, *, index: int = 0, query: str | None = None)
         normalized["retrieval"] = retrieval
     if references:
         normalized["references"] = references
+    normalized.update(_retriever_score_fields(retriever_signal))
     document_endpoint = public_envelope.get("document_endpoint")
     if isinstance(document_endpoint, str) and document_endpoint:
         normalized["document_endpoint"] = document_endpoint
@@ -1740,6 +1813,13 @@ def shape_search_payload(
         canonical_only=canonical_only,
         exclude_ambient=exclude_ambient,
     )
+    if query_terms(query) and not filters_active:
+        hits = [
+            hit
+            for hit in hits
+            if float(hit.get("term_coverage") or 0) > 0
+            or _normalized_retriever_score(hit) is not None
+        ]
     relevance = lexical_relevance_summary(
         query,
         [
@@ -1747,8 +1827,10 @@ def shape_search_payload(
             for h in hits
             if isinstance(h.get("term_coverage"), (int, float))
         ],
-        scores_available=any(h.get("score") is not None for h in hits),
+        scores_available=any(_normalized_retriever_score(h) is not None for h in hits),
     )
+    if before_filters and not hits and query_terms(query) and not filters_active:
+        relevance["no_lexical_match"] = True
     warnings: list[str] = []
     if payload.get("note"):
         warnings.append(str(payload["note"]))
@@ -1791,6 +1873,13 @@ def shape_search_payload(
         out["code"] = CODE_TIMEOUT
     elif payload.get("code"):
         out["code"] = payload["code"]
+    elif not hits and before_filters and query_terms(query) and not filters_active:
+        out["code"] = CODE_NO_RELEVANT_RESULTS
+        out["answerable"] = False
+        out["message"] = (
+            "No result had verifiable query overlap or a retriever score. "
+            "Add an exact issue key, repository, file, symbol, or topic."
+        )
     return out
 
 

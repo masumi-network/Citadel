@@ -564,6 +564,45 @@ async def test_index_payload_preserves_cognee_chunk_provenance() -> None:
     }
 
 
+
+def test_scored_results_copy_cosine_distance_into_chunk_payload() -> None:
+    raw_id = uuid4()
+    client = _FakeClient()
+    adapter = _adapter(client)
+    point = SimpleNamespace(
+        id="stored-point",
+        score=0.88,
+        payload={
+            "citadel_original_id": str(raw_id),
+            "document_id": "document-17",
+        },
+    )
+
+    result = adapter._scored_results([point])[0]
+
+    assert result.score == pytest.approx(0.12)
+    assert result.payload is not None
+    assert result.payload["distance"] == pytest.approx(0.12)
+
+
+def test_scored_results_omit_distance_for_scoreless_records() -> None:
+    # retrieve()/scroll() return Records with no score. A fabricated distance
+    # would advertise a perfect match and could clobber a real payload key.
+    raw_id = uuid4()
+    adapter = _adapter(_FakeClient())
+    record = SimpleNamespace(
+        id="stored-point",
+        payload={
+            "citadel_original_id": str(raw_id),
+            "document_id": "document-17",
+        },
+    )
+
+    result = adapter._scored_results([record])[0]
+
+    assert result.payload is not None
+    assert "distance" not in result.payload
+
 @pytest.mark.asyncio
 async def test_search_uses_shared_collection_and_mandatory_tenant_filter() -> None:
     client = _FakeClient()

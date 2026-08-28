@@ -7,6 +7,7 @@ import hmac
 from inspect import isawaitable
 import json
 import logging
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -89,6 +90,7 @@ from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
     DOC_TYPE_CANONICAL,
+    CODE_NO_RELEVANT_RESULTS,
     DOC_TYPE_TRACE,
     NO_LEXICAL_MATCH_WARNING,
     apply_query_ranking,
@@ -2990,8 +2992,21 @@ def document_endpoint_for_result(
     return f"/api/documents/{quote(drilldown_id, safe=':._-')}"
 
 
+_RETRIEVER_SCORE_FIELDS = frozenset(
+    {"distance", "similarity", "retriever_score", "score"}
+)
+
+
 def result_content_sha256(result: dict[str, Any]) -> str:
-    content_basis = {key: value for key, value in result.items() if key != "_citadel"}
+    # A content hash must identify the CHUNK, not the query. Retrieval scores
+    # (Qdrant cosine distance, similarity, token-overlap score) vary per query
+    # for the same chunk, so excluding them keeps content_sha256 stable and lets
+    # retrieval_eval.trust_observations still see per-request metadata drift.
+    content_basis = {
+        key: value
+        for key, value in result.items()
+        if key != "_citadel" and key not in _RETRIEVER_SCORE_FIELDS
+    }
     encoded = json.dumps(content_basis, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -3022,36 +3037,67 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_id, str) and raw_id.strip():
         return result
     idless = {key: value for key, value in result.items() if key != "id"}
-    basis = json.dumps(idless, sort_keys=True, default=str)
+    # Derive the fallback id from content only: retrieval scores vary per query
+    # and would otherwise make the same chunk's synthetic id query-dependent.
+    basis_fields = {
+        key: value
+        for key, value in idless.items()
+        if key not in _RETRIEVER_SCORE_FIELDS
+    }
+    basis = json.dumps(basis_fields, sort_keys=True, default=str)
     derived = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
     return {**idless, "id": f"chunk:{derived}"}
 
 
-def _result_retriever_score(result: dict[str, Any]) -> float | None:
-    """A numeric relevance value the retriever itself attached, if any.
-
-    cognee 1.2.2's CHUNKS retriever returns chunk payload dicts without one —
-    the vector engine's ScoredResult carries a cosine distance, but the
-    retriever hands back ``found_chunk.payload`` only, so the distance is
-    dropped upstream of this repo's client boundary. For cognee hits this is
-    therefore always None. It is checked anyway so that the moment the client
-    boundary starts merging the distance into the payload, hits surface it here
-    without another change. Never invented: absent stays absent.
-
-    The one live producer of a ``score`` today is the github digest fallback
-    (``search_github_sync_state``), whose value is a token-overlap COUNT — an
-    unbounded integer in a different unit. Passing it through here would
-    surface it as ``retriever_score`` and flip ``retriever_scores_available``
-    on exactly the pages whose only signal is lexical, so that path is
-    excluded rather than mislabelled.
-    """
+def _result_retriever_signal(
+    result: dict[str, Any],
+    *,
+    include_envelope: bool = False,
+    lifecycle: dict[str, Any] | None = None,
+) -> tuple[float, str, str] | None:
+    """Return a finite retriever value with its metric meaning."""
     if result.get("source") == "github_sync_state":
         return None
-    for key in ("score", "distance", "similarity"):
+    if include_envelope:
+        envelope = result.get("_citadel")
+        if isinstance(envelope, dict):
+            relevance = envelope.get("relevance")
+            if isinstance(relevance, dict):
+                value = relevance.get("retriever_score")
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and isfinite(float(value))
+                ):
+                    return (
+                        float(value),
+                        str(relevance.get("retriever_score_kind") or "score"),
+                        str(relevance.get("retriever_score_direction") or "unknown"),
+                    )
+    for key, kind, direction in (
+        ("distance", "distance", "lower-is-better"),
+        ("similarity", "similarity", "higher-is-better"),
+        ("retriever_score", "score", "unknown"),
+        ("score", "score", "unknown"),
+    ):
         value = result.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(float(value))
+        ):
+            if key == "score" and (lifecycle or {}).get("backend") == "vector":
+                kind = "cosine-distance"
+                direction = "lower-is-better"
+            return float(value), kind, direction
     return None
+
+
+def _result_retriever_score(
+    result: dict[str, Any], *, include_envelope: bool = False
+) -> float | None:
+    signal = _result_retriever_signal(result, include_envelope=include_envelope)
+    return signal[0] if signal is not None else None
 
 
 def with_result_metadata(
@@ -3074,9 +3120,9 @@ def with_result_metadata(
     the flag falls back to "any id with a backing endpoint" (non-caller-scoped
     callers/tests). Synthetic ``chunk:<hash>`` ids stay non-drillable either way.
 
-    ``query`` (when supplied) adds ``_citadel.relevance``: the retriever's own
-    score when the payload carries one (it does not today — see
-    ``_result_retriever_score``), observable lexical term coverage, and a
+    ``query`` (when supplied) adds ``_citadel.relevance``: lexical term
+    coverage, a typed retriever score when the payload carries one (Qdrant
+    carries cosine distance as ``distance``), and a
     ``match_context`` window around the densest query-term cluster so that a
     caller which truncates ``text`` at the head still shows the part of a long
     document that actually matched.
@@ -3157,9 +3203,15 @@ def with_result_metadata(
             "term_coverage": round(coverage, 3),
             "matched_terms": matched,
         }
-        retriever_score = _result_retriever_score(normalized)
-        if retriever_score is not None:
+        retriever_signal = _result_retriever_signal(
+            normalized,
+            lifecycle=lifecycle if isinstance(lifecycle, dict) else None,
+        )
+        if retriever_signal is not None:
+            retriever_score, retriever_kind, retriever_direction = retriever_signal
             relevance["retriever_score"] = retriever_score
+            relevance["retriever_score_kind"] = retriever_kind
+            relevance["retriever_score_direction"] = retriever_direction
         full_text = first_string(
             normalized.get("text"),
             normalized.get("content"),
@@ -3278,6 +3330,13 @@ def select_public_search_page(
         candidates = apply_query_ranking(candidates, query, mode=mode)
 
     terms = query_terms(query)
+    if ranked_query and filter_kwargs is None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if hit_term_coverage(candidate, terms)[0] > 0
+            or _result_retriever_score(candidate, include_envelope=True) is not None
+        ]
     coverages = [hit_term_coverage(candidate, terms)[0] for candidate in candidates]
     lexical_evidence = any(coverage > 0 for coverage in coverages)
 
@@ -8599,6 +8658,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     relevance_summary = lexical_relevance_summary(
         body.query, coverages, scores_available=retriever_scores_seen
     )
+    if candidates_matched and not normalized and query_terms(body.query):
+        relevance_summary["no_lexical_match"] = True
     payload: dict[str, Any] = {
         "results": normalized,
         "dataset": primary_dataset,
@@ -8627,8 +8688,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
-    if not clarification_required and not normalized and body.dataset is None and (
-        not filters_active or candidates_fetched == 0
+    if (
+        not clarification_required
+        and not normalized
+        and candidates_matched == 0
+        and body.dataset is None
+        and (not filters_active or candidates_fetched == 0)
     ):
         # With filters active this fires only when retrieval itself came back
         # empty — an empty page whose candidates the filters excluded gets the
@@ -8638,6 +8703,17 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)
+    if not clarification_required and not normalized and candidates_matched:
+        payload.update(
+            {
+                "code": CODE_NO_RELEVANT_RESULTS,
+                "answerable": False,
+                "message": (
+                    "No result had verifiable query overlap or a retriever score. "
+                    "Add an exact issue key, repository, file, symbol, or topic."
+                ),
+            }
+        )
     warnings: list[str] = []
     if (
         filters_active
