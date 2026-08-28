@@ -62,6 +62,7 @@ from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
 from kb.lifecycle import (
+    LifecycleConflictError,
     LifecycleNotFoundError,
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
@@ -7603,6 +7604,11 @@ async def lifecycle_requeue_failed(
             "expected_count": exc.expected_count,
             "current_count": len(exc.actual_candidate_ids),
         }
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleConflictError as exc:
+        # Base-class catch LAST: route drift under CITADEL_PROJECTION_DIGEST_V2.
+        detail = {"code": "LIFECYCLE_ROUTE_DRIFT", "message": str(exc)}
         record("lifecycle.requeue.apply", False, detail)
         raise HTTPException(status_code=409, detail=detail) from exc
 

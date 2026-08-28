@@ -415,7 +415,10 @@ class Citadel:
         """Tombstone current exact and optional chunk revisions for one source."""
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
-        self._assert_projection_routes_stable()
+        # Tombstones are deliberately NOT route-guarded: they run through the
+        # route-independent worker path (no LLM), and blocking them under v2
+        # route drift would leave deleted content searchable (the Obsidian
+        # delete path does not retry a failed tombstone).
         projection = self._lifecycle_projection_request()
         current = self.lifecycle_store.current_revisions_for_source(
             dataset,
@@ -887,7 +890,6 @@ class Citadel:
         candidate_ids: tuple[str, ...],
     ) -> dict[str, Any]:
         """Apply one exact active-generation recovery preview."""
-        self._assert_projection_routes_stable()
         projection = self._lifecycle_requeue_projection()
         if (
             generation_id != projection.generation_id
@@ -895,6 +897,9 @@ class Citadel:
             or config_digest != projection.config_digest
         ):
             raise LifecycleRequeueIdentityMismatchError(projection)
+        # Drift check AFTER identity validation so stale previews keep their
+        # 409 identity-mismatch contract; the guard protects only the write.
+        self._assert_projection_routes_stable()
         assert self.lifecycle_store is not None
         requeued_ids = self.lifecycle_store.requeue_failed_projections(
             projection,

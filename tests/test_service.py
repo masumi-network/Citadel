@@ -510,9 +510,9 @@ async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
     """With v2 on, a mid-process route change (operator edit or the
     free-router fallback) must fail NEW projection work fast: a silently
     frozen digest would strand jobs, and a moving digest would let receipts
-    attest a model that did not run. Read paths (search, readyz, tombstone)
-    build projection identities through the same builder and must keep
-    working, so the builder itself never raises.
+    attest a model that did not run. Read paths (search, readyz) and
+    route-independent tombstones keep working: the builder never raises, and
+    a blocked tombstone would leave deleted content searchable.
     """
     monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/frozen:free")
@@ -523,6 +523,7 @@ async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
         ),
         cognee=FakeCognee(),
     )
+    preview = kb.lifecycle_requeue_failed_preview()
     before = kb._lifecycle_projection_request().config_digest
     monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/flipped:free")
     # Read-safe: the builder still answers, with the frozen attestation.
@@ -532,18 +533,21 @@ async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
         await kb.ingest("drifted source", source_key="manual:drift")
     with pytest.raises(LifecycleConflictError, match="restart the node"):
         kb.queue_lifecycle_rebuild(generation_id="generation-drift-target")
-    with pytest.raises(LifecycleConflictError, match="restart the node"):
-        await kb.tombstone_source(
-            dataset="notes", source_key="manual:drift", reason="test"
-        )
+    # Requeue apply validates the preview identity FIRST (its 409 contract),
+    # then refuses the drifted write.
     with pytest.raises(LifecycleConflictError, match="restart the node"):
         kb.lifecycle_requeue_failed(
-            generation_id="generation-any",
-            projection_version="lifecycle-v1:cognee-1.4.1",
-            config_digest="sha256:any",
+            generation_id=preview["generation_id"],
+            projection_version=preview["projection_version"],
+            config_digest=preview["config_digest"],
             expected_count=0,
             candidate_ids=(),
         )
+    # Tombstones are route-independent and must stay available under drift.
+    tombstoned = await kb.tombstone_source(
+        dataset="notes", source_key="manual:absent", reason="test"
+    )
+    assert tombstoned == ()
 
 
 def test_lifecycle_v1_freezes_llm_model_against_fallback_rewrite(
