@@ -415,6 +415,7 @@ class Citadel:
         """Tombstone current exact and optional chunk revisions for one source."""
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        self._assert_projection_routes_stable()
         projection = self._lifecycle_projection_request()
         current = self.lifecycle_store.current_revisions_for_source(
             dataset,
@@ -886,6 +887,7 @@ class Citadel:
         candidate_ids: tuple[str, ...],
     ) -> dict[str, Any]:
         """Apply one exact active-generation recovery preview."""
+        self._assert_projection_routes_stable()
         projection = self._lifecycle_requeue_projection()
         if (
             generation_id != projection.generation_id

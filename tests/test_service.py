@@ -532,6 +532,18 @@ async def test_lifecycle_v2_rejects_runtime_route_drift_on_writes_only(
         await kb.ingest("drifted source", source_key="manual:drift")
     with pytest.raises(LifecycleConflictError, match="restart the node"):
         kb.queue_lifecycle_rebuild(generation_id="generation-drift-target")
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        await kb.tombstone_source(
+            dataset="notes", source_key="manual:drift", reason="test"
+        )
+    with pytest.raises(LifecycleConflictError, match="restart the node"):
+        kb.lifecycle_requeue_failed(
+            generation_id="generation-any",
+            projection_version="lifecycle-v1:cognee-1.4.1",
+            config_digest="sha256:any",
+            expected_count=0,
+            candidate_ids=(),
+        )
 
 
 def test_lifecycle_v1_freezes_llm_model_against_fallback_rewrite(
