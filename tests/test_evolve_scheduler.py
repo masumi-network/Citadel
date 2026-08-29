@@ -108,11 +108,13 @@ class _FakeCitadel:
         self.resume_calls: list[bool] = []
         self.cognee = _FakeCognee()
 
-    def resume_lifecycle_queue(self) -> bool:
+    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
         # The scheduler kicks the projection drain after every pass, because
         # starts are suppressed while Phase 1 holds the writer lock and Phase 2
-        # never drains the lifecycle queue itself.
-        self.resume_calls.append(True)
+        # never drains the lifecycle queue itself. Recording the kwarg pins the
+        # split: the pre-Phase-2 kick is vector-only (False), the post-pass
+        # kick includes the deferred graph lane (True).
+        self.resume_calls.append(include_deferred)
         return True
 
     async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
@@ -136,12 +138,16 @@ class _BlockingCognifyCitadel(_FakeCitadel):
     def __init__(self, cognify_calls: list[bool]) -> None:
         super().__init__(cognify_calls)
         self.cognify_started = asyncio.Event()
+        self.cognify_tasks: list[asyncio.Task[Any]] = []
 
     async def cognify_dataset(
         self, *, force: bool = False, verify: bool = False
     ) -> dict[str, Any]:
         self._cognify_calls.append(force)
         assert verify is True
+        task = asyncio.current_task()
+        if task is not None:
+            self.cognify_tasks.append(task)
         self.cognify_started.set()
         await asyncio.Event().wait()
         return {}
@@ -267,9 +273,11 @@ async def test_drain_resume_fires_before_phase2(
     try:
         await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
         # Phase 2 is blocked right now and will never return; the drain must
-        # already have been kicked.
-        assert fake_citadel.resume_calls, (
-            "resume_lifecycle_queue must fire after Phase 1, before Phase 2"
+        # already have been kicked, and vector-only: the pre-Phase-2 kick must
+        # not (re)start the graph lane behind a possibly hung Phase 2.
+        assert fake_citadel.resume_calls == [False], (
+            "resume_lifecycle_queue must fire after Phase 1, before Phase 2, "
+            "with include_deferred=False"
         )
     finally:
         task.cancel()
@@ -288,7 +296,11 @@ async def test_hung_phase2_is_bounded_and_still_stamps(
 
     import kb.server as server
 
-    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    # Keep the orphan-skip budget out of the way: this test pins the timeout
+    # verdict, not the wedge escalation, and the 1ms interval would reach the
+    # default budget before the assertions run.
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
     _patch_phase1(monkeypatch)
     cognify_calls: list[bool] = []
     fake_citadel = _BlockingCognifyCitadel(cognify_calls)
@@ -315,6 +327,7 @@ async def test_hung_phase2_is_bounded_and_still_stamps(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        await _cancel_phase2_orphans()
 
 
 class _RaisingCitadel:
@@ -530,3 +543,497 @@ async def test_a_dying_scheduler_task_is_logged(monkeypatch: Any, caplog: Any) -
     died = [r for r in caplog.records if "died" in r.message]
     assert died, "a scheduler task that raised must be logged at ERROR"
     assert "evolve-scheduler" in died[0].getMessage()
+
+
+async def _cancel_phase2_orphans() -> None:
+    """Test cleanup only: reap deliberately un-cancelled Phase 2 orphans."""
+    for orphan in asyncio.all_tasks():
+        if orphan.get_name() == "evolve-phase2-cognify" and not orphan.done():
+            orphan.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await orphan
+
+
+class _CountingMaintenance:
+    def __init__(self, owner: "_CountingCognee") -> None:
+        self._owner = owner
+
+    async def __aenter__(self) -> None:
+        self._owner.entries += 1
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _CountingCognee:
+    def __init__(self) -> None:
+        self.entries = 0
+
+    def maintenance(self) -> _CountingMaintenance:
+        return _CountingMaintenance(self)
+
+
+class _LockCognee:
+    """Real asyncio.Lock-backed maintenance, mirroring the gateway's."""
+
+    def __init__(self) -> None:
+        self.maintenance_lock = asyncio.Lock()
+        self.entries = 0
+
+    @contextlib.asynccontextmanager
+    async def maintenance(self) -> Any:
+        async with self.maintenance_lock:
+            self.entries += 1
+            yield
+
+
+def _record_stamps(monkeypatch: Any) -> list[dict[str, Any]]:
+    """Count record_completed calls; the loop imports it by name at start."""
+    import kb.evolve_state as evolve_state
+
+    real = evolve_state.record_completed
+    stamps: list[dict[str, Any]] = []
+
+    def recording(path: Any, **kwargs: Any) -> None:
+        stamps.append(dict(kwargs))
+        real(path, **kwargs)
+
+    monkeypatch.setattr(evolve_state, "record_completed", recording)
+    return stamps
+
+
+async def test_pre_phase2_resume_is_vector_only(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The kick between Phase 1 and Phase 2 must be include_deferred=False
+    (baseline lanes take no maintenance/writer lock, so the drain can never
+    park behind Phase 2); the post-pass finally kick stays True so deferred
+    graph work still drains after a healthy pass.
+    """
+    import kb.server as server
+
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _FakeCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    try:
+        for _ in range(300):
+            if len(fake_citadel.resume_calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(fake_citadel.resume_calls) >= 2
+    assert fake_citadel.resume_calls[0] is False, "pre-Phase-2 kick must be vector-only"
+    assert fake_citadel.resume_calls[1] is True, "post-pass kick must include deferred"
+
+
+async def test_phase2_timeout_leaves_cognify_uncancelled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """P1-B: no cancellation may reach a cognee write path in-process. A timed
+    out Phase 2 stamps cognify_timeout and flips the canary, but the inner
+    cognify task is left running un-cancelled (shield, not cancel).
+    """
+    import json as json_module
+
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert state_path.exists(), "the timed-out pass must still stamp"
+        state = json_module.loads(state_path.read_text())
+        assert state["last_run_reason"] == "cognify_timeout"
+        assert server._LAST_CANARY is not None
+        assert server._LAST_CANARY["ok"] is False
+        assert server._LAST_CANARY.get("error") == "TimeoutError"
+        assert fake_citadel.cognify_tasks, "cognify was never attempted"
+        first = fake_citadel.cognify_tasks[0]
+        assert first.get_name() == "evolve-phase2-cognify"
+        assert not first.cancelled(), (
+            "the timed-out cognify must NOT be cancelled (P1-B)"
+        )
+        assert not first.done(), (
+            "the hung cognify must be left running un-cancelled"
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await _cancel_phase2_orphans()
+
+
+async def test_orphaned_phase2_skips_next_pass_without_pausing(
+    monkeypatch: Any, caplog: Any, tmp_path: Path
+) -> None:
+    """While a Phase 2 orphan lives, later passes are SKIPPED: no second
+    pause (a skip can never re-park the drain), no maintenance entry, no
+    second stamp, and the skip is loud.
+    """
+    import logging
+
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
+    _patch_phase1(monkeypatch)
+    stamps = _record_stamps(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    fake_citadel.cognee = _CountingCognee()
+    fake_citadel.pause_calls = 0
+
+    def _pause() -> None:
+        fake_citadel.pause_calls += 1
+
+    fake_citadel.pause_lifecycle_queue = _pause
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    with caplog.at_level(logging.ERROR, logger=server.logger.name):
+        task = asyncio.create_task(
+            server._evolve_scheduler_loop(0.001, str(state_path))
+        )
+        try:
+            for _ in range(300):
+                if any("pass skipped" in r.message for r in caplog.records):
+                    break
+                await asyncio.sleep(0.01)
+            # Let a few more intervals elapse: every one must keep skipping.
+            await asyncio.sleep(0.05)
+            skips = [r for r in caplog.records if "pass skipped" in r.message]
+            assert skips, "a skipped pass must be logged at ERROR"
+            assert fake_citadel.pause_calls == 1, (
+                "a skipped pass must not pause the queue again"
+            )
+            assert fake_citadel.cognee.entries == 1, (
+                "a skipped pass must not enter maintenance"
+            )
+            assert len(stamps) == 1, "a skipped pass must not stamp"
+            assert not task.done()
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await _cancel_phase2_orphans()
+
+
+async def test_orphan_skip_budget_flips_canary_unhealthy(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Past CITADEL_EVOLVE_ORPHAN_MAX_SKIPS skipped passes the canary records
+    Phase2OrphanWedged so /readyz goes unhealthy and escalates to a restart.
+    """
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    try:
+        for _ in range(300):
+            if (
+                server._LAST_CANARY is not None
+                and server._LAST_CANARY.get("error") == "Phase2OrphanWedged"
+            ):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await _cancel_phase2_orphans()
+
+    assert server._LAST_CANARY is not None
+    assert server._LAST_CANARY["ok"] is False
+    assert server._LAST_CANARY.get("error") == "Phase2OrphanWedged"
+
+
+class _OrphanRecoveringCitadel(_FakeCitadel):
+    """First cognify hangs until released, then completes; later ones pass."""
+
+    def __init__(self, cognify_calls: list[bool]) -> None:
+        super().__init__(cognify_calls)
+        self.cognify_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self._first = True
+
+    async def cognify_dataset(
+        self, *, force: bool = False, verify: bool = False
+    ) -> dict[str, Any]:
+        if self._first:
+            self._first = False
+            self.cognify_started.set()
+            await self.release.wait()
+        return await super().cognify_dataset(force=force, verify=verify)
+
+
+async def test_orphan_completion_restores_normal_passes(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Once the orphan finishes, the next pass runs Phase 1 + Phase 2 normally
+    and stamps a full healthy cycle (orphan slot and skip counter reset).
+    """
+    import json as json_module
+
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _OrphanRecoveringCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert state_path.exists()
+        assert (
+            json_module.loads(state_path.read_text())["last_run_reason"]
+            == "cognify_timeout"
+        )
+        # The hung cognify resolves between ticks; the orphan completes and the
+        # next pass must run in full again.
+        fake_citadel.release.set()
+        for _ in range(300):
+            if (
+                state_path.exists()
+                and json_module.loads(state_path.read_text())["last_run_ok"] is True
+            ):
+                break
+            await asyncio.sleep(0.01)
+        state = json_module.loads(state_path.read_text())
+        assert state["last_run_ok"] is True, "a full pass must stamp again"
+        assert server._LAST_CANARY is not None
+        assert server._LAST_CANARY["ok"] is True
+        assert not task.done()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await _cancel_phase2_orphans()
+
+
+class _InterleavingCitadel(_FakeCitadel):
+    """Phase 2's cognify waits on maintenance behind a hung graph-lane job.
+
+    Mirrors the gateway: cognee.cognify acquires the maintenance lock before
+    writing, and the graph lane holds the same lock across its run_once.
+    """
+
+    def __init__(self, cognify_calls: list[bool]) -> None:
+        super().__init__(cognify_calls)
+        self.cognee = _LockCognee()
+        self.graph_lane_task: asyncio.Task[Any] | None = None
+        self.graph_lane_holding = asyncio.Event()
+        self.pause_calls = 0
+
+    def pause_lifecycle_queue(self) -> None:
+        self.pause_calls += 1
+
+    async def _graph_lane(self) -> None:
+        async with self.cognee.maintenance():
+            self.graph_lane_holding.set()
+            await asyncio.Event().wait()
+
+    async def cognify_dataset(
+        self, *, force: bool = False, verify: bool = False
+    ) -> dict[str, Any]:
+        self._cognify_calls.append(force)
+        assert verify is True
+        # A graph-lane job woken by the shared projection gate got the FIFO
+        # maintenance lock ahead of this cognify and hangs while holding it.
+        self.graph_lane_task = asyncio.create_task(self._graph_lane())
+        await self.graph_lane_holding.wait()
+        async with self.cognee.maintenance():
+            return {}
+
+
+async def test_maintenance_lock_interleaving_times_out_waiter_only(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """THE interleaving case: Phase 2 waits behind a graph-lane job on the
+    maintenance lock and hits its budget. Only the WAITER times out: the
+    graph-lane holder is untouched, the pass stamps cognify_timeout, and the
+    next tick takes the orphan-skip branch so Phase 1 never blocks on the
+    held lock.
+    """
+    import json as json_module
+
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _InterleavingCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert state_path.exists(), "the timed-out pass must still stamp"
+        state = json_module.loads(state_path.read_text())
+        assert state["last_run_reason"] == "cognify_timeout"
+        # The graph-lane holder is untouched: not cancelled, still holding.
+        graph_lane = fake_citadel.graph_lane_task
+        assert graph_lane is not None
+        assert not graph_lane.cancelled()
+        assert not graph_lane.done()
+        assert fake_citadel.cognee.maintenance_lock.locked(), (
+            "the graph-lane job must still hold the maintenance lock"
+        )
+        # Later ticks take the orphan-skip branch: no new pause, no Phase 1
+        # blocking on the held lock (entries stay at Phase 1 + graph lane).
+        entries_after_timeout = fake_citadel.cognee.entries
+        pauses_after_timeout = fake_citadel.pause_calls
+        await asyncio.sleep(0.05)
+        assert fake_citadel.pause_calls == pauses_after_timeout == 1
+        assert fake_citadel.cognee.entries == entries_after_timeout == 2
+        assert not task.done()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if fake_citadel.graph_lane_task is not None:
+            fake_citadel.graph_lane_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await fake_citadel.graph_lane_task
+        await _cancel_phase2_orphans()
+
+
+async def test_phase1_maintenance_entry_is_bounded(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Maintenance held by an outside task (no orphan): Phase 1's bounded
+    entry times out, the pass resumes the queue (include_deferred=True), does
+    not stamp, and defers to the next interval instead of hanging.
+    """
+    import kb.server as server
+
+    monkeypatch.setattr(
+        server, "_evolve_maintenance_acquire_timeout_seconds", lambda: 0.05
+    )
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _FakeCitadel(cognify_calls)
+    fake_citadel.cognee = _LockCognee()
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    holding = asyncio.Event()
+
+    async def _hold() -> None:
+        async with fake_citadel.cognee.maintenance():
+            holding.set()
+            await asyncio.Event().wait()
+
+    holder = asyncio.create_task(_hold())
+    await asyncio.wait_for(holding.wait(), timeout=1)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if True in fake_citadel.resume_calls:
+                break
+            await asyncio.sleep(0.01)
+        assert True in fake_citadel.resume_calls, (
+            "a deferred pass must resume the paused queue with include_deferred=True"
+        )
+        assert not state_path.exists(), "a deferred pass must not stamp"
+        assert cognify_calls == [], "Phase 2 must not run when Phase 1 was deferred"
+        assert not task.done(), "the loop must survive a busy maintenance lock"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        holder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await holder
+
+
+def test_phase2_timeout_floor_respects_canary_budget(monkeypatch: Any) -> None:
+    """P2: the Phase 2 bound must always cover the canary wait plus margin,
+    and the floor tracks a raised canary budget (formula, not constant).
+    """
+    import kb.server as server
+
+    monkeypatch.delenv("CITADEL_CANARY_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_TIMEOUT_SECONDS", "60")
+    assert server._evolve_cognify_timeout_seconds() >= 900.0
+    monkeypatch.setenv("CITADEL_CANARY_TIMEOUT_SECONDS", "2000")
+    assert server._evolve_cognify_timeout_seconds() >= 2300.0
+
+
+async def test_scheduler_teardown_cancels_phase2_task(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Loop teardown is the ONE path that still cancels the inner cognify
+    (repaired at next boot by recover_stale_cognify_runs); the cancelled pass
+    must not stamp.
+    """
+    import kb.server as server
+
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
+    assert len(fake_citadel.cognify_tasks) == 1
+    inner = fake_citadel.cognify_tasks[0]
+    assert inner.get_name() == "evolve-phase2-cognify"
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    with contextlib.suppress(asyncio.CancelledError):
+        await inner
+
+    assert inner.cancelled(), "teardown must cancel the inner Phase 2 task"
+    assert not state_path.exists(), "a cancelled pass must not stamp"

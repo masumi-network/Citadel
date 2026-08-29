@@ -391,6 +391,67 @@ async def test_vector_lane_runs_while_graph_lane_holds_maintenance(
         await kb.stop_lifecycle_queue()
 
 
+class MaintenanceCountingVectorLaneCognee(VectorLaneCognee):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maintenance_entries = 0
+
+    @asynccontextmanager
+    async def maintenance(self):
+        self.maintenance_entries += 1
+        yield
+
+
+@pytest.mark.asyncio
+async def test_baseline_lane_never_enters_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The load-bearing claim behind the evolve scheduler's vector-only
+    pre-Phase-2 kick: a baseline drain (resume WITHOUT include_deferred)
+    writes relational and vector receipts, defers graph, and never enters
+    cognee.maintenance() — so it can never park behind a Phase 2 (or any
+    other holder) of that lock.
+    """
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-1")
+    monkeypatch.setenv("DB_PROVIDER", "sqlite")
+    monkeypatch.setenv("VECTOR_DB_PROVIDER", "qdrant")
+    monkeypatch.setenv("GRAPH_DATABASE_PROVIDER", "ladybug")
+    fake = MaintenanceCountingVectorLaneCognee()
+    kb = Citadel(
+        CitadelConfig(
+            default_dataset="seat:alice",
+            user_id="alice",
+            lifecycle_enabled=True,
+            lifecycle_store_path=str(tmp_path / "lifecycle.sqlite3"),
+        ),
+        cognee=fake,
+    )
+
+    accepted = await kb.ingest(
+        "baseline lane content reaches relational and vector search only",
+        source_key="manual:alice:baseline-lane",
+        defer_cognify=True,
+    )
+    kb.resume_lifecycle_queue()
+    await kb.wait_for_lifecycle_idle()
+
+    operation = kb.lifecycle_store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "deferred", "graph work must stay deferred"
+    assert next(
+        receipt.state
+        for receipt in operation.receipts
+        if receipt.backend == "relational"
+    ) == "searchable"
+    assert next(
+        receipt.state for receipt in operation.receipts if receipt.backend == "vector"
+    ) == "searchable"
+    assert accepted.source_revision_id in fake.vector_ids
+    assert fake.maintenance_entries == 0, (
+        "the baseline lane must never enter maintenance"
+    )
+
+
 def test_lifecycle_config_digest_tracks_projection_affecting_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

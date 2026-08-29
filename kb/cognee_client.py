@@ -4798,6 +4798,30 @@ class CogneePublicClient:
             finally:
                 _COGNEE_MAINTENANCE_HELD.reset(token)
 
+    async def recover_stale_cognify_runs(self) -> None:
+        """Roll back cognify runs a previous process left mid-write.
+
+        Process teardown is the one remaining path that cancels an in-flight
+        cognify, and cognee's pipeline rollback fires on Exception only
+        (run_tasks catches Exception, not BaseException), so a cancelled run
+        strands partial graph/vector/relational writes with its pipeline run
+        row stuck DATASET_PROCESSING_STARTED. Cognee ships its own repair for
+        exactly this, but only wires it into its own API server, never into
+        this gateway. Run it at boot, under the maintenance lock, before any
+        queue starts. Runs younger than COGNEE_STALE_RUN_RECOVERY_MIN_AGE_SECONDS
+        (default 3600) are skipped by cognee as possibly live.
+        """
+        self._prepare_cognee_environment()
+        import cognee
+
+        await self._ensure_cognee_ready(cognee)
+        async with self.maintenance():
+            from cognee.modules.cognify.recovery import (
+                recover_stale_cognify_runs_on_startup,
+            )
+
+            await recover_stale_cognify_runs_on_startup()
+
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         """Cognify under the maintenance lock unless a repair already holds it."""
         if _COGNEE_MAINTENANCE_HELD.get():

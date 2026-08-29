@@ -7119,6 +7119,70 @@ def test_start_lifecycle_queue_resumes_due_projection_work(monkeypatch: Any) -> 
     assert calls == ["resume"]
 
 
+async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
+    monkeypatch: Any,
+) -> None:
+    """Boot must repair cognify runs a previous process abandoned mid-write
+    (teardown cancellation bypasses cognee's Exception-only rollback), and it
+    must do so BEFORE the lifecycle queue starts so nothing races the
+    rollback. A raising recovery must never abort boot.
+
+    Drives server.lifespan directly: the hosted-MCP session manager is
+    once-per-process, so a second TestClient boot in the suite would break it.
+    """
+    import contextlib as contextlib_module
+    from types import SimpleNamespace
+
+    from kb import server
+
+    calls: list[str] = []
+    # FakeCitadel's short test keys would otherwise refuse boot (M4).
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+
+    @contextlib_module.asynccontextmanager
+    async def _null_run() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        server,
+        "mcp_server",
+        SimpleNamespace(session_manager=SimpleNamespace(run=_null_run)),
+    )
+    monkeypatch.setattr(
+        server, "_start_lifecycle_queue", lambda: calls.append("lifecycle")
+    )
+    monkeypatch.setattr(server, "_start_repo_stats_scheduler", lambda: None)
+
+    class _RecoveringCognee:
+        async def recover_stale_cognify_runs(self) -> None:
+            calls.append("recover")
+
+    citadel = FakeCitadel()
+    citadel.cognee = _RecoveringCognee()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+
+    async with server.lifespan(app):
+        pass
+
+    assert calls.count("recover") == 1, "recovery must run exactly once at boot"
+    assert calls.index("recover") < calls.index("lifecycle"), (
+        "recovery must run before the lifecycle queue starts"
+    )
+
+    class _ExplodingCognee:
+        async def recover_stale_cognify_runs(self) -> None:
+            calls.append("boom")
+            raise RuntimeError("recovery exploded")
+
+    citadel.cognee = _ExplodingCognee()
+    # Boot completes despite the raise: entering the context is the assertion.
+    async with server.lifespan(app):
+        pass
+
+    assert "boom" in calls, "the raising recovery was never attempted"
+
+
 async def test_stop_lifecycle_queue_awaits_worker_shutdown(monkeypatch: Any) -> None:
     from kb import server
 
