@@ -378,6 +378,26 @@ def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> 
         raise
 
 
+def _evolve_cognify_timeout_seconds() -> float:
+    """Upper bound for one Phase 2 cognify pass (canary included).
+
+    Must exceed the canary wait (default 600s) with room for the cognify queue
+    itself; an unbounded Phase 2 parks the completion stamp and, before the
+    post-stages kick existed, the whole projection drain.
+    """
+    raw = os.getenv("CITADEL_EVOLVE_COGNIFY_TIMEOUT_SECONDS", "").strip()
+    default = 1800.0
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not isfinite(value) or value <= 0:
+        return default
+    return value
+
+
 async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
     """Run every evolve stage and Cognify on the web server's event loop.
 
@@ -471,6 +491,15 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             phase1_ok = False
             phase1_reason = "maintenance_exception"
             logger.exception("Evolve scheduler: maintenance entry failed")
+        # Kick the projection drain NOW, before Phase 2: the pass paused the
+        # queue above, and a hung Phase 2 (observed live 2026-08-28: cognify
+        # emitted nothing for 25+ minutes) must never park a 12k-job rebuild
+        # behind it. The post-pass kick in the finally below stays as a
+        # belt-and-braces no-op when the drain is already running.
+        try:
+            _resume_lifecycle_queue(citadel, include_deferred=True)
+        except Exception:
+            logger.exception("Evolve scheduler: post-stages projection resume failed")
         # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
         force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
             "1",
@@ -483,8 +512,12 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         phase2_reason: str | None = None
         try:
             # verify=True runs the end-to-end ingest+cognify+search canary and
-            # records its verdict for /readyz (#27).
-            result = await citadel.cognify_dataset(force=force, verify=True)
+            # records its verdict for /readyz (#27). Bounded: an unbounded hang
+            # here would block the completion stamp and the next interval.
+            result = await asyncio.wait_for(
+                citadel.cognify_dataset(force=force, verify=True),
+                timeout=_evolve_cognify_timeout_seconds(),
+            )
             verification = result.get("verification") or {}
             _record_canary_verdict(
                 ok=bool(result.get("ok")),
@@ -514,6 +547,17 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             # and kicking a drain task on a loop being torn down helps nobody.
             cancelled = True
             raise
+        except TimeoutError:
+            # The bound above fired: Phase 2 hung past its budget (observed
+            # live 2026-08-28). The drain already got its post-stages kick, the
+            # canary flips unhealthy, and the stamp below lets the next
+            # interval run instead of waiting behind a dead cognify.
+            phase2_reason = "cognify_timeout"
+            logger.error(
+                "Evolve scheduler: cognify timed out after %.0fs",
+                _evolve_cognify_timeout_seconds(),
+            )
+            _record_canary_verdict(ok=False, error="TimeoutError")
         except Exception as exc:
             phase2_reason = "cognify_exception"
             logger.exception("Evolve scheduler: cognify failed")

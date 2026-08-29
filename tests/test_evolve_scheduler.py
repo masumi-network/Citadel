@@ -222,6 +222,11 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
 async def test_evolve_scheduler_does_not_resume_after_phase2_cancellation(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
+    """Cancellation mid-Phase-2 must add NO extra resume.
+
+    The post-stages kick (before Phase 2) is expected and has already fired;
+    tearing the loop down must not kick the drain again on a dying loop.
+    """
     import kb.server as server
 
     _patch_phase1(monkeypatch)
@@ -233,12 +238,83 @@ async def test_evolve_scheduler_does_not_resume_after_phase2_cancellation(
         server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
     )
     await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
+    resumes_before_cancel = list(fake_citadel.resume_calls)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
     assert cognify_calls
-    assert fake_citadel.resume_calls == []
+    assert fake_citadel.resume_calls == resumes_before_cancel
+
+
+async def test_drain_resume_fires_before_phase2(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The pass pauses the queue at start, so the drain kick must NOT wait
+    behind Phase 2: a hung cognify (observed live 2026-08-28) would otherwise
+    park a full-generation rebuild indefinitely.
+    """
+    import kb.server as server
+
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    try:
+        await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
+        # Phase 2 is blocked right now and will never return; the drain must
+        # already have been kicked.
+        assert fake_citadel.resume_calls, (
+            "resume_lifecycle_queue must fire after Phase 1, before Phase 2"
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_hung_phase2_is_bounded_and_still_stamps(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A cognify that never returns must hit the Phase 2 bound: the canary
+    flips unhealthy with the timeout, the pass still stamps (so the next boot
+    resumes the interval instead of re-running forever), and the loop lives on.
+    """
+    import json as json_module
+
+    import kb.server as server
+
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_TIMEOUT_SECONDS", "0.05")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert state_path.exists(), "the timed-out pass must still stamp"
+        state = json_module.loads(state_path.read_text())
+        assert state["last_run_ok"] is False
+        assert state["last_run_reason"] == "cognify_timeout"
+        assert server._LAST_CANARY is not None
+        assert server._LAST_CANARY["ok"] is False
+        assert server._LAST_CANARY.get("error") == "TimeoutError"
+        assert not task.done(), "the loop must survive a Phase 2 timeout"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 class _RaisingCitadel:
