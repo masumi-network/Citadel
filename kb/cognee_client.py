@@ -4881,7 +4881,9 @@ class CogneePublicClient:
         has its own latest status DATASET_PROCESSING_COMPLETED at a
         created_at newer than OR EQUAL to this run's dangling STARTED row
         (equal timestamps cannot prove ordering, so equality is unsafe; the
-        dangling run itself never matches because its ranked row is STARTED).
+        dangling run's own STARTED row is excluded by the COMPLETED filter,
+        though with a same-timestamp STARTED and COMPLETED row in ONE run
+        the ranking itself is ambiguous — either pick still fails closed).
         Cognee 1.4.1 never transfers source-ref ownership: a later run that
         re-touches an existing source ref does not attach its own ref, so
         the old run keeps the SOLE ref, and rolling the old run back removes
@@ -4981,8 +4983,9 @@ class CogneePublicClient:
 
         if newer_completed:
             logger.error(
-                "dangling cognify run %s (dataset=%s) is buried under %d newer "
-                "COMPLETED run(s); cognee never transfers source-ref ownership, "
+                "dangling cognify run %s (dataset=%s) has %d COMPLETED run(s) "
+                "at a newer or equal timestamp (not provably older); cognee "
+                "never transfers source-ref ownership, "
                 "so rolling it back could delete graph/vector artifacts the "
                 "completed run(s) still reuse — leaving it dangling so boot "
                 "aborts",
