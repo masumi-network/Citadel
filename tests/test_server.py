@@ -7119,23 +7119,13 @@ def test_start_lifecycle_queue_resumes_due_projection_work(monkeypatch: Any) -> 
     assert calls == ["resume"]
 
 
-async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
-    monkeypatch: Any,
-) -> None:
-    """Boot must repair cognify runs a previous process abandoned mid-write
-    (teardown cancellation bypasses cognee's Exception-only rollback), and it
-    must do so BEFORE the lifecycle queue starts so nothing races the
-    rollback. A raising recovery must never abort boot.
-
-    Drives server.lifespan directly: the hosted-MCP session manager is
-    once-per-process, so a second TestClient boot in the suite would break it.
-    """
+def _patch_lifespan_boot(monkeypatch: Any, calls: list[str]) -> None:
+    """Stub the MCP session manager and record every worker starter."""
     import contextlib as contextlib_module
     from types import SimpleNamespace
 
     from kb import server
 
-    calls: list[str] = []
     # FakeCitadel's short test keys would otherwise refuse boot (M4).
     monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
 
@@ -7149,13 +7139,39 @@ async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
         SimpleNamespace(session_manager=SimpleNamespace(run=_null_run)),
     )
     monkeypatch.setattr(
+        server, "_start_cognify_queue", lambda: calls.append("cognify")
+    )
+    monkeypatch.setattr(
         server, "_start_lifecycle_queue", lambda: calls.append("lifecycle")
     )
-    monkeypatch.setattr(server, "_start_repo_stats_scheduler", lambda: None)
+    monkeypatch.setattr(
+        server, "_start_evolve_scheduler", lambda: calls.append("evolve")
+    )
+    monkeypatch.setattr(
+        server, "_start_repo_stats_scheduler", lambda: calls.append("repo_stats")
+    )
+
+
+async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
+    monkeypatch: Any,
+) -> None:
+    """Boot must repair cognify runs a previous process abandoned mid-write
+    (teardown cancellation bypasses cognee's Exception-only rollback), and it
+    must do so BEFORE any worker starts so nothing races the rollback. A
+    verified-clean recovery then starts all four workers.
+
+    Drives server.lifespan directly: the hosted-MCP session manager is
+    once-per-process, so a second TestClient boot in the suite would break it.
+    """
+    from kb import server
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
 
     class _RecoveringCognee:
-        async def recover_stale_cognify_runs(self) -> None:
+        async def recover_stale_cognify_runs(self) -> list[Any]:
             calls.append("recover")
+            return []
 
     citadel = FakeCitadel()
     citadel.cognee = _RecoveringCognee()
@@ -7169,18 +7185,176 @@ async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
     assert calls.index("recover") < calls.index("lifecycle"), (
         "recovery must run before the lifecycle queue starts"
     )
+    assert calls[-4:] == ["cognify", "lifecycle", "evolve", "repo_stats"], (
+        "a verified-clean recovery must start all four workers"
+    )
+
+
+async def test_lifespan_aborts_when_stale_cognify_recovery_raises(
+    monkeypatch: Any,
+) -> None:
+    """A raising recovery must abort boot, not degrade it. Skipping only the
+    boot-time starters is NOT fail-closed: live write paths restart writers
+    while the API is up (legacy remember() -> schedule_cognify() ->
+    _start_cognify_queue_drain(); /api/linear-sync/run schedules cognify), and
+    any new cognify run would bury the unrecovered latest run as
+    no-longer-latest forever. The process must exit so the platform restart
+    policy retries recovery on the next boot; no worker of any kind may start.
+    """
+    from kb import server
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
 
     class _ExplodingCognee:
         async def recover_stale_cognify_runs(self) -> None:
             calls.append("boom")
             raise RuntimeError("recovery exploded")
 
+    citadel = FakeCitadel()
     citadel.cognee = _ExplodingCognee()
-    # Boot completes despite the raise: entering the context is the assertion.
-    async with server.lifespan(app):
-        pass
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
 
-    assert "boom" in calls, "the raising recovery was never attempted"
+    with pytest.raises(RuntimeError, match="recovery exploded"):
+        async with server.lifespan(app):
+            raise AssertionError("lifespan must not yield after a failed recovery")
+
+    assert calls == ["boom"], (
+        "a failed recovery must start nothing: no cognify queue, no lifecycle "
+        "queue, no evolve scheduler, no repo-stats task"
+    )
+
+
+async def test_lifespan_aborts_when_recovery_verification_finds_stale_runs(
+    monkeypatch: Any,
+) -> None:
+    """cognee's recovery swallows its own failures, so 'the call returned' is
+    not 'the repair happened'. When the post-recovery probe still finds a
+    latest DATASET_PROCESSING_STARTED run, the client raises
+    CogneeStartupRecoveryError and boot must abort exactly like any other
+    recovery failure.
+    """
+    from kb import server
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
+
+    class _UnverifiedCognee:
+        async def recover_stale_cognify_runs(self) -> None:
+            calls.append("unverified")
+            raise CogneeStartupRecoveryError(
+                "stale cognify-run recovery left 1 dataset(s) with their "
+                "latest run still DATASET_PROCESSING_STARTED: dead-beef"
+            )
+
+    citadel = FakeCitadel()
+    citadel.cognee = _UnverifiedCognee()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+
+    with pytest.raises(CogneeStartupRecoveryError, match="dead-beef"):
+        async with server.lifespan(app):
+            raise AssertionError(
+                "lifespan must not yield while a partial cognify write is "
+                "unrecovered"
+            )
+
+    assert calls == ["unverified"], (
+        "an unverified recovery must start nothing: no cognify queue, no "
+        "lifecycle queue, no evolve scheduler, no repo-stats task"
+    )
+
+
+async def test_lifespan_teardown_stops_evolve_before_the_lifecycle_queue(
+    monkeypatch: Any,
+) -> None:
+    """Cancelling the evolve scheduler while it waits in maintenance/Phase 1
+    hits its CancelledError handler, which resumes the lifecycle queue
+    (include_deferred=True) before re-raising. Teardown must therefore cancel
+    the scheduler (and repo-stats) BEFORE stopping the lifecycle queue: the
+    old order (lifecycle -> cognify -> evolve) let that resume restart
+    vector/graph lane tasks AFTER stop_lifecycle_queue had already returned,
+    leaving live lane tasks behind a stopped queue at shutdown.
+
+    Drives the real _evolve_scheduler_loop, parked inside the bounded
+    maintenance acquire, through the real lifespan teardown.
+    """
+    import contextlib as contextlib_module
+    from types import SimpleNamespace
+
+    from kb import server
+
+    calls: list[str] = []
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+
+    @contextlib_module.asynccontextmanager
+    async def _null_run() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        server,
+        "mcp_server",
+        SimpleNamespace(session_manager=SimpleNamespace(run=_null_run)),
+    )
+
+    entered_maintenance = asyncio.Event()
+
+    class _BlockedMaintenance:
+        async def __aenter__(self) -> None:
+            entered_maintenance.set()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _BlockedMaintenanceCognee:
+        def maintenance(self) -> _BlockedMaintenance:
+            return _BlockedMaintenance()
+
+        async def recover_stale_cognify_runs(self) -> list[Any]:
+            return []
+
+    class _TeardownCitadel(FakeCitadel):
+        cognee = _BlockedMaintenanceCognee()
+
+        def pause_lifecycle_queue(self) -> None:
+            calls.append("pause")
+
+        def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
+            calls.append("lane_resume")
+            return True
+
+        async def stop_lifecycle_queue(self) -> None:
+            calls.append("lifecycle_stop")
+
+    citadel = _TeardownCitadel()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+    # The real loop with a near-zero interval so the first pass parks in the
+    # maintenance acquire immediately; the floor in _start_evolve_scheduler
+    # would otherwise delay the pass by 60s.
+    monkeypatch.setattr(
+        server,
+        "_start_evolve_scheduler",
+        lambda: asyncio.create_task(server._evolve_scheduler_loop(0.001, "")),
+    )
+
+    async with server.lifespan(app):
+        await asyncio.wait_for(entered_maintenance.wait(), timeout=5)
+
+    assert "pause" in calls, "the pass never reached its maintenance acquire"
+    assert calls.count("lane_resume") >= 2, (
+        "the cancelled maintenance wait must have fired its lifecycle resume "
+        "(boot start + cancellation-window resume); the regression window was "
+        "never exercised"
+    )
+    stop_at = calls.index("lifecycle_stop")
+    assert "lane_resume" not in calls[stop_at + 1 :], (
+        "a lifecycle lane was restarted after stop_lifecycle_queue returned: "
+        "teardown must cancel the evolve scheduler before stopping the queue"
+    )
 
 
 async def test_stop_lifecycle_queue_awaits_worker_shutdown(monkeypatch: Any) -> None:

@@ -31,6 +31,19 @@ DEFAULT_COGNIFY_QUEUE_PATH = Path(".citadel/cognify_queue.json")
 COGNIFY_EXECUTION_LOCK_POLL_SECONDS = 1.0
 _PREPARED_COGNEE_STORAGE_SIGNATURE: tuple[str, ...] | None = None
 
+
+class CogneeStartupRecoveryError(RuntimeError):
+    """Boot-time stale cognify-run recovery could not be verified clean.
+
+    cognee's recover_stale_cognify_runs_on_startup swallows every failure
+    (candidate-query errors and per-run rollback errors are logged and
+    dropped), so its return proves nothing. When the post-recovery probe
+    still finds a dataset whose latest cognify run is
+    DATASET_PROCESSING_STARTED, that run holds unrecovered partial writes;
+    a new cognify would bury it as no-longer-latest forever.
+    """
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -4798,7 +4811,49 @@ class CogneePublicClient:
             finally:
                 _COGNEE_MAINTENANCE_HELD.reset(token)
 
-    async def recover_stale_cognify_runs(self) -> None:
+    async def _stale_cognify_latest_runs(self) -> list[Any]:
+        """Latest-per-dataset cognify runs still stuck DATASET_PROCESSING_STARTED.
+
+        Mirrors the candidate query in cognee's
+        recover_stale_cognify_runs_on_startup exactly (row_number over
+        dataset_id ordered by created_at desc, rn == 1, status STARTED,
+        pipeline_name 'cognify_pipeline'), so an empty result means the set
+        recovery selected from is now empty. Sound as a post-recovery probe
+        because a failed rollback also skips reset_pipeline_run_status,
+        leaving the failed run the dataset's latest row.
+        """
+        from sqlalchemy import func, select
+        from sqlalchemy.orm import aliased
+
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
+
+        db_engine = get_relational_engine()
+        async with db_engine.get_async_session() as session:
+            latest_per_dataset = (
+                select(
+                    PipelineRun,
+                    func.row_number()
+                    .over(
+                        partition_by=PipelineRun.dataset_id,
+                        order_by=PipelineRun.created_at.desc(),
+                    )
+                    .label("rn"),
+                )
+                .where(PipelineRun.pipeline_name == "cognify_pipeline")
+                .subquery()
+            )
+            latest_run = aliased(PipelineRun, latest_per_dataset)
+            result = await session.execute(
+                select(latest_run)
+                .where(latest_per_dataset.c.rn == 1)
+                .where(
+                    latest_run.status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+                )
+            )
+            return list(result.scalars().all())
+
+    async def recover_stale_cognify_runs(self) -> list[Any]:
         """Roll back cognify runs a previous process left mid-write.
 
         Process teardown is the one remaining path that cancels an in-flight
@@ -4824,6 +4879,15 @@ class CogneePublicClient:
         recover_stale_cognify_runs_on_startup takes no age parameter and the
         env var is read at import time into a module constant, so the
         constant itself is set and restored around the call.
+
+        cognee's recovery swallows its own failures (candidate-query errors
+        return early; per-run rollback errors log and continue), so the call
+        returning is not proof of repair. Re-run its candidate query after
+        the call: any dataset whose latest cognify run is still
+        DATASET_PROCESSING_STARTED raises CogneeStartupRecoveryError, and a
+        probe that itself fails propagates: swallowing it would recreate the
+        exact blind spot this verification exists to close. Returns the
+        (always empty) list of still-stale runs on the healthy path.
         """
         self._prepare_cognee_environment()
         import cognee
@@ -4838,6 +4902,20 @@ class CogneePublicClient:
                 await cognify_recovery.recover_stale_cognify_runs_on_startup()
             finally:
                 cognify_recovery.STALE_RUN_MIN_AGE_SECONDS = original_min_age
+
+            still_stale = await self._stale_cognify_latest_runs()
+            if still_stale:
+                datasets = ", ".join(
+                    sorted(
+                        str(getattr(run, "dataset_id", run)) for run in still_stale
+                    )
+                )
+                raise CogneeStartupRecoveryError(
+                    "stale cognify-run recovery left "
+                    f"{len(still_stale)} dataset(s) with their latest run still "
+                    f"DATASET_PROCESSING_STARTED: {datasets}"
+                )
+            return still_stale
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         """Cognify under the maintenance lock unless a repair already holds it."""

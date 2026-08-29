@@ -987,21 +987,25 @@ async def lifespan(app: FastAPI) -> Any:
         # Repair cognify runs a previous process abandoned mid-write: teardown
         # cancellation bypasses cognee's Exception-only rollback, stranding
         # partial writes and a DATASET_PROCESSING_STARTED run row. Cognee's own
-        # startup recovery handles exactly this; run it before either queue
-        # starts so nothing races the rollback. Boot must never fail on it.
-        try:
-            recover = getattr(
-                getattr(get_citadel(), "cognee", None),
-                "recover_stale_cognify_runs",
-                None,
-            )
-            if callable(recover):
-                await recover()
-        except Exception:
-            logger.exception(
-                "Stale cognify-run recovery failed; continuing boot with any "
-                "partial writes left in place"
-            )
+        # startup recovery handles exactly this; run it before any worker
+        # starts so nothing races the rollback. A failed or unverified
+        # recovery ABORTS boot (the raise propagates out of lifespan): cognee
+        # swallows its own recovery failures, so the client re-probes and
+        # raises CogneeStartupRecoveryError when a latest run is still
+        # STARTED. Skipping the boot-time starters instead would not be
+        # fail-closed, because live write paths restart writers while the API
+        # is up (legacy remember() -> schedule_cognify() ->
+        # _start_cognify_queue_drain(); /api/linear-sync/run schedules
+        # cognify), and any new cognify run would bury the unrecovered latest
+        # run as no-longer-latest forever. A dead process retried by the
+        # platform restart policy IS the signal.
+        recover = getattr(
+            getattr(get_citadel(), "cognee", None),
+            "recover_stale_cognify_runs",
+            None,
+        )
+        if callable(recover):
+            await recover()
         _start_cognify_queue()
         _start_lifecycle_queue()
         evolve_task = _start_evolve_scheduler()
@@ -1009,11 +1013,18 @@ async def lifespan(app: FastAPI) -> Any:
         try:
             yield
         finally:
-            await _stop_lifecycle_queue()
-            await _stop_cognify_queue()
+            # Cancel the schedulers BEFORE stopping the queues: cancelling the
+            # evolve scheduler while it waits in maintenance/Phase 1 hits its
+            # CancelledError handler, which resumes the lifecycle queue
+            # (include_deferred=True) before re-raising. The old order
+            # (lifecycle -> cognify -> evolve) let that resume restart
+            # vector/graph lane tasks after stop_lifecycle_queue had already
+            # returned.
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
             await _stop_evolve_scheduler(repo_stats_task)
+            await _stop_lifecycle_queue()
+            await _stop_cognify_queue()
 
 
 # Single-source the service version and captured deployment identity. The Railway

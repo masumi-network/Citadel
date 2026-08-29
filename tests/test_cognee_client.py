@@ -5445,27 +5445,18 @@ async def test_cognify_violations_fail_even_when_missing_ids_are_in_flight(
     assert "still in lifecycle projection" in message
 
 
-@pytest.mark.asyncio
-async def test_stale_run_recovery_neutralizes_the_age_guard(
-    monkeypatch: Any,
-) -> None:
-    """Boot recovery must roll back the run the PREVIOUS process cancelled at
-    teardown even on an immediate restart: cognee's STALE_RUN_MIN_AGE_SECONDS
-    (env read at import time, default 3600) would otherwise skip the young
-    run, and the next cognify would bury it as no-longer-latest forever. The
-    gateway is the sole writer at that point, so age 0 is safe; the constant
-    must be restored after the call.
+def _stub_cognee_recovery_modules(
+    monkeypatch: Any, fake_recover: Any
+) -> Any:
+    """Install a stub cognee package whose startup recovery is ``fake_recover``.
+
+    Returns the stub recovery module so tests can read its
+    STALE_RUN_MIN_AGE_SECONDS constant.
     """
     import types
 
-    seen_ages: list[int] = []
-
     recovery_mod = types.ModuleType("cognee.modules.cognify.recovery")
     recovery_mod.STALE_RUN_MIN_AGE_SECONDS = 3600  # type: ignore[attr-defined]
-
-    async def fake_recover() -> None:
-        seen_ages.append(recovery_mod.STALE_RUN_MIN_AGE_SECONDS)  # type: ignore[attr-defined]
-
     recovery_mod.recover_stale_cognify_runs_on_startup = fake_recover  # type: ignore[attr-defined]
     cognify_mod = types.ModuleType("cognee.modules.cognify")
     cognify_mod.recovery = recovery_mod  # type: ignore[attr-defined]
@@ -5479,7 +5470,11 @@ async def test_stale_run_recovery_neutralizes_the_age_guard(
     monkeypatch.setitem(
         sys.modules, "cognee.modules.cognify.recovery", recovery_mod
     )
+    return recovery_mod
 
+
+def _recovery_client(monkeypatch: Any) -> CogneePublicClient:
+    """A client whose environment/readiness plumbing is neutralized."""
     client = CogneePublicClient()
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
 
@@ -5487,9 +5482,36 @@ async def test_stale_run_recovery_neutralizes_the_age_guard(
         return None
 
     monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    return client
 
-    await client.recover_stale_cognify_runs()
 
+@pytest.mark.asyncio
+async def test_stale_run_recovery_neutralizes_the_age_guard(
+    monkeypatch: Any,
+) -> None:
+    """Boot recovery must roll back the run the PREVIOUS process cancelled at
+    teardown even on an immediate restart: cognee's STALE_RUN_MIN_AGE_SECONDS
+    (env read at import time, default 3600) would otherwise skip the young
+    run, and the next cognify would bury it as no-longer-latest forever. The
+    gateway is the sole writer at that point, so age 0 is safe; the constant
+    must be restored after the call.
+    """
+    seen_ages: list[int] = []
+
+    async def fake_recover() -> None:
+        seen_ages.append(recovery_mod.STALE_RUN_MIN_AGE_SECONDS)  # type: ignore[attr-defined]
+
+    recovery_mod = _stub_cognee_recovery_modules(monkeypatch, fake_recover)
+    client = _recovery_client(monkeypatch)
+
+    async def clean_probe() -> list[Any]:
+        return []
+
+    monkeypatch.setattr(client, "_stale_cognify_latest_runs", clean_probe)
+
+    still_stale = await client.recover_stale_cognify_runs()
+
+    assert still_stale == [], "a verified-clean recovery must report no leftovers"
     assert seen_ages == [0], (
         "recovery must run with the min-age guard neutralized so the run the "
         "previous process abandoned seconds ago is rolled back"
@@ -5497,3 +5519,66 @@ async def test_stale_run_recovery_neutralizes_the_age_guard(
     assert recovery_mod.STALE_RUN_MIN_AGE_SECONDS == 3600, (  # type: ignore[attr-defined]
         "the module constant must be restored after the call"
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_raises_when_a_started_latest_run_remains(
+    monkeypatch: Any,
+) -> None:
+    """cognee 1.4.1's recover_stale_cognify_runs_on_startup swallows every
+    failure: a candidate-query error logs and returns, and a per-run rollback
+    error logs and skips reset_pipeline_run_status, leaving that run the
+    dataset's LATEST row, still DATASET_PROCESSING_STARTED. Its return value
+    therefore proves nothing. Recovery must re-run the same
+    latest-run-per-dataset probe AFTER the call and raise on any remaining
+    STARTED latest row, so boot can refuse to bury the partial write under
+    the next cognify.
+    """
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    order: list[str] = []
+
+    async def fake_recover() -> None:
+        order.append("recover")
+
+    _stub_cognee_recovery_modules(monkeypatch, fake_recover)
+    client = _recovery_client(monkeypatch)
+
+    async def poisoned_probe() -> list[Any]:
+        order.append("verify")
+        return [SimpleNamespace(dataset_id="dead-beef-dataset")]
+
+    monkeypatch.setattr(client, "_stale_cognify_latest_runs", poisoned_probe)
+
+    with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+        await client.recover_stale_cognify_runs()
+
+    assert order == ["recover", "verify"], (
+        "verification must run after the recovery call, not instead of it"
+    )
+    assert "dead-beef-dataset" in str(excinfo.value), (
+        "the error must name the unrecovered dataset(s)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_verification_error_propagates(
+    monkeypatch: Any,
+) -> None:
+    """A verification probe that cannot run is a failure, not a pass. cognee
+    swallowing exactly this class of error is why the probe exists; swallowing
+    it again here would recreate the blind spot.
+    """
+    async def fake_recover() -> None:
+        return None
+
+    _stub_cognee_recovery_modules(monkeypatch, fake_recover)
+    client = _recovery_client(monkeypatch)
+
+    async def broken_probe() -> list[Any]:
+        raise RuntimeError("relational engine gone")
+
+    monkeypatch.setattr(client, "_stale_cognify_latest_runs", broken_probe)
+
+    with pytest.raises(RuntimeError, match="relational engine gone"):
+        await client.recover_stale_cognify_runs()
