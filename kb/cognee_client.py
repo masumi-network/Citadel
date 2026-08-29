@@ -35,12 +35,12 @@ _PREPARED_COGNEE_STORAGE_SIGNATURE: tuple[str, ...] | None = None
 class CogneeStartupRecoveryError(RuntimeError):
     """Boot-time stale cognify-run recovery could not be verified clean.
 
-    cognee's recover_stale_cognify_runs_on_startup swallows every failure
-    (candidate-query errors and per-run rollback errors are logged and
-    dropped), so its return proves nothing. When the post-recovery probe
-    still finds a dataset whose latest cognify run is
-    DATASET_PROCESSING_STARTED, that run holds unrecovered partial writes;
-    a new cognify would bury it as no-longer-latest forever.
+    Raised when, after the startup recovery loop, some cognify run's own
+    latest status row is still DATASET_PROCESSING_STARTED: that run holds
+    unrecovered partial writes (including a run whose Dataset row is gone,
+    which cannot be rolled back without its ownership context). Starting the
+    writers anyway would stack new writes on top of the partial run, so boot
+    aborts for operator inspection.
     """
 
 
@@ -4811,16 +4811,22 @@ class CogneePublicClient:
             finally:
                 _COGNEE_MAINTENANCE_HELD.reset(token)
 
-    async def _stale_cognify_latest_runs(self) -> list[Any]:
-        """Latest-per-dataset cognify runs still stuck DATASET_PROCESSING_STARTED.
+    async def _stale_cognify_runs(self) -> list[Any]:
+        """EVERY cognify run whose own latest status row is STARTED.
 
-        Mirrors the candidate query in cognee's
-        recover_stale_cognify_runs_on_startup exactly (row_number over
-        dataset_id ordered by created_at desc, rn == 1, status STARTED,
-        pipeline_name 'cognify_pipeline'), so an empty result means the set
-        recovery selected from is now empty. Sound as a post-recovery probe
-        because a failed rollback also skips reset_pipeline_run_status,
-        leaving the failed run the dataset's latest row.
+        Ranks status rows per pipeline_run_id (each run's own latest row),
+        NOT per dataset. The gateway cognifies with use_pipeline_cache=False,
+        so a newer run B in the same dataset can end
+        DATASET_PROCESSING_ERRORED and bury an older abandoned run A: any
+        per-dataset ranking — cognee's own startup-recovery candidate query
+        included — selects only B, filters it out, and reports clean while
+        A's partial graph/vector/relational writes remain unrecovered.
+
+        Per-run STARTED-as-latest means exactly "not rolled back": cognee
+        writes DATASET_PROCESSING_ERRORED after its inline rollback
+        (run_tasks), and startup recovery stamps the same terminal row after
+        a successful rollback, so a run whose event stream still ends
+        STARTED has partial writes nothing has cleaned up.
         """
         from sqlalchemy import func, select
         from sqlalchemy.orm import aliased
@@ -4830,12 +4836,12 @@ class CogneePublicClient:
 
         db_engine = get_relational_engine()
         async with db_engine.get_async_session() as session:
-            latest_per_dataset = (
+            latest_per_run = (
                 select(
                     PipelineRun,
                     func.row_number()
                     .over(
-                        partition_by=PipelineRun.dataset_id,
+                        partition_by=PipelineRun.pipeline_run_id,
                         order_by=PipelineRun.created_at.desc(),
                     )
                     .label("rn"),
@@ -4843,77 +4849,160 @@ class CogneePublicClient:
                 .where(PipelineRun.pipeline_name == "cognify_pipeline")
                 .subquery()
             )
-            latest_run = aliased(PipelineRun, latest_per_dataset)
+            latest_row = aliased(PipelineRun, latest_per_run)
             result = await session.execute(
-                select(latest_run)
-                .where(latest_per_dataset.c.rn == 1)
+                select(latest_row)
+                .where(latest_per_run.c.rn == 1)
                 .where(
-                    latest_run.status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+                    latest_row.status == PipelineRunStatus.DATASET_PROCESSING_STARTED
                 )
             )
             return list(result.scalars().all())
 
+    async def _recover_dangling_cognify_run(self, run: Any) -> bool:
+        """Roll back ONE dangling cognify run and close its event stream.
+
+        Rollback is safe on a run that is no longer its dataset's latest:
+        cognee 1.4.1 scopes both rollback paths to the given
+        pipeline_run_id's own artifacts. The graph-provenance path removes
+        only the source refs the run attached and hard-deletes artifacts
+        only when left unowned
+        (unified_store_engine.rollback_by_pipeline_run_id); the legacy path
+        selects Node/Edge rows by pipeline_run_id and keeps any slug another
+        run also wrote (cognify_rollback_handler's shared-slug exclusion).
+        Newer runs' state survives.
+
+        The terminal DATASET_PROCESSING_ERRORED event is written for the
+        SAME pipeline_run_id — cognee's own convention for a rolled-back run
+        (run_tasks logs ERRORED after its inline rollback) — so the per-run
+        probe sees the stream closed, this boot and every later one.
+        reset_pipeline_run_status then logs a fresh INITIATED run so
+        cognee's run qualification does not report the dataset "already
+        being processed".
+
+        A run whose Dataset row is GONE is left dangling (returns False):
+        the missing row does not prove the run left no graph/vector
+        artifacts, and rollback needs the dataset's id and owner_id to
+        address them, so there is no preserved context to perform — or
+        verify — a rollback. Stamping it terminal would hide unknown
+        partial writes behind a clean probe; instead the caller's
+        verification names it and boot aborts for operator inspection.
+
+        Every failure propagates. Swallowing here is what created the blind
+        spot this recovery exists to close.
+        """
+        from cognee.context_global_variables import (
+            set_database_global_context_variables,
+        )
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.cognify.rollback import cognify_rollback_handler
+        from cognee.modules.data.models import Dataset
+        from cognee.modules.pipelines.methods import reset_pipeline_run_status
+        from cognee.modules.pipelines.operations.log_pipeline_run_error import (
+            log_pipeline_run_error,
+        )
+
+        db_engine = get_relational_engine()
+        async with db_engine.get_async_session() as session:
+            dataset = await session.get(Dataset, run.dataset_id)
+
+        if dataset is None:
+            logger.error(
+                "dangling cognify run %s references missing dataset %s; "
+                "cannot roll back without the dataset's ownership context — "
+                "leaving it dangling so boot aborts",
+                run.pipeline_run_id,
+                run.dataset_id,
+            )
+            return False
+
+        async with set_database_global_context_variables(
+            dataset.id, dataset.owner_id
+        ):
+            await cognify_rollback_handler(
+                pipeline_run_id=run.pipeline_run_id,
+                dataset=dataset,
+            )
+            await log_pipeline_run_error(
+                run.pipeline_run_id,
+                run.pipeline_id,
+                run.pipeline_name,
+                run.dataset_id,
+                None,
+                RuntimeError("recovered at startup"),
+            )
+            await reset_pipeline_run_status(
+                dataset.owner_id, dataset.id, "cognify_pipeline"
+            )
+        logger.info(
+            "startup recovery rolled back dangling cognify run %s (dataset=%s)",
+            run.pipeline_run_id,
+            run.dataset_id,
+        )
+        return True
+
     async def recover_stale_cognify_runs(self) -> list[Any]:
-        """Roll back cognify runs a previous process left mid-write.
+        """Roll back every cognify run a previous process left mid-write.
 
         Process teardown is the one remaining path that cancels an in-flight
         cognify, and cognee's pipeline rollback fires on Exception only
         (run_tasks catches Exception, not BaseException), so a cancelled run
-        strands partial graph/vector/relational writes with its pipeline run
-        row stuck DATASET_PROCESSING_STARTED. Cognee ships its own repair for
-        exactly this, but only wires it into its own API server, never into
-        this gateway. Run it at boot, under the maintenance lock, before any
-        queue starts.
+        strands partial graph/vector/relational writes with its latest
+        pipeline-run row stuck DATASET_PROCESSING_STARTED.
 
-        The min-age guard is neutralized (set to 0) for the duration of the
-        call. Cognee's guard exists for multi-replica deployments where a
-        young DATASET_PROCESSING_STARTED run may belong to another live
-        worker; here there is none: this gateway is the sole writer (Kuzu's
-        exclusive lock, node-local /data storage), and recovery runs before
-        either queue starts, under the maintenance lock, so no run can be
-        live. Age 0 closes both failure modes the guard would otherwise
-        leave open: an immediate restart skipping the run the previous
-        process cancelled seconds ago (younger than the 3600s default), and
-        that skipped run being buried forever once the next cognify makes it
-        no-longer-latest (recovery only examines each dataset's latest run).
-        recover_stale_cognify_runs_on_startup takes no age parameter and the
-        env var is read at import time into a module constant, so the
-        constant itself is set and restored around the call.
+        cognee ships its own startup repair
+        (recover_stale_cognify_runs_on_startup) but this gateway cannot use
+        it, for three verified 1.4.1 reasons. First, its candidate query
+        ranks per DATASET, so an abandoned run buried under a newer terminal
+        run in the same dataset is invisible to it forever — with
+        use_pipeline_cache=False that burial is routine. Second, it swallows
+        every failure (candidate-query errors return early; per-run rollback
+        errors log and continue), so its return proves nothing. Third, its
+        success path never closes the recovered run's own event stream:
+        reset_pipeline_run_status logs INITIATED under a FRESH uuid4
+        pipeline_run_id, leaving the repaired run's latest row STARTED,
+        which any sound per-run verification would flag on every later
+        boot.
 
-        cognee's recovery swallows its own failures (candidate-query errors
-        return early; per-run rollback errors log and continue), so the call
-        returning is not proof of repair. Re-run its candidate query after
-        the call: any dataset whose latest cognify run is still
-        DATASET_PROCESSING_STARTED raises CogneeStartupRecoveryError, and a
-        probe that itself fails propagates: swallowing it would recreate the
-        exact blind spot this verification exists to close. Returns the
-        (always empty) list of still-stale runs on the healthy path.
+        So recovery happens here: enumerate every dangling run (per-run
+        latest row STARTED), roll each back with cognee's own run-scoped
+        cognify_rollback_handler, and close each stream with a terminal
+        ERRORED event for the same run id. No age guard is needed: cognee's
+        STALE_RUN_MIN_AGE_SECONDS exists for multi-replica deployments
+        where a young STARTED run may belong to another live worker, but
+        this gateway is the sole writer (Kuzu's exclusive lock, node-local
+        /data storage) and recovery runs under the maintenance lock before
+        either queue starts, so no run can be live.
+
+        Any failure propagates and aborts boot. Afterwards the per-run
+        probe re-runs as a backstop: any run still dangling — including one
+        whose Dataset row is gone, which cannot be safely rolled back or
+        stamped terminal — raises CogneeStartupRecoveryError for operator
+        inspection, because starting writers on top of an unrecovered
+        partial run is how the corpus silently rots. Returns the (always
+        empty) list of still-dangling runs on the healthy path.
         """
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
         async with self.maintenance():
-            from cognee.modules.cognify import recovery as cognify_recovery
+            for run in await self._stale_cognify_runs():
+                await self._recover_dangling_cognify_run(run)
 
-            original_min_age = cognify_recovery.STALE_RUN_MIN_AGE_SECONDS
-            cognify_recovery.STALE_RUN_MIN_AGE_SECONDS = 0
-            try:
-                await cognify_recovery.recover_stale_cognify_runs_on_startup()
-            finally:
-                cognify_recovery.STALE_RUN_MIN_AGE_SECONDS = original_min_age
-
-            still_stale = await self._stale_cognify_latest_runs()
+            still_stale = await self._stale_cognify_runs()
             if still_stale:
-                datasets = ", ".join(
+                runs_desc = ", ".join(
                     sorted(
-                        str(getattr(run, "dataset_id", run)) for run in still_stale
+                        f"{getattr(run, 'pipeline_run_id', run)} "
+                        f"(dataset {getattr(run, 'dataset_id', 'unknown')})"
+                        for run in still_stale
                     )
                 )
                 raise CogneeStartupRecoveryError(
                     "stale cognify-run recovery left "
-                    f"{len(still_stale)} dataset(s) with their latest run still "
-                    f"DATASET_PROCESSING_STARTED: {datasets}"
+                    f"{len(still_stale)} run(s) with their latest status "
+                    f"still DATASET_PROCESSING_STARTED: {runs_desc}"
                 )
             return still_stale
 

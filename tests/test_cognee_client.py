@@ -5445,32 +5445,15 @@ async def test_cognify_violations_fail_even_when_missing_ids_are_in_flight(
     assert "still in lifecycle projection" in message
 
 
-def _stub_cognee_recovery_modules(
-    monkeypatch: Any, fake_recover: Any
-) -> Any:
-    """Install a stub cognee package whose startup recovery is ``fake_recover``.
-
-    Returns the stub recovery module so tests can read its
-    STALE_RUN_MIN_AGE_SECONDS constant.
-    """
-    import types
-
-    recovery_mod = types.ModuleType("cognee.modules.cognify.recovery")
-    recovery_mod.STALE_RUN_MIN_AGE_SECONDS = 3600  # type: ignore[attr-defined]
-    recovery_mod.recover_stale_cognify_runs_on_startup = fake_recover  # type: ignore[attr-defined]
-    cognify_mod = types.ModuleType("cognee.modules.cognify")
-    cognify_mod.recovery = recovery_mod  # type: ignore[attr-defined]
-    modules_mod = types.ModuleType("cognee.modules")
-    modules_mod.cognify = cognify_mod  # type: ignore[attr-defined]
-    cognee_mod = types.ModuleType("cognee")
-    cognee_mod.modules = modules_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "cognee", cognee_mod)
-    monkeypatch.setitem(sys.modules, "cognee.modules", modules_mod)
-    monkeypatch.setitem(sys.modules, "cognee.modules.cognify", cognify_mod)
-    monkeypatch.setitem(
-        sys.modules, "cognee.modules.cognify.recovery", recovery_mod
-    )
-    return recovery_mod
+# ---------------------------------------------------------------------------
+# Startup recovery of dangling cognify runs.
+#
+# These tests run cognee's REAL PipelineRun/Dataset models and the client's
+# REAL SQL against an in-memory aiosqlite engine — the round-4 review showed
+# every earlier probe test mocked the query, so nothing pinned its ranking.
+# Only the destructive boundary (cognify_rollback_handler, the dataset
+# context manager) is stubbed.
+# ---------------------------------------------------------------------------
 
 
 def _recovery_client(monkeypatch: Any) -> CogneePublicClient:
@@ -5485,100 +5468,410 @@ def _recovery_client(monkeypatch: Any) -> CogneePublicClient:
     return client
 
 
-@pytest.mark.asyncio
-async def test_stale_run_recovery_neutralizes_the_age_guard(
-    monkeypatch: Any,
-) -> None:
-    """Boot recovery must roll back the run the PREVIOUS process cancelled at
-    teardown even on an immediate restart: cognee's STALE_RUN_MIN_AGE_SECONDS
-    (env read at import time, default 3600) would otherwise skip the young
-    run, and the next cognify would bury it as no-longer-latest forever. The
-    gateway is the sole writer at that point, so age 0 is safe; the constant
-    must be restored after the call.
+async def _pipeline_runs_store(monkeypatch: Any) -> tuple[Any, Any]:
+    """In-memory sqlite carrying cognee's real pipeline_runs/datasets schema.
+
+    Wires the engine into every ``get_relational_engine`` the recovery path
+    consults: the client's call-time imports resolve through the relational
+    module, while cognee's own log_pipeline_run_error/_initiated helpers
+    bound the symbol at import time, so each module is patched directly.
     """
-    seen_ages: list[int] = []
+    import contextlib
 
-    async def fake_recover() -> None:
-        seen_ages.append(recovery_mod.STALE_RUN_MIN_AGE_SECONDS)  # type: ignore[attr-defined]
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    recovery_mod = _stub_cognee_recovery_modules(monkeypatch, fake_recover)
-    client = _recovery_client(monkeypatch)
+    import importlib
 
-    async def clean_probe() -> list[Any]:
-        return []
+    import cognee.infrastructure.databases.relational as relational_mod
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun
 
-    monkeypatch.setattr(client, "_stale_cognify_latest_runs", clean_probe)
-
-    still_stale = await client.recover_stale_cognify_runs()
-
-    assert still_stale == [], "a verified-clean recovery must report no leftovers"
-    assert seen_ages == [0], (
-        "recovery must run with the min-age guard neutralized so the run the "
-        "previous process abandoned seconds ago is rolled back"
+    # The operations package __init__ rebinds these submodule names to the
+    # functions they export, so a plain `import a.b.c as m` yields the
+    # FUNCTION; import_module returns the real module to patch.
+    log_error_mod = importlib.import_module(
+        "cognee.modules.pipelines.operations.log_pipeline_run_error"
     )
-    assert recovery_mod.STALE_RUN_MIN_AGE_SECONDS == 3600, (  # type: ignore[attr-defined]
-        "the module constant must be restored after the call"
+    log_init_mod = importlib.import_module(
+        "cognee.modules.pipelines.operations.log_pipeline_run_initiated"
     )
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda sync: PipelineRun.__table__.create(sync))
+        await conn.run_sync(lambda sync: Dataset.__table__.create(sync))
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    class _Engine:
+        @contextlib.asynccontextmanager
+        async def get_async_session(self):
+            async with sessions() as session:
+                yield session
+
+    wrapper = _Engine()
+    for module in (relational_mod, log_error_mod, log_init_mod):
+        monkeypatch.setattr(module, "get_relational_engine", lambda: wrapper)
+    return sessions, engine
+
+
+def _stub_rollback_boundary(monkeypatch: Any) -> dict[str, list[Any]]:
+    """Record rollback/context calls without touching graph or vector stores."""
+    import contextlib
+
+    import cognee.context_global_variables as context_vars_mod
+    import cognee.modules.cognify.rollback as rollback_mod
+
+    calls: dict[str, list[Any]] = {"rollback": [], "context": []}
+
+    async def fake_rollback(*, pipeline_run_id: Any, dataset: Any, **_: Any) -> None:
+        calls["rollback"].append((pipeline_run_id, dataset.id))
+
+    @contextlib.asynccontextmanager
+    async def fake_context(dataset_id: Any, owner_id: Any):
+        calls["context"].append((dataset_id, owner_id))
+        yield
+
+    monkeypatch.setattr(rollback_mod, "cognify_rollback_handler", fake_rollback)
+    monkeypatch.setattr(
+        context_vars_mod, "set_database_global_context_variables", fake_context
+    )
+    return calls
+
+
+def _run_event(
+    run_id: UUID, dataset_id: UUID, pipeline_id: UUID, status: Any, at: datetime
+) -> Any:
+    from cognee.modules.pipelines.models import PipelineRun
+
+    return PipelineRun(
+        pipeline_run_id=run_id,
+        pipeline_name="cognify_pipeline",
+        pipeline_id=pipeline_id,
+        dataset_id=dataset_id,
+        status=status,
+        run_info={},
+        created_at=at,
+    )
+
+
+async def _seed(sessions: Any, rows: list[Any]) -> None:
+    async with sessions() as session:
+        session.add_all(rows)
+        await session.commit()
+
+
+async def _run_events(sessions: Any, run_id: UUID) -> list[Any]:
+    from sqlalchemy import select
+
+    from cognee.modules.pipelines.models import PipelineRun
+
+    async with sessions() as session:
+        result = await session.execute(
+            select(PipelineRun)
+            .where(PipelineRun.pipeline_run_id == run_id)
+            .order_by(PipelineRun.created_at.asc())
+        )
+        return list(result.scalars().all())
 
 
 @pytest.mark.asyncio
-async def test_stale_run_recovery_raises_when_a_started_latest_run_remains(
+async def test_recovery_rolls_back_dangling_run_hidden_behind_newer_errored_run(
     monkeypatch: Any,
 ) -> None:
-    """cognee 1.4.1's recover_stale_cognify_runs_on_startup swallows every
-    failure: a candidate-query error logs and returns, and a per-run rollback
-    error logs and skips reset_pipeline_run_status, leaving that run the
-    dataset's LATEST row, still DATASET_PROCESSING_STARTED. Its return value
-    therefore proves nothing. Recovery must re-run the same
-    latest-run-per-dataset probe AFTER the call and raise on any remaining
-    STARTED latest row, so boot can refuse to bury the partial write under
-    the next cognify.
+    """Round-4 P1 against the real schema: with use_pipeline_cache=False run A
+    can be abandoned STARTED and buried by run B that ends ERRORED in the same
+    dataset. Any per-dataset ranking — cognee's own recovery candidate query
+    included — sees only B, filters it out, and reports clean while A's
+    partial writes rot. Recovery must find A per-run, roll back exactly A
+    (never B, whose inline rollback already ran at error time), close A's own
+    event stream with a terminal ERRORED row, and reset the dataset's
+    pipeline status.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
+    from sqlalchemy import select
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_ERRORED,
+                    base + timedelta(minutes=12),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+
+        assert [rid for rid, _ in calls["rollback"]] == [run_a], (
+            "exactly the hidden dangling run must be rolled back; run B was "
+            "already rolled back inline when it errored"
+        )
+        assert calls["context"] == [(dataset_id, owner_id)], (
+            "rollback must run inside the dataset's ownership context"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+        ), "A's own event stream must end terminal, under the SAME run id"
+        async with sessions() as session:
+            initiated_rows = (
+                (
+                    await session.execute(
+                        select(PipelineRun).where(
+                            PipelineRun.status
+                            == PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                            PipelineRun.pipeline_run_id.notin_([run_a, run_b]),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(initiated_rows) == 1, (
+            "reset_pipeline_run_status must log a fresh INITIATED run so the "
+            "dataset is not reported as already being processed"
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_of_a_run_does_not_reflag_it_on_the_next_boot(
+    monkeypatch: Any,
+) -> None:
+    """False-positive regression: cognee's reset logs INITIATED under a FRESH
+    uuid4 run id and never closes the recovered run's own stream, so a naive
+    per-run probe would flag every successfully recovered run forever and
+    wedge boot permanently. After boot 1 recovers A, boot 2 must be a clean
+    no-op: A's stream now ends terminal, nothing is rolled back again.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base + timedelta(minutes=1),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert len(calls["rollback"]) == 1
+
+        assert await client.recover_stale_cognify_runs() == [], (
+            "boot 2 must not flag the run boot 1 recovered"
+        )
+        assert len(calls["rollback"]) == 1, (
+            "boot 2 must not roll the already-recovered run back again"
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_dangling_runs_dataset_is_missing(
+    monkeypatch: Any,
+) -> None:
+    """A dangling run whose Dataset row is GONE cannot be rolled back (the
+    rollback needs the dataset's id and owner_id) and must NOT be stamped
+    terminal — that would hide unknown partial writes behind a clean probe.
+    Boot must abort naming the run so an operator inspects it.
+    """
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        run_a, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                _run_event(
+                    run_a,
+                    uuid4(),
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base,
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the uninspectable run"
+        )
+        assert calls["rollback"] == [], (
+            "no rollback without the dataset's ownership context"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_a_no_op_on_a_clean_store(monkeypatch: Any) -> None:
+    """Every run stream ending terminal means nothing to recover: no rollback
+    calls, no new status rows, empty result.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
+    from sqlalchemy import func, select
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_c, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_c,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base,
+                ),
+                _run_event(
+                    run_c,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    base + timedelta(minutes=5),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert calls["rollback"] == []
+        async with sessions() as session:
+            row_count = (
+                await session.execute(select(func.count(PipelineRun.id)))
+            ).scalar()
+        assert row_count == 2, "a clean store must not gain status rows"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_raises_when_a_dangling_run_survives_the_loop(
+    monkeypatch: Any,
+) -> None:
+    """The post-loop probe is a backstop: if a run is still dangling after the
+    recovery loop ran, boot must abort naming it rather than start writers on
+    top of an unrecovered partial run.
     """
     from kb.cognee_client import CogneeStartupRecoveryError
 
     order: list[str] = []
-
-    async def fake_recover() -> None:
-        order.append("recover")
-
-    _stub_cognee_recovery_modules(monkeypatch, fake_recover)
     client = _recovery_client(monkeypatch)
+    dangling = SimpleNamespace(
+        pipeline_run_id="dead-beef-run", dataset_id="dead-beef-dataset"
+    )
 
-    async def poisoned_probe() -> list[Any]:
-        order.append("verify")
-        return [SimpleNamespace(dataset_id="dead-beef-dataset")]
+    async def probe() -> list[Any]:
+        order.append("probe")
+        return [dangling]
 
-    monkeypatch.setattr(client, "_stale_cognify_latest_runs", poisoned_probe)
+    async def recover_one(run: Any) -> bool:
+        order.append("recover")
+        return True
+
+    monkeypatch.setattr(client, "_stale_cognify_runs", probe)
+    monkeypatch.setattr(client, "_recover_dangling_cognify_run", recover_one)
 
     with pytest.raises(CogneeStartupRecoveryError) as excinfo:
         await client.recover_stale_cognify_runs()
 
-    assert order == ["recover", "verify"], (
-        "verification must run after the recovery call, not instead of it"
+    assert order == ["probe", "recover", "probe"], (
+        "verification must re-run the probe after the recovery loop"
     )
-    assert "dead-beef-dataset" in str(excinfo.value), (
-        "the error must name the unrecovered dataset(s)"
-    )
+    assert "dead-beef-run" in str(excinfo.value)
+    assert "dead-beef-dataset" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
-async def test_stale_run_recovery_verification_error_propagates(
-    monkeypatch: Any,
-) -> None:
-    """A verification probe that cannot run is a failure, not a pass. cognee
-    swallowing exactly this class of error is why the probe exists; swallowing
+async def test_stale_run_recovery_probe_error_propagates(monkeypatch: Any) -> None:
+    """A probe that cannot run is a failure, not a pass. cognee's own recovery
+    swallowing exactly this class of error is why this path exists; swallowing
     it again here would recreate the blind spot.
     """
-    async def fake_recover() -> None:
-        return None
-
-    _stub_cognee_recovery_modules(monkeypatch, fake_recover)
     client = _recovery_client(monkeypatch)
 
     async def broken_probe() -> list[Any]:
         raise RuntimeError("relational engine gone")
 
-    monkeypatch.setattr(client, "_stale_cognify_latest_runs", broken_probe)
+    monkeypatch.setattr(client, "_stale_cognify_runs", broken_probe)
 
     with pytest.raises(RuntimeError, match="relational engine gone"):
         await client.recover_stale_cognify_runs()

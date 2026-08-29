@@ -986,19 +986,20 @@ async def lifespan(app: FastAPI) -> Any:
             )
         # Repair cognify runs a previous process abandoned mid-write: teardown
         # cancellation bypasses cognee's Exception-only rollback, stranding
-        # partial writes and a DATASET_PROCESSING_STARTED run row. Cognee's own
-        # startup recovery handles exactly this; run it before any worker
+        # partial writes and a DATASET_PROCESSING_STARTED run row. The client
+        # runs its own recovery loop (cognee's startup repair ranks per
+        # dataset, so it never sees a run buried under a newer terminal run,
+        # and it swallows its own failures): every run whose own latest
+        # status row is STARTED is rolled back and closed, before any worker
         # starts so nothing races the rollback. A failed or unverified
-        # recovery ABORTS boot (the raise propagates out of lifespan): cognee
-        # swallows its own recovery failures, so the client re-probes and
-        # raises CogneeStartupRecoveryError when a latest run is still
-        # STARTED. Skipping the boot-time starters instead would not be
-        # fail-closed, because live write paths restart writers while the API
-        # is up (legacy remember() -> schedule_cognify() ->
-        # _start_cognify_queue_drain(); /api/linear-sync/run schedules
-        # cognify), and any new cognify run would bury the unrecovered latest
-        # run as no-longer-latest forever. A dead process retried by the
-        # platform restart policy IS the signal.
+        # recovery ABORTS boot (the raise propagates out of lifespan) with
+        # CogneeStartupRecoveryError naming the dangling runs. Skipping the
+        # boot-time starters instead would not be fail-closed, because live
+        # write paths restart writers while the API is up (legacy remember()
+        # -> schedule_cognify() -> _start_cognify_queue_drain();
+        # /api/linear-sync/run schedules cognify), and any new cognify run
+        # would stack writes on top of the unrecovered partial run. A dead
+        # process retried by the platform restart policy IS the signal.
         recover = getattr(
             getattr(get_citadel(), "cognee", None),
             "recover_stale_cognify_runs",
