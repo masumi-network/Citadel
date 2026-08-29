@@ -4877,8 +4877,11 @@ class CogneePublicClient:
     async def _recover_dangling_cognify_run(self, run: Any) -> bool:
         """Roll back ONE dangling cognify run and close its event stream.
 
-        Rollback is REFUSED (returns False) when a NEWER run in the same
-        dataset has its own latest status DATASET_PROCESSING_COMPLETED.
+        Rollback is REFUSED (returns False) when a run in the same dataset
+        has its own latest status DATASET_PROCESSING_COMPLETED at a
+        created_at newer than OR EQUAL to this run's dangling STARTED row
+        (equal timestamps cannot prove ordering, so equality is unsafe; the
+        dangling run itself never matches because its ranked row is STARTED).
         Cognee 1.4.1 never transfers source-ref ownership: a later run that
         re-touches an existing source ref does not attach its own ref, so
         the old run keeps the SOLE ref, and rolling the old run back removes
@@ -4962,7 +4965,7 @@ class CogneePublicClient:
                         latest_per_run.c.status
                         == PipelineRunStatus.DATASET_PROCESSING_COMPLETED
                     )
-                    .where(latest_per_run.c.created_at > run.created_at)
+                    .where(latest_per_run.c.created_at >= run.created_at)
                 )
             ).scalar_one()
 

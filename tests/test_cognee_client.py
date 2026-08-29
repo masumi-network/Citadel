@@ -5902,6 +5902,69 @@ async def test_recovery_fails_closed_when_a_newer_run_completed(
 
 
 @pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_completed_run_ties_on_timestamp(
+    monkeypatch: Any,
+) -> None:
+    """Round-6 P1: a COMPLETED run whose latest row shares the exact
+    created_at of the dangling run's STARTED row must still block rollback.
+    Equal timestamps cannot prove ordering, so equality is unsafe; the guard
+    uses >= (the dangling run itself never matches: its ranked row is
+    STARTED, not COMPLETED).
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        tie = base + timedelta(minutes=5)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    tie,
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    tie,
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the run tied with the completed run"
+        )
+        assert calls["rollback"] == [], (
+            "an equal-timestamp completed sibling cannot prove ordering; "
+            "recovery must not roll the dangling run back"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling for the operator, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_recovery_rolls_back_two_dangling_runs_newest_first(
     monkeypatch: Any,
 ) -> None:
