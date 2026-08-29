@@ -5443,3 +5443,57 @@ async def test_cognify_violations_fail_even_when_missing_ids_are_in_flight(
     message = str(excinfo.value)
     assert "doc-oversized" in message
     assert "still in lifecycle projection" in message
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_neutralizes_the_age_guard(
+    monkeypatch: Any,
+) -> None:
+    """Boot recovery must roll back the run the PREVIOUS process cancelled at
+    teardown even on an immediate restart: cognee's STALE_RUN_MIN_AGE_SECONDS
+    (env read at import time, default 3600) would otherwise skip the young
+    run, and the next cognify would bury it as no-longer-latest forever. The
+    gateway is the sole writer at that point, so age 0 is safe; the constant
+    must be restored after the call.
+    """
+    import types
+
+    seen_ages: list[int] = []
+
+    recovery_mod = types.ModuleType("cognee.modules.cognify.recovery")
+    recovery_mod.STALE_RUN_MIN_AGE_SECONDS = 3600  # type: ignore[attr-defined]
+
+    async def fake_recover() -> None:
+        seen_ages.append(recovery_mod.STALE_RUN_MIN_AGE_SECONDS)  # type: ignore[attr-defined]
+
+    recovery_mod.recover_stale_cognify_runs_on_startup = fake_recover  # type: ignore[attr-defined]
+    cognify_mod = types.ModuleType("cognee.modules.cognify")
+    cognify_mod.recovery = recovery_mod  # type: ignore[attr-defined]
+    modules_mod = types.ModuleType("cognee.modules")
+    modules_mod.cognify = cognify_mod  # type: ignore[attr-defined]
+    cognee_mod = types.ModuleType("cognee")
+    cognee_mod.modules = modules_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cognee", cognee_mod)
+    monkeypatch.setitem(sys.modules, "cognee.modules", modules_mod)
+    monkeypatch.setitem(sys.modules, "cognee.modules.cognify", cognify_mod)
+    monkeypatch.setitem(
+        sys.modules, "cognee.modules.cognify.recovery", recovery_mod
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+
+    await client.recover_stale_cognify_runs()
+
+    assert seen_ages == [0], (
+        "recovery must run with the min-age guard neutralized so the run the "
+        "previous process abandoned seconds ago is rolled back"
+    )
+    assert recovery_mod.STALE_RUN_MIN_AGE_SECONDS == 3600, (  # type: ignore[attr-defined]
+        "the module constant must be restored after the call"
+    )

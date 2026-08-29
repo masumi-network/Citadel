@@ -1037,3 +1037,116 @@ async def test_scheduler_teardown_cancels_phase2_task(
 
     assert inner.cancelled(), "teardown must cancel the inner Phase 2 task"
     assert not state_path.exists(), "a cancelled pass must not stamp"
+
+
+async def test_maintenance_busy_skips_consume_the_skip_budget(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A pass that cannot enter maintenance is a SKIP, same budget as the
+    orphan guard: past CITADEL_EVOLVE_ORPHAN_MAX_SKIPS deferred passes the
+    canary records MaintenanceWedged so /readyz cannot stay green while the
+    scheduler defers forever.
+    """
+    import kb.server as server
+
+    monkeypatch.setattr(
+        server, "_evolve_maintenance_acquire_timeout_seconds", lambda: 0.05
+    )
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1")
+    monkeypatch.setattr(server, "_LAST_CANARY", None)
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _FakeCitadel(cognify_calls)
+    fake_citadel.cognee = _LockCognee()
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    holding = asyncio.Event()
+
+    async def _hold() -> None:
+        async with fake_citadel.cognee.maintenance():
+            holding.set()
+            await asyncio.Event().wait()
+
+    holder = asyncio.create_task(_hold())
+    await asyncio.wait_for(holding.wait(), timeout=1)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(300):
+            if (
+                server._LAST_CANARY is not None
+                and server._LAST_CANARY.get("error") == "MaintenanceWedged"
+            ):
+                break
+            await asyncio.sleep(0.01)
+        assert server._LAST_CANARY is not None, (
+            "exhausted maintenance-busy skips must flip the canary"
+        )
+        assert server._LAST_CANARY["ok"] is False
+        assert server._LAST_CANARY.get("error") == "MaintenanceWedged"
+        assert not state_path.exists(), "a skipped pass must not stamp"
+        assert cognify_calls == [], "Phase 2 must not run on a skipped pass"
+        assert not task.done(), "the loop must survive budget exhaustion"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        holder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await holder
+
+
+async def test_scheduler_exit_reaps_detached_phase2_orphan(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """After a timeout detaches Phase 2 as the orphan, cancelling the sleeping
+    scheduler must still reap that task: lifespan awaits only the scheduler,
+    so a leaked evolve-phase2-cognify would overlap shutdown and a later
+    lifespan.
+    """
+    import json as json_module
+
+    import kb.server as server
+
+    monkeypatch.setattr(server, "_evolve_cognify_timeout_seconds", lambda: 0.05)
+    monkeypatch.setenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "1000000")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _BlockingCognifyCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        await asyncio.wait_for(fake_citadel.cognify_started.wait(), timeout=3)
+        inner = fake_citadel.cognify_tasks[0]
+        # Wait until the pass timed out and stamped, i.e. the inner task is
+        # now the detached orphan and the scheduler is sleeping.
+        for _ in range(300):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert state_path.exists()
+        assert (
+            json_module.loads(state_path.read_text())["last_run_reason"]
+            == "cognify_timeout"
+        )
+        assert not inner.done(), "precondition: the orphan is still running"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert inner.done(), (
+            "scheduler exit must cancel and await the detached Phase 2 orphan"
+        )
+        assert inner.cancelled()
+        assert inner not in server._BACKGROUND_TASKS
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await _cancel_phase2_orphans()

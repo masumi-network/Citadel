@@ -4808,19 +4808,36 @@ class CogneePublicClient:
         row stuck DATASET_PROCESSING_STARTED. Cognee ships its own repair for
         exactly this, but only wires it into its own API server, never into
         this gateway. Run it at boot, under the maintenance lock, before any
-        queue starts. Runs younger than COGNEE_STALE_RUN_RECOVERY_MIN_AGE_SECONDS
-        (default 3600) are skipped by cognee as possibly live.
+        queue starts.
+
+        The min-age guard is neutralized (set to 0) for the duration of the
+        call. Cognee's guard exists for multi-replica deployments where a
+        young DATASET_PROCESSING_STARTED run may belong to another live
+        worker; here there is none: this gateway is the sole writer (Kuzu's
+        exclusive lock, node-local /data storage), and recovery runs before
+        either queue starts, under the maintenance lock, so no run can be
+        live. Age 0 closes both failure modes the guard would otherwise
+        leave open: an immediate restart skipping the run the previous
+        process cancelled seconds ago (younger than the 3600s default), and
+        that skipped run being buried forever once the next cognify makes it
+        no-longer-latest (recovery only examines each dataset's latest run).
+        recover_stale_cognify_runs_on_startup takes no age parameter and the
+        env var is read at import time into a module constant, so the
+        constant itself is set and restored around the call.
         """
         self._prepare_cognee_environment()
         import cognee
 
         await self._ensure_cognee_ready(cognee)
         async with self.maintenance():
-            from cognee.modules.cognify.recovery import (
-                recover_stale_cognify_runs_on_startup,
-            )
+            from cognee.modules.cognify import recovery as cognify_recovery
 
-            await recover_stale_cognify_runs_on_startup()
+            original_min_age = cognify_recovery.STALE_RUN_MIN_AGE_SECONDS
+            cognify_recovery.STALE_RUN_MIN_AGE_SECONDS = 0
+            try:
+                await cognify_recovery.recover_stale_cognify_runs_on_startup()
+            finally:
+                cognify_recovery.STALE_RUN_MIN_AGE_SECONDS = original_min_age
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
         """Cognify under the maintenance lock unless a repair already holds it."""
