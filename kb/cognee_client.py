@@ -4877,13 +4877,22 @@ class CogneePublicClient:
     async def _recover_dangling_cognify_run(self, run: Any) -> bool:
         """Roll back ONE dangling cognify run and close its event stream.
 
-        Rollback is REFUSED (returns False) when a run in the same dataset
-        has its own latest status DATASET_PROCESSING_COMPLETED at a
-        created_at newer than OR EQUAL to this run's dangling STARTED row
-        (equal timestamps cannot prove ordering, so equality is unsafe; the
-        dangling run's own STARTED row is excluded by the COMPLETED filter,
-        though with a same-timestamp STARTED and COMPLETED row in ONE run
-        the ranking itself is ambiguous — either pick still fails closed).
+        Rollback is REFUSED (returns False) when ANY cognify status row in
+        the same dataset is DATASET_PROCESSING_COMPLETED at a created_at
+        newer than OR EQUAL to this run's dangling STARTED row (equal
+        timestamps cannot prove ordering, so equality is unsafe). The check
+        deliberately counts raw rows — no per-run ranking and no
+        self-vs-sibling distinction. Ranking is what makes a same-run tie
+        dangerous: one run carrying a STARTED and a COMPLETED row at the
+        SAME created_at has an unspecified rn==1 pick (PipelineRun 1.4.1
+        has no monotonic tiebreak column), so a guard that re-runs the
+        ranking can pick STARTED, drop the COMPLETED sibling behind its
+        rn==1 filter, and roll back a run that COMPLETED — deleting its
+        artifacts. Counting rows means that COMPLETED sibling always
+        blocks, whichever way the ranking fell. The trade is deliberate
+        fail-closed over-blocking: a COMPLETED row whose own run later
+        logged newer rows still blocks (a ranked check would have dropped
+        it), which only ever refuses a rollback, never permits one.
         Cognee 1.4.1 never transfers source-ref ownership: a later run that
         re-touches an existing source ref does not attach its own ref, so
         the old run keeps the SOLE ref, and rolling the old run back removes
@@ -4895,9 +4904,10 @@ class CogneePublicClient:
         the run stays dangling, the caller's backstop names it, and boot
         aborts for the operator to decide.
 
-        Rollback IS safe when no newer run completed — the run is its
-        dataset's newest, every newer run ended ERRORED (its inline rollback
-        already ran) or INITIATED (no processing happened), or a newer
+        Rollback IS safe when no COMPLETED row exists at a newer-or-equal
+        timestamp — the run is its dataset's newest, every newer run ended
+        ERRORED (its inline rollback already ran) or INITIATED (no
+        processing happened), or a newer
         dangling run was rolled back earlier in this boot's newest-first
         loop and now ends ERRORED. Cognee scopes both rollback paths to the
         given pipeline_run_id's own artifacts: the graph-provenance path
@@ -4943,31 +4953,17 @@ class CogneePublicClient:
         db_engine = get_relational_engine()
         async with db_engine.get_async_session() as session:
             dataset = await session.get(Dataset, run.dataset_id)
-            latest_per_run = (
-                select(
-                    PipelineRun.status,
-                    PipelineRun.created_at,
-                    func.row_number()
-                    .over(
-                        partition_by=PipelineRun.pipeline_run_id,
-                        order_by=PipelineRun.created_at.desc(),
-                    )
-                    .label("rn"),
-                )
-                .where(PipelineRun.pipeline_name == "cognify_pipeline")
-                .where(PipelineRun.dataset_id == run.dataset_id)
-                .subquery()
-            )
-            newer_completed = (
+            completed_rows = (
                 await session.execute(
                     select(func.count())
-                    .select_from(latest_per_run)
-                    .where(latest_per_run.c.rn == 1)
+                    .select_from(PipelineRun)
+                    .where(PipelineRun.pipeline_name == "cognify_pipeline")
+                    .where(PipelineRun.dataset_id == run.dataset_id)
                     .where(
-                        latest_per_run.c.status
+                        PipelineRun.status
                         == PipelineRunStatus.DATASET_PROCESSING_COMPLETED
                     )
-                    .where(latest_per_run.c.created_at >= run.created_at)
+                    .where(PipelineRun.created_at >= run.created_at)
                 )
             ).scalar_one()
 
@@ -4981,17 +4977,17 @@ class CogneePublicClient:
             )
             return False
 
-        if newer_completed:
+        if completed_rows:
             logger.error(
-                "dangling cognify run %s (dataset=%s) has %d COMPLETED run(s) "
+                "dangling cognify run %s (dataset=%s) has %d COMPLETED row(s) "
                 "at a newer or equal timestamp (not provably older); cognee "
                 "never transfers source-ref ownership, "
-                "so rolling it back could delete graph/vector artifacts the "
-                "completed run(s) still reuse — leaving it dangling so boot "
+                "so rolling it back could delete graph/vector artifacts a "
+                "completed run still reuses — leaving it dangling so boot "
                 "aborts",
                 run.pipeline_run_id,
                 run.dataset_id,
-                newer_completed,
+                completed_rows,
             )
             return False
 

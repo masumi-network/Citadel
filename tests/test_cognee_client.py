@@ -5965,6 +5965,108 @@ async def test_recovery_fails_closed_when_a_completed_run_ties_on_timestamp(
 
 
 @pytest.mark.asyncio
+async def test_recovery_fails_closed_on_a_same_run_started_completed_tie(
+    monkeypatch: Any,
+) -> None:
+    """Round-7 P1: ONE run carries a STARTED and a COMPLETED row at the SAME
+    created_at. sqlite breaks the created_at tie by insert order (the
+    first-inserted row wins rn==1), so with STARTED inserted first the run
+    ranks dangling even though it COMPLETED. A guard that re-runs the per-run
+    ranking drops the COMPLETED sibling behind its rn==1 filter and rolls
+    back a run that COMPLETED, deleting its artifacts. The guard must count
+    COMPLETED rows directly — no ranking — so the run's own COMPLETED
+    sibling blocks rollback and boot aborts naming the run.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        tie = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        completed = PipelineRunStatus.DATASET_PROCESSING_COMPLETED
+        # Two sequential commits pin the insert order: STARTED first, so the
+        # tie ranking picks STARTED as the run's rn==1 row.
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(run_a, dataset_id, pipe, started, tie),
+            ],
+        )
+        await _seed(sessions, [_run_event(run_a, dataset_id, pipe, completed, tie)])
+
+        flagged = await client._stale_cognify_runs()
+        assert [r.pipeline_run_id for r in flagged] == [run_a], (
+            "precondition: the tie ranking must pick STARTED as the run's "
+            "latest row; otherwise this test exercises the benign branch"
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), "the abort must name the tied run"
+        assert calls["rollback"] == [], (
+            "the run COMPLETED; rolling it back would delete its artifacts"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert len(a_events) == 2 and not any(
+            e.status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+            for e in a_events
+        ), "recovery must not stamp the completed run terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_same_run_tie_with_completed_ranked_first_is_a_no_op(
+    monkeypatch: Any,
+) -> None:
+    """The benign order of the same tie: COMPLETED inserted first wins rn==1,
+    so the run's latest row is terminal and it is never flagged dangling —
+    no rollback, no abort.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        tie = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        completed = PipelineRunStatus.DATASET_PROCESSING_COMPLETED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(run_a, dataset_id, pipe, completed, tie),
+            ],
+        )
+        await _seed(sessions, [_run_event(run_a, dataset_id, pipe, started, tie)])
+
+        assert await client._stale_cognify_runs() == [], (
+            "precondition: the tie ranking must pick COMPLETED as the run's "
+            "latest row, so the run is never flagged"
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert calls["rollback"] == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_recovery_rolls_back_two_dangling_runs_newest_first(
     monkeypatch: Any,
 ) -> None:
