@@ -5824,6 +5824,147 @@ async def test_recovery_is_a_no_op_on_a_clean_store(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_newer_run_completed(
+    monkeypatch: Any,
+) -> None:
+    """Round-5 P1: dangling run A buried by a newer COMPLETED run B must NOT
+    be rolled back. Cognee 1.4.1 never gives a later re-touch of an existing
+    source ref its own run ownership, so A holds the SOLE ref and rolling A
+    back would delete graph/vector artifacts B still reuses (cognee's own
+    provenance contract,
+    cognee/tests/integration/tasks/test_graph_provenance_delete_default_stack.py:126-151).
+    Boot must abort naming A so an operator decides.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    base + timedelta(minutes=12),
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the run buried under the completed run"
+        )
+        assert calls["rollback"] == [], (
+            "rolling A back could delete source refs the completed run B "
+            "still reuses; recovery must not touch it"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling for the operator, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rolls_back_two_dangling_runs_newest_first(
+    monkeypatch: Any,
+) -> None:
+    """Two dangling runs in one dataset (both latest-STARTED) are both safe to
+    recover, newest first: once the newer run B is rolled back its stream ends
+    ERRORED, so it no longer looks like a completed successor and the older
+    run A recovers behind it in the same loop. No abort.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+
+        assert [rid for rid, _ in calls["rollback"]] == [run_b, run_a], (
+            "both dangling runs must be recovered, newest first, so the "
+            "newer one is already rolled back when the older one is checked"
+        )
+        for run_id in (run_a, run_b):
+            events = await _run_events(sessions, run_id)
+            assert (
+                events[-1].status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+            ), "each recovered run's own stream must end terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_stale_run_recovery_raises_when_a_dangling_run_survives_the_loop(
     monkeypatch: Any,
 ) -> None:
