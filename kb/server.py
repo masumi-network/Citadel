@@ -890,7 +890,6 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     first_barrier.failed_job_ids,
                                 )
                         except asyncio.CancelledError:
-                            cancelled = True
                             raise
                         except Exception:
                             first_barrier_ok = False
@@ -916,7 +915,6 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     post_code,
                                 )
                         except asyncio.CancelledError:
-                            cancelled = True
                             raise
                         except Exception:
                             post_stages_ok = False
@@ -959,7 +957,6 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                         second_barrier.failed_job_ids,
                                     )
                             except asyncio.CancelledError:
-                                cancelled = True
                                 raise
                             except Exception:
                                 second_barrier_ok = False
