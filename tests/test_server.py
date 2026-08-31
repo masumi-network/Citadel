@@ -23,6 +23,7 @@ from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.lifecycle import LifecycleRequeueDriftError
+from kb.projection_barrier import ProjectionBarrierResult
 from kb.mesh import MeshState
 from kb.models import FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
@@ -2980,6 +2981,9 @@ def test_feedback_rejects_dataset_outside_token_allowlist(tmp_path: Any) -> None
     assert denied.status_code == 403
     assert denied.json()["detail"] == "Dataset not allowed: seat:someone-else."
     assert allowed.status_code == 200
+
+
+
 
 
 def test_feedback_rejects_oversized_text(tmp_path: Any) -> None:
@@ -7150,6 +7154,316 @@ def _patch_lifespan_boot(monkeypatch: Any, calls: list[str]) -> None:
     monkeypatch.setattr(
         server, "_start_repo_stats_scheduler", lambda: calls.append("repo_stats")
     )
+
+
+class _SchedulerCitadel(FakeCitadel):
+    def __init__(self) -> None:
+        self.cognify_calls: list[dict[str, Any]] = []
+        self.resume_calls: list[bool] = []
+        self.post_pass_resume = asyncio.Event()
+        self.cognee = SimpleNamespace(writer_lock=None)
+
+    def pause_lifecycle_queue(self) -> None:
+        pass
+
+    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> None:
+        self.resume_calls.append(include_deferred)
+        if include_deferred:
+            self.post_pass_resume.set()
+
+    async def cognify_dataset(
+        self, *, dataset: Any = None, verify: bool = False, force: bool = False
+    ) -> dict[str, Any]:
+        self.cognify_calls.append(
+            {"dataset": dataset, "verify": verify, "force": force}
+        )
+        return {
+            "ok": True,
+            "graph_before": {"nodes": 0, "edges": 0},
+            "graph_after": {"nodes": 1, "edges": 1},
+            "graph_grew": True,
+            "verification": {
+                "marker": "scheduler-test-marker",
+                "search_hit": True,
+                "graph_grew": True,
+                "ok": True,
+            },
+        }
+
+
+async def _run_one_evolve_scheduler_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    citadel: _SchedulerCitadel,
+    state_path: Path,
+) -> None:
+    from kb import server
+    import kb.evolve_state as evolve_state
+    import scripts.run_railway as run_railway
+
+    class _MaintenanceContext:
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    async def _acquire(_citadel: Any, _timeout: float) -> _MaintenanceContext:
+        return _MaintenanceContext()
+
+    async def _stages(**kwargs: Any) -> int:
+        del kwargs
+        return 0
+
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+    monkeypatch.setattr(server, "_acquire_maintenance", _acquire)
+    monkeypatch.setattr(evolve_state, "first_sleep_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(run_railway, "run_evolve_in_loop", _stages)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(3600, str(state_path)),
+        name="test-evolve-scheduler",
+    )
+
+    try:
+        await asyncio.wait_for(citadel.post_pass_resume.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_evolve_scheduler_skips_phase2_cognify_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    caplog.set_level(logging.INFO, logger="kb.server")
+    citadel = _SchedulerCitadel()
+
+    async def _fail_if_called(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError(f"disabled scheduler called cognify_dataset: {kwargs}")
+
+    monkeypatch.setattr(citadel, "cognify_dataset", _fail_if_called)
+    state_path = tmp_path / "evolve-state.json"
+    await _run_one_evolve_scheduler_pass(monkeypatch, citadel, state_path)
+
+    assert citadel.cognify_calls == []
+    assert citadel.resume_calls == [False, True]
+    assert json.loads(state_path.read_text())["last_run_ok"] is True
+    assert any(
+        "Phase 2 Cognify skipped" in record.getMessage()
+        and "CITADEL_EVOLVE_COGNIFY_ENABLED=false" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_evolve_scheduler_preserves_failed_canary_when_phase2_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    citadel = _SchedulerCitadel()
+    failed_canary = {
+        "ok": False,
+        "search_hit": False,
+        "graph_grew": False,
+        "marker": None,
+        "projection_chain_ok": False,
+        "projection_receipt_count": 0,
+        "error": "prior_failure",
+    }
+    monkeypatch.setattr(server_module, "_LAST_CANARY", failed_canary)
+
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert server_module._LAST_CANARY == failed_canary
+
+
+async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    import kb.evolve_state as evolve_state
+    import scripts.run_railway as run_railway
+
+    events: list[tuple[Any, ...]] = []
+    second_barrier_seen = asyncio.Event()
+    projection = SimpleNamespace(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+    )
+
+    class Store:
+        query_count = 0
+
+        def projection_job_ids_for_capture_run(
+            self,
+            capture_run_id: str,
+            *,
+            generation_id: str,
+            projection_version: str,
+            config_digest: str,
+        ) -> tuple[str, ...]:
+            assert capture_run_id
+            assert (generation_id, projection_version, config_digest) == (
+                projection.generation_id,
+                projection.projection_version,
+                projection.config_digest,
+            )
+            self.query_count += 1
+            return (
+                ("source-job",)
+                if self.query_count == 1
+                else ("source-job", "post-stage-job")
+            )
+
+    class SchedulerCitadel(_SchedulerCitadel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lifecycle_store = Store()
+
+        def _lifecycle_projection_request(self) -> Any:
+            return projection
+
+        def resume_lifecycle_queue(
+            self,
+            *,
+            include_deferred: bool = False,
+            job_ids: Any = None,
+        ) -> None:
+            del job_ids
+            super().resume_lifecycle_queue(include_deferred=include_deferred)
+            if include_deferred:
+                events.append(("resume", include_deferred))
+
+    citadel = SchedulerCitadel()
+
+    async def stages(**kwargs: Any) -> int:
+        events.append(
+            ("stages", tuple(kwargs["stages"]), kwargs["capture_run_id"])
+        )
+        return 0
+
+    async def barrier(
+        barrier_citadel: Any,
+        job_ids: Any,
+        *,
+        timeout_seconds: float,
+    ) -> ProjectionBarrierResult:
+        assert barrier_citadel is citadel
+        assert timeout_seconds > 0
+        ids = tuple(job_ids)
+        events.append(("barrier", ids))
+        if len([event for event in events if event[0] == "barrier"]) == 2:
+            second_barrier_seen.set()
+        return ProjectionBarrierResult(ids, ids, (), (), True)
+
+    class MaintenanceContext:
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    async def acquire(_citadel: Any, _timeout: float) -> MaintenanceContext:
+        return MaintenanceContext()
+
+    def record_completed(
+        _state_path: str,
+        *,
+        ok: bool = True,
+        reason: str | None = None,
+    ) -> None:
+        events.append(("completed", ok, reason))
+
+    monkeypatch.setattr(server_module, "get_citadel", lambda: citadel)
+    monkeypatch.setattr(server_module, "_acquire_maintenance", acquire)
+    monkeypatch.setattr(evolve_state, "first_sleep_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(evolve_state, "record_completed", record_completed)
+    monkeypatch.setattr(run_railway, "run_evolve_in_loop", stages)
+    monkeypatch.setattr(server_module, "wait_for_projection_barrier", barrier)
+
+    task = asyncio.create_task(
+        server_module._evolve_scheduler_loop(
+            3600, str(tmp_path / "evolve-state.json")
+        )
+    )
+    try:
+        await asyncio.wait_for(second_barrier_seen.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    stage_events = [event for event in events if event[0] == "stages"]
+    barrier_events = [event for event in events if event[0] == "barrier"]
+
+    assert [(event[0], event[1]) for event in events] == [
+        ("stages", ("github_sync", "repo_content_sync", "linear_sync")),
+        ("barrier", ("source-job",)),
+        ("stages", ("self_improve", "promotion")),
+        ("barrier", ("post-stage-job",)),
+        ("completed", True),
+        ("resume", True),
+    ]
+    assert [event[1] for event in stage_events] == [
+        ("github_sync", "repo_content_sync", "linear_sync"),
+        ("self_improve", "promotion"),
+    ]
+    assert stage_events[0][2] == stage_events[1][2]
+    assert [event[1] for event in barrier_events] == [
+        ("source-job",),
+        ("post-stage-job",),
+    ]
+
+
+
+
+@pytest.mark.asyncio
+
+
+
+@pytest.mark.asyncio
+
+
+
+
+
+@pytest.mark.asyncio
+
+
+
+@pytest.mark.asyncio
+async def test_evolve_scheduler_rejects_no_argument_stage_runner() -> None:
+    calls: list[str] = []
+
+    async def no_argument_runner() -> int:
+        calls.append("ran")
+        return 0
+
+    with pytest.raises(TypeError, match="capture_run_id|stages"):
+        await server_module._run_evolve_stage_group(
+            no_argument_runner,
+            capture_run_id="capture:scheduled",
+            stages=("github_sync",),
+        )
+
+    assert calls == []
+
+
+async def test_evolve_scheduler_runs_phase2_cognify_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "true")
+    citadel = _SchedulerCitadel()
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert citadel.cognify_calls == [
+        {"dataset": None, "verify": True, "force": False}
+    ]
+    assert citadel.resume_calls == [False, True]
 
 
 async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(

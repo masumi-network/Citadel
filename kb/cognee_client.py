@@ -8,6 +8,7 @@ from hashlib import md5
 import json
 import logging
 import os
+import re
 import secrets
 from collections.abc import Awaitable, AsyncIterator, Callable, Iterator, Mapping
 from datetime import datetime, timezone
@@ -107,6 +108,273 @@ def _cognify_data_ids(result: Any) -> list[str]:
     return list(dict.fromkeys(data_ids))
 
 
+_SELECTED_COGNIFY_MARKERS = (
+    ("litellm", "litellm"),
+    ("embedding", "embedding"),
+    ("vector", "vector"),
+    ("provider quota", "provider quota"),
+    ("rate limit", "rate limit"),
+    ("free-model daily quota", "free-model daily quota"),
+    ("free model daily quota", "free-model daily quota"),
+    ("free-model quota", "free-model quota"),
+    ("free model quota", "free-model quota"),
+    (
+        "free-models-per-day-high-balance",
+        "free-models-per-day-high-balance",
+    ),
+    ("free-models-per-day", "free-models-per-day"),
+    ("free-models-per-hour", "free-models-per-hour"),
+    ("free-models-per-min", "free-models-per-min"),
+    ("openrouter_free_tier_daily", "openrouter_free_tier_daily"),
+    ("llm", "llm"),
+    ("language model", "language model"),
+    ("structured output", "structured output"),
+    ("authenticationerror", "authenticationerror"),
+    ("permissionerror", "permissionerror"),
+    ("authentication", "authentication"),
+    ("api key", "api key"),
+    ("provider", "provider"),
+    ("unauthorized", "unauthorized"),
+    ("forbidden", "forbidden"),
+    ("invalid url", "invalid url"),
+    ("dimension mismatch", "dimension mismatch"),
+    ("vector size", "vector size"),
+    ("wrong dimension", "wrong dimension"),
+    ("model unavailable", "model unavailable"),
+    ("model not found", "model_not_found"),
+    ("model_not_found", "model_not_found"),
+    ("timeout", "timeout"),
+    ("timed out", "timed out"),
+    ("connection", "connection"),
+    ("openrouter", "openrouter"),
+)
+_SELECTED_COGNIFY_QUOTA_MARKERS = frozenset(
+    {
+        "openrouter free-model daily quota",
+        "free-model daily quota",
+        "free-model quota",
+        "free-models-per-day-high-balance",
+        "free-models-per-day",
+        "free-models-per-hour",
+        "free-models-per-min",
+        "openrouter_free_tier_daily",
+        "provider quota",
+    }
+)
+_SELECTED_COGNIFY_PROVIDER_MARKERS = frozenset(
+    marker
+    for _, marker in _SELECTED_COGNIFY_MARKERS
+    if marker
+    not in {
+        "embedding",
+        "vector",
+        "authentication",
+        "api key",
+        "provider",
+        "dimension mismatch",
+        "vector size",
+        "wrong dimension",
+    }
+)
+_SELECTED_COGNIFY_EMBEDDING_MARKERS = frozenset(
+    {
+        "free-model daily quota",
+        "free-model quota",
+        "free-models-per-day-high-balance",
+        "free-models-per-day",
+        "free-models-per-hour",
+        "free-models-per-min",
+        "provider quota",
+        "rate limit",
+        "timeout",
+        "timed out",
+        "connection",
+        "authentication",
+        "api key",
+        "provider",
+        "unauthorized",
+        "authenticationerror",
+        "permissionerror",
+        "dimension mismatch",
+        "vector size",
+        "wrong dimension",
+        "429",
+    }
+)
+_SELECTED_COGNIFY_STATUS_CODES = frozenset({"401", "403", "404", "422", "429", "503"})
+_SELECTED_COGNIFY_STATUS_PATTERN = re.compile(
+    r"(?<!\d)(401|403|404|422|429|503)(?!\d)"
+)
+_SELECTED_COGNIFY_RESET = re.compile(
+    r"x-ratelimit-reset[\"']?\s*[:=]\s*[\"']?(\d{10,13})",
+    re.IGNORECASE,
+)
+_SELECTED_COGNIFY_OPENROUTER = re.compile(r"\bopenrouter\b", re.IGNORECASE)
+
+
+def _selected_cognify_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return value.get("payload")
+    return getattr(value, "payload", None)
+
+
+def _selected_cognify_safe_markers(value: Any) -> tuple[str, ...]:
+    payload = _selected_cognify_payload(value)
+    if payload in (None, ""):
+        return ()
+    text = payload if isinstance(payload, str) else str(payload)
+    lowered = text.lower()
+    has_embedding_text = "embedding" in lowered or "vector" in lowered
+    markers: list[str] = []
+
+    def add(marker: str) -> None:
+        if marker not in markers:
+            markers.append(marker)
+
+    has_compound_quota = (
+        "openrouter free-model daily quota" in lowered
+        or "openrouter free model daily quota" in lowered
+    )
+    if has_compound_quota:
+        add("openrouter free-model daily quota")
+
+    for needle, marker in _SELECTED_COGNIFY_MARKERS:
+        if has_compound_quota and needle in {
+            "openrouter",
+            "free-model daily quota",
+            "free model daily quota",
+        }:
+            continue
+        if (
+            needle == "free-models-per-day"
+            and "free-models-per-day-high-balance" in lowered
+        ):
+            continue
+        if needle in {"authentication", "api key", "provider"} and not has_embedding_text:
+            continue
+        if needle == "openrouter":
+            if _SELECTED_COGNIFY_OPENROUTER.search(text) is None:
+                continue
+        elif needle not in lowered:
+            continue
+        add(marker)
+
+    for match in _SELECTED_COGNIFY_STATUS_PATTERN.finditer(text):
+        add(match.group(1))
+
+    reset = _SELECTED_COGNIFY_RESET.search(text)
+    if reset:
+        add(f"X-RateLimit-Reset={reset.group(1)}")
+    return tuple(markers)
+
+
+def _selected_cognify_provider_score(value: Any) -> tuple[int, int, int] | None:
+    markers = set(_selected_cognify_safe_markers(value))
+    has_embedding_marker = bool(markers & {"embedding", "vector"})
+    if has_embedding_marker and not markers & _SELECTED_COGNIFY_EMBEDDING_MARKERS:
+        return None
+    provider_count = sum(
+        marker in _SELECTED_COGNIFY_PROVIDER_MARKERS
+        or marker in _SELECTED_COGNIFY_STATUS_CODES
+        or (has_embedding_marker and marker in _SELECTED_COGNIFY_EMBEDDING_MARKERS)
+        for marker in markers
+    )
+    has_reset = any(marker.startswith("X-RateLimit-Reset=") for marker in markers)
+    has_quota = bool(markers & _SELECTED_COGNIFY_QUOTA_MARKERS)
+    if provider_count == 0 and not has_reset:
+        return None
+    return (int(has_reset), int(has_quota), provider_count + int(has_reset))
+
+
+def _selected_cognify_errored_result(result: Any) -> Any | None:
+    """Find a terminal ``PipelineRunErrored`` in a selected-data receipt."""
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+
+    seen: set[int] = set()
+    errored_results: list[Any] = []
+
+    def find(value: Any) -> None:
+        if value is None or id(value) in seen:
+            return
+        seen.add(id(value))
+
+        if isinstance(value, PipelineRunErrored):
+            errored_results.append(value)
+        else:
+            status = (
+                value.get("status")
+                if isinstance(value, Mapping)
+                else getattr(value, "status", None)
+            )
+            if status == "PipelineRunErrored":
+                errored_results.append(value)
+
+        if isinstance(value, Mapping):
+            nested_values = value.values()
+        elif isinstance(value, (list, tuple)):
+            nested_values = value
+        else:
+            nested_values = (
+                getattr(value, "run_info", None),
+                getattr(value, "data_ingestion_info", None),
+            )
+        for nested in nested_values:
+            find(nested)
+
+    find(result)
+    if not errored_results:
+        return None
+
+    selected_result: Any | None = None
+    selected_score: tuple[int, int, int] | None = None
+    for candidate in errored_results:
+        score = _selected_cognify_provider_score(candidate)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected_result = candidate
+            selected_score = score
+    return selected_result if selected_result is not None else errored_results[0]
+
+
+def _selected_cognify_error(result: Any) -> RuntimeError | None:
+    """Turn a selected terminal error receipt into a classifier-visible error."""
+    errored_result = _selected_cognify_errored_result(result)
+    if errored_result is None:
+        return None
+    message = "selected cognify received an errored terminal run (PipelineRunErrored)"
+    safe_payload = "; ".join(_selected_cognify_safe_markers(errored_result))
+    if safe_payload:
+        message = f"{message}: {safe_payload}"
+    return RuntimeError(message)
+
+
+def _selected_cognify_receipt_ids(
+    result: Any,
+    *,
+    selected_data: list[Any],
+    dataset: str,
+) -> tuple[list[str], dict[str, list[str]]] | None:
+    """Infer selected source IDs only from a validated terminal receipt."""
+    if not selected_data or not isinstance(result, Mapping) or len(result) != 1:
+        return None
+
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+    )
+
+    key, run = next(iter(result.items()))
+    if not isinstance(run, PipelineRunCompleted):
+        return None
+    if run.status != "PipelineRunCompleted":
+        return None
+    if str(run.dataset_name) != dataset or run.dataset_id is None:
+        return None
+    if key != "run_info" and str(key) != str(run.dataset_id):
+        return None
+
+    processed_ids = [str(row.id) for row in selected_data]
+    return processed_ids, {str(run.dataset_id): processed_ids}
+
+
 def _cognify_data_ids_by_dataset(
     result: Any,
     datasets: list[str],
@@ -191,6 +459,8 @@ NODE_DATASET_MAP_FAILURE_TTL_SECONDS = _float_env(
 # concurrent /api/mesh/graph opens collapse to one Kuzu read + one format pass
 # (#28/#50). Shaping still runs per caller (off-loop). Env-overridable.
 GRAPH_DATA_CACHE_TTL_SECONDS = _float_env("CITADEL_GRAPH_DATA_CACHE_TTL_SECONDS", 30.0)
+
+
 
 
 def assert_cognee_dataset_api() -> None:
@@ -428,6 +698,15 @@ class CogneeGateway(Protocol):
         raise NotImplementedError
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any:
+        raise NotImplementedError
+
+    async def cognify_selected_data(
+        self,
+        *,
+        dataset: str,
+        data_ids: list[str],
+        force: bool = False,
+    ) -> Any:
         raise NotImplementedError
 
     async def vector_project(
@@ -1731,6 +2010,50 @@ class CogneePublicClient:
                 + ", ".join(missing)
             )
         return [by_id[document_id] for document_id in wanted]
+    async def _cognify_selected_data_rows(
+        self,
+        *,
+        dataset: str,
+        data_ids: list[str],
+    ) -> list[Any]:
+        """Load exact authorized Cognee Data rows in caller order."""
+        if not data_ids:
+            raise ValueError("selected-data cognify requires at least one data id")
+        try:
+            wanted = [str(UUID(str(data_id))) for data_id in data_ids]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("selected-data cognify ids must be UUIDs") from exc
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("selected-data cognify ids contain duplicates")
+
+        from cognee.infrastructure.databases.relational import get_relational_engine
+        from cognee.modules.data.models import Data, Dataset, DatasetData
+        from cognee.modules.users.methods import get_default_user
+        from sqlalchemy import select
+
+        user = await get_default_user()
+        engine = get_relational_engine()
+        async with engine.get_async_session() as session:
+            rows = await session.execute(
+                select(Data)
+                .join(DatasetData, DatasetData.data_id == Data.id)
+                .join(Dataset, Dataset.id == DatasetData.dataset_id)
+                .where(
+                    Dataset.owner_id == user.id,
+                    Dataset.tenant_id == user.tenant_id,
+                    Dataset.name == dataset,
+                    Data.id.in_([UUID(data_id) for data_id in wanted]),
+                )
+            )
+            by_id = {str(row.id): row for row in rows.scalars().all()}
+
+        missing = [data_id for data_id in wanted if data_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                "selected-data cognify source is missing from the authorized dataset: "
+                + ", ".join(missing)
+            )
+        return [by_id[data_id] for data_id in wanted]
 
     async def document_counts_by_dataset(self) -> dict[str, int]:
         """Durable per-dataset document counts, straight from the relational store.
@@ -5093,6 +5416,28 @@ class CogneePublicClient:
             return await self._cognify_unlocked(datasets=datasets, force=force)
         async with self.maintenance():
             return await self._cognify_unlocked(datasets=datasets, force=force)
+    async def cognify_selected_data(
+        self,
+        *,
+        dataset: str,
+        data_ids: list[str],
+        force: bool = False,
+    ) -> Any:
+        """Cognify only the requested, authorized Cognee Data rows."""
+        if not dataset:
+            raise ValueError("selected-data cognify requires a dataset")
+        if _COGNEE_MAINTENANCE_HELD.get():
+            return await self._cognify_unlocked(
+                datasets=[dataset],
+                force=force,
+                selected_data_ids=data_ids,
+            )
+        async with self.maintenance():
+            return await self._cognify_unlocked(
+                datasets=[dataset],
+                force=force,
+                selected_data_ids=data_ids,
+            )
 
     async def vector_project(
         self,
@@ -5172,7 +5517,11 @@ class CogneePublicClient:
         return await run_unlocked()
 
     async def _cognify_unlocked(
-        self, *, datasets: list[str], force: bool = False
+        self,
+        *,
+        datasets: list[str],
+        force: bool = False,
+        selected_data_ids: list[str] | None = None,
     ) -> Any:
         """Cognify already-added data in ``datasets``.
 
@@ -5200,26 +5549,75 @@ class CogneePublicClient:
         import cognee
 
         await self._ensure_cognee_ready(cognee)
-        expected_ids = await self.dataset_document_ids(datasets) if force else []
+        selected_data: list[Any] | None = None
+        if selected_data_ids is not None:
+            if len(datasets) != 1:
+                raise ValueError(
+                    "selected-data cognify requires exactly one dataset"
+                )
+            selected_data = await self._cognify_selected_data_rows(
+                dataset=datasets[0],
+                data_ids=selected_data_ids,
+            )
+        expected_ids = (
+            [str(row.id) for row in selected_data]
+            if force and selected_data is not None
+            else await self.dataset_document_ids(datasets)
+            if force
+            else []
+        )
         # Single Kuzu writer: serialize the graph write against any other in-process
         # cognify so they cannot collide on the lock (#47).
         async def run_cognify(
             *, incremental_loading: bool, data_cache: bool
         ) -> Any:
             async with self.writer_lock:
-                cognify_result = await cognee.cognify(
-                    datasets=datasets,
-                    incremental_loading=incremental_loading,
-                    data_cache=data_cache,
-                )
+                if selected_data is None:
+                    cognify_result = await cognee.cognify(
+                        datasets=datasets,
+                        incremental_loading=incremental_loading,
+                        data_cache=data_cache,
+                    )
+                else:
+                    from cognee.api.v1.cognify.cognify import get_default_tasks
+                    from cognee.infrastructure.databases.vector.embeddings.config import (
+                        get_embedding_config,
+                    )
+                    from cognee.infrastructure.llm.config import get_llm_config
+                    from cognee.modules.cognify.rollback import (
+                        cognify_rollback_handler,
+                    )
+                    from cognee.modules.pipelines import run_pipeline
+                    from cognee.modules.pipelines.layers.pipeline_execution_mode import (
+                        run_pipeline_blocking,
+                    )
+
+                    tasks = await get_default_tasks()
+                    cognify_result = await run_pipeline_blocking(
+                        pipeline=run_pipeline,
+                        tasks=tasks,
+                        data=selected_data,
+                        datasets=datasets,
+                        pipeline_name="cognify_pipeline",
+                        use_pipeline_cache=False,
+                        rollback_handler=cognify_rollback_handler,
+                        incremental_loading=incremental_loading,
+                        data_cache=data_cache,
+                        data_per_batch=20,
+                        llm_config=get_llm_config(),
+                        embedding_config=get_embedding_config(),
+                    )
                 self._invalidate_graph_data_cache()
                 return cognify_result
-
         try:
             result = await run_cognify(
                 incremental_loading=not force,
                 data_cache=not force,
             )
+            if selected_data is not None:
+                selected_error = _selected_cognify_error(result)
+                if selected_error is not None:
+                    raise selected_error
         except Exception as exc:
             from kb.embedding_profile import (
                 activate_local_embedding_fallback,
@@ -5253,10 +5651,22 @@ class CogneePublicClient:
 
             self._prepare_cognee_environment()
             result = await run_cognify(incremental_loading=False, data_cache=False)
+            if selected_data is not None:
+                selected_error = _selected_cognify_error(result)
+                if selected_error is not None:
+                    raise selected_error
         # The graph writer lock protects Kuzu only. Run the vector payload census
         # after releasing it so a slow SQL scan cannot block another cognify.
         processed_ids = _cognify_data_ids(result)
         processed_ids_by_dataset = _cognify_data_ids_by_dataset(result, datasets)
+        if not processed_ids and selected_data:
+            inferred = _selected_cognify_receipt_ids(
+                result,
+                selected_data=selected_data,
+                dataset=datasets[0],
+            )
+            if inferred is not None:
+                processed_ids, processed_ids_by_dataset = inferred
         if force:
             missing_ids = sorted(set(expected_ids) - set(processed_ids))
             if missing_ids:

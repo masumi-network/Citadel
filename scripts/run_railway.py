@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from typing import Callable
 
 from scripts.stage_loop import run_async, stage_loop
@@ -394,21 +394,46 @@ def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]
     ]
 
 
-async def run_evolve_in_loop() -> int:
-    """Run the evolve stages on the caller's loop. The web scheduler's Phase 1.
+async def run_evolve_in_loop(
+    *,
+    capture_run_id: str | None = None,
+    stages: Sequence[str] | None = None,
+) -> int:
+    """Run selected evolve stages on the caller's event loop.
 
-    Replaces spawning ``python -m scripts.run_railway`` as a subprocess. That
-    subprocess could never succeed for any cognee-touching stage: the web
-    process's cognee Kuzu worker holds an exclusive file lock on
-    ``cognee_graph_kuzu`` for the container's lifetime, so github_sync and
-    linear_sync died on "Could not set lock on file" every single hour (#88,
-    #46). The subprocess existed to free that lock on exit, which was backwards.
-
-    Running here also retires the loop-binding hazard (#69) rather than working
-    around it: one process and one loop means cognee binds its cached engine
-    exactly once.
+    ``capture_run_id`` identifies the source-sync watermark for callers that
+    record accepted lifecycle revisions. Stage selection lets the web scheduler
+    place projection barriers between source and consumer stages.
     """
-    return await _run_stages_async(evolve_stages_async(), label="Evolve")
+    if capture_run_id is not None and (
+        not isinstance(capture_run_id, str) or not capture_run_id.strip()
+    ):
+        raise ValueError("capture_run_id must be a non-empty string when provided")
+
+    available = evolve_stages_async()
+    if stages is None:
+        selected = available
+    else:
+        requested = tuple(stages)
+        if any(not isinstance(name, str) or not name.strip() for name in requested):
+            raise ValueError("stages must contain only non-empty strings")
+        available_names = {name for name, _, _ in available}
+        unknown = sorted(set(requested) - available_names)
+        if unknown:
+            raise ValueError(f"unknown evolve stages: {', '.join(unknown)}")
+        requested_names = set(requested)
+        selected = [
+            stage for stage in available if stage[0] in requested_names
+        ]
+
+    if capture_run_id is not None:
+        logger.info("Evolve capture run: %s", capture_run_id)
+    if capture_run_id is None:
+        return await _run_stages_async(selected, label="Evolve")
+    from kb.service import capture_run_scope
+
+    with capture_run_scope(capture_run_id):
+        return await _run_stages_async(selected, label="Evolve")
 
 
 def _run_stages(stages: list[tuple[str, bool, Callable[[], int]]], *, label: str) -> int:

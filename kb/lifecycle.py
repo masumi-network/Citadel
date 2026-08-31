@@ -8,7 +8,7 @@ and initial backend receipts commit together.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -34,6 +34,37 @@ _RECEIPT_STATES = {"pending", "running", "completed", "searchable", "failed", "s
 _DEFERRED_GRAPH_ERROR = "graph_enrichment_deferred"
 _LEXICAL_TOKEN_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 _LEXICAL_PASSAGE_CHARS = 2400
+
+
+
+def _normalize_job_ids(job_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    if job_ids is None:
+        return None
+    if isinstance(job_ids, (str, bytes)):
+        raise TypeError("job_ids must be a sequence of strings")
+    values = tuple(job_ids)
+    if any(not isinstance(job_id, str) or not job_id.strip() for job_id in values):
+        raise ValueError("job_ids must contain only non-empty strings")
+    return tuple(dict.fromkeys(values))
+
+
+def _install_job_filter(
+    connection: sqlite3.Connection,
+    job_ids: tuple[str, ...] | None,
+    *,
+    column: str = "projection_job_id",
+) -> str:
+    """Use a temp table so large exact-ID sets avoid SQLite bind limits."""
+    if job_ids is None:
+        return ""
+    connection.execute(
+        "CREATE TEMP TABLE lifecycle_job_filter (job_id TEXT PRIMARY KEY)"
+    )
+    connection.executemany(
+        "INSERT INTO lifecycle_job_filter (job_id) VALUES (?)",
+        ((job_id,) for job_id in job_ids),
+    )
+    return f"AND {column} IN (SELECT job_id FROM lifecycle_job_filter)"
 
 
 def _lexical_passages(text: str) -> tuple[str, ...]:
@@ -1565,6 +1596,60 @@ class LifecycleStore:
             state=self._operation_state(job, receipts),
         )
 
+
+
+
+
+    def projection_states_for_job_ids(
+        self, job_ids: Sequence[str]
+    ) -> dict[str, Mapping[str, Any]]:
+        """Return job and receipt states for an exact ID set in one query."""
+        normalized_job_ids = _normalize_job_ids(job_ids)
+        if not normalized_job_ids:
+            return {}
+        with self._connect() as connection:
+            job_filter = _install_job_filter(
+                connection,
+                normalized_job_ids,
+                column="job.projection_job_id",
+            )
+            rows = connection.execute(
+                f"""
+                SELECT job.projection_job_id AS projection_job_id,
+                       job.state AS job_state,
+                       receipt.backend AS receipt_backend,
+                       receipt.state AS receipt_state
+                FROM projection_jobs AS job
+                LEFT JOIN projection_receipts AS receipt
+                  ON receipt.projection_job_id = job.projection_job_id
+                WHERE 1 = 1
+                {job_filter}
+                ORDER BY job.projection_job_id,
+                         CASE receipt.backend
+                             WHEN 'relational' THEN 1
+                             WHEN 'vector' THEN 2
+                             WHEN 'graph' THEN 3
+                             ELSE 4
+                         END,
+                         receipt.backend
+                """
+            ).fetchall()
+        states: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            projection_job_id = str(row["projection_job_id"])
+            state = states.setdefault(
+                projection_job_id,
+                {"state": str(row["job_state"]), "receipts": {}},
+            )
+            backend = row["receipt_backend"]
+            if backend is not None:
+                state["receipts"][str(backend)] = str(row["receipt_state"])
+        return {
+            job_id: states[job_id]
+            for job_id in normalized_job_ids
+            if job_id in states
+        }
+
     def latest_operations_for_dataset(
         self, dataset: str, *, limit: int = 10
     ) -> tuple[ProjectionOperation, ...]:
@@ -1585,6 +1670,51 @@ class LifecycleStore:
                 (dataset, limit),
             ).fetchall()
         return tuple(self.get_operation(str(row["projection_job_id"])) for row in rows)
+    def projection_job_ids_for_capture_run(
+        self,
+        capture_run_id: str,
+        *,
+        generation_id: str,
+        projection_version: str,
+        config_digest: str,
+    ) -> tuple[str, ...]:
+        """Return exact projection jobs bound to one captured source run."""
+        for field_name, value in {
+            "capture_run_id": capture_run_id,
+            "generation_id": generation_id,
+            "projection_version": projection_version,
+            "config_digest": config_digest,
+        }.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job.projection_job_id
+                FROM source_revisions AS source
+                JOIN source_heads AS head
+                  ON head.dataset = source.dataset
+                 AND head.source_key = source.source_key
+                 AND head.source_revision_id = source.source_revision_id
+                JOIN projection_jobs AS job
+                  ON job.source_revision_id = source.source_revision_id
+                WHERE source.capture_run_id = ?
+                  AND job.generation_id = ?
+                  AND job.projection_version = ?
+                  AND job.config_digest = ?
+                ORDER BY source.dataset, source.source_key,
+                         source.source_revision_id, job.projection_job_id
+                """,
+                (
+                    capture_run_id,
+                    generation_id,
+                    projection_version,
+                    config_digest,
+                ),
+            ).fetchall()
+        return tuple(str(row["projection_job_id"]) for row in rows)
+
+
 
     def retrieval_binding(
         self,
@@ -1943,6 +2073,7 @@ class LifecycleStore:
         lease_seconds: float = 120,
         include_deferred: bool = False,
         deferred_only: bool = False,
+        job_ids: Sequence[str] | None = None,
     ) -> ProjectionLease | None:
         """Claim one due job and recover an expired lease in the same transaction."""
         if not worker_id.strip():
@@ -1957,6 +2088,7 @@ class LifecycleStore:
                 raise ValueError(f"{label} must be non-empty when provided")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        normalized_job_ids = _normalize_job_ids(job_ids)
         claimed_at = now or datetime.now(UTC)
         claimed_text = _utc_text(claimed_at)
         leased_until = _utc_text(claimed_at + timedelta(seconds=lease_seconds))
@@ -1964,14 +2096,16 @@ class LifecycleStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                job_filter = _install_job_filter(connection, normalized_job_ids)
                 row = connection.execute(
-                    """
+                    f"""
                     SELECT *
                     FROM projection_jobs
                     WHERE (? IS NULL OR generation_id = ?)
                       AND (? IS NULL OR projection_version = ?)
                       AND (? IS NULL OR config_digest = ?)
                       AND (? IS NULL OR dataset = ?)
+                    {job_filter}
                       AND (? = 0 OR state = 'deferred')
                       AND ((
                           state = 'pending' AND available_at <= ?
@@ -2608,14 +2742,17 @@ class LifecycleStore:
         now: datetime | None = None,
         include_deferred: bool = False,
         deferred_only: bool = False,
+        job_ids: Sequence[str] | None = None,
     ) -> float | None:
         """Return seconds until the next pending job or expired lease is claimable."""
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
             raise ValueError("lifecycle timestamps must include a timezone")
+        normalized_job_ids = _normalize_job_ids(job_ids)
         with self._connect() as connection:
+            job_filter = _install_job_filter(connection, normalized_job_ids)
             rows = connection.execute(
-                """
+                f"""
                 SELECT CASE
                     WHEN state = 'pending' THEN available_at
                     WHEN state = 'running' THEN leased_until
@@ -2630,6 +2767,7 @@ class LifecycleStore:
                   AND (? IS NULL OR generation_id = ?)
                   AND (? IS NULL OR projection_version = ?)
                   AND (? IS NULL OR config_digest = ?)
+                {job_filter}
                 """,
                 (
                     int(deferred_only),

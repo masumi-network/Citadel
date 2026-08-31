@@ -1558,3 +1558,354 @@ def test_failed_missing_path_candidates_select_file_not_found_jobs(
     assert candidates[0]["source_key"] == "manual:marker3-pathfile"
     assert candidates[0]["dataset"] == "seat:citadel-dev-team"
     assert candidates[0]["error_code"] == "FileNotFoundError"
+def test_projection_job_ids_for_capture_run_uses_exact_identity_and_order(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    exact = ProjectionRequest(
+        generation_id="generation-exact",
+        projection_version="projection-exact",
+        config_digest="sha256:exact",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+
+    def accept(
+        source_key: str,
+        *,
+        capture_run_id: str,
+        projection: ProjectionRequest = exact,
+    ) -> str:
+        return store.accept_source(
+            f"content:{source_key}".encode(),
+            capture=CaptureContext(
+                dataset="central",
+                source_key=source_key,
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="test",
+                capture_run_id=capture_run_id,
+                captured_at=T0,
+            ),
+            projection=projection,
+            now=T0,
+        ).projection_job_id
+
+    exact_z = accept("source:z", capture_run_id="capture-exact")
+    exact_a = accept("source:a", capture_run_id="capture-exact")
+    accept("source:other-run", capture_run_id="capture-other")
+    accept(
+        "source:other-generation",
+        capture_run_id="capture-exact",
+        projection=ProjectionRequest(
+            generation_id="generation-other",
+            projection_version="projection-exact",
+            config_digest="sha256:exact",
+            providers=exact.providers,
+        ),
+    )
+    accept(
+        "source:other-version",
+        capture_run_id="capture-exact",
+        projection=ProjectionRequest(
+            generation_id="generation-version",
+            projection_version="projection-other",
+            config_digest="sha256:exact",
+            providers=exact.providers,
+        ),
+    )
+    accept(
+        "source:other-digest",
+        capture_run_id="capture-exact",
+        projection=ProjectionRequest(
+            generation_id="generation-digest",
+            projection_version="projection-exact",
+            config_digest="sha256:other",
+            providers=exact.providers,
+        ),
+    )
+
+    assert store.projection_job_ids_for_capture_run(
+        "capture-exact",
+        generation_id=exact.generation_id,
+        projection_version=exact.projection_version,
+        config_digest=exact.config_digest,
+    ) == (exact_a, exact_z)
+
+
+def test_projection_job_ids_for_capture_run_uses_current_source_head(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-exact",
+        projection_version="projection-exact",
+        config_digest="sha256:exact",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    capture = CaptureContext(
+        dataset="central",
+        source_key="source:revised",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="test",
+        capture_run_id="capture:watermark",
+        captured_at=T0,
+    )
+
+    stale = store.accept_source(
+        b"stale revision",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+    current = store.accept_source(
+        b"current revision",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+
+    assert stale.projection_job_id != current.projection_job_id
+    assert (
+        store.get_current_revision("central", "source:revised").source_revision_id
+        == current.source_revision_id
+    )
+    assert store.projection_job_ids_for_capture_run(
+        "capture:watermark",
+        generation_id=projection.generation_id,
+        projection_version=projection.projection_version,
+        config_digest=projection.config_digest,
+    ) == (current.projection_job_id,)
+
+
+def test_claim_next_job_exact_filter_skips_due_older_deferred_job(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+
+    def accept(source_key: str) -> str:
+        return store.accept_source(
+            source_key.encode(),
+            capture=CaptureContext(
+                dataset="central",
+                source_key=source_key,
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="test",
+                capture_run_id=source_key,
+                captured_at=T0,
+            ),
+            projection=projection,
+            now=T0,
+        ).projection_job_id
+
+    old_job_id = accept("source:old")
+    exact_job_id = accept("source:exact")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE projection_jobs SET state = 'deferred' WHERE projection_job_id = ?",
+            (old_job_id,),
+        )
+
+    exact_lease = store.claim_next_job(
+        worker_id="exact-worker",
+        now=T0,
+        lease_seconds=30,
+        include_deferred=True,
+        job_ids=(exact_job_id,),
+    )
+
+    assert exact_lease is not None
+    assert exact_lease.projection_job_id == exact_job_id
+    assert store.get_operation(old_job_id).job.state == "deferred"
+
+
+def test_claim_next_job_exact_filter_handles_large_id_sets(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    exact_job_id = store.accept_source(
+        b"large exact filter",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="source:exact",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="capture:exact",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    ).projection_job_id
+    job_ids = tuple(f"missing:{index}" for index in range(1100)) + (exact_job_id,)
+
+    lease = store.claim_next_job(
+        worker_id="exact-worker",
+        now=T0,
+        lease_seconds=30,
+        job_ids=job_ids,
+    )
+
+    assert lease is not None
+    assert lease.projection_job_id == exact_job_id
+
+
+def test_projection_states_for_job_ids_handles_large_id_sets(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    accepted = store.accept_source(
+        b"large projection state read",
+        capture=CaptureContext(
+            dataset="central",
+            source_key="source:exact",
+            source_locator=None,
+            media_type="text/plain",
+            capture_actor_id="test",
+            capture_run_id="capture:exact",
+            captured_at=T0,
+        ),
+        projection=projection,
+        now=T0,
+    )
+    job_ids = tuple(f"missing:{index}" for index in range(1100)) + (
+        accepted.projection_job_id,
+    )
+
+    states = store.projection_states_for_job_ids(job_ids)
+
+    assert set(states) == {accepted.projection_job_id}
+    assert states[accepted.projection_job_id] == {
+        "state": "pending",
+        "receipts": {
+            "relational": "pending",
+            "vector": "pending",
+            "graph": "pending",
+        },
+    }
+
+
+def test_next_wakeup_exact_filter_ignores_due_old_deferred_job(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+
+    def accept(source_key: str) -> str:
+        return store.accept_source(
+            source_key.encode(),
+            capture=CaptureContext(
+                dataset="central",
+                source_key=source_key,
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="test",
+                capture_run_id=source_key,
+                captured_at=T0,
+            ),
+            projection=projection,
+            now=T0,
+        ).projection_job_id
+
+    old_job_id = accept("source:old")
+    exact_job_id = accept("source:exact")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE projection_jobs
+            SET state = 'deferred', available_at = ?
+            WHERE projection_job_id = ?
+            """,
+            ("2026-08-09T12:00:00Z", old_job_id),
+        )
+        connection.execute(
+            """
+            UPDATE projection_jobs
+            SET available_at = ?
+            WHERE projection_job_id = ?
+            """,
+            ("2026-08-09T12:00:10Z", exact_job_id),
+        )
+
+    assert (
+        store.next_wakeup_delay(
+            now=T0,
+            include_deferred=True,
+        )
+        == 0
+    )
+    assert store.next_wakeup_delay(
+        now=T0,
+        include_deferred=True,
+        job_ids=(exact_job_id,),
+    ) == 10
+
+
+def test_graph_worker_exact_filter_can_be_cleared(tmp_path: Path) -> None:
+    from kb.lifecycle_worker import LifecycleProjectionWorker
+
+    worker = LifecycleProjectionWorker(
+        LifecycleStore(tmp_path / "lifecycle.sqlite3"),
+        object(),
+        worker_id="graph-worker",
+        include_graph=True,
+        include_deferred=True,
+        deferred_only=True,
+        job_ids=("job:exact",),
+    )
+
+    assert worker.job_ids == ("job:exact",)
+    worker.set_job_filter(None)
+    assert worker.job_ids is None
+
+
+@pytest.mark.asyncio
+async def test_graph_worker_forwards_exact_filter_to_claims() -> None:
+    from kb.lifecycle_worker import LifecycleProjectionWorker
+
+    claims: list[dict[str, object]] = []
+
+    class Store:
+        def claim_next_job(self, **kwargs: object) -> None:
+            claims.append(kwargs)
+            return None
+
+    worker = LifecycleProjectionWorker(
+        Store(),
+        object(),
+        worker_id="graph-worker",
+        include_graph=True,
+        include_deferred=True,
+        deferred_only=True,
+        job_ids=("job:exact",),
+    )
+
+    assert await worker.run_once() is False
+    worker.set_job_filter(None)
+    assert await worker.run_once() is False
+    assert claims[0]["job_ids"] == ("job:exact",)
+    assert claims[1]["job_ids"] is None
