@@ -197,6 +197,7 @@ def test_merge_claude_settings_adds_then_idempotent(tmp_path: Path) -> None:
     prompt_hooks = [h for g in prompt_groups for h in g["hooks"]]
     assert any("kb.hooks.search_inject" in h["command"] for h in prompt_hooks)
     assert prompt_hooks[0]["allowedEnvVars"] == [TOKEN_ENV, BASE_URL_ENV]
+    assert prompt_hooks[0]["timeout"] == 15
     start_groups = data["hooks"]["SessionStart"]
     start_cmds = [h["command"] for g in start_groups for h in g["hooks"]]
     assert any("kb.hooks.sync_start" in c for c in start_cmds)
