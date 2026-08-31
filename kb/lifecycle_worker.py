@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 import inspect
 import logging
@@ -15,6 +15,7 @@ from kb.lifecycle import (
     ProjectionLease,
     ProjectionLeaseError,
     ProjectionOperation,
+    _normalize_job_ids,
 )
 
 
@@ -214,6 +215,13 @@ class ProjectionGateway(Protocol):
     ) -> Any: ...
 
     async def cognify(self, *, datasets: list[str], force: bool = False) -> Any: ...
+    async def cognify_selected_data(
+        self,
+        *,
+        dataset: str,
+        data_ids: list[str],
+        force: bool = False,
+    ) -> Any: ...
 
     async def vector_project(
         self,
@@ -298,6 +306,8 @@ class LifecycleProjectionWorker:
         fault_injector: Callable[[str], None] | None = None,
         include_graph: bool = True,
         include_deferred: bool = False,
+        job_ids: Sequence[str] | None = None,
+        job_filter_owner: str | None = None,
         deferred_only: bool = False,
     ) -> None:
         if max_attempts < 1:
@@ -314,11 +324,41 @@ class LifecycleProjectionWorker:
         self._fault_injector = fault_injector
         self.include_graph = include_graph
         self.include_deferred = include_deferred
+        self.job_ids = _normalize_job_ids(job_ids)
+        if job_filter_owner is not None and (
+            not isinstance(job_filter_owner, str) or not job_filter_owner.strip()
+        ):
+            raise ValueError("job_filter_owner must be non-empty when provided")
+        self._job_filter_owner = (
+            job_filter_owner if self.job_ids is not None else None
+        )
         self.deferred_only = deferred_only
 
     def _inject_fault(self, stage: str) -> None:
         if self._fault_injector is not None:
             self._fault_injector(stage)
+
+    def set_job_filter(
+        self,
+        job_ids: Sequence[str] | None,
+        *,
+        owner: str | None = None,
+    ) -> bool:
+        """Set an exact filter only when its owner owns the active scope."""
+        if owner is not None and (
+            not isinstance(owner, str) or not owner.strip()
+        ):
+            raise ValueError("owner must be non-empty when provided")
+        normalized = _normalize_job_ids(job_ids)
+        if self.job_ids is not None and owner != self._job_filter_owner:
+            return False
+        self.job_ids = normalized
+        self._job_filter_owner = owner if normalized is not None else None
+        return True
+
+    @property
+    def job_filter_owner(self) -> str | None:
+        return self._job_filter_owner
 
     def _record_projection_failure(
         self,
@@ -432,6 +472,7 @@ class LifecycleProjectionWorker:
             lease_seconds=self.lease_seconds,
             include_deferred=self.include_deferred,
             deferred_only=self.deferred_only,
+            job_ids=self.job_ids if self.include_graph else None,
         )
         if lease is None:
             return False
@@ -869,10 +910,20 @@ class LifecycleProjectionWorker:
         operation = self.store.get_operation(lease.projection_job_id)
         graph = self._receipt(operation, "graph")
         if graph.state not in {"completed", "searchable"}:
+            cognify_selected_data = getattr(
+                self.gateway,
+                "cognify_selected_data",
+                None,
+            )
+            if not callable(cognify_selected_data):
+                raise ProjectionVerificationError(
+                    "graph projection requires the gateway cognify_selected_data method"
+                )
             self.store.begin_backend(lease, "graph", now=now)
             graph_result = await heartbeat.wait(
-                self.gateway.cognify(
-                    datasets=[source.dataset],
+                cognify_selected_data(
+                    dataset=source.dataset,
+                    data_ids=[source.source_revision_id],
                     force=requires_reprojection,
                 )
             )
@@ -945,11 +996,21 @@ class LifecycleProjectionWorker:
             if receipt.state not in {"completed", "searchable"}
         ]
         if pending:
+            cognify_selected_data = getattr(
+                self.gateway,
+                "cognify_selected_data",
+                None,
+            )
+            if not callable(cognify_selected_data):
+                raise ProjectionVerificationError(
+                    "graph projection requires the gateway cognify_selected_data method"
+                )
             for backend in pending:
                 self.store.begin_backend(lease, backend, now=now)
             cognify_result = await heartbeat.wait(
-                self.gateway.cognify(
-                    datasets=[source.dataset],
+                cognify_selected_data(
+                    dataset=source.dataset,
+                    data_ids=[source.source_revision_id],
                     force=requires_reprojection,
                 )
             )

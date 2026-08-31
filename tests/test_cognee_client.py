@@ -440,6 +440,698 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
 
     assert reads == 2
 
+@pytest.mark.asyncio
+async def test_cognify_selected_data_scopes_rows_and_validates_before_write(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.pipelines as pipelines_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id, other_id = uuid4(), uuid4()
+    selected_id, unselected_id, other_data_id = uuid4(), uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Dataset(
+                    id=other_id,
+                    name="other",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                Data(id=unselected_id, name="unselected"),
+                Data(id=other_data_id, name="other"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+                DatasetData(dataset_id=notes_id, data_id=unselected_id),
+                DatasetData(dataset_id=other_id, data_id=other_data_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    client = CogneePublicClient()
+    captured: list[dict[str, Any]] = []
+    lock_states: list[bool] = []
+
+    async def run_pipeline(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        lock_states.append(client.writer_lock.locked())
+        yield SimpleNamespace(dataset_id=notes_id)
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(pipelines_module, "run_pipeline", run_pipeline)
+
+    async def unexpected_public_cognify(**_: Any) -> Any:
+        raise AssertionError("selected-data cognify must not call public cognee.cognify")
+
+    monkeypatch.setattr(cognee, "cognify", unexpected_public_cognify)
+
+    try:
+        await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["datasets"] == ["notes"]
+        assert all(isinstance(row, Data) for row in captured[0]["data"])
+        assert [row.id for row in captured[0]["data"]] == [selected_id]
+        assert captured[0]["pipeline_name"] == "cognify_pipeline"
+        assert captured[0]["use_pipeline_cache"] is False
+        assert captured[0]["incremental_loading"] is True
+        assert captured[0]["data_cache"] is True
+        assert lock_states == [True]
+
+        with pytest.raises(ValueError, match="duplicate"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id), str(selected_id)],
+            )
+        with pytest.raises(RuntimeError, match="authorized dataset"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(other_data_id)],
+            )
+        with pytest.raises(RuntimeError, match="authorized dataset"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(uuid4())],
+            )
+        assert len(captured) == 1
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_shape",
+    ["inner", "outer"],
+    ids=["inner-run-info", "outer-dataset-map"],
+)
+async def test_cognify_selected_force_accepts_regular_terminal_receipt(
+    monkeypatch: Any, receipt_shape: str
+) -> None:
+    from importlib import import_module
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id = uuid4()
+    selected_id, unselected_id = uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                Data(id=unselected_id, name="unselected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+                DatasetData(dataset_id=notes_id, data_id=unselected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    pipeline_run_id = uuid4()
+    inner_completed = PipelineRunCompleted(
+        pipeline_run_id=pipeline_run_id,
+        dataset_id=notes_id,
+        dataset_name="notes",
+    )
+    outer_completed = PipelineRunCompleted(
+        pipeline_run_id=pipeline_run_id,
+        dataset_id=notes_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"run_info": inner_completed}],
+    )
+    if receipt_shape == "inner":
+        receipt: dict[str, Any] = {"run_info": inner_completed}
+    else:
+        receipt = {str(notes_id): outer_completed}
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipt
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        return {"ok": True, "violation_count": 0, "chunks_scanned": 1}
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    try:
+        result = await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+            force=True,
+        )
+
+        if receipt_shape == "inner":
+            assert result["run_info"] is inner_completed
+        else:
+            assert result[str(notes_id)] is outer_completed
+        assert len(low_level_calls) == 1
+        assert [row.id for row in low_level_calls[0]["data"]] == [selected_id]
+        assert low_level_calls[0]["incremental_loading"] is False
+        assert low_level_calls[0]["data_cache"] is False
+        assert len(stored_checks) == 1
+        assert stored_checks[0]["document_ids"] == [str(selected_id)]
+        assert stored_checks[0]["datasets"] == ["notes"]
+        assert stored_checks[0]["document_ids_by_dataset"] == {
+            str(notes_id): [str(selected_id)]
+        }
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_cognify_selected_force_rejects_outer_errored_receipt(
+    monkeypatch: Any,
+) -> None:
+    from importlib import import_module
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id = uuid4()
+    selected_id = uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=notes_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"data_id": selected_id}],
+    )
+    receipt: dict[str, Any] = {str(notes_id): errored}
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipt
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        raise AssertionError("stored_chunk_budget_check must not run for an errored receipt")
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    try:
+        with pytest.raises(RuntimeError, match="PipelineRunErrored"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id)],
+                force=True,
+            )
+        assert len(low_level_calls) == 1
+        assert [row.id for row in low_level_calls[0]["data"]] == [selected_id]
+        assert stored_checks == []
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_receipt_kind",
+    ["completed", "errored"],
+    ids=["completed", "errored"],
+)
+async def test_cognify_selected_provider_error_receipt_retries_with_free_router(
+    monkeypatch: Any, second_receipt_kind: str
+) -> None:
+    from importlib import import_module
+
+    import cognee
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb import model_routing
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    dataset_id = uuid4()
+    selected_id = uuid4()
+    selected = SimpleNamespace(id=selected_id)
+    provider_marker = (
+        "openrouter free-model daily quota; X-RateLimit-Reset=1787443200000"
+    )
+    inner_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=provider_marker,
+    )
+    outer_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: provider response",
+        data_ingestion_info=[{"run_info": inner_errored}],
+    )
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"data_id": selected_id}],
+    )
+    second_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: Bearer SECONDSECRET",
+    )
+    second_receipt = (
+        completed if second_receipt_kind == "completed" else second_errored
+    )
+    receipts: list[dict[str, Any]] = [
+        {str(dataset_id): outer_errored},
+        {str(dataset_id): second_receipt},
+    ]
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipts.pop(0)
+
+    async def selected_rows(
+        *, dataset: str, data_ids: list[str]
+    ) -> list[Any]:
+        assert dataset == "notes"
+        assert data_ids == [str(selected_id)]
+        return [selected]
+
+    fallback_errors: list[BaseException] = []
+
+    def activate_fallback(error: BaseException) -> bool:
+        fallback_errors.append(error)
+        return True
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        return {"ok": True, "violation_count": 0, "chunks_scanned": 1}
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        client := CogneePublicClient(),
+        "_prepare_cognee_environment",
+        lambda: None,
+    )
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "_cognify_selected_data_rows", selected_rows)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(
+        model_routing,
+        "activate_cognee_free_router_fallback",
+        activate_fallback,
+    )
+
+    if second_receipt_kind == "errored":
+        with pytest.raises(RuntimeError, match="PipelineRunErrored") as raised:
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id)],
+            )
+        assert "SECONDSECRET" not in str(raised.value)
+        assert "Bearer" not in str(raised.value)
+        assert len(low_level_calls) == 2
+        assert len(fallback_errors) == 1
+        assert stored_checks == []
+    else:
+        result = await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+        )
+
+        assert result[str(dataset_id)] is completed
+        assert len(low_level_calls) == 2
+        assert len(fallback_errors) == 1
+        assert provider_marker in str(fallback_errors[0])
+        assert low_level_calls[0]["incremental_loading"] is True
+        assert low_level_calls[0]["data_cache"] is True
+        assert low_level_calls[1]["incremental_loading"] is False
+        assert low_level_calls[1]["data_cache"] is False
+        assert stored_checks[0]["document_ids"] == [str(selected_id)]
+
+
+@pytest.mark.parametrize(
+    "receipt_kind",
+    ["errored", "unknown", "mixed"],
+    ids=["errored", "unknown", "mixed-terminal-results"],
+)
+def test_selected_cognify_receipt_fallback_rejects_unvalidated_results(
+    receipt_kind: str,
+) -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb.cognee_client import _selected_cognify_receipt_ids
+    dataset_id = uuid4()
+    data_id = uuid4()
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    if receipt_kind == "errored":
+        receipt: dict[str, Any] = {str(dataset_id): errored}
+    elif receipt_kind == "unknown":
+        receipt = {str(dataset_id): object()}
+    else:
+        receipt = {str(dataset_id): completed, "unknown": object()}
+
+    assert (
+        _selected_cognify_receipt_ids(
+            receipt,
+            selected_data=[SimpleNamespace(id=data_id)],
+            dataset="notes",
+        )
+        is None
+    )
+
+
+
+@pytest.mark.parametrize(
+    "receipt_shape",
+    ["outer", "inner", "nested", "mixed", "unknown"],
+    ids=[
+        "outer-result",
+        "inner-run-info",
+        "nested-ingestion",
+        "mixed-completed-errored",
+        "unknown-receipt",
+    ],
+)
+def test_selected_cognify_rejects_errored_terminal_receipts(
+    receipt_shape: str,
+) -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb.cognee_client import _selected_cognify_errored_result
+
+    dataset_id = uuid4()
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    if receipt_shape == "outer":
+        receipt: Any = {str(dataset_id): errored}
+    elif receipt_shape == "inner":
+        receipt = {"run_info": errored}
+    elif receipt_shape == "nested":
+        nested = PipelineRunCompleted(
+            pipeline_run_id=uuid4(),
+            dataset_id=dataset_id,
+            dataset_name="notes",
+            data_ingestion_info=[{"run_info": errored}],
+        )
+        receipt = {str(dataset_id): nested}
+    elif receipt_shape == "mixed":
+        receipt = {str(dataset_id): completed, "errored": errored}
+    else:
+        receipt = {"run_info": SimpleNamespace(dataset_id=dataset_id)}
+
+    found = _selected_cognify_errored_result(receipt)
+    assert found is (None if receipt_shape == "unknown" else errored)
+def test_selected_cognify_error_prefers_nested_provider_marker_and_sanitizes_payload() -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+    from kb.cognee_client import _selected_cognify_error
+    from kb.lifecycle_worker import _is_provider_quota_exhausted
+
+    dataset_id = uuid4()
+    selected_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=(
+            "openrouter free-model daily quota; "
+            "free-models-per-day-high-balance; "
+            "X-RateLimit-Reset=1787443200000"
+        ),
+    )
+    raw_response = (
+        "https://openrouter.ai/api/v1/chat/completions response "
+        "Bearer SUPERSECRET provider body"
+    )
+    outer_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=f"PipelineRunFailedError: {raw_response}",
+        data_ingestion_info=[{"run_info": selected_error}],
+    )
+
+    error = _selected_cognify_error({str(dataset_id): outer_error})
+
+    assert error is not None
+    message = str(error)
+    assert "openrouter" in message
+    assert "free-model daily quota" in message
+    assert "X-RateLimit-Reset=1787443200000" in message
+    assert "free-models-per-day-high-balance" in message
+    assert "SUPERSECRET" not in message
+    assert "Bearer" not in message
+    assert raw_response not in message
+    assert _is_provider_quota_exhausted(error)
+
+
+def test_selected_cognify_error_preserves_nested_embedding_provider_markers() -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+    from kb.cognee_client import _selected_cognify_error
+    from kb.embedding_profile import is_embedding_provider_failure
+
+    dataset_id = uuid4()
+    inner_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="Embedding provider quota; 429; X-RateLimit-Reset=1787443200000",
+    )
+    outer_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: Bearer OUTERSECRET",
+        data_ingestion_info=[{"run_info": inner_error}],
+    )
+
+    error = _selected_cognify_error({str(dataset_id): outer_error})
+
+    assert error is not None
+    message = str(error)
+    assert "embedding" in message
+    assert "quota" in message
+    assert "429" in message
+    assert "X-RateLimit-Reset=1787443200000" in message
+    assert "OUTERSECRET" not in message
+    assert "Bearer" not in message
+    assert is_embedding_provider_failure(error)
+
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_cognify_does_not_change_provider_route_on_failure(
@@ -5480,7 +6172,7 @@ async def _pipeline_runs_store(monkeypatch: Any) -> tuple[Any, Any]:
 
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    import importlib
+    from importlib import import_module
 
     import cognee.infrastructure.databases.relational as relational_mod
     from cognee.modules.data.models import Dataset
@@ -5489,10 +6181,10 @@ async def _pipeline_runs_store(monkeypatch: Any) -> tuple[Any, Any]:
     # The operations package __init__ rebinds these submodule names to the
     # functions they export, so a plain `import a.b.c as m` yields the
     # FUNCTION; import_module returns the real module to patch.
-    log_error_mod = importlib.import_module(
+    log_error_mod = import_module(
         "cognee.modules.pipelines.operations.log_pipeline_run_error"
     )
-    log_init_mod = importlib.import_module(
+    log_init_mod = import_module(
         "cognee.modules.pipelines.operations.log_pipeline_run_initiated"
     )
 

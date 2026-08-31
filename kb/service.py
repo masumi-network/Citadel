@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -59,6 +61,28 @@ from kb.source_search import search_github_sync_state
 from kb.tags import merge_tags
 
 logger = logging.getLogger(__name__)
+_JOB_IDS_UNSET = object()
+
+_ACTIVE_CAPTURE_RUN_ID: ContextVar[str | None] = ContextVar(
+    "citadel_active_capture_run_id", default=None
+)
+
+
+def current_capture_run_id() -> str | None:
+    """Return the capture watermark bound to the current scheduled stage."""
+    return _ACTIVE_CAPTURE_RUN_ID.get()
+
+
+@contextmanager
+def capture_run_scope(capture_run_id: str):
+    """Bind one capture watermark across all stage-local Citadel instances."""
+    if not isinstance(capture_run_id, str) or not capture_run_id.strip():
+        raise ValueError("capture_run_id must be a non-empty string")
+    token = _ACTIVE_CAPTURE_RUN_ID.set(capture_run_id)
+    try:
+        yield
+    finally:
+        _ACTIVE_CAPTURE_RUN_ID.reset(token)
 
 # Upper bound for search breadth. The HTTP /search route (SearchBody) already rejects
 # top_k outside [1, 100] and the MCP layer clamps to 25, but this is the single
@@ -304,6 +328,9 @@ class Citadel:
             if attestation:
                 capture_metadata["attestation"] = dict(attestation)
             self._assert_projection_routes_stable()
+            effective_capture_run_id = (
+                current_capture_run_id() or capture_run_id or session_id
+            )
             acceptance = self.lifecycle_store.accept_source(
                 data.encode("utf-8"),
                 capture=CaptureContext(
@@ -312,7 +339,7 @@ class Citadel:
                     source_locator=source_locator,
                     media_type=media_type,
                     capture_actor_id=capture_actor_id or self.config.user_id,
-                    capture_run_id=capture_run_id or session_id,
+                    capture_run_id=effective_capture_run_id,
                     captured_at=captured_at or datetime.now(UTC),
                     metadata=capture_metadata,
                 ),
@@ -426,6 +453,7 @@ class Citadel:
             include_chunks=include_chunks,
         )
         results: list[IngestResult] = []
+        effective_capture_run_id = current_capture_run_id() or capture_run_id
         for revision in current:
             if revision.tombstone:
                 continue
@@ -437,7 +465,7 @@ class Citadel:
                     source_locator=source_locator or revision.source_locator,
                     media_type=revision.media_type,
                     capture_actor_id=capture_actor_id or self.config.user_id,
-                    capture_run_id=capture_run_id,
+                    capture_run_id=effective_capture_run_id,
                     captured_at=captured_at or datetime.now(UTC),
                     metadata={
                         "replaces_source_revision_id": revision.source_revision_id,
@@ -603,8 +631,12 @@ class Citadel:
         self._lifecycle_projection_task = task
         task.add_done_callback(self._log_lifecycle_task_done)
         return True
-
-    def _start_graph_lifecycle_projection(self) -> bool:
+    def _start_graph_lifecycle_projection(
+        self,
+        *,
+        job_ids: Sequence[str] | None | object = _JOB_IDS_UNSET,
+        job_filter_owner: str | None = None,
+    ) -> bool:
         if (
             not self._lifecycle_vector_only
             or self.lifecycle_store is None
@@ -612,6 +644,14 @@ class Citadel:
         ):
             return False
         task = self._lifecycle_graph_projection_task
+        existing_worker = self.lifecycle_graph_worker
+        if existing_worker is not None and job_ids is not _JOB_IDS_UNSET:
+            requested_job_ids = None if job_ids is None else job_ids
+            if not existing_worker.set_job_filter(
+                requested_job_ids,
+                owner=job_filter_owner,
+            ):
+                return False
         if task is not None and not task.done():
             return True
         try:
@@ -621,6 +661,16 @@ class Citadel:
                 "lifecycle graph projection not started: no running event loop"
             )
             return False
+        if job_ids is _JOB_IDS_UNSET and existing_worker is not None:
+            initial_job_ids = existing_worker.job_ids
+            initial_owner = existing_worker.job_filter_owner
+        else:
+            initial_job_ids = None if job_ids is _JOB_IDS_UNSET else job_ids
+            initial_owner = (
+                None
+                if job_ids is _JOB_IDS_UNSET or job_ids is None
+                else job_filter_owner
+            )
         self.lifecycle_graph_worker = LifecycleProjectionWorker(
             self.lifecycle_store,
             self.cognee,
@@ -631,6 +681,8 @@ class Citadel:
             include_graph=True,
             include_deferred=True,
             deferred_only=True,
+            job_ids=initial_job_ids,
+            job_filter_owner=initial_owner,
         )
         task = loop.create_task(
             self._drain_lifecycle(self.lifecycle_graph_worker),
@@ -686,8 +738,12 @@ class Citadel:
                 config_digest=worker.config_digest,
                 include_deferred=worker.include_deferred,
                 deferred_only=worker.deferred_only,
+                job_ids=worker.job_ids if worker.include_graph else None,
             )
             if delay is None:
+                if worker.deferred_only and worker.job_ids:
+                    await asyncio.sleep(0.05)
+                    continue
                 return processed_count
             if delay > 0:
                 # A long quota backoff must not hide newly accepted work.
@@ -698,12 +754,34 @@ class Citadel:
         self._lifecycle_projection_gate.clear()
         return True
 
-    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
-        """Resume baseline work and optionally the scheduled graph lane."""
+    def resume_lifecycle_queue(
+        self,
+        *,
+        include_deferred: bool = False,
+        job_ids: Sequence[str] | None | object = _JOB_IDS_UNSET,
+        job_filter_owner: str | None = None,
+    ) -> bool:
+        """Resume lifecycle work without changing an owned exact graph filter."""
+        if include_deferred and job_ids is not _JOB_IDS_UNSET:
+            requested_job_ids = None if job_ids is None else job_ids
+            if not self._lifecycle_vector_only and self.lifecycle_worker is not None:
+                self.lifecycle_worker.set_job_filter(
+                    requested_job_ids,
+                    owner=job_filter_owner,
+                )
         self._lifecycle_projection_gate.set()
         started = self._start_lifecycle_projection()
         if include_deferred:
-            started = self._start_graph_lifecycle_projection() or started
+            if job_ids is _JOB_IDS_UNSET:
+                started = self._start_graph_lifecycle_projection() or started
+            else:
+                started = (
+                    self._start_graph_lifecycle_projection(
+                        job_ids=job_ids,
+                        job_filter_owner=job_filter_owner,
+                    )
+                    or started
+                )
         return started
 
     async def wait_for_lifecycle_idle(self) -> int:
@@ -730,7 +808,7 @@ class Citadel:
             raise ValueError("poll_seconds must be positive")
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
-        self._start_lifecycle_projection()
+        self.resume_lifecycle_queue(include_deferred=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         while True:
@@ -762,6 +840,15 @@ class Citadel:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+    def projection_states_for_job_ids(
+        self, job_ids: Sequence[str]
+    ) -> dict[str, Mapping[str, Any]]:
+        """Return exact lifecycle job and receipt states in one store read."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        return self.lifecycle_store.projection_states_for_job_ids(job_ids)
 
     def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
         """Return one bounded source-to-provider operation record."""

@@ -165,7 +165,8 @@ def _patch_phase1(monkeypatch: Any, *, code: int = 0, raises: bool = False) -> l
 
     suppressed: list[bool] = []
 
-    async def fake_phase1() -> int:
+    async def fake_phase1(**kwargs: Any) -> int:
+        del kwargs
         suppressed.append(_suppress_inline_cognify())
         if raises:
             raise RuntimeError("phase 1 exploded")

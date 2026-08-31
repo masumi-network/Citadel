@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -67,6 +68,7 @@ from kb.lifecycle import (
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
 )
+from kb.projection_barrier import ProjectionBarrierResult, wait_for_projection_barrier
 from kb.session_trace import force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
@@ -158,6 +160,12 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
         logger.error(
             "Background task %s died: %s", task.get_name(), exc, exc_info=exc
         )
+
+
+
+
+
+
 
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
@@ -362,6 +370,53 @@ class _McpAcceptShim:
                     merged = f"{merged}, {needed}"
         kept.append((b"accept", merged.encode("latin-1")))
         await self.app({**scope, "headers": kept}, receive, send)
+_EVOLVE_SOURCE_STAGES = ("github_sync", "repo_content_sync", "linear_sync")
+_EVOLVE_POST_PROJECTION_STAGES = ("self_improve", "promotion")
+
+
+async def _run_evolve_stage_group(
+    runner: Callable[..., Any],
+    *,
+    capture_run_id: str,
+    stages: tuple[str, ...],
+) -> int:
+    result = runner(capture_run_id=capture_run_id, stages=stages)
+    if isawaitable(result):
+        return int(await result)
+    return int(result)
+
+
+def _projection_job_ids_for_capture_run(
+    citadel: Any,
+    capture_run_id: str,
+) -> tuple[str, ...]:
+    store = getattr(citadel, "lifecycle_store", None)
+    query = getattr(store, "projection_job_ids_for_capture_run", None)
+    projection_factory = getattr(citadel, "_lifecycle_projection_request", None)
+    if not callable(query) or not callable(projection_factory):
+        return ()
+    projection = projection_factory()
+    return tuple(
+        query(
+            capture_run_id,
+            generation_id=projection.generation_id,
+            projection_version=projection.projection_version,
+            config_digest=projection.config_digest,
+        )
+    )
+
+
+async def _wait_for_evolve_projection_barrier(
+    citadel: Any,
+    job_ids: tuple[str, ...],
+) -> ProjectionBarrierResult:
+    return await wait_for_projection_barrier(
+        citadel,
+        job_ids,
+        timeout_seconds=_canary_timeout_seconds(),
+    )
+
+
 
 
 def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> None:
@@ -473,7 +528,7 @@ async def _acquire_maintenance(citadel: Any, timeout_seconds: float) -> Any | No
 
 
 async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
-    """Run every evolve stage and Cognify on the web server's event loop.
+    """Run the evolve stages and Cognify on the web server's event loop.
 
     Two Cognee and Kuzu constraints require one process and one loop:
     - cognee binds its async resources to the loop that created them. Cognify
@@ -483,9 +538,11 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
       may hold it. A second sync or Cognify process would contend with the web
       process for that lock.
 
-    Phase 1 runs source sync, self-improvement, promotion, and Linear sync with
-    inline Cognify suppressed. Phase 2 runs one Cognify pass. The first pass
-    waits for the remaining interval so a redeploy does not start heavy work.
+    Source sync runs first with inline Cognify suppressed. The first projection
+    barrier gates self-improvement and promotion. A second barrier drains jobs
+    created by those consumer stages. Phase 2 runs one Cognify pass when enabled.
+    The first pass waits for the remaining interval so a redeploy does not start
+    heavy work.
     """
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
@@ -512,6 +569,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             delay = float(interval_seconds)
             logger.info("Evolve scheduler: starting scheduled pass")
             citadel = get_citadel()
+            capture_run_id = f"evolve:{uuid4().hex}"
+            logger.info("Evolve scheduler: capture run %s", capture_run_id)
             # ORPHAN GUARD — before the pause and before Phase 1. A previous
             # pass's Phase 2 timed out and was deliberately left running:
             # cancelling it in-process could land inside a cognee write path,
@@ -553,6 +612,12 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             if callable(pause):
                 pause()
             phase1_ok = True
+            first_barrier_ok = True
+            first_barrier_reason: str | None = None
+            post_stages_ok = True
+            post_stages_reason: str | None = None
+            second_barrier_ok = True
+            second_barrier_reason: str | None = None
             phase1_reason: str | None = None
             # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
             # the writer lock so lifecycle cannot claim a lease and then wait inside
@@ -585,9 +650,15 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                             # cognify does not storm the writer lock; Phase 2 below cognifies once
                             # as the sole writer (#47).
                             with suppress_inline_cognify():
-                                code = await run_evolve_in_loop()
+                                code = await _run_evolve_stage_group(
+                                    run_evolve_in_loop,
+                                    capture_run_id=capture_run_id,
+                                    stages=_EVOLVE_SOURCE_STAGES,
+                                )
                             if code == 0:
-                                logger.info("Evolve scheduler: stages finished (exit=0)")
+                                logger.info(
+                                    "Evolve scheduler: source stages finished (exit=0)"
+                                )
                             else:
                                 phase1_ok = False
                                 phase1_reason = f"stages_exit_{code}"
@@ -596,7 +667,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                 # failed=..." line, so log at ERROR here to make the cycle
                                 # visibly bad rather than an INFO nobody reads (#89).
                                 logger.error(
-                                    "Evolve scheduler: stages finished with failures (exit=%s) - "
+                                    "Evolve scheduler: source stages finished with failures (exit=%s) - "
                                     "see the 'Evolve finished' line above for which stages failed",
                                     code,
                                 )
@@ -667,9 +738,17 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             try:
                 _resume_lifecycle_queue(citadel, include_deferred=False)
             except Exception:
-                logger.exception("Evolve scheduler: post-stages projection resume failed")
-            # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
+                logger.exception("Evolve scheduler: source projection resume failed")
+            # Phase 2: Cognify in-loop; the web process is the sole Kuzu writer.
             force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            cognify_enabled = os.getenv(
+                "CITADEL_EVOLVE_COGNIFY_ENABLED", "true"
+            ).strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -686,8 +765,17 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             # DATASET_PROCESSING_STARTED (P1-B). On timeout the task is left
             # running as this loop's single orphan and the guard at the top of the
             # pass takes over.
+            if cognify_enabled:
+                phase2_coro = citadel.cognify_dataset(force=force, verify=True)
+            else:
+                logger.info(
+                    "Evolve scheduler: Phase 2 Cognify skipped "
+                    "(CITADEL_EVOLVE_COGNIFY_ENABLED=false)"
+                )
+                phase2_ok = True
+                phase2_coro = asyncio.sleep(0, result={"ok": True})
             phase2_task = asyncio.create_task(
-                citadel.cognify_dataset(force=force, verify=True),
+                phase2_coro,
                 name="evolve-phase2-cognify",
             )
             _BACKGROUND_TASKS.add(phase2_task)
@@ -699,27 +787,30 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 # loop alive past _stop_evolve_scheduler.
                 async with asyncio.timeout(_evolve_cognify_timeout_seconds()):
                     result = await asyncio.shield(phase2_task)
-                verification = result.get("verification") or {}
-                _record_canary_verdict(
-                    ok=bool(result.get("ok")),
-                    search_hit=verification.get("search_hit"),
-                    graph_grew=result.get("graph_grew"),
-                    marker=verification.get("marker"),
-                    projection_chain_ok=verification.get("projection_chain_ok"),
-                    projection_receipt_count=len(verification.get("projection_receipts") or []),
-                )
-                projection_chain_ok = verification.get(
-                    "projection_chain_ok", verification.get("ok", True)
-                )
-                phase2_ok = bool(result.get("ok")) and projection_chain_ok is not False
-                if not phase2_ok:
-                    phase2_reason = "cognify_verification_failed"
-                logger.info(
-                    "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
-                    result.get("graph_after"),
-                    result.get("graph_grew"),
-                    _LAST_CANARY["ok"] if _LAST_CANARY is not None else None,
-                )
+                if cognify_enabled:
+                    verification = result.get("verification") or {}
+                    _record_canary_verdict(
+                        ok=bool(result.get("ok")),
+                        search_hit=verification.get("search_hit"),
+                        graph_grew=result.get("graph_grew"),
+                        marker=verification.get("marker"),
+                        projection_chain_ok=verification.get("projection_chain_ok"),
+                        projection_receipt_count=len(
+                            verification.get("projection_receipts") or []
+                        ),
+                    )
+                    projection_chain_ok = verification.get(
+                        "projection_chain_ok", verification.get("ok", True)
+                    )
+                    phase2_ok = bool(result.get("ok")) and projection_chain_ok is not False
+                    if not phase2_ok:
+                        phase2_reason = "cognify_verification_failed"
+                    logger.info(
+                        "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
+                        result.get("graph_after"),
+                        result.get("graph_grew"),
+                        _LAST_CANARY["ok"] if _LAST_CANARY is not None else None,
+                    )
             except asyncio.CancelledError:
                 # Teardown landing mid-Phase-2 (the canary can now wait minutes on
                 # its marker's projection, so this window is wide): the pass did
@@ -763,6 +854,120 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                 _record_canary_verdict(ok=False, error=exc.__class__.__name__)
             finally:
                 if not cancelled:
+                    if orphan is not None and not orphan.done():
+                        first_barrier_ok = False
+                        first_barrier_reason = "phase2_orphan"
+                        source_job_ids = ()
+                        logger.error(
+                            "Evolve scheduler: projection barrier deferred while "
+                            "the Phase 2 orphan is still running"
+                        )
+                    else:
+                        try:
+                            source_job_ids = _projection_job_ids_for_capture_run(
+                                citadel, capture_run_id
+                            )
+                        except Exception:
+                            first_barrier_ok = False
+                            first_barrier_reason = "projection_query_exception"
+                            logger.exception(
+                                "Evolve scheduler: source projection watermark lookup failed"
+                            )
+                            source_job_ids = ()
+
+                    if first_barrier_ok:
+                        try:
+                            first_barrier = await _wait_for_evolve_projection_barrier(
+                                citadel, source_job_ids
+                            )
+                            first_barrier_ok = first_barrier.complete
+                            if not first_barrier_ok:
+                                first_barrier_reason = "projection_barrier_incomplete"
+                                logger.error(
+                                    "Evolve scheduler: first projection barrier incomplete "
+                                    "(pending=%s failed=%s)",
+                                    first_barrier.pending_job_ids,
+                                    first_barrier.failed_job_ids,
+                                )
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            raise
+                        except Exception:
+                            first_barrier_ok = False
+                            first_barrier_reason = "projection_barrier_exception"
+                            logger.exception(
+                                "Evolve scheduler: first projection barrier failed"
+                            )
+
+                    if first_barrier_ok:
+                        try:
+                            with suppress_inline_cognify():
+                                post_code = await _run_evolve_stage_group(
+                                    run_evolve_in_loop,
+                                    capture_run_id=capture_run_id,
+                                    stages=_EVOLVE_POST_PROJECTION_STAGES,
+                                )
+                            if post_code != 0:
+                                post_stages_ok = False
+                                post_stages_reason = f"stages_exit_{post_code}"
+                                logger.error(
+                                    "Evolve scheduler: post-projection stages finished "
+                                    "with failures (exit=%s)",
+                                    post_code,
+                                )
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            raise
+                        except Exception:
+                            post_stages_ok = False
+                            post_stages_reason = "stages_exception"
+                            logger.exception(
+                                "Evolve scheduler: post-projection stages failed"
+                            )
+
+                        try:
+                            all_job_ids = _projection_job_ids_for_capture_run(
+                                citadel, capture_run_id
+                            )
+                            source_ids = set(source_job_ids)
+                            post_job_ids = tuple(
+                                job_id
+                                for job_id in all_job_ids
+                                if job_id not in source_ids
+                            )
+                        except Exception:
+                            second_barrier_ok = False
+                            second_barrier_reason = "projection_query_exception"
+                            post_job_ids = ()
+                            logger.exception(
+                                "Evolve scheduler: post-projection watermark lookup failed"
+                            )
+                        if second_barrier_ok:
+                            try:
+                                second_barrier = (
+                                    await _wait_for_evolve_projection_barrier(
+                                        citadel, post_job_ids
+                                    )
+                                )
+                                second_barrier_ok = second_barrier.complete
+                                if not second_barrier_ok:
+                                    second_barrier_reason = "projection_barrier_incomplete"
+                                    logger.error(
+                                        "Evolve scheduler: second projection barrier "
+                                        "incomplete (pending=%s failed=%s)",
+                                        second_barrier.pending_job_ids,
+                                        second_barrier.failed_job_ids,
+                                    )
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                raise
+                            except Exception:
+                                second_barrier_ok = False
+                                second_barrier_reason = "projection_barrier_exception"
+                                logger.exception(
+                                    "Evolve scheduler: second projection barrier failed"
+                                )
+                if not cancelled:
                     # Stamp the pass even when a stage failed. This records that the
                     # cycle RAN, which is what the next boot needs to resume the
                     # interval; whether the stages succeeded is already on the
@@ -771,13 +976,26 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                     # clock forever, which is the bug this fixes (#153). A CANCELLED
                     # pass is the one exception: it did not run, so it must not
                     # stamp (see the CancelledError branch above).
-                    cycle_ok = phase1_ok and phase2_ok
+                    cycle_ok = (
+                        phase1_ok
+                        and phase2_ok
+                        and first_barrier_ok
+                        and post_stages_ok
+                        and second_barrier_ok
+                    )
                     record_completed(
                         state_path,
                         ok=cycle_ok,
                         reason=None
                         if cycle_ok
-                        else (phase1_reason or phase2_reason or "scheduled_cycle_failed"),
+                        else (
+                            phase1_reason
+                            or phase2_reason
+                            or first_barrier_reason
+                            or post_stages_reason
+                            or second_barrier_reason
+                            or "scheduled_cycle_failed"
+                        ),
                     )
                     # Drain whatever the pass deferred. Projection starts are
                     # suppressed while Phase 1 holds the writer lock, and Phase 2
@@ -1672,6 +1890,7 @@ def get_mesh() -> MeshState:
     if not hasattr(app.state, "mesh"):
         app.state.mesh = MeshState()
     return app.state.mesh
+
 
 
 def get_github_syncer() -> GitHubOrgSyncer:
