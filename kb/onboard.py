@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from kb.capture_config import DEFAULT_NODE_URL
+from kb.hooks.search_inject import BASE_URL_ENV, SEARCH_MODULE
 from kb.hooks.sync_start import AGENT_POLICY_REMINDER
 
 TOKEN_ENV = "CITADEL_MCP_ACCESS_TOKEN"
@@ -38,6 +39,7 @@ START_MODULE = "kb.hooks.sync_start"
 _SESSION_HOOK_MARKER = SESSION_MODULE
 _START_HOOK_MARKER = START_MODULE
 
+_SEARCH_HOOK_MARKER = SEARCH_MODULE
 
 def _hook_python() -> str:
     """The interpreter that has `kb` installed (so the hooks can import it)."""
@@ -121,6 +123,16 @@ def _session_start_hook(python: str | None = None) -> dict[str, Any]:
         "command": f'"{py}" -m {START_MODULE}',
         "timeout": 10,
         "allowedEnvVars": [TOKEN_ENV],
+    }
+
+
+def _user_prompt_submit_hook(python: str | None = None) -> dict[str, Any]:
+    py = python or _hook_python()
+    return {
+        "type": "command",
+        "command": f'"{py}" -m {SEARCH_MODULE}',
+        "timeout": 10,
+        "allowedEnvVars": [TOKEN_ENV, BASE_URL_ENV],
     }
 
 
@@ -248,11 +260,12 @@ def merge_mcp_config(path: Path, base_url: str = DEFAULT_NODE_URL) -> str:
 
 
 def merge_claude_settings(path: Path, python: str | None = None) -> str:
-    """Merge the SessionEnd + SessionStart hooks into .claude/settings.json.
+    """Merge the SessionEnd, SessionStart, and UserPromptSubmit hooks.
 
     SessionEnd distills the closing session to the dev's node; SessionStart
-    injects a recent-activity digest. Both are idempotent (detected by module
-    marker) so the merge never duplicates them on re-run.
+    injects a recent-activity digest; UserPromptSubmit injects task search
+    context. All hooks are idempotent (detected by module marker) so the merge
+    never duplicates them on re-run.
     """
     data = _load_json_object(path)
     hooks = data.setdefault("hooks", {})
@@ -264,6 +277,9 @@ def merge_claude_settings(path: Path, python: str | None = None) -> str:
     session_start = hooks.setdefault("SessionStart", [])
     if not isinstance(session_start, list):
         raise ValueError(f"corrupt {path}: hooks.SessionStart must be an array")
+    user_prompt_submit = hooks.setdefault("UserPromptSubmit", [])
+    if not isinstance(user_prompt_submit, list):
+        raise ValueError(f"corrupt {path}: hooks.UserPromptSubmit must be an array")
 
     changed = False
     if not _event_has_marker(session_end, _SESSION_HOOK_MARKER):
@@ -272,12 +288,16 @@ def merge_claude_settings(path: Path, python: str | None = None) -> str:
     if not _event_has_marker(session_start, _START_HOOK_MARKER):
         session_start.append({"matcher": "startup|resume", "hooks": [_session_start_hook(python)]})
         changed = True
+    if not _event_has_marker(user_prompt_submit, _SEARCH_HOOK_MARKER):
+        user_prompt_submit.append({"hooks": [_user_prompt_submit_hook(python)]})
+        changed = True
     allowed = data.setdefault("httpHookAllowedEnvVars", [])
     if not isinstance(allowed, list):
         raise ValueError(f"corrupt {path}: httpHookAllowedEnvVars must be an array")
-    if TOKEN_ENV not in allowed:
-        allowed.append(TOKEN_ENV)
-        changed = True
+    for env_name in (TOKEN_ENV, BASE_URL_ENV):
+        if env_name not in allowed:
+            allowed.append(env_name)
+            changed = True
     if not changed:
         return "unchanged"
     _write_json(path, data)
