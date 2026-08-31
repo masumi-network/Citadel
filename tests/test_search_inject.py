@@ -217,6 +217,9 @@ def test_fetch_task_hits_posts_authenticated_bounded_search_request(
     assert request.get_header("Authorization") == "Bearer ctdl_secret"
     assert request.get_header("Content-type") == "application/json"
     assert timeout == search_inject.HTTP_TIMEOUT_SECONDS
+    # Advisor-set bound (2026-08-31): p90 7.45s / max 7.71s measured on prod;
+    # 10s converts every sampled 5s miss into a hit with 2.3s headroom.
+    assert timeout == 10
     assert payload["search_id"] == "search-1"
 
 
