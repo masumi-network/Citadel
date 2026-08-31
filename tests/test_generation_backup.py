@@ -16,6 +16,7 @@ import kb.generation_backup as generation_backup
 from kb.cli import _backup_generation_create, _backup_generation_restore, build_parser
 from kb.generation_backup import (
     GenerationBackupError,
+    QdrantSnapshotStore,
     create_generation_backup,
     restore_generation_backup,
 )
@@ -85,6 +86,59 @@ def _lite_root(root: Path) -> None:
     (root / "data-storage/source.txt").write_text("retained source", encoding="utf-8")
     (root / "citadel-state/auth.json").write_text('{"key":"hash-only"}\n', encoding="utf-8")
 
+@pytest.mark.parametrize(
+    ("configured_timeout", "expected_timeout"),
+    [(None, 900), ("1200", 1200)],
+)
+def test_qdrant_snapshot_store_passes_snapshot_timeout_to_client(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_timeout: str | None,
+    expected_timeout: int,
+) -> None:
+    client_kwargs: dict[str, Any] = {}
+
+    class FakeQdrantClient:
+        def __init__(self, **kwargs: Any) -> None:
+            client_kwargs.update(kwargs)
+
+    monkeypatch.setattr(generation_backup, "QdrantClient", FakeQdrantClient)
+    if configured_timeout is None:
+        monkeypatch.delenv("CITADEL_QDRANT_SNAPSHOT_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("CITADEL_QDRANT_SNAPSHOT_TIMEOUT_SECONDS", configured_timeout)
+
+    QdrantSnapshotStore(url="http://qdrant:6333", api_key="secret")
+
+    assert client_kwargs == {
+        "url": "http://qdrant:6333",
+        "api_key": "secret",
+        "timeout": expected_timeout,
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured_timeout", "error"),
+    [
+        ("not-a-number", "must be a finite number"),
+        ("0", "must be at least 1 second"),
+    ],
+)
+def test_qdrant_snapshot_store_rejects_invalid_snapshot_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_timeout: str,
+    error: str,
+) -> None:
+    class FakeQdrantClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setattr(generation_backup, "QdrantClient", FakeQdrantClient)
+    monkeypatch.setenv("CITADEL_QDRANT_SNAPSHOT_TIMEOUT_SECONDS", configured_timeout)
+
+    with pytest.raises(GenerationBackupError, match=error):
+        QdrantSnapshotStore(url="http://qdrant:6333", api_key="secret")
+
+
 
 def test_parser_exposes_generation_backup_and_restore() -> None:
     parser = build_parser()
@@ -136,6 +190,25 @@ def test_generation_backup_restores_every_provider_from_downloaded_artifacts(
     assert (backup_root / "local/data-storage/source.txt").read_text(encoding="utf-8") == "retained source"
     assert json.loads((backup_root / "manifest.json").read_text(encoding="utf-8")) == manifest
 
+    lifecycle_artifact = backup_root / "local/citadel-state/lifecycle.sqlite3"
+    lifecycle_bytes = bytearray(lifecycle_artifact.read_bytes())
+    lifecycle_bytes[24:28] = b"\x00\x00\x00\x00"
+    lifecycle_artifact.write_bytes(lifecycle_bytes)
+    for item in manifest["local_files"]:
+        if item["path"] == "citadel-state/lifecycle.sqlite3":
+            item["size"] = len(lifecycle_bytes)
+            item["sha256"] = hashlib.sha256(lifecycle_bytes).hexdigest()
+            break
+    manifest_path = backup_root / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (backup_root / "manifest.sha256").write_text(
+        f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}  manifest.json\n",
+        encoding="ascii",
+    )
+
     restore_root = tmp_path / "restore"
     restore_store = MemorySnapshotStore({})
     result = restore_generation_backup(
@@ -147,13 +220,60 @@ def test_generation_backup_restores_every_provider_from_downloaded_artifacts(
 
     assert result["generation_id"] == "generation-1"
     assert restore_store.restored == snapshots
-    with sqlite3.connect(restore_root / "cognee-system/databases/cognee.db") as connection:
+    restored_database = restore_root / "cognee-system/databases/cognee.db"
+    restored_lifecycle = restore_root / "citadel-state/lifecycle.sqlite3"
+    assert restored_database.read_bytes() == (
+        backup_root / "local/cognee-system/databases/cognee.db"
+    ).read_bytes()
+    assert restored_lifecycle.read_bytes() == lifecycle_artifact.read_bytes()
+    with sqlite3.connect(restored_database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("SELECT value FROM documents").fetchall() == [("doc-1",)]
-    with sqlite3.connect(restore_root / "citadel-state/lifecycle.sqlite3") as connection:
+    with sqlite3.connect(restored_lifecycle) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("SELECT value FROM revisions").fetchall() == [
             ("revision-1",)
         ]
 
+
+def test_generation_restore_rejects_mutated_target_sqlite_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    _lite_root(source_root)
+    backup_root = tmp_path / "generation-backup"
+    create_generation_backup(
+        generation_id="generation-1",
+        data_root=source_root,
+        destination=backup_root,
+        snapshot_store=MemorySnapshotStore({"collection-1": b"snapshot"}),
+    )
+    restore_store = MemorySnapshotStore({})
+    original_copy_sqlite = generation_backup._copy_sqlite
+
+    def copy_and_mutate_target(source_path: Path, destination_path: Path) -> None:
+        original_copy_sqlite(source_path, destination_path)
+        if destination_path.name == "lifecycle.sqlite3":
+            mutated = bytearray(destination_path.read_bytes())
+            mutated[-1] ^= 1
+            destination_path.write_bytes(mutated)
+
+    monkeypatch.setattr(generation_backup, "_copy_sqlite", copy_and_mutate_target)
+
+    with pytest.raises(
+        GenerationBackupError,
+        match="restored artifact digest mismatch: citadel-state/lifecycle.sqlite3",
+    ):
+        restore_generation_backup(
+            generation_id="generation-1",
+            backup_root=backup_root,
+            target_data_root=tmp_path / "restore",
+            snapshot_store=restore_store,
+        )
+
+    assert restore_store.restored == {}
+    assert not (tmp_path / "restore").exists()
 
 def test_generation_backup_maps_configured_lite_roots_and_database_names(
     monkeypatch: pytest.MonkeyPatch,

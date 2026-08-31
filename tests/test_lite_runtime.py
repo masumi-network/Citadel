@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ LITE_WRITTEN_ENV_KEYS = (
     "SYSTEM_ROOT_DIRECTORY",
     "DATA_ROOT_DIRECTORY",
     "CACHE_ROOT_DIRECTORY",
+    "FASTEMBED_CACHE_PATH",
     "COGNEE_LOGS_DIR",
     "CITADEL_STATE_DIRECTORY",
     "LADYBUG_HOME_DIRECTORY",
@@ -29,6 +31,11 @@ LITE_WRITTEN_ENV_KEYS = (
     "TELEMETRY_DISABLED",
     "AUTO_FEEDBACK",
     "CITADEL_COGNIFY_QUEUE_PATH",
+    "CITADEL_LITE_DATA_ROOT",
+    "CITADEL_LIFECYCLE_STORE_PATH",
+    "CITADEL_LITE_PROJECTION_CUTOVER_ROOT",
+    "CITADEL_LITE_PROJECTION_CUTOVER_BACKUP_ROOT",
+    "CITADEL_LITE_PROJECTION_CUTOVER_MANIFEST_SHA256",
 )
 
 
@@ -187,6 +194,141 @@ def test_configure_lite_environment_preserves_cache_root_override(
 
     assert Path(os.environ["CACHE_ROOT_DIRECTORY"]) == cache_override
     assert cache_override.is_dir()
+
+
+def test_rebind_lite_paths_preserves_nested_persisted_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_root = Path("/data")
+    new_root = tmp_path / "new-root"
+    external = tmp_path / "external" / "access.json"
+    configured = {
+        "CITADEL_ACCESS_STORE_PATH": old_root / "citadel-state/auth/access.json",
+        "CITADEL_REPAIR_JOURNAL_PATH": old_root / "citadel-state/repair/repair.jsonl",
+        "CITADEL_EVALUATION_GATE_PATH": old_root / "citadel-state/gates/evaluation.json",
+        "CITADEL_CONTACT_STORE_PATH": external,
+    }
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", str(old_root))
+    root_paths = "README.md,docs/"
+    monkeypatch.setenv("CITADEL_REPO_CONTENT_SYNC_ROOT_PATHS", root_paths)
+
+    for name, value in configured.items():
+        monkeypatch.setenv(name, str(value))
+
+    lite_runtime._rebind_lite_paths(new_root)
+
+    state_root = new_root / "citadel-state"
+    assert Path(os.environ["CITADEL_ACCESS_STORE_PATH"]) == state_root / "auth/access.json"
+    assert Path(os.environ["CITADEL_REPAIR_JOURNAL_PATH"]) == state_root / "repair/repair.jsonl"
+    assert Path(os.environ["CITADEL_EVALUATION_GATE_PATH"]) == (
+        state_root / "gates/evaluation.json"
+    )
+    assert os.environ["CITADEL_CONTACT_STORE_PATH"] == str(external)
+    assert os.environ["CITADEL_REPO_CONTENT_SYNC_ROOT_PATHS"] == root_paths
+
+
+def test_rebind_lite_paths_preserves_external_fastembed_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fastembed_cache = "/opt/fastembed-cache"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", "/data")
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", fastembed_cache)
+
+    lite_runtime._rebind_lite_paths(tmp_path / "new-root")
+
+    assert os.environ["FASTEMBED_CACHE_PATH"] == fastembed_cache
+
+
+def test_rebind_lite_paths_preserves_relative_persisted_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    relative = "citadel-state/contacts.json"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", "/data")
+    monkeypatch.setenv("CITADEL_CONTACT_STORE_PATH", relative)
+
+    lite_runtime._rebind_lite_paths(tmp_path / "new-root")
+
+    assert os.environ["CITADEL_CONTACT_STORE_PATH"] == relative
+
+
+def test_rebind_lite_paths_canonicalizes_lifecycle_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_root = Path("/data")
+    new_root = tmp_path / "new-root"
+    old_state = old_root / ".citadel"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", str(old_root))
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(old_state))
+    monkeypatch.setenv(
+        "CITADEL_LIFECYCLE_STORE_PATH",
+        str(old_state / "legacy/lifecycle.sqlite3"),
+    )
+    monkeypatch.setenv(
+        "CITADEL_ACCESS_STORE_PATH",
+        str(old_state / "auth/access.json"),
+    )
+
+    lite_runtime._rebind_lite_paths(new_root)
+
+    assert Path(os.environ["CITADEL_LIFECYCLE_STORE_PATH"]) == (
+        new_root / "citadel-state/lifecycle.sqlite3"
+    )
+    assert Path(os.environ["CITADEL_ACCESS_STORE_PATH"]) == (
+        new_root / "citadel-state/auth/access.json"
+    )
+
+
+def test_rebind_lite_paths_maps_all_storage_root_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_root = Path("/data")
+    old_system_root = old_root / "cognee-system"
+    old_data_root = old_root / "data-storage"
+    old_state_root = old_root / "citadel-state"
+    new_root = tmp_path / "new-root"
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", str(old_root))
+    monkeypatch.setenv("SYSTEM_ROOT_DIRECTORY", str(old_system_root))
+    monkeypatch.setenv("DATA_ROOT_DIRECTORY", str(old_data_root))
+    monkeypatch.setenv("CITADEL_STATE_DIRECTORY", str(old_state_root))
+    monkeypatch.setenv(
+        "CITADEL_CONTACT_STORE_PATH",
+        str(old_data_root / "nested/contact.json"),
+    )
+    monkeypatch.setenv(
+        "CITADEL_REPAIR_JOURNAL_PATH",
+        str(old_system_root / "nested/repair.jsonl"),
+    )
+    monkeypatch.setenv(
+        "CITADEL_LIFECYCLE_STORE_PATH",
+        str(old_system_root / "nested/lifecycle.sqlite3"),
+    )
+    monkeypatch.setenv(
+        "CITADEL_EVALUATION_GATE_PATH",
+        str(old_state_root / "nested/evaluation.json"),
+    )
+    outside_storage = str(old_root / "outside/persisted.json")
+    monkeypatch.setenv("CITADEL_OBSIDIAN_SYNC_STATE_PATH", outside_storage)
+
+    lite_runtime._rebind_lite_paths(new_root)
+
+    assert Path(os.environ["CITADEL_CONTACT_STORE_PATH"]) == (
+        new_root / "data-storage/nested/contact.json"
+    )
+    assert Path(os.environ["CITADEL_REPAIR_JOURNAL_PATH"]) == (
+        new_root / "cognee-system/nested/repair.jsonl"
+    )
+    assert Path(os.environ["CITADEL_EVALUATION_GATE_PATH"]) == (
+        new_root / "citadel-state/nested/evaluation.json"
+    )
+    assert os.environ["CITADEL_OBSIDIAN_SYNC_STATE_PATH"] == outside_storage
+    assert Path(os.environ["CITADEL_LIFECYCLE_STORE_PATH"]) == (
+        new_root / "citadel-state/lifecycle.sqlite3"
+    )
 
 
 def test_configure_lite_environment_rejects_postgres(
@@ -359,3 +501,220 @@ def test_quarantine_renames_unreadable_sqlite_and_sidecars(tmp_path: Path) -> No
     assert (tmp_path / "cognee.db.corrupt-20260817T073000Z-shm").read_bytes() == b"shm"
     assert not wal.exists()
     assert not shm.exists()
+
+
+def test_main_runs_prelock_backup_before_startup(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    events: list[object] = []
+
+    destination = "/data/backups/v058-canonical-20260829"
+
+    monkeypatch.setenv("CITADEL_LITE_BACKUP_DESTINATION", destination)
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-058")
+    monkeypatch.setenv("VECTOR_DB_URL", "http://qdrant:6333")
+    monkeypatch.setenv("VECTOR_DB_KEY", "qdrant-key")
+
+    def configure(data_root: Path | None = None) -> Path:
+        events.append(("configure", data_root))
+        return Path("/data")
+
+    class FakeSnapshotStore:
+        def __init__(self, *, url: str, api_key: str | None) -> None:
+            events.append(("qdrant", url, api_key))
+
+        def __enter__(self) -> FakeSnapshotStore:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("qdrant-close")
+
+    def create_backup(
+        *,
+        generation_id: str,
+        data_root: Path,
+        destination: Path,
+        snapshot_store: object,
+    ) -> dict[str, object]:
+        events.append(
+            ("backup", generation_id, data_root, destination, snapshot_store.__class__.__name__)
+        )
+        return {"generation_id": generation_id, "destination": str(destination)}
+
+    monkeypatch.setattr(lite_runtime, "configure_lite_environment", configure)
+
+    def drop_privileges(_root: Path) -> None:
+        raise AssertionError("pre-lock backup must run before dropping privileges")
+
+    monkeypatch.setattr(lite_runtime, "drop_root_privileges", drop_privileges)
+
+    def lock(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("pre-lock backup must not acquire the Lite writer lock")
+    monkeypatch.setattr(lite_runtime, "acquire_single_instance_lock", lock)
+
+    async def migrations() -> None:
+        raise AssertionError("pre-lock backup must not run migrations")
+    monkeypatch.setattr(lite_runtime, "run_migrations", migrations)
+
+    fake_generation_backup = SimpleNamespace(
+        QdrantSnapshotStore=FakeSnapshotStore,
+        create_generation_backup=create_backup,
+    )
+    monkeypatch.setitem(sys.modules, "kb.generation_backup", fake_generation_backup)
+
+    lite_runtime.main()
+
+    assert events == [
+        ("configure", None),
+        ("qdrant", "http://qdrant:6333", "qdrant-key"),
+        ("backup", "generation-058", Path("/data"), Path(destination), "FakeSnapshotStore"),
+        "qdrant-close",
+    ]
+    assert json.dumps(
+        {"generation_id": "generation-058", "destination": destination}, sort_keys=True
+    ) in capsys.readouterr().out
+
+
+def test_main_reports_prelock_backup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_LITE_BACKUP_DESTINATION", "/data/backups/failure")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-058")
+    monkeypatch.setenv("VECTOR_DB_URL", "http://qdrant:6333")
+    monkeypatch.setenv("VECTOR_DB_KEY", "qdrant-key")
+
+    def configure(data_root: Path | None = None) -> Path:
+        return Path("/data")
+
+    class FailingSnapshotStore:
+        def __init__(self, *, url: str, api_key: str | None) -> None:
+            pass
+
+        def __enter__(self) -> FailingSnapshotStore:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    def create_backup(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("backup failed")
+
+    fake_generation_backup = SimpleNamespace(
+        QdrantSnapshotStore=FailingSnapshotStore,
+        create_generation_backup=create_backup,
+    )
+    monkeypatch.setitem(sys.modules, "kb.generation_backup", fake_generation_backup)
+
+    monkeypatch.setattr(lite_runtime, "configure_lite_environment", configure)
+    monkeypatch.setattr(
+        lite_runtime,
+        "acquire_single_instance_lock",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pre-lock backup must run before the Lite writer lock")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="backup failed") as error:
+        lite_runtime.main()
+
+    assert error.value.code != 0
+
+
+def test_main_runs_projection_cutover_before_lock_and_starts_web(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+    target = tmp_path / "clean-root"
+    backup = tmp_path / "backup"
+    manifest_hash = "a" * 64
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_ROOT", str(target))
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_BACKUP_ROOT", str(backup))
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_MANIFEST_SHA256", manifest_hash)
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-059")
+
+    def cutover() -> dict[str, object]:
+        events.append(
+            ("cutover", {"target_root": Path(os.environ["CITADEL_LITE_PROJECTION_CUTOVER_ROOT"])})
+        )
+        target.mkdir()
+        return {"ok": True, "generation_id": "generation-059"}
+
+    def configure(data_root: Path | None = None) -> Path:
+        events.append(("configure", data_root))
+        return Path(data_root or target)
+    monkeypatch.setattr(lite_runtime, "configure_lite_environment", configure)
+    monkeypatch.setattr(lite_runtime, "run_prelock_projection_cutover", cutover)
+    monkeypatch.setattr(lite_runtime, "drop_root_privileges", lambda root: events.append("drop"))
+    monkeypatch.setattr(
+        lite_runtime,
+        "acquire_single_instance_lock",
+        lambda *_args, **_kwargs: events.append("lock"),
+    )
+    monkeypatch.setattr(lite_runtime, "wait_for_qdrant", lambda: events.append("qdrant"))
+
+    async def migrations() -> None:
+        events.append("migrations")
+
+    monkeypatch.setattr(lite_runtime, "run_migrations", migrations)
+    monkeypatch.setattr(
+        lite_runtime,
+        "write_bootstrap_receipt",
+        lambda root: events.append(("receipt", root)) or target / "bootstrap.json",
+    )
+    monkeypatch.setattr(lite_runtime.os, "execv", lambda executable, args: events.append(("exec", args)))
+    lite_runtime.main()
+
+    assert [item[0] if isinstance(item, tuple) else item for item in events] == [
+        "cutover",
+        "configure",
+        "drop",
+        "lock",
+        "qdrant",
+        "migrations",
+        "receipt",
+        "exec",
+    ]
+    assert events[0][1]["target_root"] == target
+    assert events[1][1] == target
+
+
+def test_projection_cutover_rebinds_persisted_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from kb import projection_cutover
+
+    target = tmp_path / "clean-root"
+    backup = tmp_path / "backup"
+    manifest_hash = "b" * 64
+    monkeypatch.setenv("CITADEL_LITE_DATA_ROOT", "/data")
+    monkeypatch.setenv("CITADEL_ACCESS_STORE_PATH", "/data/citadel-state/auth/access.json")
+    monkeypatch.setenv("CITADEL_GENERATION_ID", "generation-060")
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_ROOT", str(target))
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_BACKUP_ROOT", str(backup))
+    monkeypatch.setenv("CITADEL_LITE_PROJECTION_CUTOVER_MANIFEST_SHA256", manifest_hash)
+    calls: list[dict[str, object]] = []
+
+    def prepare(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"ok": True, "generation_id": "generation-060"}
+
+    monkeypatch.setattr(projection_cutover, "prepare_projection_cutover", prepare)
+
+    assert lite_runtime.run_prelock_projection_cutover() == {
+        "ok": True,
+        "generation_id": "generation-060",
+    }
+
+    assert calls == [
+        {
+            "backup_root": backup,
+            "target_root": target,
+            "generation_id": "generation-060",
+            "manifest_sha256": manifest_hash,
+        }
+    ]
+    assert Path(os.environ["CITADEL_ACCESS_STORE_PATH"]) == (
+        target / "citadel-state/auth/access.json"
+    )
