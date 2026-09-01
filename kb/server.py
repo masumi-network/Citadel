@@ -889,6 +889,16 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     first_barrier.pending_job_ids,
                                     first_barrier.failed_job_ids,
                                 )
+                            else:
+                                logger.info(
+                                    "Evolve scheduler: first projection barrier complete "
+                                    "(capture_run_id=%s jobs=%d searchable=%d pending=%d failed=%d)",
+                                    capture_run_id,
+                                    len(first_barrier.job_ids),
+                                    len(first_barrier.searchable_job_ids),
+                                    len(first_barrier.pending_job_ids),
+                                    len(first_barrier.failed_job_ids),
+                                )
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -913,6 +923,12 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     "Evolve scheduler: post-projection stages finished "
                                     "with failures (exit=%s)",
                                     post_code,
+                                )
+                            else:
+                                logger.info(
+                                    "Evolve scheduler: post-projection stages finished "
+                                    "(capture_run_id=%s exit=0)",
+                                    capture_run_id,
                                 )
                         except asyncio.CancelledError:
                             raise
@@ -955,6 +971,16 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                         "incomplete (pending=%s failed=%s)",
                                         second_barrier.pending_job_ids,
                                         second_barrier.failed_job_ids,
+                                    )
+                                else:
+                                    logger.info(
+                                        "Evolve scheduler: second projection barrier complete "
+                                        "(capture_run_id=%s jobs=%d searchable=%d pending=%d failed=%d)",
+                                        capture_run_id,
+                                        len(second_barrier.job_ids),
+                                        len(second_barrier.searchable_job_ids),
+                                        len(second_barrier.pending_job_ids),
+                                        len(second_barrier.failed_job_ids),
                                     )
                             except asyncio.CancelledError:
                                 raise

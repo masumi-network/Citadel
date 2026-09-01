@@ -7282,8 +7282,10 @@ async def test_evolve_scheduler_preserves_failed_canary_when_phase2_disabled(
 async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    caplog.set_level(logging.INFO, logger="kb.server")
     import kb.evolve_state as evolve_state
     import scripts.run_railway as run_railway
 
@@ -7397,6 +7399,24 @@ async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
     stage_events = [event for event in events if event[0] == "stages"]
     barrier_events = [event for event in events if event[0] == "barrier"]
 
+    capture_run_id = stage_events[0][2]
+    success_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if (
+            "projection barrier complete" in record.getMessage()
+            or "post-projection stages finished (capture_run_id=" in record.getMessage()
+        )
+    ]
+    assert success_logs == [
+        "Evolve scheduler: first projection barrier complete "
+        f"(capture_run_id={capture_run_id} jobs=1 searchable=1 pending=0 failed=0)",
+        "Evolve scheduler: post-projection stages finished "
+        f"(capture_run_id={capture_run_id} exit=0)",
+        "Evolve scheduler: second projection barrier complete "
+        f"(capture_run_id={capture_run_id} jobs=1 searchable=1 pending=0 failed=0)",
+    ]
+
     assert [(event[0], event[1]) for event in events] == [
         ("stages", ("github_sync", "repo_content_sync", "linear_sync")),
         ("barrier", ("source-job",)),
@@ -7414,6 +7434,47 @@ async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
         ("source-job",),
         ("post-stage-job",),
     ]
+
+@pytest.mark.asyncio
+async def test_evolve_scheduler_omits_success_logs_for_incomplete_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kb import server as server_module
+
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    caplog.set_level(logging.INFO, logger="kb.server")
+    citadel = _SchedulerCitadel()
+
+    async def incomplete_barrier(
+        _citadel: Any,
+        job_ids: Any,
+        *,
+        timeout_seconds: float,
+    ) -> ProjectionBarrierResult:
+        del timeout_seconds
+        ids = tuple(job_ids)
+        return ProjectionBarrierResult(ids, (), ids, (), False)
+
+    monkeypatch.setattr(
+        server_module,
+        "wait_for_projection_barrier",
+        incomplete_barrier,
+    )
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch,
+        citadel,
+        tmp_path / "evolve-state.json",
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any(
+        "first projection barrier complete" in message
+        or "post-projection stages finished (capture_run_id=" in message
+        or "second projection barrier complete" in message
+        for message in messages
+    )
 
 
 
