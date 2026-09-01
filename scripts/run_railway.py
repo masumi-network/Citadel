@@ -177,12 +177,19 @@ async def _promotion_stage_async() -> int:
     from kb.improvement_policy import automation_evaluation_passed
     from kb.learning import LearningProcess
     from kb.promotion import PromotionEngine
-    from kb.service import Citadel
+    from kb.service import Citadel, current_capture_run_id
 
     citadel = Citadel.from_env()
     config = citadel.config
     if not config.promotion_enabled:
         logger.info("Promotion stage skipped: disabled via CITADEL_PROMOTION_ENABLED")
+        return 0
+    capture_run_id = current_capture_run_id()
+    if capture_run_id is None:
+        logger.info(
+            "promotion stage skipped: no capture watermark "
+            "(unbarriered standalone run)"
+        )
         return 0
     if not automation_evaluation_passed(config):
         logger.info("Promotion stage skipped: Central evaluation gate has not passed")
@@ -207,7 +214,10 @@ async def _promotion_stage_async() -> int:
         failures = 0
         for seat in seats:
             try:
-                result = await engine.run(seat, dry_run=config.promotion_dry_run)
+                run_kwargs: dict[str, Any] = {"dry_run": config.promotion_dry_run}
+                if capture_run_id is not None:
+                    run_kwargs["capture_run_id"] = capture_run_id
+                result = await engine.run(seat, **run_kwargs)
             except Exception as exc:
                 logger.error(
                     "Promotion failed for %s: %s: %s",

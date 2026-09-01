@@ -64,6 +64,7 @@ class FakeLearning:
                 "attestation": kwargs.get("attestation"),
                 "allow_llm": kwargs.get("allow_llm"),
                 "defer_cognify": kwargs.get("defer_cognify"),
+                "capture_run_id": kwargs.get("capture_run_id"),
             }
         )
         if self.central_reject_reason and dataset == CENTRAL:
@@ -175,6 +176,29 @@ async def test_relevant_clean_item_is_promoted_to_central_with_audit(tmp_path: P
     assert promote_events[0]["success"] is True
     assert promote_events[0]["dataset"] == CENTRAL
     assert promote_events[0]["detail"]["seat"] == SEAT
+
+
+async def test_promotion_write_carries_capture_watermark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kb.service import capture_run_scope
+
+    engine, learning, _store = _engine(
+        tmp_path,
+        [_org_note()],
+        _github_state(tmp_path),
+    )
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+
+    with capture_run_scope("evolve:promotion"):
+        result = await engine.run(
+            SEAT,
+            dry_run=False,
+            capture_run_id="evolve:promotion",
+        )
+
+    assert result["promoted"] == 1
+    assert learning.central_writes[0]["capture_run_id"] == "evolve:promotion"
 
 
 async def test_auto_promotion_attests_the_request_actor(

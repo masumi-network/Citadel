@@ -929,6 +929,7 @@ class AccessStore:
                 score=item.score,
                 relevant=item.relevant,
                 sensitive=item.sensitive,
+                secret_scan=item.secret_scan,
             )
             next_items.append(updated.to_dict())
         if updated is None:

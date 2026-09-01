@@ -361,7 +361,7 @@ def test_evolve_continues_past_a_failed_stage(monkeypatch: Any) -> None:
     ]
 
 
-def test_promotion_stage_fails_after_partial_seat_failure(monkeypatch: Any) -> None:
+def test_promotion_stage_skips_unbarriered_run(monkeypatch: Any) -> None:
     import kb.access as access
     import kb.improvement_policy as improvement_policy
     import kb.learning as learning
@@ -407,8 +407,62 @@ def test_promotion_stage_fails_after_partial_seat_failure(monkeypatch: Any) -> N
     monkeypatch.setattr(learning, "LearningProcess", lambda citadel: object())
     monkeypatch.setattr(promotion, "PromotionEngine", FakePromotionEngine)
 
-    assert run_railway.run_async(run_railway._promotion_stage_async()) == 1
-    assert calls == ["seat:alice", "seat:bob"]
+    assert run_railway.run_async(run_railway._promotion_stage_async()) == 0
+    assert calls == []
+
+
+def test_promotion_stage_uses_scheduler_capture_watermark(monkeypatch: Any) -> None:
+    import kb.access as access
+    import kb.improvement_policy as improvement_policy
+    import kb.learning as learning
+    import kb.promotion as promotion
+    import kb.service as service
+
+    calls: list[tuple[str, bool, str | None]] = []
+
+    class FakeConfig:
+        promotion_enabled = True
+        promotion_dry_run = False
+        access_store_path = "unused.json"
+
+    class FakeCitadel:
+        config = FakeConfig()
+
+    class FakeAccessStore:
+        def __init__(self, path: str) -> None:
+            assert path == "unused.json"
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "principals": [
+                    {"seat_slug": "alice", "default_dataset": "seat:alice"},
+                ]
+            }
+
+    class FakePromotionEngine:
+        def __init__(self, *args: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            seat: str,
+            *,
+            dry_run: bool,
+            capture_run_id: str | None = None,
+        ) -> dict[str, int]:
+            calls.append((seat, dry_run, capture_run_id))
+            return {"promoted": 1}
+
+    monkeypatch.setattr(service.Citadel, "from_env", classmethod(lambda cls: FakeCitadel()))
+    monkeypatch.setattr(access, "AccessStore", FakeAccessStore)
+    monkeypatch.setattr(improvement_policy, "automation_evaluation_passed", lambda config: True)
+    monkeypatch.setattr(learning, "LearningProcess", lambda citadel: object())
+    monkeypatch.setattr(promotion, "PromotionEngine", FakePromotionEngine)
+
+    with service.capture_run_scope("evolve:scheduled"):
+        assert run_railway.run_async(run_railway._promotion_stage_async()) == 0
+
+    assert calls == [("seat:alice", False, "evolve:scheduled")]
 
 
 def test_evolve_exits_nonzero_when_all_enabled_stages_fail(monkeypatch: Any) -> None:

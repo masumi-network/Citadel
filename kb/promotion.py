@@ -43,7 +43,7 @@ from kb.promotion_queue import (
 )
 from kb.promotion_refs import ReferenceAssessment, assess_org_reference, parse_capture_tags_from_text
 from kb.security_scan import SecurityScanEntry, scan_text_entries
-from kb.service import Citadel
+from kb.service import Citadel, current_capture_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -533,6 +533,7 @@ class PromotionEngine:
         proposal: ProposedPromotion,
         *,
         attested_by: AccessIdentity | None = None,
+        capture_run_id: str | None = None,
     ) -> str:
         """Promote one qualifying item via the org-ready dual-write path.
 
@@ -589,6 +590,11 @@ class PromotionEngine:
                 operation="promotion",
                 attestation=attestation,
                 defer_cognify=True,
+                capture_run_id=(
+                    capture_run_id
+                    if capture_run_id is not None
+                    else current_capture_run_id()
+                ),
             )
         except SecretContentError as exc:
             self.access_store.record_event(
@@ -677,6 +683,7 @@ class PromotionEngine:
         dry_run: bool = True,
         max_items: int | None = None,
         actor: AccessIdentity | None = None,
+        capture_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Enumerate, decide, and (when ``dry_run=False``) promote.
 
@@ -728,6 +735,7 @@ class PromotionEngine:
                     identity,
                     proposal,
                     attested_by=actor,
+                    capture_run_id=capture_run_id,
                 )
                 if outcome == "promoted":
                     promoted += 1

@@ -649,3 +649,43 @@ def test_approved_capture_roots_round_trip(tmp_path: Path) -> None:
 
     loaded = access_store.get_approved_capture_roots("alice")
     assert loaded.paths == ("/Users/alice/work",)
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_decide_promotion_preserves_secret_scan(
+    tmp_path: Path, decision: str
+) -> None:
+    from kb.promotion_queue import PromotionPendingItem
+
+    access_store = store(tmp_path)
+    pending_item = PromotionPendingItem(
+        id="promo-secret-scan",
+        seat_slug="alice",
+        seat_dataset="seat:alice",
+        candidate_text="candidate",
+        candidate_hash="candidate-hash",
+        preview="candidate",
+        reference_status="new_org_project",
+        reference_reason="new project",
+        created_at="2026-08-31T00:00:00+00:00",
+        secret_scan={
+            "ok": True,
+            "blocked": False,
+            "highest_severity": None,
+            "finding_count": 0,
+            "findings": [],
+            "scanned_at": "2026-08-31T00:00:00+00:00",
+        },
+    )
+    access_store.add_promotion_pending(pending_item)
+    listed = access_store.list_promotion_pending(seat_slug="alice")
+    assert listed == [pending_item]
+
+    updated = access_store.decide_promotion_pending(
+        pending_item.id,
+        decision=decision,
+        actor_id="admin",
+        actor_name="Admin",
+    )
+
+    assert updated.secret_scan == pending_item.secret_scan
