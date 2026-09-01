@@ -11,6 +11,7 @@ Explicit agent ratings still go through ``POST /feedback`` /
 from __future__ import annotations
 
 from hashlib import sha256
+import math
 from typing import Any
 
 from kb.security_scan import redact_secrets
@@ -99,6 +100,13 @@ def _safe_str(value: Any, *, limit: int) -> str | None:
     return text[:limit]
 
 
+def _redacted_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = redact_secrets(str(value)).strip()
+    return text or None
+
+
 def _hit_score(item: dict[str, Any]) -> float | None:
     for key in ("score", "relevance", "similarity"):
         value = item.get(key)
@@ -119,9 +127,18 @@ def summarize_hit(item: Any, *, rank: int) -> dict[str, Any] | None:
     provenance = (
         envelope.get("provenance") if isinstance(envelope.get("provenance"), dict) else {}
     )
-    result_id = _safe_str(
-        envelope.get("result_id") or item.get("id") or item.get("url"),
+    raw_result_id = _redacted_str(
+        envelope.get("result_id") or item.get("id") or item.get("url")
+    )
+    result_id = raw_result_id[:MAX_ID_CHARS] if raw_result_id is not None else None
+    source_revision_id = _safe_str(
+        envelope.get("source_revision_id") or item.get("source_revision_id"),
         limit=MAX_ID_CHARS,
+    )
+    source_dataset = (
+        _safe_str(envelope.get("dataset") or item.get("dataset"), limit=120)
+        if source_revision_id
+        else None
     )
     summary: dict[str, Any] = {
         "rank": rank,
@@ -133,8 +150,12 @@ def summarize_hit(item: Any, *, rank: int) -> dict[str, Any] | None:
             limit=64,
         ),
         "dataset": _safe_str(envelope.get("dataset") or item.get("dataset"), limit=120),
+        "source_revision_id": source_revision_id,
+        "source_dataset": source_dataset,
         "score": _hit_score(item),
     }
+    if raw_result_id is not None and len(raw_result_id) > MAX_ID_CHARS:
+        summary["_identity_result_id"] = raw_result_id
     # Drop nulls for a stable, compact shape.
     return {key: value for key, value in summary.items() if value is not None}
 
@@ -274,3 +295,104 @@ def feedback_note_from_telemetry(telemetry: dict[str, Any]) -> str:
         f"top=[{ids}] "
         f"query={telemetry.get('query') or ''}"
     )
+
+
+def durable_search_event(
+    telemetry: dict[str, Any],
+    *,
+    dataset: str,
+    actor_id: str | None,
+    presence_only: bool = False,
+) -> dict[str, Any]:
+    """Select only safe fields for the durable feedback ledger."""
+    top_results = telemetry.get("top_results")
+    first = top_results[0] if isinstance(top_results, list) and top_results else {}
+    display_result_id = first.get("id") if isinstance(first, dict) else None
+    identity_result_id = (
+        first.get("_identity_result_id") if isinstance(first, dict) else None
+    )
+    trust_tier = first.get("trust_tier") if isinstance(first, dict) else None
+    score = first.get("score") if isinstance(first, dict) else None
+    source_revision_id = first.get("source_revision_id") if isinstance(first, dict) else None
+    source_dataset = first.get("source_dataset") if isinstance(first, dict) else None
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+        or not -1.0 <= float(score) <= 1.0
+    ):
+        score = None
+    if presence_only:
+        actor_id = None
+        display_result_id = None
+        identity_result_id = None
+        trust_tier = None
+        score = None
+        source_revision_id = None
+        source_dataset = None
+    result_id = (
+        identity_result_id
+        if isinstance(identity_result_id, str)
+        else display_result_id
+    )
+    reason = (
+        "empty_search"
+        if telemetry.get("empty")
+        else "low_score_search"
+        if telemetry.get("low_score")
+        else "search_telemetry"
+    )
+    event: dict[str, Any] = {
+        "kind": "implicit_search",
+        "search_id": telemetry.get("search_id"),
+        "result_id": result_id,
+        "actor_id": actor_id,
+        "dataset": dataset,
+        "score": score,
+        "trust_tier": trust_tier,
+        "reason": reason,
+        "occurred_at": telemetry.get("occurred_at"),
+    }
+    if not presence_only and source_revision_id:
+        event["source_revision_id"] = source_revision_id
+        event["source_dataset"] = source_dataset or (
+            first.get("dataset") if isinstance(first, dict) else None
+        )
+    return event
+
+
+def durable_explicit_event(
+    *,
+    qa_id: str,
+    result_id: str | None,
+    search_id: str | None,
+    actor_id: str | None,
+    dataset: str,
+    score: int | None,
+    text_present: bool,
+) -> dict[str, Any]:
+    """Build a durable explicit event without storing free-form feedback text."""
+    normalized_qa_id = qa_id.strip()
+    normalized_search_id = (
+        search_id.strip()
+        if isinstance(search_id, str) and search_id.strip()
+        else normalized_qa_id
+        if normalized_qa_id.startswith("search:")
+        else None
+    )
+    normalized_result_id = (
+        result_id.strip()
+        if isinstance(result_id, str) and result_id.strip()
+        else None
+        if normalized_qa_id.startswith("search:")
+        else normalized_qa_id
+    )
+    return {
+        "kind": "explicit_feedback",
+        "search_id": normalized_search_id,
+        "result_id": normalized_result_id,
+        "actor_id": actor_id,
+        "dataset": dataset,
+        "score": score,
+        "reason": "explicit_feedback_text_present" if text_present else "explicit_feedback",
+    }

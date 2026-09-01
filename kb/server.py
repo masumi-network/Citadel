@@ -90,7 +90,12 @@ from kb.promotion_queue import (
 )
 from kb.qdrant_adapter import QdrantProviderError
 from kb.repo_content_sync import RepoContentSyncer
-from kb.search_feedback import build_search_telemetry, presence_only_telemetry
+from kb.feedback_store import FeedbackStore
+from kb.search_feedback import (
+    build_search_telemetry,
+    durable_search_event,
+    presence_only_telemetry,
+)
 from kb.search_format import (
     DOC_TYPE_CANONICAL,
     CODE_NO_RELEVANT_RESULTS,
@@ -162,10 +167,35 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
         )
 
 
+async def _persist_search_feedback_event(
+    config: CitadelConfig,
+    event: Mapping[str, Any],
+    feedback_store: FeedbackStore | None,
+) -> None:
+    def write() -> None:
+        store = feedback_store or FeedbackStore(config.feedback_store_path)
+        store.record_event(event)
+
+    try:
+        await asyncio.to_thread(write)
+    except Exception as exc:  # noqa: BLE001 - search must not depend on feedback
+        logger.warning("detached search feedback write failed: %s", exc)
 
 
-
-
+def _schedule_search_feedback_event(
+    config: CitadelConfig,
+    event: Mapping[str, Any],
+    feedback_store: FeedbackStore | None,
+) -> None:
+    pending = _persist_search_feedback_event(config, event, feedback_store)
+    try:
+        task = asyncio.create_task(pending, name="feedback-durable-write")
+    except RuntimeError as exc:
+        pending.close()
+        logger.warning("detached search feedback scheduling failed: %s", exc)
+        return
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_forget_background_task)
 
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
@@ -371,7 +401,7 @@ class _McpAcceptShim:
         kept.append((b"accept", merged.encode("latin-1")))
         await self.app({**scope, "headers": kept}, receive, send)
 _EVOLVE_SOURCE_STAGES = ("github_sync", "repo_content_sync", "linear_sync")
-_EVOLVE_POST_PROJECTION_STAGES = ("self_improve", "promotion")
+_EVOLVE_POST_PROJECTION_STAGES = ("self_improve", "promotion", "feedback")
 
 
 async def _run_evolve_stage_group(
@@ -1669,6 +1699,7 @@ class ShareSessionBody(BaseModel):
 class FeedbackBody(BaseModel):
     qa_id: str | None = Field(default=None, min_length=1)
     result_id: str | None = Field(default=None, min_length=1)
+    search_id: str | None = Field(default=None, min_length=1)
     score: int | None = Field(default=None, ge=-1, le=1)
     text: str | None = None
     session_id: str | None = None
@@ -3126,6 +3157,7 @@ async def capture_search_feedback(
     timed_out: bool,
     session_id: str | None = None,
     filters: dict[str, Any] | None = None,
+    feedback_store: FeedbackStore | None = None,
 ) -> dict[str, Any] | None:
     """Best-effort implicit search telemetry into the feedback mesh index.
 
@@ -3171,11 +3203,32 @@ async def capture_search_feedback(
         node_dataset = (
             actor.default_dataset if is_seat_dataset(actor.default_dataset) else None
         )
+        durable_event: dict[str, Any] | None = None
+        try:
+            durable_event = durable_search_event(
+                telemetry,
+                dataset=node_dataset or primary_dataset,
+                actor_id=actor.actor_id,
+                presence_only=not bool(node_dataset),
+            )
+        except Exception as exc:  # noqa: BLE001 - feedback must never fail search
+            logger.warning("durable search feedback scheduling failed: %s", exc)
+        # The complete over-limit identity exists only for the durable ledger.
+        # Strip the hint before the telemetry dict reaches Mesh activity/SSE
+        # subscribers or the search response payload.
+        for hit in telemetry.get("top_results") or []:
+            if isinstance(hit, dict):
+                hit.pop("_identity_result_id", None)
         await mesh_state.record_search_telemetry(
             config,
             telemetry=telemetry if node_dataset else presence_only_telemetry(telemetry),
             dataset=node_dataset or primary_dataset,
         )
+        if durable_event is not None:
+            try:
+                _schedule_search_feedback_event(config, durable_event, feedback_store)
+            except Exception as exc:  # noqa: BLE001 - feedback must never fail search
+                logger.warning("durable search feedback scheduling failed: %s", exc)
         return telemetry
     except Exception as exc:  # noqa: BLE001 - feedback must never fail search
         logger.warning("search telemetry write failed: %s", exc)
@@ -9302,6 +9355,9 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
                 text=body.text,
                 session_id=session_id,
                 dataset=dataset,
+                search_id=body.search_id,
+                result_id=body.result_id,
+                actor_id=actor.actor_id,
             )
         )
     except Exception as exc:  # pragma: no cover - depends on runtime Cognee configuration.
@@ -9314,6 +9370,7 @@ async def feedback(body: FeedbackBody, request: Request) -> Any:
             detail={"operation": "feedback", "error_type": exc.__class__.__name__},
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
     await mesh_state.record_feedback(
         citadel.config,

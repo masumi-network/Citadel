@@ -92,6 +92,12 @@ def _lifecycle_store_path(value: str | None) -> str:
     return str(Path(_state_root()) / "lifecycle.sqlite3")
 
 
+def _feedback_store_path(value: str | None) -> str:
+    if value:
+        return value
+    return str(Path(_state_root()) / "feedback.sqlite3")
+
+
 def _repo_stats_state_path(value: str | None) -> str:
     if value:
         return value
@@ -263,6 +269,9 @@ class CitadelConfig:
     evaluation_gate_path: str = ".citadel/evaluation_gate.json"
     repair_journal_path: str = ".citadel/repair_journal.jsonl"
     cognify_queue_path: str = ".citadel/cognify_queue.json"
+    feedback_store_path: str = field(
+        default_factory=lambda: str(Path(_state_root()) / "feedback.sqlite3")
+    )
     # Direct dataclass construction is used by isolated unit tests and embedded
     # callers. The server path uses from_env(), where lifecycle v1 is on unless
     # explicitly disabled.
@@ -485,6 +494,9 @@ class CitadelConfig:
             or str(Path(_state_root()) / "evaluation_gate.json"),
             repair_journal_path=_repair_journal_path(
                 os.getenv("CITADEL_REPAIR_JOURNAL_PATH")
+            ),
+            feedback_store_path=_feedback_store_path(
+                os.getenv("CITADEL_FEEDBACK_STORE_PATH")
             ),
             cognify_queue_path=_cognify_queue_path(os.getenv("CITADEL_COGNIFY_QUEUE_PATH")),
             lifecycle_enabled=_bool(

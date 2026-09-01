@@ -2,22 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+import threading
+import time
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from kb.config import CitadelConfig
+from kb.feedback_store import FeedbackStore
 from kb.mesh import MeshState
 from kb.search_feedback import (
     SCHEMA_VERSION,
     build_search_telemetry,
+    durable_search_event,
     summarize_hit,
 )
 from kb.server import capture_search_feedback
 
 
 CONFIG = CitadelConfig(tenant_id="test", default_dataset="notes")
+
+
+async def _drain_feedback_writes() -> None:
+    import kb.server as server_module
+
+    tasks = tuple(
+        task
+        for task in server_module._BACKGROUND_TASKS
+        if task.get_name() == "feedback-durable-write"
+    )
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 def test_build_search_telemetry_payload_shape_is_stable() -> None:
@@ -226,6 +244,380 @@ async def test_capture_search_feedback_attempts_write_on_every_call() -> None:
     assert telemetry["tool_name"] == "citadel_search"
     mesh.record_search_telemetry.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_capture_search_feedback_durable_failure_does_not_fail_search() -> None:
+    class BoomStore:
+        def record_event(self, event: dict[str, Any]) -> str:
+            del event
+            raise OSError("feedback sqlite unavailable")
+
+    class FakeRequest:
+        headers: dict[str, str] = {}
+
+    class FakeActor:
+        seat_slug = "canary"
+        actor_id = "actor:canary"
+        default_dataset = "seat:canary"
+
+    telemetry = await capture_search_feedback(
+        mesh_state=MeshState(),
+        config=CONFIG,
+        request=FakeRequest(),  # type: ignore[arg-type]
+        actor=FakeActor(),  # type: ignore[arg-type]
+        query="search",
+        results=[],
+        search_datasets=["seat:canary"],
+        primary_dataset="seat:canary",
+        top_k=1,
+        latency_ms=1,
+        timed_out=False,
+        feedback_store=BoomStore(),  # type: ignore[arg-type]
+    )
+
+    assert telemetry is not None
+    await _drain_feedback_writes()
+
+
+@pytest.mark.asyncio
+async def test_capture_search_feedback_detaches_locked_durable_write() -> None:
+    import kb.server as server_module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class LockedStore:
+        def record_event(self, event: dict[str, Any]) -> str:
+            del event
+            started.set()
+            release.wait(timeout=2)
+            return "feedback-event:locked"
+
+    class FakeRequest:
+        headers: dict[str, str] = {}
+
+    class FakeActor:
+        seat_slug = "canary"
+        actor_id = "actor:canary"
+        default_dataset = "seat:canary"
+
+    started_at = time.perf_counter()
+    telemetry = await capture_search_feedback(
+        mesh_state=MeshState(),
+        config=CONFIG,
+        request=FakeRequest(),  # type: ignore[arg-type]
+        actor=FakeActor(),  # type: ignore[arg-type]
+        query="search",
+        results=[],
+        search_datasets=["seat:canary"],
+        primary_dataset="seat:canary",
+        top_k=1,
+        latency_ms=1,
+        timed_out=False,
+        feedback_store=LockedStore(),  # type: ignore[arg-type]
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert telemetry is not None
+    assert elapsed < 0.5
+    assert await asyncio.to_thread(started.wait, 1)
+    release.set()
+    writes = [
+        task
+        for task in tuple(server_module._BACKGROUND_TASKS)
+        if task.get_name() == "feedback-durable-write"
+    ]
+    if writes:
+        await asyncio.gather(*writes)
+
+
+
+@pytest.mark.asyncio
+async def test_capture_search_feedback_persists_redacted_node_event(tmp_path: Any) -> None:
+    mesh = MeshState()
+    config = replace(CONFIG, feedback_store_path=str(tmp_path / "feedback.sqlite3"))
+
+    class FakeRequest:
+        headers: dict[str, str] = {"x-citadel-mcp-tool": "citadel_search"}
+
+    class FakeActor:
+        seat_slug = "canary"
+        actor_id = "actor:canary"
+        default_dataset = "seat:canary"
+
+    telemetry = await capture_search_feedback(
+        mesh_state=mesh,
+        config=config,
+        request=FakeRequest(),  # type: ignore[arg-type]
+        actor=FakeActor(),  # type: ignore[arg-type]
+        query="private query token=ctdl_abcdefghijklmnopqrstuvwxyz012345",
+        results=[
+            {
+                "id": "result:canary",
+                "text": "private source body must not persist",
+                "_citadel": {
+                    "result_id": "result:canary",
+                    "trust_tier": "unattested",
+                    "source_revision_id": "revision:central",
+                    "dataset": "masumi-network",
+                },
+            }
+        ],
+        search_datasets=["seat:canary"],
+        primary_dataset="seat:canary",
+        top_k=1,
+        latency_ms=3,
+        timed_out=False,
+    )
+
+    assert telemetry is not None
+    await _drain_feedback_writes()
+    events = FeedbackStore(config.feedback_store_path).list_unprocessed()
+    assert len(events) == 1
+    assert events[0].dataset == "seat:canary"
+    assert events[0].actor_id == "actor:canary"
+    assert events[0].result_id == "result:canary"
+    assert events[0].source_revision_id == "revision:central"
+    assert events[0].source_dataset == "masumi-network"
+    assert "private query" not in (events[0].reason or "")
+    assert "ctdl_" not in str(events[0])
+
+
+@pytest.mark.asyncio
+async def test_capture_search_feedback_keeps_identity_hint_out_of_mesh(tmp_path: Any) -> None:
+    mesh = MeshState()
+    mesh.record_search_telemetry = AsyncMock(wraps=mesh.record_search_telemetry)  # type: ignore[method-assign]
+    config = replace(CONFIG, feedback_store_path=str(tmp_path / "feedback.sqlite3"))
+
+    class FakeRequest:
+        headers: dict[str, str] = {}
+
+    class FakeActor:
+        seat_slug = "canary"
+        actor_id = "actor:canary"
+        default_dataset = "seat:canary"
+
+    long_id = "result:" + ("a" * 300)
+    telemetry = await capture_search_feedback(
+        mesh_state=mesh,
+        config=config,
+        request=FakeRequest(),  # type: ignore[arg-type]
+        actor=FakeActor(),  # type: ignore[arg-type]
+        query="long identity",
+        results=[{"id": long_id, "_citadel": {"result_id": long_id}}],
+        search_datasets=["seat:canary"],
+        primary_dataset="seat:canary",
+        top_k=1,
+        latency_ms=1,
+        timed_out=False,
+    )
+
+    assert telemetry is not None
+    recorded = mesh.record_search_telemetry.await_args.kwargs["telemetry"]
+    assert all(
+        "_identity_result_id" not in hit
+        for hit in recorded.get("top_results", [])
+        if isinstance(hit, dict)
+    )
+    assert all(
+        "_identity_result_id" not in hit
+        for hit in telemetry.get("top_results", [])
+        if isinstance(hit, dict)
+    )
+    await _drain_feedback_writes()
+    events = FeedbackStore(config.feedback_store_path).list_unprocessed()
+    assert len(events) == 1
+    assert events[0].result_id == long_id[:256]
+
+
+
+def test_durable_event_keeps_private_lifecycle_identity_but_not_shared_identity() -> None:
+    telemetry = build_search_telemetry(
+        query="central source",
+        results=[
+            {
+                "id": "result:central",
+                "score": 0.9,
+                "_citadel": {
+                    "result_id": "result:central",
+                    "source_revision_id": "revision:central",
+                    "dataset": "masumi-network",
+                    "trust_tier": "unattested",
+                },
+            }
+        ],
+        datasets=["seat:alice", "masumi-network"],
+        primary_dataset="masumi-network",
+    )
+
+    private_event = durable_search_event(
+        telemetry,
+        dataset="seat:alice",
+        actor_id="actor:alice",
+    )
+    shared_event = durable_search_event(
+        telemetry,
+        dataset="masumi-network",
+        actor_id="actor:alice",
+        presence_only=True,
+    )
+
+    assert private_event["source_revision_id"] == "revision:central"
+    assert private_event["source_dataset"] == "masumi-network"
+    assert "source_revision_id" not in shared_event
+    assert "source_dataset" not in shared_event
+
+
+
+
+
+def test_durable_event_domain_separates_long_id_from_digest(tmp_path: Any) -> None:
+    from hashlib import sha256
+
+    long_result_id = "result:" + "r" * 300
+    digest_result_id = sha256(long_result_id.encode("utf-8")).hexdigest()
+
+    def build_event(result_id: str) -> dict[str, Any]:
+        telemetry = build_search_telemetry(
+            query="domain-separated result",
+            results=[{"id": result_id, "score": 0.8}],
+            datasets=["seat:canary"],
+            primary_dataset="seat:canary",
+        )
+        return durable_search_event(
+            telemetry,
+            dataset="seat:canary",
+            actor_id="actor:canary",
+        )
+
+    store = FeedbackStore(tmp_path / "feedback.sqlite3")
+    long_event = build_event(long_result_id)
+    digest_event = build_event(digest_result_id)
+    long_id = store.record_event(long_event)
+    digest_id = store.record_event(digest_event)
+
+    assert long_id != digest_id
+    store.record_decision(long_id, "no_action", "long identity")
+    store.record_decision(digest_id, "no_action", "digest identity")
+    assert {decision.event_id for decision in store.list_decisions()} == {long_id, digest_id}
+
+
+def test_durable_event_preserves_complete_identity_over_4096_chars(tmp_path: Any) -> None:
+    def build_event(
+        suffix: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        result_id = "r" * 5000 + suffix
+        telemetry = build_search_telemetry(
+            query="very long result",
+            results=[{"id": result_id, "score": 0.8}],
+            datasets=["seat:canary"],
+            primary_dataset="seat:canary",
+        )
+        return result_id, durable_search_event(
+            telemetry,
+            dataset="seat:canary",
+            actor_id="actor:canary",
+        ), telemetry
+
+    store = FeedbackStore(tmp_path / "feedback.sqlite3")
+    first_result, first_event, first_telemetry = build_event("a")
+    second_result, second_event, second_telemetry = build_event("b")
+    first_id = store.record_event(first_event)
+    second_id = store.record_event(second_event)
+
+    assert first_telemetry["top_results"][0]["id"] == first_result[:200]
+    assert first_telemetry["top_results"][0]["_identity_result_id"] == first_result
+    assert second_telemetry["top_results"][0]["id"] == second_result[:200]
+    assert second_telemetry["top_results"][0]["_identity_result_id"] == second_result
+    assert first_event["result_id"] == first_result
+    assert second_event["result_id"] == second_result
+    assert first_id != second_id
+    rows = store.list_unprocessed()
+    assert len(rows) == 2
+    assert rows[0].result_id == rows[1].result_id
+    assert len(rows[0].result_id or "") <= 256
+
+
+@pytest.mark.asyncio
+async def test_capture_search_feedback_uses_presence_only_for_shared_rows(tmp_path: Any) -> None:
+    config = replace(CONFIG, feedback_store_path=str(tmp_path / "feedback.sqlite3"))
+
+    class FakeRequest:
+        headers: dict[str, str] = {}
+
+    class FakeActor:
+        seat_slug = None
+        actor_id = "service"
+        default_dataset = "masumi-network"
+
+    await capture_search_feedback(
+        mesh_state=MeshState(),
+        config=config,
+        request=FakeRequest(),  # type: ignore[arg-type]
+        actor=FakeActor(),  # type: ignore[arg-type]
+        query="private query",
+        results=[
+            {
+                "id": "central-result",
+                "score": 0.9,
+                "_citadel": {
+                    "result_id": "central-result",
+                    "source_revision_id": "revision:central",
+                    "dataset": "masumi-network",
+                },
+            }
+        ],
+        search_datasets=["masumi-network"],
+        primary_dataset="masumi-network",
+        top_k=1,
+        latency_ms=3,
+        timed_out=False,
+    )
+    await _drain_feedback_writes()
+
+    event = FeedbackStore(config.feedback_store_path).list_unprocessed()[0]
+    assert event.dataset == "masumi-network"
+    assert event.actor_id is None
+    assert event.result_id is None
+    assert event.source_revision_id is None
+    assert event.source_dataset is None
+
+
+def test_feedback_endpoint_persists_search_and_result_linkage(tmp_path: Any) -> None:
+    import kb.server as server_module
+    from kb.service import Citadel
+    from test_server import authed_client
+
+    class Cognee:
+        async def add_feedback(self, **kwargs: Any) -> bool:
+            del kwargs
+            return True
+
+    client = authed_client()
+    original_citadel = server_module.app.state.citadel
+    config = replace(
+        original_citadel.config,
+        feedback_store_path=str(tmp_path / "feedback.sqlite3"),
+    )
+    server_module.app.state.citadel = Citadel(config, cognee=Cognee())  # type: ignore[arg-type]
+    try:
+        response = client.post(
+            "/feedback",
+            json={
+                "qa_id": "search:abc",
+                "result_id": "result:abc",
+                "score": -1,
+                "text": "raw feedback text stays outside the event",
+            },
+        )
+        assert response.status_code == 200
+        event = FeedbackStore(config.feedback_store_path).list_unprocessed()[0]
+        assert event.search_id == "search:abc"
+        assert event.result_id == "result:abc"
+        assert event.score == -1
+        assert event.reason == "explicit_feedback_text_present"
+    finally:
+        server_module.app.state.citadel = original_citadel
 
 def test_search_endpoint_records_telemetry_and_survives_feedback_failure(
     monkeypatch: pytest.MonkeyPatch,

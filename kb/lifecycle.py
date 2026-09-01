@@ -1597,7 +1597,57 @@ class LifecycleStore:
         )
 
 
-
+    def get_operation_for_source_revision(
+        self,
+        source_revision_id: str,
+        *,
+        dataset: str | None = None,
+        generation_id: str | None = None,
+        projection_version: str | None = None,
+        config_digest: str | None = None,
+    ) -> ProjectionOperation | None:
+        """Return one exact projection operation for a retained source revision."""
+        if not isinstance(source_revision_id, str) or not source_revision_id.strip():
+            raise ValueError("source_revision_id must be a non-empty string")
+        optional = {
+            "dataset": dataset,
+            "generation_id": generation_id,
+            "projection_version": projection_version,
+            "config_digest": config_digest,
+        }
+        for field_name, value in optional.items():
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"{field_name} must be a non-empty string")
+        clauses = ["job.source_revision_id = ?"]
+        parameters: list[str] = [source_revision_id]
+        for field_name, value in optional.items():
+            if value is None:
+                continue
+            clauses.append(f"job.{field_name} = ?")
+            parameters.append(value)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT job.projection_job_id
+                FROM projection_jobs AS job
+                JOIN source_revisions AS source
+                  ON source.source_revision_id = job.source_revision_id
+                JOIN source_heads AS head
+                  ON head.source_revision_id = job.source_revision_id
+                 AND head.dataset = source.dataset
+                WHERE {' AND '.join(clauses)}
+                  AND source.dataset = job.dataset
+                  AND source.tombstone = 0
+                ORDER BY job.created_at DESC, job.projection_job_id DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        if row is None:
+            return None
+        return self.get_operation(str(row["projection_job_id"]))
 
 
     def projection_states_for_job_ids(

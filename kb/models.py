@@ -38,6 +38,9 @@ class FeedbackRequest:
     text: str | None = None
     session_id: str | None = None
     dataset: str | None = None
+    search_id: str | None = None
+    result_id: str | None = None
+    actor_id: str | None = None
 
 
 @dataclass(frozen=True)
