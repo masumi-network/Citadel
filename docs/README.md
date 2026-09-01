@@ -19,6 +19,18 @@ guidance, and check the code before acting on it.
 | [`performance.md`](performance.md) | Measured numbers and how they were produced. |
 | [`adr/`](adr/README.md) | Architecture decision records, indexed. |
 
+## Current implementation
+
+[REPORTED] This revision is in an unmerged PR stack. Production may run an earlier revision. The current source descriptions below are not deployment evidence.
+
+[VERIFIED] The Lite runtime uses SQLite, Qdrant, and Ladybug. SQLite lifecycle receipts bind each active source revision to relational, vector, and graph projection state (`kb/lite_runtime.py:103-120`, `kb/lifecycle.py:451-528`).
+
+[VERIFIED] The web process owns graph writes. Its optional evolve scheduler places a first projection barrier before self-improvement, promotion, and feedback, then waits at a second barrier (`kb/server.py:560-573`, `kb/server.py:768-1040`).
+
+[VERIFIED] The `UserPromptSubmit` hook adds bounded, redacted, untrusted search context. Search telemetry and explicit feedback use the durable feedback ledger. Session login reports effective scopes and labels for Private Node, Central, and Shared Session Traces (`kb/hooks/search_inject.py:174-283`, `kb/server.py:3169-3259`, `kb/server.py:4452-4508`).
+
+Use [`architecture.md`](architecture.md) for the system shape, [`operations.md`](operations.md) for runtime and self-hosting, and [`mcp/README.md`](mcp/README.md) for agent setup. Keep the public `Degraded` status until failed graph jobs are classified.
+
 ## Current design work
 
 The 2026-08-03 design session repositioned Citadel as a governed data substrate.

@@ -1,75 +1,105 @@
+# Citadel Archive
+
+Self-hosted Organization Vault and seat capture CLI built on Cognee.
+
+[![Test](https://github.com/masumi-network/Citadel/actions/workflows/test.yml/badge.svg)](https://github.com/masumi-network/Citadel/actions/workflows/test.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](pyproject.toml)
+
 <p align="center">
   <img src="docs/brand/readme-banner.svg" alt="Citadel Archive" width="860" />
 </p>
 
-# Citadel
+## What it does
 
-> Self-hosted memory for engineering teams and the agents working alongside them.
+Citadel captures source material, keeps the accepted revision in SQLite, and projects it into relational, vector, and graph stores. Search returns data that has a current projection receipt. Central stores shared memory. Each seat has a private Node.
 
-[![State of the Vault](https://img.shields.io/badge/live-state%20of%20the%20vault-FF51FF?style=flat&labelColor=0a0a0a)](https://citadel.utxo.ag/info)
-[![Test](https://github.com/masumi-network/Citadel/actions/workflows/test.yml/badge.svg)](https://github.com/masumi-network/Citadel/actions/workflows/test.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![MCP](https://img.shields.io/badge/MCP-hosted-7c3aed)
-
-Your team already writes down everything worth knowing. It ends up scattered across commits, pull requests, Linear tickets, and coding sessions nobody can search a week later. New engineers ask questions that were answered in March. Coding agents start every task with no idea what your team already decided.
-
-Citadel collects that material as it is produced and puts it behind one query interface, for people and for agents. It runs on your own infrastructure.
+Capture enters through the CLI, HTTP writes, Git hooks, Claude Code hooks, and scheduled source sync. People use the web UI or CLI. Agents use the hosted MCP endpoint.
 
 <p align="center">
-  <img src="docs/brand/readme-dashboard.jpg" alt="Citadel dashboard showing the knowledge graph" width="860" />
+  <img src="docs/brand/readme-dashboard.jpg" alt="Citadel dashboard" width="860" />
 </p>
 
-## Status: in testing, not yet open
+## Architecture
 
-Citadel currently runs for two organisations, Masumi Network and Sokosumi Network, who are using it daily and finding the problems. It is not open for general use yet.
+```mermaid
+flowchart LR
+    git_hooks["Git and agent hooks"]
+    cli_capture["CLI capture and sync"]
+    http_writes["HTTP ingest and contribute"]
+    scheduled_sync["Scheduled source sync"]
+    lifecycle["SQLite lifecycle<br/>source revisions, jobs, receipts"]
+    relational["Relational projection"]
+    vector["Vector projection"]
+    graph_projection["Graph projection"]
+    search["Receipt gated search"]
+    central["Central shared dataset"]
+    seat["Private seat Node"]
+    mcp["MCP /mcp/"]
+    cli_search["CLI search"]
+    web_ui["Web UI"]
 
-If you are interested, watch the repository and wait for the stable release. We would rather you adopt something that works than something that is still moving under you. We publish benchmark numbers as we go, including the parts that are not good yet, so you can judge readiness for yourself rather than taking our word for it.
-
-A self-hosted path for individuals to try it is planned. It is not ready today.
-
-## Who it is being built for
-
-Teams running coding agents get the most out of it. Claude Code, Cursor, and anything else speaking MCP query the same vault the engineers do, through a hosted endpoint. An agent that can look up why you dropped Postmark for Resend does not re-litigate it.
-
-It also suits companies that cannot ship their context to a vendor. Apache-2.0, `pip install`, runs where you decide. One caveat worth stating plainly: document text is sent to an external model provider for enrichment and digests, so this is data you control the storage of, not data that never leaves the building.
-
-And it is for anyone tired of filing things. Capture runs from git and editor hooks. Nobody tags anything.
-
-## How it works
-
-Capture happens without you. A git pre-push hook and a Claude Code session hook snapshot work as it is produced, while GitHub activity, repository content, and Linear issues sync on a schedule.
-
-You ask from wherever you already are: the CLI, the web interface, or MCP. Answers carry a link back to the commit, issue, or document behind them, and retrieved text is marked as untrusted context worth checking before you act on it.
-
-Promotion is the deliberate part. Captured work lands in your own space, and reaching shared org memory takes an explicit step. That gate is what keeps the shared layer worth reading instead of turning it into everyone's scratch notes.
+    git_hooks --> lifecycle
+    cli_capture --> lifecycle
+    http_writes --> lifecycle
+    scheduled_sync --> lifecycle
+    lifecycle --> relational
+    lifecycle --> vector
+    lifecycle --> graph_projection
+    relational --> search
+    vector --> search
+    graph_projection --> search
+    central -. scope .-> search
+    seat -. scope .-> search
+    search --> mcp
+    search --> cli_search
+    search --> web_ui
+```
 
 ## Quick start
 
-```bash
-npx skills add masumi-network/citadel --skill citadel
-pipx install citadel-archive
-citadel onboard      # token, hooks, MCP (project + Cursor/Codex/Claude/…), capture roots
-citadel status       # connection, identity, local setup
-```
+### Use the hosted Node
 
-No Python yet? `curl -fsSL https://raw.githubusercontent.com/masumi-network/Citadel/main/install.sh | sh` checks for 3.11+, asks before installing, then sets up pipx and the CLI.
-
-Self-hosting the server:
+The base package installs the lightweight `citadel` CLI. Set a seat token when `citadel onboard` asks for one.
 
 ```bash
-uv sync --dev
-cp .env.example .env
-uv run uvicorn kb.server:app --reload --port 8000
+python -m pip install citadel-archive
+citadel onboard
+citadel status
+citadel search "what did we decide about the vault?"
 ```
 
-Full walkthrough in [`docs/onboarding/teammate-rollout.md`](docs/onboarding/teammate-rollout.md), deployment in [`docs/operations.md`](docs/operations.md).
+For a headless setup, keep the token in the environment:
 
-## Connecting an agent
+```bash
+export CITADEL_MCP_ACCESS_TOKEN=ctdl_...
+citadel onboard --non-interactive --json
+citadel status --json --check-search
+```
 
-Agents need a URL and a token. `citadel onboard` writes project `.mcp.json` and,
-when those tools are detected, `~/.cursor/mcp.json`, Codex, Claude user-scope,
-Gemini, and Windsurf:
+### Run the Lite runtime from source
+
+Use Python 3.11 or newer. Export the deployment variables required by `kb.lite_runtime` before starting it.
+
+```bash
+uv sync --all-extras --dev
+# Export the runtime variables required by kb.lite_runtime.
+uv run python -m kb.lite_runtime
+```
+
+### Run with Docker Compose
+
+Docker Compose starts the Qdrant service and the Citadel service. It binds Citadel to `127.0.0.1:8000` by default.
+
+```bash
+cp .env.lite.example .env
+# Replace every CHANGE_ME value in .env.
+docker compose --env-file .env up --build
+```
+
+## Connect an agent
+
+Citadel exposes a streamable HTTP MCP endpoint at `/mcp/`. Use a bearer token in the request header. `citadel onboard` can write this project configuration for you.
 
 ```json
 {
@@ -77,61 +107,51 @@ Gemini, and Windsurf:
     "citadel": {
       "type": "http",
       "url": "https://citadel.utxo.ag/mcp/",
-      "headers": { "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}" }
+      "headers": {
+        "Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
+      }
     }
   }
 }
 ```
 
-Use one seat per human. Give each agent process a distinct seat-bound token.
-After the human signs in with a seat token, the Access page can mint a reader
-token for search-only work or a writer token for explicit ingest. Do not share
-one token across agent processes.
+Use one seat per human. Keep each agent process on its own seat-bound token. Search with `citadel_search` before editing. Rate a result with `citadel_record_feedback` when a user asks for feedback capture.
 
-For headless setup, pass the token through the environment instead of `argv`:
+## Capabilities and surfaces
 
-```bash
-export CITADEL_MCP_ACCESS_TOKEN=ctdl_...
-citadel onboard --non-interactive --json   # also wires Cursor/Codex/Claude when detected
-citadel status --json --check-search
-```
+| Capability | Surface | Contract |
+|---|---|---|
+| Search | `POST /search`, `citadel_search`, `citadel search`, web search page | Reader access with `kb:search`; responses include hits and may include `search_id`. |
+| Feedback | `POST /feedback`, `citadel_record_feedback`, `citadel feedback`, dashboard form | Writer access with `kb:feedback`; link feedback to a search or result ID. |
+| Promotion | `/api/promotion/pending`, `citadel_promotion_pending`, `citadel_promotion_approve`, `citadel_promotion_reject`, `citadel promotion` | Review Node to Central candidates; approval and rejection require admin access. |
+| Graph UI | `/api/mesh/graph`, `/next/app/graph`, `/app` | Reader access with `kb:search`; graph reads follow the caller dataset scope. |
+| Hooks | `citadel onboard`, Git `pre-push`, Claude Code `SessionStart`, `UserPromptSubmit`, and `SessionEnd` | Captures approved work and injects bounded search context. Hook failures exit silently. |
 
-Confirm that status reports the expected `seat_slug` and
-`default_dataset: seat:<slug>` before the agent starts work.
+## Security and privacy
 
-Twenty-two tools cover search, document fetch, ingest, contribution, and the admin surface. Core CLI commands speak `--json`. Setup per client and the tool reference are in [`docs/mcp/README.md`](docs/mcp/README.md).
+Seat isolation. `seat:<slug>` datasets are private by default. A seat can read Central and its own Node. Other seat Nodes are denied.
 
-## Measured performance
+Shared telemetry. Search rows that land in a shared dataset carry presence data only. Query text and hit IDs stay on the caller's Node when a seat Node is available.
 
-We publish the numbers, including the ones that look bad.
+Canary writes. Production write tests target `seat:canary`. Promotion is disabled by default and runs in dry-run mode by default. Approving a pending promotion requires admin access.
 
-Search median on 2026-08-17 was 25 s (citadel-archive 0.5.1 CLI, warm, golden q01, n=20, node https://citadel.utxo.ag). The 2026-07-31 client round-trip of 269 ms is no longer what production does. Self-host cost is about $23/mo from Railway 24-hour averages on 2026-08-17 (Citadel-Archive and Qdrant). Quote as about $23, not to the cent.
+Hook transport. Hooks read `CITADEL_MCP_ACCESS_TOKEN` from the environment, require HTTPS, refuse redirects, and return exit code 0 on failures.
 
-A 2026-08-03 69-question golden harness scored `answer_recall@5` at 0.8974 over the 39 questions carrying validated answer spans.
+Provider settings. Graph extraction needs an LLM key. `LLM_ENDPOINT` and `EMBEDDING_ENDPOINT` control provider destinations, so review those values before storing sensitive text.
 
-Two limits belong next to that number. Roughly a third of stored documents are not reachable by search at all ([#228](https://github.com/masumi-network/Citadel/issues/228)), and the documents that are indexed were embedded only at the head, so text past roughly the first 1,500 characters is also unreachable ([#227](https://github.com/masumi-network/Citadel/issues/227)). Ranking also correlates poorly with query relevance. All three are open work, and no recall figure currently describes the whole corpus.
+## Known limits
 
-Full table, definitions, and how to reproduce: [`docs/performance.md`](docs/performance.md).
+Measurements are dated. A warm 2026-08-17 run of CLI 0.5.1 returned successful searches at a 25,049 ms p50 for one query, with 20 of 20 searches returning results. A 2026-08-03 frozen harness measured `answer_recall@5` at 0.8974 over 39 span-bearing questions. That harness also found 892 of 2,867 accepted documents with zero vector chunks. Text after roughly the first 1,500 characters can be missed. These figures do not measure the whole corpus.
+
+See [`docs/performance.md`](docs/performance.md) for test conditions, definitions, and reproduction commands.
 
 ## Documentation
 
-| | |
-|---|---|
-| [Concepts and glossary](docs/concepts.md) | Seats, nodes, central, promotion, the learning process |
-| [Architecture](docs/architecture.md) | Subsystems, storage, how the pieces fit |
-| [MCP and agents](docs/mcp/README.md) | Client setup, tool reference, agent policy |
-| [Performance](docs/performance.md) | Benchmark results and the harness |
-| [Operations](docs/operations.md) | Deployment, environment, integrations |
-| [Decisions](docs/adr/) | Architecture decision records |
-| [Domain language](CONTEXT.md) | Terms this codebase uses precisely |
+Start with [Architecture](docs/architecture.md), [Operations](docs/operations.md), [MCP setup and tool reference](docs/mcp/README.md), [Domain language](CONTEXT.md), [Performance](docs/performance.md), or the [architecture decision records](docs/adr/).
 
 ## Contributing
 
-Issues and pull requests welcome. Commits need a DCO sign-off (`git commit -s`, no CLA), PR titles follow Conventional Commits, and the `CI gate` check must pass. Python 3.11+.
-
-Start with [`good first issue`](https://github.com/masumi-network/Citadel/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) or read [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-Found a security issue? Do not open a public issue. Use [private vulnerability reporting](https://github.com/masumi-network/Citadel/security/advisories/new). See [`SECURITY.md`](SECURITY.md).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development setup, checks, and pull request rules. Report vulnerabilities through [`SECURITY.md`](SECURITY.md), not a public issue.
 
 ## License
 

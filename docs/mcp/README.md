@@ -1,4 +1,5 @@
-# Citadel — Integration Guide
+# Citadel: Integration Guide
+
 
 This guide covers how to connect any MCP-capable coding agent to the Citadel
 Organization Vault.
@@ -7,12 +8,28 @@ Organization Vault.
 
 | Public | Private |
 |---|---|
-| This repo ([Citadel](https://github.com/masumi-network/Citadel)) — code, docs, skills | Railway vault — live memory, DB, hashed tokens |
-| Hosted skill URLs (`/skills/connect`, `/skills/vault`, `/skills/boundary`) | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) — backup exports |
+| This repo ([Citadel](https://github.com/masumi-network/Citadel)) contains code, docs, and skills. | Hosted vault state contains private memory, the database, and hashed tokens. |
+| Hosted skill URLs (`/skills/connect`, `/skills/vault`, `/skills/boundary`) | [Vault-Backup-Mirror](https://github.com/masumi-network/Vault-Backup-Mirror) contains backup exports. |
 | Agent discovery manifest (`/.well-known/citadel.json`) | `ctdl_` tokens, `.env`, vault search results |
 | MCP tool names and API routes | Obsidian sync contents and source documents |
 
 Do not commit tokens or vault content to git. See [public-and-private.md](../public-and-private.md).
+## Current runtime contract
+
+[REPORTED] This revision is in an unmerged PR stack. Production may run an earlier revision. Verify the deployed revision before you use a production result as evidence.
+
+[VERIFIED] Hosted MCP runs at `/mcp/` in the FastAPI web process. It uses the same `ctdl_` bearer tokens and access scopes as the web UI (`kb/server.py:139-143`, `kb/mcp_server.py:322-332`).
+
+[VERIFIED] The `UserPromptSubmit` hook is separate from MCP. It extracts a bounded task query, sends it to `/search` over HTTPS, and prints at most three result contexts. The context contains provenance and trust labels, is marked untrusted, is capped at 6,000 characters, and is secret-redacted. Any failure prints policy text and returns zero (`kb/hooks/search_inject.py:84-140`, `kb/hooks/search_inject.py:174-283`).
+
+[VERIFIED] Each search schedules a redacted telemetry write to the durable feedback ledger without blocking the response. Writers can add explicit feedback with HTTP `POST /feedback` or `citadel_record_feedback`. The explicit event links a search ID or result ID and stores a bounded reason, not the free-form feedback text in the event row (`kb/server.py:3169-3259`, `kb/service.py:1512-1594`, `kb/search_feedback.py:364-398`, `kb/feedback_store.py:144-224`).
+
+[VERIFIED] Promotion runs only in the scheduled path after the first projection barrier. Secret scan, organization reference, LLM classification, and the relevance threshold gate a Central write. A standalone evolve run without a capture watermark skips promotion and exits zero. Approve and reject routes require `admin` and `sources:sync` (`scripts/run_railway.py:167-196`, `kb/promotion.py:368-510`, `kb/server.py:7499-7583`).
+
+[VERIFIED] `POST /admin/session` accepts an environment access key or a `ctdl_` token and sets a secure session cookie. `GET /api/session` returns the role, effective scopes, seat slug, readable datasets, and labels. Seat responses label the private `seat:<slug>` dataset as `Private Node`, the shared dataset as `Central`, and `session-traces` as `Shared Session Traces` (`kb/server.py:4452-4508`, `kb/server.py:3067-3106`).
+
+[VERIFIED] Seat-scoped callers can read and write only their own `seat:` Node. Another seat's Node is denied. Central and Shared Session Traces follow their own read rules. Admin and environment identities can bypass the dataset allowlist (`kb/server.py:2494-2512`).
+
 
 **Agent skill URLs (share these):**
 
@@ -49,21 +66,8 @@ boundary rules.
 
 **Table of contents:**
 
-- [Prerequisites](#prerequisites)
-- [Rules vs skill vs MCP](#rules-vs-skill-vs-mcp)
-- [Claude Code](#claude-code)
-- [Claude Code (local + cloud)](#claude-code-local--cloud)
-- [Claude Desktop](#claude-desktop)
-- [Codex (OpenAI)](#codex-openai)
-- [Connector-Style Apps (ChatGPT / Codex desktop, etc.)](#connector-style-apps-chatgpt--codex-desktop-etc)
-- [Cursor](#cursor)
-- [Pi (Coding Agent Harness)](#pi-coding-agent-harness)
-- [Any MCP Client (Generic)](#any-mcp-client-generic)
-- [Direct HTTP API (No MCP)](#direct-http-api-no-mcp)
-- [Token Management](#token-management)
-- [Tool Reference](#tool-reference)
-- [Troubleshooting](#troubleshooting)
-- [Architecture Notes](#architecture-notes)
+Use these sections: [Prerequisites](#prerequisites), [Rules vs skill vs MCP](#rules-vs-skill-vs-mcp), [Claude Code](#claude-code), [Claude Code (local + cloud)](#claude-code-local--cloud), [Claude Desktop](#claude-desktop), [Codex (OpenAI)](#codex-openai), [Connector-Style Apps](#connector-style-apps-chatgpt--codex-desktop-etc), [Cursor](#cursor), [Pi](#pi-coding-agent-harness), [Any MCP Client](#any-mcp-client-generic), [Direct HTTP API](#direct-http-api-no-mcp), [Token Management](#token-management), [Tool Reference](#tool-reference), [Troubleshooting](#troubleshooting), and [Architecture Notes](#architecture-notes).
+
 
 ---
 
@@ -413,13 +417,8 @@ do not read `~/.zshrc`. `/mcp` reconnect does not recapture a missing launch env
 
 ### Step 1 — Add MCP server (manual)
 
-Open Cursor Settings → Features → Model Context Protocol. Add a new MCP server:
+Open Cursor Settings and select the Model Context Protocol settings. Add a hosted HTTP server named `citadel` with URL `https://citadel.utxo.ag/mcp/`. Set the `Authorization` header to `Bearer ctdl_...` for the seat token.
 
-- **Name**: `citadel`
-- **Type**: hosted HTTP / streamable HTTP
-- **URL**: `https://citadel.utxo.ag/mcp/`
-- **Headers**:
-  - `Authorization` = `Bearer ctdl_...` (your token)
 
 ### Step 2 — Verify
 
@@ -629,7 +628,7 @@ Citadel stores only the SHA-256 hash. The raw token is shown once at creation.
 |---|---|---|
 | `citadel_discovery` | Safe agent discovery metadata: MCP endpoint, skill hashes, tool policy | — |
 | `citadel_session` | Show authenticated role, actor, capabilities | — |
-| `citadel_search` | Search the Organization Vault; each hit includes `_citadel` provenance, hash, and retrieval metadata. Automatically records implicit search telemetry (query, top hit ids/scores/trust, latency) into the feedback mesh. Use `source=repo-content` for a connector; `types` filters content shapes. | `query`, `dataset?`, `session_id?`, `top_k?`, `source?`, `repo?`, `path?`, `types?`, `mode?` |
+| `citadel_search` | Search the Organization Vault; each hit includes `_citadel` provenance, hash, and retrieval metadata. Each call records redacted implicit telemetry in the durable feedback ledger. Use `source=repo-content` for a connector; `types` filters content shapes. | `query`, `dataset?`, `session_id?`, `top_k?`, `source?`, `repo?`, `path?`, `types?`, `mode?` |
 | `citadel_get_document` | Fetch a full document by a search hit `id` when `_citadel.retrieval.document_drilldown_available` is true. A later 404 means the source changed, the caller scope changed, or the result is stale. | `document_id` |
 | `citadel_get_mesh` | Runtime-activity projection snapshot. Under ADR-0009 this is **caller-scoped** for non-admin tokens: other seats' document/query activity is stripped; seat presence (roster + counts) stays universal | — |
 | `citadel_list_sources` | Source-learning, GitHub sync, index status | — |
@@ -654,10 +653,13 @@ reject inline Cognify requests.
 | Tool | Description | Parameters |
 |---|---|---|
 | `citadel_run_learning_agent` | Run source-learning agent | `force?`, `dry_run?` |
-| `citadel_backup_mirror_status` | Inspect backup mirror manifest status | — |
+| `citadel_backup_mirror_status` | Inspect backup mirror manifest status | none |
 | `citadel_run_backup_mirror` | Run backup mirror manifest export | `dry_run?` |
 | `citadel_audit_events` | Inspect bounded audit events | `view?`, `limit?` |
 | `citadel_improve` | Run Cognee improvement cycle | `dataset?`, `session_ids?` |
+| `citadel_promotion_pending` | List promotion items. Reader access is filtered to the caller's seat. | `status?` |
+| `citadel_promotion_approve` | Approve one pending item. Requires admin and `sources:sync`. | `item_id`, `note?` |
+| `citadel_promotion_reject` | Reject one pending item. Requires admin and `sources:sync`. | `item_id`, `note?` |
 
 ### Resources
 

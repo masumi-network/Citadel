@@ -16,20 +16,31 @@ fallback. The `/next/*` routes remain explicit preview aliases.
 | `/contact` | the enquiry form | `web/src/pages/contact.tsx` |
 | `/login` | seat access | `web/src/pages/login.tsx` |
 
-The Next dashboard slices are behind the same session gate as `/app`:
+The Next dashboard slices use the same session gate as `/app`. The server checks role, capability, and effective API scope.
 
-| preview | page | minimum role |
-| --- | --- | --- |
-| `/next/app` | Home | reader |
-| `/next/app/search` | search | reader |
-| `/next/app/sources` | sources | reader |
-| `/next/app/graph` | graph | reader |
-| `/next/app/review` | the promotion queue | writer |
-| `/next/app/admin` | placeholder | admin |
+| preview | page | role | scope |
+| --- | --- | --- | --- |
+| `/next/app` | Home | reader | `kb:read` |
+| `/next/app/search` | search | reader | `kb:search` |
+| `/next/app/sources` | sources | reader | `sources:read` |
+| `/next/app/graph` | graph | reader | `kb:search` |
+| `/next/app/review` | the promotion queue | writer | `kb:read` |
+| `/next/app/admin` | placeholder | admin | `access:manage` |
+
+The Review page lists queue items allowed by the caller's scope. A seat sees its own queue. An admin can see all queues and can approve or reject. Writers see an admin notice because the decision endpoints require `admin` and `sources:sync` (`kb/server.py:7499-7583`).
+
 
 `/app` still serves the legacy authenticated dashboard. The Next dashboard is
 preview-only until browser interaction, API parity, and operator sign-off are
 complete. The public route switch does not switch the authenticated dashboard.
+## Login and readable scopes
+
+`POST /admin/session` accepts an environment credential or a `ctdl_` token. It sets a secure session cookie. `GET /api/session` returns the role, effective scopes, seat slug, readable dataset IDs, and `dataset_labels` (`kb/server.py:4452-4508`).
+
+Seat responses label the caller's `seat:<slug>` dataset as `Private Node`, the configured shared dataset as `Central`, and `session-traces` as `Shared Session Traces`. A seat-scoped request cannot name another seat's Node (`kb/server.py:3067-3106`, `kb/server.py:2494-2512`).
+
+[REPORTED] The current Next source is in an unmerged PR stack. Production may run an earlier revision. The route and scope descriptions above describe the current source code.
+
 
 ## The dashboard's gates
 
@@ -46,12 +57,7 @@ and render immediately, while Review and Admin are added only once
 `GET /api/session` reports a role that reaches them. No exported document
 contains the Admin link at any role. Two tests pin both halves.
 
-`docs/dashboard-api-contract.md` is the spec for what each view may read. It
-records which response fields the old dashboard actually rendered, and a list of
-gaps where the design asks for data no endpoint returns. Where a gap applies, the
-port renders nothing rather than a substitute: Review shows no secret-scan result
-because no scan runs, and Home shows a dash where `readable_document_count` and
-`captured_last_7d` are not yet returned.
+`docs/dashboard-api-contract.md` is the spec for each view's data. When a field is absent, the port leaves it blank or shows a dash. Review does not render `secret_scan`; the queue endpoint redacts candidate text and computes a deferred scan when needed. Home shows a dash for `readable_document_count` and `captured_last_7d` until those fields are returned (`kb/server.py:2461-2491`, `web/src/pages/app/review.tsx:125-158`).
 
 ## Build
 

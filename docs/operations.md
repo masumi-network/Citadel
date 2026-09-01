@@ -1,59 +1,58 @@
-# Citadel — Operations & Self-Hosting
+# Citadel: Operations and Self-Hosting
+
 
 Operational reference for running Citadel as a self-hosted Organization Vault:
 deployment, environment, integrations, and the full API surface. For the product
 overview and quick start, see the [README](../README.md).
+## Current runtime
+
+[REPORTED] This revision is in an unmerged PR stack. Production may run an earlier revision. Verify the deployed revision before you use a production result as evidence.
+
+[VERIFIED] The current Lite profile uses SQLite for relational data, Qdrant for vectors, and Ladybug for the graph. It requires authenticated access (`kb/lite_runtime.py:103-120`).
+
+[VERIFIED] Lifecycle SQLite stores retained source revisions, current source heads, projection jobs, and one receipt per required backend. One acceptance transaction writes the source, head, job, and pending receipts (`kb/lifecycle.py:451-528`, `kb/lifecycle.py:548-786`).
+
+[VERIFIED] A complete operation needs searchable relational, vector, and graph receipts for one active source revision. The barrier reads exact job IDs and returns pending or failed IDs without treating them as complete (`kb/projection_barrier.py:101-136`, `kb/projection_barrier.py:173-261`).
+
+[VERIFIED] The web process owns graph writes. With `CITADEL_EVOLVE_SCHEDULER_ENABLED=true`, its event loop runs source stages and one Cognify pass, waits for the first projection barrier, runs self-improvement, promotion, and feedback, then waits for a second barrier (`kb/server.py:560-573`, `kb/server.py:768-1040`).
+
+[VERIFIED] Search telemetry and explicit feedback use the durable feedback ledger under the state root. Ledger writes are redacted and detached from the search response (`kb/config.py:95-98`, `kb/server.py:3169-3259`, `kb/service.py:1512-1594`).
+
+[VERIFIED] Promotion is disabled by default and dry-run is enabled by default. Secret scan, organization reference, LLM classification, and the configured score threshold must pass before a Central write (`kb/config.py:248-255`, `kb/promotion.py:368-510`).
+
+[VERIFIED] Seat tokens identify a private Node and carry readable dataset labels for Private Node, Central, and Shared Session Traces. `/admin/session` sets a secure cookie. `/api/session` returns role, seat, scopes, datasets, and labels (`kb/access.py:458-543`, `kb/server.py:4452-4508`).
+
+[REPORTED] The public status keeps `Degraded` while health reports an unresolved failure. Keep this label until failed graph jobs are classified. This revision does not change that wording (`kb/static/info.js:176-187`).
+
 
 ## Contents
 
-- [Deployment (Railway)](#deployment-railway)
-- [Environment & LLM provider](#environment--llm-provider)
-- [Access roles & tokens](#access-roles--tokens)
-- [HTTP API reference](#http-api-reference)
-- [MCP server](#mcp-server)
-- [GitHub organization sync](#github-organization-sync)
-- [Linear workspace sync](#linear-workspace-sync)
-- [Google Chat update digest](#google-chat-update-digest)
-- [Obsidian vault sync](#obsidian-vault-sync)
-- [Knowledge conflicts](#knowledge-conflicts)
-- [Vault backup mirror](#vault-backup-mirror)
+Sections: [Deployment (Railway)](#deployment-railway), [Environment and LLM provider](#environment--llm-provider), [Access roles and tokens](#access-roles--tokens), [HTTP API reference](#http-api-reference), [MCP server](#mcp-server), [GitHub organization sync](#github-organization-sync), [Linear workspace sync](#linear-workspace-sync), [Google Chat update digest](#google-chat-update-digest), [Obsidian vault sync](#obsidian-vault-sync), [Knowledge conflicts](#knowledge-conflicts), and [Vault backup mirror](#vault-backup-mirror).
+
 
 ---
 
 ## Deployment (Railway)
 
-[CORRECTED 2026-08-14] `railway.toml` for the web service is
-`startCommand = "python -m kb.lite_runtime"` (`railway.toml:13`) with
-`healthcheckPath = "/healthz"` and `healthcheckTimeout = 300`. This is a
-liveness gate. Projection readiness remains on `/health/ready` and
-authenticated `/readyz`. Lite
-defaults in `kb/lite_runtime.py:77-82` are `DB_PROVIDER=sqlite`,
-`GRAPH_DATABASE_PROVIDER=ladybug`, `VECTOR_DB_PROVIDER=qdrant`. Other Railway
-services may still select `scripts.run_railway` job modes in their own config
-(github-sync, backup-mirror, pipeline). Do not start the published web image
-with `python -m scripts.run_railway` as the web entry. That is the command that
-failed the 2026-08-11 cutover when `scripts/` was not importable.
+[VERIFIED] The web service starts `python -m kb.lite_runtime` (`railway.toml:13`). Its liveness check is `/healthz`. Projection readiness uses `/health/ready` and authenticated `/readyz` (`railway.toml:14-15`).
 
-The Postgres + pgvector + Ladybug shape below is a self-host option. It is not
-the live Railway web profile as of 2026-08-14.
+[VERIFIED] The Lite profile sets `DB_PROVIDER=sqlite`, `GRAPH_DATABASE_PROVIDER=ladybug`, and `VECTOR_DB_PROVIDER=qdrant` (`kb/lite_runtime.py:103-120`). Do not start the web image with `python -m scripts.run_railway`.
 
-Dependencies for the image still need to be listed where the Dockerfile and
-`pyproject.toml` install them. A new runtime dependency must be added there.
+The Postgres, pgvector, and Ladybug shape below is a self-host alternative. It is not the current Lite profile.
 
-Recommended first deployment shape for a **Postgres self-host** (not current
-Railway Lite):
+### Self-host alternative
 
-- One web service for this repository.
-- One cron service for daily GitHub syncs (`CITADEL_RUN_MODE=learning-agent`).
-- One cron service for Vault Backup Mirror manifest export (`backup-mirror`).
-- One Railway Postgres dedicated to Citadel, with `pgvector` enabled.
-- One Railway volume mounted at `/data` for Cognee graph state files.
+Add runtime dependencies in the Dockerfile and `pyproject.toml`. Use one web process for the graph store and one mounted volume for its state. Keep graph-writing stages in that web process. Do not add an `evolve` or `cognify` cron service that shares the graph store.
 
-Use Railway's private Postgres `DATABASE_URL` as the app database binding. At
-runtime Citadel derives Cognee's split `DB_*` settings from `DATABASE_URL`, and
-maps `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD` into
-`VECTOR_DB_*` when `VECTOR_DB_PROVIDER=pgvector`. Set explicit `VECTOR_DB_*` only
-when the vector store uses a different Postgres target.
+Use a private Postgres `DATABASE_URL` as the app database binding for this alternative. Citadel derives Cognee's `DB_*` settings from it. When `VECTOR_DB_PROVIDER=pgvector`, it maps the Postgres fields into `VECTOR_DB_*`. Set explicit vector fields only when the vector store uses another Postgres target.
+
+
+For the self-host Postgres alternative, use the graph and path settings below. Keep graph-writing stages in the web process. Do not start a second process that opens the same graph store.
+
+Citadel keeps its own logs at `CITADEL_LOG_LEVEL` and applies a separate threshold to Cognee's task and retrieval loggers. The default `CITADEL_COGNEE_LOG_LEVEL=WARNING` keeps warnings and failures. Set `INFO` or `DEBUG` during diagnosis, then restore `WARNING`.
+
+Public service surfaces read the package version from `kb.__version__` when the web process starts. `build_id` uses `RAILWAY_GIT_COMMIT_SHA`, then `CITADEL_BUILD_ID`. `deployment_id` uses the Railway deployment or snapshot identifiers. A missing source identifier stays `null`.
+
 
 ```bash
 GRAPH_DATABASE_PROVIDER=ladybug
@@ -61,23 +60,8 @@ SYSTEM_ROOT_DIRECTORY=/data/.cognee_system
 DATA_ROOT_DIRECTORY=/data/.data_storage
 ```
 
-Citadel keeps its own logs at `CITADEL_LOG_LEVEL` and applies a separate
-threshold to Cognee's high-volume task and retrieval loggers. The default
-`CITADEL_COGNEE_LOG_LEVEL=WARNING` preserves warnings and failures without
-flooding Railway's log ingestion. Temporarily set it to `INFO` or `DEBUG` for
-diagnosis, then restore `WARNING`.
 
-Public service surfaces read the package version from `kb.__version__`, captured
-when the web process starts. `build_id` reports `RAILWAY_GIT_COMMIT_SHA` when
-Railway provides it, then `CITADEL_BUILD_ID` as a CI-provided fallback.
-`deployment_id` is reported separately from `RAILWAY_DEPLOYMENT_ID`,
-`RAILWAY_SNAPSHOT_ID`, or `CITADEL_DEPLOYMENT_ID`. A missing source identifier
-stays `null`; a release version or deployment ID must never be used as a commit
-substitute. Deploy from a Git-connected Railway commit, or set
-`CITADEL_BUILD_ID` to the exact `git rev-parse HEAD` value in the deployment
-environment.
-
-Enable pgvector before production ingest:
+For the self-host Postgres alternative, enable pgvector before production ingest:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -104,10 +88,10 @@ Do not paste seat tokens or DB URLs into chat. Env vars stay in Railway
 (`railway variables --service Citadel-Archive`). After deploy, restart Cursor so
 MCP re-fetches `tools/list` from the new Node.
 
-### Promotion Agent (ADR-0007 P5/P6)
+### Promotion and evolve scheduling
 
-After the promotion code is deployed, enable the governed Node→Central path on the
-**Citadel-Archive** web service:
+Promotion is opt-in and dry-run is enabled by default. Set the variables below only for an approved deployment. The relevance threshold and item limit remain configurable.
+
 
 ```bash
 railway variables --service Citadel-Archive \
@@ -117,32 +101,16 @@ railway variables --service Citadel-Archive \
   --set "CITADEL_PROMOTION_MAX_ITEMS=20"
 ```
 
-- **On demand:** seat writers call `POST /api/promote/run` or `citadel promotion run --execute`.
-- **Approval queue:** `GET /api/promotion/pending`, dashboard **Promotion Queue**, MCP
-  `citadel_promotion_*`, or `citadel promotion list|approve|reject`.
-- **6h cron:** add a Railway cron service with `CITADEL_RUN_MODE=evolve`, the same
-  `/data` volume as the web service, and schedule `0 */6 * * *` (UTC). The evolve
-  pipeline runs GitHub sync → repo-content → self-improve → **promotion** → cognify.
-  Toggle the promotion stage alone with `CITADEL_EVOLVE_PROMOTION_ENABLED=true|false`.
+The HTTP `POST /api/promote/run` route checks access and returns `409` with `llm_scheduled_only`. It does not run the promotion LLM from a user request (`kb/server.py:7467-7496`).
 
-> **Two warnings before you add that cron service.**
->
-> A second process sharing the web service's `/data` is how [#88](https://github.com/masumi-network/Citadel/issues/88)
-> happens: cognee opens the Kuzu graph read-write with an exclusive OS file lock
-> and holds it for the process lifetime, so whichever process touches the graph
-> first locks the other one out. The web service already runs the evolve cycle on
-> `CITADEL_EVOLVE_SCHEDULER_ENABLED`; prefer that over a separate service until
-> #88 is resolved.
->
-> Set `restartPolicyType = "NEVER"` on any cron-style service. The repo default in
-> `railway.toml` is `ON_FAILURE` with 3 retries, and an evolve pass now exits
-> nonzero when *any* stage failed (#89), so a single failing stage under the
-> default policy would re-run the whole pass up to three more times.
+`GET /api/promotion/pending` lists redacted queue items. A seat sees its own queue. An admin can inspect all queues. Approve and reject require the `admin` role and `sources:sync` (`kb/server.py:7499-7566`).
 
-Cron services should also mount `/data` so `github_sync_state.json` and
-`backup_mirror/` persist between runs. Keep app and database in the same
-project/environment so the database stays private to Citadel. The graph store
-can later move to Neo4j or Memgraph without changing Citadel's wrapper code.
+The web scheduler runs promotion after the first projection barrier. It passes the capture watermark to the stage. A standalone `CITADEL_RUN_MODE=evolve` run has no watermark, so its promotion stage skips and exits zero. Standalone evolve does not process feedback. The standalone `cognify` mode refuses to run when the web scheduler owns the graph (`kb/server.py:932-999`, `scripts/run_railway.py:167-196`, `scripts/run_railway.py:352-432`, `scripts/run_railway.py:147-164`).
+
+Do not add a separate `evolve` or `cognify` cron service that opens the graph store. The web process is the only graph writer. Keep any separate non-graph job away from the web service's graph state (`kb/server.py:1073-1081`).
+
+For a separate cron job that writes state, set `restartPolicyType = "NEVER"` and mount the volume that owns its state. Keep the app and database in one project and environment.
+
 
 **Operational checks:**
 
@@ -161,7 +129,7 @@ CITADEL_SEARCH_DEFAULT_DATASET=masumi-network
 [CORRECTED 2026-08-23] For OpenRouter, Cognee uses the custom-provider form.
 The model id must be `openrouter/`-prefixed. The native OpenRouter route
 `openrouter/free` becomes `openrouter/openrouter/free` for Cognee. OpenRouter
-documents that the router filters for features such as structured outputs:
+documents that the router filters for capabilities such as structured outputs:
 https://openrouter.ai/openrouter/free.
 
 The local default uses that free router. Production inspection still showed the
@@ -223,45 +191,33 @@ token's permissions within its role; scopes that exceed the role are rejected
 tokens on the Access page (or `POST /api/access/tokens`); the token is shown
 once — Citadel stores only its hash, prefix, role, scopes, expiry, and last-used
 timestamp. Pass it as `Authorization: Bearer <token>`.
+### Token login and memory scope
+
+`POST /admin/session` accepts an environment access key or a `ctdl_` token. A valid request sets an `HttpOnly`, `Secure`, `SameSite=lax` cookie with a 12-hour lifetime. `GET /api/session` accepts that session or the bearer token and returns the role, effective scopes, seat slug, readable dataset IDs, and `dataset_labels` (`kb/server.py:4452-4508`).
+
+For a seat, the labels identify `seat:<slug>` as `Private Node`, the configured shared dataset as `Central`, and `session-traces` as `Shared Session Traces` (`kb/server.py:3067-3106`). The server checks both role and scope for each route (`kb/server.py:2275-2304`).
+
+Seat-scoped reads and writes stay inside the caller's own `seat:` dataset. Another seat's Node returns a dataset-denied response. Shared datasets follow their own access rules. Admin and environment identities bypass the dataset allowlist (`kb/server.py:2494-2512`).
+
 
 ## HTTP API reference
 
-Health probes are split on purpose:
+Health probes:
 
-- `GET /healthz` is liveness and the Railway deploy gate (`railway.toml`
-  `healthcheckPath`). It is unauthenticated and does not run corpus or canary
-  work.
-- `GET /health/ready` checks dependency readiness, including bounded corpus and
-  lifecycle probes. A backlog can keep it at `503` while the process serves
-  traffic.
-- `GET /readyz` is authenticated readiness (bounded corpus probe, lifecycle
-  census, last canary). The image `HEALTHCHECK` targets this route.
+`GET /healthz` is unauthenticated liveness and the Railway deploy gate. It does not run corpus or canary work. `GET /health/ready` checks dependency readiness and may return `503` while the process serves traffic. `GET /readyz` is authenticated readiness. It checks the bounded corpus probe, lifecycle census, and last canary.
 
-Core:
+| Group | Routes |
+|---|---|
+| Read | `GET /api/session`, `GET /api/knowledge`, `GET /api/knowledge/events`, `GET /api/mesh`, `GET /api/mesh/graph`, `GET /api/indexes`, `GET /api/sources`, `GET /api/documents/{id}`, and `GET /events`. |
+| Write | `POST /ingest`, `POST /search`, `POST /feedback`, `POST /api/contribute`, and the Obsidian sync routes. |
+| Admin jobs | `POST /api/self-upgrade`, `POST /api/github-sync/run`, and `POST /api/learning-agent/run`. |
+| Conflicts | `GET /api/conflicts?status=open|resolved` and `POST /api/conflicts/{id}/resolve`. |
+| Admin | `GET /api/access`, token creation and revocation, audit events, backup mirror status and runs, Linear sync status and runs, and lifecycle recovery routes. |
 
-- `GET /api/session`, `GET /api/knowledge`, `GET /api/knowledge/events`
-- `GET /api/mesh`, `GET /api/mesh/graph`, `GET /api/indexes`
-- `GET /api/sources`, `GET /api/documents/{id}`, `GET /events`
-- `GET /api/conflicts?status=open|resolved`, `POST /api/conflicts/{id}/resolve`
-- `POST /ingest`, `POST /search`, `POST /feedback`, `POST /improve`, `POST /api/contribute`
-- `POST /api/self-upgrade`, `POST /api/github-sync/run`, `POST /api/learning-agent/run`
-- Obsidian: `POST /api/obsidian/vaults`, `GET /api/obsidian/manifest`,
-  `POST /api/obsidian/sync/push`, `GET /api/obsidian/sync/pull`,
-  `POST /api/obsidian/conflicts/{id}/resolve`
+Lifecycle recovery previews active-generation failures by default. Apply requires the returned generation identity, ordered `candidate_ids`, and `expected_count`. A changed preview returns `409` without resetting a job. The route requires `admin` and `sources:sync`.
 
-Admin:
+`POST /api/lifecycle/tombstone-failed` previews current-head jobs whose last error is `FileNotFoundError`. Apply uses the same confirmation fields and tombstones those source keys.
 
-- `GET /api/access`, `POST /api/access/tokens`, `POST /api/access/tokens/{id}/revoke`
-- `GET /api/audit?view=all|mcp|access|failures&limit=50`
-- `GET /api/backup-mirror`, `POST /api/backup-mirror/run`
-- `GET /api/linear-sync`, `POST /api/linear-sync/run`
-- `POST /api/lifecycle/requeue-failed` previews active-generation failures by
-  default. Apply requires the returned generation identity, exact ordered
-  `candidate_ids`, and `expected_count`. A changed preview returns HTTP 409
-  without resetting any job. The route requires admin role and `sources:sync`.
-- `POST /api/lifecycle/tombstone-failed` previews current-head jobs whose last
-  error is `FileNotFoundError` (missing local path). Apply uses the same
-  confirmation fields and tombstones those `source_key`s instead of requeueing.
 
 Examples:
 
@@ -326,6 +282,7 @@ Authorization: Bearer ctdl_<token>
 ```json
 {
   "mcpServers": {
+
     "citadel": {
       "type": "http",
       "url": "https://citadel.utxo.ag/mcp/",
@@ -352,6 +309,7 @@ CITADEL_MCP_SELF_BASE_URL=http://127.0.0.1:8000   # forwarded calls hit the API 
 CITADEL_MCP_ALLOWED_HOSTS=citadel.utxo.ag  # optional Host/Origin allow-list
 ```
 
+
 **Safe defaults:** use a reader service-account token for normal agent work;
 require client approval for `citadel_ingest` / `citadel_record_feedback`; keep
 `citadel_run_learning_agent` / `citadel_run_backup_mirror` / `citadel_improve`
@@ -365,21 +323,23 @@ Exposed tools include `citadel_discovery`, `citadel_session`, `citadel_search`,
 `citadel_ingest`, `citadel_contribute`, `citadel_record_feedback`,
 `citadel_linear_my_issues`, `citadel_linear_search`, `citadel_run_learning_agent`,
 `citadel_backup_mirror_status`, `citadel_run_backup_mirror`, `citadel_audit_events`,
-and `citadel_improve`. `citadel_search` hits carry an additive `_citadel`
-provenance envelope (`rank`, `dataset`, `result_id`, `content_sha256`,
-`provenance`, `retrieval`, `doc_type`, `content_hint`, `trust_tier`);
-`citadel_get_document` takes the `id` from a hit when
-`_citadel.retrieval.document_drilldown_available` is true. `content_hint`
-describes what the hit's text looks like and is body-derived, so it is a
-relevance signal only; `trust_tier` reports attested provenance
-(`reference-only` or `unattested`) and is never derived from content — see
-[ADR-0012](adr/0012-attested-trust-vs-content-hint.md). Every search also
-records **implicit search telemetry** into the mesh feedback index (query,
-filters, top hit ids/doc_types/trust_tiers/scores, latency, empty/low-score
-flags, MCP tool name when present) — non-blocking and approval-free. Telemetry
-rows land on the caller's own seat Node; a caller without a seat writes a
-presence-only row. Writers may still call `citadel_record_feedback` after
-reading hits for explicit scores (pass `qa_id` **or** `result_id`).
+`citadel_improve`, `citadel_promotion_pending`, `citadel_promotion_approve`, and
+`citadel_promotion_reject`.
+
+`citadel_search` returns an `_citadel` envelope with result and retrieval metadata.
+`content_hint` describes the hit text and is a relevance signal only. `trust_tier`
+reports attested provenance, which is `reference-only` for shared session traces
+and `unattested` for other hits. Verify API and specification claims against live
+MIP or OpenAPI sources.
+
+Every search also writes implicit telemetry to the durable feedback ledger. A seat
+gets its own Node row. A seatless caller gets a presence-only row. Writers may call
+`citadel_record_feedback` with a `qa_id` or `result_id` and a score of `1` or `-1`.
+### Task-aware search injection
+
+The `UserPromptSubmit` hook extracts a bounded task query from the prompt. It removes fenced code, long log lines, URLs, and command wrappers. It sends the query to `POST /search` only over HTTPS. The request uses the seat token from `CITADEL_MCP_ACCESS_TOKEN`, a five-second timeout, and at most three results (`kb/hooks/search_inject.py:18-28`, `kb/hooks/search_inject.py:84-140`, `kb/hooks/search_inject.py:227-259`).
+
+The hook prints a context block with result IDs, titles, datasets, trust tiers, provenance, and short snippets. It marks the block as untrusted context, caps the output at 6,000 characters, and redacts secrets. Network, parse, and formatting failures print the static policy and return exit code zero (`kb/hooks/search_inject.py:174-224`, `kb/hooks/search_inject.py:267-283`).
 
 ## GitHub organization sync
 
@@ -415,8 +375,8 @@ summarization is disabled for private-repo metadata unless
 `CITADEL_ORG_DIGEST_LLM_ALLOW_PRIVATE=true`. Run via `citadel sync-github`,
 `citadel sync-repo-content`, or `POST /api/repo-content-sync/run`.
 
-For Railway, create a cron service with `CITADEL_RUN_MODE=learning-agent` and a
-schedule (e.g. `0 8 * * *` — 08:00 UTC daily).
+
+Keep GitHub sync stages in the web process when graph projection is enabled. Do not create a `learning-agent` cron service against the same graph state.
 
 ## LLM-independent baseline retrieval
 

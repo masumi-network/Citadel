@@ -117,7 +117,8 @@ Structured or source-linked knowledge added to an **Organization Vault** by an a
 _Avoid_: chat message, random update, raw agent conversation
 
 **Promotion**:
-A curated copy of content from a seat **Node** into **Central**. Dual-write: the original stays in the **Node**; the copy goes to **Central**. Runs on a schedule (operator cron) and via an LLM **Promotion Agent** that cross-references the note against org projects and **Structured Knowledge** already in **Central** — not a direct seat write.
+A curated copy of content from a seat **Node** into **Central**. The original stays in the **Node**. The web scheduler runs the governed copy after a complete projection barrier. A pending **New Org Project** needs admin approval.
+
 _Avoid_: move, delete original, automatic merge, direct seat ingest to Central
 
 **Promotion Agent**:
@@ -129,7 +130,7 @@ A project, repo, product, or initiative named in a seat **Node** whose repositor
 _Avoid_: personal side project auto-share, new folder name, any novel string, external-org repo auto-promote
 
 **Promotion Approval**:
-The **Vault Member** response when the **Promotion Agent** automatically proposes promoting a **New Org Project** note from their **Node** into **Central**. **Vault Members do not add items to the queue** — autonomous capture (hooks, `citadel capture`, MCP) fills the **Node**; the agent queues pending items when rules match. **Approve** = allow this one note into **Central**. **Reject** = keep it on the **Node** only; rejection **sticks** — the same note is not re-queued on later cron passes unless its content changes. Each approval is **one-shot**; later notes from the same external project still need approval or masumi org repo membership. Every promote and approve/reject is **source-linked and auditable** (actor, seat, timestamp, repo hints, preview). v1: audit events plus promotion metadata on the **Central** copy; target: full **Source Snapshot** back-link. Surfaces: **Operations Dashboard**, MCP (approve/reject only after explicit user confirmation), and CLI (`citadel promotion …`, `--json`). Each **Vault Member** sees their own queue; admins see all seats and may approve on a member’s behalf (delegate flagged in audit).
+The response from an authorized admin when the **Promotion Agent** proposes a **New Org Project** note from a seat **Node**. Autonomous capture fills the **Node**. The agent creates the pending item when the gates match. `GET /api/promotion/pending` lets a seat read its own queue. Approve and reject require the `admin` role and `sources:sync`. **Approve** copies the note to **Central**. **Reject** keeps it on the **Node**. Rejection remains in force for the same content hash. Each decision is one-shot and auditable.
 _Avoid_: auto-approve novel work, silent admin override, chat-only approval, standing bypass for external repos
 
 **Operations Dashboard**:
@@ -173,7 +174,8 @@ A source-linked change that affects work visibility, product behavior, architect
 _Avoid_: raw activity, commit spam, productivity tracking
 
 **Organization Update Digest**:
-A source-linked summary of meaningful changes, features, decisions, and ongoing work produced from the **Organization Vault**.
+A source-linked summary of meaningful product changes, decisions, and ongoing work produced from the **Organization Vault**.
+
 _Avoid_: chat transcript, people report, raw activity feed, surveillance
 
 **Security Finding**:
@@ -188,7 +190,28 @@ _Avoid_: merge, overwrite, silent correction
 How settled a piece of **Structured Knowledge** is, surfaced to readers as a trust signal — `seed` (a single source, or an open **Knowledge Conflict**), `growing` (a few corroborating sources), `stable` (multiple corroborating sources, no open conflict). It reflects corroboration and contradiction state; it is **not** a **Promotion** gate — **Promotion** keeps its own gates (secret scan, org reference, relevance), and **Knowledge Maturity** simply tells a reader how corroborated a **Central** answer is.
 _Avoid_: approval status, promotion gate, workflow stage, review state
 
+## Current implementation terms
+
+[VERIFIED] **Projection Receipt**:
+An SQLite record for one backend projection of one retained source revision. Required backends are relational, vector, and graph. A receipt becomes searchable only after the worker verifies provider readback (`kb/lifecycle.py:503-528`, `kb/lifecycle_worker.py:752-958`).
+
+[VERIFIED] **Projection Barrier**:
+A bounded wait over exact lifecycle job IDs. It returns searchable, pending, and failed IDs. A job is complete only when relational, vector, and graph receipts are searchable (`kb/projection_barrier.py:19-25`, `kb/projection_barrier.py:173-261`).
+
+[VERIFIED] **Feedback Ledger**:
+The SQLite store at the state root for redacted implicit search events, explicit feedback events, and one bounded decision per event. The consumer can record `no_action`, `ranking_eval_candidate`, or `projection_repair_candidate` (`kb/config.py:95-98`, `kb/feedback_store.py:256-337`, `kb/feedback_store.py:628-659`).
+
+[VERIFIED] **Task Search Context**:
+The bounded, provenance-labeled, untrusted context printed by the `UserPromptSubmit` hook after it searches the authenticated Node. It contains short result fields and is secret-redacted. Hook failures return zero and print policy text (`kb/hooks/search_inject.py:174-224`, `kb/hooks/search_inject.py:267-283`).
+
+[VERIFIED] **Session Login**:
+The `POST /admin/session` token exchange. It accepts environment credentials and `ctdl_` tokens, then sets a secure cookie. `GET /api/session` returns role, scopes, seat, readable datasets, and dataset labels (`kb/server.py:4452-4508`).
+
+[VERIFIED] **Readable Dataset Label**:
+The server label for a dataset in the session scope. Seat responses use `Private Node`, `Central`, and `Shared Session Traces` for the corresponding datasets (`kb/server.py:3067-3106`).
+
 ## Relationships
+
 
 - An **Organization Vault** is accessed by humans and agents.
 - An **Organization Vault** contains **Structured Knowledge**.
@@ -212,11 +235,12 @@ _Avoid_: approval status, promotion gate, workflow stage, review state
 - A **Security Finding** is separate from an **Organization Update Digest** and should never expose secret values in external communication surfaces.
 - A **Knowledge Conflict** should be shown when source-linked knowledge disagrees.
 - A **Seat** is one human **Principal** that may hold several **Tokens**; **Agent Identities** acting for that human are separate principals that may be granted access to the seat's **Node**.
-- A caller is treated as holding a **Node** when a seat **Node** is in its access scope — **Seat Node Write Policy** applies: writes land in that **Node** only; **Central** is read-only for that caller.
-- **Central** gains new **Structured Knowledge** from org source sync, **Promotion** (cron + **Promotion Agent**), service-account **Vault Contributions**, and operator jobs — not from direct seat-scoped writes.
-- When **Promotion** finds content that extends known org work (repo in the masumi org list or strong **Central** match), it may copy to **Central** without **Vault Member** action only after secret scan and LLM relevance checks pass; structured repo lists decide *whether* something is org work, not whether it is safe to share.
-- When **Promotion** detects a **New Org Project**, it must obtain **Promotion Approval** (dashboard, MCP with user confirm, or CLI) before syncing to **Central**; **Vault Members** respond to agent-proposed queue items — they do not add items manually.
-- **CLI** (`citadel onboard`, `setup`, `capture`, `status`) handles setup and Node capture over HTTP; **MCP** handles in-session search, deliberate ingest, and promotion approve/reject — hooks do not use MCP.
+- A caller is treated as holding a **Node** when a seat **Node** is in its access scope. **Seat Node Write Policy** applies. Writes land in that **Node** only. **Central** is read-only for that caller.
+- **Central** gains new **Structured Knowledge** from org source sync, the web **Promotion** stage, service-account **Vault Contributions**, and operator jobs. Direct seat-scoped writes do not reach **Central**.
+- When **Promotion** finds content that extends known org work, secret scan, LLM classification, and the configured relevance gate must pass before a copy reaches **Central**.
+- When **Promotion** detects a **New Org Project**, an authorized admin must approve the pending item before the copy reaches **Central**. Seat holders can read their own queue. Admins approve or reject items.
+- **CLI** (`citadel onboard`, `setup`, `capture`, `status`) handles setup and Node capture over HTTP. **MCP** handles in-session search, deliberate ingest, and promotion decisions. Hooks do not use MCP.
+
 - Integration sources (e.g. Linear) sync org-wide into **Central**; **Seat-Scoped Mirrors** copy assignee-relevant subsets into each seat's **Node** (e.g. John's assigned Linear issues appear in John's **Node** and in **Central**).
 - A **Session Trace** is private to its **Seat**'s **Node** by default; a **Shared Session Trace** is a volunteered copy in `session-traces` readable by every **Seat** via **`citadel_search`**, never **Central** and never another seat's **Node**.
 - **Shared Session Traces** do not become **Structured Knowledge** and do not feed the daily improve loop; **Central** stays curated org truth.
@@ -233,19 +257,15 @@ push, session close, or agent work.
 | Manual CLI capture | **Vault Member** runs `citadel capture` on approved roots | seat **Node** | dev (on demand) |
 | SessionEnd hook (Claude Code) | session close | seat **Node** | dev (optional) |
 | Explicit MCP / agent ingest | user-approved write outside auto-capture | seat **Node** | **Vault Member** + agent (MCP; not hooks) |
-| Railway `learning-agent` cron | daily schedule | **Central** | operator |
-| Railway `linear-sync` cron | scheduled | **Central** + **Seat-Scoped Mirror** | operator |
-| Railway **Promotion Agent** cron | every 6h + on demand | seat **Node** → **Central** (governed) | cron: operator; on demand: **Vault Member** (own seat) or admin (any seat) via dashboard or CLI |
+| Web evolve scheduler | configured interval | **Central** and governed **Promotion** | web process |
+| Railway `linear-sync` job | scheduled | **Central** + **Seat-Scoped Mirror** | operator |
 
-**Member day-to-day:** update the **Node** only (hooks, `citadel capture`, optional MCP ingest). **Central** updates automatically when the **Promotion Agent** rules pass, or when the member **approves** a **New Org Project** proposal in their queue.
+
+**Member day-to-day:** update the **Node** only (hooks, `citadel capture`, optional MCP ingest). **Central** updates when the web scheduler passes its gates or an authorized admin approves a pending **Promotion** item.
 
 Install once: `citadel onboard` (idempotent). It writes a self-contained git pre-push hook (`python -m kb.hooks.sync_push`), SessionEnd/SessionStart hooks (`kb.hooks.sync_session` / `kb.hooks.sync_start`), the proactive agent policy (`AGENTS.md` plus native rules for Cursor, Windsurf, and Gemini when detected), project `.mcp.json`, and detected client MCP configs (Claude Code, Cursor, Codex, Gemini, Windsurf). On macOS it also runs `launchctl setenv` so Dock-launched Cursor can see `CITADEL_MCP_ACCESS_TOKEN` until logout.
 Register **Approved Capture Roots** locally, assign **Capture Root Tags**, and merge the server **Capture Policy** template during seat setup (Citadel CLI wizard).
-
-**Agent sync policy:** rely on hooks + cron for allowlisted org repos. Agents read via `citadel_search`,
-`citadel_linear_my_issues`, and `citadel_linear_search`. Do **not** trigger
-admin sync (`POST /api/linear-sync/run`, learning-agent runs) unless the user
-explicitly asks for an immediate refresh.
+**Agent sync policy:** rely on hooks for Node capture and the web scheduler for governed Central work. Agents read via `citadel_search`, `citadel_linear_my_issues`, and `citadel_linear_search`. Do not trigger admin sync (`POST /api/linear-sync/run`, learning-agent runs) unless the user explicitly asks for an immediate refresh.
 
 ## Graph views (Phase 2)
 
@@ -337,7 +357,7 @@ mesh, including per-item drill-down.
 - "daily update" was initially broad; resolved: daily updates are **Repository Daily Updates**, not people or department reports.
 - "repository daily update detail" was too broad; resolved: include meaningful commits, pull requests, and repository changes only.
 - "meaningful change" was vague; resolved: **Meaningful Source Changes** are source-linked changes around pull requests, merged work, repository momentum, blockers, decisions, reliability, architecture, or product behavior.
-- "org update" was broader than repository changes; resolved: an **Organization Update Digest** summarizes meaningful source-linked changes, features, decisions, and ongoing work from the **Organization Vault**.
+- "org update" was broader than repository changes; resolved: an **Organization Update Digest** summarizes meaningful product changes, decisions, and ongoing work from the **Organization Vault**.
 - "secret reporting" was initially mixed into the update digest; resolved: potential secrets and high-risk issues are **Security Findings**, redacted and handled separately from daily digests.
 - "conflicting knowledge" was unresolved; resolved: prefer newer source-linked repository truth for code behavior, while marking **Knowledge Conflicts** visibly.
 - "is a caller a Seat?" was conflated with principal identity; resolved: for **Central** curation the test is whether a seat **Node** is in the caller's access scope, which covers both the human's **Tokens** and their **Agent Identities** — agents are not the human **Principal** and so carry no seat marker of their own.
