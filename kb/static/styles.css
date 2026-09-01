@@ -1056,7 +1056,7 @@ pre {
 
 .graph-panel {
   display: grid;
-  grid-template-rows: auto auto minmax(320px, 1fr) auto;
+  grid-template-rows: auto auto minmax(320px, 1fr) auto auto;
   min-height: 590px;
   overflow: visible;
 }
@@ -1091,8 +1091,124 @@ pre {
   background: var(--bg);
 }
 
-.selection {
+.graph-controls {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: calc(100% - 24px);
+}
+
+.graph-control-button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 8px 10px;
+}
+
+.graph-instructions {
+  position: absolute;
+  top: 66px;
+  left: 14px;
+  z-index: 2;
+  max-width: min(420px, calc(100% - 28px));
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border-quiet);
+  background: var(--scrim);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+
+.graph-node-directory {
   grid-row: 4;
+  min-width: 0;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-quiet);
+  background: var(--surface);
+}
+
+.graph-node-directory-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.graph-node-directory-header h3 {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.graph-directory-count,
+.graph-directory-empty,
+.graph-selection-status {
+  color: var(--quiet);
+  font-size: 11px;
+}
+
+.graph-node-directory-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 6px;
+  max-height: 188px;
+  margin-top: 8px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.graph-node-directory-row {
+  display: flex;
+  min-width: 0;
+  min-height: 44px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--field);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-node-directory-row:hover,
+.graph-node-directory-row[aria-pressed="true"] {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.graph-node-directory-row strong,
+.graph-node-directory-row span {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-node-directory-row strong {
+  font-size: 12px;
+}
+
+.graph-node-directory-row span {
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.graph-selection-status {
+  margin-top: 7px;
+}
+
+.selection {
+  grid-row: 5;
 }
 
 .toolbar-actions {
@@ -1480,14 +1596,15 @@ pre {
 }
 
 .selection .node-connection {
-  display: grid;
-  grid-template-columns: minmax(84px, 0.34fr) minmax(0, 1fr);
-  gap: 8px;
-  align-items: start;
+  display: flex;
+  min-height: 44px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
   width: 100%;
-  min-height: 0;
   margin-top: 2px;
-  padding: 3px 8px;
+  padding: 7px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--field);
@@ -1504,27 +1621,27 @@ pre {
 }
 
 .selection .node-connection-relation {
-  color: var(--quiet);
+  color: var(--text);
   font-family: var(--mono);
   font-size: 10.5px;
+  font-weight: 600;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
 .selection .node-connection-label {
-  color: var(--muted);
+  color: var(--text);
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
-
 .selection .node-connections-more {
   display: block;
+  min-height: 44px;
   margin-top: 4px;
-  color: var(--primary);
-  appearance: none;
+  padding: 8px 0;
   border: 0;
-  padding: 0;
   background: transparent;
+  color: var(--primary);
   font-size: 11px;
   text-decoration: underline;
   cursor: pointer;
@@ -1533,6 +1650,18 @@ pre {
 .selection .node-connections-more:hover,
 .selection .node-connections-more:focus-visible {
   color: var(--text);
+}
+
+.selection .node-hidden-notice,
+.selection .node-document-empty p {
+  margin-top: 8px;
+  color: var(--muted);
+}
+
+.selection .node-show-on-canvas,
+.selection .node-document-retry {
+  min-height: 44px;
+  margin-top: 10px;
 }
 
 /* Kind legend overlaid on the knowledge-graph canvas; chips toggle kinds
@@ -3237,6 +3366,26 @@ textarea[aria-invalid="true"] {
   .graph-view-field select,
   .graph-view-actions button {
     min-height: 44px;
+  }
+  .graph-controls {
+    top: 10px;
+    right: 10px;
+    left: 10px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    max-width: none;
+  }
+
+  .graph-control-button {
+    width: 100%;
+  }
+
+  .graph-instructions {
+    top: 160px;
+    right: 10px;
+    left: 10px;
+    max-width: none;
   }
 
   .graph-view-icon {

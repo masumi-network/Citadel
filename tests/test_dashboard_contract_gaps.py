@@ -815,3 +815,229 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
     assert "Nearest document in view — not a direct source" in app_js, (
         "the nearest-walk fallback must label itself as not being provenance"
     )
+
+
+def test_graph_has_accessible_controls_and_keyboard_instructions() -> None:
+    """The canvas needs visible controls and instructions for non-pointer users."""
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'id="graphControls"' in index_html
+    for label in ("Zoom in", "Zoom out", "Fit all", "Fit selection", "Clear selection"):
+        assert f">{label}<" in index_html
+    assert 'aria-describedby="graphInstructions"' in index_html
+    assert "drag to pan" in index_html.lower()
+    assert "keyboard shortcuts" in index_html.lower()
+
+
+def test_graph_node_directory_uses_native_buttons_and_shared_selection() -> None:
+    """Every visible node must be reachable in an accessible directory."""
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="graphNodeDirectory"' in index_html
+    assert "Nodes in this view" in index_html
+    assert "aria-current" in app_js or "aria-pressed" in app_js
+    assert "renderGraphNodeDirectory" in app_js
+    assert "selectNode(" in app_js
+    assert "aria-live" in index_html
+
+def test_graph_directory_restores_focus_after_keyboard_selection() -> None:
+    """Replacing a selected row must not strand keyboard focus."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "button.dataset.nodeId = node.id" in app_js
+    assert "selectedButton?.focus()" in app_js
+
+def test_graph_directory_uses_fresh_render_data_before_graph_getter_updates() -> None:
+    """The force-graph getter can lag its setter during the first paint."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function renderGraphNodeDirectory(nodesOverride = null)" in app_js
+    assert "renderGraphNodeDirectory(data.nodes)" in app_js
+
+
+def test_graph_connections_are_readable_and_expandable() -> None:
+    """Connection rows need a count, two-line labels, and a capped initial list."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+    assert "Connections (${neighbors.length})" in app_js
+    assert "Show all ${neighbors.length} connections" in app_js
+    assert "node-connections-more" in app_js
+    assert "min-height: 44px" in styles_css
+
+
+def test_hidden_graph_targets_explain_the_filter_and_can_be_shown() -> None:
+    """A loaded but filtered target must offer an explicit reveal action."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "Not shown in this map" in app_js
+    assert "Show on canvas" in app_js
+    assert "showGraphNodeOnCanvas" in app_js
+    assert "graphHiddenKinds.delete" in app_js
+
+
+def test_no_document_state_explains_loaded_graph_limits_and_retries() -> None:
+    """An empty walk is not proof of global absence and must be recoverable."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "capped or filtered" in app_js.lower()
+    assert "Retry" in app_js
+    assert "loadKnowledgeGraph(true)" in app_js
+
+
+def test_visible_knowledge_page_fits_graph_after_hidden_initial_render() -> None:
+    """Navigation must resize and fit once when the graph becomes visible."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "resizeGraphForVisibility" in app_js
+    assert "zoomToFit" in app_js
+    assert "setPage" in app_js
+
+
+def test_public_info_status_wording_remains_unchanged() -> None:
+    """The graph work must not change the public lifecycle health wording."""
+    info_js = (REPO / "kb" / "static" / "info.js").read_text(encoding="utf-8")
+    assert "Degraded" in info_js
+
+
+def test_graph_redaction_pattern_is_declared_before_event_details_render() -> None:
+    """Event details must redact sensitive keys without a runtime ReferenceError."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "const sensitiveDetailPattern =" in app_js
+    assert "sensitiveDetailPattern.test(key)" in app_js
+
+
+def test_graph_subtabs_keep_native_navigation_handlers() -> None:
+    """Rendered content tabs must switch pages when activated."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    subtabs = re.search(r"function renderSubtabs\(activePage\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
+    assert subtabs
+    assert 'button.addEventListener("click", () => setPage(tab.page))' in subtabs.group(1)
+
+
+def test_graph_shape_preserves_trust_and_provenance_metadata() -> None:
+    """Graph shaping must retain server-attested trust, datasets, and promotion data."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert re.search(r"function shapeRealGraph\(payload\)", app_js)
+    for field in ("trust_tier", "datasets", "promoted_by", "promoted_at"):
+        assert f"node.{field}" in app_js
+
+
+def test_graph_mode_reset_updates_selection_status_and_fit_control() -> None:
+    """Changing graph modes must clear both visual and assistive selection state."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert re.search(r"function setGraphMode\(mode\)", app_js)
+    assert "graphSelectionStatus.textContent = \"No node selected.\"" in app_js
+    assert "graphFitSelection.disabled = true" in app_js
+
+
+def test_document_states_distinguish_permission_and_unavailable_errors() -> None:
+    """Permission failures and unavailable documents need distinct copy."""
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "firstErrorStatus" in app_js
+    assert "firstErrorStatus === 401 || firstErrorStatus === 403" in app_js
+    assert "permission" in app_js.lower()
+    assert "Document unavailable" in app_js
+
+
+def test_graph_directory_has_one_live_region_and_real_list_items() -> None:
+    """The directory keeps one live status and preserves list semantics."""
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="graphSelectionStatus"' in index_html
+    assert 'id="selectedNode" class="selection"' in index_html
+    assert '<ul id="graphNodeDirectoryList"' in index_html
+    assert "document.createElement(\"li\")" in app_js
+
+
+def test_graph_mobile_controls_reserve_instruction_space() -> None:
+    """Small screens need a stacked control grid so instructions stay readable."""
+    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+    assert "@media (max-width: 520px)" in styles_css
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in styles_css
+    assert "top: 160px" in styles_css
+
+
+def test_graph_connection_text_uses_high_contrast_tokens() -> None:
+    """Connection text must use the primary text token against the field surface."""
+    import re
+
+    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
+    relation = re.search(
+        r"\.selection \.node-connection-relation\s*\{(.*?)\n\}", styles_css, re.DOTALL
+    )
+    label = re.search(
+        r"\.selection \.node-connection-label\s*\{(.*?)\n\}", styles_css, re.DOTALL
+    )
+    assert relation and "color: var(--text)" in relation.group(1)
+    assert label and "color: var(--text)" in label.group(1)
+
+
+def test_knowledge_graph_refresh_reconciles_removed_selection() -> None:
+    """A refreshed payload that removes the selected node must clear its inspector."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    helper = re.search(
+        r"function reconcileGraphSelection\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert helper, "selection reconciliation helper is missing"
+    body = helper.group(1)
+    assert "renderedGraphNodes().some" in body
+    assert "state.selectedId = null" in body
+    assert "graphSelectionStatus.textContent = \"No node selected.\"" in body
+    assert "graphFitSelection.disabled = true" in body
+    assignment = app_js.index("state.realGraph = shapeRealGraph(payload)")
+    assert "reconcileGraphSelection()" in app_js[assignment:]
+
+
+def test_fit_selection_starts_disabled_and_tracks_visible_selection() -> None:
+    """Fit selection must not offer a no-op action before a visible selection."""
+    import re
+
+    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    button = re.search(r'<button id="graphFitSelection"[^>]*>', index_html)
+    assert button and "disabled" in button.group(0)
+    assert "function updateGraphFitSelectionState()" in app_js
+    assert "renderedGraphNodes().some" in app_js
+    assert "updateGraphFitSelectionState()" in app_js
+
+
+def test_graph_filter_transitions_reconcile_fit_selection_state() -> None:
+    """Hiding a selected node must disable Fit selection after the rebuild."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    toggle = re.search(
+        r"function toggleGraphKind\(kind\)\s*\{(.*?)(?=\nfunction )",
+        app_js,
+        re.DOTALL,
+    )
+    aggregate = re.search(
+        r"function setGraphAggregate\(enabled\)\s*\{(.*?)(?=\nfunction )",
+        app_js,
+        re.DOTALL,
+    )
+    assert toggle and "updateGraphFitSelectionState()" in toggle.group(1)
+    assert aggregate and "updateGraphFitSelectionState()" in aggregate.group(1)
+
+
+def test_graph_filter_transitions_reconcile_hidden_selection() -> None:
+    """Filter rebuilds must clear selection when the rendered node disappears."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    helper = re.search(
+        r"function reconcileGraphSelection\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert helper and "renderedGraphNodes().some" in helper.group(1)
+    for name in ("toggleGraphKind", "setGraphAggregate"):
+        transition = re.search(
+            rf"function {name}\([^)]*\)\s*\{{(.*?)(?=\nfunction )",
+            app_js,
+            re.DOTALL,
+        )
+        assert transition, f"{name} transition is missing"
+        body = transition.group(1)
+        rebuild = body.index("buildGraphScene()")
+        assert "reconcileGraphSelection()" in body[rebuild:]
