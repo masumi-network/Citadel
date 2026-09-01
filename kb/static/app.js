@@ -210,6 +210,16 @@ const graphViewMenu = document.getElementById("graphViewMenu");
 const graphViewLabel = document.getElementById("graphViewLabel");
 const realGraphEmpty = document.getElementById("realGraphEmpty");
 const graphLegend = document.getElementById("graphLegend");
+const graphControls = document.getElementById("graphControls");
+const graphZoomIn = document.getElementById("graphZoomIn");
+const graphZoomOut = document.getElementById("graphZoomOut");
+const graphFitAll = document.getElementById("graphFitAll");
+const graphFitSelection = document.getElementById("graphFitSelection");
+const graphClearSelection = document.getElementById("graphClearSelection");
+const graphNodeDirectory = document.getElementById("graphNodeDirectory");
+const graphNodeDirectoryList = document.getElementById("graphNodeDirectoryList");
+const graphNodeDirectoryCount = document.getElementById("graphNodeDirectoryCount");
+const graphSelectionStatus = document.getElementById("graphSelectionStatus");
 const toastStack = document.getElementById("toastStack");
 const searchResultStatus = document.getElementById("searchResultStatus");
 const pageButtons = Array.from(document.querySelectorAll("[data-page-target]"));
@@ -272,15 +282,12 @@ function renderSubtabs(activePage) {
   });
   subtabBar.hidden = subtabBar.children.length < 2;
 }
-const sensitiveDetailPattern = /(token|secret|password|authorization|body|content|text|query)$/i;
-
-// force-graph instance + render state. Selection/highlight live here so the
-// node/link accessors can dim non-neighbours cheaply during hover.
 const graph = {
   instance: null,
   width: 1,
   height: 1,
   viewInitialized: false,
+  visibilityFitted: false,
   centralId: null,
   highlightNodes: new Set(),
   highlightLinks: new Set(),
@@ -288,6 +295,7 @@ const graph = {
 };
 let graphNodeMatches = [];
 let graphNodeMatchIndex = -1;
+const sensitiveDetailPattern = /(token|secret|password|authorization|body|content|text|query)$/i;
 
 // Shared Central dataset (config.github_sync_dataset / access.CENTRAL_DATASET).
 const CENTRAL_DATASET = "masumi-network";
@@ -790,9 +798,14 @@ function setPage(name) {
   if (allowed && window.location.hash !== `#${name}`) {
     window.history.replaceState(null, "", `#${name}`);
   }
-  // force-graph keeps its own layout across page switches; just re-fit the
-  // canvas to the (possibly newly-visible) container without re-seeding.
+  // A hidden canvas reports zero dimensions, so resize and fit once after the
+  // Knowledge page becomes visible.
   resizeCanvas();
+  if (resolvedName === "knowledge") {
+    resizeGraphForVisibility();
+  } else {
+    graph.visibilityFitted = false;
+  }
   if (resolvedName === "access") {
     loadAccess();
   }
@@ -868,6 +881,17 @@ function resizeCanvas() {
   graph.height = Math.max(1, rect.height);
   if (!graph.instance) return;
   graph.instance.width(graph.width).height(graph.height);
+}
+
+function resizeGraphForVisibility() {
+  if (!canvas || canvas.closest('[data-page="knowledge"]')?.hidden) {
+    graph.visibilityFitted = false;
+    return;
+  }
+  resizeCanvas();
+  if (!graph.instance || graph.visibilityFitted) return;
+  graph.visibilityFitted = true;
+  graph.instance.zoomToFit(600, 40);
 }
 
 function mergeGraph(snapshot) {
@@ -2066,6 +2090,7 @@ function renderGraph() {
   });
 
   graph.instance.graphData({ nodes: data.nodes, links: data.links });
+  renderGraphNodeDirectory(data.nodes);
   renderGraphNodeSearchResults();
   graph.instance.centerAt(0, 0);
   // Arm a settle-fit for this data set (handled by onEngineStop); keep a single
@@ -2123,6 +2148,20 @@ function resetGraphView() {
   if (graph.instance) graph.instance.zoomToFit(600, 40);
 }
 
+function zoomGraphBy(factor) {
+  if (!graph.instance || typeof graph.instance.zoom !== "function") return;
+  const current = Number(graph.instance.zoom()) || 1;
+  graph.instance.zoom(clamp(current * factor, 0.2, 8), 250);
+}
+
+function fitSelectedGraphNode() {
+  if (!state.selectedId) return;
+  const rendered = renderedGraphNodes().find((node) => node.id === state.selectedId);
+  if (!rendered || !Number.isFinite(rendered.x) || !Number.isFinite(rendered.y)) return;
+  graph.instance.centerAt(rendered.x, rendered.y, 400);
+  if (typeof graph.instance.zoom === "function") graph.instance.zoom(2.2, 400);
+}
+
 // Pause/resume the force engine (wired to the Pause button).
 function setGraphPaused(paused) {
   if (!graph.instance) return;
@@ -2143,8 +2182,18 @@ function truncate(value, length) {
 
 function selectNode(node) {
   state.selectedId = node?.id || null;
+  updateGraphFitSelectionState();
+  if (graphSelectionStatus) {
+    graphSelectionStatus.textContent = node
+      ? `Selected ${node.label || node.id || "node"}.`
+      : "No node selected.";
+  }
+  if (node) {
+    renderGraphNodeDirectory();
+  }
   if (!node) {
     selectedNode.textContent = "Select a note or node to inspect its links.";
+    renderGraphNodeDirectory();
     updateNodeSelection();
     return;
   }
@@ -2159,12 +2208,23 @@ function selectNode(node) {
       <p>${escapeHtml(formatDetails(node.metadata || {}))}</p>
     `;
   }
-  // Dataset hubs (seat presence + Central) never have stored document text —
-  // the inspector shows their presence counts instead, so skip the fetch
-  // rather than fire a guaranteed 404.
+  // Dataset hubs (seat presence + Central) never have stored document text.
+  // The inspector shows their presence counts instead, so skip the fetch.
   if (state.graphMode === "knowledge" && node.id && node.type !== "dataset") {
     loadNodeDocument(node);
   }
+  updateNodeSelection();
+}
+
+function reconcileGraphSelection() {
+  if (!state.selectedId) return;
+  const visible = renderedGraphNodes().some((node) => node.id === state.selectedId);
+  if (visible) return;
+  state.selectedId = null;
+  selectedNode.textContent = "Select a note or node to inspect its links.";
+  if (graphSelectionStatus) graphSelectionStatus.textContent = "No node selected.";
+  if (graphFitSelection) graphFitSelection.disabled = true;
+  renderGraphNodeDirectory();
   updateNodeSelection();
 }
 
@@ -2209,14 +2269,16 @@ function renderKnowledgeInspector(node) {
   const container = document.createElement("div");
   container.className = "node-connections";
   const heading = document.createElement("strong");
-  heading.textContent = "Connections";
+  heading.textContent = `Connections (${neighbors.length})`;
   const list = document.createElement("div");
   list.className = "node-connections-list";
   container.append(heading, list);
 
+  let showingAll = false;
   const renderConnections = () => {
     list.innerHTML = "";
-    neighbors.forEach((item) => {
+    const visibleNeighbors = showingAll ? neighbors : neighbors.slice(0, 10);
+    visibleNeighbors.forEach((item) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "node-connection";
@@ -2230,21 +2292,83 @@ function renderKnowledgeInspector(node) {
       labelText.className = "node-connection-label";
       labelText.textContent = label;
       button.append(relationshipText, labelText);
-      // Resolve by id at click time: a graph refresh replaces state.realGraph
-      // while this button persists, so the captured node object may be stale.
+      // Resolve by id at click time because a graph refresh can replace the
+      // captured node object while this inspector remains mounted.
       const targetId = item.node.id;
       button.addEventListener("click", () => {
         const target = state.realGraph?.nodes.get(targetId);
         if (!target) return;
-        focusGraphNode(targetId);
+        if (!focusGraphNode(targetId)) {
+          renderHiddenTargetAction(target);
+          return;
+        }
         selectNode(target);
       });
       list.append(button);
     });
+    if (!showingAll && neighbors.length > 10) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "node-connections-more";
+      more.textContent = `Show all ${neighbors.length} connections`;
+      more.addEventListener("click", () => {
+        showingAll = true;
+        renderConnections();
+      });
+      list.append(more);
+    }
   };
 
   renderConnections();
+
   selectedNode.append(container);
+}
+
+function renderHiddenTargetAction(node) {
+  state.selectedId = node?.id || null;
+  updateGraphFitSelectionState();
+  if (graphSelectionStatus) {
+    graphSelectionStatus.textContent = node
+      ? `Selected ${node.label || node.id || "node"}.`
+      : "No node selected.";
+  }
+  selectedNode.innerHTML = `
+    <div>
+      <strong>${escapeHtml(node.label || node.id)}</strong>
+      <span>${escapeHtml(nodeKind(node))}</span>
+    </div>
+    <p class="node-hidden-notice">Not shown in this map. This node is loaded but hidden by the current map mode or kind filter.</p>
+  `;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "secondary-button compact-button node-show-on-canvas";
+  button.textContent = "Show on canvas";
+  button.addEventListener("click", () => showGraphNodeOnCanvas(node));
+  selectedNode.append(button);
+  renderGraphNodeDirectory();
+  updateNodeSelection();
+}
+
+function showGraphNodeOnCanvas(node) {
+  if (!node) return;
+  const kind = nodeKind(node);
+  state.graphAggregate = false;
+  state.graphHiddenKinds.delete(kind);
+  if (graphAggregateButton) {
+    graphAggregateButton.classList.remove("active");
+    graphAggregateButton.setAttribute("aria-pressed", "false");
+    graphAggregateButton.title =
+      "Raw graph: every payload node renders (legend chips filter kinds). Click to aggregate.";
+  }
+  renderGraphLegend();
+  buildGraphScene();
+  updateGraphMeta();
+  resetGraphView();
+  window.setTimeout(() => {
+    const target = state.realGraph?.nodes.get(node.id) || node;
+    focusGraphNode(node.id);
+    selectNode(target);
+  }, 0);
 }
 
 // Neighbors of a node straight from state.realGraph edges (either direction).
@@ -2423,17 +2547,71 @@ function documentCandidates(node) {
 // Centre the viewport on a rendered node by id, mirroring handleNodeClick.
 // Nodes hidden by the legend filter are not rendered, so those just skip.
 function focusGraphNode(nodeId) {
-  if (!graph.instance || typeof graph.instance.graphData !== "function") return;
+  if (!graph.instance || typeof graph.instance.graphData !== "function") return false;
   const rendered = (graph.instance.graphData().nodes || []).find((item) => item.id === nodeId);
-  if (rendered && Number.isFinite(rendered.x) && Number.isFinite(rendered.y)) {
+  if (!rendered) return false;
+  if (Number.isFinite(rendered.x) && Number.isFinite(rendered.y)) {
     graph.instance.centerAt(rendered.x, rendered.y, 600);
   }
+  return true;
+}
+
+function renderGraphNodeDirectory(nodesOverride = null) {
+  if (!graphNodeDirectoryList) return;
+  const nodes = (Array.isArray(nodesOverride) ? nodesOverride : renderedGraphNodes())
+    .slice()
+    .sort((left, right) =>
+      String(left.label || left.id).localeCompare(String(right.label || right.id))
+    );
+  graphNodeDirectoryList.innerHTML = "";
+  if (graphNodeDirectoryCount) graphNodeDirectoryCount.textContent = `${nodes.length} loaded`;
+  if (!nodes.length) {
+    const empty = document.createElement("li");
+    empty.className = "graph-directory-empty";
+    empty.textContent = "No nodes are visible in this map.";
+    graphNodeDirectoryList.append(empty);
+    return;
+  }
+  nodes.forEach((node) => {
+    const item = document.createElement("li");
+    item.className = "graph-node-directory-item";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "graph-node-directory-row";
+    button.setAttribute("aria-pressed", node.id === state.selectedId ? "true" : "false");
+    const kind = nodeKind(node);
+    const dataset = String(node.metadata?.dataset || "");
+    const degree = Array.isArray(node.neighbors) ? node.neighbors.length : 0;
+    const title = document.createElement("strong");
+    title.textContent = String(node.label || node.id || "Unnamed node");
+    const meta = document.createElement("span");
+    button.dataset.nodeId = node.id;
+    meta.textContent = `${kind}${dataset ? ` · ${dataset}` : ""} · ${degree} loaded links`;
+    button.append(title, meta);
+    button.addEventListener("click", () => {
+      const target = activeGraphData().nodes.get(node.id) || node;
+      focusGraphNode(node.id);
+      selectNode(target);
+      const selectedButton = Array.from(
+        graphNodeDirectoryList.querySelectorAll(".graph-node-directory-row")
+      ).find((candidate) => candidate.dataset.nodeId === node.id);
+      selectedButton?.focus();
+    });
+    item.append(button);
+    graphNodeDirectoryList.append(item);
+  });
 }
 
 function renderedGraphNodes() {
   if (!graph.instance || typeof graph.instance.graphData !== "function") return [];
   const nodes = graph.instance.graphData()?.nodes;
   return Array.isArray(nodes) ? nodes : [];
+}
+
+function updateGraphFitSelectionState() {
+  const visible = Boolean(state.selectedId) &&
+    renderedGraphNodes().some((node) => node.id === state.selectedId);
+  if (graphFitSelection) graphFitSelection.disabled = !visible;
 }
 
 function matchingGraphNodes(query) {
@@ -2598,7 +2776,7 @@ async function loadNodeDocument(node) {
   selectedNode.append(container);
   const candidates = documentCandidates(node);
   let firstError = null;
-
+  let firstErrorStatus = null;
   for (const candidate of candidates) {
     if (state.selectedId !== node.id) return;
     try {
@@ -2629,21 +2807,34 @@ async function loadNodeDocument(node) {
       const message = String(error?.message || "Request failed");
       if (error?.status === 404 || /not found/i.test(message)) continue;
       firstError = message;
+      firstErrorStatus = Number(error?.status) || null;
       break;
     }
   }
 
-  // Typed empty states, never a silent dead-end: say whether the loaded graph
-  // simply has no document to walk to, or candidates existed and none resolved.
-  container.classList.add("node-document-empty");
-  if (firstError) {
-    container.innerHTML = `<p>Could not load document text: ${escapeHtml(firstError)}</p>`;
+  // Typed empty states, never a silent dead-end. The loaded graph is a capped
+  // or filtered slice, so this state does not claim global absence.
+  if (firstErrorStatus === 401 || firstErrorStatus === 403) {
+    container.innerHTML =
+      "<p>Document unavailable. This seat may not have permission to read it.</p>";
+  } else if (firstError) {
+    container.innerHTML = `<p>Document unavailable: ${escapeHtml(firstError)}</p>`;
   } else if (!candidates.length) {
     container.innerHTML =
-      "<p>No document reachable from this node in the loaded graph.</p>";
+      "<p>No document reachable from this node in the loaded graph. The graph payload may be capped or filtered.</p>";
   } else {
     container.innerHTML = "<p>No document text stored for this node.</p>";
   }
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "secondary-button compact-button node-document-retry";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", () => {
+    if (state.selectedId !== node.id) return;
+    container.remove();
+    loadNodeDocument(node);
+  });
+  container.append(retry);
 }
 
 async function loadMesh(showConnection = true) {
@@ -2833,6 +3024,8 @@ function toggleGraphKind(kind) {
   }
   renderGraphLegend();
   buildGraphScene();
+  reconcileGraphSelection();
+  updateGraphFitSelectionState();
   updateGraphMeta();
 }
 
@@ -2850,6 +3043,8 @@ function setGraphAggregate(enabled) {
       : "Raw graph: every payload node renders (legend chips filter kinds). Click to aggregate.";
   }
   buildGraphScene();
+  reconcileGraphSelection();
+  updateGraphFitSelectionState();
   resetGraphView();
   updateGraphMeta();
 }
@@ -2906,11 +3101,19 @@ function shapeRealGraph(payload) {
   list.forEach((node) => {
     const links = degree.get(node.id) || 0;
     const dataset = node.dataset || null;
+    const datasets = Array.isArray(node.datasets) ? [...node.datasets] : dataset ? [dataset] : [];
+    const trust_tier = node.trust_tier || null;
+    const promoted_by = node.promoted_by || null;
+    const promoted_at = node.promoted_at || null;
     const isDatasetHub = (node.type || "node") === "dataset";
     const isSeatHub =
       isDatasetHub && String(dataset || node.label || "").startsWith(SEAT_DATASET_PREFIX);
     const metadata = { type: node.type || "node", links };
     if (dataset) metadata.dataset = dataset;
+    if (datasets.length) metadata.datasets = datasets;
+    if (trust_tier) metadata.trust_tier = trust_tier;
+    if (promoted_by) metadata.promoted_by = promoted_by;
+    if (promoted_at) metadata.promoted_at = promoted_at;
     // Presence metadata rides on dataset hubs ({documents: N}); pass it
     // through untouched so the inspector can show counts without a fetch.
     const presence =
@@ -2921,6 +3124,10 @@ function shapeRealGraph(payload) {
       type: node.type || "node",
       internal_name: node.internal_name || null,
       presence,
+      datasets,
+      trust_tier,
+      promoted_by,
+      promoted_at,
       status: isDatasetHub ? (isSeatHub ? "seat" : "dataset") : "linked",
       size: isDatasetHub ? 72 : clamp(26 + links * 5, 24, 58),
       metadata,
@@ -2979,6 +3186,7 @@ async function loadKnowledgeGraph(force = false) {
   if (state.realGraphLoading) return;
   if (state.realGraph && !force) {
     buildGraphScene();
+    reconcileGraphSelection();
     resetGraphView();
     updateGraphMeta();
     updateRealGraphEmpty();
@@ -3007,6 +3215,7 @@ async function loadKnowledgeGraph(force = false) {
     updateGraphDatasetFilter();
     if (state.graphMode === "knowledge") {
       buildGraphScene();
+      reconcileGraphSelection();
       resetGraphView();
       updateGraphMeta();
       updateRealGraphEmpty();
@@ -3029,7 +3238,6 @@ async function loadKnowledgeGraph(force = false) {
     state.realGraphLoading = false;
   }
 }
-
 function setGraphMode(mode) {
   if (state.graphMode === mode) return;
   state.graphMode = mode;
@@ -3044,6 +3252,8 @@ function setGraphMode(mode) {
     button.setAttribute("aria-pressed", active ? "true" : "false");
   });
   state.selectedId = null;
+  if (graphFitSelection) graphFitSelection.disabled = true;
+  if (graphSelectionStatus) graphSelectionStatus.textContent = "No node selected.";
   selectedNode.textContent = "Select a note or node to inspect its links.";
   // Aggregate + dataset filter act on the Knowledge Mesh only; hide them in
   // live mode so they never sit on the toolbar as dead controls.
@@ -4591,6 +4801,14 @@ document.getElementById("pauseButton").addEventListener("click", (event) => {
   closeGraphViewMenu();
 });
 
+if (graphControls) {
+  graphZoomIn?.addEventListener("click", () => zoomGraphBy(1.35));
+  graphZoomOut?.addEventListener("click", () => zoomGraphBy(1 / 1.35));
+  graphFitAll?.addEventListener("click", resetGraphView);
+  graphFitSelection?.addEventListener("click", fitSelectedGraphNode);
+  graphClearSelection?.addEventListener("click", () => selectNode(null));
+}
+
 auditFilterButtons.forEach((button) => {
   button.addEventListener("click", () => {
     state.auditFilter = button.dataset.auditFilter || "all";
@@ -4633,8 +4851,17 @@ if (graphDatasetFilter) {
 // Pan, zoom, drag, hover, and click are handled natively by force-graph on the
 // canvas it owns; keyboard re-frame via the canvas container.
 canvas.addEventListener("keydown", (event) => {
-  if (event.key === "Home") {
+  if (event.key === "Home" || event.key === "0") {
     resetGraphView();
+    event.preventDefault();
+  } else if (event.key === "+" || event.key === "=") {
+    zoomGraphBy(1.35);
+    event.preventDefault();
+  } else if (event.key === "-") {
+    zoomGraphBy(1 / 1.35);
+    event.preventDefault();
+  } else if (event.key === "Escape") {
+    selectNode(null);
     event.preventDefault();
   }
 });
