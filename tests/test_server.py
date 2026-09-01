@@ -2243,6 +2243,157 @@ def test_reader_access_can_view_and_search_but_not_mutate() -> None:
     assert search.status_code == 200
     assert ingest.status_code == 403
     assert sync_run.status_code == 403
+ 
+ 
+def test_session_payload_exposes_seat_scopes_and_secure_cookie(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    created = admin.post("/api/access/seats", json={"name": "Canary", "slug": "canary"})
+    assert created.status_code == 200
+    token = created.json()["token"]
+
+    seat = TestClient(app, base_url="https://testserver")
+    login = seat.post("/admin/session", json={"access_key": token})
+
+    assert login.status_code == 200
+    cookie = login.headers["set-cookie"]
+    assert f"{server_module.ADMIN_COOKIE}=" in cookie
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "SameSite=lax" in cookie
+    assert login.json()["role"] == "writer"
+    assert login.json()["seat_slug"] == "canary"
+    assert "kb:read" in login.json()["scopes"]
+    assert login.json()["datasets"] == [
+        "seat:canary",
+        "masumi-network",
+        SESSION_TRACES_DATASET,
+    ]
+    assert login.json()["dataset_labels"] == {
+        "seat:canary": "Private Node",
+        "masumi-network": "Central",
+        SESSION_TRACES_DATASET: "Shared Session Traces",
+    }
+
+    current = seat.get("/api/session")
+    assert current.status_code == 200
+    assert current.json()["scopes"] == login.json()["scopes"]
+    assert current.json()["datasets"] == login.json()["datasets"]
+
+
+def test_next_preview_requires_effective_scope_not_role(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    created = admin.post(
+        "/api/access/tokens",
+        json={
+            "name": "searchless-writer",
+            "role": "writer",
+            "kind": "service_account",
+            "scopes": ["kb:read"],
+        },
+    )
+    assert created.status_code == 200
+    client = TestClient(app, base_url="https://testserver")
+    login = client.post("/admin/session", json={"access_key": created.json()["token"]})
+    assert login.status_code == 200
+
+    expected = {
+        "/next/app": 200,
+        "/next/app/review": 200,
+        "/next/app/search": 403,
+        "/next/app/graph": 403,
+        "/next/app/sources": 403,
+        "/next/app/admin": 403,
+    }
+    for path, status in expected.items():
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == status, path
+ 
+ 
+def test_search_hides_document_preview_without_read_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    class SearchOnlyCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            return [{"id": "doc", "text": f"{query} result"}]
+
+        async def resolve_document_owner_ids(self, document_id: str) -> list[str] | None:
+            return [document_id]
+
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/tokens",
+        json={
+            "name": "search-only-reader",
+            "role": "reader",
+            "kind": "service_account",
+            "scopes": ["kb:search"],
+        },
+    ).json()["token"]
+    app.state.citadel = SearchOnlyCitadel()
+
+    async def node_dataset_map(**_kwargs: Any) -> dict[str, list[str]]:
+        return {"doc": ["notes"]}
+
+    monkeypatch.setattr(server_module, "load_node_dataset_map", node_dataset_map)
+    response = TestClient(app, base_url="https://testserver").post(
+        "/search",
+        json={"query": "document"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    hit = response.json()["results"][0]
+    assert hit["_citadel"]["retrieval"]["document_drilldown_available"] is False
+    assert "document_endpoint" not in hit["_citadel"]
+
+
+def test_canonical_app_names_private_node_central_and_shared_trace_scopes() -> None:
+    page = authed_client("test-reader").get("/app").text
+    app_js = (server_module.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="sessionScopes"' in page
+    assert "Private Node" in page
+    assert "Central" in page
+    assert "Shared Session Traces" in page
+    assert 'data-search-scope="traces"' in page
+    assert 'const SESSION_TRACES_DATASET = "session-traces";' in app_js
+    assert "function canPreviewDocuments()" in app_js
+    assert "if (!canPreviewDocuments()) return null;" in app_js
+ 
+ 
+def test_search_only_token_can_load_its_preview_session(tmp_path: Any) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    token = admin.post(
+        "/api/access/tokens",
+        json={
+            "name": "search-only-reader",
+            "role": "reader",
+            "kind": "service_account",
+            "scopes": ["kb:search"],
+        },
+    ).json()["token"]
+    client = TestClient(app, base_url="https://testserver")
+    assert client.post("/admin/session", json={"access_key": token}).status_code == 200
+
+    preview = client.get("/next/app/search")
+    session = client.get("/api/session")
+
+    assert preview.status_code == 200
+    assert session.status_code == 200
+    assert session.json()["scopes"] == ["kb:search"]
+
+
+def test_central_filter_requires_a_server_label() -> None:
+    app_js = (server_module.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "function centralSearchDataset()" in app_js
+    assert 'state.datasetLabels?.[dataset] === "Central"' in app_js
+    assert "chip.disabled = !available;" in app_js
 
 
 def test_ingest_is_capture_only_by_default() -> None:

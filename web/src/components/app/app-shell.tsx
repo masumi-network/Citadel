@@ -96,9 +96,10 @@ export function AppShell({
               )}
             </div>
             {seat ? (
-              <span className="ml-1.5 font-mono text-[11.5px] text-ink-3 max-[900px]:hidden">
-                {seat}
-              </span>
+              <div className="ml-1.5 flex flex-col items-end gap-0.5 font-mono text-[11.5px] text-ink-3 max-[900px]:hidden">
+                <span>{`seat:${seat}`}</span>
+                <span className="text-[10px]">Private Node · Central · Shared Session Traces</span>
+              </div>
             ) : null}
             <ThemeButton />
             <form method="post" action="/admin/logout">

@@ -74,6 +74,9 @@ const state = {
   nodeLabel: null,
   defaultDataset: null,
   searchDatasets: null,
+  datasetLabels: null,
+  scopes: null,
+
   capabilities: null,
   githubSync: null,
   obsidianSources: null,
@@ -117,6 +120,11 @@ const runtimeStatus = document.getElementById("runtimeStatus");
 const sessionRole = document.getElementById("sessionRole");
 const sessionSeat = document.getElementById("sessionSeat");
 const roleSummary = document.getElementById("roleSummary");
+const sessionScopes = document.getElementById("sessionScopes");
+const sessionScopeNode = document.getElementById("sessionScopeNode");
+const sessionScopeCentral = document.getElementById("sessionScopeCentral");
+const sessionScopeTraces = document.getElementById("sessionScopeTraces");
+
 const accessMode = document.getElementById("accessMode");
 const graphMeta = document.getElementById("graphMeta");
 const selectedNode = document.getElementById("selectedNode");
@@ -300,6 +308,8 @@ const sensitiveDetailPattern = /(token|secret|password|authorization|body|conten
 // Shared Central dataset (config.github_sync_dataset / access.CENTRAL_DATASET).
 const CENTRAL_DATASET = "masumi-network";
 const SEAT_DATASET_PREFIX = "seat:";
+const SESSION_TRACES_DATASET = "session-traces";
+
 
 // Resolve a token from a CSS custom property so node colours stay in sync with
 // the brand palette (--primary, --info, etc.) instead of hardcoded hex.
@@ -626,11 +636,54 @@ function datasetSourceBadge(dataset) {
     }
     return { label: `Seat ${slug}`, kind: "seat" };
   }
-  if (name === "session-traces") {
-    return { label: "Shared traces", kind: "traces" };
+  if (name === SESSION_TRACES_DATASET) {
+    return { label: "Shared Session Traces", kind: "traces" };
   }
+
   return { label: name, kind: "other" };
 }
+ 
+function sessionReadableDatasets() {
+  const datasets = Array.isArray(state.searchDatasets)
+    ? state.searchDatasets
+    : state.defaultDataset
+      ? [state.defaultDataset]
+      : [];
+  return datasets.filter((dataset) => typeof dataset === "string" && dataset.trim());
+}
+ 
+function centralSearchDataset() {
+  return sessionReadableDatasets().find(
+    (dataset) => state.datasetLabels?.[dataset] === "Central",
+  ) || null;
+}
+
+
+function renderSessionScopes() {
+  if (!sessionScopes) return;
+  const datasets = new Set(sessionReadableDatasets());
+  const nodeDataset = state.seatSlug
+    ? state.defaultDataset ||
+      sessionReadableDatasets().find((dataset) => dataset.startsWith(SEAT_DATASET_PREFIX))
+    : null;
+  const entries = [
+    [sessionScopeNode, nodeDataset, "Private Node"],
+    [sessionScopeCentral, centralSearchDataset(), "Central"],
+    [sessionScopeTraces, SESSION_TRACES_DATASET, "Shared Session Traces"],
+  ];
+  entries.forEach(([element, dataset, fallback]) => {
+    if (!element) return;
+    const visible = Boolean(dataset && datasets.has(dataset));
+    element.hidden = !visible;
+    if (visible) {
+      element.textContent = state.datasetLabels?.[dataset] || fallback;
+    }
+  });
+  sessionScopes.hidden = !state.role || !entries.some(
+    ([element, dataset]) => Boolean(element && dataset && datasets.has(dataset))
+  );
+}
+
 
 const RELATIONSHIP_LABELS = {
   affects: "Affects",
@@ -715,6 +768,8 @@ function applyAccessControls() {
   });
 
   configureAccessPanel();
+  renderSessionScopes();
+
 
   renderDashboardMcpSession();
   renderConflicts();
@@ -752,8 +807,11 @@ async function loadSession() {
     state.currentTokenId = session.actor?.token_id || session.token_id || null;
     state.nodeLabel = session.node_label || null;
     state.defaultDataset = session.default_dataset || null;
-    state.searchDatasets = session.search_datasets || null;
-    state.capabilities = session.capabilities || null;
+    state.searchDatasets = session.datasets || session.search_datasets || null;
+    state.datasetLabels = session.dataset_labels || null;
+    updateSearchScopeControls();
+    state.scopes = session.scopes || session.actor?.scopes || null;
+
     applyAccessControls();
     // The dataset filter's options come from the session scope.
     updateGraphDatasetFilter();
@@ -1807,7 +1865,14 @@ function resultMetaRows(result) {
   ].filter(([, value]) => value !== null && value !== undefined && value !== "");
 }
 
+function canPreviewDocuments() {
+  if (!state.role) return false;
+  if (Array.isArray(state.scopes)) return state.scopes.includes("kb:read");
+  return state.capabilities?.read === true;
+}
+
 function safeDocumentEndpoint(result) {
+  if (!canPreviewDocuments()) return null;
   const envelope = resultEnvelope(result);
   const endpoint = envelope.document_endpoint;
   if (
@@ -3075,7 +3140,10 @@ function updateGraphDatasetFilter() {
   for (const name of names) {
     const option = document.createElement("option");
     option.value = name;
-    option.textContent = name === state.defaultDataset ? `My seat (${name})` : name;
+    option.textContent =
+      state.datasetLabels?.[name] ||
+      (name === state.defaultDataset ? `My Node (${name})` : name);
+
     graphDatasetFilter.append(option);
   }
   // Keep a selection alive across option rebuilds; an option that vanished
@@ -5243,20 +5311,33 @@ document.getElementById("ingestForm").addEventListener("submit", async (event) =
 // doc_type filters. Both go on the same /search request the app already made,
 // so nothing about the API contract changes.
 const searchFilters = { scope: "all", types: new Set() };
+ 
+function updateSearchScopeControls() {
+  const available = Boolean(centralSearchDataset());
+  document.querySelectorAll("[data-search-scope='central']").forEach((chip) => {
+    chip.disabled = !available;
+    chip.setAttribute("aria-disabled", available ? "false" : "true");
+  });
+  if (!available && searchFilters.scope === "central") {
+    searchFilters.scope = "all";
+    document.querySelectorAll("[data-search-scope]").forEach((chip) => {
+      const active = chip.dataset.searchScope === "all";
+      chip.classList.toggle("is-on", active);
+      chip.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+  }
+}
 
 function searchScopeDataset() {
   if (searchFilters.scope === "central") {
-    // Prefer what the session says this caller can search over the hardcoded
-    // name, so a deployment whose Central dataset is not "masumi-network" still
-    // scopes correctly instead of 403ing on the allowlist.
-    const fromSession = (state.searchDatasets || []).find(
-      (name) =>
-        typeof name === "string" &&
-        !name.startsWith(SEAT_DATASET_PREFIX) &&
-        name !== "session-traces",
-    );
-    return fromSession || CENTRAL_DATASET;
+    return centralSearchDataset();
   }
+  if (searchFilters.scope === "traces") {
+    return sessionReadableDatasets().includes(SESSION_TRACES_DATASET)
+      ? SESSION_TRACES_DATASET
+      : null;
+  }
+
   if (searchFilters.scope === "node") {
     return state.seatSlug ? `${SEAT_DATASET_PREFIX}${state.seatSlug}` : null;
   }
@@ -5269,8 +5350,17 @@ function initializeSearchFilters() {
     chip.addEventListener("click", () => {
       // "My Node only" is meaningless without a seat, so it says so instead of
       // quietly searching everything.
-      if (chip.dataset.searchScope === "node" && !state.seatSlug) {
-        showToast("This token has no seat, so there is no private Node to search.", true);
+      if (
+        (chip.dataset.searchScope === "node" && !state.seatSlug) ||
+        (chip.dataset.searchScope === "traces" &&
+          !sessionReadableDatasets().includes(SESSION_TRACES_DATASET))
+      ) {
+        showToast(
+          chip.dataset.searchScope === "traces"
+            ? "This token cannot search shared session traces."
+            : "This token has no seat, so there is no private Node to search.",
+          true,
+        );
         return;
       }
       searchFilters.scope = chip.dataset.searchScope;

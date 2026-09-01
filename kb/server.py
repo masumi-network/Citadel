@@ -1464,8 +1464,8 @@ LOGIN_HTML = """<!doctype html>
         <p class="eyebrow">Seat access</p>
         <h1>Open your vault.</h1>
         <p class="auth-lede">
-          Your Node stays private. Signing in opens your own seat. Central is
-          shared, and nobody reads another seat's notes.
+          Your Node stays private. Central is shared. Shared Session Traces are
+          reference-only, and nobody reads another seat's notes.
         </p>
         <form id="loginForm" class="auth-form">
           <label class="auth-label" for="adminKey">Seat token</label>
@@ -3083,9 +3083,25 @@ def resolved_memory_scope(
         "default_session": identity.default_session,
         "allowed_datasets": list(identity.allowed_datasets) or None,
         "search_datasets": search_datasets if len(search_datasets) > 1 else None,
+        "datasets": search_datasets,
+        "dataset_labels": {
+            dataset: readable_dataset_label(dataset, identity, config)
+            for dataset in search_datasets
+        },
         "seat_slug": seat_slug,
         "node_label": node_label(identity.default_dataset),
     }
+
+ 
+def readable_dataset_label(dataset: str, identity: AccessIdentity, config: CitadelConfig) -> str:
+    if dataset == seat_node_dataset(identity):
+        return "Private Node"
+    if dataset == central_dataset(config):
+        return "Central"
+    if dataset == SESSION_TRACES_DATASET:
+        return "Shared Session Traces"
+    return dataset
+
 
 
 _AUTHOR_TAG_RE = re.compile(r"[^a-z0-9]+")
@@ -3108,9 +3124,13 @@ def _contribution_tags(body_tags: list[str], actor: AccessIdentity) -> list[str]
 
 
 def role_payload(role: str, identity: AccessIdentity | None = None) -> dict[str, Any]:
-    scopes = set(effective_scopes(identity)) if identity else set(default_scopes(role))
+    effective_scope_values = (
+        effective_scopes(identity) if identity is not None else default_scopes(role)
+    )
+    scopes = set(effective_scope_values)
     payload: dict[str, Any] = {
         "role": role,
+        "scopes": list(effective_scope_values),
         "capabilities": {
             "read": ROLE_ORDER[role] >= ROLE_ORDER["reader"]
             and bool({"kb:read", "kb:search", "sources:read", "obsidian:sync:pull"} & scopes),
@@ -3127,12 +3147,13 @@ def role_payload(role: str, identity: AccessIdentity | None = None) -> dict[str,
             "name": identity.actor_name,
             "source": identity.source,
             "token_id": identity.token_id,
-            "scopes": list(effective_scopes(identity)),
+            "scopes": list(effective_scope_values),
         },
     }
     if identity is not None:
         payload.update(resolved_memory_scope(identity, get_citadel().config))
     return payload
+
 
 
 def mcp_tool_name(request: Request) -> str | None:
@@ -4136,38 +4157,78 @@ async def next_preview() -> Response:
 # does receive the Admin markup. A static export cannot vary its HTML by role at
 # all, so the gate has to be the route: a seat that cannot open a view is served
 # the locked page instead, and the view's markup never leaves the server.
-WEBUI_APP_VIEWS: dict[str, str] = {
-    "graph": "reader",
-    "search": "reader",
-    "sources": "reader",
-    "review": "writer",
-    "admin": "admin",
+WEBUI_APP_VIEWS: dict[str, tuple[str, str, str]] = {
+    "graph": ("reader", "read", "kb:search"),
+    "search": ("reader", "read", "kb:search"),
+    "sources": ("reader", "read", "sources:read"),
+    "review": ("writer", "read", "kb:read"),
+    "admin": ("admin", "admin", "access:manage"),
 }
 
 
-def next_app_page(request: Request, view: str, minimum_role: str) -> Response:
-    """Serve one dashboard view, behind the same door /app uses."""
-    role = session_role(request)
-    if not role:
+
+def has_webui_capability(
+    identity: AccessIdentity, capability: str, required_scope: str
+) -> bool:
+    if required_scope not in effective_scopes(identity):
+        return False
+    if capability == "read":
+        return ROLE_ORDER[identity.role] >= ROLE_ORDER["reader"] and bool(
+            {"kb:read", "kb:search", "sources:read", "obsidian:sync:pull"}
+            & set(effective_scopes(identity))
+        )
+    if capability == "admin":
+        return ROLE_ORDER[identity.role] >= ROLE_ORDER["admin"] and bool(
+            {"sources:sync", "access:manage", "audit:read"}
+            & set(effective_scopes(identity))
+        )
+    return False
+
+
+def next_app_page(
+    request: Request,
+    view: str,
+    minimum_role: str,
+    capability: str,
+    required_scope: str,
+) -> Response:
+    """Serve one dashboard view behind the same door and scope as /app."""
+    identity = session_identity(request)
+    if not identity:
         # Anonymous callers go to the sign-in page rather than the landing page:
         # they asked for the app by name. Same as /app.
         return RedirectResponse("/login", status_code=303)
-    if ROLE_ORDER[role] < ROLE_ORDER[minimum_role]:
+    if (
+        ROLE_ORDER[identity.role] < ROLE_ORDER[minimum_role]
+        or not has_webui_capability(identity, capability, required_scope)
+    ):
         return webui_page("app/locked", status_code=403)
     return webui_page(view)
 
 
 @app.get("/next/app", include_in_schema=False)
 async def next_app_home(request: Request) -> Response:
-    return next_app_page(request, "app", "reader")
+    minimum_role, capability, required_scope = ("reader", "read", "kb:read")
+    return next_app_page(request, "app", minimum_role, capability, required_scope)
 
 
 @app.get("/next/app/{view}", include_in_schema=False)
 async def next_app_view(view: str, request: Request) -> Response:
-    minimum_role = WEBUI_APP_VIEWS.get(view)
-    if minimum_role is None:
+    requirements = WEBUI_APP_VIEWS.get(view)
+    if requirements is None:
         raise HTTPException(status_code=404, detail="Not Found")
-    return next_app_page(request, f"app/{view}", minimum_role)
+    minimum_role, capability, required_scope = requirements
+    return next_app_page(
+        request,
+        f"app/{view}",
+        minimum_role,
+        capability,
+        required_scope,
+    )
+
+
+
+
 
 
 # The theme bootstrap. Every exported page loads it from <head> before paint,
@@ -4434,7 +4495,7 @@ async def logout(request: Request, response: Response) -> Any:
 
 @app.get("/api/session")
 async def current_session(request: Request) -> dict[str, Any]:
-    identity = require_access(request, "reader", "kb:read")
+    identity = require_role(request, "reader")
     record_mcp_audit(
         request,
         actor=identity,
@@ -9015,11 +9076,10 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             },
         )
 
-    # Shaping order: envelope -> rank -> filter -> select -> drilldown. The
-    # drill-down hints are resolved LAST, over the final page only, because
-    # each scoped resolution costs a get_document call and over-fetching for
-    # filters would otherwise triple that cost for hits the caller never sees.
-    bypass_drilldown = can_bypass_dataset_allowlist(actor)
+    # Document preview is a separate read capability from search. Do not
+    # advertise a document endpoint to a token that can only search.
+    can_read_documents = "kb:read" in effective_scopes(actor)
+    bypass_drilldown = can_read_documents and can_bypass_dataset_allowlist(actor)
     normalized: list[dict[str, Any]] = []
     for index, (dataset, result) in enumerate(merged):
         shaped = public_search_result(
@@ -9060,7 +9120,7 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     # endpoint it points at. Resolved once per UNIQUE drillable id on the final
     # page; the shared map is fetched once and reused across ids.
     drilldown_ms: float | None = None
-    if not bypass_drilldown:
+    if can_read_documents and not bypass_drilldown:
         drilldown_started = time.perf_counter()
         drilldown_map: dict[str, list[str]] | None = None
         drilldown_map_loaded = False

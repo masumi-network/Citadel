@@ -113,6 +113,13 @@
                 <span id="accessMode" class="status-chip" hidden>Locked</span>
               </div>
               <p id="roleSummary" class="seat-role-note">Resolving access</p>
+              <div id="sessionScopes" class="seat-role-note" aria-label="Readable scopes" hidden>
+                <span>Readable scopes</span>
+                <div id="sessionScopeNode">Private Node</div>
+                <div id="sessionScopeCentral">Central</div>
+                <div id="sessionScopeTraces">Shared Session Traces</div>
+              </div>
+
             </div>
           </div>
 
@@ -697,6 +704,7 @@
                       <button class="chip is-on" type="button" data-search-scope="all" aria-pressed="true">Everything</button>
                       <button class="chip" type="button" data-search-scope="central" aria-pressed="false">Central only</button>
                       <button class="chip" type="button" data-search-scope="node" aria-pressed="false">My Node only</button>
+                      <button class="chip" type="button" data-search-scope="traces" aria-pressed="false">Shared traces only</button>
                     </div>
                   </div>
 

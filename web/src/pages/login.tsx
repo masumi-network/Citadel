@@ -70,8 +70,8 @@ export default function Login() {
               Open your vault.
             </h1>
             <p className="mb-7 text-[15px] leading-[1.6] text-ink-2">
-              Your Node stays private. Signing in opens your own seat. Central is shared, and nobody
-              reads another seat&apos;s notes.
+              Your Node stays private. Central is shared, and Shared Session Traces are reference-only.
+              Nobody reads another seat&apos;s notes.
             </p>
             <form onSubmit={onSubmit} className="flex flex-col gap-2">
               <label className={FIELD_LABEL} htmlFor="adminKey">

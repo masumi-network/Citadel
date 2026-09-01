@@ -19,12 +19,17 @@ export const ROLE_ORDER: Record<Role, number> = { reader: 1, writer: 2, admin: 3
 
 export type Session = {
   role: Role;
+  scopes?: string[];
+  capabilities?: { read?: boolean; write?: boolean; admin?: boolean };
   default_dataset?: string | null;
   search_datasets?: string[] | null;
+  datasets?: string[] | null;
+  dataset_labels?: Record<string, string> | null;
   seat_slug?: string | null;
   node_label?: string | null;
   actor?: { name?: string | null } | null;
 };
+
 
 export type SearchScope = "all" | "central" | "node";
 
@@ -44,21 +49,24 @@ export const SEARCH_SOURCE_OPTIONS = [
 
 export type SearchSource = (typeof SEARCH_SOURCE_OPTIONS)[number]["value"];
 
-const SESSION_TRACES_DATASET = "session-traces";
+export const SESSION_TRACES_DATASET = "session-traces";
+
 
 /** Resolve only dataset IDs whose meaning is established by the session payload.
  *
  * A seat response orders its datasets as Node, Central (when allowed), then
  * session traces. Central is intentionally left unavailable when the response
- * does not identify a seat, because a lone default dataset is not proof that it
- * is Central.
+ * does not identify a seat, because a lone default dataset is not proof that
+ * it is Central.
  */
 export function searchScopeDatasets(session: Session | null): SearchScopeDatasets {
   if (!session?.seat_slug) return { central: null, node: null };
 
-  const datasets = Array.isArray(session.search_datasets)
-    ? session.search_datasets.filter((dataset): dataset is string => Boolean(dataset?.trim()))
-    : [];
+  const datasets = Array.isArray(session.datasets)
+    ? session.datasets.filter((dataset): dataset is string => Boolean(dataset?.trim()))
+    : Array.isArray(session.search_datasets)
+      ? session.search_datasets.filter((dataset): dataset is string => Boolean(dataset?.trim()))
+      : [];
   const defaultDataset = session.default_dataset?.trim() || null;
   const node =
     (defaultDataset && datasets.includes(defaultDataset) ? defaultDataset : null) ||
@@ -68,6 +76,15 @@ export function searchScopeDatasets(session: Session | null): SearchScopeDataset
     datasets.find((dataset) => dataset !== node && dataset !== SESSION_TRACES_DATASET) || null;
 
   return { central, node };
+}
+
+export function readableDatasetLabel(session: Session | null, dataset: string): string {
+  const provided = session?.dataset_labels?.[dataset];
+  if (provided?.trim()) return provided;
+  if (dataset === SESSION_TRACES_DATASET) return "Shared Session Traces";
+  if (dataset === session?.default_dataset) return "Private Node";
+  if (dataset === "masumi-network") return "Central";
+  return dataset;
 }
 
 export function canUse(role: Role | null, minimum: Role): boolean {
