@@ -1,0 +1,20 @@
+{
+  "name": "citadel-cli",
+  "version": "1.0.0",
+  "description": "npm/pnpm wrapper that bootstraps the Citadel Python CLI into a user-cache venv, leaving system Python untouched.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "citadel": "bin/citadel.mjs"
+  },
+  "files": [
+    "bin/citadel.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/masumi-network/Citadel"
+  }
+}
