@@ -88,6 +88,7 @@ const state = {
   meSummaryError: false,
   promotions: [],
   sources: [],
+  sourceSummary: {},
   auditFilter: "all",
   // Knowledge Mesh is the durable view; Vault Activity is restart-transient and
   // therefore empty on every fresh boot/redeploy — a bad first impression.
@@ -519,6 +520,13 @@ function buildForceGraphData() {
   let links = [];
   for (const edge of source.edges) {
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+    const relationship = String(edge.relationship || edge.label || "").toLowerCase();
+    if (
+      state.graphMode === "knowledge" &&
+      (relationship === "contains" || relationship === "is_part_of")
+    ) {
+      continue;
+    }
     // Projection edges carry "label", knowledge edges "relationship" —
     // normalize so linkLabel tooltips work in both modes.
     links.push({
@@ -532,6 +540,14 @@ function buildForceGraphData() {
   // the raw graph (state.realGraph) stays untouched for inspection/search.
   if (state.graphMode === "knowledge" && state.graphAggregate !== false) {
     ({ nodes, links } = aggregateKnowledgeMesh(nodes, links));
+  }
+  if (state.graphMode === "knowledge") {
+    const connected = new Set(links.flatMap((link) => [link.source, link.target]));
+    nodes = nodes.filter(
+      (node) => nodeKind(node) === "dataset" || nodeKind(node) === "seat" || connected.has(node.id),
+    );
+    const visible = new Set(nodes.map((node) => node.id));
+    links = links.filter((link) => visible.has(link.source) && visible.has(link.target));
   }
   // resolveCentralId's highest-degree fallback reads node.neighbors, which is
   // only populated by rebuildNeighborLinks — so resolve AFTER the first pass,
@@ -1921,7 +1937,7 @@ const LABEL_ZOOM_THRESHOLD = 1.6;
 // floored to this many SCREEN px (divided by globalScale, the same zoom
 // compensation drawNodeLabel uses) without changing the painted size.
 const NODE_REL_SIZE = 4;
-const MIN_NODE_HIT_RADIUS_PX = 6;
+const MIN_NODE_HIT_RADIUS_PX = 12;
 
 function initializeGraph() {
   if (!window.ForceGraph) {
@@ -1938,6 +1954,8 @@ function initializeGraph() {
     .height(graph.height)
     .backgroundColor("rgba(0,0,0,0)")
     .nodeId("id")
+    .enableNodeDrag(true)
+    .enablePanInteraction(true)
     .nodeRelSize(NODE_REL_SIZE)
     .nodeVal(nodeValue)
     .nodeColor(nodeColor)
@@ -2169,8 +2187,8 @@ function selectNode(node) {
 }
 
 // Knowledge-mode inspector: label, kind + dataset, internal name when the
-// backend provides one, then every clickable connection from the unfiltered
-// real graph (hidden kinds still listed).
+// backend provides one, then every clickable connection from the caller-scoped
+// real graph payload (hidden kinds still listed).
 // loadNodeDocument appends the stored document text after this content.
 function renderKnowledgeInspector(node) {
   const kind = nodeKind(node);
@@ -2247,18 +2265,36 @@ function renderKnowledgeInspector(node) {
   selectedNode.append(container);
 }
 
-// Neighbors of a node straight from state.realGraph edges (either direction).
+// Neighbors of a node from the caller-scoped real graph payload in knowledge
+// mode. The rendered graph remains the fallback for other modes or before the
+// Knowledge Mesh payload arrives.
 function knowledgeNeighbors(nodeId) {
-  const real = state.realGraph;
-  if (!real) return [];
+  const rendered = graph.instance?.graphData?.();
+  const source =
+    state.graphMode === "knowledge" && state.realGraph
+      ? state.realGraph
+      : { nodes: rendered?.nodes, edges: rendered?.links };
+  const nodes = source.nodes instanceof Map
+    ? Array.from(source.nodes.values())
+    : Array.isArray(source.nodes)
+      ? source.nodes
+      : [];
+  const edges = Array.isArray(source.edges) ? source.edges : [];
+  if (!nodes.length) return [];
+  const byId = new Map(nodes.map((node) => [String(node.id), node]));
+  const selectedId = String(nodeId);
+  const endpointId = (endpoint) =>
+    typeof endpoint === "object" && endpoint !== null ? String(endpoint.id) : String(endpoint);
   const result = [];
   const seen = new Set();
-  for (const edge of real.edges) {
+  for (const edge of edges) {
+    const sourceId = endpointId(edge.source);
+    const targetId = endpointId(edge.target);
     let otherId = null;
-    if (edge.source === nodeId) otherId = edge.target;
-    else if (edge.target === nodeId) otherId = edge.source;
+    if (sourceId === selectedId) otherId = targetId;
+    else if (targetId === selectedId) otherId = sourceId;
     else continue;
-    const other = real.nodes.get(otherId);
+    const other = byId.get(otherId);
     if (!other) continue;
     const relationship = edge.relationship || edge.label || "related";
     const key = `${relationship}:${other.id}`;
@@ -2364,8 +2400,8 @@ function sourcingDocumentCandidates(node) {
   const seenChunks = new Set();
   for (const edge of real.edges) {
     if (String(edge.relationship || edge.label || "") !== SOURCING_RELATIONSHIP) continue;
-    const otherId =
-      edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null;
+    if (edge.target !== node.id) continue;
+    const otherId = edge.source;
     if (!otherId || seenChunks.has(otherId)) continue;
     seenChunks.add(otherId);
     const chunk = real.nodes.get(otherId);
@@ -2436,11 +2472,23 @@ function renderedGraphNodes() {
   return Array.isArray(nodes) ? nodes : [];
 }
 
+function graphSearchCandidates(source) {
+  if (state.graphMode === "knowledge" && state.realGraph?.nodes instanceof Map) {
+    return Array.from(state.realGraph.nodes.values());
+  }
+  if (source?.nodes instanceof Map) {
+    return Array.from(source.nodes.values());
+  }
+  return renderedGraphNodes();
+}
+
 function matchingGraphNodes(query) {
   const normalized = String(query || "").trim().toLowerCase();
   if (!normalized) return [];
   const tokens = normalized.split(/\s+/).filter(Boolean);
-  return renderedGraphNodes()
+  const source = activeGraphData();
+  const candidates = graphSearchCandidates(source);
+  return candidates
     .map((node) => {
       const label = String(node.label || node.id || "");
       const id = String(node.id || "");
@@ -2622,7 +2670,14 @@ async function loadNodeDocument(node) {
               candidate.relationship || "related"
             )} · ${escapeHtml(candidate.node.label || candidate.node.id)}</p>`
           : "";
-      container.innerHTML = `${source}${title}<pre>${escapeHtml(doc.body)}</pre>`;
+      const rendered = `${source}${title}<pre>${escapeHtml(doc.body)}</pre>`;
+      const broadDigest = /^#\s+(Linear workspace sync|.*GitHub daily update)\b/im.test(
+        String(doc.body)
+      );
+      if (broadDigest) {
+        continue;
+      }
+      container.innerHTML = rendered;
       return;
     } catch (error) {
       if (state.selectedId !== node.id) return;
@@ -3466,37 +3521,37 @@ function renderKnowledgeSources(error = null) {
     return;
   }
 
-  const github = state.githubSync;
-  const obsidianPayload = state.obsidianSources || {};
-  const obsidianSources = obsidianPayload.sources || [];
-  const summary = obsidianPayload.summary || {};
-  const sourceRows = [];
-  if (github) {
-    sourceRows.push({
-      name: `GitHub: ${github.org || "organization"}`,
-      body: `${github.tracked_repositories || 0} repositories - ${formatDate(github.last_checked_at)}`,
-      status: github.last_checked_at ? "tracked" : "ready",
-      error: false,
-    });
-  }
-  obsidianSources.forEach((source) => {
-    sourceRows.push({
-      name: source.name || "Obsidian vault",
-      body: `${source.documents || 0} notes - ${formatDate(source.last_push_at)}`,
-      status: source.open_conflicts ? "review" : "synced",
-      error: Boolean(source.open_conflicts),
-    });
+  const sourceRows = (state.sources || []).map((source) => {
+    const type = String(source.source_type || "source");
+    const labels = {
+      github: "GitHub activity",
+      github_repo_content: "GitHub repository content",
+      linear: "Linear workspace",
+      obsidian_vault: "Obsidian vault",
+    };
+    const status = String(source.status || "ready");
+    return {
+      name: `${labels[type] || "Source"}: ${source.name || "configured"}`,
+      documents: Number(source.documents || 0),
+      body: `${Number(source.documents || 0).toLocaleString()} records - ${formatDate(
+        source.last_checked_at || source.last_push_at
+      )}`,
+      status,
+      error: ["error", "degraded", "review"].includes(status),
+    };
   });
 
   const sourceCount = sourceRows.length;
-  const snapshotCount = Number(github?.tracked_repositories || 0) + Number(summary.obsidian_documents || 0);
-  const conflictCount = Number(summary.open_conflicts || 0);
+  const snapshotCount = sourceRows.reduce((total, source) => total + source.documents, 0);
+  const conflictCount = Number(state.sourceSummary?.open_conflicts || 0);
   if (knowledgeSourceCount) knowledgeSourceCount.textContent = String(sourceCount);
   if (knowledgeSnapshotCount && !state.snapshot) knowledgeSnapshotCount.textContent = String(snapshotCount);
   if (knowledgeConflictCount) knowledgeConflictCount.textContent = String(conflictCount);
 
   if (!sourceRows.length) {
-    knowledgeSourceList.append(emptyState("No connected sources", "GitHub and Obsidian sources will appear here."));
+    knowledgeSourceList.append(
+      emptyState("No connected sources", "GitHub, Linear, and other configured sources will appear here.")
+    );
     return;
   }
 
@@ -3896,9 +3951,12 @@ async function loadSources() {
   try {
     const payload = await api("/api/sources");
     state.sources = payload.sources || [];
+    state.sourceSummary = payload.summary || {};
   } catch {
     state.sources = [];
+    state.sourceSummary = {};
   }
+  renderKnowledgeSources();
   renderHome();
   renderReview();
 }
@@ -4999,6 +5057,7 @@ document.getElementById("ingestForm").addEventListener("submit", async (event) =
         data,
         dataset: String(formData.get("dataset") || "").trim() || null,
         tags,
+        idempotency_key: crypto.randomUUID(),
       }),
     });
     form.querySelector("[name='data']").value = "";
@@ -5122,6 +5181,26 @@ document.getElementById("searchForm").addEventListener("submit", async (event) =
   }
 });
 
+// Keep one caller key for one logical feedback payload. Uncertain retries reuse
+// it, while a changed payload gets a fresh key.
+function feedbackRequestState(state, payload, makeKey = () => crypto.randomUUID()) {
+  const serialized = JSON.stringify(payload);
+  const key = state.key && state.payload === serialized ? state.key : makeKey();
+  return {
+    state: { key, payload: serialized },
+    request: { ...payload, idempotency_key: key },
+  };
+}
+
+function feedbackRequestCompletion(state, outcome) {
+  return outcome === "accepted" || outcome === "conflict"
+    ? { key: null, payload: null }
+    : state;
+}
+
+let pendingFeedbackKey = null;
+let pendingFeedbackPayload = null;
+
 document.getElementById("feedbackForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -5143,17 +5222,27 @@ document.getElementById("feedbackForm").addEventListener("submit", async (event)
   feedbackStatus.textContent = "Recording";
   feedbackStatus.className = "status-chip status-standby";
   setBusy(button, true, { idle: "Record feedback", loading: "Recording" });
+  const feedbackPayload = {
+    qa_id: qaId,
+    score: scoreValue === "" ? null : Number.parseInt(scoreValue, 10),
+    text: String(formData.get("text") || "").trim() || null,
+    dataset: String(formData.get("dataset") || "").trim() || null,
+    session_id: String(formData.get("sessionId") || "").trim() || null,
+  };
+  const prepared = feedbackRequestState(
+    { key: pendingFeedbackKey, payload: pendingFeedbackPayload },
+    feedbackPayload,
+  );
+  pendingFeedbackKey = prepared.state.key;
+  pendingFeedbackPayload = prepared.state.payload;
   try {
     const response = await api("/feedback", {
       method: "POST",
-      body: JSON.stringify({
-        qa_id: qaId,
-        score: scoreValue === "" ? null : Number.parseInt(scoreValue, 10),
-        text: String(formData.get("text") || "").trim() || null,
-        dataset: String(formData.get("dataset") || "").trim() || null,
-        session_id: String(formData.get("sessionId") || "").trim() || null,
-      }),
+      body: JSON.stringify(prepared.request),
     });
+    const completed = feedbackRequestCompletion(prepared.state, "accepted");
+    pendingFeedbackKey = completed.key;
+    pendingFeedbackPayload = completed.payload;
     feedbackStatus.textContent = response.recorded ? "Recorded" : "Skipped";
     feedbackStatus.className = `status-chip ${response.recorded ? "status-enabled" : "status-standby"}`;
     feedbackResult.innerHTML = `
@@ -5164,6 +5253,12 @@ document.getElementById("feedbackForm").addEventListener("submit", async (event)
     `;
     await loadMesh(false);
   } catch (err) {
+    const completed = feedbackRequestCompletion(
+      prepared.state,
+      err.status === 409 ? "conflict" : "uncertain",
+    );
+    pendingFeedbackKey = completed.key;
+    pendingFeedbackPayload = completed.payload;
     error.textContent = err.message;
     feedbackStatus.textContent = "Failed";
     feedbackStatus.className = "status-chip status-error";
