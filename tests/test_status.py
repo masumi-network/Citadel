@@ -288,6 +288,58 @@ def test_gather_status_healthy(tmp_path: Path, monkeypatch) -> None:
     assert report.to_dict()["readiness"]["search"] is True
 
 
+def test_gather_status_allowlists_hostile_recent_fields(tmp_path: Path, monkeypatch) -> None:
+    # A hostile audit row carrying actor identity, a token-like value, dataset,
+    # and a nested detail payload must be stripped to display scalars only.
+    hostile = {
+        "title": "feat: safe",
+        "created_at": "2026-06-27T10:00:00",
+        "action": "contribute",
+        "actor_id": "principal_secret",
+        "actor_name": "Alice",
+        "role": "admin",
+        "dataset": "seat:alice",
+        "token": "ctdl_supersecrettoken",
+        "detail": {"query": "confidential text", "nested": "payload"},
+        "unknown_key": "drop me",
+    }
+    monkeypatch.setattr(
+        status_mod._OPENER,
+        "open",
+        _route(
+            {
+                "/healthz": {"ok": True, "service": "citadel"},
+                "/api/session": {"ok": True, "role": "writer", "seat_slug": "alice"},
+                "/api/contributions/recent": {"contributions": [hostile]},
+            }
+        ),
+    )
+    report = gather_status(
+        "https://node.example",
+        "ctdl_tok",
+        repo=tmp_path,
+        config_path=tmp_path / "c.json",
+    )
+    row = report.recent[0]
+    assert row == {
+        "title": "feat: safe",
+        "created_at": "2026-06-27T10:00:00",
+        "action": "contribute",
+    }
+    blob = json.dumps(report.to_dict())
+    for leaked in ("principal_secret", "ctdl_supersecrettoken", "seat:alice", "confidential text", "admin", "drop me"):
+        assert leaked not in blob
+
+
+def test_sanitize_recent_drops_non_dict_and_non_scalar() -> None:
+    from kb.status import _sanitize_recent
+
+    assert _sanitize_recent("not a list") == []
+    assert _sanitize_recent([None, "x", 5]) == []
+    # A scalar-only allowlist; a dict/list value under an allowed key is dropped.
+    assert _sanitize_recent([{"title": ["nested"], "action": "ok"}]) == [{"action": "ok"}]
+
+
 def test_readiness_auth_required_and_search_codes(tmp_path: Path) -> None:
     report = StatusReport(
         node_url="https://node.example",
@@ -1071,3 +1123,34 @@ def test_pre_push_check_distinguishes_no_git_repo(tmp_path: Path) -> None:
     assert "no git repo" in hook.detail
     assert str(tmp_path) in hook.detail
     assert hook.data["git_repo"] is False
+
+
+def test_ingest_node_carries_stable_idempotency_key(monkeypatch: Any) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs["payload"])
+        return {"accepted": True}
+
+    monkeypatch.setattr(status_mod, "_request", fake_request)
+    status_mod.ingest_node("https://node.example", "ctdl_x", "smoke note", ["smoke"])
+    status_mod.ingest_node("https://node.example", "ctdl_x", "smoke note", ["smoke"])
+
+    assert seen[0]["idempotency_key"]
+    assert seen[0]["idempotency_key"] == seen[1]["idempotency_key"]
+
+
+def test_ingest_node_idempotency_key_avoids_delimiter_collision(
+    monkeypatch: Any,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs["payload"])
+        return {"accepted": True}
+
+    monkeypatch.setattr(status_mod, "_request", fake_request)
+    status_mod.ingest_node("https://node.example", "ctdl_x", "a\x1fb", ["c"])
+    status_mod.ingest_node("https://node.example", "ctdl_x", "a", ["b", "c"])
+
+    assert seen[0]["idempotency_key"] != seen[1]["idempotency_key"]
