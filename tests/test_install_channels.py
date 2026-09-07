@@ -222,3 +222,30 @@ def test_homebrew_formula_declares_textual_resource() -> None:
     text = FORMULA.read_text()
     assert 'resource "textual"' in text  # base dep is vendored, not silently dropped
     assert "no third-party dependencies" not in text  # the false claim is gone
+
+
+def test_wrapper_ignores_unverified_cached_venv(tmp_path: Path) -> None:
+    # A pre-seeded same-version venv with no digest marker must not be trusted;
+    # only a marker matching the pinned wheel sha256 makes it a verified hit.
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    env = {"XDG_CACHE_HOME": str(tmp_path)}
+    body = (
+        'const {mkdirSync, writeFileSync} = await import("node:fs");\n'
+        'const {join} = await import("node:path");\n'
+        "const venv = w.venvDir();\n"
+        'const bin = join(venv, process.platform === "win32" ? "Scripts" : "bin");\n'
+        "mkdirSync(bin, {recursive: true});\n"
+        'writeFileSync(join(bin, process.platform === "win32" ? "citadel.exe" : "citadel"), "#!/bin/sh\\n");\n'
+        'console.log("nomarker", w.verifiedCacheHit(venv));\n'
+        'writeFileSync(join(venv, ".citadel-wheel-sha256"), w.pinnedWheelHash() + "\\n");\n'
+        'console.log("match", w.verifiedCacheHit(venv));\n'
+        'writeFileSync(join(venv, ".citadel-wheel-sha256"), "f".repeat(64) + "\\n");\n'
+        'console.log("mismatch", w.verifiedCacheHit(venv));'
+    )
+    result = _node_eval(node, body, env=env)
+    assert result.returncode == 0, result.stderr
+    assert "nomarker false" in result.stdout
+    assert "match true" in result.stdout
+    assert "mismatch false" in result.stdout

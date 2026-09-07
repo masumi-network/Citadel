@@ -13,7 +13,7 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
@@ -83,6 +83,25 @@ export function pinnedWheelHash() {
   return PINNED_WHEEL_SHA256;
 }
 
+function wheelMarker(venv) {
+  return join(venv, ".citadel-wheel-sha256");
+}
+
+// A cached venv is trusted only when a digest marker written after a verified,
+// --require-hashes install matches the pinned wheel sha256. A pre-seeded or
+// tampered same-version venv without a matching marker is never reused.
+export function verifiedCacheHit(venv) {
+  const { citadel } = venvCitadel(venv);
+  if (!existsSync(citadel)) return false;
+  const marker = wheelMarker(venv);
+  if (!existsSync(marker)) return false;
+  try {
+    return readFileSync(marker, "utf8").trim() === pinnedWheelHash();
+  } catch {
+    return false;
+  }
+}
+
 export function installSpec() {
   const dir = mkdtempSync(join(tmpdir(), "citadel-req-"));
   const file = join(dir, "requirements.txt");
@@ -108,7 +127,7 @@ export function pipInstallArgs(requirement) {
 function ensureVenv() {
   const venv = venvDir();
   const bins = venvCitadel(venv);
-  if (existsSync(bins.citadel)) return bins.citadel;
+  if (verifiedCacheHit(venv)) return bins.citadel;
 
   const py = findPython();
   if (!py) {
@@ -121,6 +140,7 @@ function ensureVenv() {
   const { requirement } = installSpec();
   result = spawnSync(bins.python, pipInstallArgs(requirement), { stdio: "inherit" });
   if (result.status !== 0) fail(`could not install ${PKG}==${PINNED_VERSION}`);
+  writeFileSync(wheelMarker(venv), `${pinnedWheelHash()}\n`);
   return bins.citadel;
 }
 
