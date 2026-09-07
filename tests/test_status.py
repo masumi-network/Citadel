@@ -340,6 +340,13 @@ def test_sanitize_recent_drops_non_dict_and_non_scalar() -> None:
     assert _sanitize_recent([{"title": ["nested"], "action": "ok"}]) == [{"action": "ok"}]
 
 
+def test_fetch_recent_fails_closed_on_non_dict_response(monkeypatch) -> None:
+    # A malformed API response (list, None, scalar) must yield [], never raise.
+    for shape in ([{"contributions": []}], None, "boom", 5):
+        monkeypatch.setattr(status_mod, "_request", lambda *a, **k: shape)
+        assert status_mod.fetch_recent("https://node.example", "tok") == []
+
+
 def test_readiness_auth_required_and_search_codes(tmp_path: Path) -> None:
     report = StatusReport(
         node_url="https://node.example",

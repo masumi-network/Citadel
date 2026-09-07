@@ -968,7 +968,8 @@ def fetch_recent(
         )
     except Exception:
         return []
-    return _sanitize_recent(data.get("contributions"))
+    payload = data if isinstance(data, dict) else {}
+    return _sanitize_recent(payload.get("contributions"))
 
 
 def gather_status(
