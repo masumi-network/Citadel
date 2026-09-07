@@ -194,6 +194,7 @@ def test_dataset_map_tags_document_and_appends_hub() -> None:
     doc = next(node for node in payload["nodes"] if node["id"] == "doc-1")
     assert doc["dataset"] == "seat:alice"
     assert doc["datasets"] == ["seat:alice"]
+    assert doc["document_endpoint"] == "/api/documents/doc-1"
     hub = next(node for node in payload["nodes"] if node["id"] == "dataset:seat:alice")
     assert hub == {
         "id": "dataset:seat:alice",
@@ -1107,6 +1108,29 @@ async def test_graph_seat_first_orders_callers_content_before_the_cap() -> None:
     assert _content_ids(seated) == ["doc-seat", "doc-c0"]
 
 
+async def test_graph_seat_first_keeps_connected_pair_before_cap() -> None:
+    nodes = [
+        ("doc-central-0", {"type": "TextDocument"}),
+        ("doc-central-1", {"type": "TextDocument"}),
+        ("doc-seat", {"type": "TextDocument"}),
+        ("chunk-seat", {"type": "DocumentChunk", "text": "seat content"}),
+    ]
+    edges = [
+        ("doc-central-0", "doc-central-1", "related", {}),
+        ("chunk-seat", "doc-seat", "is_part_of", {}),
+    ]
+    mapping = {
+        "doc-central-0": ["masumi-network"],
+        "doc-central-1": ["masumi-network"],
+        "doc-seat": ["seat:alice"],
+    }
+    mesh = KnowledgeMesh(FakeDatasetMapGateway(nodes, edges, mapping))
+
+    seated = await mesh.graph(limit=2, seat_first="seat:alice")
+
+    assert _content_ids(seated) == ["doc-seat", "chunk-seat"]
+
+
 async def test_graph_seat_first_without_matching_content_changes_nothing() -> None:
     mesh = KnowledgeMesh(
         FakeDatasetMapGateway(
@@ -1115,3 +1139,288 @@ async def test_graph_seat_first_without_matching_content_changes_nothing() -> No
     )
 
     assert await mesh.graph(seat_first="seat:ghost") == await mesh.graph()
+
+
+# --- lifecycle current-head graph filtering -----------------------------------
+
+
+class FakeLifecycleStore:
+    def __init__(self, statuses: dict[str, bool]) -> None:
+        self.statuses = statuses
+
+    def source_revision_statuses(self) -> dict[str, bool]:
+        return dict(self.statuses)
+
+
+CURRENT_SOURCE_REVISION_IDS = {"doc-current", "doc-hidden-current"}
+STALE_SOURCE_REVISION_IDS = {"doc-stale"}
+TOMBSTONED_SOURCE_REVISION_IDS = {"doc-tombstoned"}
+LIFECYCLE_SOURCE_STATUSES = {
+    **{source_id: True for source_id in CURRENT_SOURCE_REVISION_IDS},
+    **{source_id: False for source_id in STALE_SOURCE_REVISION_IDS},
+    **{source_id: False for source_id in TOMBSTONED_SOURCE_REVISION_IDS},
+}
+
+
+async def test_graph_filters_stale_and_tombstoned_nodes_before_scope_and_cap() -> None:
+    nodes = [
+        ("doc-stale", {"name": "stale document", "type": "TextDocument"}),
+        ("chunk-stale", {"text": "stale chunk", "type": "DocumentChunk"}),
+        (
+            "doc-tombstoned",
+            {"name": "tombstoned document", "type": "TextDocument"},
+        ),
+        (
+            "chunk-tombstoned",
+            {"text": "tombstoned chunk", "type": "DocumentChunk"},
+        ),
+        (
+            "doc-hidden-current",
+            {"name": "private current document", "type": "TextDocument"},
+        ),
+        (
+            "chunk-hidden-current",
+            {"text": "private current chunk", "type": "DocumentChunk"},
+        ),
+        ("doc-current", {"name": "current document", "type": "TextDocument"}),
+        ("chunk-current", {"text": "current chunk", "type": "DocumentChunk"}),
+    ]
+    edges = [
+        ("chunk-stale", "doc-stale", "is_part_of", {}),
+        ("chunk-tombstoned", "doc-tombstoned", "is_part_of", {}),
+        ("chunk-hidden-current", "doc-hidden-current", "is_part_of", {}),
+        ("chunk-current", "doc-current", "is_part_of", {}),
+    ]
+    gateway = FakeDatasetGateway(
+        nodes,
+        edges,
+        dataset_map={
+            "doc-stale": ["masumi-network"],
+            "doc-tombstoned": ["masumi-network"],
+            "doc-hidden-current": ["seat:alice"],
+            "doc-current": ["masumi-network"],
+        },
+    )
+    mesh = KnowledgeMesh(
+        gateway,
+        lifecycle_store=FakeLifecycleStore(LIFECYCLE_SOURCE_STATUSES),
+    )
+
+    full_graph = await mesh.graph(limit=20, dataset_visible=_central_only)
+
+    full_ids = {node["id"] for node in full_graph["nodes"]}
+    assert {"doc-current", "chunk-current"} <= full_ids
+    assert {
+        "source": "chunk-current",
+        "target": "doc-current",
+        "relationship": "is_part_of",
+    } in full_graph["edges"]
+    assert "doc-hidden-current" not in full_ids
+    assert "chunk-hidden-current" not in full_ids
+    for stale_id in (
+        STALE_SOURCE_REVISION_IDS
+        | TOMBSTONED_SOURCE_REVISION_IDS
+        | {"chunk-stale", "chunk-tombstoned"}
+    ):
+        assert stale_id not in full_ids
+    payload_text = json.dumps(full_graph, sort_keys=True)
+    for stale_id in STALE_SOURCE_REVISION_IDS | TOMBSTONED_SOURCE_REVISION_IDS:
+        assert stale_id not in payload_text
+        assert f"/api/documents/{stale_id}" not in payload_text
+    assert "stale chunk" not in payload_text
+    assert "tombstoned chunk" not in payload_text
+    assert "private current document" not in payload_text
+    assert "/api/documents/doc-current" in payload_text
+    assert all(
+        edge["source"] in full_ids and edge["target"] in full_ids
+        for edge in full_graph["edges"]
+    )
+
+    capped_graph = await mesh.graph(limit=2, dataset_visible=_central_only)
+    capped_content_ids = [
+        node["id"]
+        for node in capped_graph["nodes"]
+        if node["type"] != "dataset"
+    ]
+    assert capped_content_ids == ["doc-current", "chunk-current"]
+
+async def test_graph_prunes_stale_only_nodes_from_bypass_view() -> None:
+    gateway = FakeDatasetGateway(
+        [
+            ("doc-current", {"name": "current", "type": "TextDocument"}),
+            ("chunk-current", {"text": "current body", "type": "DocumentChunk"}),
+            ("entity-shared", {"name": "shared", "type": "Entity"}),
+            ("doc-stale", {"name": "stale", "type": "TextDocument"}),
+            ("chunk-stale", {"text": "stale body", "type": "DocumentChunk"}),
+            ("entity-stale", {"name": "stale entity", "type": "Entity"}),
+            ("summary-stale", {"text": "stale summary", "type": "TextSummary"}),
+        ],
+        [
+            ("chunk-current", "doc-current", "is_part_of", {}),
+            ("entity-shared", "chunk-current", "contains", {}),
+            ("entity-shared", "chunk-stale", "contains", {}),
+            ("chunk-stale", "doc-stale", "is_part_of", {}),
+            ("summary-stale", "chunk-stale", "made_from", {}),
+            ("entity-stale", "doc-current"),
+            ("entity-stale", "chunk-stale", "contains", {}),
+        ],
+    )
+    mesh = KnowledgeMesh(
+        gateway,
+        lifecycle_store=FakeLifecycleStore(
+            {
+                "doc-current": True,
+                "doc-stale": False,
+            }
+        ),
+    )
+
+    graph = await mesh.graph(limit=20)
+
+    ids = {node["id"] for node in graph["nodes"]}
+    assert {"doc-current", "chunk-current", "entity-shared"} <= ids
+    assert not ids.intersection({"doc-stale", "chunk-stale", "entity-stale", "summary-stale"})
+
+
+async def test_graph_preserves_unmanaged_document_roots() -> None:
+    gateway = FakeDatasetGateway(
+        [
+            ("doc-stale", {"name": "stale", "type": "TextDocument"}),
+            ("chunk-stale", {"text": "stale body", "type": "DocumentChunk"}),
+            ("entity-shared", {"name": "shared", "type": "Entity"}),
+            (
+                "doc-unmanaged",
+                {
+                    "name": "unmanaged",
+                    "type": "text",
+                    "text": "unmanaged document body",
+                },
+            ),
+            ("chunk-unmanaged", {"text": "unmanaged body", "type": "DocumentChunk"}),
+        ],
+        [
+            ("chunk-stale", "doc-stale", "is_part_of", {}),
+            ("entity-shared", "chunk-stale", "contains", {}),
+            ("entity-shared", "chunk-unmanaged", "contains", {}),
+            ("chunk-unmanaged", "doc-unmanaged", "is_part_of", {}),
+        ],
+    )
+    mesh = KnowledgeMesh(
+        gateway,
+        lifecycle_store=FakeLifecycleStore({"doc-stale": False}),
+    )
+
+    graph = await mesh.graph(limit=20)
+
+    ids = {node["id"] for node in graph["nodes"]}
+    assert {"doc-unmanaged", "chunk-unmanaged", "entity-shared"} <= ids
+    assert "/api/documents/doc-unmanaged" in json.dumps(graph)
+    assert not ids.intersection({"doc-stale", "chunk-stale"})
+
+def test_graph_payload_cap_prefers_later_connected_pair() -> None:
+    payload = build_graph_payload(
+        [
+            ("isolated", {"name": "orphan", "type": "Entity"}),
+            ("hub", {"name": "Central", "type": "Hub"}),
+            ("pair-left", {"name": "left", "type": "Entity"}),
+            ("pair-right", {"name": "right", "type": "Entity"}),
+        ],
+        [("pair-left", "pair-right", "related", {})],
+        limit=2,
+    )
+
+    ids = {node["id"] for node in payload["nodes"]}
+    assert ids == {"pair-left", "pair-right"}
+    assert payload["edges"] == [
+        {"source": "pair-left", "target": "pair-right", "relationship": "related"}
+    ]
+    assert all(
+        edge["source"] in ids and edge["target"] in ids for edge in payload["edges"]
+    )
+def test_graph_payload_cap_reserves_preferred_endpoint_pairs() -> None:
+    payload = build_graph_payload(
+        [
+            ("doc-a", {"name": "A", "type": "TextDocument"}),
+            ("doc-b", {"name": "B", "type": "TextDocument"}),
+            ("chunk-a", {"text": "A body", "type": "DocumentChunk"}),
+            ("chunk-b", {"text": "B body", "type": "DocumentChunk"}),
+        ],
+        [
+            ("chunk-a", "doc-a", "is_part_of", {}),
+            ("chunk-b", "doc-b", "is_part_of", {}),
+        ],
+        limit=2,
+        preferred_ids={"doc-a", "doc-b", "chunk-a", "chunk-b"},
+    )
+
+    ids = {node["id"] for node in payload["nodes"]}
+    assert ids == {"doc-a", "chunk-a"}
+    assert payload["edges"] == [
+        {"source": "chunk-a", "target": "doc-a", "relationship": "is_part_of"}
+    ]
+def test_graph_payload_cap_completes_preferred_pair_with_missing_endpoint() -> None:
+    payload = build_graph_payload(
+        [
+            ("a", {"name": "A", "type": "Entity"}),
+            ("b", {"name": "B", "type": "Entity"}),
+            ("d", {"name": "D", "type": "Entity"}),
+            ("c", {"name": "C", "type": "Entity"}),
+        ],
+        [
+            ("a", "b", "related", {}),
+            ("b", "c", "related", {}),
+        ],
+        limit=3,
+        preferred_ids={"a", "b", "c", "d"},
+    )
+
+    ids = {node["id"] for node in payload["nodes"]}
+    assert ids == {"a", "b", "c"}
+    assert payload["edges"] == [
+        {"source": "a", "target": "b", "relationship": "related"},
+        {"source": "b", "target": "c", "relationship": "related"},
+    ]
+
+
+def test_graph_payload_cap_ignores_malformed_preferred_edges() -> None:
+    payload = build_graph_payload(
+        [
+            ("bad-left", {"name": "bad left", "type": "Entity"}),
+            ("bad-right", {"name": "bad right", "type": "Entity"}),
+            ("valid-left", {"name": "valid left", "type": "Entity"}),
+            ("valid-right", {"name": "valid right", "type": "Entity"}),
+        ],
+        [
+            ("bad-left", "bad-right"),
+            ("valid-left", "valid-right", "related", {}),
+        ],
+        limit=2,
+        preferred_ids={"bad-left", "bad-right", "valid-left", "valid-right"},
+    )
+
+    ids = {node["id"] for node in payload["nodes"]}
+    assert ids == {"valid-left", "valid-right"}
+    assert payload["edges"] == [
+        {"source": "valid-left", "target": "valid-right", "relationship": "related"}
+    ]
+
+
+def test_graph_payload_stamps_trace_id_and_prune_hides_withdrawn() -> None:
+    from kb.session_trace import prune_withdrawn_graph
+
+    payload = build_graph_payload(
+        [
+            ("chunk-a", {"type": "DocumentChunk", "text": "# Shared Session Trace\nTrace-Id: trace:gone\n\nDead end"}),
+            ("chunk-b", {"type": "DocumentChunk", "text": "ordinary note with no marker"}),
+        ],
+        [("chunk-a", "chunk-b", "related", {})],
+    )
+    node_by_id = {node["id"]: node for node in payload["nodes"]}
+    assert node_by_id["chunk-a"].get("trace_id") == "trace:gone"
+    assert "trace_id" not in node_by_id["chunk-b"]
+
+    pruned = prune_withdrawn_graph(payload, {"trace:gone"})
+    kept_ids = {node["id"] for node in pruned["nodes"]}
+    assert kept_ids == {"chunk-b"}
+    # The edge to the withdrawn node is dropped with it.
+    assert pruned["edges"] == []

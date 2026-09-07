@@ -1024,6 +1024,9 @@ _SESSION_TRACE_WORST_CASE_INPUTS: list[tuple[str, str, Callable[[int], str]]] = 
     ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:" + " " * n),
     ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:" + "\n" * n),
     ("_AUTHOR_SEAT_LINE", "search", lambda n: "Author-Seat:\n" * (n // 13)),
+    ("_TRACE_ID_LINE", "search", lambda n: "Trace-Id:" + " " * n),
+    ("_TRACE_ID_LINE", "search", lambda n: "Trace-Id:" + "\n" * n),
+    ("_TRACE_ID_LINE", "search", lambda n: "Trace-Id:\n" * (n // 10)),
 ]
 
 

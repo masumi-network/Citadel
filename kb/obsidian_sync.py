@@ -213,6 +213,21 @@ class ObsidianSyncStore:
         conflicts: list[dict[str, Any]] = []
         now = now_iso()
 
+        # Reject a batch that maps two request paths to one normalized path
+        # before any mutation. The store keys a document by normalized path, so
+        # a slash/dot duplicate (``notes/a.md`` and ``./notes/a.md``) would
+        # otherwise resolve to one document with order-dependent content. Fail
+        # the whole push and leave the manifest unchanged.
+        seen_paths: dict[str, str] = {}
+        for incoming in documents:
+            normalized = normalize_path(incoming.path)
+            if normalized in seen_paths:
+                raise ValueError(
+                    f"Duplicate normalized path in push batch: {normalized!r} "
+                    f"(from {seen_paths[normalized]!r} and {incoming.path!r})."
+                )
+            seen_paths[normalized] = incoming.path
+
         for incoming in documents:
             normalized_path = normalize_path(incoming.path)
             body = "" if incoming.deleted else incoming.content

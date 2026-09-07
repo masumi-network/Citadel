@@ -13,6 +13,7 @@ raising, so the report always renders.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -192,12 +193,21 @@ class StatusReport:
         return out
 
     def to_dict(self) -> dict[str, Any]:
+        checks: list[dict[str, Any]] = []
+        for check in self.checks:
+            item = asdict(check)
+            if check.name == "token":
+                # JSON is an automation boundary. Even a masked suffix can
+                # correlate with a credential, so expose only its state.
+                item["detail"] = "configured" if check.ok else "not configured"
+                item["data"] = {}
+            checks.append(item)
         return {
             "node_url": self.node_url,
             "healthy": self.healthy,
             "identity": self.identity,
-            "checks": [asdict(c) for c in self.checks],
-            "recent": self.recent,
+            "checks": checks,
+            "recent": _sanitize_recent(self.recent),
             "repo": self.repo,
             "readiness": self.readiness(),
         }
@@ -600,7 +610,19 @@ def ingest_node(
     """
     if cognify:
         raise ValueError("User ingest is capture-only; run scheduled projection separately")
-    payload: dict[str, Any] = {"data": data, "tags": list(tags), "cognify": False}
+    tag_list = list(tags)
+    payload: dict[str, Any] = {
+        "data": data,
+        "tags": tag_list,
+        "cognify": False,
+        "idempotency_key": hashlib.sha256(
+            json.dumps(
+                ["citadel-ingest", data, tag_list],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
     resolved = timeout if timeout is not None else _INGEST_TIMEOUT
     return _request(
         "POST",
@@ -906,6 +928,32 @@ def check_local_setup(repo: Path, config_path: Path | None = None) -> list[Check
     return checks
 
 
+# JSON status is an automation boundary. Upstream ``/api/contributions/recent``
+# returns full audit rows (actor_id, actor_kind, role, dataset, detail, …), but
+# only these scalar display fields belong in status output. Everything else,
+# including actor identity, tokens, datasets, detail payloads, and unknown keys,
+# is dropped. Non-scalar values are dropped even for allowed keys.
+_RECENT_ALLOWED_FIELDS = ("created_at", "timestamp", "title", "action")
+
+
+def _sanitize_recent(rows: Any) -> list[dict[str, Any]]:
+    """Field-allowlist recent contribution rows for the status boundary."""
+    if not isinstance(rows, list):
+        return []
+    clean: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item: dict[str, Any] = {}
+        for key in _RECENT_ALLOWED_FIELDS:
+            value = row.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                if value is not None:
+                    item[key] = value
+        clean.append(item)
+    return clean
+
+
 def fetch_recent(
     base_url: str, token: str | None, *, limit: int = 5, timeout: float = _TIMEOUT
 ) -> list[dict[str, Any]]:
@@ -920,7 +968,8 @@ def fetch_recent(
         )
     except Exception:
         return []
-    return data.get("contributions") or []
+    payload = data if isinstance(data, dict) else {}
+    return _sanitize_recent(payload.get("contributions"))
 
 
 def gather_status(

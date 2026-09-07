@@ -20,6 +20,7 @@ import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Callable
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,14 @@ DEFAULT_MAX_NODES = 200
 
 _LABEL_KEYS = ("name", "label", "title", "text", "id")
 _TYPE_KEYS = ("type", "node_type", "entity_type", "category")
+_DOCUMENT_NODE_TYPES = frozenset({"text", "pdf", "audio", "image"})
+
+
+def _is_document_node_type(value: Any) -> bool:
+    normalized = str(value).strip().lower()
+    return "chunk" not in normalized and (
+        "document" in normalized or normalized in _DOCUMENT_NODE_TYPES
+    )
 
 # Cognee names document nodes ``text_<md5>``/``data_<md5>`` — useless to
 # humans. Labels matching this (or a bare node id) are candidates for
@@ -41,6 +50,23 @@ _CHUNK_LABEL_MAX = 64
 _SEAT_PREFIX = "seat:"
 _SESSION_TRACES_DATASET = "session-traces"
 _ATTESTATION_METADATA_KEY = "citadel_attestation"
+
+# A Shared Session Trace embeds one ``Trace-Id:`` line (kb.session_trace). The
+# withdrawal path hides a trace by ID, so stamp it onto derived graph nodes so
+# a scoped read can drop a withdrawn trace before a projection rebuild does.
+# Match on one line only: horizontal whitespace after the marker and a non-CR/LF
+# value, so an empty marker cannot borrow the next line as a false trace ID.
+_TRACE_ID_RE = re.compile(r"^Trace-Id:[ \t]*([^\r\n]+)\r?$", re.MULTILINE)
+
+
+def _node_trace_id(properties: Any) -> str | None:
+    if not isinstance(properties, dict):
+        return None
+    text = properties.get("text")
+    if not isinstance(text, str):
+        return None
+    match = _TRACE_ID_RE.search(text)
+    return match.group(1).strip() if match else None
 
 # YAML frontmatter closing fences are searched within this many leading lines.
 _FRONTMATTER_SCAN_LINES = 30
@@ -383,6 +409,7 @@ def build_graph_payload(
     limit: int = DEFAULT_MAX_NODES,
     dataset_map: dict[str, list[str]] | None = None,
     presence: list[dict[str, Any]] | None = None,
+    preferred_ids: set[str] | None = None,
     collapse_orphan_documents: bool = False,
 ) -> dict[str, Any]:
     """Shape raw Cognee graph tuples into the ``{nodes, edges}`` contract.
@@ -426,9 +453,11 @@ def build_graph_payload(
     """
     limit = max(1, limit)
     dataset_map = dataset_map or {}
-    nodes: list[dict[str, Any]] = []
-    kept_ids: set[str] = set()
-    node_by_id: dict[str, dict[str, Any]] = {}
+    # Parse every valid node before applying the cap. The old implementation
+    # stopped at the first ``limit`` rows, which could leave a capped graph
+    # with no complete relationship even when a later pair existed.
+    node_rows: list[tuple[str, dict[str, Any]]] = []
+    seen_node_ids: set[str] = set()
     for raw in raw_nodes:
         try:
             node_id, properties = raw[0], raw[1]
@@ -437,25 +466,115 @@ def build_graph_payload(
         if not isinstance(properties, dict):
             properties = {}
         node_key = str(node_id)
-        if node_key in kept_ids:
+        if node_key in seen_node_ids:
             continue
-        kept_ids.add(node_key)
+        seen_node_ids.add(node_key)
+        node_rows.append((node_key, properties))
+
+    selected_ids: set[str] = set()
+    if len(node_rows) <= limit:
+        selected_ids = {node_id for node_id, _ in node_rows}
+    else:
+        # Seat-first callers reserve their own nodes before relationship
+        # selection. This keeps the caller's content visible even when the
+        # graph enumeration starts with another connected component.
+        preferred = preferred_ids or set()
+        # Reserve complete preferred endpoint pairs before filling the cap
+        # with individual preferred nodes. Seat-first callers otherwise can
+        # spend the whole cap on documents and lose every chunk relationship.
+        for raw in raw_edges:
+            endpoints = _raw_endpoints(raw)
+            try:
+                str(raw[2])
+            except (TypeError, IndexError, KeyError):
+                continue
+            if endpoints is None:
+                continue
+            source, target = endpoints
+            missing_ids = {source, target} - selected_ids
+            if (
+                source == target
+                or source not in preferred
+                or target not in preferred
+                or source not in seen_node_ids
+                or target not in seen_node_ids
+                or not missing_ids
+                or len(selected_ids) + len(missing_ids) > limit
+            ):
+                continue
+            selected_ids.update(missing_ids)
+            if len(selected_ids) >= limit:
+                break
+        for node_id, _ in node_rows:
+            if len(selected_ids) >= limit:
+                break
+            if node_id in preferred:
+                selected_ids.add(node_id)
+        # Prefer whole endpoint pairs in raw edge order. If one endpoint is
+        # already selected, add its missing endpoint when the cap allows it.
+        for raw in raw_edges:
+            endpoints = _raw_endpoints(raw)
+            try:
+                str(raw[2])
+            except (TypeError, IndexError, KeyError):
+                continue
+            if endpoints is None:
+                continue
+            source, target = endpoints
+            if (
+                source == target
+                or source not in seen_node_ids
+                or target not in seen_node_ids
+            ):
+                continue
+            source_selected = source in selected_ids
+            target_selected = target in selected_ids
+            if source_selected and target_selected:
+                continue
+            if source_selected or target_selected:
+                if len(selected_ids) < limit:
+                    selected_ids.add(target if source_selected else source)
+                continue
+            if len(selected_ids) + 2 > limit:
+                continue
+            selected_ids.add(source)
+            selected_ids.add(target)
+        if len(selected_ids) < limit:
+            for node_id, _ in node_rows:
+                if node_id in selected_ids:
+                    continue
+                selected_ids.add(node_id)
+                if len(selected_ids) >= limit:
+                    break
+
+    nodes: list[dict[str, Any]] = []
+    kept_ids: set[str] = set()
+    node_by_id: dict[str, dict[str, Any]] = {}
+    for node_key, properties in node_rows:
+        if node_key not in selected_ids:
+            continue
         node: dict[str, Any] = {
             "id": node_key,
             "label": _node_label(node_key, properties),
             "type": _node_type(properties),
             "trust_tier": _trust_tier(dataset_map.get(node_key)),
         }
+        if _is_document_node_type(node["type"]):
+            node["document_endpoint"] = (
+                f"/api/documents/{quote(node_key, safe=':._-')}"
+            )
         names = dataset_map.get(node_key)
         if names:
             node["dataset"] = names[0]
             node["datasets"] = list(names)
             node["trust_tier"] = _trust_tier(names)
         node.update(_promotion_metadata(properties))
+        node_trace = _node_trace_id(properties)
+        if node_trace:
+            node["trace_id"] = node_trace
         nodes.append(node)
+        kept_ids.add(node_key)
         node_by_id[node_key] = node
-        if len(nodes) >= limit:
-            break
 
     # Captured before collapse can shrink ``nodes`` so ``truncated`` keeps its
     # meaning ("more raw nodes exist than were shaped"), not "collapse removed
@@ -528,6 +647,9 @@ def build_graph_payload(
                     best = (key, text)
             if best is None:
                 continue
+            doc_trace_match = _TRACE_ID_RE.search(best[1])
+            if doc_trace_match:
+                internal_nodes[doc_id]["trace_id"] = doc_trace_match.group(1).strip()
             label = _first_line_label(best[1], _DOC_LABEL_MAX, clean=_strip_summary_lead)
             if not label:
                 continue
@@ -571,7 +693,7 @@ def build_graph_payload(
                     if (
                         doc_id in still_internal
                         and set_id in nodeset_ids
-                        and "document" in str(node_by_id[doc_id].get("type", "")).lower()
+                        and _is_document_node_type(node_by_id[doc_id].get("type", ""))
                     ):
                         collapse_into.setdefault(doc_id, set_id)
         for doc_id, set_id in collapse_into.items():
@@ -733,8 +855,9 @@ def fallback_graph(
 class KnowledgeMesh:
     """Reads the real knowledge graph through a Cognee gateway."""
 
-    def __init__(self, gateway: Any) -> None:
+    def __init__(self, gateway: Any, *, lifecycle_store: Any | None = None) -> None:
         self.gateway = gateway
+        self.lifecycle_store = lifecycle_store
 
     async def graph(
         self,
@@ -756,8 +879,8 @@ class KnowledgeMesh:
         may not read are stripped — no node tag, no hub, no belongs_to edge.
         ``total_nodes``/``total_edges`` keep the raw org-wide counts while
         ``visible_nodes`` reports the caller-scoped count so the UI can be
-        honest. ``None`` applies no filtering (bypass/admin callers) and keeps
-        the exact unfiltered behavior.
+        honest. ``None`` skips ADR-0009 dataset filtering for bypass callers;
+        lifecycle current-head filtering still applies.
 
         ``dataset`` narrows the view to one dataset's subgraph using the SAME
         layered inclusion the visibility pass runs (documents, their chunks,
@@ -794,6 +917,168 @@ class KnowledgeMesh:
             )
         raw_nodes = list(raw_nodes)
         raw_edges = list(raw_edges)
+        total_nodes = len(raw_nodes)
+        total_edges = len(raw_edges)
+        lifecycle_removed_ids: set[str] = set()
+        if self.lifecycle_store is not None:
+            status_reader = getattr(self.lifecycle_store, "source_revision_statuses", None)
+            try:
+                if not callable(status_reader):
+                    raise AttributeError("source_revision_statuses is unavailable")
+                source_statuses = await asyncio.to_thread(status_reader)
+                if not isinstance(source_statuses, Mapping):
+                    raise TypeError("source_revision_statuses must return a mapping")
+                lifecycle_statuses: dict[str, bool] = {}
+                for source_id, is_current in source_statuses.items():
+                    if (
+                        not isinstance(source_id, str)
+                        or not source_id
+                        or not isinstance(is_current, bool)
+                    ):
+                        raise ValueError("invalid lifecycle source revision status")
+                    lifecycle_statuses[source_id] = is_current
+            except Exception as exc:
+                logger.warning(
+                    "Knowledge mesh lifecycle status read failed with %s; "
+                    "returning a fail-closed graph",
+                    exc.__class__.__name__,
+                )
+                return fallback_graph(
+                    f"lifecycle_status_error:{exc.__class__.__name__}", presence
+                )
+
+            stale_ids = {
+                source_id
+                for source_id, is_current in lifecycle_statuses.items()
+                if not is_current
+            }
+            if stale_ids:
+                chunk_ids: set[str] = set()
+                unmanaged_document_ids: set[str] = set()
+                raw_node_ids = {
+                    node_id for raw in raw_nodes if (node_id := _raw_id(raw)) is not None
+                }
+                adjacency: dict[str, set[str]] = {}
+                for raw in raw_edges:
+                    try:
+                        str(raw[2])
+                    except (TypeError, IndexError, KeyError):
+                        continue
+                    endpoints = _raw_endpoints(raw)
+                    if endpoints is None:
+                        continue
+                    source_id, target_id = endpoints
+                    if source_id not in raw_node_ids or target_id not in raw_node_ids:
+                        continue
+                    adjacency.setdefault(source_id, set()).add(target_id)
+                    adjacency.setdefault(target_id, set()).add(source_id)
+                for raw in raw_nodes:
+                    node_id = _raw_id(raw)
+                    if node_id is None:
+                        continue
+                    try:
+                        properties = raw[1]
+                    except (TypeError, IndexError, KeyError):
+                        properties = {}
+                    if not isinstance(properties, dict):
+                        properties = {}
+                    node_type = _node_type(properties).lower()
+                    if "chunk" in node_type or (
+                        not _is_document_node_type(node_type)
+                        and any(
+                            isinstance(properties.get(key), str)
+                            and properties[key].strip()
+                            for key in ("text", "chunk", "content", "raw_content")
+                        )
+                    ):
+                        chunk_ids.add(node_id)
+                    elif _is_document_node_type(node_type) and node_id not in lifecycle_statuses:
+                        unmanaged_document_ids.add(node_id)
+
+                lifecycle_removed_ids = set(stale_ids)
+                for raw in raw_edges:
+                    endpoints = _raw_endpoints(raw)
+                    try:
+                        relationship = str(raw[2])
+                    except (TypeError, IndexError, KeyError):
+                        continue
+                    if endpoints is None or relationship != "is_part_of":
+                        continue
+                    source_id, target_id = endpoints
+                    if (
+                        source_id in stale_ids
+                        and (
+                            source_id not in chunk_ids
+                            or target_id in chunk_ids
+                        )
+                    ):
+                        lifecycle_removed_ids.add(target_id)
+                    if (
+                        target_id in stale_ids
+                        and (
+                            target_id not in chunk_ids
+                            or source_id in chunk_ids
+                        )
+                    ):
+                        lifecycle_removed_ids.add(source_id)
+
+                affected_component_ids: set[str] = set()
+                pending = [source_id for source_id in stale_ids if source_id in raw_node_ids]
+                while pending:
+                    node_id = pending.pop()
+                    if node_id in affected_component_ids:
+                        continue
+                    affected_component_ids.add(node_id)
+                    pending.extend(
+                        neighbor
+                        for neighbor in adjacency.get(node_id, ())
+                        if neighbor not in affected_component_ids
+                    )
+
+                current_ids = {
+                    source_id
+                    for source_id, is_current in lifecycle_statuses.items()
+                    if is_current and source_id in raw_node_ids
+                } | unmanaged_document_ids
+                reachable_current_ids: set[str] = set()
+                pending = [
+                    source_id
+                    for source_id in current_ids
+                    if source_id not in lifecycle_removed_ids
+                ]
+                while pending:
+                    node_id = pending.pop()
+                    if node_id in reachable_current_ids or node_id in lifecycle_removed_ids:
+                        continue
+                    reachable_current_ids.add(node_id)
+                    pending.extend(
+                        neighbor
+                        for neighbor in adjacency.get(node_id, ())
+                        if neighbor not in reachable_current_ids
+                        and neighbor not in lifecycle_removed_ids
+                    )
+                lifecycle_removed_ids.update(
+                    node_id
+                    for node_id in affected_component_ids
+                    if node_id not in reachable_current_ids
+                )
+                raw_nodes = [
+                    raw
+                    for raw in raw_nodes
+                    if _raw_id(raw) not in lifecycle_removed_ids
+                ]
+                raw_edges = [
+                    raw
+                    for raw in raw_edges
+                    if (
+                        (endpoints := _raw_endpoints(raw)) is None
+                        or (
+                            endpoints[0] not in lifecycle_removed_ids
+                            and endpoints[1] not in lifecycle_removed_ids
+                        )
+                    )
+                ]
+
         dataset_map: dict[str, list[str]] = {}
         node_dataset_map = getattr(self.gateway, "node_dataset_map", None)
         if callable(node_dataset_map):
@@ -806,6 +1091,12 @@ class KnowledgeMesh:
                     exc.__class__.__name__,
                 )
                 dataset_map = {}
+        if lifecycle_removed_ids:
+            dataset_map = {
+                node_id: names
+                for node_id, names in dataset_map.items()
+                if node_id not in lifecycle_removed_ids
+            }
         if presence:
             # Fill presence document counts from the RAW map, before caller
             # scoping strips hidden names: contribution counts are presence
@@ -818,13 +1109,11 @@ class KnowledgeMesh:
                 {**entry, "documents": counts.get(str(entry.get("dataset")), 0)}
                 for entry in presence
             ]
-        if not raw_nodes:
+        if not raw_nodes and total_nodes == 0:
             # ADR-0009: seats are ALWAYS visible — the empty-graph fallback
             # still renders presence hubs, with document counts from the
             # dataset map read above (0 when nothing is mapped).
             return fallback_graph("graph_empty", presence)
-        total_nodes = len(raw_nodes)
-        total_edges = len(raw_edges)
         visible_nodes: int | None = None
         if dataset_visible is not None:
             # ADR-0009 scoping is pure Python over already-materialized tuples/
@@ -873,6 +1162,7 @@ class KnowledgeMesh:
             ]
             if visible_nodes is not None:
                 visible_nodes = len(raw_nodes)
+        priority_ids: set[str] = set()
         if seat_first:
             # Seat-first ordering pre-cap: the caller's own cluster (same
             # layered inclusion) moves ahead of the enumeration tail. Pure
@@ -898,13 +1188,17 @@ class KnowledgeMesh:
                 limit=limit,
                 dataset_map=dataset_map,
                 presence=presence,
+                preferred_ids=priority_ids,
                 collapse_orphan_documents=collapse_orphans,
             )
         )
+        if dataset_visible is not None or self.lifecycle_store is not None:
+            # Totals remain raw graph counts, including rows removed from the
+            # caller-facing lifecycle projection.
+            payload["total_nodes"] = total_nodes
+            payload["total_edges"] = total_edges
         if dataset_visible is not None:
             # Raw org-wide totals stay honest about what exists; the caller's
             # scope is reported separately.
-            payload["total_nodes"] = total_nodes
-            payload["total_edges"] = total_edges
             payload["visible_nodes"] = visible_nodes
         return {"ok": True, "fallback": False, **payload}
