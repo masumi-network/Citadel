@@ -568,6 +568,108 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     assert "Not reported by this node yet" in app_js and "Unavailable" in app_js, (
         "a failed fetch and an absent field must render different reasons"
     )
+ 
+def test_feedback_retry_key_exercises_payload_and_outcome_transitions() -> None:
+    """Run the feedback key state machine through retries and terminal outcomes."""
+    import re
+    import subprocess
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    helpers = re.search(
+        r"function feedbackRequestState\(.*?\n\}\n\nfunction feedbackRequestCompletion\(.*?\n\}",
+        app_js,
+        re.DOTALL,
+    )
+    assert helpers, "feedback key helpers moved"
+    script = (
+        helpers.group(0)
+        + r"""
+let nextKey = 0;
+const makeKey = () => `key-${++nextKey}`;
+const firstPayload = { qa_id: "qa-1", score: 1, text: null, dataset: null, session_id: null };
+const changedPayload = { ...firstPayload, score: -1 };
+let state = { key: null, payload: null };
+
+let first = feedbackRequestState(state, firstPayload, makeKey);
+if (first.request.idempotency_key !== "key-1") process.exit(1);
+state = feedbackRequestCompletion(first.state, "uncertain");
+let retry = feedbackRequestState(state, firstPayload, makeKey);
+if (retry.request.idempotency_key !== "key-1") process.exit(2);
+let changed = feedbackRequestState(state, changedPayload, makeKey);
+if (changed.request.idempotency_key !== "key-2") process.exit(3);
+state = feedbackRequestCompletion(changed.state, "conflict");
+if (state.key !== null || state.payload !== null) process.exit(4);
+let accepted = feedbackRequestState(state, changedPayload, makeKey);
+if (accepted.request.idempotency_key !== "key-3") process.exit(5);
+state = feedbackRequestCompletion(accepted.state, "accepted");
+if (state.key !== null || state.payload !== null) process.exit(6);
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=commonjs", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+ 
+    assert 'body: JSON.stringify(prepared.request)' in app_js
+    assert 'feedbackRequestCompletion(prepared.state, "accepted")' in app_js
+    assert 'err.status === 409 ? "conflict" : "uncertain"' in app_js
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_ingest_uses_the_payload_bound_retry_safe_key() -> None:
+    """Ingest must reuse one key across retries of a payload, never mint per attempt."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    handler = re.search(
+        r'getElementById\("ingestForm"\)\.addEventListener\("submit".*?\n\}\);',
+        app_js,
+        re.DOTALL,
+    )
+    assert handler, "ingest submit handler moved"
+    body = handler.group(0)
+    # The per-attempt UUID is gone; the payload-bound helper drives the key.
+    assert "crypto.randomUUID()" not in body
+    assert "feedbackRequestState(" in body
+    assert "pendingIngestKey" in body and "pendingIngestPayload" in body
+    assert "body: JSON.stringify(prepared.request)" in body
+    assert 'feedbackRequestCompletion(prepared.state, "accepted")' in body
+    assert 'err.status === 409 ? "conflict" : "uncertain"' in body
+
+def test_connected_feed_count_uses_every_source_from_api() -> None:
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "const sourceRows = (state.sources || []).map" in app_js
+    assert 'github_repo_content: "GitHub repository content"' in app_js
+    assert 'linear: "Linear workspace"' in app_js
+    assert "state.sourceSummary = payload.summary || {}" in app_js
+    assert "renderKnowledgeSources();" in app_js
+
+
+def test_graph_enables_node_drag_and_canvas_pan() -> None:
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert ".enableNodeDrag(true)" in app_js
+    assert ".enablePanInteraction(true)" in app_js
+
+
+def test_graph_connections_use_full_caller_scoped_payload() -> None:
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    neighbors = re.search(
+        r"function knowledgeNeighbors\(nodeId\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+
+    assert neighbors
+    body = neighbors.group(1)
+    assert "state.realGraph" in body
+    assert "graph.instance?.graphData?.()" in body
+    assert "connected.has(node.id)" in app_js
+    assert 'relationship === "contains" || relationship === "is_part_of"' in app_js
+
 
 
 def test_event_graph_focus_matches_exact_source_identity() -> None:
@@ -678,6 +780,88 @@ def test_graph_aggregate_toggle_writes_state() -> None:
     )
 
 
+def test_graph_search_indexes_full_knowledge_graph_not_rendered_projection() -> None:
+    """Knowledge search must retain documents hidden by aggregation."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    matching = re.search(
+        r"function matchingGraphNodes\(query\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert matching, "matchingGraphNodes() not found in kb/static/app.js"
+    body = matching.group(1)
+
+    assert "renderedGraphNodes()" not in body, (
+        "graph search is indexed from the rendered aggregation, so hidden "
+        "documents cannot be selected"
+    )
+    assert re.search(r"state\.realGraph|activeGraphData\(\)", body), (
+        "graph search has no full caller-scoped graph source"
+    )
+
+
+def test_graph_search_selection_keeps_document_inspector_states() -> None:
+    """Selecting a hidden document must use the existing inspector load path."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    chooser = re.search(
+        r"function chooseGraphNodeMatch\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert chooser, "chooseGraphNodeMatch() not found in kb/static/app.js"
+    assert "handleNodeClick(node)" in chooser.group(1), (
+        "graph search selection bypasses the canonical node-click path"
+    )
+
+    handler = re.search(
+        r"function handleNodeClick\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert handler, "handleNodeClick() not found in kb/static/app.js"
+    handler_body = handler.group(1)
+    assert "selectNode(" in handler_body, (
+        "hidden full-graph nodes bypass the canonical selection path"
+    )
+    assert re.search(r"state\.realGraph|activeGraphData\(\)", handler_body), (
+        "selection has no full caller-scoped graph source for hidden nodes"
+    )
+
+
+    selection = re.search(
+        r"function selectNode\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert selection, "selectNode() not found in kb/static/app.js"
+    assert "renderKnowledgeInspector(node)" in selection.group(1), (
+        "knowledge-node selection no longer renders the graph inspector"
+    )
+    assert "loadNodeDocument(node)" in selection.group(1), (
+        "knowledge-node selection bypasses document loading"
+    )
+
+    loader = re.search(
+        r"async function loadNodeDocument\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert loader, "loadNodeDocument() not found in kb/static/app.js"
+    body = loader.group(1)
+    assert "documentCandidates(node)" in body, (
+        "the inspector does not resolve the selected node to source documents"
+    )
+    assert "/api/documents/" in body, (
+        "the inspector no longer loads the selected source document"
+    )
+
+    assert "Loading document text" in body, "document loading state was removed"
+    assert "Could not load document text" in body, (
+        "document request failures lost their typed error state"
+    )
+    assert "No document reachable from this node in the loaded graph." in body, (
+        "missing graph-document links lost their typed empty state"
+    )
+    assert "No document text stored for this node." in body, (
+        "missing document text lost its typed empty state"
+    )
+
+
 def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
     """Seat-visibility contract with the backend: GET /api/mesh/graph gains an
     optional dataset=<name> query param (server filters pre-cap, response
@@ -711,22 +895,35 @@ def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
 
 
 def test_graph_pointer_area_floors_small_node_hit_radius() -> None:
-    """nodeVal spans 2-9 with nodeRelSize 4, which is a 1-3 screen-px target
-    for low-degree entities at the fit-out zoom of a ~1000-node mesh —
-    visible but effectively unclickable. Pin the shadow-canvas pointer paint
-    and its zoom-compensated screen-space floor."""
+    """Small nodes need a 12 px screen-space hit radius without changing paint."""
+    import re
+
     app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
-    assert "nodePointerAreaPaint" in app_js, (
-        "no pointer-area override; tiny nodes stay unclickable at fit-out zoom"
+    minimum = re.search(r"const MIN_NODE_HIT_RADIUS_PX\s*=\s*(\d+)", app_js)
+    assert minimum, "the pointer area has no numeric minimum radius"
+    assert int(minimum.group(1)) >= 12, (
+        "the pointer hit-area floor must be at least 12 screen px"
     )
-    assert "MIN_NODE_HIT_RADIUS_PX" in app_js, (
-        "the pointer area has no named minimum radius"
+
+    assert ".nodeRelSize(NODE_REL_SIZE)" in app_js, (
+        "the painted node size no longer uses NODE_REL_SIZE"
     )
-    assert "MIN_NODE_HIT_RADIUS_PX / (globalScale || 1)" in app_js, (
-        "the hit-radius floor must be screen-space (divided by the zoom scale), "
-        "or it shrinks with the same fit-out zoom that caused the defect"
+    pointer = re.search(
+        r"\.nodePointerAreaPaint\(\(node, color, ctx, globalScale\) => \{(.*?)\n\s*\}\)",
+        app_js,
+        re.DOTALL,
     )
+    assert pointer, "nodePointerAreaPaint() is not wired"
+    body = pointer.group(1)
+    assert (
+        "const painted = NODE_REL_SIZE * Math.sqrt(Math.max(nodeValue(node), 0));"
+        in body
+    ), "the pointer paint no longer preserves the painted node-size calculation"
+    assert (
+        "const radius = Math.max(painted, MIN_NODE_HIT_RADIUS_PX / (globalScale || 1));"
+        in body
+    ), "the pointer paint does not floor the hit area in screen space"
 
 
 def test_graph_depth_control_is_gone() -> None:
@@ -794,6 +991,9 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
         "the other-endpoint kind filter is gone; Entity->Entity contains edges "
         "(32 in the live payload) would count as sourcing chunks"
     )
+    assert "edge.target !== node.id" in sourcing.group(1), (
+        "only directed chunk-to-entity contains edges prove source provenance"
+    )
     assert ".sort((a, b) => b.count - a.count)" in sourcing.group(1), (
         "the sourcing-count ranking is gone; the digest that name-drops a node "
         "once would tie with the document actually about it"
@@ -815,3 +1015,6 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
     assert "Nearest document in view — not a direct source" in app_js, (
         "the nearest-walk fallback must label itself as not being provenance"
     )
+    assert "Linear workspace sync" in app_js
+    assert "if (broadDigest)" in app_js
+    assert "broadDigestFallback" not in app_js
