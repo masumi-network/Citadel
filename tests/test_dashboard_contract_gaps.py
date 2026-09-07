@@ -618,6 +618,26 @@ if (state.key !== null || state.payload !== null) process.exit(6);
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_ingest_uses_the_payload_bound_retry_safe_key() -> None:
+    """Ingest must reuse one key across retries of a payload, never mint per attempt."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    handler = re.search(
+        r'getElementById\("ingestForm"\)\.addEventListener\("submit".*?\n\}\);',
+        app_js,
+        re.DOTALL,
+    )
+    assert handler, "ingest submit handler moved"
+    body = handler.group(0)
+    # The per-attempt UUID is gone; the payload-bound helper drives the key.
+    assert "crypto.randomUUID()" not in body
+    assert "feedbackRequestState(" in body
+    assert "pendingIngestKey" in body and "pendingIngestPayload" in body
+    assert "body: JSON.stringify(prepared.request)" in body
+    assert 'feedbackRequestCompletion(prepared.state, "accepted")' in body
+    assert 'err.status === 409 ? "conflict" : "uncertain"' in body
+
 def test_connected_feed_count_uses_every_source_from_api() -> None:
     app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 

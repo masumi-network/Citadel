@@ -5030,6 +5030,9 @@ document.getElementById("accessTokenForm").addEventListener("submit", async (eve
   }
 });
 
+let pendingIngestKey = null;
+let pendingIngestPayload = null;
+
 document.getElementById("ingestForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -5050,19 +5053,34 @@ document.getElementById("ingestForm").addEventListener("submit", async (event) =
     return;
   }
   setBusy(button, true, { idle: "Save to vault", loading: "Indexing" });
+  const ingestPayload = {
+    data,
+    dataset: String(formData.get("dataset") || "").trim() || null,
+    tags,
+  };
+  const prepared = feedbackRequestState(
+    { key: pendingIngestKey, payload: pendingIngestPayload },
+    ingestPayload,
+  );
+  pendingIngestKey = prepared.state.key;
+  pendingIngestPayload = prepared.state.payload;
   try {
     await api("/ingest", {
       method: "POST",
-      body: JSON.stringify({
-        data,
-        dataset: String(formData.get("dataset") || "").trim() || null,
-        tags,
-        idempotency_key: crypto.randomUUID(),
-      }),
+      body: JSON.stringify(prepared.request),
     });
+    const completed = feedbackRequestCompletion(prepared.state, "accepted");
+    pendingIngestKey = completed.key;
+    pendingIngestPayload = completed.payload;
     form.querySelector("[name='data']").value = "";
     await loadMesh(false);
   } catch (err) {
+    const completed = feedbackRequestCompletion(
+      prepared.state,
+      err.status === 409 ? "conflict" : "uncertain",
+    );
+    pendingIngestKey = completed.key;
+    pendingIngestPayload = completed.payload;
     error.textContent = err.message;
   } finally {
     setBusy(button, false, { idle: "Save to vault", loading: "Indexing" });
