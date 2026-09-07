@@ -5,7 +5,8 @@
   "description": "Build-time toolchain for the browser side of Citadel. Two things live here: the legacy esbuild bundle for the React Flow diagram on the hand-written / page (kb/static/vendor/, committed), and the Next.js app in web/ (exported to kb/webui/, committed). Neither runs in CI or on Railway; both ship as static files. See docs/web-bundle.md.",
   "type": "module",
   "workspaces": [
-    "web"
+    "web",
+    "packages/citadel-cli"
   ],
   "scripts": {
     "build:flow": "node scripts/build-flow.mjs",
