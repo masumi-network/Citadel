@@ -1071,3 +1071,25 @@ def test_pre_push_check_distinguishes_no_git_repo(tmp_path: Path) -> None:
     assert "no git repo" in hook.detail
     assert str(tmp_path) in hook.detail
     assert hook.data["git_repo"] is False
+
+
+def test_feedback_node_posts_only_provided_fields(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_open(request: Any, timeout: float | None = None) -> _FakeResp:
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["auth"] = request.headers.get("Authorization")
+        captured["body"] = json.loads(request.data.decode())
+        return _FakeResp({"recorded": True, "improved": False, "ok": True})
+
+    monkeypatch.setattr(status_mod._OPENER, "open", fake_open)
+    result = status_mod.feedback_node(
+        "https://node.example", "ctdl_tok", qa_id="qa-1", score=1
+    )
+    assert result["recorded"] is True
+    assert captured["url"] == "https://node.example/feedback"
+    assert captured["method"] == "POST"
+    assert captured["auth"] == "Bearer ctdl_tok"
+    # Omitted fields are ABSENT from the body (personal-by-default), not null.
+    assert captured["body"] == {"qa_id": "qa-1", "score": 1}

@@ -611,6 +611,48 @@ def ingest_node(
     )
 
 
+def feedback_node(
+    base_url: str,
+    token: str,
+    *,
+    qa_id: str | None = None,
+    result_id: str | None = None,
+    score: int | None = None,
+    text: str | None = None,
+    session_id: str | None = None,
+    dataset: str | None = None,
+    timeout: float = _INGEST_TIMEOUT,
+) -> dict[str, Any]:
+    """POST feedback to the Node's /feedback (the route MCP citadel_record_feedback uses).
+
+    Omitting ``dataset`` and ``session_id`` lets the seat token resolve the write
+    to its own Node and default session (personal-by-default), mirroring
+    ``ingest_node``. The Node still refuses a seat write to a mismatched
+    ``dataset`` or a session the caller does not own (403), so pass them only for
+    a deliberate non-default target.
+    """
+    payload: dict[str, Any] = {}
+    if qa_id:
+        payload["qa_id"] = qa_id
+    if result_id:
+        payload["result_id"] = result_id
+    if score is not None:
+        payload["score"] = score
+    if text:
+        payload["text"] = text
+    if session_id:
+        payload["session_id"] = session_id
+    if dataset:
+        payload["dataset"] = dataset
+    return _request(
+        "POST",
+        f"{base_url.rstrip('/')}/feedback",
+        token=token,
+        payload=payload,
+        timeout=timeout,
+    )
+
+
 def fetch_operation(
     base_url: str,
     token: str,
