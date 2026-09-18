@@ -11,7 +11,7 @@ from kb.conflicts import KnowledgeConflictStore
 from kb.learning import LearningProcess
 from kb.llm_enrichment import EnrichedChunk, EnrichmentOutcome
 from kb.lifecycle import lifecycle_chunk_source_key
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import IngestResult
 
 
