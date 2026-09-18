@@ -3750,13 +3750,22 @@ def with_result_metadata(
     # a full Repository/Source/Commit/Blob header the repo-content syncer wrote,
     # which a text collision cannot fake, so it keeps its own identity.
     #
+    # Dual-written Node copies also carry a durable `Author-Seat:` line stamped
+    # by `force_shared_trace_author_seat` at share time. Prefer that over the
+    # query-scoped text marker so the same `(result_id, content_sha256)` keeps a
+    # stable trust_tier whether or not session-traces were in this recall set
+    # (#249). Elevating trust is still impossible: Author-Seat only demotes.
+    #
     # ADR-0017 applied that exception to `doc_type` but left `trust` demoted
     # unconditionally, so Central documentation still came back labelled as a
     # trace's trust tier. This finishes it: the exception now governs both.
     preview = {**normalized, "_citadel": metadata}
     inferred = infer_doc_type(preview)
     source_linked = inferred == DOC_TYPE_CANONICAL
-    if dataset == SESSION_TRACES_DATASET or (shared_trace and not source_linked):
+    durable_shared_trace = bool(_trace_author_seat(normalized))
+    if dataset == SESSION_TRACES_DATASET or (
+        (shared_trace or durable_shared_trace) and not source_linked
+    ):
         metadata["trust"] = "reference-only"
         author_seat = _trace_author_seat(normalized)
         if author_seat:
