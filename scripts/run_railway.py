@@ -25,12 +25,14 @@ Modes (via ``CITADEL_RUN_MODE``):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
 from collections.abc import Awaitable, Sequence
-from typing import Callable
+from typing import Any, Callable
 
+from kb.feedback_store import FeedbackStore, process_feedback_events
 from scripts.stage_loop import run_async, stage_loop
 
 logger = logging.getLogger("citadel.pipeline")
@@ -229,6 +231,30 @@ async def _promotion_stage_async() -> int:
     return 1 if failures else 0
 
 
+
+async def _feedback_stage_async() -> int:
+    """Process one bounded batch of durable feedback decisions."""
+    from kb.service import Citadel
+
+    citadel = Citadel.from_env()
+    lifecycle = getattr(citadel, "lifecycle_store", None)
+
+    def process() -> Any:
+        return process_feedback_events(
+            FeedbackStore(citadel.config.feedback_store_path),
+            lifecycle,
+            limit=100,
+        )
+
+    result = await asyncio.to_thread(process)
+    logger.info("Feedback stage finished: decisions=%s", result.processed_count)
+    return 0
+
+
+def _feedback_stage() -> int:
+    return run_async(_feedback_stage_async())
+
+
 def _promotion_stage() -> int:
     return run_async(_promotion_stage_async())
 
@@ -317,11 +343,9 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
     """(name, enabled, runner) for the 6h evolve cron, in execution order.
 
     Mirrors :func:`pipeline_stages` (per-stage env toggles) but chains the
-    self-evolving cycle: github sync -> repo-content sync -> self-improve ->
-    promotion -> linear sync -> cognify. The 6h cadence is an operator
-    Railway-cron / in-process scheduler step, not code. Each stage carries its own
-    ``CITADEL_EVOLVE_*`` toggle so an operator can disable any link without
-    touching the others.
+    unbarriered source cycle: github sync -> repo-content sync -> self-improve ->
+    promotion -> linear sync -> cognify. Feedback runs only in the web scheduler
+    after its projection barrier.
     """
     return [
         (
@@ -360,10 +384,9 @@ def evolve_stages() -> list[tuple[str, bool, Callable[[], int]]]:
 def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]]:
     """The evolve stages as awaitables, for running inside the web loop (#88).
 
-    Mirrors :func:`evolve_stages` name-for-name and toggle-for-toggle;
-    ``test_evolve_stage_lists_stay_in_sync`` pins that. ``cognify`` is absent on
-    purpose: the scheduler runs it itself afterwards as Phase 2, which is what
-    the old subprocess expressed by setting CITADEL_EVOLVE_COGNIFY_ENABLED=false.
+    The in-loop list includes the bounded feedback stage because the web
+    scheduler invokes it only after the projection barrier. Standalone evolve
+    uses the sync list above and does not include feedback.
     """
     return [
         (
@@ -385,6 +408,11 @@ def evolve_stages_async() -> list[tuple[str, bool, Callable[[], Awaitable[int]]]
             "promotion",
             _bool(os.getenv("CITADEL_EVOLVE_PROMOTION_ENABLED"), default=True),
             _promotion_stage_async,
+        ),
+        (
+            "feedback",
+            True,
+            _feedback_stage_async,
         ),
         (
             "linear_sync",

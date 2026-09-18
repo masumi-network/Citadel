@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import threading
 import logging
 import tempfile
 import time
@@ -2984,7 +2985,41 @@ def test_feedback_rejects_dataset_outside_token_allowlist(tmp_path: Any) -> None
 
 
 
+def test_feedback_endpoint_records_one_durable_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
 
+    from kb.feedback_store import FeedbackStore
+    from kb.service import Citadel
+
+    class Cognee:
+        async def add_feedback(self, **kwargs: Any) -> bool:
+            del kwargs
+            return True
+
+    client = authed_client()
+    config = replace(
+        FakeCitadel.config,
+        feedback_store_path=str(tmp_path / "feedback.sqlite3"),
+    )
+    app.state.citadel = Citadel(config, cognee=Cognee())  # type: ignore[arg-type]
+    calls: list[dict[str, Any]] = []
+    original_record_event = FeedbackStore.record_event
+
+    def record_event_once(self: FeedbackStore, event: Any) -> str:
+        calls.append(dict(event))
+        return original_record_event(self, event)
+
+    monkeypatch.setattr(FeedbackStore, "record_event", record_event_once)
+    response = client.post(
+        "/feedback",
+        json={"qa_id": "search:once", "result_id": "result:once", "score": 1},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
 
 def test_feedback_rejects_oversized_text(tmp_path: Any) -> None:
     # FeedbackBody.text carries no max_length; the durable-write path needs the
@@ -7400,14 +7435,14 @@ async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
     assert [(event[0], event[1]) for event in events] == [
         ("stages", ("github_sync", "repo_content_sync", "linear_sync")),
         ("barrier", ("source-job",)),
-        ("stages", ("self_improve", "promotion")),
+        ("stages", ("self_improve", "promotion", "feedback")),
         ("barrier", ("post-stage-job",)),
         ("completed", True),
         ("resume", True),
     ]
     assert [event[1] for event in stage_events] == [
         ("github_sync", "repo_content_sync", "linear_sync"),
-        ("self_improve", "promotion"),
+        ("self_improve", "promotion", "feedback"),
     ]
     assert stage_events[0][2] == stage_events[1][2]
     assert [event[1] for event in barrier_events] == [
@@ -7419,17 +7454,123 @@ async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
 
 
 @pytest.mark.asyncio
+async def test_feedback_stage_processes_one_bounded_batch_after_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from kb.feedback_store import FeedbackStore
+    from kb.service import Citadel
+    import scripts.run_railway as run_railway
+
+    path = tmp_path / "feedback.sqlite3"
+    feedback = FeedbackStore(path)
+    event_id = feedback.record_event(
+        {
+            "kind": "implicit_search",
+            "search_id": "search:stage",
+            "result_id": "result:stage",
+            "actor_id": "actor:stage",
+            "dataset": "seat:canary",
+            "score": 0.1,
+        }
+    )
+    citadel = SimpleNamespace(
+        config=SimpleNamespace(feedback_store_path=str(path)),
+        lifecycle_store=SimpleNamespace(),
+    )
+    monkeypatch.setattr(Citadel, "from_env", classmethod(lambda cls: citadel))
+
+    code = await run_railway._feedback_stage_async()
+
+    assert code == 0
+    assert feedback.list_unprocessed() == ()
+    decision = feedback.list_decisions()[0]
+    assert decision.event_id == event_id
+    assert decision.decision == "no_action"
+
+
+@pytest.mark.asyncio
+async def test_feedback_stage_detaches_locked_store_from_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.run_railway as run_railway
+    from kb.service import Citadel
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class LockedStore:
+        def __init__(self, path: str) -> None:
+            del path
+            started.set()
+            release.wait(timeout=1)
+
+    def process(store: Any, lifecycle: Any, *, limit: int) -> Any:
+        del store, lifecycle
+        assert limit == 100
+        return SimpleNamespace(processed_count=0)
+
+    citadel = SimpleNamespace(
+        config=SimpleNamespace(feedback_store_path=str(tmp_path / "feedback.sqlite3")),
+        lifecycle_store=SimpleNamespace(),
+    )
+    monkeypatch.setattr(Citadel, "from_env", classmethod(lambda cls: citadel))
+    monkeypatch.setattr(run_railway, "FeedbackStore", LockedStore, raising=False)
+    monkeypatch.setattr(run_railway, "process_feedback_events", process, raising=False)
+
+    task = asyncio.create_task(run_railway._feedback_stage_async())
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert started.is_set()
+    release.set()
+    assert await task == 0
+
 
 
 
 @pytest.mark.asyncio
+async def test_feedback_stage_processes_when_lifecycle_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from kb.feedback_store import FeedbackStore
+    from kb.service import Citadel
+    import scripts.run_railway as run_railway
 
+    path = tmp_path / "feedback.sqlite3"
+    store = FeedbackStore(path)
+    event_id = store.record_event(
+        {
+            "kind": "explicit_feedback",
+            "search_id": "search:disabled",
+            "result_id": "result:disabled",
+            "actor_id": "actor:disabled",
+            "dataset": "seat:canary",
+            "score": 1,
+        }
+    )
+    telemetry_id = store.record_event(
+        {
+            "kind": "implicit_search",
+            "search_id": "search:telemetry",
+            "result_id": "result:telemetry",
+            "actor_id": "actor:disabled",
+            "dataset": "seat:canary",
+            "score": 0.1,
+        }
+    )
+    citadel = SimpleNamespace(
+        config=SimpleNamespace(feedback_store_path=str(path)),
+        lifecycle_store=None,
+    )
+    monkeypatch.setattr(Citadel, "from_env", classmethod(lambda cls: citadel))
 
+    assert await run_railway._feedback_stage_async() == 0
 
-
-
-@pytest.mark.asyncio
-
+    decisions = {item.event_id: item.decision for item in store.list_decisions()}
+    assert decisions[event_id] == "ranking_eval_candidate"
+    assert decisions[telemetry_id] == "no_action"
 
 
 @pytest.mark.asyncio
