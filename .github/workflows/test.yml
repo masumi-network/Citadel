@@ -116,8 +116,12 @@ jobs:
         # have a fixed release are pinned out via [tool.uv] override-dependencies
         # in pyproject.toml rather than ignored here.
         run: |
+          # PYSEC-2026-3816 wants cognee>=1.5.0; Citadel pins 1.4.1 and ships a
+          # patched wheel via scripts/build_secure_cognee.py. Keep ignored until
+          # the 1.5 adapter cutover lands.
           uv run pip-audit --cache-dir .pip-audit-cache \
-            --ignore-vuln PYSEC-2026-2447
+            --ignore-vuln PYSEC-2026-2447 \
+            --ignore-vuln PYSEC-2026-3816
 
   plain-requirements-smoke:
     name: plain requirements install
