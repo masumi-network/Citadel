@@ -10188,7 +10188,7 @@ def test_contact_is_stored_when_the_gateway_is_unconfigured(monkeypatch, tmp_pat
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True, "stored": True}
+    assert response.json() == {"delivered": False, "stored": True}
     saved = store.recent()
     assert len(saved) == 1
     assert saved[0]["name"] == "Ada Lovelace"
@@ -10233,7 +10233,7 @@ def test_contact_is_kept_when_chat_delivery_fails(monkeypatch, tmp_path) -> None
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True, "stored": True}
+    assert response.json() == {"delivered": False, "stored": True}
     assert len(store.recent()) == 1
 
 

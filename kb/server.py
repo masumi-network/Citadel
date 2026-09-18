@@ -4281,7 +4281,9 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
     if gateway is None:
         if stored:
             logger.info("Partner contact stored from %s (no Chat gateway configured)", client_ip)
-            return {"delivered": True, "stored": True}
+            # Stored is not delivered. Lying with delivered:true hid that no
+            # gateway was configured (#151).
+            return {"delivered": False, "stored": True}
         raise HTTPException(
             status_code=503,
             detail="The contact channel is not configured on this node. Please email us instead.",
@@ -4300,8 +4302,9 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
         logger.exception("Partner contact delivery failed")
         if stored:
             # Chat is down but the enquiry is on disk, so it is not lost and the
-            # sender should not be told to try again and send it twice.
-            return {"delivered": True, "stored": True}
+            # sender should not be told to try again and send it twice. Still
+            # report delivered:false — stored ≠ delivered (#151).
+            return {"delivered": False, "stored": True}
         raise HTTPException(
             status_code=502,
             detail="We could not deliver that right now. Please email us instead.",
