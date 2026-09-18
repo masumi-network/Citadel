@@ -2132,3 +2132,290 @@ def test_mcp_install_help_contains_add_help(capsys) -> None:
     out = capsys.readouterr().out
     assert "add (install)" in out
     assert "Add Citadel MCP to a tool" in out
+
+
+# ---- field-report fixes: update fallback, feedback HTTP, mcp scope/show, status exit ----
+
+
+def test_update_pipx_upgrade_falls_back_to_pypi_reinstall(monkeypatch, capsys) -> None:
+    from kb.cli import _update
+
+    wired: list[str] = []
+    calls: list[list[str]] = []
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "upgrade" in cmd:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Unable to parse package spec: /gone/Citadel Archive",
+            )
+        return SimpleNamespace(
+            returncode=0, stdout="installed package citadel-archive 0.5.2", stderr=""
+        )
+
+    monkeypatch.setattr("kb.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("kb.cli._wire_write_tier_tools", lambda url: wired.append(url) or ([], []))
+    monkeypatch.setattr("kb.cli._refresh_skills_pack", lambda: None)
+    rc = asyncio.run(_update(argparse.Namespace()))
+    assert rc == 0
+    assert calls[0][:2] == ["/usr/bin/pipx", "upgrade"]
+    assert calls[1][:3] == ["/usr/bin/pipx", "install", "--force"]
+    assert "installed package citadel-archive 0.5.2" in capsys.readouterr().out
+    assert wired == [DEFAULT_NODE_URL]
+
+
+def test_feedback_posts_to_node_and_omits_dataset_session(monkeypatch, capsys) -> None:
+    from kb.cli import _feedback
+
+    captured: dict[str, Any] = {}
+
+    def fake_feedback_node(base_url, token, **kwargs):
+        captured.update(kwargs)
+        return {"recorded": True, "improved": False, "ok": True}
+
+    monkeypatch.setattr("kb.status.feedback_node", fake_feedback_node)
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    args = argparse.Namespace(
+        qa_id="qa-1", result_id=None, score=1, text=None,
+        session=None, dataset=None, node_url=None, local=False, json=True,
+    )
+    rc = asyncio.run(_feedback(args))
+    assert rc == 0
+    assert captured["qa_id"] == "qa-1"
+    assert captured["dataset"] is None
+    assert captured["session_id"] is None
+    assert captured["score"] == 1
+    assert json.loads(capsys.readouterr().out)["recorded"] is True
+
+
+def test_feedback_requires_an_id(capsys) -> None:
+    from kb.cli import _feedback
+
+    args = argparse.Namespace(
+        qa_id=None, result_id=None, score=None, text=None,
+        session=None, dataset=None, node_url=None, local=False, json=True,
+    )
+    rc = asyncio.run(_feedback(args))
+    assert rc == 1
+    assert "MISSING_ID" in capsys.readouterr().out
+
+
+def test_mcp_add_scope_project_writes_dot_mcp_json(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_add
+
+    args = argparse.Namespace(tool="claude", node_url=None, scope="project", repo=str(tmp_path))
+    rc = asyncio.run(_mcp_add(args))
+    assert rc == 0
+    block = json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]["citadel"]
+    assert block["type"] == "http"
+    assert block["headers"]["Authorization"] == "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
+
+
+def test_mcp_add_scope_project_rejects_non_claude(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_add
+
+    args = argparse.Namespace(tool="cursor", node_url=None, scope="project", repo=str(tmp_path))
+    rc = asyncio.run(_mcp_add(args))
+    assert rc == 2
+    assert not (tmp_path / ".mcp.json").exists()
+    assert "only 'claude'" in capsys.readouterr().err
+
+
+def test_mcp_show_masks_literal_token(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_show
+
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"citadel": {
+        "type": "http", "url": "https://citadel.utxo.ag/mcp/",
+        "headers": {"Authorization": "Bearer ctdl_secrettoken_WXYZ"},
+    }}}))
+    args = argparse.Namespace(tool=None, scope="project", repo=str(tmp_path), json=True)
+    rc = asyncio.run(_mcp_show(args))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ctdl_secrettoken_WXYZ" not in out
+    assert "WXYZ" in out
+    auth = json.loads(out)["citadel"]["headers"]["Authorization"]
+    assert auth.startswith("Bearer ") and "ctdl_secrettoken" not in auth
+
+
+def test_mcp_show_preserves_env_reference(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_show
+
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"citadel": {
+        "type": "http", "url": "https://x/mcp/",
+        "headers": {"Authorization": "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"},
+    }}}))
+    args = argparse.Namespace(tool=None, scope="project", repo=str(tmp_path), json=True)
+    rc = asyncio.run(_mcp_show(args))
+    assert rc == 0
+    auth = json.loads(capsys.readouterr().out)["citadel"]["headers"]["Authorization"]
+    assert auth == "Bearer ${CITADEL_MCP_ACCESS_TOKEN}"
+
+
+def test_status_exit_zero_when_authed_even_if_corpus_red(monkeypatch, tmp_path, capsys) -> None:
+    from kb.cli import _status
+
+    checks = [
+        Check("node", True, "healthy"),
+        Check("auth", True, "valid"),
+        Check("corpus", False, "MaintenanceWedged"),
+        Check("pre_push_hook", False, "no git repo"),
+    ]
+    monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks, healthy=False))
+    monkeypatch.setattr("kb.cli.fetch_mesh_summary", lambda *a, **k: {})
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    args = argparse.Namespace(
+        repo=str(tmp_path), config=str(tmp_path / "c.json"), node_url=None,
+        json=True, full=False, check_search=False, no_search=False, no_recent=True,
+    )
+    rc = asyncio.run(_status(args))
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["healthy"] is False
+
+
+def test_status_exit_one_when_explicit_search_probe_fails(monkeypatch, tmp_path, capsys) -> None:
+    from kb.cli import _status
+
+    checks = [
+        Check("node", True, "healthy"),
+        Check("auth", True, "valid"),
+        Check("search", False, "unavailable", data={"code": "SEARCH_UNAVAILABLE"}),
+    ]
+    monkeypatch.setattr("kb.cli.gather_status", lambda *a, **k: _report(checks, healthy=True))
+    monkeypatch.setattr("kb.cli.fetch_mesh_summary", lambda *a, **k: {})
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    args = argparse.Namespace(
+        repo=str(tmp_path), config=str(tmp_path / "c.json"), node_url=None,
+        json=True, full=False, check_search=True, no_search=False, no_recent=True,
+    )
+    rc = asyncio.run(_status(args))
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["healthy"] is True
+
+
+def test_mask_mcp_auth_is_case_insensitive() -> None:
+    from kb.cli import _mask_mcp_auth
+
+    for key in ("authorization", "AUTHORIZATION", "Authorization"):
+        block = {"headers": {key: "Bearer ctdl_secrettoken_WXYZ"}}
+        masked = _mask_mcp_auth(block)["headers"]
+        assert list(masked) == [key]
+        assert "ctdl_secrettoken" not in masked[key]
+        assert masked[key].endswith("WXYZ")
+    # A non-string authorization value is unexpected: fail closed, never print.
+    weird = _mask_mcp_auth({"headers": {"authorization": ["Bearer ctdl_secrettoken_WXYZ"]}})
+    assert weird["headers"]["authorization"] == "****"
+
+
+def test_feedback_local_dispatch_uses_single_arg_wrapper(monkeypatch, capsys) -> None:
+    """`feedback --local` must reach the @_needs_server wrapper without a
+    TypeError: the wrapper accepts exactly (args)."""
+    import sys as _sys
+
+    from kb.cli import _feedback
+
+    monkeypatch.setitem(_sys.modules, "kb.service", None)
+    args = argparse.Namespace(
+        qa_id=None, result_id="hit-1", score=1, text=None,
+        session=None, dataset=None, node_url=None, local=True, json=True,
+        command="feedback",
+    )
+    rc = asyncio.run(_feedback(args))
+    assert rc == 2
+    assert "needs the server extra" in capsys.readouterr().err
+    assert args.qa_id == "hit-1"
+
+
+def test_mask_mcp_auth_preserves_exact_env_references() -> None:
+    from kb.cli import _mask_mcp_auth
+
+    preserved = [
+        "Bearer $CITADEL_MCP_ACCESS_TOKEN",
+        "$CITADEL_MCP_ACCESS_TOKEN",
+        "Bearer ${CITADEL_MCP_ACCESS_TOKEN}",
+        "${CITADEL_MCP_ACCESS_TOKEN}",
+        "Bearer ${env:CITADEL_MCP_ACCESS_TOKEN}",
+        "${env:CITADEL_MCP_ACCESS_TOKEN}",
+    ]
+    for value in preserved:
+        block = {"headers": {"Authorization": value}}
+        assert _mask_mcp_auth(block)["headers"]["Authorization"] == value
+
+
+def test_mask_mcp_auth_masks_non_standalone_env_forms() -> None:
+    from kb.cli import _mask_mcp_auth
+
+    secret = "ctdl_real_secret_WXYZ"
+    leaked = [
+        f"Bearer ${{CITADEL_MCP_ACCESS_TOKEN:-{secret}}}",
+        f"${{CITADEL_MCP_ACCESS_TOKEN:-{secret}}}",
+        f"Bearer $CITADEL_MCP_ACCESS_TOKEN {secret}",
+        "prefix$CITADEL_MCP_ACCESS_TOKEN",
+        f"Bearer ${{CITADEL_MCP_ACCESS_TOKEN}}{secret}",
+        f"$CITADEL_MCP_ACCESS_TOKEN-{secret}",
+    ]
+    for value in leaked:
+        masked = _mask_mcp_auth({"headers": {"Authorization": value}})["headers"]["Authorization"]
+        assert secret not in masked, value
+        assert "ctdl_real_secret" not in masked, value
+
+
+def test_update_fallback_preserves_server_extra(monkeypatch, capsys) -> None:
+    from kb.cli import _update
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("kb.cli._install_channel", lambda: ("pipx", "/usr/bin/pipx"))
+    monkeypatch.setattr("kb.cli._pipx_reinstall_spec", lambda: "citadel-archive[server]")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "upgrade" in cmd:
+            return SimpleNamespace(returncode=1, stdout="", stderr="broken spec")
+        return SimpleNamespace(
+            returncode=0, stdout="installed package citadel-archive 0.5.2", stderr=""
+        )
+
+    monkeypatch.setattr("kb.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("kb.cli._wire_write_tier_tools", lambda url: ([], []))
+    monkeypatch.setattr("kb.cli._refresh_skills_pack", lambda: None)
+    rc = asyncio.run(_update(argparse.Namespace()))
+    assert rc == 0
+    assert calls[1][-1] == "citadel-archive[server]"
+
+
+def test_mcp_show_rejects_tool_with_project_scope(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_show
+
+    args = argparse.Namespace(tool="cursor", scope="project", repo=str(tmp_path), json=True)
+    rc = asyncio.run(_mcp_show(args))
+    assert rc == 2
+    assert "not both" in capsys.readouterr().err
+
+
+def test_feedback_timeout_reports_timeout_code(monkeypatch, capsys) -> None:
+    from kb.cli import _feedback
+
+    def boom(*a, **k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("kb.status.feedback_node", boom)
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    args = argparse.Namespace(
+        qa_id="qa-1", result_id=None, score=None, text=None,
+        session=None, dataset=None, node_url=None, local=False, json=True,
+    )
+    rc = asyncio.run(_feedback(args))
+    assert rc == 1
+    assert "TIMEOUT" in capsys.readouterr().out
+
+
+def test_mcp_add_rejects_repo_without_project_scope(tmp_path, capsys) -> None:
+    from kb.cli import _mcp_add
+
+    args = argparse.Namespace(tool="claude", node_url=None, scope="global", repo=str(tmp_path))
+    rc = asyncio.run(_mcp_add(args))
+    assert rc == 2
+    assert "--scope project" in capsys.readouterr().err

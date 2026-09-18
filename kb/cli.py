@@ -46,6 +46,7 @@ from kb.capture import (
 from kb.capture_roots_sync import sync_local_capture_roots_to_server, sync_warning_message
 from kb.onboard import (
     TOKEN_ENV,
+    claude_user_mcp_path,
     claude_user_settings_path,
     detect_shell_rc,
     diagnose_mcp_config,
@@ -58,6 +59,7 @@ from kb.onboard import (
     merge_claude_settings,
     merge_mcp_config,
     publish_token_to_macos_gui,
+    read_citadel_mcp_block,
     read_token_from_rc,
 )
 from kb.banner import (
@@ -1261,8 +1263,85 @@ async def _prepare_pr_context(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _feedback(args: argparse.Namespace) -> int:
+    """Record explicit feedback on a search hit over HTTP (the Node), like MCP
+    citadel_record_feedback. `--local` runs the in-process server stack instead
+    (needs the [server] extra).
+
+    Personal-by-default: with no --dataset/--session the seat token resolves the
+    write to its own Node and default session. The Node still refuses a seat
+    write to another dataset, or a session the caller does not own (403), so
+    pass those only for a deliberate non-default target.
+    """
+    as_json = getattr(args, "json", False)
+    qa_id = getattr(args, "qa_id", None)
+    result_id = getattr(args, "result_id", None)
+    if not qa_id and not result_id:
+        return _emit_error(
+            "feedback",
+            "pass a QA id (positional) or --result-id.",
+            as_json=as_json,
+            code="MISSING_ID",
+        )
+    if getattr(args, "local", False):
+        # The @_needs_server wrapper takes exactly (args); resolve the id onto
+        # the namespace for the local handler.
+        args.qa_id = qa_id or result_id
+        return await _feedback_local(args)
+    base_url = node_base_url(getattr(args, "node_url", None))
+    token = capture_token()
+    if not token:
+        return _emit_no_token("feedback", as_json=as_json)
+    from kb.status import feedback_node
+
+    try:
+        with _Spinner("Recording feedback…"):
+            result = await asyncio.to_thread(
+                feedback_node,
+                base_url,
+                token,
+                qa_id=qa_id,
+                result_id=result_id,
+                score=args.score,
+                text=args.text,
+                session_id=args.session,
+                dataset=args.dataset,
+            )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
+        if not as_json:
+            _print_auth_hint("feedback", exc.code)
+        return _emit_error(
+            "feedback",
+            f"HTTP {exc.code} {detail}",
+            as_json=as_json,
+            code="HTTP_ERROR",
+            extra={"http_status": exc.code},
+        )
+    except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        if _is_timeout_exc(exc):
+            return _emit_error(
+                "feedback",
+                f"no response from the Node: {exc}",
+                as_json=as_json,
+                code="TIMEOUT",
+                extra={"timed_out": True},
+            )
+        return _emit_error("feedback", str(exc), as_json=as_json, code="NODE_UNREACHABLE")
+    if not isinstance(result, dict):
+        result = {"recorded": False, "reason": "unexpected response from the Node"}
+    if as_json:
+        _print_json(result)
+    else:
+        recorded = bool(result.get("recorded"))
+        note = " · improved" if result.get("improved") else ""
+        print(f"  {mark(recorded, enable=supports_color())} "
+              f"feedback {'recorded' if recorded else 'not recorded'}{note}")
+    return 0 if (result.get("recorded") or result.get("ok")) else 1
+
+
 @_needs_server
-async def _feedback(args: argparse.Namespace) -> None:
+async def _feedback_local(args: argparse.Namespace) -> int:
     from kb.models import FeedbackRequest
     from kb.service import Citadel
 
@@ -2253,6 +2332,39 @@ async def _mcp_add(args: argparse.Namespace) -> int:
 
     node_url = node_base_url(args.node_url)
     color = supports_color()
+    scope = getattr(args, "scope", "global")
+    if scope != "project" and getattr(args, "repo", None):
+        print("citadel mcp add: --repo applies to --scope project only", file=sys.stderr)
+        return 2
+    if scope == "project":
+        # .mcp.json is Claude Code's project-scope format; other tools use their
+        # own per-user config files (see `citadel mcp add <tool>` / `mcp list`).
+        if args.tool != "claude":
+            print(
+                "citadel mcp add --scope project: only 'claude' has a project "
+                f"config (.mcp.json); {args.tool!r} uses a per-user file; run "
+                f"`citadel mcp add {args.tool}` without --scope.",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "repo", None):
+            repo = Path(args.repo).expanduser()
+            if not repo.is_dir():
+                print(f"citadel mcp add: --repo {repo} is not a directory", file=sys.stderr)
+                return 2
+        else:
+            repo = git_root_or_cwd()
+        path = repo / ".mcp.json"
+        try:
+            status = merge_mcp_config(path, node_url)
+        except (OSError, ValueError) as exc:
+            print(f"citadel mcp add: {exc}", file=sys.stderr)
+            return 1
+        print(f"  {mark(True, enable=color)} Claude project MCP  "
+              f"{paint(f'{status} · {path}', 'dim', enable=color)}")
+        print(paint(f"  Token stays an env var ({TOKEN_ENV}); nothing secret is written.",
+                    "dim", enable=color))
+        return 0
     targets = tool_detect.ALL_TOOLS if args.tool == "all" else [args.tool]
     rc = 0
     for name in targets:
@@ -2302,6 +2414,100 @@ async def _mcp_list(args: argparse.Namespace) -> int:
         spec = tool_detect.SPECS[name]
         mode = {"write": "auto-write", "snippet": "snippet", "note": "note"}[spec.mode]
         print(f"  {paint(name.ljust(9), 'cyan', enable=color)} {mode:<10} {paint(spec.config_hint, 'dim', enable=color)}")
+    return 0
+
+
+def _mask_mcp_auth(block: dict[str, Any]) -> dict[str, Any]:
+    """Copy an MCP server block with any literal Authorization token masked.
+
+    Preserve only a full env reference: optional ``Bearer `` plus ``$NAME``,
+    ``${NAME}``, or ``${env:NAME}``. Default-value interpolations
+    (``${NAME:-secret}``), concatenated text, and any other shape are masked.
+    """
+    env_ref = re.compile(
+        r"^(?:Bearer\s+)?(?:\$[A-Za-z_][A-Za-z0-9_]*"
+        r"|\$\{[A-Za-z_][A-Za-z0-9_]*\}"
+        r"|\$\{env:[A-Za-z_][A-Za-z0-9_]*\})$"
+    )
+    masked = dict(block)
+    headers = block.get("headers")
+    if isinstance(headers, dict):
+        new_headers = dict(headers)
+        for key, value in headers.items():
+            # HTTP header names are case-insensitive: mask every variant,
+            # keeping the original key casing.
+            if key.lower() != "authorization":
+                continue
+            if not isinstance(value, str):
+                # Unexpected value shape: fail closed, never print it.
+                new_headers[key] = "****"
+                continue
+            if env_ref.fullmatch(value):
+                continue
+            parts = value.split()
+            new_headers[key] = (
+                f"{parts[0]} {mask_token(parts[-1])}" if len(parts) > 1 else mask_token(value)
+            )
+        masked["headers"] = new_headers
+    return masked
+
+
+_MCP_SHOW_JSON_PATHS = {
+    "claude": "~/.claude.json",
+    "cursor": "~/.cursor/mcp.json",
+    "gemini": "~/.gemini/settings.json",
+    "windsurf": "~/.codeium/windsurf/mcp_config.json",
+}
+
+
+async def _mcp_show(args: argparse.Namespace) -> int:
+    """Print the citadel MCP entry for a scope/tool with its token masked.
+
+    A safe alternative to `cat`-ing a config that may hold unrelated secrets: it
+    reads only the ``citadel`` server block and masks any literal Authorization
+    token.
+    """
+    color = supports_color()
+    as_json = getattr(args, "json", False)
+    tool = getattr(args, "tool", None)
+    scope = getattr(args, "scope", None)
+    if scope == "project" and tool:
+        print("citadel mcp show: pass a tool OR --scope project, not both", file=sys.stderr)
+        return 2
+    if getattr(args, "repo", None) and tool:
+        print("citadel mcp show: --repo applies to the project scope only", file=sys.stderr)
+        return 2
+    if getattr(args, "scope", None) == "project" or tool is None:
+        if getattr(args, "repo", None):
+            repo = Path(args.repo).expanduser()
+        else:
+            repo = git_root_or_cwd()
+        path = repo / ".mcp.json"
+        label = f"project · {path}"
+    elif tool in _MCP_SHOW_JSON_PATHS:
+        path = (
+            claude_user_mcp_path()
+            if tool == "claude"
+            else Path(_MCP_SHOW_JSON_PATHS[tool]).expanduser()
+        )
+        label = f"{tool} · {path}"
+    else:
+        print(
+            f"citadel mcp show: {tool!r} has no readable JSON config "
+            f"(supported: {', '.join(_MCP_SHOW_JSON_PATHS)}, or --scope project).",
+            file=sys.stderr,
+        )
+        return 2
+    block = read_citadel_mcp_block(path)
+    if block is None:
+        print(f"citadel mcp show: no citadel MCP entry in {path}", file=sys.stderr)
+        return 1
+    masked = _mask_mcp_auth(block)
+    if as_json:
+        _print_json({"scope": label, "citadel": masked})
+    else:
+        print(paint(f"citadel MCP: {label}", "bold", enable=color))
+        print(_indent(json.dumps(masked, indent=2)))
     return 0
 
 
@@ -2415,7 +2621,20 @@ async def _status(args: argparse.Namespace) -> int:
             if hint:
                 print(paint(f"  hint: {hint}", "yellow", enable=use_color))
         await _maybe_prompt_update(color=use_color)
-    return 0 if report.healthy else 1
+    # Exit reflects the CALLER's readiness, not the server-side data plane: an
+    # authenticated, reachable Node exits 0 even while its corpus/indexes warm
+    # (that stays visible as a degraded verdict and healthy=false). A search
+    # probe runs only under --check-search; when it does and fails, exit 1.
+    ready = report.readiness()
+    node = next((c for c in report.checks if c.name == "node"), None)
+    # A report with no node check is unverified, not ready: fail closed.
+    node_ok = bool(node and node.ok)
+    caller_ready = (
+        node_ok
+        and bool(ready.get("authenticated"))
+        and (bool(ready.get("search")) or not ready.get("search_probed"))
+    )
+    return 0 if caller_ready else 1
 
 
 def _render_mesh(mesh: dict[str, Any], color: bool) -> str:
@@ -3354,6 +3573,51 @@ def _install_channel() -> tuple[str, str]:
     return "other", ""
 
 
+def _pipx_reinstall_spec() -> str:
+    """Reinstall spec for the recovery path: keep the [server] extra when this
+    venv already carries it (a bare reinstall would silently drop it and break
+    the --local commands)."""
+    import importlib.util
+
+    if importlib.util.find_spec("cognee") is not None:
+        return "citadel-archive[server]"
+    return "citadel-archive"
+
+
+async def _pipx_reinstall_fallback(pipx: str, *, color: bool) -> int:
+    """Recover a broken `pipx upgrade` by force-reinstalling from PyPI.
+
+    `pipx upgrade` fails when pipx recorded the original install source as a
+    now-missing local path (a path with a space fails to parse at all). PyPI is
+    always a valid source, so a forced reinstall reaches the latest release
+    regardless of the recorded source.
+    """
+    spec = _pipx_reinstall_spec()
+    print(f"  {WARN} upgrade could not use the recorded install source; "
+          f"reinstalling {spec} from PyPI…", file=sys.stderr)
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [pipx, "install", "--force", "--pip-args=--no-cache-dir", spec],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"citadel update: pipx reinstall failed: {exc}", file=sys.stderr)
+        return 1
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if proc.returncode != 0:
+        print(f"citadel update: pipx reinstall failed:\n{out}", file=sys.stderr)
+        return 1
+    line = next((ln for ln in out.splitlines() if "citadel-archive" in ln.lower()), "")
+    print(f"  {mark(True, enable=color)} {line.strip() or f'reinstalled {spec} from PyPI'}")
+    if not _capture_has_custom_node_url():
+        _wire_write_tier_tools(node_base_url())
+    _refresh_skills_pack()
+    return 0
+
+
 async def _update(args: argparse.Namespace) -> int:
     """Update citadel in place — the answer to `pipx install` saying
     "already seems to be installed"; no --force incantations needed."""
@@ -3387,7 +3651,7 @@ async def _update(args: argparse.Namespace) -> int:
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     if proc.returncode != 0:
         print(f"citadel update: pipx upgrade failed:\n{out}", file=sys.stderr)
-        return 1
+        return await _pipx_reinstall_fallback(detail, color=color)
     if "already at latest" in out:
         print(f"  {mark(True, enable=color)} already up to date — citadel {current}")
     else:
@@ -3995,10 +4259,36 @@ def build_parser() -> argparse.ArgumentParser:
         "tool", help="Tool to wire: claude, cursor, codex, gemini, windsurf, cline, zed, pi, or all"
     )
     mcp_add.add_argument("--node-url", help="Override Node URL")
+    mcp_add.add_argument(
+        "--scope",
+        choices=["global", "project"],
+        default="global",
+        help="global: default per-tool wiring (Claude also writes the repo .mcp.json). "
+        "project: write only ./.mcp.json (Claude Code) at the repo root",
+    )
+    mcp_add.add_argument("--repo", help="(--scope project) repo root to write .mcp.json into")
     mcp_add.set_defaults(handler=_mcp_add)
 
     mcp_list = mcp_sub.add_parser("list", help="List detected coding tools and how each is wired")
     mcp_list.set_defaults(handler=_mcp_list)
+
+    mcp_show = mcp_sub.add_parser(
+        "show",
+        help="Print the citadel MCP entry for a tool/scope with the token masked",
+    )
+    mcp_show.add_argument(
+        "tool",
+        nargs="?",
+        help="Tool whose JSON config to read: claude, cursor, gemini, windsurf (omit with --scope project)",
+    )
+    mcp_show.add_argument(
+        "--scope",
+        choices=["project"],
+        help="project: read ./.mcp.json at the repo root instead of a tool's per-user config",
+    )
+    mcp_show.add_argument("--repo", help="(--scope project) repo root to read .mcp.json from")
+    mcp_show.add_argument("--json", action="store_true", help="Machine-readable output")
+    mcp_show.set_defaults(handler=_mcp_show)
 
     skills = subcommands.add_parser(
         "skills",
@@ -4181,7 +4471,8 @@ def build_parser() -> argparse.ArgumentParser:
     feedback = subcommands.add_parser("feedback", help="Attach feedback to a Cognee QA entry")
     feedback.add_argument(
         "qa_id",
-        help="QA entry id to rate (the `id` from a `citadel search --local` hit)",
+        nargs="?",
+        help="QA entry id to rate (a hit's `id`/`qa_id` from `citadel search`); or use --result-id",
     )
     feedback.add_argument(
         "--score", type=int, choices=[-1, 0, 1], help="1 useful, -1 not useful, 0 neutral"
@@ -4189,6 +4480,14 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--text", help="Optional free-text note on the rating")
     feedback.add_argument("--dataset", help="Dataset the QA entry belongs to")
     feedback.add_argument("--session", help="Session id the QA entry belongs to")
+    feedback.add_argument("--result-id", dest="result_id", help="Search-hit result id (alternative to the positional qa_id)")
+    feedback.add_argument("--node-url", help="Override Node URL")
+    feedback.add_argument(
+        "--local",
+        action="store_true",
+        help="Record via the in-process server stack instead of the Node (needs the server extra)",
+    )
+    feedback.add_argument("--json", action="store_true", help="Machine-readable output")
     feedback.set_defaults(handler=_feedback)
 
     improve = subcommands.add_parser(

@@ -47,7 +47,7 @@ Promotion is the deliberate part. Captured work lands in your own space, and rea
 ## Quick start
 
 ```bash
-npx skills add masumi-network/citadel --skill citadel
+npx skills add masumi-network/citadel --skill '*'   # all skills; --skill citadel installs only the router
 pipx install citadel-archive
 citadel onboard      # token, hooks, MCP (project + Cursor/Codex/Claude/…), capture roots
 citadel status       # connection, identity, local setup

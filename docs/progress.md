@@ -2212,7 +2212,7 @@ not as successful retrieval.
   the provider quota reset as a future recovery point, but the post-reset
   probe still found the search surface unavailable.
 - [VERIFIED] The shell `citadel` command resolves to
-  `/Users/sarthiborkar/.local/bin/citadel`, while `uv run which citadel`
+  `~/.local/bin/citadel`, while `uv run which citadel`
   resolves to the repository virtual environment. The global command's
   `operation --help` does not expose `--require-searchable`; the repository
   entry point does expose it.
