@@ -982,10 +982,7 @@ async def _search(args: argparse.Namespace) -> int:
         return _emit_no_token("search", as_json=getattr(args, "json", False))
     from kb.search_format import (
         apply_query_ranking,
-        is_docs_mode_query,
-        is_spec_mode_query,
         prepare_search_payload_for_agent,
-        query_terms,
         shape_search_payload,
     )
     from kb.status import search_node
@@ -1074,20 +1071,16 @@ async def _search(args: argparse.Namespace) -> int:
         _print_json(prepare_search_payload_for_agent(raw))
         return 0
 
-    # Human view: always apply filters; for API/spec or docs/token queries also
-    # flatten to ranked results so section grouping cannot hide boosts.
-    display = dict(raw)
+    # Human view: always show ranked `results` and clear `sections` so
+    # Central-first grouping cannot renumber a stronger Node hit (#106).
+    # JSON/`--json` above keeps the server sections envelope unchanged.
     if filters_on:
-        display = {**display, "results": shaped["results"], "sections": None}
-    elif (
-        is_docs_mode_query(args.query, mode=shape_kw.get("mode"))
-        or is_spec_mode_query(args.query)
-        or len(query_terms(args.query)) == 1
-    ):
+        display = {**raw, "results": shaped["results"], "sections": None}
+    else:
         ranked = apply_query_ranking(
             list(raw.get("results") or []), args.query, mode=shape_kw.get("mode")
         )
-        display = {**display, "results": ranked, "sections": None}
+        display = {**raw, "results": ranked, "sections": None}
     _render_search(display, args.query)
     if shaped.get("warnings"):
         for warning in shaped["warnings"]:

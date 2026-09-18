@@ -5,6 +5,7 @@ import asyncio
 from io import BytesIO
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import urllib.error
 
@@ -541,7 +542,7 @@ def test_search_json_matches_mcp_agent_payload(monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out) == _compact_search_for_agent(payload)
 
 
-def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
+def test_search_http_renders_trace_provenance(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     trace_hit = {
         "text": "fixed the kuzu lock",
@@ -568,7 +569,8 @@ def test_search_http_renders_trace_sections(monkeypatch, capsys) -> None:
     rc = asyncio.run(_search(args))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Session traces (reference-only" in out
+    # Human output ignores section headers; trust still shows on the hit meta.
+    assert "Session traces (reference-only" not in out
     assert "trust: reference-only" in out
     assert "author: alice" in out
     assert "fixed the kuzu lock" in out
@@ -626,6 +628,38 @@ def test_search_human_literal_query_flattens_ranked_results(monkeypatch, capsys)
     out = capsys.readouterr().out
     assert out.index("quokka-beacon-8823") < out.index("unrelated central note")
     assert "Central\n" not in out
+
+
+def test_search_human_multi_term_ignores_sections_for_ranked_display(
+    monkeypatch, capsys
+) -> None:
+    """Multi-term human search must not renumber via Central-first sections (#106)."""
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    central = {
+        "text": "unrelated central note about nothing",
+        "_citadel": {"dataset": "masumi-network"},
+    }
+    better = {
+        "text": "node note with canary phrase and quokka beacon",
+        "_citadel": {"dataset": "seat:alice"},
+    }
+    payload = {
+        "results": [central, better],
+        "sections": {"central": [central], "session_traces": [], "node": [better]},
+    }
+    monkeypatch.setattr("kb.status.search_node", lambda *a, **k: payload)
+
+    rc = asyncio.run(
+        _search(_search_args(query="canary phrase quokka", json=False))
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.index("canary phrase") < out.index("unrelated central note")
+    assert "Central\n" not in out
+    assert "Node\n" not in out
+    assert re.search(r"1\.\s+.*canary phrase", out)
+    assert re.search(r"2\.\s+.*unrelated central", out)
 
 
 def test_search_no_token_exits_one(monkeypatch, capsys) -> None:
