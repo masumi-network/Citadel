@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
@@ -40,6 +41,15 @@ class FakeCitadel:
         auto_improve=True,
         build_global_context_index=True,
     )
+    readiness_stage_evidence = {
+        name: {"status": "ready", "reason": "test_complete"}
+        for name in (
+            "process_alive",
+            "source_searchable",
+            "projection_searchable",
+            "mesh_ready",
+        )
+    }
 
     async def ingest(self, data: str, **kwargs: Any) -> IngestResult:
         return IngestResult(True, "accepted", kwargs["dataset"] or "notes", tuple(kwargs["tags"]))
@@ -460,9 +470,273 @@ def test_healthz() -> None:
     assert response.json() == {"ok": True, "service": "citadel"}
 
 
-def test_deployment_readiness_allows_recoverable_data_backlog(
+
+def _stage_evidence(
+    *,
+    process_alive: str = "ready",
+    source_searchable: str = "ready",
+    projection_searchable: str = "ready",
+    mesh_ready: str = "ready",
+) -> dict[str, dict[str, str]]:
+    return {
+        name: {"status": status, "reason": f"{name}_evidence"}
+        for name, status in {
+            "process_alive": process_alive,
+            "source_searchable": source_searchable,
+            "projection_searchable": projection_searchable,
+            "mesh_ready": mesh_ready,
+        }.items()
+    }
+
+
+def _stage_lifecycle(**stages: str) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "ok": True,
+        "stage_evidence": _stage_evidence(**stages),
+    }
+
+
+def test_readyz_adds_safe_stage_shape_and_preserves_payload_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True, "indexed_docs": 1}
+
+    async def healthy_lifecycle(_citadel: Any) -> dict[str, Any]:
+        return _stage_lifecycle()
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", healthy_lifecycle)
+    ready = authed_client("test-reader").get("/readyz")
+
+    assert ready.status_code == 200
+    body = ready.json()
+    assert {
+        "ok", "service", "tenant_id", "default_dataset", "auto_improve",
+        "build_global_context_index", "corpus", "lifecycle", "canary", "stages",
+    } <= body.keys()
+    assert set(body["stages"]) == {
+        "process_alive", "source_searchable", "projection_searchable", "mesh_ready",
+    }
+    for stage in body["stages"].values():
+        assert set(stage) == {"status", "reason"}
+        assert stage["status"] in {"ready", "pending", "failed", "unavailable"}
+        assert stage["reason"]
+
+
+@pytest.mark.parametrize(
+    ("canary", "expected_status"),
+    [
+        (None, 200),
+        ({"ok": True}, 200),
+        ({"ok": False}, 503),
+        ({"detail": "missing"}, 503),
+        ({"ok": 0}, 503),
+        ({"ok": 1}, 503),
+        ({"ok": "true"}, 503),
+    ],
+)
+def test_readyz_canary_gate_requires_strict_boolean_true(
+    monkeypatch: pytest.MonkeyPatch,
+    canary: dict[str, Any] | None,
+    expected_status: int,
+) -> None:
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    async def healthy_lifecycle(_citadel: Any) -> dict[str, Any]:
+        return _stage_lifecycle()
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", healthy_lifecycle)
+    client = authed_client("test-reader")
+    server_module._LAST_CANARY = canary
+
+    ready = client.get("/readyz")
+
+    assert ready.status_code == expected_status
+    assert ready.json()["canary"] == canary
+
+
+def test_stage_status_uses_local_evidence_not_aggregate_ok() -> None:
+    lifecycle = _stage_lifecycle(projection_searchable="pending")
+    lifecycle["ok"] = True
+
+    stages = server_module._readiness_stages(lifecycle)
+
+    assert stages["projection_searchable"] == {
+        "status": "pending", "reason": "projection_searchable_evidence"
+    }
+
+
+def test_readyz_strict_gate_rejects_pending_projection_with_ready_process_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    async def pending_projection(_citadel: Any) -> dict[str, Any]:
+        return _stage_lifecycle(projection_searchable="pending")
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", pending_projection)
+    ready = authed_client("test-reader").get("/readyz")
+
+    assert ready.status_code == 503
+    body = ready.json()
+    assert body["ok"] is False
+    assert body["stages"]["process_alive"]["status"] == "ready"
+    assert body["stages"]["source_searchable"]["status"] == "ready"
+    assert body["stages"]["projection_searchable"]["status"] == "pending"
+
+
+def test_stage_reasons_redact_exception_text() -> None:
+    sentinel = "postgresql://user:SECRET@host"
+    lifecycle = _stage_lifecycle(mesh_ready="failed")
+    lifecycle["stage_evidence"]["mesh_ready"]["reason"] = sentinel
+    stages = server_module._readiness_stages(lifecycle)
+
+    assert sentinel not in json.dumps(stages)
+    assert stages["mesh_ready"] == {
+        "status": "unavailable", "reason": "stage_evidence_unavailable"
+    }
+
+def test_readyz_strict_gate_rejects_pending_mesh_with_ready_prior_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    async def pending_mesh(_citadel: Any) -> dict[str, Any]:
+        return _stage_lifecycle(mesh_ready="pending")
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", pending_mesh)
+    ready = authed_client("test-reader").get("/readyz")
+
+    assert ready.status_code == 503
+    body = ready.json()
+    assert body["ok"] is False
+    assert body["stages"]["process_alive"]["status"] == "ready"
+    assert body["stages"]["source_searchable"]["status"] == "ready"
+    assert body["stages"]["projection_searchable"]["status"] == "ready"
+    assert body["stages"]["mesh_ready"]["status"] == "pending"
+
+
+class _CappedHeadConnection:
+    def __init__(self, rows: list[dict[str, str]]) -> None:
+        self.rows = rows
+        self.params: tuple[int, ...] | None = None
+
+    def __enter__(self) -> "_CappedHeadConnection":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def execute(self, query: str, params: tuple[int, ...] = ()) -> "_CappedHeadConnection":
+        assert "LIMIT ?" in query
+        self.params = params
+        return self
+
+    def fetchall(self) -> list[dict[str, str]]:
+        return self.rows
+
+
+class _HeadEvidenceStore:
+    def __init__(self, rows: list[dict[str, str]]) -> None:
+        self.connection = _CappedHeadConnection(rows)
+
+    def _connect(self) -> _CappedHeadConnection:
+        return self.connection
+
+    def current_head_evidence(self, dataset: str, source_keys: list[str], **_kwargs: Any) -> dict[str, Any]:
+        return {"evidence": [], "errors": []}
+
+
+def test_current_head_census_fails_closed_at_configured_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _HeadEvidenceStore([
+        {"dataset": "notes", "source_key": "a"},
+        {"dataset": "notes", "source_key": "b"},
+        {"dataset": "notes", "source_key": "c"},
+    ])
+    monkeypatch.setattr(server_module, "_corpus_health_max_documents", lambda: 2)
+
+    stages = server_module._lifecycle_stage_evidence(
+        SimpleNamespace(lifecycle_store=store),
+        {"generation_id": "g", "projection_version": "p", "config_digest": "d"},
+    )
+
+    assert store.connection.params == (3,)
+    assert stages == {
+        name: {"status": "unavailable", "reason": "stage_head_census_cap_exceeded"}
+        for name in ("source_searchable", "projection_searchable", "mesh_ready")
+    }
+
+
+def test_current_head_stage_evidence_uses_real_lifecycle_store(tmp_path: Path) -> None:
+    # The real store returns a CurrentHeadEvidenceResult dataclass, not a dict.
+    # It must be consumed (asdict), not rejected as non-Mapping the way dict
+    # fakes never exposed. A fully searchable head reads ready on every stage.
+    from kb.lifecycle import LifecycleStore
+    from tests.test_current_head_evidence import PROJECTION, _accept, _make_searchable
+
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = _accept(store, "github:masumi-network/Citadel:path:doc.md", b"doc body")
+    _make_searchable(store, accepted.projection_job_id)
+
+    stages = server_module._lifecycle_stage_evidence(
+        SimpleNamespace(lifecycle_store=store),
+        {
+            "generation_id": PROJECTION.generation_id,
+            "projection_version": PROJECTION.projection_version,
+            "config_digest": PROJECTION.config_digest,
+        },
+    )
+
+    assert {name: stage["status"] for name, stage in stages.items()} == {
+        "source_searchable": "ready",
+        "projection_searchable": "ready",
+        "mesh_ready": "ready",
+    }
+
+
+def test_current_head_stage_evidence_preserves_unavailable_over_failed_and_pending() -> None:
+    class MixedStore(_HeadEvidenceStore):
+        def current_head_evidence(self, dataset: str, source_keys: list[str], **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "evidence": [],
+                "errors": [
+                    {"code": "CURRENT_JOB_MISSING"},
+                    {"code": "CURRENT_JOB_MISMATCH"},
+                    {"code": "RECEIPT_STATE", "backend_states": {"vector": "pending", "graph": "pending"}},
+                ],
+            }
+
+    store = MixedStore([
+        {"dataset": "notes", "source_key": "a"},
+    ])
+    stages = server_module._lifecycle_stage_evidence(
+        SimpleNamespace(lifecycle_store=store),
+        {"generation_id": "g", "projection_version": "p", "config_digest": "d"},
+    )
+
+    assert stages["projection_searchable"] == {
+        "status": "unavailable", "reason": "stage_projection_evidence_missing"
+    }
+    assert stages["mesh_ready"] == {
+        "status": "unavailable", "reason": "stage_mesh_evidence_missing"
+    }
+
+
+def test_deployment_readiness_rejects_recoverable_data_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A node with a corpus backlog or a failed projection is not ready. The
+    # deploy gate mirrors /readyz, so it must fail closed rather than green.
     async def backlog_corpus() -> dict[str, Any]:
         return {"ok": False, "tracked_sources": 50, "indexed_docs": 40}
 
@@ -476,8 +750,8 @@ def test_deployment_readiness_allows_recoverable_data_backlog(
 
     response = client.get("/health/ready")
 
-    assert response.status_code == 200
-    assert response.json() == {"ok": True, "service": "citadel"}
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "service": "citadel"}
     assert response.headers["cache-control"] == "no-store"
 
 
@@ -524,7 +798,7 @@ def test_deployment_readiness_caches_serial_lifecycle_probes(
     def lifecycle_health(_citadel: Any) -> dict[str, Any]:
         nonlocal calls
         calls += 1
-        return {"enabled": True, "ok": True}
+        return _stage_lifecycle()
 
     async def corpus_health() -> dict[str, Any]:
         return {"ok": True}
@@ -569,6 +843,33 @@ def test_public_state_uses_the_package_source_version() -> None:
     response = client.get("/api/state")
     assert response.status_code == 200
     assert response.json()["version"] == server_module._SERVICE_VERSION
+
+
+def test_public_state_reflects_full_readiness_gate_and_carries_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # V5: /api/state ok/healthy follow the combined readiness gate, and it
+    # carries the same safe stage block. A pending stage is not green.
+    async def healthy_corpus() -> dict[str, Any]:
+        return {"ok": True}
+
+    async def pending_projection(_citadel: Any) -> dict[str, Any]:
+        return _stage_lifecycle(projection_searchable="pending")
+
+    monkeypatch.setattr(server_module, "_bounded_corpus_health", healthy_corpus)
+    monkeypatch.setattr(server_module, "_bounded_lifecycle_health", pending_projection)
+
+    body = TestClient(app).get("/api/state").json()
+
+    assert body["ok"] is False
+    assert body["healthy"] is False
+    assert body["stages"]["source_searchable"]["status"] == "ready"
+    assert body["stages"]["projection_searchable"]["status"] == "pending"
+
+    # V6: the deploy gate mirrors the same combined readiness state.
+    deploy = TestClient(app).get("/health/ready")
+    assert deploy.status_code == 503
+    assert deploy.json() == {"ok": False, "service": "citadel"}
 
 
 def test_public_state_and_readyz_report_lifecycle_census(
@@ -5134,9 +5435,27 @@ def test_search_timeout_budget_is_a_typed_failure() -> None:
 
     r = client.post("/search", json={"query": "q", "top_k": 3})
     assert r.status_code == 504
-    assert r.json()["detail"] == {
-        "code": "SEARCH_TIMEOUT",
-        "message": "Search exceeded the configured server budget.",
+    detail = r.json()["detail"]
+    assert detail["code"] == "SEARCH_TIMEOUT"
+    assert detail["message"] == "Search exceeded the configured server budget."
+    receipt = detail["retrieval_receipt"]
+    assert receipt["scope"] == {"datasets": ["notes"], "filters": {}}
+    assert receipt["candidate_page"] == {
+        "limit": 13,
+        "fetched": None,
+        "matched": None,
+        "returned": None,
+        "selection_trimmed": None,
+        "upstream_truncation": None,
+    }
+    assert receipt["execution"] == {
+        "timed_out": True,
+        "degraded": False,
+        "observed_result_modes": [],
+    }
+    assert receipt["absence"] == {
+        "proven": False,
+        "reason": "search_timeout",
     }
 
 
@@ -10188,7 +10507,7 @@ def test_contact_is_stored_when_the_gateway_is_unconfigured(monkeypatch, tmp_pat
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True, "stored": True}
+    assert response.json() == {"delivered": False, "stored": True}
     saved = store.recent()
     assert len(saved) == 1
     assert saved[0]["name"] == "Ada Lovelace"
@@ -10233,7 +10552,7 @@ def test_contact_is_kept_when_chat_delivery_fails(monkeypatch, tmp_path) -> None
     response = client.post("/contact", json=_enquiry())
 
     assert response.status_code == 200
-    assert response.json() == {"delivered": True, "stored": True}
+    assert response.json() == {"delivered": False, "stored": True}
     assert len(store.recent()) == 1
 
 
@@ -10463,6 +10782,91 @@ def test_the_weak_key_guard_can_be_overridden_explicitly(monkeypatch) -> None:
     server_module.enforce_access_key_strength()
 
 
+def test_search_empty_page_carries_bounded_retrieval_receipt() -> None:
+    class EmptyCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return []
+
+    client = authed_client("test-reader")
+    app.state.citadel = EmptyCitadel()
+    response = client.post("/search", json={"query": "missing", "top_k": 2})
+
+    assert response.status_code == 200
+    receipt = response.json()["retrieval_receipt"]
+    assert receipt["absence"]["proven"] is False
+    assert receipt["absence"]["reason"] == "bounded_candidate_page"
+    assert receipt["candidate_page"] == {
+        "limit": 12,
+        "fetched": 0,
+        "matched": 0,
+        "returned": 0,
+        "selection_trimmed": False,
+        "upstream_truncation": None,
+    }
+
+
+def test_search_receipt_uses_resolved_authorized_datasets(tmp_path: Path) -> None:
+    app.state.access_store = AccessStore(tmp_path / "access.json")
+    admin = authed_client()
+    created = admin.post(
+        "/api/access/tokens",
+        json={
+            "name": "scoped-receipt-reader",
+            "role": "reader",
+            "kind": "service_account",
+            "default_dataset": "personal",
+            "allowed_datasets": ["personal"],
+        },
+    )
+    token = created.json()["token"]
+    client = TestClient(app, base_url="https://testserver")
+    response = client.post(
+        "/search",
+        json={"query": "missing", "path": "/Volumes/private/secret.txt"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    receipt = response.json()["retrieval_receipt"]
+    assert receipt["scope"]["datasets"] == ["personal"]
+    assert "masumi-network" not in receipt["scope"]["datasets"]
+    assert "path" not in receipt["scope"]["filters"]
+    assert "/Volumes/private/secret.txt" not in json.dumps(receipt)
+
+
+def test_search_receipt_distinguishes_candidate_counts_and_modes() -> None:
+    class CandidateCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return [
+                {
+                    "id": f"candidate-{index}",
+                    "text": f"{query} candidate {index}",
+                    "_lifecycle": {
+                        "retrieval_mode": (
+                            "vector" if index % 2 == 0 else "lexical_fallback"
+                        )
+                    },
+                }
+                for index in range(4)
+            ]
+
+    client = authed_client("test-reader")
+    app.state.citadel = CandidateCitadel()
+    response = client.post("/search", json={"query": "q", "top_k": 2})
+
+    assert response.status_code == 200
+    receipt = response.json()["retrieval_receipt"]
+    assert receipt["candidate_page"]["fetched"] == 4
+    assert receipt["candidate_page"]["matched"] == 4
+    assert receipt["candidate_page"]["returned"] == 2
+    assert receipt["candidate_page"]["selection_trimmed"] is True
+    assert receipt["candidate_page"]["upstream_truncation"] is None
+    assert receipt["execution"]["observed_result_modes"] == [
+        "lexical_fallback",
+        "vector",
+    ]
+
+
 def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
     """A search that returned nothing must not be recorded as a success (#50).
 
@@ -10511,6 +10915,15 @@ def test_a_timed_out_search_is_audited_as_a_failure(monkeypatch) -> None:
 
     assert response.status_code == 504
     assert body["detail"]["code"] == "SEARCH_TIMEOUT"
+    timeout_receipt = body["detail"]["retrieval_receipt"]
+    assert timeout_receipt["execution"]["timed_out"] is True
+    assert timeout_receipt["absence"] == {
+        "proven": False,
+        "reason": "search_timeout",
+    }
+    assert timeout_receipt["candidate_page"]["fetched"] is None
+    assert timeout_receipt["candidate_page"]["matched"] is None
+    assert timeout_receipt["candidate_page"]["returned"] is None
     assert audited, "the search must be audited at all"
     entry = audited[-1]
     assert entry["detail"]["timed_out"] is True

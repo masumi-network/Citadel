@@ -757,12 +757,149 @@ def _iter_cognee_words(text: str) -> Iterable[str]:
 def split_cognee_words(text: str) -> list[str]:
     """The whole segmentation, as a list.
 
-    Joining the result reproduces the input. Any coarser rule (``str.split()``, for
+    Joining the result reproduces the input. Any coarser rule (str.split(), for
     one, which breaks on newlines that cognee ignores) under-measures the longest
     word and lets past the documents this check exists to catch.
     """
     return list(_iter_cognee_words(text))
 
+
+@dataclass(frozen=True)
+class ConfiguredEmbeddingTokenizer:
+    """An offline copy of the configured model tokenizer with truncation disabled."""
+
+    model: str
+    window: int
+    tokenizer: Any
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text).ids)
+
+
+@lru_cache(maxsize=8)
+def _load_configured_embedding_tokenizer(
+    provider: str, model: str
+) -> ConfiguredEmbeddingTokenizer:
+    """Load the configured model tokenizer from the local cache, never the network."""
+    if not provider or not model:
+        raise ChunkBudgetValidationError(
+            "configured embedding provider and model are required for bounded chunking"
+        )
+    try:
+        from cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine import (
+            resolve_embedding_tokenizer,
+        )
+        from tokenizers import Tokenizer
+    except Exception as exc:  # pragma: no cover - optional server dependencies
+        raise ChunkBudgetValidationError(
+            "the configured embedding tokenizer dependencies are unavailable"
+        ) from exc
+
+    previous_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        resolved = resolve_embedding_tokenizer(
+            provider=provider,
+            model=model,
+            max_completion_tokens=resolve_chunk_budget(),
+        )
+    finally:
+        if previous_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous_offline
+
+    source = getattr(resolved, "tokenizer", None)
+    backend = getattr(source, "backend_tokenizer", None)
+    window = getattr(source, "model_max_length", None)
+    if (
+        backend is None
+        or isinstance(window, bool)
+        or not isinstance(window, int)
+        or window <= 0
+        or window >= 1_000_000_000
+    ):
+        raise ChunkBudgetValidationError(
+            f"no cached untruncated tokenizer is available for embedding model {model!r}"
+        )
+    try:
+        clone = Tokenizer.from_str(backend.to_str())
+        clone.no_truncation()
+    except Exception as exc:  # pragma: no cover - tokenizer contract failure
+        raise ChunkBudgetValidationError(
+            f"could not clone the cached tokenizer for embedding model {model!r}"
+        ) from exc
+    return ConfiguredEmbeddingTokenizer(model=model, window=window, tokenizer=clone)
+
+
+def configured_embedding_tokenizer() -> ConfiguredEmbeddingTokenizer:
+    """Return the configured model tokenizer, counted without truncation."""
+    from kb.embedding_profile import active_embedding_profile
+
+    profile = active_embedding_profile()
+    return _load_configured_embedding_tokenizer(profile.provider, profile.model)
+
+
+def iter_budget_chunks(
+    text: str,
+    *,
+    budget: int | None = None,
+    count_tokens: Callable[[str], int] | None = None,
+) -> Iterable[tuple[str, int]]:
+    """Yield lossless chunks whose exact size fits the configured token budget.
+
+    The production bounded Cognee chunker supplies count_tokens from the configured
+    embedding model's truncation-free tokenizer. The default BPE counter remains
+    for legacy callers that explicitly operate in Cognee's accounting unit.
+    """
+    if not isinstance(text, str):
+        raise TypeError("chunk text must be a string")
+    limit = budget if budget is not None else resolve_chunk_budget()
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("chunk budget must be a positive integer")
+    if count_tokens is None:
+        encoding = require_bpe_encoding()
+
+        def count(value: str) -> int:
+            return len(encoding.encode(value, disallowed_special=()))
+    else:
+        count = count_tokens
+
+    def split_segment(segment: str) -> Iterable[tuple[str, int]]:
+        remaining = segment
+        while remaining:
+            measured = count(remaining)
+            if measured <= limit:
+                yield remaining, measured
+                return
+            low, high = 1, len(remaining) + 1
+            while low < high:
+                middle = (low + high) // 2
+                if count(remaining[:middle]) <= limit:
+                    low = middle + 1
+                else:
+                    high = middle
+            end = low - 1
+            if end < 1:
+                raise ChunkBudgetValidationError("tokenizer cannot split one character")
+            piece = remaining[:end]
+            yield piece, count(piece)
+            remaining = remaining[end:]
+
+    current = ""
+    for segment in _iter_cognee_words(text):
+        for piece, piece_tokens in split_segment(segment):
+            if piece_tokens > limit:
+                raise ChunkBudgetValidationError("chunk splitter produced an oversized piece")
+            candidate = current + piece
+            candidate_tokens = count(candidate)
+            if current and candidate_tokens > limit:
+                yield current, count(current)
+                current = piece
+                continue
+            current = candidate
+    if current:
+        yield current, count(current)
 
 _BPE_ENCODING: Any | None = None
 _BPE_ENCODING_UNAVAILABLE = object()
