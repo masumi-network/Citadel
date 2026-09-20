@@ -24,6 +24,7 @@ from kb.retry import run_with_retries
 from kb.search_format import (
     compact_document_payload_for_agent,
     prepare_search_payload_for_agent,
+    shape_retrieval_receipt,
 )
 from kb.security_scan import redact_secrets
 from kb.session_trace_distill import (
@@ -47,6 +48,8 @@ AUDIT_VIEWS = frozenset({"all", "mcp", "access", "failures"})
 PUBLIC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
 # tools/list must never block the hosted event loop on a nested self-HTTP call
 # (that deadlock is why Cursor shows mcp_auth with zero citadel_* tools).
+MAX_HTTP_ERROR_BODY_BYTES = 1_048_576
+HTTP_ERROR_DISPLAY_CHARS = 500
 _TOOLS_LIST_SESSION_HTTP_TIMEOUT = 2.0
 _TOOLS_LIST_SESSION_WAIT = 2.5
 
@@ -144,6 +147,7 @@ class CitadelMcpError(RuntimeError):
         *,
         status_code: int | None = None,
         error_code: str | None = None,
+        retrieval_receipt: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         # HTTP status of the upstream Citadel response, when one arrived.
@@ -151,6 +155,7 @@ class CitadelMcpError(RuntimeError):
         # "the node could not be asked" without parsing the message (#171).
         self.status_code = status_code
         self.error_code = error_code
+        self.retrieval_receipt = retrieval_receipt
 
 
 class CitadelMcpTimeout(CitadelMcpError):
@@ -737,6 +742,14 @@ def _unconfirmed_ingest(
     }
 
 
+def _read_bounded_http_error_body(exc: HTTPError) -> tuple[bytes, bool]:
+    """Read an error body completely when it fits the bounded parse budget."""
+    raw = exc.read(MAX_HTTP_ERROR_BODY_BYTES + 1)
+    if len(raw) > MAX_HTTP_ERROR_BODY_BYTES:
+        return raw[:MAX_HTTP_ERROR_BODY_BYTES], False
+    return raw, True
+
+
 class CitadelHttpClient:
     def __init__(
         self,
@@ -841,23 +854,33 @@ class CitadelHttpClient:
             else:
                 data = _open()
         except HTTPError as exc:
-            raw_detail = exc.read().decode("utf-8", errors="replace")[:500]
-            detail = redact_secrets(raw_detail, self.access_token)
+            raw_body, complete = _read_bounded_http_error_body(exc)
+            raw_detail = raw_body.decode("utf-8", errors="replace")
+            detail = redact_secrets(raw_detail, self.access_token)[:HTTP_ERROR_DISPLAY_CHARS]
             error_code: str | None = None
-            try:
-                error_payload = json.loads(raw_detail)
-            except json.JSONDecodeError:
-                error_payload = None
-            if isinstance(error_payload, dict) and isinstance(
-                error_payload.get("detail"), dict
-            ):
-                typed_detail = error_payload["detail"]
-                typed_code = typed_detail.get("code")
-                typed_message = typed_detail.get("message")
-                if isinstance(typed_code, str) and typed_code:
-                    error_code = typed_code
-                if isinstance(typed_message, str) and typed_message:
-                    detail = redact_secrets(typed_message, self.access_token)
+            retrieval_receipt: dict[str, Any] | None = None
+            error_payload: Any = None
+            if complete:
+                try:
+                    error_payload = json.loads(raw_detail)
+                except json.JSONDecodeError:
+                    pass
+            typed_detail = (
+                error_payload.get("detail")
+                if isinstance(error_payload, dict)
+                and isinstance(error_payload.get("detail"), dict)
+                else {}
+            )
+            typed_code = typed_detail.get("code")
+            typed_message = typed_detail.get("message")
+            if isinstance(typed_code, str) and typed_code:
+                error_code = typed_code
+            if isinstance(typed_message, str) and typed_message:
+                detail = redact_secrets(typed_message, self.access_token)[:HTTP_ERROR_DISPLAY_CHARS]
+            receipt_value = typed_detail.get("retrieval_receipt")
+            if receipt_value is None and isinstance(error_payload, dict):
+                receipt_value = error_payload.get("retrieval_receipt")
+            retrieval_receipt = shape_retrieval_receipt(receipt_value)
             logger.warning(
                 "Citadel API call %s %s returned HTTP %s", method, path, exc.code
             )
@@ -865,6 +888,7 @@ class CitadelHttpClient:
                 f"Citadel returned HTTP {exc.code}: {detail}",
                 status_code=exc.code,
                 error_code=error_code,
+                retrieval_receipt=retrieval_receipt,
             ) from exc
         except TimeoutError as exc:
             # A read timeout escapes urlopen unwrapped (only the connect phase
@@ -923,6 +947,11 @@ def _call(operation: str, func: Any) -> dict[str, Any]:
             metadata.append(f"code={exc.error_code}")
         if exc.status_code is not None:
             metadata.append(f"http_status={exc.status_code}")
+        if exc.retrieval_receipt is not None:
+            metadata.append(
+                "retrieval_receipt="
+                + json.dumps(exc.retrieval_receipt, sort_keys=True, separators=(",", ":"))
+            )
         suffix = f" ({', '.join(metadata)})" if metadata else ""
         raise ToolError(f"{operation} failed: {exc}{suffix}") from exc
 
