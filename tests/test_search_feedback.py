@@ -13,7 +13,7 @@ import pytest
 
 from kb.config import CitadelConfig
 from kb.feedback_store import FeedbackStore
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.search_feedback import (
     SCHEMA_VERSION,
     build_search_telemetry,
