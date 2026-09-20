@@ -221,8 +221,11 @@ clean save. **The port should render the result.**
 | `POST /feedback` | `recorded`, `improved` | user submits |
 | `GET /api/mesh` | side effect only | after submit |
 
-Body: `{qa_id, score, text, dataset, session_id}`. Reached from Search via "Use for
-feedback", which fills `qa_id` from `findFeedbackId(result)`.
+Body: `{qa_id | result_id, score (-1..1), text, dataset, session_id, correct}`. `qa_id`
+or `result_id` is required (qa_id wins); `correct` true/false maps to score 1/-1 when
+`score` is unset. A seat token may only write to its own Node: omit `dataset` and
+`session_id` (they resolve to your Node and default session), or pass your own `dataset`.
+Reached from Search via "Use for feedback", which fills `qa_id` from `findFeedbackId(result)`.
 
 ### `sources` — page ungated; individual controls gated
 

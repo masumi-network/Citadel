@@ -10,7 +10,7 @@ command**. Install the CLI and run it from your repo — the autosync hooks are
 **bundled in the package** (`kb.hooks.*`), so no vendored skill directory is needed.
 
 ```bash
-npx skills add masumi-network/citadel --skill citadel
+npx skills add masumi-network/citadel --skill '*'
 pipx install citadel-archive    # the zero-dep `citadel` base client
 # upgrade: pipx install --force citadel-archive --pip-args=--no-cache-dir
 #          (plain `pipx upgrade` can land a stale cached build)

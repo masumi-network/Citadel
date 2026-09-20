@@ -2674,6 +2674,7 @@ def guard_seat_write_policy(
             status_code=403,
             detail=(
                 f"Seat writes may only target your personal node ({node}). "
+                f"Omit the dataset, or pass dataset={node!r}, to write there. "
                 "Central is read-only; use Promotion to share org knowledge."
             ),
         )
