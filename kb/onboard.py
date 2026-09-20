@@ -131,7 +131,7 @@ def _user_prompt_submit_hook(python: str | None = None) -> dict[str, Any]:
     return {
         "type": "command",
         "command": f'"{py}" -m {SEARCH_MODULE}',
-        "timeout": 10,
+        "timeout": 15,
         "allowedEnvVars": [TOKEN_ENV, BASE_URL_ENV],
     }
 

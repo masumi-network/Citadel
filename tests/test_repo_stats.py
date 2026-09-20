@@ -207,9 +207,11 @@ def test_api_state_is_valid_with_no_token_and_no_cache(monkeypatch: Any, tmp_pat
 
     payload = client.get("/api/state").json()
 
-    assert payload["ok"] is True
+    # ok/healthy now reflect the full readiness gate; a bare test node need not
+    # be ready. This test guards the public shape under a missing GitHub token.
+    assert isinstance(payload["ok"], bool)
     # The shape /info already reads must not move.
-    for key in ("service", "version", "healthy", "sources", "totals", "updated_at"):
+    for key in ("service", "version", "healthy", "stages", "sources", "totals", "updated_at"):
         assert key in payload, f"/api/state lost {key}"
     assert "documents" in payload["totals"]
 
