@@ -27,8 +27,9 @@ done
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
-# Only ever called with our own literal command strings (no external input).
-run()  { if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] $*"; else eval "$*"; fi; }
+# Run one command argv-safe: each parameter stays a single argv item, so paths
+# with spaces or shell metacharacters are never re-split or interpreted by a shell.
+run()  { if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] $*"; else "$@"; fi; }
 
 # Prompt y/n on the real terminal even when this script is piped via `curl | sh`
 # (where stdin is the script, not the user). No tty -> default to "no".
@@ -45,7 +46,9 @@ ask() {
 
 PYTHON=""
 detect_python() {
-  for py in python3 python; do
+  # CITADEL_PYTHON wins when set, matching the pnpm wrapper's selection order.
+  for py in "${CITADEL_PYTHON:-}" python3 python; do
+    [ -n "$py" ] || continue
     if have "$py" && "$py" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null; then
       PYTHON="$py"
       return 0
@@ -58,12 +61,12 @@ install_python() {
   os="$(uname -s)"
   case "$os" in
     Darwin)
-      if have brew; then run "brew install python@3.12"
+      if have brew; then run brew install python@3.12
       else warn "Homebrew not found. Install it from https://brew.sh (or Python 3.11+ from https://python.org), then re-run."; return 1; fi ;;
     Linux)
-      if have apt-get; then run "sudo apt-get update" && run "sudo apt-get install -y python3 python3-pip python3-venv"
-      elif have dnf; then run "sudo dnf install -y python3 python3-pip"
-      elif have pacman; then run "sudo pacman -S --noconfirm python python-pip"
+      if have apt-get; then run sudo apt-get update && run sudo apt-get install -y python3 python3-pip python3-venv
+      elif have dnf; then run sudo dnf install -y python3 python3-pip
+      elif have pacman; then run sudo pacman -S --noconfirm python python-pip
       else warn "No supported package manager (apt/dnf/pacman). Install Python 3.11+ manually."; return 1; fi ;;
     *)
       warn "Unsupported OS '$os'. Install Python 3.11+ from https://python.org, then re-run."; return 1 ;;
@@ -88,19 +91,39 @@ fi
 if [ -n "$PYTHON" ]; then say "Using $("$PYTHON" --version 2>&1)"; else say "Using the freshly installed Python"; fi
 
 if have pipx; then
-  PIPX="pipx"
+  PIPX_MODE=bin
 else
   say "Installing pipx…"
-  run "${PYTHON:-python3} -m pip install --user pipx"
-  run "${PYTHON:-python3} -m pipx ensurepath"
-  PIPX="${PYTHON:-python3} -m pipx"
+  run "${PYTHON:-python3}" -m pip install --user pipx
+  run "${PYTHON:-python3}" -m pipx ensurepath
+  PIPX_MODE=module
 fi
 
-say "Installing ${PKG}…"
-# --force so re-running the installer UPGRADES an existing install (plain
-# `pipx install` is a no-op if present); --no-cache-dir so pip can't resolve a
-# stale cached wheel and pin the user to an old version.
-run "$PIPX install --force --pip-args='--no-cache-dir' $PKG"
+# Invoke pipx argv-safe, whether it is the standalone binary or `python -m pipx`.
+# A spaced or metacharacter-bearing CITADEL_PYTHON stays a single argv item.
+pipx_do() {
+  if [ "$PIPX_MODE" = module ]; then
+    run "${PYTHON:-python3}" -m pipx "$@"
+  else
+    run pipx "$@"
+  fi
+}
+
+# Install and update are separate actions. Re-running the installer must not
+# silently upgrade an existing CLI, so detect it and point at `citadel update`.
+EXISTING="$(command -v citadel 2>/dev/null || true)"
+if [ -z "$EXISTING" ] && [ -x "$HOME/.local/bin/citadel" ]; then
+  EXISTING="$HOME/.local/bin/citadel"
+fi
+if [ -n "$EXISTING" ] && [ "$DRY_RUN" != 1 ]; then
+  say "citadel is already installed ($EXISTING)."
+  say "To update it, run:  citadel update"
+  say "(The installer never upgrades an existing install.)"
+else
+  say "Installing ${PKG}…"
+  # --no-cache-dir so pip can't resolve a stale cached wheel and pin an old version.
+  pipx_do install --pip-args=--no-cache-dir "$PKG"
+fi
 
 if [ "$DRY_RUN" = 1 ]; then
   say ""

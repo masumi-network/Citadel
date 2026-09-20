@@ -1,6 +1,20 @@
 # Citadel Progress
 
-Last updated: 2026-09-15.
+Last updated: 2026-09-20.
+
+## 2026-09-20: V1 PR stack closeout (accept 4/5 defect)
+
+**Status:** Goal stopped. Closeout accepts **4/5 defect** — four v1-stack PRs are CI-green and merge-ready after branch update; one item (#326 Docker test target) was still pending at stop time.
+
+- [VERIFIED] PR **#323** (`v1/sigstore-verify`): 18/18 checks pass; mergeable; no failures.
+- [VERIFIED] PR **#324** (`v1/boundary-hardening`): 18/18 checks pass after DCO sign-off, dependency-audit anyio bump (#348), merge-conflict resolution in `tests/test_status.py`, and feedback-node test restore; `mergeState=BEHIND` — update branch before merge.
+- [VERIFIED] PR **#325** (`v1/feedback-web-key`): 18/18 checks pass; `mergeState=BEHIND` — update branch before merge. Collection error (`kb.mesh` import) was resolved on `main` via vault_activity rename (#336); branch rebased/pushed during this session.
+- [REPORTED] PR **#326** (`v1/install-packaging`): 16 checks pass, **Docker test target pending** at goal stop; ruff/test_server fixes pushed; `mergeState=BEHIND`.
+- [VERIFIED] Local branch `fix326` matches `origin/v1/install-packaging` at `5f70bc9`.
+- [NOT COMPLETE] SPEC T2–T8 (A2 readiness stages, `/api/state`, web vault-state/SectionIndex) remain on in-flight branch `fix/cognee-projection-readiness`; not part of this closeout.
+- [PLANNED] Merge order: **#323 → #324 → #325 → #326** (update each behind branch onto current `main` between merges). Do not batch-merge without updating.
+- [PLANNED] Post-merge: continue SPEC T2 per-head evidence, then T3–T8; P0 issues **#228**, **#247** remain open (local #247 proof only in T9).
+
 
 ## 2026-09-15: Readiness task checkpoint
 
