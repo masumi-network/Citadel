@@ -613,6 +613,108 @@ if (relatedNodeForEvent({{ details: {{ org: "acme.example" }} }}) !== null) proc
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_timeline_envelope_does_not_treat_org_as_dataset() -> None:
+    """#126: org/vault_id must not become timeline.dataset (bogus hub match)."""
+    import re
+    import subprocess
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    envelope = re.search(
+        r"function timelineEnvelope\(event\) \{.*?\n\}\n\nfunction timelineStatusClass",
+        app_js,
+        re.S,
+    )
+    assert envelope, "timelineEnvelope moved"
+    envelope_source = envelope.group(0).split("\n\nfunction timelineStatusClass", 1)[0]
+
+    script = f"""
+{envelope_source}
+const orgOnly = timelineEnvelope({{ type: "ingest", details: {{ org: "acme", vault_id: "v1" }} }});
+if (orgOnly.dataset !== null) process.exit(1);
+const withDataset = timelineEnvelope({{ type: "ingest", details: {{ dataset: "seat:carol", org: "acme" }} }});
+if (withDataset.dataset !== "seat:carol") process.exit(2);
+"""
+    result = subprocess.run(
+        ["node", "--input-type=commonjs", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_focus_graph_for_event_does_not_select_a_node() -> None:
+    """#126: timeline clicks must not open the Knowledge Mesh inspector."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function focusGraphForEvent(event) {" in app_js
+    focus = re.search(
+        r"function focusGraphForEvent\(event\) \{.*?\n\}\n\nfunction relatedNodeForEvent",
+        app_js,
+        re.S,
+    )
+    assert focus, "focusGraphForEvent moved"
+    body = focus.group(0)
+    assert "selectNode(" not in body, body
+    assert "return relatedNodeForEvent(event);" in body
+
+    # Also pin that selectTimelineEvent still calls focusGraphForEvent (for the
+    # Event inspector Graph focus line) without invoking selectNode itself.
+    select = re.search(
+        r"function selectTimelineEvent\(event\) \{.*?\n\}\n",
+        app_js,
+        re.S,
+    )
+    assert select, "selectTimelineEvent moved"
+    select_body = select.group(0)
+    assert "focusGraphForEvent(event)" in select_body
+    assert "selectNode(" not in select_body
+
+
+def test_update_graph_meta_does_not_resurrect_loading_after_failure() -> None:
+    """#126: argless updateGraphMeta after a failed fetch must not say Loading."""
+    import re
+    import subprocess
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    meta = re.search(
+        r"function updateGraphMeta\(message\) \{.*?\n\}\n\nfunction",
+        app_js,
+        re.S,
+    )
+    assert meta, "updateGraphMeta moved"
+    meta_source = meta.group(0).rsplit("\n\nfunction", 1)[0]
+    assert "realGraphLoading" in meta_source
+    assert "realGraphError" in meta_source
+
+    script = f"""
+const graphMeta = {{ textContent: "" }};
+const state = {{
+  graphMode: "knowledge",
+  realGraph: null,
+  realGraphLoading: false,
+  realGraphError: "Knowledge Mesh unavailable",
+}};
+{meta_source}
+updateGraphMeta();
+if (graphMeta.textContent !== "Knowledge Mesh unavailable") process.exit(1);
+state.realGraphError = null;
+updateGraphMeta();
+if (graphMeta.textContent !== "Knowledge Mesh unavailable") process.exit(2);
+state.realGraphLoading = true;
+updateGraphMeta();
+if (graphMeta.textContent !== "Loading Knowledge Mesh") process.exit(3);
+"""
+    result = subprocess.run(
+        ["node", "--input-type=commonjs", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_graph_inspector_walks_payload_edges_to_nearest_document() -> None:
     """The #186 inspector chain dead-ended on ~100% of rendered nodes: its
     candidates (the node itself plus one-hop document-bearing neighbors) are
