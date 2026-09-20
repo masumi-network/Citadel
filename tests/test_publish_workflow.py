@@ -213,7 +213,7 @@ def test_keyless_attestation_and_pypi_fail_closed_on_oci_gates() -> None:
     assert "id-token: write" in attestation
     assert "attestations: write" in attestation
     assert "artifact-metadata: write" in attestation
-    assert "uses: docker/login-action@v3" in attestation
+    assert "uses: docker/login-action@v4" in attestation
     assert "uses: actions/attest@v4" in attestation
     assert "subject-digest: ${{ needs.stage-image.outputs.digest }}" in attestation
     assert "push-to-registry: true" in attestation

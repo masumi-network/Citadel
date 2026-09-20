@@ -176,26 +176,84 @@ def test_detector_never_logs_the_content_it_measured(caplog: Any) -> None:
     assert "sha256:" in joined
 
 
-def test_window_is_read_from_the_model_not_from_a_constant() -> None:
-    """The window comes from the tokenizer the embedder will actually use."""
+def test_configured_model_tokenizer_is_offline_and_untruncated(monkeypatch: Any) -> None:
+    """The BGE tokenizer used for repair is cached and not GPT-4o BPE."""
+    monkeypatch.setenv("CITADEL_EMBEDDING_PROFILE", "fastembed")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    configured = chunk_window.configured_embedding_tokenizer()
+    assert os.environ.get("HF_HUB_OFFLINE") is None
+    source = "HEAD_MARKER " + ("filler text " * 900) + " DISTINCTIVE_TAIL_MARKER"
+    full_ids = configured.tokenizer.encode(source).ids
+    tail_ids = configured.tokenizer.encode(
+        " DISTINCTIVE_TAIL_MARKER", add_special_tokens=False
+    ).ids
 
-    class _Tok:
-        truncation = {"max_length": 384, "stride": 0}
+    assert configured.model == "BAAI/bge-small-en-v1.5"
+    assert configured.window == 512
+    assert configured.tokenizer.truncation is None
+    assert len(full_ids) > configured.window
 
-        def encode(self, text: str) -> Any:  # pragma: no cover - not called here
-            raise AssertionError
+    from tokenizers import Tokenizer
 
-    class _Model:
-        tokenizer = _Tok()
+    truncated = Tokenizer.from_str(configured.tokenizer.to_str())
+    truncated.enable_truncation(max_length=configured.window)
+    truncated_ids = truncated.encode(source).ids
+    assert len(truncated_ids) == configured.window
+    assert not any(
+        truncated_ids[index : index + len(tail_ids)] == tail_ids
+        for index in range(configured.window - len(tail_ids) + 1)
+    )
 
-    class _TextEmbedding:
-        model = _Model()
+    chunks = list(
+        chunk_window.iter_budget_chunks(
+            source,
+            budget=configured.window,
+            count_tokens=configured.count_tokens,
+        )
+    )
+    assert len(chunks) > 1
+    assert "".join(text for text, _ in chunks) == source
+    assert all(configured.count_tokens(text) <= configured.window for text, _ in chunks)
+    assert max(token_count for _, token_count in chunks) <= configured.window
 
-    class _Engine:
-        embedding_model = _TextEmbedding()
+def test_v11_non_monotonic_prefix_counter_cannot_yield_oversized_piece() -> None:
+    """A non-monotonic counter must bound output or fail closed.
 
-    assert chunk_window.resolve_model_window(_Engine()) == 384
+    The repeated full-prefix measurements deliberately disagree: binary search
+    observes an in-budget prefix, then piece measurement observes that same
+    piece over budget. Before V11, a non-empty ``current`` accepted that piece
+    and the final yield leaked it.
+    """
+    calls: dict[str, int] = {}
 
+    def non_monotonic_prefix_counter(value: str) -> int:
+        occurrence = calls.get(value, 0)
+        calls[value] = occurrence + 1
+        if value == "a ":
+            return 1
+        if value == "a badword ":
+            return 3
+        if value == "badword ":
+            return 3 if occurrence in {0, 2, 3} else 1
+        if value.startswith("bad"):
+            return 1
+        return len(value)
+
+    source = "a badword "
+    budget = 2
+    try:
+        chunks = list(
+            chunk_window.iter_budget_chunks(
+                source, budget=budget, count_tokens=non_monotonic_prefix_counter
+            )
+        )
+    except chunk_window.ChunkBudgetValidationError:
+        return
+
+    assert "".join(text for text, _ in chunks) == source
+    assert all(token_count <= budget for _, token_count in chunks)
 
 def test_unresolvable_window_is_recorded_rather_than_assumed() -> None:
     """No window means no measurement — say so, do not invent 512."""

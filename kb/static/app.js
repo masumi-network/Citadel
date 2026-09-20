@@ -106,6 +106,10 @@ const state = {
   graphDataset: "",
   realGraph: null,
   realGraphLoading: false,
+  // Last knowledge-graph load error shown by updateGraphMeta when there is no
+  // payload. Cleared on a successful fetch so a later snapshot refresh cannot
+  // resurrect "Loading Knowledge Mesh" after a failure (#126).
+  realGraphError: null,
   conflicts: [],
   conflictFilter: "open",
 };
@@ -1065,6 +1069,9 @@ function timelineEventItem(event) {
 
 function selectTimelineEvent(event) {
   state.selectedEventId = event.id;
+  // Resolve a related graph node for the Event inspector "Graph focus" line
+  // only. Do not call selectNode here — that opens the Knowledge Mesh inspector
+  // for a heuristic match and was the #126 bogus-inspector bug.
   focusGraphForEvent(event);
   if (state.snapshot) {
     renderTimeline(state.snapshot);
@@ -1117,7 +1124,9 @@ function timelineEnvelope(event) {
   return {
     kind: event.type || "event",
     status: event.type === "error" ? "failed" : details.status || "recorded",
-    dataset: details.dataset || details.org || details.vault_id || null,
+    // Only a real dataset field counts. Falling back to org/vault_id made an
+    // activity event resolve to a dataset hub and open the wrong inspector (#126).
+    dataset: details.dataset || null,
     source: details.source || details.operation || "runtime",
     metrics: {},
   };
@@ -1131,11 +1140,9 @@ function timelineStatusClass(event, timeline = timelineEnvelope(event)) {
 }
 
 function focusGraphForEvent(event) {
-  const node = relatedNodeForEvent(event);
-  if (node) {
-    selectNode(node);
-  }
-  return node;
+  // Return the related node for Event inspector copy only. Selecting it here
+  // would open #selectedNode / loadNodeDocument for a timeline click (#126).
+  return relatedNodeForEvent(event);
 }
 
 function relatedNodeForEvent(event) {
@@ -2872,7 +2879,16 @@ function updateGraphMeta(message) {
   if (state.graphMode === "knowledge") {
     const payload = state.realGraph?.payload;
     if (!payload) {
-      graphMeta.textContent = "Loading Knowledge Mesh";
+      // Distinguishes in-flight load from a completed failure. Without this,
+      // every later argless updateGraphMeta() (e.g. after a mesh snapshot)
+      // resurrected "Loading Knowledge Mesh" forever (#126).
+      if (state.realGraphLoading) {
+        graphMeta.textContent = "Loading Knowledge Mesh";
+      } else if (state.realGraphError) {
+        graphMeta.textContent = state.realGraphError;
+      } else {
+        graphMeta.textContent = "Knowledge Mesh unavailable";
+      }
       return;
     }
     // A fallback payload has no real content (only presence hubs), so the
@@ -3194,6 +3210,7 @@ async function loadKnowledgeGraph(force = false) {
     return;
   }
   state.realGraphLoading = true;
+  state.realGraphError = null;
   updateGraphMeta("Loading Knowledge Mesh");
   try {
     let payload;
@@ -3212,6 +3229,7 @@ async function loadKnowledgeGraph(force = false) {
       payload = await fetchMeshGraphWithBackoff();
     }
     state.realGraph = shapeRealGraph(payload);
+    state.realGraphError = null;
     updateGraphDatasetFilter();
     if (state.graphMode === "knowledge") {
       buildGraphScene();
@@ -3225,13 +3243,15 @@ async function loadKnowledgeGraph(force = false) {
     if (error && error.status === 429) {
       // Retries exhausted: soft, non-error status (no toast) so a login-burst
       // 429 doesn't read as a failure. Next view switch / refresh retries.
+      state.realGraphError = "Knowledge Mesh is busy — refresh in a moment";
       if (state.graphMode === "knowledge") {
-        updateGraphMeta("Knowledge Mesh is busy — refresh in a moment");
+        updateGraphMeta(state.realGraphError);
       }
     } else {
+      state.realGraphError = "Knowledge Mesh unavailable";
       showToast(`Could not load the Knowledge Mesh: ${error.message}`, "error");
       if (state.graphMode === "knowledge") {
-        updateGraphMeta("Knowledge Mesh unavailable");
+        updateGraphMeta(state.realGraphError);
       }
     }
   } finally {

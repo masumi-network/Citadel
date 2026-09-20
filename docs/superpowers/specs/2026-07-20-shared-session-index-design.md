@@ -27,7 +27,7 @@ records it in a place teammates can find.
 | Component | File | State |
 |---|---|---|
 | SessionEnd distiller | `kb/hooks/sync_session.py` | Ships. Deterministic distill into task / outcome / files / decision-marker snippets. Writes to the seat **Node** only. |
-| SessionStart injector | `kb/hooks/sync_start.py` | Ships. Proactive search guidance + optional share prompt; no teammate trace push (search-only discovery). |
+| SessionStart injector | `kb/hooks/sync_start.py` | Ships. Proactive search guidance; may inject bounded repo-scoped workspace candidates, but does not push or share traces. |
 | Share + distill | `kb/session_trace_distill.py`, `kb/session_trace.py`, `POST /api/share-session`, `citadel_share_session` | **Shipped (v1).** Client distill + redact; server LLM dead-end refinement when tool errors exist; dual-write to Node + `session-traces`. |
 | Search | `citadel_search`, `POST /search` | **Shipped (v1).** Default scope: seat **Node** + **Central** + `session-traces`; split sections; reference-only trust on trace hits. |
 
@@ -112,9 +112,10 @@ Roots** is deferred until `citadel unshare` exists.
 5. **Redact client-side, don't reject server-side.** `redact_commands()` runs
    before transport. Server secret scan remains defense in depth.
 
-6. **Search, not push.** Agents discover traces via **`citadel_search`**, not
-   SessionStart injection. **`citadel_prior_work`** (overlap-ranked lookup) is
-   **v1.1**.
+6. **Search, not push.** Agents discover traces via **`citadel_search`**.
+   SessionStart may inject bounded repo-scoped workspace candidates, but it
+   does not push or share traces. **`citadel_prior_work`** (overlap-ranked lookup)
+   is **v1.1**.
 
 7. **Resolution is a fact about an approach, never a verdict on a person.**
    Recorded per dead end, not stamped on the session or its author.

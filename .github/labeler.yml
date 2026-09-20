@@ -74,7 +74,7 @@
   - changed-files:
       - any-glob-to-any-file:
           - "kb/knowledge_mesh.py"
-          - "kb/mesh.py"
+          - "kb/vault_activity.py"
 
 "area/web":
   - changed-files:

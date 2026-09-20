@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 
 import { MEASURE } from "@/components/ui";
-import { useVaultState, versionLabel } from "@/lib/vault-state";
+import { useVaultState, versionLabel, type VaultState } from "@/lib/vault-state";
 
 export type Section = { id: string; label: string };
 
@@ -44,13 +44,25 @@ function useActiveSection(sections: Section[]): string | null {
   return active;
 }
 
-function useHealth(): { text: string; down: boolean } {
-  const { state } = useVaultState();
-  if (!state) return { text: `Live · ${FALLBACK_VERSION}`, down: false };
+export type HealthPill = { text: string; tone: "good" | "warn" | "muted" };
+
+/** Maps a settled /api/state read to the pill. Pure, so it is unit-tested
+    without React. null while unsettled is Loading, not a false-green Live. */
+export function healthPill(
+  state: VaultState | null,
+  settled: boolean
+): HealthPill {
+  if (!settled) return { text: "Loading", tone: "muted" };
+  if (!state) return { text: "Unavailable · reload page", tone: "warn" };
   const version = versionLabel(state.version) || FALLBACK_VERSION;
   return state.healthy === false
-    ? { text: `Degraded · ${version}`, down: true }
-    : { text: `Live · ${version}`, down: false };
+    ? { text: `Degraded · ${version}`, tone: "warn" }
+    : { text: `Live · ${version}`, tone: "good" };
+}
+
+function useHealth(): HealthPill {
+  const { state, settled } = useVaultState();
+  return healthPill(state, settled);
 }
 
 const LINK =
@@ -86,12 +98,18 @@ export function SectionIndex({ sections }: { sections: Section[] }) {
         ))}
         <span
           className={`ml-auto inline-flex flex-none items-center gap-[7px] self-center rounded-full border border-transparent px-[13px] py-1.5 text-[12.5px] font-medium max-[620px]:px-2.5 max-[620px]:text-[12px] max-[720px]:sticky max-[720px]:right-0 max-[720px]:z-[1] ${
-            health.down
-              ? "bg-warn-bg text-warn max-[720px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]"
-              : "bg-good-bg text-good max-[720px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]"
+            {
+              good: "bg-good-bg text-good max-[720px]:[background:linear-gradient(var(--good-bg),var(--good-bg)),var(--ground)]",
+              warn: "bg-warn-bg text-warn max-[720px]:[background:linear-gradient(var(--warn-bg),var(--warn-bg)),var(--ground)]",
+              muted: "bg-ground text-ink-2",
+            }[health.tone]
           }`}
         >
-          <span className={`size-[7px] rounded-full ${health.down ? "bg-warn" : "bg-good"}`} />
+          <span
+            className={`size-[7px] rounded-full ${
+              { good: "bg-good", warn: "bg-warn", muted: "bg-ink-2" }[health.tone]
+            }`}
+          />
           <span>{health.text}</span>
         </span>
       </div>

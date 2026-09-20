@@ -268,8 +268,9 @@ async def _linear_sync_stage_async() -> int:
     """Sync the Linear workspace into Central (+ seat mirrors) for the evolve cron.
 
     No-op (exit 0) when ``CITADEL_LINEAR_API_KEY`` is unset, so the stage is safe
-    to leave enabled. The Central write lands in shared Postgres/pgvector; the
-    evolve cognify stage then folds it into the graph. Incremental
+    to leave enabled. The Central write lands in the configured relational and
+    vector stores (Lite: SQLite + Qdrant; Postgres self-host may use pgvector);
+    the evolve cognify stage then folds it into the graph. Incremental
     (``force=False``, #90): issues whose ``updatedAt`` predates the stored
     cursor are skipped — the explicit ``CITADEL_RUN_MODE=linear-sync`` job
     stays a forced full sync.
