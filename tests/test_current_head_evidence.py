@@ -203,7 +203,9 @@ def test_current_head_evidence_is_diagnostic_complete_but_fails_partial_result(
     result = _evidence(store, searchable_key, "github:missing:path:none.md", pending_key)
 
     assert result.ok is False
-    assert [row.source_key for row in result.evidence] == [searchable_key]
+    assert [row.source_key for row in result.evidence] == [searchable_key, pending_key]
+    assert result.evidence[1].state == "pending"
+    assert store.read_retained_content(result.evidence[1].source_revision_id) == b"pending"
     assert [(error.source_key, error.code) for error in result.errors] == [
         ("github:missing:path:none.md", "CURRENT_HEAD_MISSING"),
         (pending_key, "RECEIPT_NOT_SEARCHABLE"),
@@ -357,7 +359,16 @@ def test_current_head_evidence_does_not_use_historical_searchable_projection(
     result = _evidence(store, source_key)
 
     assert result.ok is False
-    assert result.evidence == ()
+    # The current head is reported with its own pending state and current
+    # content; the superseded revision's searchable projection is never used.
+    assert [row.source_key for row in result.evidence] == [source_key]
+    assert result.evidence[0].state == "pending"
+    assert result.evidence[0].source_revision_id == current.source_revision_id
+    assert {receipt.state for receipt in result.evidence[0].receipts} == {"pending"}
+    assert (
+        store.read_retained_content(result.evidence[0].source_revision_id)
+        == b"current pending"
+    )
     assert result.errors[0].code == "RECEIPT_NOT_SEARCHABLE"
     assert result.errors[0].projection_job_ids == (current.projection_job_id,)
     assert result.errors[0].backend_states == {
