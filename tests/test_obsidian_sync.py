@@ -147,3 +147,25 @@ def test_unknown_vault_raises_key_error(tmp_path: Path) -> None:
 
     with pytest.raises(KeyError):
         sync.manifest(vault_id="vault_missing")
+
+
+def test_duplicate_normalized_paths_rejected_without_mutation(tmp_path: Path) -> None:
+    sync, vault_id = vault_store(tmp_path)
+    # Seed one document so a rejected batch has an existing manifest to preserve.
+    push_one(sync, vault_id, path="notes/a.md", content="Original")
+    before = sync.manifest(vault_id=vault_id)
+
+    # ``notes/a.md`` and ``./notes/a.md`` collapse to the same normalized path.
+    with pytest.raises(ValueError, match="Duplicate normalized path"):
+        sync.push(
+            vault_id=vault_id,
+            actor=ACTOR,
+            documents=[
+                SyncPushDocument(path="notes/a.md", content="First", base_rev=1),
+                SyncPushDocument(path="./notes/a.md", content="Second", base_rev=1),
+            ],
+        )
+
+    after = sync.manifest(vault_id=vault_id)
+    assert after["documents"] == before["documents"]
+    assert after["next_cursor"] == before["next_cursor"]

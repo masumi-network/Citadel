@@ -262,3 +262,61 @@ def test_onboard_json_no_prompts(tmp_path: Path, monkeypatch, capsys) -> None:
     assert "git pre-push hook" in names and "SessionEnd hook" in names
     assert "…" in out["token_masked"]  # masked, never the raw token
     assert "ctdl_headless_abcdef1234" not in json.dumps(out)
+
+
+def test_default_status_json_is_redacted_and_allowlisted(monkeypatch, capsys) -> None:
+    # Default `citadel status --json` must never smoke /search, never pull the
+    # full mesh graph, and must carry no graph nodes/edges/events, query labels,
+    # or token-derived values.
+    from kb.status import Check, StatusReport
+
+    seen: list[tuple[str, object]] = []
+
+    def fake_gather(node_url, token, **kw):
+        seen.append(("with_search", kw.get("with_search")))
+        return StatusReport(
+            node_url=node_url,
+            healthy=True,
+            identity={"seat_slug": "alice", "role": "writer", "scopes": ["kb:search"]},
+            checks=[
+                Check("node", True, "healthy"),
+                Check("auth", True, "valid"),
+                Check("token", True, "…6789"),
+            ],
+            recent=[
+                {
+                    "title": "feat: safe",
+                    "created_at": "2026-06-27T10:00:00",
+                    "actor_id": "principal_secret",
+                    "token": "ctdl_hostiletoken",
+                    "dataset": "seat:alice",
+                    "detail": {"query": "confidential text"},
+                }
+            ],
+            repo=".",
+        )
+
+    def fake_summary(node_url, token, **kw):
+        return {"detail": "summary", "tracked_sources": 3}
+
+    def forbidden_full_mesh(*_a, **_k):
+        raise AssertionError("default --json must not fetch the full mesh graph")
+
+    monkeypatch.setattr("kb.cli.gather_status", fake_gather)
+    monkeypatch.setattr("kb.cli.fetch_mesh_summary", fake_summary)
+    monkeypatch.setattr("kb.cli.fetch_mesh", forbidden_full_mesh)
+    rc = _run(["status", "--json", "--node-url", "https://node.example"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    blob = json.dumps(out)
+    assert "6789" not in blob
+    token_check = next(item for item in out["checks"] if item["name"] == "token")
+    assert token_check["detail"] == "configured"
+    assert ("with_search", False) in seen  # never the /search smoke by default
+    assert "nodes" not in blob and "edges" not in blob and "events" not in blob
+    assert "query" not in blob
+    assert "…" not in blob  # no masked token suffix
+    # Hostile recent-row fields are gone; only display scalars survive.
+    for leaked in ("principal_secret", "ctdl_hostiletoken", "seat:alice", "confidential text"):
+        assert leaked not in blob
+    assert out["recent"] == [{"title": "feat: safe", "created_at": "2026-06-27T10:00:00"}]
