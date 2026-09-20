@@ -194,6 +194,9 @@ jobs:
       - name: Typecheck Next app
         run: npm run typecheck --workspace web
 
+      - name: Run frontend unit tests
+        run: npm run test --workspace web
+
       - name: Build committed frontend export
         run: npm run build:web
 
