@@ -556,7 +556,6 @@ The local stdio wrapper is still available for offline/dev use:
 ```bash
 CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag
 CITADEL_MCP_ACCESS_TOKEN=ctdl_...
-CITADEL_MCP_DEFAULT_DATASET=masumi-network
 CITADEL_MCP_MAX_INGEST_BYTES=200000
 uv --directory "/absolute/path/to/Citadel" run python -m kb.mcp_server
 ```
@@ -639,15 +638,17 @@ Citadel stores only the SHA-256 hash. The raw token is shown once at creation.
 
 | Tool | Description | Parameters |
 |---|---|---|
-| `citadel_ingest` | Store durable context and queue background relational and vector projection; graph enrichment stays in the scheduled lane | `data`, `dataset?`, `tags?`, `session_id?` |
+| `citadel_ingest` | Store durable context and queue background relational and vector projection; graph enrichment stays in the scheduled lane | `data`, `dataset?`, `tags?`, `session_id?`, `cognify?` |
 | `citadel_record_feedback` | Explicit QA / hit rating (writer). Prefer after reading search hits: pass hit `id` or `search_id` as `qa_id`/`result_id`, plus `score` 1\|-1 or `correct` true\|false. Complements automatic search telemetry. | `qa_id?`, `result_id?`, `score?`, `text?`, `session_id?`, `dataset?`, `correct?` |
 | `citadel_share_session` | Volunteer a Shared Session Trace for teammates to find via search. Writes to `session-traces` (reference-only). Ask the user before calling | `cwd`, `data?`, `transcript_path?`, `capture_roots?`, `has_tool_errors?` |
 | `citadel_contribute` | Titled Vault Contribution to Central through the Learning Process, with conflict detection. Not available to seat-writer tokens (403) | `title`, `content`, `tags?`, `source_url?`, `dataset?` |
 
 `citadel_ingest` and CLI `citadel ingest` use capture-only writes by default.
-The background vector lane may make a note searchable without a generative LLM.
-Graph enrichment runs in the scheduled lane. The user-facing MCP and CLI paths
-reject inline Cognify requests.
+The optional `cognify` parameter defaults to `false`. Setting `cognify=true`
+(or CLI `--cognify`) is rejected with `COGNIFY_SCHEDULER_ONLY`: user ingest
+never runs inline Cognify. The background vector lane may make a note
+searchable without a generative LLM. Graph enrichment runs in the scheduled
+lane.
 
 ### Admin Tools
 
@@ -675,10 +676,13 @@ reject inline Cognify requests.
 |---|---|---|
 | `CITADEL_HTTP_BASE_URL` | `http://localhost:8000` | Citadel backend URL |
 | `CITADEL_MCP_ACCESS_TOKEN` | — | Bearer token for Citadel API |
-| `CITADEL_MCP_DEFAULT_DATASET` | — | Dataset used by `citadel_search` when callers omit `dataset` |
 | `CITADEL_MCP_MAX_INGEST_BYTES` | `200000` | Max ingest payload size |
 | `CITADEL_MCP_ALLOW_INSECURE_HTTP` | `false` | Allow non-localhost HTTP |
 | `CITADEL_MCP_TRANSPORT` | `stdio` | MCP transport (stdio or sse) |
+
+`CITADEL_MCP_DEFAULT_DATASET` is not read by `kb/`. When `citadel_search`
+omits `dataset`, the Node resolves the dataset server-side
+(`CITADEL_SEARCH_DEFAULT_DATASET` / `CITADEL_DEFAULT_DATASET`).
 
 ---
 
