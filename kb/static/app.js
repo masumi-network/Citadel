@@ -88,6 +88,7 @@ const state = {
   meSummaryError: false,
   promotions: [],
   sources: [],
+  sourceSummary: {},
   auditFilter: "all",
   // Knowledge Mesh is the durable view; Vault Activity is restart-transient and
   // therefore empty on every fresh boot/redeploy — a bad first impression.
@@ -106,10 +107,6 @@ const state = {
   graphDataset: "",
   realGraph: null,
   realGraphLoading: false,
-  // Last knowledge-graph load error shown by updateGraphMeta when there is no
-  // payload. Cleared on a successful fetch so a later snapshot refresh cannot
-  // resurrect "Loading Knowledge Mesh" after a failure (#126).
-  realGraphError: null,
   conflicts: [],
   conflictFilter: "open",
 };
@@ -214,16 +211,6 @@ const graphViewMenu = document.getElementById("graphViewMenu");
 const graphViewLabel = document.getElementById("graphViewLabel");
 const realGraphEmpty = document.getElementById("realGraphEmpty");
 const graphLegend = document.getElementById("graphLegend");
-const graphControls = document.getElementById("graphControls");
-const graphZoomIn = document.getElementById("graphZoomIn");
-const graphZoomOut = document.getElementById("graphZoomOut");
-const graphFitAll = document.getElementById("graphFitAll");
-const graphFitSelection = document.getElementById("graphFitSelection");
-const graphClearSelection = document.getElementById("graphClearSelection");
-const graphNodeDirectory = document.getElementById("graphNodeDirectory");
-const graphNodeDirectoryList = document.getElementById("graphNodeDirectoryList");
-const graphNodeDirectoryCount = document.getElementById("graphNodeDirectoryCount");
-const graphSelectionStatus = document.getElementById("graphSelectionStatus");
 const toastStack = document.getElementById("toastStack");
 const searchResultStatus = document.getElementById("searchResultStatus");
 const pageButtons = Array.from(document.querySelectorAll("[data-page-target]"));
@@ -286,12 +273,15 @@ function renderSubtabs(activePage) {
   });
   subtabBar.hidden = subtabBar.children.length < 2;
 }
+const sensitiveDetailPattern = /(token|secret|password|authorization|body|content|text|query)$/i;
+
+// force-graph instance + render state. Selection/highlight live here so the
+// node/link accessors can dim non-neighbours cheaply during hover.
 const graph = {
   instance: null,
   width: 1,
   height: 1,
   viewInitialized: false,
-  visibilityFitted: false,
   centralId: null,
   highlightNodes: new Set(),
   highlightLinks: new Set(),
@@ -299,7 +289,6 @@ const graph = {
 };
 let graphNodeMatches = [];
 let graphNodeMatchIndex = -1;
-const sensitiveDetailPattern = /(token|secret|password|authorization|body|content|text|query)$/i;
 
 // Shared Central dataset (config.github_sync_dataset / access.CENTRAL_DATASET).
 const CENTRAL_DATASET = "masumi-network";
@@ -531,6 +520,13 @@ function buildForceGraphData() {
   let links = [];
   for (const edge of source.edges) {
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+    const relationship = String(edge.relationship || edge.label || "").toLowerCase();
+    if (
+      state.graphMode === "knowledge" &&
+      (relationship === "contains" || relationship === "is_part_of")
+    ) {
+      continue;
+    }
     // Projection edges carry "label", knowledge edges "relationship" —
     // normalize so linkLabel tooltips work in both modes.
     links.push({
@@ -544,6 +540,14 @@ function buildForceGraphData() {
   // the raw graph (state.realGraph) stays untouched for inspection/search.
   if (state.graphMode === "knowledge" && state.graphAggregate !== false) {
     ({ nodes, links } = aggregateKnowledgeMesh(nodes, links));
+  }
+  if (state.graphMode === "knowledge") {
+    const connected = new Set(links.flatMap((link) => [link.source, link.target]));
+    nodes = nodes.filter(
+      (node) => nodeKind(node) === "dataset" || nodeKind(node) === "seat" || connected.has(node.id),
+    );
+    const visible = new Set(nodes.map((node) => node.id));
+    links = links.filter((link) => visible.has(link.source) && visible.has(link.target));
   }
   // resolveCentralId's highest-degree fallback reads node.neighbors, which is
   // only populated by rebuildNeighborLinks — so resolve AFTER the first pass,
@@ -802,14 +806,9 @@ function setPage(name) {
   if (allowed && window.location.hash !== `#${name}`) {
     window.history.replaceState(null, "", `#${name}`);
   }
-  // A hidden canvas reports zero dimensions, so resize and fit once after the
-  // Knowledge page becomes visible.
+  // force-graph keeps its own layout across page switches; just re-fit the
+  // canvas to the (possibly newly-visible) container without re-seeding.
   resizeCanvas();
-  if (resolvedName === "knowledge") {
-    resizeGraphForVisibility();
-  } else {
-    graph.visibilityFitted = false;
-  }
   if (resolvedName === "access") {
     loadAccess();
   }
@@ -885,17 +884,6 @@ function resizeCanvas() {
   graph.height = Math.max(1, rect.height);
   if (!graph.instance) return;
   graph.instance.width(graph.width).height(graph.height);
-}
-
-function resizeGraphForVisibility() {
-  if (!canvas || canvas.closest('[data-page="knowledge"]')?.hidden) {
-    graph.visibilityFitted = false;
-    return;
-  }
-  resizeCanvas();
-  if (!graph.instance || graph.visibilityFitted) return;
-  graph.visibilityFitted = true;
-  graph.instance.zoomToFit(600, 40);
 }
 
 function mergeGraph(snapshot) {
@@ -1069,9 +1057,6 @@ function timelineEventItem(event) {
 
 function selectTimelineEvent(event) {
   state.selectedEventId = event.id;
-  // Resolve a related graph node for the Event inspector "Graph focus" line
-  // only. Do not call selectNode here — that opens the Knowledge Mesh inspector
-  // for a heuristic match and was the #126 bogus-inspector bug.
   focusGraphForEvent(event);
   if (state.snapshot) {
     renderTimeline(state.snapshot);
@@ -1124,9 +1109,7 @@ function timelineEnvelope(event) {
   return {
     kind: event.type || "event",
     status: event.type === "error" ? "failed" : details.status || "recorded",
-    // Only a real dataset field counts. Falling back to org/vault_id made an
-    // activity event resolve to a dataset hub and open the wrong inspector (#126).
-    dataset: details.dataset || null,
+    dataset: details.dataset || details.org || details.vault_id || null,
     source: details.source || details.operation || "runtime",
     metrics: {},
   };
@@ -1140,9 +1123,11 @@ function timelineStatusClass(event, timeline = timelineEnvelope(event)) {
 }
 
 function focusGraphForEvent(event) {
-  // Return the related node for Event inspector copy only. Selecting it here
-  // would open #selectedNode / loadNodeDocument for a timeline click (#126).
-  return relatedNodeForEvent(event);
+  const node = relatedNodeForEvent(event);
+  if (node) {
+    selectNode(node);
+  }
+  return node;
 }
 
 function relatedNodeForEvent(event) {
@@ -1952,7 +1937,7 @@ const LABEL_ZOOM_THRESHOLD = 1.6;
 // floored to this many SCREEN px (divided by globalScale, the same zoom
 // compensation drawNodeLabel uses) without changing the painted size.
 const NODE_REL_SIZE = 4;
-const MIN_NODE_HIT_RADIUS_PX = 6;
+const MIN_NODE_HIT_RADIUS_PX = 12;
 
 function initializeGraph() {
   if (!window.ForceGraph) {
@@ -1969,6 +1954,8 @@ function initializeGraph() {
     .height(graph.height)
     .backgroundColor("rgba(0,0,0,0)")
     .nodeId("id")
+    .enableNodeDrag(true)
+    .enablePanInteraction(true)
     .nodeRelSize(NODE_REL_SIZE)
     .nodeVal(nodeValue)
     .nodeColor(nodeColor)
@@ -2097,7 +2084,6 @@ function renderGraph() {
   });
 
   graph.instance.graphData({ nodes: data.nodes, links: data.links });
-  renderGraphNodeDirectory(data.nodes);
   renderGraphNodeSearchResults();
   graph.instance.centerAt(0, 0);
   // Arm a settle-fit for this data set (handled by onEngineStop); keep a single
@@ -2155,20 +2141,6 @@ function resetGraphView() {
   if (graph.instance) graph.instance.zoomToFit(600, 40);
 }
 
-function zoomGraphBy(factor) {
-  if (!graph.instance || typeof graph.instance.zoom !== "function") return;
-  const current = Number(graph.instance.zoom()) || 1;
-  graph.instance.zoom(clamp(current * factor, 0.2, 8), 250);
-}
-
-function fitSelectedGraphNode() {
-  if (!state.selectedId) return;
-  const rendered = renderedGraphNodes().find((node) => node.id === state.selectedId);
-  if (!rendered || !Number.isFinite(rendered.x) || !Number.isFinite(rendered.y)) return;
-  graph.instance.centerAt(rendered.x, rendered.y, 400);
-  if (typeof graph.instance.zoom === "function") graph.instance.zoom(2.2, 400);
-}
-
 // Pause/resume the force engine (wired to the Pause button).
 function setGraphPaused(paused) {
   if (!graph.instance) return;
@@ -2189,18 +2161,8 @@ function truncate(value, length) {
 
 function selectNode(node) {
   state.selectedId = node?.id || null;
-  updateGraphFitSelectionState();
-  if (graphSelectionStatus) {
-    graphSelectionStatus.textContent = node
-      ? `Selected ${node.label || node.id || "node"}.`
-      : "No node selected.";
-  }
-  if (node) {
-    renderGraphNodeDirectory();
-  }
   if (!node) {
     selectedNode.textContent = "Select a note or node to inspect its links.";
-    renderGraphNodeDirectory();
     updateNodeSelection();
     return;
   }
@@ -2215,29 +2177,18 @@ function selectNode(node) {
       <p>${escapeHtml(formatDetails(node.metadata || {}))}</p>
     `;
   }
-  // Dataset hubs (seat presence + Central) never have stored document text.
-  // The inspector shows their presence counts instead, so skip the fetch.
+  // Dataset hubs (seat presence + Central) never have stored document text —
+  // the inspector shows their presence counts instead, so skip the fetch
+  // rather than fire a guaranteed 404.
   if (state.graphMode === "knowledge" && node.id && node.type !== "dataset") {
     loadNodeDocument(node);
   }
   updateNodeSelection();
 }
 
-function reconcileGraphSelection() {
-  if (!state.selectedId) return;
-  const visible = renderedGraphNodes().some((node) => node.id === state.selectedId);
-  if (visible) return;
-  state.selectedId = null;
-  selectedNode.textContent = "Select a note or node to inspect its links.";
-  if (graphSelectionStatus) graphSelectionStatus.textContent = "No node selected.";
-  if (graphFitSelection) graphFitSelection.disabled = true;
-  renderGraphNodeDirectory();
-  updateNodeSelection();
-}
-
 // Knowledge-mode inspector: label, kind + dataset, internal name when the
-// backend provides one, then every clickable connection from the unfiltered
-// real graph (hidden kinds still listed).
+// backend provides one, then every clickable connection from the caller-scoped
+// real graph payload (hidden kinds still listed).
 // loadNodeDocument appends the stored document text after this content.
 function renderKnowledgeInspector(node) {
   const kind = nodeKind(node);
@@ -2276,16 +2227,14 @@ function renderKnowledgeInspector(node) {
   const container = document.createElement("div");
   container.className = "node-connections";
   const heading = document.createElement("strong");
-  heading.textContent = `Connections (${neighbors.length})`;
+  heading.textContent = "Connections";
   const list = document.createElement("div");
   list.className = "node-connections-list";
   container.append(heading, list);
 
-  let showingAll = false;
   const renderConnections = () => {
     list.innerHTML = "";
-    const visibleNeighbors = showingAll ? neighbors : neighbors.slice(0, 10);
-    visibleNeighbors.forEach((item) => {
+    neighbors.forEach((item) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "node-connection";
@@ -2299,97 +2248,53 @@ function renderKnowledgeInspector(node) {
       labelText.className = "node-connection-label";
       labelText.textContent = label;
       button.append(relationshipText, labelText);
-      // Resolve by id at click time because a graph refresh can replace the
-      // captured node object while this inspector remains mounted.
+      // Resolve by id at click time: a graph refresh replaces state.realGraph
+      // while this button persists, so the captured node object may be stale.
       const targetId = item.node.id;
       button.addEventListener("click", () => {
         const target = state.realGraph?.nodes.get(targetId);
         if (!target) return;
-        if (!focusGraphNode(targetId)) {
-          renderHiddenTargetAction(target);
-          return;
-        }
+        focusGraphNode(targetId);
         selectNode(target);
       });
       list.append(button);
     });
-    if (!showingAll && neighbors.length > 10) {
-      const more = document.createElement("button");
-      more.type = "button";
-      more.className = "node-connections-more";
-      more.textContent = `Show all ${neighbors.length} connections`;
-      more.addEventListener("click", () => {
-        showingAll = true;
-        renderConnections();
-      });
-      list.append(more);
-    }
   };
 
   renderConnections();
-
   selectedNode.append(container);
 }
 
-function renderHiddenTargetAction(node) {
-  state.selectedId = node?.id || null;
-  updateGraphFitSelectionState();
-  if (graphSelectionStatus) {
-    graphSelectionStatus.textContent = node
-      ? `Selected ${node.label || node.id || "node"}.`
-      : "No node selected.";
-  }
-  selectedNode.innerHTML = `
-    <div>
-      <strong>${escapeHtml(node.label || node.id)}</strong>
-      <span>${escapeHtml(nodeKind(node))}</span>
-    </div>
-    <p class="node-hidden-notice">Not shown in this map. This node is loaded but hidden by the current map mode or kind filter.</p>
-  `;
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "secondary-button compact-button node-show-on-canvas";
-  button.textContent = "Show on canvas";
-  button.addEventListener("click", () => showGraphNodeOnCanvas(node));
-  selectedNode.append(button);
-  renderGraphNodeDirectory();
-  updateNodeSelection();
-}
-
-function showGraphNodeOnCanvas(node) {
-  if (!node) return;
-  const kind = nodeKind(node);
-  state.graphAggregate = false;
-  state.graphHiddenKinds.delete(kind);
-  if (graphAggregateButton) {
-    graphAggregateButton.classList.remove("active");
-    graphAggregateButton.setAttribute("aria-pressed", "false");
-    graphAggregateButton.title =
-      "Raw graph: every payload node renders (legend chips filter kinds). Click to aggregate.";
-  }
-  renderGraphLegend();
-  buildGraphScene();
-  updateGraphMeta();
-  resetGraphView();
-  window.setTimeout(() => {
-    const target = state.realGraph?.nodes.get(node.id) || node;
-    focusGraphNode(node.id);
-    selectNode(target);
-  }, 0);
-}
-
-// Neighbors of a node straight from state.realGraph edges (either direction).
+// Neighbors of a node from the caller-scoped real graph payload in knowledge
+// mode. The rendered graph remains the fallback for other modes or before the
+// Knowledge Mesh payload arrives.
 function knowledgeNeighbors(nodeId) {
-  const real = state.realGraph;
-  if (!real) return [];
+  const rendered = graph.instance?.graphData?.();
+  const source =
+    state.graphMode === "knowledge" && state.realGraph
+      ? state.realGraph
+      : { nodes: rendered?.nodes, edges: rendered?.links };
+  const nodes = source.nodes instanceof Map
+    ? Array.from(source.nodes.values())
+    : Array.isArray(source.nodes)
+      ? source.nodes
+      : [];
+  const edges = Array.isArray(source.edges) ? source.edges : [];
+  if (!nodes.length) return [];
+  const byId = new Map(nodes.map((node) => [String(node.id), node]));
+  const selectedId = String(nodeId);
+  const endpointId = (endpoint) =>
+    typeof endpoint === "object" && endpoint !== null ? String(endpoint.id) : String(endpoint);
   const result = [];
   const seen = new Set();
-  for (const edge of real.edges) {
+  for (const edge of edges) {
+    const sourceId = endpointId(edge.source);
+    const targetId = endpointId(edge.target);
     let otherId = null;
-    if (edge.source === nodeId) otherId = edge.target;
-    else if (edge.target === nodeId) otherId = edge.source;
+    if (sourceId === selectedId) otherId = targetId;
+    else if (targetId === selectedId) otherId = sourceId;
     else continue;
-    const other = real.nodes.get(otherId);
+    const other = byId.get(otherId);
     if (!other) continue;
     const relationship = edge.relationship || edge.label || "related";
     const key = `${relationship}:${other.id}`;
@@ -2495,8 +2400,8 @@ function sourcingDocumentCandidates(node) {
   const seenChunks = new Set();
   for (const edge of real.edges) {
     if (String(edge.relationship || edge.label || "") !== SOURCING_RELATIONSHIP) continue;
-    const otherId =
-      edge.source === node.id ? edge.target : edge.target === node.id ? edge.source : null;
+    if (edge.target !== node.id) continue;
+    const otherId = edge.source;
     if (!otherId || seenChunks.has(otherId)) continue;
     seenChunks.add(otherId);
     const chunk = real.nodes.get(otherId);
@@ -2554,59 +2459,11 @@ function documentCandidates(node) {
 // Centre the viewport on a rendered node by id, mirroring handleNodeClick.
 // Nodes hidden by the legend filter are not rendered, so those just skip.
 function focusGraphNode(nodeId) {
-  if (!graph.instance || typeof graph.instance.graphData !== "function") return false;
+  if (!graph.instance || typeof graph.instance.graphData !== "function") return;
   const rendered = (graph.instance.graphData().nodes || []).find((item) => item.id === nodeId);
-  if (!rendered) return false;
-  if (Number.isFinite(rendered.x) && Number.isFinite(rendered.y)) {
+  if (rendered && Number.isFinite(rendered.x) && Number.isFinite(rendered.y)) {
     graph.instance.centerAt(rendered.x, rendered.y, 600);
   }
-  return true;
-}
-
-function renderGraphNodeDirectory(nodesOverride = null) {
-  if (!graphNodeDirectoryList) return;
-  const nodes = (Array.isArray(nodesOverride) ? nodesOverride : renderedGraphNodes())
-    .slice()
-    .sort((left, right) =>
-      String(left.label || left.id).localeCompare(String(right.label || right.id))
-    );
-  graphNodeDirectoryList.innerHTML = "";
-  if (graphNodeDirectoryCount) graphNodeDirectoryCount.textContent = `${nodes.length} loaded`;
-  if (!nodes.length) {
-    const empty = document.createElement("li");
-    empty.className = "graph-directory-empty";
-    empty.textContent = "No nodes are visible in this map.";
-    graphNodeDirectoryList.append(empty);
-    return;
-  }
-  nodes.forEach((node) => {
-    const item = document.createElement("li");
-    item.className = "graph-node-directory-item";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "graph-node-directory-row";
-    button.setAttribute("aria-pressed", node.id === state.selectedId ? "true" : "false");
-    const kind = nodeKind(node);
-    const dataset = String(node.metadata?.dataset || "");
-    const degree = Array.isArray(node.neighbors) ? node.neighbors.length : 0;
-    const title = document.createElement("strong");
-    title.textContent = String(node.label || node.id || "Unnamed node");
-    const meta = document.createElement("span");
-    button.dataset.nodeId = node.id;
-    meta.textContent = `${kind}${dataset ? ` · ${dataset}` : ""} · ${degree} loaded links`;
-    button.append(title, meta);
-    button.addEventListener("click", () => {
-      const target = activeGraphData().nodes.get(node.id) || node;
-      focusGraphNode(node.id);
-      selectNode(target);
-      const selectedButton = Array.from(
-        graphNodeDirectoryList.querySelectorAll(".graph-node-directory-row")
-      ).find((candidate) => candidate.dataset.nodeId === node.id);
-      selectedButton?.focus();
-    });
-    item.append(button);
-    graphNodeDirectoryList.append(item);
-  });
 }
 
 function renderedGraphNodes() {
@@ -2615,17 +2472,23 @@ function renderedGraphNodes() {
   return Array.isArray(nodes) ? nodes : [];
 }
 
-function updateGraphFitSelectionState() {
-  const visible = Boolean(state.selectedId) &&
-    renderedGraphNodes().some((node) => node.id === state.selectedId);
-  if (graphFitSelection) graphFitSelection.disabled = !visible;
+function graphSearchCandidates(source) {
+  if (state.graphMode === "knowledge" && state.realGraph?.nodes instanceof Map) {
+    return Array.from(state.realGraph.nodes.values());
+  }
+  if (source?.nodes instanceof Map) {
+    return Array.from(source.nodes.values());
+  }
+  return renderedGraphNodes();
 }
 
 function matchingGraphNodes(query) {
   const normalized = String(query || "").trim().toLowerCase();
   if (!normalized) return [];
   const tokens = normalized.split(/\s+/).filter(Boolean);
-  return renderedGraphNodes()
+  const source = activeGraphData();
+  const candidates = graphSearchCandidates(source);
+  return candidates
     .map((node) => {
       const label = String(node.label || node.id || "");
       const id = String(node.id || "");
@@ -2783,7 +2646,7 @@ async function loadNodeDocument(node) {
   selectedNode.append(container);
   const candidates = documentCandidates(node);
   let firstError = null;
-  let firstErrorStatus = null;
+
   for (const candidate of candidates) {
     if (state.selectedId !== node.id) return;
     try {
@@ -2807,41 +2670,35 @@ async function loadNodeDocument(node) {
               candidate.relationship || "related"
             )} · ${escapeHtml(candidate.node.label || candidate.node.id)}</p>`
           : "";
-      container.innerHTML = `${source}${title}<pre>${escapeHtml(doc.body)}</pre>`;
+      const rendered = `${source}${title}<pre>${escapeHtml(doc.body)}</pre>`;
+      const broadDigest = /^#\s+(Linear workspace sync|.*GitHub daily update)\b/im.test(
+        String(doc.body)
+      );
+      if (broadDigest) {
+        continue;
+      }
+      container.innerHTML = rendered;
       return;
     } catch (error) {
       if (state.selectedId !== node.id) return;
       const message = String(error?.message || "Request failed");
       if (error?.status === 404 || /not found/i.test(message)) continue;
       firstError = message;
-      firstErrorStatus = Number(error?.status) || null;
       break;
     }
   }
 
-  // Typed empty states, never a silent dead-end. The loaded graph is a capped
-  // or filtered slice, so this state does not claim global absence.
-  if (firstErrorStatus === 401 || firstErrorStatus === 403) {
-    container.innerHTML =
-      "<p>Document unavailable. This seat may not have permission to read it.</p>";
-  } else if (firstError) {
-    container.innerHTML = `<p>Document unavailable: ${escapeHtml(firstError)}</p>`;
+  // Typed empty states, never a silent dead-end: say whether the loaded graph
+  // simply has no document to walk to, or candidates existed and none resolved.
+  container.classList.add("node-document-empty");
+  if (firstError) {
+    container.innerHTML = `<p>Could not load document text: ${escapeHtml(firstError)}</p>`;
   } else if (!candidates.length) {
     container.innerHTML =
-      "<p>No document reachable from this node in the loaded graph. The graph payload may be capped or filtered.</p>";
+      "<p>No document reachable from this node in the loaded graph.</p>";
   } else {
     container.innerHTML = "<p>No document text stored for this node.</p>";
   }
-  const retry = document.createElement("button");
-  retry.type = "button";
-  retry.className = "secondary-button compact-button node-document-retry";
-  retry.textContent = "Retry";
-  retry.addEventListener("click", () => {
-    if (state.selectedId !== node.id) return;
-    container.remove();
-    loadNodeDocument(node);
-  });
-  container.append(retry);
 }
 
 async function loadMesh(showConnection = true) {
@@ -2879,16 +2736,7 @@ function updateGraphMeta(message) {
   if (state.graphMode === "knowledge") {
     const payload = state.realGraph?.payload;
     if (!payload) {
-      // Distinguishes in-flight load from a completed failure. Without this,
-      // every later argless updateGraphMeta() (e.g. after a mesh snapshot)
-      // resurrected "Loading Knowledge Mesh" forever (#126).
-      if (state.realGraphLoading) {
-        graphMeta.textContent = "Loading Knowledge Mesh";
-      } else if (state.realGraphError) {
-        graphMeta.textContent = state.realGraphError;
-      } else {
-        graphMeta.textContent = "Knowledge Mesh unavailable";
-      }
+      graphMeta.textContent = "Loading Knowledge Mesh";
       return;
     }
     // A fallback payload has no real content (only presence hubs), so the
@@ -3040,8 +2888,6 @@ function toggleGraphKind(kind) {
   }
   renderGraphLegend();
   buildGraphScene();
-  reconcileGraphSelection();
-  updateGraphFitSelectionState();
   updateGraphMeta();
 }
 
@@ -3059,8 +2905,6 @@ function setGraphAggregate(enabled) {
       : "Raw graph: every payload node renders (legend chips filter kinds). Click to aggregate.";
   }
   buildGraphScene();
-  reconcileGraphSelection();
-  updateGraphFitSelectionState();
   resetGraphView();
   updateGraphMeta();
 }
@@ -3117,19 +2961,11 @@ function shapeRealGraph(payload) {
   list.forEach((node) => {
     const links = degree.get(node.id) || 0;
     const dataset = node.dataset || null;
-    const datasets = Array.isArray(node.datasets) ? [...node.datasets] : dataset ? [dataset] : [];
-    const trust_tier = node.trust_tier || null;
-    const promoted_by = node.promoted_by || null;
-    const promoted_at = node.promoted_at || null;
     const isDatasetHub = (node.type || "node") === "dataset";
     const isSeatHub =
       isDatasetHub && String(dataset || node.label || "").startsWith(SEAT_DATASET_PREFIX);
     const metadata = { type: node.type || "node", links };
     if (dataset) metadata.dataset = dataset;
-    if (datasets.length) metadata.datasets = datasets;
-    if (trust_tier) metadata.trust_tier = trust_tier;
-    if (promoted_by) metadata.promoted_by = promoted_by;
-    if (promoted_at) metadata.promoted_at = promoted_at;
     // Presence metadata rides on dataset hubs ({documents: N}); pass it
     // through untouched so the inspector can show counts without a fetch.
     const presence =
@@ -3140,10 +2976,6 @@ function shapeRealGraph(payload) {
       type: node.type || "node",
       internal_name: node.internal_name || null,
       presence,
-      datasets,
-      trust_tier,
-      promoted_by,
-      promoted_at,
       status: isDatasetHub ? (isSeatHub ? "seat" : "dataset") : "linked",
       size: isDatasetHub ? 72 : clamp(26 + links * 5, 24, 58),
       metadata,
@@ -3202,7 +3034,6 @@ async function loadKnowledgeGraph(force = false) {
   if (state.realGraphLoading) return;
   if (state.realGraph && !force) {
     buildGraphScene();
-    reconcileGraphSelection();
     resetGraphView();
     updateGraphMeta();
     updateRealGraphEmpty();
@@ -3210,7 +3041,6 @@ async function loadKnowledgeGraph(force = false) {
     return;
   }
   state.realGraphLoading = true;
-  state.realGraphError = null;
   updateGraphMeta("Loading Knowledge Mesh");
   try {
     let payload;
@@ -3229,11 +3059,9 @@ async function loadKnowledgeGraph(force = false) {
       payload = await fetchMeshGraphWithBackoff();
     }
     state.realGraph = shapeRealGraph(payload);
-    state.realGraphError = null;
     updateGraphDatasetFilter();
     if (state.graphMode === "knowledge") {
       buildGraphScene();
-      reconcileGraphSelection();
       resetGraphView();
       updateGraphMeta();
       updateRealGraphEmpty();
@@ -3243,21 +3071,20 @@ async function loadKnowledgeGraph(force = false) {
     if (error && error.status === 429) {
       // Retries exhausted: soft, non-error status (no toast) so a login-burst
       // 429 doesn't read as a failure. Next view switch / refresh retries.
-      state.realGraphError = "Knowledge Mesh is busy — refresh in a moment";
       if (state.graphMode === "knowledge") {
-        updateGraphMeta(state.realGraphError);
+        updateGraphMeta("Knowledge Mesh is busy — refresh in a moment");
       }
     } else {
-      state.realGraphError = "Knowledge Mesh unavailable";
       showToast(`Could not load the Knowledge Mesh: ${error.message}`, "error");
       if (state.graphMode === "knowledge") {
-        updateGraphMeta(state.realGraphError);
+        updateGraphMeta("Knowledge Mesh unavailable");
       }
     }
   } finally {
     state.realGraphLoading = false;
   }
 }
+
 function setGraphMode(mode) {
   if (state.graphMode === mode) return;
   state.graphMode = mode;
@@ -3272,8 +3099,6 @@ function setGraphMode(mode) {
     button.setAttribute("aria-pressed", active ? "true" : "false");
   });
   state.selectedId = null;
-  if (graphFitSelection) graphFitSelection.disabled = true;
-  if (graphSelectionStatus) graphSelectionStatus.textContent = "No node selected.";
   selectedNode.textContent = "Select a note or node to inspect its links.";
   // Aggregate + dataset filter act on the Knowledge Mesh only; hide them in
   // live mode so they never sit on the toolbar as dead controls.
@@ -3696,37 +3521,37 @@ function renderKnowledgeSources(error = null) {
     return;
   }
 
-  const github = state.githubSync;
-  const obsidianPayload = state.obsidianSources || {};
-  const obsidianSources = obsidianPayload.sources || [];
-  const summary = obsidianPayload.summary || {};
-  const sourceRows = [];
-  if (github) {
-    sourceRows.push({
-      name: `GitHub: ${github.org || "organization"}`,
-      body: `${github.tracked_repositories || 0} repositories - ${formatDate(github.last_checked_at)}`,
-      status: github.last_checked_at ? "tracked" : "ready",
-      error: false,
-    });
-  }
-  obsidianSources.forEach((source) => {
-    sourceRows.push({
-      name: source.name || "Obsidian vault",
-      body: `${source.documents || 0} notes - ${formatDate(source.last_push_at)}`,
-      status: source.open_conflicts ? "review" : "synced",
-      error: Boolean(source.open_conflicts),
-    });
+  const sourceRows = (state.sources || []).map((source) => {
+    const type = String(source.source_type || "source");
+    const labels = {
+      github: "GitHub activity",
+      github_repo_content: "GitHub repository content",
+      linear: "Linear workspace",
+      obsidian_vault: "Obsidian vault",
+    };
+    const status = String(source.status || "ready");
+    return {
+      name: `${labels[type] || "Source"}: ${source.name || "configured"}`,
+      documents: Number(source.documents || 0),
+      body: `${Number(source.documents || 0).toLocaleString()} records - ${formatDate(
+        source.last_checked_at || source.last_push_at
+      )}`,
+      status,
+      error: ["error", "degraded", "review"].includes(status),
+    };
   });
 
   const sourceCount = sourceRows.length;
-  const snapshotCount = Number(github?.tracked_repositories || 0) + Number(summary.obsidian_documents || 0);
-  const conflictCount = Number(summary.open_conflicts || 0);
+  const snapshotCount = sourceRows.reduce((total, source) => total + source.documents, 0);
+  const conflictCount = Number(state.sourceSummary?.open_conflicts || 0);
   if (knowledgeSourceCount) knowledgeSourceCount.textContent = String(sourceCount);
   if (knowledgeSnapshotCount && !state.snapshot) knowledgeSnapshotCount.textContent = String(snapshotCount);
   if (knowledgeConflictCount) knowledgeConflictCount.textContent = String(conflictCount);
 
   if (!sourceRows.length) {
-    knowledgeSourceList.append(emptyState("No connected sources", "GitHub and Obsidian sources will appear here."));
+    knowledgeSourceList.append(
+      emptyState("No connected sources", "GitHub, Linear, and other configured sources will appear here.")
+    );
     return;
   }
 
@@ -4126,9 +3951,12 @@ async function loadSources() {
   try {
     const payload = await api("/api/sources");
     state.sources = payload.sources || [];
+    state.sourceSummary = payload.summary || {};
   } catch {
     state.sources = [];
+    state.sourceSummary = {};
   }
+  renderKnowledgeSources();
   renderHome();
   renderReview();
 }
@@ -4821,14 +4649,6 @@ document.getElementById("pauseButton").addEventListener("click", (event) => {
   closeGraphViewMenu();
 });
 
-if (graphControls) {
-  graphZoomIn?.addEventListener("click", () => zoomGraphBy(1.35));
-  graphZoomOut?.addEventListener("click", () => zoomGraphBy(1 / 1.35));
-  graphFitAll?.addEventListener("click", resetGraphView);
-  graphFitSelection?.addEventListener("click", fitSelectedGraphNode);
-  graphClearSelection?.addEventListener("click", () => selectNode(null));
-}
-
 auditFilterButtons.forEach((button) => {
   button.addEventListener("click", () => {
     state.auditFilter = button.dataset.auditFilter || "all";
@@ -4871,17 +4691,8 @@ if (graphDatasetFilter) {
 // Pan, zoom, drag, hover, and click are handled natively by force-graph on the
 // canvas it owns; keyboard re-frame via the canvas container.
 canvas.addEventListener("keydown", (event) => {
-  if (event.key === "Home" || event.key === "0") {
+  if (event.key === "Home") {
     resetGraphView();
-    event.preventDefault();
-  } else if (event.key === "+" || event.key === "=") {
-    zoomGraphBy(1.35);
-    event.preventDefault();
-  } else if (event.key === "-") {
-    zoomGraphBy(1 / 1.35);
-    event.preventDefault();
-  } else if (event.key === "Escape") {
-    selectNode(null);
     event.preventDefault();
   }
 });
@@ -5219,6 +5030,9 @@ document.getElementById("accessTokenForm").addEventListener("submit", async (eve
   }
 });
 
+let pendingIngestKey = null;
+let pendingIngestPayload = null;
+
 document.getElementById("ingestForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -5239,18 +5053,34 @@ document.getElementById("ingestForm").addEventListener("submit", async (event) =
     return;
   }
   setBusy(button, true, { idle: "Save to vault", loading: "Indexing" });
+  const ingestPayload = {
+    data,
+    dataset: String(formData.get("dataset") || "").trim() || null,
+    tags,
+  };
+  const prepared = feedbackRequestState(
+    { key: pendingIngestKey, payload: pendingIngestPayload },
+    ingestPayload,
+  );
+  pendingIngestKey = prepared.state.key;
+  pendingIngestPayload = prepared.state.payload;
   try {
     await api("/ingest", {
       method: "POST",
-      body: JSON.stringify({
-        data,
-        dataset: String(formData.get("dataset") || "").trim() || null,
-        tags,
-      }),
+      body: JSON.stringify(prepared.request),
     });
+    const completed = feedbackRequestCompletion(prepared.state, "accepted");
+    pendingIngestKey = completed.key;
+    pendingIngestPayload = completed.payload;
     form.querySelector("[name='data']").value = "";
     await loadMesh(false);
   } catch (err) {
+    const completed = feedbackRequestCompletion(
+      prepared.state,
+      err.status === 409 ? "conflict" : "uncertain",
+    );
+    pendingIngestKey = completed.key;
+    pendingIngestPayload = completed.payload;
     error.textContent = err.message;
   } finally {
     setBusy(button, false, { idle: "Save to vault", loading: "Indexing" });
@@ -5369,6 +5199,26 @@ document.getElementById("searchForm").addEventListener("submit", async (event) =
   }
 });
 
+// Keep one caller key for one logical feedback payload. Uncertain retries reuse
+// it, while a changed payload gets a fresh key.
+function feedbackRequestState(state, payload, makeKey = () => crypto.randomUUID()) {
+  const serialized = JSON.stringify(payload);
+  const key = state.key && state.payload === serialized ? state.key : makeKey();
+  return {
+    state: { key, payload: serialized },
+    request: { ...payload, idempotency_key: key },
+  };
+}
+
+function feedbackRequestCompletion(state, outcome) {
+  return outcome === "accepted" || outcome === "conflict"
+    ? { key: null, payload: null }
+    : state;
+}
+
+let pendingFeedbackKey = null;
+let pendingFeedbackPayload = null;
+
 document.getElementById("feedbackForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -5390,17 +5240,27 @@ document.getElementById("feedbackForm").addEventListener("submit", async (event)
   feedbackStatus.textContent = "Recording";
   feedbackStatus.className = "status-chip status-standby";
   setBusy(button, true, { idle: "Record feedback", loading: "Recording" });
+  const feedbackPayload = {
+    qa_id: qaId,
+    score: scoreValue === "" ? null : Number.parseInt(scoreValue, 10),
+    text: String(formData.get("text") || "").trim() || null,
+    dataset: String(formData.get("dataset") || "").trim() || null,
+    session_id: String(formData.get("sessionId") || "").trim() || null,
+  };
+  const prepared = feedbackRequestState(
+    { key: pendingFeedbackKey, payload: pendingFeedbackPayload },
+    feedbackPayload,
+  );
+  pendingFeedbackKey = prepared.state.key;
+  pendingFeedbackPayload = prepared.state.payload;
   try {
     const response = await api("/feedback", {
       method: "POST",
-      body: JSON.stringify({
-        qa_id: qaId,
-        score: scoreValue === "" ? null : Number.parseInt(scoreValue, 10),
-        text: String(formData.get("text") || "").trim() || null,
-        dataset: String(formData.get("dataset") || "").trim() || null,
-        session_id: String(formData.get("sessionId") || "").trim() || null,
-      }),
+      body: JSON.stringify(prepared.request),
     });
+    const completed = feedbackRequestCompletion(prepared.state, "accepted");
+    pendingFeedbackKey = completed.key;
+    pendingFeedbackPayload = completed.payload;
     feedbackStatus.textContent = response.recorded ? "Recorded" : "Skipped";
     feedbackStatus.className = `status-chip ${response.recorded ? "status-enabled" : "status-standby"}`;
     feedbackResult.innerHTML = `
@@ -5411,6 +5271,12 @@ document.getElementById("feedbackForm").addEventListener("submit", async (event)
     `;
     await loadMesh(false);
   } catch (err) {
+    const completed = feedbackRequestCompletion(
+      prepared.state,
+      err.status === 409 ? "conflict" : "uncertain",
+    );
+    pendingFeedbackKey = completed.key;
+    pendingFeedbackPayload = completed.payload;
     error.textContent = err.message;
     feedbackStatus.textContent = "Failed";
     feedbackStatus.className = "status-chip status-error";
