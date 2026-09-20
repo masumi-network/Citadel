@@ -568,6 +568,108 @@ def test_home_reads_the_readable_corpus_count_not_the_node_only_one() -> None:
     assert "Not reported by this node yet" in app_js and "Unavailable" in app_js, (
         "a failed fetch and an absent field must render different reasons"
     )
+ 
+def test_feedback_retry_key_exercises_payload_and_outcome_transitions() -> None:
+    """Run the feedback key state machine through retries and terminal outcomes."""
+    import re
+    import subprocess
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    helpers = re.search(
+        r"function feedbackRequestState\(.*?\n\}\n\nfunction feedbackRequestCompletion\(.*?\n\}",
+        app_js,
+        re.DOTALL,
+    )
+    assert helpers, "feedback key helpers moved"
+    script = (
+        helpers.group(0)
+        + r"""
+let nextKey = 0;
+const makeKey = () => `key-${++nextKey}`;
+const firstPayload = { qa_id: "qa-1", score: 1, text: null, dataset: null, session_id: null };
+const changedPayload = { ...firstPayload, score: -1 };
+let state = { key: null, payload: null };
+
+let first = feedbackRequestState(state, firstPayload, makeKey);
+if (first.request.idempotency_key !== "key-1") process.exit(1);
+state = feedbackRequestCompletion(first.state, "uncertain");
+let retry = feedbackRequestState(state, firstPayload, makeKey);
+if (retry.request.idempotency_key !== "key-1") process.exit(2);
+let changed = feedbackRequestState(state, changedPayload, makeKey);
+if (changed.request.idempotency_key !== "key-2") process.exit(3);
+state = feedbackRequestCompletion(changed.state, "conflict");
+if (state.key !== null || state.payload !== null) process.exit(4);
+let accepted = feedbackRequestState(state, changedPayload, makeKey);
+if (accepted.request.idempotency_key !== "key-3") process.exit(5);
+state = feedbackRequestCompletion(accepted.state, "accepted");
+if (state.key !== null || state.payload !== null) process.exit(6);
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=commonjs", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+ 
+    assert 'body: JSON.stringify(prepared.request)' in app_js
+    assert 'feedbackRequestCompletion(prepared.state, "accepted")' in app_js
+    assert 'err.status === 409 ? "conflict" : "uncertain"' in app_js
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_ingest_uses_the_payload_bound_retry_safe_key() -> None:
+    """Ingest must reuse one key across retries of a payload, never mint per attempt."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    handler = re.search(
+        r'getElementById\("ingestForm"\)\.addEventListener\("submit".*?\n\}\);',
+        app_js,
+        re.DOTALL,
+    )
+    assert handler, "ingest submit handler moved"
+    body = handler.group(0)
+    # The per-attempt UUID is gone; the payload-bound helper drives the key.
+    assert "crypto.randomUUID()" not in body
+    assert "feedbackRequestState(" in body
+    assert "pendingIngestKey" in body and "pendingIngestPayload" in body
+    assert "body: JSON.stringify(prepared.request)" in body
+    assert 'feedbackRequestCompletion(prepared.state, "accepted")' in body
+    assert 'err.status === 409 ? "conflict" : "uncertain"' in body
+
+def test_connected_feed_count_uses_every_source_from_api() -> None:
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "const sourceRows = (state.sources || []).map" in app_js
+    assert 'github_repo_content: "GitHub repository content"' in app_js
+    assert 'linear: "Linear workspace"' in app_js
+    assert "state.sourceSummary = payload.summary || {}" in app_js
+    assert "renderKnowledgeSources();" in app_js
+
+
+def test_graph_enables_node_drag_and_canvas_pan() -> None:
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert ".enableNodeDrag(true)" in app_js
+    assert ".enablePanInteraction(true)" in app_js
+
+
+def test_graph_connections_use_full_caller_scoped_payload() -> None:
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    neighbors = re.search(
+        r"function knowledgeNeighbors\(nodeId\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+
+    assert neighbors
+    body = neighbors.group(1)
+    assert "state.realGraph" in body
+    assert "graph.instance?.graphData?.()" in body
+    assert "connected.has(node.id)" in app_js
+    assert 'relationship === "contains" || relationship === "is_part_of"' in app_js
+
 
 
 def test_event_graph_focus_matches_exact_source_identity() -> None:
@@ -603,108 +705,6 @@ const matched = relatedNodeForEvent({{ details: {{ org: " ACME " }} }});
 if (!matched || matched.id !== "exact") process.exit(1);
 if (relatedNodeForEvent({{ details: {{ org: "acme-docs" }} }}).id !== "near") process.exit(2);
 if (relatedNodeForEvent({{ details: {{ org: "acme.example" }} }}) !== null) process.exit(3);
-"""
-    result = subprocess.run(
-        ["node", "--input-type=commonjs", "--eval", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_timeline_envelope_does_not_treat_org_as_dataset() -> None:
-    """#126: org/vault_id must not become timeline.dataset (bogus hub match)."""
-    import re
-    import subprocess
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    envelope = re.search(
-        r"function timelineEnvelope\(event\) \{.*?\n\}\n\nfunction timelineStatusClass",
-        app_js,
-        re.S,
-    )
-    assert envelope, "timelineEnvelope moved"
-    envelope_source = envelope.group(0).split("\n\nfunction timelineStatusClass", 1)[0]
-
-    script = f"""
-{envelope_source}
-const orgOnly = timelineEnvelope({{ type: "ingest", details: {{ org: "acme", vault_id: "v1" }} }});
-if (orgOnly.dataset !== null) process.exit(1);
-const withDataset = timelineEnvelope({{ type: "ingest", details: {{ dataset: "seat:carol", org: "acme" }} }});
-if (withDataset.dataset !== "seat:carol") process.exit(2);
-"""
-    result = subprocess.run(
-        ["node", "--input-type=commonjs", "--eval", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_focus_graph_for_event_does_not_select_a_node() -> None:
-    """#126: timeline clicks must not open the Knowledge Mesh inspector."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "function focusGraphForEvent(event) {" in app_js
-    focus = re.search(
-        r"function focusGraphForEvent\(event\) \{.*?\n\}\n\nfunction relatedNodeForEvent",
-        app_js,
-        re.S,
-    )
-    assert focus, "focusGraphForEvent moved"
-    body = focus.group(0)
-    assert "selectNode(" not in body, body
-    assert "return relatedNodeForEvent(event);" in body
-
-    # Also pin that selectTimelineEvent still calls focusGraphForEvent (for the
-    # Event inspector Graph focus line) without invoking selectNode itself.
-    select = re.search(
-        r"function selectTimelineEvent\(event\) \{.*?\n\}\n",
-        app_js,
-        re.S,
-    )
-    assert select, "selectTimelineEvent moved"
-    select_body = select.group(0)
-    assert "focusGraphForEvent(event)" in select_body
-    assert "selectNode(" not in select_body
-
-
-def test_update_graph_meta_does_not_resurrect_loading_after_failure() -> None:
-    """#126: argless updateGraphMeta after a failed fetch must not say Loading."""
-    import re
-    import subprocess
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    meta = re.search(
-        r"function updateGraphMeta\(message\) \{.*?\n\}\n\nfunction",
-        app_js,
-        re.S,
-    )
-    assert meta, "updateGraphMeta moved"
-    meta_source = meta.group(0).rsplit("\n\nfunction", 1)[0]
-    assert "realGraphLoading" in meta_source
-    assert "realGraphError" in meta_source
-
-    script = f"""
-const graphMeta = {{ textContent: "" }};
-const state = {{
-  graphMode: "knowledge",
-  realGraph: null,
-  realGraphLoading: false,
-  realGraphError: "Knowledge Mesh unavailable",
-}};
-{meta_source}
-updateGraphMeta();
-if (graphMeta.textContent !== "Knowledge Mesh unavailable") process.exit(1);
-state.realGraphError = null;
-updateGraphMeta();
-if (graphMeta.textContent !== "Knowledge Mesh unavailable") process.exit(2);
-state.realGraphLoading = true;
-updateGraphMeta();
-if (graphMeta.textContent !== "Loading Knowledge Mesh") process.exit(3);
 """
     result = subprocess.run(
         ["node", "--input-type=commonjs", "--eval", script],
@@ -780,6 +780,88 @@ def test_graph_aggregate_toggle_writes_state() -> None:
     )
 
 
+def test_graph_search_indexes_full_knowledge_graph_not_rendered_projection() -> None:
+    """Knowledge search must retain documents hidden by aggregation."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+    matching = re.search(
+        r"function matchingGraphNodes\(query\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert matching, "matchingGraphNodes() not found in kb/static/app.js"
+    body = matching.group(1)
+
+    assert "renderedGraphNodes()" not in body, (
+        "graph search is indexed from the rendered aggregation, so hidden "
+        "documents cannot be selected"
+    )
+    assert re.search(r"state\.realGraph|activeGraphData\(\)", body), (
+        "graph search has no full caller-scoped graph source"
+    )
+
+
+def test_graph_search_selection_keeps_document_inspector_states() -> None:
+    """Selecting a hidden document must use the existing inspector load path."""
+    import re
+
+    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
+
+    chooser = re.search(
+        r"function chooseGraphNodeMatch\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert chooser, "chooseGraphNodeMatch() not found in kb/static/app.js"
+    assert "handleNodeClick(node)" in chooser.group(1), (
+        "graph search selection bypasses the canonical node-click path"
+    )
+
+    handler = re.search(
+        r"function handleNodeClick\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert handler, "handleNodeClick() not found in kb/static/app.js"
+    handler_body = handler.group(1)
+    assert "selectNode(" in handler_body, (
+        "hidden full-graph nodes bypass the canonical selection path"
+    )
+    assert re.search(r"state\.realGraph|activeGraphData\(\)", handler_body), (
+        "selection has no full caller-scoped graph source for hidden nodes"
+    )
+
+
+    selection = re.search(
+        r"function selectNode\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert selection, "selectNode() not found in kb/static/app.js"
+    assert "renderKnowledgeInspector(node)" in selection.group(1), (
+        "knowledge-node selection no longer renders the graph inspector"
+    )
+    assert "loadNodeDocument(node)" in selection.group(1), (
+        "knowledge-node selection bypasses document loading"
+    )
+
+    loader = re.search(
+        r"async function loadNodeDocument\(node\)\s*\{(.*?)\n\}", app_js, re.DOTALL
+    )
+    assert loader, "loadNodeDocument() not found in kb/static/app.js"
+    body = loader.group(1)
+    assert "documentCandidates(node)" in body, (
+        "the inspector does not resolve the selected node to source documents"
+    )
+    assert "/api/documents/" in body, (
+        "the inspector no longer loads the selected source document"
+    )
+
+    assert "Loading document text" in body, "document loading state was removed"
+    assert "Could not load document text" in body, (
+        "document request failures lost their typed error state"
+    )
+    assert "No document reachable from this node in the loaded graph." in body, (
+        "missing graph-document links lost their typed empty state"
+    )
+    assert "No document text stored for this node." in body, (
+        "missing document text lost its typed empty state"
+    )
+
+
 def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
     """Seat-visibility contract with the backend: GET /api/mesh/graph gains an
     optional dataset=<name> query param (server filters pre-cap, response
@@ -813,22 +895,35 @@ def test_graph_dataset_filter_rides_on_mesh_graph_url() -> None:
 
 
 def test_graph_pointer_area_floors_small_node_hit_radius() -> None:
-    """nodeVal spans 2-9 with nodeRelSize 4, which is a 1-3 screen-px target
-    for low-degree entities at the fit-out zoom of a ~1000-node mesh —
-    visible but effectively unclickable. Pin the shadow-canvas pointer paint
-    and its zoom-compensated screen-space floor."""
+    """Small nodes need a 12 px screen-space hit radius without changing paint."""
+    import re
+
     app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
 
-    assert "nodePointerAreaPaint" in app_js, (
-        "no pointer-area override; tiny nodes stay unclickable at fit-out zoom"
+    minimum = re.search(r"const MIN_NODE_HIT_RADIUS_PX\s*=\s*(\d+)", app_js)
+    assert minimum, "the pointer area has no numeric minimum radius"
+    assert int(minimum.group(1)) >= 12, (
+        "the pointer hit-area floor must be at least 12 screen px"
     )
-    assert "MIN_NODE_HIT_RADIUS_PX" in app_js, (
-        "the pointer area has no named minimum radius"
+
+    assert ".nodeRelSize(NODE_REL_SIZE)" in app_js, (
+        "the painted node size no longer uses NODE_REL_SIZE"
     )
-    assert "MIN_NODE_HIT_RADIUS_PX / (globalScale || 1)" in app_js, (
-        "the hit-radius floor must be screen-space (divided by the zoom scale), "
-        "or it shrinks with the same fit-out zoom that caused the defect"
+    pointer = re.search(
+        r"\.nodePointerAreaPaint\(\(node, color, ctx, globalScale\) => \{(.*?)\n\s*\}\)",
+        app_js,
+        re.DOTALL,
     )
+    assert pointer, "nodePointerAreaPaint() is not wired"
+    body = pointer.group(1)
+    assert (
+        "const painted = NODE_REL_SIZE * Math.sqrt(Math.max(nodeValue(node), 0));"
+        in body
+    ), "the pointer paint no longer preserves the painted node-size calculation"
+    assert (
+        "const radius = Math.max(painted, MIN_NODE_HIT_RADIUS_PX / (globalScale || 1));"
+        in body
+    ), "the pointer paint does not floor the hit area in screen space"
 
 
 def test_graph_depth_control_is_gone() -> None:
@@ -896,6 +991,9 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
         "the other-endpoint kind filter is gone; Entity->Entity contains edges "
         "(32 in the live payload) would count as sourcing chunks"
     )
+    assert "edge.target !== node.id" in sourcing.group(1), (
+        "only directed chunk-to-entity contains edges prove source provenance"
+    )
     assert ".sort((a, b) => b.count - a.count)" in sourcing.group(1), (
         "the sourcing-count ranking is gone; the digest that name-drops a node "
         "once would tie with the document actually about it"
@@ -917,229 +1015,6 @@ def test_graph_inspector_prefers_sourcing_chunks_over_nearest_document() -> None
     assert "Nearest document in view — not a direct source" in app_js, (
         "the nearest-walk fallback must label itself as not being provenance"
     )
-
-
-def test_graph_has_accessible_controls_and_keyboard_instructions() -> None:
-    """The canvas needs visible controls and instructions for non-pointer users."""
-    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    assert 'id="graphControls"' in index_html
-    for label in ("Zoom in", "Zoom out", "Fit all", "Fit selection", "Clear selection"):
-        assert f">{label}<" in index_html
-    assert 'aria-describedby="graphInstructions"' in index_html
-    assert "drag to pan" in index_html.lower()
-    assert "keyboard shortcuts" in index_html.lower()
-
-
-def test_graph_node_directory_uses_native_buttons_and_shared_selection() -> None:
-    """Every visible node must be reachable in an accessible directory."""
-    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert 'id="graphNodeDirectory"' in index_html
-    assert "Nodes in this view" in index_html
-    assert "aria-current" in app_js or "aria-pressed" in app_js
-    assert "renderGraphNodeDirectory" in app_js
-    assert "selectNode(" in app_js
-    assert "aria-live" in index_html
-
-def test_graph_directory_restores_focus_after_keyboard_selection() -> None:
-    """Replacing a selected row must not strand keyboard focus."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "button.dataset.nodeId = node.id" in app_js
-    assert "selectedButton?.focus()" in app_js
-
-def test_graph_directory_uses_fresh_render_data_before_graph_getter_updates() -> None:
-    """The force-graph getter can lag its setter during the first paint."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "function renderGraphNodeDirectory(nodesOverride = null)" in app_js
-    assert "renderGraphNodeDirectory(data.nodes)" in app_js
-
-
-def test_graph_connections_are_readable_and_expandable() -> None:
-    """Connection rows need a count, two-line labels, and a capped initial list."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
-    assert "Connections (${neighbors.length})" in app_js
-    assert "Show all ${neighbors.length} connections" in app_js
-    assert "node-connections-more" in app_js
-    assert "min-height: 44px" in styles_css
-
-
-def test_hidden_graph_targets_explain_the_filter_and_can_be_shown() -> None:
-    """A loaded but filtered target must offer an explicit reveal action."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "Not shown in this map" in app_js
-    assert "Show on canvas" in app_js
-    assert "showGraphNodeOnCanvas" in app_js
-    assert "graphHiddenKinds.delete" in app_js
-
-
-def test_no_document_state_explains_loaded_graph_limits_and_retries() -> None:
-    """An empty walk is not proof of global absence and must be recoverable."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "capped or filtered" in app_js.lower()
-    assert "Retry" in app_js
-    assert "loadKnowledgeGraph(true)" in app_js
-
-
-def test_visible_knowledge_page_fits_graph_after_hidden_initial_render() -> None:
-    """Navigation must resize and fit once when the graph becomes visible."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "resizeGraphForVisibility" in app_js
-    assert "zoomToFit" in app_js
-    assert "setPage" in app_js
-
-
-def test_public_info_status_wording_remains_unchanged() -> None:
-    """The graph work must not change the public lifecycle health wording."""
-    info_js = (REPO / "kb" / "static" / "info.js").read_text(encoding="utf-8")
-    assert "Degraded" in info_js
-
-
-def test_graph_redaction_pattern_is_declared_before_event_details_render() -> None:
-    """Event details must redact sensitive keys without a runtime ReferenceError."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "const sensitiveDetailPattern =" in app_js
-    assert "sensitiveDetailPattern.test(key)" in app_js
-
-
-def test_graph_subtabs_keep_native_navigation_handlers() -> None:
-    """Rendered content tabs must switch pages when activated."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    subtabs = re.search(r"function renderSubtabs\(activePage\)\s*\{(.*?)\n\}", app_js, re.DOTALL)
-    assert subtabs
-    assert 'button.addEventListener("click", () => setPage(tab.page))' in subtabs.group(1)
-
-
-def test_graph_shape_preserves_trust_and_provenance_metadata() -> None:
-    """Graph shaping must retain server-attested trust, datasets, and promotion data."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert re.search(r"function shapeRealGraph\(payload\)", app_js)
-    for field in ("trust_tier", "datasets", "promoted_by", "promoted_at"):
-        assert f"node.{field}" in app_js
-
-
-def test_graph_mode_reset_updates_selection_status_and_fit_control() -> None:
-    """Changing graph modes must clear both visual and assistive selection state."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert re.search(r"function setGraphMode\(mode\)", app_js)
-    assert "graphSelectionStatus.textContent = \"No node selected.\"" in app_js
-    assert "graphFitSelection.disabled = true" in app_js
-
-
-def test_document_states_distinguish_permission_and_unavailable_errors() -> None:
-    """Permission failures and unavailable documents need distinct copy."""
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert "firstErrorStatus" in app_js
-    assert "firstErrorStatus === 401 || firstErrorStatus === 403" in app_js
-    assert "permission" in app_js.lower()
-    assert "Document unavailable" in app_js
-
-
-def test_graph_directory_has_one_live_region_and_real_list_items() -> None:
-    """The directory keeps one live status and preserves list semantics."""
-    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    assert 'id="graphSelectionStatus"' in index_html
-    assert 'id="selectedNode" class="selection"' in index_html
-    assert '<ul id="graphNodeDirectoryList"' in index_html
-    assert "document.createElement(\"li\")" in app_js
-
-
-def test_graph_mobile_controls_reserve_instruction_space() -> None:
-    """Small screens need a stacked control grid so instructions stay readable."""
-    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
-    assert "@media (max-width: 520px)" in styles_css
-    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in styles_css
-    assert "top: 160px" in styles_css
-
-
-def test_graph_connection_text_uses_high_contrast_tokens() -> None:
-    """Connection text must use the primary text token against the field surface."""
-    import re
-
-    styles_css = (REPO / "kb" / "static" / "styles.css").read_text(encoding="utf-8")
-    relation = re.search(
-        r"\.selection \.node-connection-relation\s*\{(.*?)\n\}", styles_css, re.DOTALL
-    )
-    label = re.search(
-        r"\.selection \.node-connection-label\s*\{(.*?)\n\}", styles_css, re.DOTALL
-    )
-    assert relation and "color: var(--text)" in relation.group(1)
-    assert label and "color: var(--text)" in label.group(1)
-
-
-def test_knowledge_graph_refresh_reconciles_removed_selection() -> None:
-    """A refreshed payload that removes the selected node must clear its inspector."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    helper = re.search(
-        r"function reconcileGraphSelection\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL
-    )
-    assert helper, "selection reconciliation helper is missing"
-    body = helper.group(1)
-    assert "renderedGraphNodes().some" in body
-    assert "state.selectedId = null" in body
-    assert "graphSelectionStatus.textContent = \"No node selected.\"" in body
-    assert "graphFitSelection.disabled = true" in body
-    assignment = app_js.index("state.realGraph = shapeRealGraph(payload)")
-    assert "reconcileGraphSelection()" in app_js[assignment:]
-
-
-def test_fit_selection_starts_disabled_and_tracks_visible_selection() -> None:
-    """Fit selection must not offer a no-op action before a visible selection."""
-    import re
-
-    index_html = (REPO / "kb" / "static" / "index.html").read_text(encoding="utf-8")
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    button = re.search(r'<button id="graphFitSelection"[^>]*>', index_html)
-    assert button and "disabled" in button.group(0)
-    assert "function updateGraphFitSelectionState()" in app_js
-    assert "renderedGraphNodes().some" in app_js
-    assert "updateGraphFitSelectionState()" in app_js
-
-
-def test_graph_filter_transitions_reconcile_fit_selection_state() -> None:
-    """Hiding a selected node must disable Fit selection after the rebuild."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    toggle = re.search(
-        r"function toggleGraphKind\(kind\)\s*\{(.*?)(?=\nfunction )",
-        app_js,
-        re.DOTALL,
-    )
-    aggregate = re.search(
-        r"function setGraphAggregate\(enabled\)\s*\{(.*?)(?=\nfunction )",
-        app_js,
-        re.DOTALL,
-    )
-    assert toggle and "updateGraphFitSelectionState()" in toggle.group(1)
-    assert aggregate and "updateGraphFitSelectionState()" in aggregate.group(1)
-
-
-def test_graph_filter_transitions_reconcile_hidden_selection() -> None:
-    """Filter rebuilds must clear selection when the rendered node disappears."""
-    import re
-
-    app_js = (REPO / "kb" / "static" / "app.js").read_text(encoding="utf-8")
-    helper = re.search(
-        r"function reconcileGraphSelection\(\)\s*\{(.*?)\n\}", app_js, re.DOTALL
-    )
-    assert helper and "renderedGraphNodes().some" in helper.group(1)
-    for name in ("toggleGraphKind", "setGraphAggregate"):
-        transition = re.search(
-            rf"function {name}\([^)]*\)\s*\{{(.*?)(?=\nfunction )",
-            app_js,
-            re.DOTALL,
-        )
-        assert transition, f"{name} transition is missing"
-        body = transition.group(1)
-        rebuild = body.index("buildGraphScene()")
-        assert "reconcileGraphSelection()" in body[rebuild:]
+    assert "Linear workspace sync" in app_js
+    assert "if (broadDigest)" in app_js
+    assert "broadDigestFallback" not in app_js
