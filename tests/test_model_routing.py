@@ -105,3 +105,17 @@ def test_cognee_fallback_uses_same_litellm_route(monkeypatch) -> None:
     assert activate_cognee_free_router_fallback(error) is True
     assert os.environ["LLM_MODEL"] == DEFAULT_COGNEE_FREE_ROUTER_MODEL
     assert os.environ["LLM_EXTRACTION_MODEL"] == DEFAULT_COGNEE_FREE_ROUTER_MODEL
+
+
+def test_cognee_fallback_never_rewrites_routes_under_digest_v2(monkeypatch) -> None:
+    """v2 pins projection models per generation: a mid-projection fallback
+    rewrite would let receipts attest a model that did not run (TOCTOU past
+    the accept-time drift guard). The fallback must refuse to activate.
+    """
+    _clear_routing_env(monkeypatch)
+    monkeypatch.setenv("CITADEL_PROJECTION_DIGEST_V2", "true")
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/vendor/pinned:free")
+
+    assert activate_cognee_free_router_fallback(RuntimeError("provider quota")) is False
+    assert os.environ["LLM_EXTRACTION_MODEL"] == "openrouter/vendor/pinned:free"
+    assert os.environ.get("CITADEL_COGNEE_FREE_ROUTER_ACTIVE", "") != "true"

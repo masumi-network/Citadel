@@ -641,6 +641,698 @@ async def test_cognify_invalidates_cached_graph_snapshot(monkeypatch: Any) -> No
 
     assert reads == 2
 
+@pytest.mark.asyncio
+async def test_cognify_selected_data_scopes_rows_and_validates_before_write(
+    monkeypatch: Any,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.pipelines as pipelines_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id, other_id = uuid4(), uuid4()
+    selected_id, unselected_id, other_data_id = uuid4(), uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Dataset(
+                    id=other_id,
+                    name="other",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                Data(id=unselected_id, name="unselected"),
+                Data(id=other_data_id, name="other"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+                DatasetData(dataset_id=notes_id, data_id=unselected_id),
+                DatasetData(dataset_id=other_id, data_id=other_data_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    client = CogneePublicClient()
+    captured: list[dict[str, Any]] = []
+    lock_states: list[bool] = []
+
+    async def run_pipeline(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        lock_states.append(client.writer_lock.locked())
+        yield SimpleNamespace(dataset_id=notes_id)
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(pipelines_module, "run_pipeline", run_pipeline)
+
+    async def unexpected_public_cognify(**_: Any) -> Any:
+        raise AssertionError("selected-data cognify must not call public cognee.cognify")
+
+    monkeypatch.setattr(cognee, "cognify", unexpected_public_cognify)
+
+    try:
+        await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["datasets"] == ["notes"]
+        assert all(isinstance(row, Data) for row in captured[0]["data"])
+        assert [row.id for row in captured[0]["data"]] == [selected_id]
+        assert captured[0]["pipeline_name"] == "cognify_pipeline"
+        assert captured[0]["use_pipeline_cache"] is False
+        assert captured[0]["incremental_loading"] is True
+        assert captured[0]["data_cache"] is True
+        assert lock_states == [True]
+
+        with pytest.raises(ValueError, match="duplicate"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id), str(selected_id)],
+            )
+        with pytest.raises(RuntimeError, match="authorized dataset"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(other_data_id)],
+            )
+        with pytest.raises(RuntimeError, match="authorized dataset"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(uuid4())],
+            )
+        assert len(captured) == 1
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_shape",
+    ["inner", "outer"],
+    ids=["inner-run-info", "outer-dataset-map"],
+)
+async def test_cognify_selected_force_accepts_regular_terminal_receipt(
+    monkeypatch: Any, receipt_shape: str
+) -> None:
+    from importlib import import_module
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id = uuid4()
+    selected_id, unselected_id = uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                Data(id=unselected_id, name="unselected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+                DatasetData(dataset_id=notes_id, data_id=unselected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    pipeline_run_id = uuid4()
+    inner_completed = PipelineRunCompleted(
+        pipeline_run_id=pipeline_run_id,
+        dataset_id=notes_id,
+        dataset_name="notes",
+    )
+    outer_completed = PipelineRunCompleted(
+        pipeline_run_id=pipeline_run_id,
+        dataset_id=notes_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"run_info": inner_completed}],
+    )
+    if receipt_shape == "inner":
+        receipt: dict[str, Any] = {"run_info": inner_completed}
+    else:
+        receipt = {str(notes_id): outer_completed}
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipt
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        return {"ok": True, "violation_count": 0, "chunks_scanned": 1}
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    try:
+        result = await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+            force=True,
+        )
+
+        if receipt_shape == "inner":
+            assert result["run_info"] is inner_completed
+        else:
+            assert result[str(notes_id)] is outer_completed
+        assert len(low_level_calls) == 1
+        assert [row.id for row in low_level_calls[0]["data"]] == [selected_id]
+        assert low_level_calls[0]["incremental_loading"] is False
+        assert low_level_calls[0]["data_cache"] is False
+        assert len(stored_checks) == 1
+        assert stored_checks[0]["document_ids"] == [str(selected_id)]
+        assert stored_checks[0]["datasets"] == ["notes"]
+        assert stored_checks[0]["document_ids_by_dataset"] == {
+            str(notes_id): [str(selected_id)]
+        }
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_cognify_selected_force_rejects_outer_errored_receipt(
+    monkeypatch: Any,
+) -> None:
+    from importlib import import_module
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    user_id = uuid4()
+    tenant_id = uuid4()
+    notes_id = uuid4()
+    selected_id = uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(
+                    id=notes_id,
+                    name="notes",
+                    owner_id=user_id,
+                    tenant_id=tenant_id,
+                ),
+                Data(id=selected_id, name="selected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=notes_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"data_id": selected_id}],
+    )
+    receipt: dict[str, Any] = {str(notes_id): errored}
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipt
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        raise AssertionError("stored_chunk_budget_check must not run for an errored receipt")
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        relational_module,
+        "get_relational_engine",
+        lambda: FakeRelationalEngine(),
+    )
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+
+    try:
+        with pytest.raises(RuntimeError, match="PipelineRunErrored"):
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id)],
+                force=True,
+            )
+        assert len(low_level_calls) == 1
+        assert [row.id for row in low_level_calls[0]["data"]] == [selected_id]
+        assert stored_checks == []
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_receipt_kind",
+    ["completed", "errored"],
+    ids=["completed", "errored"],
+)
+async def test_cognify_selected_provider_error_receipt_retries_with_free_router(
+    monkeypatch: Any, second_receipt_kind: str
+) -> None:
+    from importlib import import_module
+
+    import cognee
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb import model_routing
+
+    pipeline_execution_mode = import_module(
+        "cognee.modules.pipelines.layers.pipeline_execution_mode"
+    )
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+    embedding_config = import_module(
+        "cognee.infrastructure.databases.vector.embeddings.config"
+    )
+    llm_config = import_module("cognee.infrastructure.llm.config")
+
+    dataset_id = uuid4()
+    selected_id = uuid4()
+    selected = SimpleNamespace(id=selected_id)
+    provider_marker = (
+        "openrouter free-model daily quota; X-RateLimit-Reset=1787443200000"
+    )
+    inner_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=provider_marker,
+    )
+    outer_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: provider response",
+        data_ingestion_info=[{"run_info": inner_errored}],
+    )
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        data_ingestion_info=[{"data_id": selected_id}],
+    )
+    second_errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: Bearer SECONDSECRET",
+    )
+    second_receipt = (
+        completed if second_receipt_kind == "completed" else second_errored
+    )
+    receipts: list[dict[str, Any]] = [
+        {str(dataset_id): outer_errored},
+        {str(dataset_id): second_receipt},
+    ]
+    low_level_calls: list[dict[str, Any]] = []
+
+    async def run_pipeline_blocking(**kwargs: Any) -> dict[str, Any]:
+        low_level_calls.append(kwargs)
+        return receipts.pop(0)
+
+    async def selected_rows(
+        *, dataset: str, data_ids: list[str]
+    ) -> list[Any]:
+        assert dataset == "notes"
+        assert data_ids == [str(selected_id)]
+        return [selected]
+
+    fallback_errors: list[BaseException] = []
+
+    def activate_fallback(error: BaseException) -> bool:
+        fallback_errors.append(error)
+        return True
+
+    stored_checks: list[dict[str, Any]] = []
+
+    async def stored_chunk_budget_check(**kwargs: Any) -> dict[str, Any]:
+        stored_checks.append(kwargs)
+        return {"ok": True, "violation_count": 0, "chunks_scanned": 1}
+
+    async def get_default_tasks() -> list[Any]:
+        return []
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        client := CogneePublicClient(),
+        "_prepare_cognee_environment",
+        lambda: None,
+    )
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(client, "_cognify_selected_data_rows", selected_rows)
+    monkeypatch.setattr(client, "stored_chunk_budget_check", stored_chunk_budget_check)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(cognee, "cognify", lambda **_: None)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(embedding_config, "get_embedding_config", object)
+    monkeypatch.setattr(llm_config, "get_llm_config", object)
+    monkeypatch.setattr(
+        pipeline_execution_mode,
+        "run_pipeline_blocking",
+        run_pipeline_blocking,
+    )
+    monkeypatch.setattr(
+        model_routing,
+        "activate_cognee_free_router_fallback",
+        activate_fallback,
+    )
+
+    if second_receipt_kind == "errored":
+        with pytest.raises(RuntimeError, match="PipelineRunErrored") as raised:
+            await client.cognify_selected_data(
+                dataset="notes",
+                data_ids=[str(selected_id)],
+            )
+        assert "SECONDSECRET" not in str(raised.value)
+        assert "Bearer" not in str(raised.value)
+        assert len(low_level_calls) == 2
+        assert len(fallback_errors) == 1
+        assert stored_checks == []
+    else:
+        result = await client.cognify_selected_data(
+            dataset="notes",
+            data_ids=[str(selected_id)],
+        )
+
+        assert result[str(dataset_id)] is completed
+        assert len(low_level_calls) == 2
+        assert len(fallback_errors) == 1
+        assert provider_marker in str(fallback_errors[0])
+        assert low_level_calls[0]["incremental_loading"] is True
+        assert low_level_calls[0]["data_cache"] is True
+        assert low_level_calls[1]["incremental_loading"] is False
+        assert low_level_calls[1]["data_cache"] is False
+        assert stored_checks[0]["document_ids"] == [str(selected_id)]
+
+
+@pytest.mark.parametrize(
+    "receipt_kind",
+    ["errored", "unknown", "mixed"],
+    ids=["errored", "unknown", "mixed-terminal-results"],
+)
+def test_selected_cognify_receipt_fallback_rejects_unvalidated_results(
+    receipt_kind: str,
+) -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb.cognee_client import _selected_cognify_receipt_ids
+    dataset_id = uuid4()
+    data_id = uuid4()
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    if receipt_kind == "errored":
+        receipt: dict[str, Any] = {str(dataset_id): errored}
+    elif receipt_kind == "unknown":
+        receipt = {str(dataset_id): object()}
+    else:
+        receipt = {str(dataset_id): completed, "unknown": object()}
+
+    assert (
+        _selected_cognify_receipt_ids(
+            receipt,
+            selected_data=[SimpleNamespace(id=data_id)],
+            dataset="notes",
+        )
+        is None
+    )
+
+
+
+@pytest.mark.parametrize(
+    "receipt_shape",
+    ["outer", "inner", "nested", "mixed", "unknown"],
+    ids=[
+        "outer-result",
+        "inner-run-info",
+        "nested-ingestion",
+        "mixed-completed-errored",
+        "unknown-receipt",
+    ],
+)
+def test_selected_cognify_rejects_errored_terminal_receipts(
+    receipt_shape: str,
+) -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+    from kb.cognee_client import _selected_cognify_errored_result
+
+    dataset_id = uuid4()
+    errored = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    completed = PipelineRunCompleted(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+    )
+    if receipt_shape == "outer":
+        receipt: Any = {str(dataset_id): errored}
+    elif receipt_shape == "inner":
+        receipt = {"run_info": errored}
+    elif receipt_shape == "nested":
+        nested = PipelineRunCompleted(
+            pipeline_run_id=uuid4(),
+            dataset_id=dataset_id,
+            dataset_name="notes",
+            data_ingestion_info=[{"run_info": errored}],
+        )
+        receipt = {str(dataset_id): nested}
+    elif receipt_shape == "mixed":
+        receipt = {str(dataset_id): completed, "errored": errored}
+    else:
+        receipt = {"run_info": SimpleNamespace(dataset_id=dataset_id)}
+
+    found = _selected_cognify_errored_result(receipt)
+    assert found is (None if receipt_shape == "unknown" else errored)
+def test_selected_cognify_error_prefers_nested_provider_marker_and_sanitizes_payload() -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+    from kb.cognee_client import _selected_cognify_error
+    from kb.lifecycle_worker import _is_provider_quota_exhausted
+
+    dataset_id = uuid4()
+    selected_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=(
+            "openrouter free-model daily quota; "
+            "free-models-per-day-high-balance; "
+            "X-RateLimit-Reset=1787443200000"
+        ),
+    )
+    raw_response = (
+        "https://openrouter.ai/api/v1/chat/completions response "
+        "Bearer SUPERSECRET provider body"
+    )
+    outer_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload=f"PipelineRunFailedError: {raw_response}",
+        data_ingestion_info=[{"run_info": selected_error}],
+    )
+
+    error = _selected_cognify_error({str(dataset_id): outer_error})
+
+    assert error is not None
+    message = str(error)
+    assert "openrouter" in message
+    assert "free-model daily quota" in message
+    assert "X-RateLimit-Reset=1787443200000" in message
+    assert "free-models-per-day-high-balance" in message
+    assert "SUPERSECRET" not in message
+    assert "Bearer" not in message
+    assert raw_response not in message
+    assert _is_provider_quota_exhausted(error)
+
+
+def test_selected_cognify_error_preserves_nested_embedding_provider_markers() -> None:
+    from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored
+    from kb.cognee_client import _selected_cognify_error
+    from kb.embedding_profile import is_embedding_provider_failure
+
+    dataset_id = uuid4()
+    inner_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="Embedding provider quota; 429; X-RateLimit-Reset=1787443200000",
+    )
+    outer_error = PipelineRunErrored(
+        pipeline_run_id=uuid4(),
+        dataset_id=dataset_id,
+        dataset_name="notes",
+        payload="PipelineRunFailedError: Bearer OUTERSECRET",
+        data_ingestion_info=[{"run_info": inner_error}],
+    )
+
+    error = _selected_cognify_error({str(dataset_id): outer_error})
+
+    assert error is not None
+    message = str(error)
+    assert "embedding" in message
+    assert "quota" in message
+    assert "429" in message
+    assert "X-RateLimit-Reset=1787443200000" in message
+    assert "OUTERSECRET" not in message
+    assert "Bearer" not in message
+    assert is_embedding_provider_failure(error)
+
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_cognify_does_not_change_provider_route_on_failure(
@@ -5758,3 +6450,739 @@ async def test_repair_snapshot_selection_is_bounded_and_released() -> None:
     replacement = client._store_repair_snapshot({"document_ids": ["replacement"]})
     assert replacement in client._repair_snapshots
     assert len(client._repair_snapshots) == MAX_REPAIR_SNAPSHOTS
+# ---------------------------------------------------------------------------
+# Startup recovery of dangling cognify runs.
+#
+# These tests run cognee's REAL PipelineRun/Dataset models and the client's
+# REAL SQL against an in-memory aiosqlite engine — the round-4 review showed
+# every earlier probe test mocked the query, so nothing pinned its ranking.
+# Only the destructive boundary (cognify_rollback_handler, the dataset
+# context manager) is stubbed.
+# ---------------------------------------------------------------------------
+
+
+def _recovery_client(monkeypatch: Any) -> CogneePublicClient:
+    """A client whose environment/readiness plumbing is neutralized."""
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    return client
+
+
+async def _pipeline_runs_store(monkeypatch: Any) -> tuple[Any, Any]:
+    """In-memory sqlite carrying cognee's real pipeline_runs/datasets schema.
+
+    Wires the engine into every ``get_relational_engine`` the recovery path
+    consults: the client's call-time imports resolve through the relational
+    module, while cognee's own log_pipeline_run_error/_initiated helpers
+    bound the symbol at import time, so each module is patched directly.
+    """
+    import contextlib
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from importlib import import_module
+
+    import cognee.infrastructure.databases.relational as relational_mod
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun
+
+    # The operations package __init__ rebinds these submodule names to the
+    # functions they export, so a plain `import a.b.c as m` yields the
+    # FUNCTION; import_module returns the real module to patch.
+    log_error_mod = import_module(
+        "cognee.modules.pipelines.operations.log_pipeline_run_error"
+    )
+    log_init_mod = import_module(
+        "cognee.modules.pipelines.operations.log_pipeline_run_initiated"
+    )
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda sync: PipelineRun.__table__.create(sync))
+        await conn.run_sync(lambda sync: Dataset.__table__.create(sync))
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    class _Engine:
+        @contextlib.asynccontextmanager
+        async def get_async_session(self):
+            async with sessions() as session:
+                yield session
+
+    wrapper = _Engine()
+    for module in (relational_mod, log_error_mod, log_init_mod):
+        monkeypatch.setattr(module, "get_relational_engine", lambda: wrapper)
+    return sessions, engine
+
+
+def _stub_rollback_boundary(monkeypatch: Any) -> dict[str, list[Any]]:
+    """Record rollback/context calls without touching graph or vector stores."""
+    import contextlib
+
+    import cognee.context_global_variables as context_vars_mod
+    import cognee.modules.cognify.rollback as rollback_mod
+
+    calls: dict[str, list[Any]] = {"rollback": [], "context": []}
+
+    async def fake_rollback(*, pipeline_run_id: Any, dataset: Any, **_: Any) -> None:
+        calls["rollback"].append((pipeline_run_id, dataset.id))
+
+    @contextlib.asynccontextmanager
+    async def fake_context(dataset_id: Any, owner_id: Any):
+        calls["context"].append((dataset_id, owner_id))
+        yield
+
+    monkeypatch.setattr(rollback_mod, "cognify_rollback_handler", fake_rollback)
+    monkeypatch.setattr(
+        context_vars_mod, "set_database_global_context_variables", fake_context
+    )
+    return calls
+
+
+def _run_event(
+    run_id: UUID, dataset_id: UUID, pipeline_id: UUID, status: Any, at: datetime
+) -> Any:
+    from cognee.modules.pipelines.models import PipelineRun
+
+    return PipelineRun(
+        pipeline_run_id=run_id,
+        pipeline_name="cognify_pipeline",
+        pipeline_id=pipeline_id,
+        dataset_id=dataset_id,
+        status=status,
+        run_info={},
+        created_at=at,
+    )
+
+
+async def _seed(sessions: Any, rows: list[Any]) -> None:
+    async with sessions() as session:
+        session.add_all(rows)
+        await session.commit()
+
+
+async def _run_events(sessions: Any, run_id: UUID) -> list[Any]:
+    from sqlalchemy import select
+
+    from cognee.modules.pipelines.models import PipelineRun
+
+    async with sessions() as session:
+        result = await session.execute(
+            select(PipelineRun)
+            .where(PipelineRun.pipeline_run_id == run_id)
+            .order_by(PipelineRun.created_at.asc())
+        )
+        return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_recovery_rolls_back_dangling_run_hidden_behind_newer_errored_run(
+    monkeypatch: Any,
+) -> None:
+    """Round-4 P1 against the real schema: with use_pipeline_cache=False run A
+    can be abandoned STARTED and buried by run B that ends ERRORED in the same
+    dataset. Any per-dataset ranking — cognee's own recovery candidate query
+    included — sees only B, filters it out, and reports clean while A's
+    partial writes rot. Recovery must find A per-run, roll back exactly A
+    (never B, whose inline rollback already ran at error time), close A's own
+    event stream with a terminal ERRORED row, and reset the dataset's
+    pipeline status.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
+    from sqlalchemy import select
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_ERRORED,
+                    base + timedelta(minutes=12),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+
+        assert [rid for rid, _ in calls["rollback"]] == [run_a], (
+            "exactly the hidden dangling run must be rolled back; run B was "
+            "already rolled back inline when it errored"
+        )
+        assert calls["context"] == [(dataset_id, owner_id)], (
+            "rollback must run inside the dataset's ownership context"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+        ), "A's own event stream must end terminal, under the SAME run id"
+        async with sessions() as session:
+            initiated_rows = (
+                (
+                    await session.execute(
+                        select(PipelineRun).where(
+                            PipelineRun.status
+                            == PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                            PipelineRun.pipeline_run_id.notin_([run_a, run_b]),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(initiated_rows) == 1, (
+            "reset_pipeline_run_status must log a fresh INITIATED run so the "
+            "dataset is not reported as already being processed"
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_of_a_run_does_not_reflag_it_on_the_next_boot(
+    monkeypatch: Any,
+) -> None:
+    """False-positive regression: cognee's reset logs INITIATED under a FRESH
+    uuid4 run id and never closes the recovered run's own stream, so a naive
+    per-run probe would flag every successfully recovered run forever and
+    wedge boot permanently. After boot 1 recovers A, boot 2 must be a clean
+    no-op: A's stream now ends terminal, nothing is rolled back again.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base + timedelta(minutes=1),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert len(calls["rollback"]) == 1
+
+        assert await client.recover_stale_cognify_runs() == [], (
+            "boot 2 must not flag the run boot 1 recovered"
+        )
+        assert len(calls["rollback"]) == 1, (
+            "boot 2 must not roll the already-recovered run back again"
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_dangling_runs_dataset_is_missing(
+    monkeypatch: Any,
+) -> None:
+    """A dangling run whose Dataset row is GONE cannot be rolled back (the
+    rollback needs the dataset's id and owner_id) and must NOT be stamped
+    terminal — that would hide unknown partial writes behind a clean probe.
+    Boot must abort naming the run so an operator inspects it.
+    """
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        run_a, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                _run_event(
+                    run_a,
+                    uuid4(),
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base,
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the uninspectable run"
+        )
+        assert calls["rollback"] == [], (
+            "no rollback without the dataset's ownership context"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_a_no_op_on_a_clean_store(monkeypatch: Any) -> None:
+    """Every run stream ending terminal means nothing to recover: no rollback
+    calls, no new status rows, empty result.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
+    from sqlalchemy import func, select
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_c, pipe = uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_c,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    base,
+                ),
+                _run_event(
+                    run_c,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    base + timedelta(minutes=5),
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert calls["rollback"] == []
+        async with sessions() as session:
+            row_count = (
+                await session.execute(select(func.count(PipelineRun.id)))
+            ).scalar()
+        assert row_count == 2, "a clean store must not gain status rows"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_newer_run_completed(
+    monkeypatch: Any,
+) -> None:
+    """Round-5 P1: dangling run A buried by a newer COMPLETED run B must NOT
+    be rolled back. Cognee 1.4.1 never gives a later re-touch of an existing
+    source ref its own run ownership, so A holds the SOLE ref and rolling A
+    back would delete graph/vector artifacts B still reuses (cognee's own
+    provenance contract,
+    cognee/tests/integration/tasks/test_graph_provenance_delete_default_stack.py:126-151).
+    Boot must abort naming A so an operator decides.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    base + timedelta(minutes=12),
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the run buried under the completed run"
+        )
+        assert calls["rollback"] == [], (
+            "rolling A back could delete source refs the completed run B "
+            "still reuses; recovery must not touch it"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling for the operator, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_when_a_completed_run_ties_on_timestamp(
+    monkeypatch: Any,
+) -> None:
+    """Round-6 P1: a COMPLETED run whose latest row shares the exact
+    created_at of the dangling run's STARTED row must still block rollback.
+    Equal timestamps cannot prove ordering, so equality is unsafe; the guard
+    uses >= (the dangling run itself never matches: its ranked row is
+    STARTED, not COMPLETED).
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        tie = base + timedelta(minutes=5)
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_STARTED,
+                    tie,
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    tie,
+                ),
+            ],
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), (
+            "the abort must name the run tied with the completed run"
+        )
+        assert calls["rollback"] == [], (
+            "an equal-timestamp completed sibling cannot prove ordering; "
+            "recovery must not roll the dangling run back"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert (
+            a_events[-1].status == PipelineRunStatus.DATASET_PROCESSING_STARTED
+        ), "the run must stay dangling for the operator, not be stamped terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_on_a_same_run_started_completed_tie(
+    monkeypatch: Any,
+) -> None:
+    """Round-7 P1: ONE run carries a STARTED and a COMPLETED row at the SAME
+    created_at. sqlite breaks the created_at tie by insert order (the
+    first-inserted row wins rn==1), so with STARTED inserted first the run
+    ranks dangling even though it COMPLETED. A guard that re-runs the per-run
+    ranking drops the COMPLETED sibling behind its rn==1 filter and rolls
+    back a run that COMPLETED, deleting its artifacts. The guard must count
+    COMPLETED rows directly — no ranking — so the run's own COMPLETED
+    sibling blocks rollback and boot aborts naming the run.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        tie = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        completed = PipelineRunStatus.DATASET_PROCESSING_COMPLETED
+        # Two sequential commits pin the insert order: STARTED first, so the
+        # tie ranking picks STARTED as the run's rn==1 row.
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(run_a, dataset_id, pipe, started, tie),
+            ],
+        )
+        await _seed(sessions, [_run_event(run_a, dataset_id, pipe, completed, tie)])
+
+        flagged = await client._stale_cognify_runs()
+        assert [r.pipeline_run_id for r in flagged] == [run_a], (
+            "precondition: the tie ranking must pick STARTED as the run's "
+            "latest row; otherwise this test exercises the benign branch"
+        )
+
+        with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+            await client.recover_stale_cognify_runs()
+
+        assert str(run_a) in str(excinfo.value), "the abort must name the tied run"
+        assert calls["rollback"] == [], (
+            "the run COMPLETED; rolling it back would delete its artifacts"
+        )
+        a_events = await _run_events(sessions, run_a)
+        assert len(a_events) == 2 and not any(
+            e.status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+            for e in a_events
+        ), "recovery must not stamp the completed run terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_same_run_tie_with_completed_ranked_first_is_a_no_op(
+    monkeypatch: Any,
+) -> None:
+    """The benign order of the same tie: COMPLETED inserted first wins rn==1,
+    so the run's latest row is terminal and it is never flagged dangling —
+    no rollback, no abort.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, pipe = uuid4(), uuid4()
+        tie = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        completed = PipelineRunStatus.DATASET_PROCESSING_COMPLETED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(run_a, dataset_id, pipe, completed, tie),
+            ],
+        )
+        await _seed(sessions, [_run_event(run_a, dataset_id, pipe, started, tie)])
+
+        assert await client._stale_cognify_runs() == [], (
+            "precondition: the tie ranking must pick COMPLETED as the run's "
+            "latest row, so the run is never flagged"
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+        assert calls["rollback"] == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rolls_back_two_dangling_runs_newest_first(
+    monkeypatch: Any,
+) -> None:
+    """Two dangling runs in one dataset (both latest-STARTED) are both safe to
+    recover, newest first: once the newer run B is rolled back its stream ends
+    ERRORED, so it no longer looks like a completed successor and the older
+    run A recovers behind it in the same loop. No abort.
+    """
+    from cognee.modules.data.models import Dataset
+    from cognee.modules.pipelines.models import PipelineRunStatus
+
+    sessions, engine = await _pipeline_runs_store(monkeypatch)
+    try:
+        calls = _stub_rollback_boundary(monkeypatch)
+        client = _recovery_client(monkeypatch)
+
+        dataset_id, owner_id = uuid4(), uuid4()
+        run_a, run_b, pipe = uuid4(), uuid4(), uuid4()
+        base = datetime.now(UTC) - timedelta(hours=2)
+        started = PipelineRunStatus.DATASET_PROCESSING_STARTED
+        await _seed(
+            sessions,
+            [
+                Dataset(id=dataset_id, name="notes", owner_id=owner_id),
+                _run_event(
+                    run_a,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base,
+                ),
+                _run_event(
+                    run_a, dataset_id, pipe, started, base + timedelta(minutes=1)
+                ),
+                _run_event(
+                    run_b,
+                    dataset_id,
+                    pipe,
+                    PipelineRunStatus.DATASET_PROCESSING_INITIATED,
+                    base + timedelta(minutes=10),
+                ),
+                _run_event(
+                    run_b, dataset_id, pipe, started, base + timedelta(minutes=11)
+                ),
+            ],
+        )
+
+        assert await client.recover_stale_cognify_runs() == []
+
+        assert [rid for rid, _ in calls["rollback"]] == [run_b, run_a], (
+            "both dangling runs must be recovered, newest first, so the "
+            "newer one is already rolled back when the older one is checked"
+        )
+        for run_id in (run_a, run_b):
+            events = await _run_events(sessions, run_id)
+            assert (
+                events[-1].status == PipelineRunStatus.DATASET_PROCESSING_ERRORED
+            ), "each recovered run's own stream must end terminal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_raises_when_a_dangling_run_survives_the_loop(
+    monkeypatch: Any,
+) -> None:
+    """The post-loop probe is a backstop: if a run is still dangling after the
+    recovery loop ran, boot must abort naming it rather than start writers on
+    top of an unrecovered partial run.
+    """
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    order: list[str] = []
+    client = _recovery_client(monkeypatch)
+    dangling = SimpleNamespace(
+        pipeline_run_id="dead-beef-run", dataset_id="dead-beef-dataset"
+    )
+
+    async def probe() -> list[Any]:
+        order.append("probe")
+        return [dangling]
+
+    async def recover_one(run: Any) -> bool:
+        order.append("recover")
+        return True
+
+    monkeypatch.setattr(client, "_stale_cognify_runs", probe)
+    monkeypatch.setattr(client, "_recover_dangling_cognify_run", recover_one)
+
+    with pytest.raises(CogneeStartupRecoveryError) as excinfo:
+        await client.recover_stale_cognify_runs()
+
+    assert order == ["probe", "recover", "probe"], (
+        "verification must re-run the probe after the recovery loop"
+    )
+    assert "dead-beef-run" in str(excinfo.value)
+    assert "dead-beef-dataset" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_stale_run_recovery_probe_error_propagates(monkeypatch: Any) -> None:
+    """A probe that cannot run is a failure, not a pass. cognee's own recovery
+    swallowing exactly this class of error is why this path exists; swallowing
+    it again here would recreate the blind spot.
+    """
+    client = _recovery_client(monkeypatch)
+
+    async def broken_probe() -> list[Any]:
+        raise RuntimeError("relational engine gone")
+
+    monkeypatch.setattr(client, "_stale_cognify_runs", broken_probe)
+
+    with pytest.raises(RuntimeError, match="relational engine gone"):
+        await client.recover_stale_cognify_runs()

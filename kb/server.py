@@ -7,6 +7,7 @@ import hmac
 from inspect import isawaitable
 import json
 import logging
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
+from uuid import uuid4
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -64,10 +66,12 @@ from kb.linear_sync import LinearSyncer
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.learning import LearningOutcome, LearningProcess
 from kb.lifecycle import (
+    LifecycleConflictError,
     LifecycleNotFoundError,
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
 )
+from kb.projection_barrier import ProjectionBarrierResult, wait_for_projection_barrier
 from kb.session_trace import force_shared_trace_author_seat
 from kb.learning_agent import LearningAgent
 from kb.logging_utils import configure_logging
@@ -92,6 +96,7 @@ from kb.repo_content_sync import RepoContentSyncer
 from kb.search_feedback import build_search_telemetry, presence_only_telemetry
 from kb.search_format import (
     DOC_TYPE_CANONICAL,
+    CODE_NO_RELEVANT_RESULTS,
     DOC_TYPE_TRACE,
     NO_LEXICAL_MATCH_WARNING,
     apply_query_ranking,
@@ -123,7 +128,7 @@ from kb.security_scan import (
     redact_secrets,
     scan_text_entries,
 )
-from kb.service import Citadel
+from kb.service import Citadel, _canary_timeout_seconds
 from kb.skills import skill_catalog, skill_integrity, skill_path
 from kb.source_search import GITHUB_DOC_ID_PREFIX, github_section_document
 
@@ -158,6 +163,12 @@ def _forget_background_task(task: "asyncio.Task[Any]") -> None:
         logger.error(
             "Background task %s died: %s", task.get_name(), exc, exc_info=exc
         )
+
+
+
+
+
+
 
 # Most recent evolve-scheduler cognify canary verdict (verify=True), surfaced via
 # /readyz so an always-on health probe goes RED when end-to-end ingest+cognify+
@@ -362,6 +373,53 @@ class _McpAcceptShim:
                     merged = f"{merged}, {needed}"
         kept.append((b"accept", merged.encode("latin-1")))
         await self.app({**scope, "headers": kept}, receive, send)
+_EVOLVE_SOURCE_STAGES = ("github_sync", "repo_content_sync", "linear_sync")
+_EVOLVE_POST_PROJECTION_STAGES = ("self_improve", "promotion")
+
+
+async def _run_evolve_stage_group(
+    runner: Callable[..., Any],
+    *,
+    capture_run_id: str,
+    stages: tuple[str, ...],
+) -> int:
+    result = runner(capture_run_id=capture_run_id, stages=stages)
+    if isawaitable(result):
+        return int(await result)
+    return int(result)
+
+
+def _projection_job_ids_for_capture_run(
+    citadel: Any,
+    capture_run_id: str,
+) -> tuple[str, ...]:
+    store = getattr(citadel, "lifecycle_store", None)
+    query = getattr(store, "projection_job_ids_for_capture_run", None)
+    projection_factory = getattr(citadel, "_lifecycle_projection_request", None)
+    if not callable(query) or not callable(projection_factory):
+        return ()
+    projection = projection_factory()
+    return tuple(
+        query(
+            capture_run_id,
+            generation_id=projection.generation_id,
+            projection_version=projection.projection_version,
+            config_digest=projection.config_digest,
+        )
+    )
+
+
+async def _wait_for_evolve_projection_barrier(
+    citadel: Any,
+    job_ids: tuple[str, ...],
+) -> ProjectionBarrierResult:
+    return await wait_for_projection_barrier(
+        citadel,
+        job_ids,
+        timeout_seconds=_canary_timeout_seconds(),
+    )
+
+
 
 
 def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> None:
@@ -372,14 +430,108 @@ def _resume_lifecycle_queue(citadel: Any, *, include_deferred: bool = False) -> 
     try:
         resume(include_deferred=include_deferred)
     except TypeError as exc:
-        if include_deferred and "include_deferred" in str(exc):
+        if "include_deferred" in str(exc):
             resume()
             return
         raise
 
 
+def _evolve_cognify_timeout_seconds() -> float:
+    """Upper bound for one Phase 2 cognify pass (canary included).
+
+    Must exceed the canary wait (default 600s) with room for the cognify queue
+    itself; an unbounded Phase 2 parks the completion stamp and, before the
+    post-stages kick existed, the whole projection drain.
+
+    Floored at the canary budget plus 300s. Phase 2 contains the canary wait
+    itself, both cognify calls, and possibly one FIFO'd graph-lane job, so any
+    smaller bound guarantees a mid-pass timeout on every verify pass. The
+    formula, not the constant, is the contract: raise
+    CITADEL_CANARY_TIMEOUT_SECONDS and the floor tracks it.
+    """
+    floor = _canary_timeout_seconds() + 300.0
+    raw = os.getenv("CITADEL_EVOLVE_COGNIFY_TIMEOUT_SECONDS", "").strip()
+    default = 1800.0
+    if not raw:
+        return max(default, floor)
+    try:
+        value = float(raw)
+    except ValueError:
+        return max(default, floor)
+    if not isfinite(value) or value <= 0:
+        return max(default, floor)
+    return max(value, floor)
+
+
+def _evolve_maintenance_acquire_timeout_seconds() -> float:
+    """Bound for Phase 1's maintenance-lock acquire.
+
+    A hung Phase 2 orphan (or any other holder) must not park the next pass's
+    Phase 1 forever: past this bound the pass defers itself to the next
+    interval instead. Floored at 60s: a too-small value only postpones a pass,
+    it can never corrupt, so the floor is about not thrashing.
+    """
+    raw = os.getenv("CITADEL_EVOLVE_MAINTENANCE_TIMEOUT_SECONDS", "").strip()
+    default = 900.0
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not isfinite(value) or value <= 0:
+        return default
+    return max(value, 60.0)
+
+
+def _evolve_orphan_max_skips() -> int:
+    """Budget of consecutive skipped passes before the canary flips unhealthy.
+
+    Shared by both skip causes: a live un-cancelled Phase 2 orphan and a
+    maintenance acquire that keeps timing out. Either way the scheduler is
+    not running passes, and past this budget /readyz must escalate to an
+    operator or healthcheck restart (#27)."""
+    raw = os.getenv("CITADEL_EVOLVE_ORPHAN_MAX_SKIPS", "").strip()
+    default = 2
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(value, 1)
+
+
+async def _acquire_maintenance(citadel: Any, timeout_seconds: float) -> Any | None:
+    """Enter ``citadel.cognee.maintenance()`` with a bound; None means busy.
+
+    The caller owns ``await ctx.__aexit__(None, None, None)`` in a finally.
+    Cancelling ``__aenter__`` on timeout is safe: the @asynccontextmanager
+    generator (kb/cognee_client.py maintenance) is cancelled inside its
+    ``async with self.maintenance_lock`` — before the lock is held nothing is
+    acquired, and after it the async-with releases the lock on unwind.
+    Non-timeout failures (including fakes without ``maintenance``) propagate to
+    the caller's existing ``maintenance_exception`` branch.
+
+    ``asyncio.timeout``, not ``wait_for``: on Python 3.11 ``wait_for`` can
+    SWALLOW an outer cancellation that lands just as the inner future
+    completes (returns the result instead of raising CancelledError; fixed in
+    3.12 by reimplementing ``wait_for`` on ``asyncio.timeout``, gh-96764).
+    ``__aenter__`` here completes near-instantly on the happy path, so the
+    swallow window is hit in practice and the scheduler loop would survive
+    ``_stop_evolve_scheduler`` forever.
+    """
+    ctx = citadel.cognee.maintenance()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            await ctx.__aenter__()
+    except TimeoutError:
+        return None
+    return ctx
+
+
 async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None:
-    """Run every evolve stage and Cognify on the web server's event loop.
+    """Run the evolve stages and Cognify on the web server's event loop.
 
     Two Cognee and Kuzu constraints require one process and one loop:
     - cognee binds its async resources to the loop that created them. Cognify
@@ -389,9 +541,11 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
       may hold it. A second sync or Cognify process would contend with the web
       process for that lock.
 
-    Phase 1 runs source sync, self-improvement, promotion, and Linear sync with
-    inline Cognify suppressed. Phase 2 runs one Cognify pass. The first pass
-    waits for the remaining interval so a redeploy does not start heavy work.
+    Source sync runs first with inline Cognify suppressed. The first projection
+    barrier gates self-improvement and promotion. A second barrier drains jobs
+    created by those consumer stages. Phase 2 runs one Cognify pass when enabled.
+    The first pass waits for the remaining interval so a redeploy does not start
+    heavy work.
     """
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
@@ -408,149 +562,482 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
         "Evolve scheduler: first pass in %.0fs of a %ss interval (last pass: %s)",
         delay, interval_seconds, last or "none recorded",
     )
-    while True:
-        await asyncio.sleep(delay)
-        delay = float(interval_seconds)
-        logger.info("Evolve scheduler: starting scheduled pass")
-        citadel = get_citadel()
-        pause = getattr(citadel, "pause_lifecycle_queue", None)
-        if callable(pause):
-            pause()
-        phase1_ok = True
-        phase1_reason: str | None = None
-        # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
-        # the writer lock so lifecycle cannot claim a lease and then wait inside
-        # Cognee while this pass owns the graph.
-        try:
-            async with citadel.cognee.maintenance():
-                writer_lock = getattr(
-                    getattr(citadel, "cognee", None), "writer_lock", None
+    orphan: asyncio.Task[Any] | None = None
+    orphan_started = 0.0
+    consecutive_skips = 0
+    phase2_task: asyncio.Task[Any] | None = None
+    try:
+        while True:
+            await asyncio.sleep(delay)
+            delay = float(interval_seconds)
+            logger.info("Evolve scheduler: starting scheduled pass")
+            citadel = get_citadel()
+            capture_run_id = f"evolve:{uuid4().hex}"
+            logger.info("Evolve scheduler: capture run %s", capture_run_id)
+            # ORPHAN GUARD — before the pause and before Phase 1. A previous
+            # pass's Phase 2 timed out and was deliberately left running:
+            # cancelling it in-process could land inside a cognee write path,
+            # whose rollback fires on Exception only (run_tasks catches Exception,
+            # not BaseException), stranding partial writes. While the orphan lives
+            # it may hold the maintenance lock, so running Phase 1 would wedge on
+            # entry and pausing the queue here would park the drain for nothing.
+            # Skip the pass: no pause, no stamp (the pass did not run).
+            if orphan is not None and not orphan.done():
+                consecutive_skips += 1
+                max_skips = _evolve_orphan_max_skips()
+                logger.error(
+                    "Evolve scheduler: pass skipped, Phase 2 orphan %s from a "
+                    "previous pass is still running after %.0fs (skip %d/%d)",
+                    orphan.get_name(),
+                    time.monotonic() - orphan_started,
+                    consecutive_skips,
+                    max_skips,
                 )
-                acquired = False
-                try:
-                    if writer_lock is not None:
-                        await writer_lock.acquire()
-                        acquired = True
-                    # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
-                    # A second process can never open the graph: cognee holds an exclusive
-                    # OS file lock on cognee_graph_kuzu for the lifetime of whichever
-                    # process opens it, and that is always this one. github_sync and
-                    # linear_sync died on "Could not set lock on file" every hour because
-                    # of it. Add-only for the duration so the per-ingest background
-                    # cognify does not storm the writer lock; Phase 2 below cognifies once
-                    # as the sole writer (#47).
-                    with suppress_inline_cognify():
-                        code = await run_evolve_in_loop()
-                    if code == 0:
-                        logger.info("Evolve scheduler: stages finished (exit=0)")
-                    else:
-                        phase1_ok = False
-                        phase1_reason = f"stages_exit_{code}"
-                        # A partial failure is the normal broken case, not an edge one:
-                        # the stage names are already on the "Evolve finished: ...
-                        # failed=..." line, so log at ERROR here to make the cycle
-                        # visibly bad rather than an INFO nobody reads (#89).
-                        logger.error(
-                            "Evolve scheduler: stages finished with failures (exit=%s) - "
-                            "see the 'Evolve finished' line above for which stages failed",
-                            code,
+                if consecutive_skips >= max_skips:
+                    logger.critical(
+                        "Evolve scheduler: Phase 2 orphan exceeded its skip "
+                        "budget; flipping the canary unhealthy so /readyz "
+                        "escalates to an operator or healthcheck restart (#27)"
+                    )
+                    _record_canary_verdict(ok=False, error="Phase2OrphanWedged")
+                continue
+            if orphan is not None:
+                orphan_exc = None if orphan.cancelled() else orphan.exception()
+                logger.warning(
+                    "Evolve scheduler: orphaned Phase 2 task %s finished after "
+                    "%.0fs (%s); resuming normal passes",
+                    orphan.get_name(),
+                    time.monotonic() - orphan_started,
+                    orphan_exc if orphan_exc is not None else "ok",
+                )
+                orphan = None
+            pause = getattr(citadel, "pause_lifecycle_queue", None)
+            if callable(pause):
+                pause()
+            phase1_ok = True
+            first_barrier_ok = True
+            first_barrier_reason: str | None = None
+            post_stages_ok = True
+            post_stages_reason: str | None = None
+            second_barrier_ok = True
+            second_barrier_reason: str | None = None
+            phase1_reason: str | None = None
+            # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
+            # the writer lock so lifecycle cannot claim a lease and then wait inside
+            # Cognee while this pass owns the graph. Entry is bounded: a holder
+            # that never releases (e.g. a hung graph-lane job) must defer this
+            # pass to the next interval, not wedge the scheduler on the lock.
+            maintenance_ctx = None
+            try:
+                maintenance_ctx = await _acquire_maintenance(
+                    citadel, _evolve_maintenance_acquire_timeout_seconds()
+                )
+                if maintenance_ctx is not None:
+                    # Phase 1 can run: the pass is no longer a consecutive skip.
+                    consecutive_skips = 0
+                    try:
+                        writer_lock = getattr(
+                            getattr(citadel, "cognee", None), "writer_lock", None
                         )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    phase1_ok = False
-                    phase1_reason = "stages_exception"
-                    logger.exception("Evolve scheduler: stages failed")
-                finally:
-                    if acquired:
-                        writer_lock.release()
-        except asyncio.CancelledError:
-            _resume_lifecycle_queue(citadel, include_deferred=True)
-            raise
-        except Exception:
-            phase1_ok = False
-            phase1_reason = "maintenance_exception"
-            logger.exception("Evolve scheduler: maintenance entry failed")
-        # Phase 2 — cognify in-loop; the web process is the sole Kuzu writer now.
-        force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        cancelled = False
-        phase2_ok = False
-        phase2_reason: str | None = None
-        try:
-            # verify=True runs the end-to-end ingest+cognify+search canary and
-            # records its verdict for /readyz (#27).
-            result = await citadel.cognify_dataset(force=force, verify=True)
-            verification = result.get("verification") or {}
-            _record_canary_verdict(
-                ok=bool(result.get("ok")),
-                search_hit=verification.get("search_hit"),
-                graph_grew=result.get("graph_grew"),
-                marker=verification.get("marker"),
-                projection_chain_ok=verification.get("projection_chain_ok"),
-                projection_receipt_count=len(verification.get("projection_receipts") or []),
-            )
-            projection_chain_ok = verification.get(
-                "projection_chain_ok", verification.get("ok", True)
-            )
-            phase2_ok = bool(result.get("ok")) and projection_chain_ok is not False
-            if not phase2_ok:
-                phase2_reason = "cognify_verification_failed"
-            logger.info(
-                "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
-                result.get("graph_after"),
-                result.get("graph_grew"),
-                _LAST_CANARY["ok"] if _LAST_CANARY is not None else None,
-            )
-        except asyncio.CancelledError:
-            # Teardown landing mid-Phase-2 (the canary can now wait minutes on
-            # its marker's projection, so this window is wide): the pass did
-            # NOT run to completion, so stamping it would make the next boot
-            # wait a full interval instead of re-running the interrupted pass,
-            # and kicking a drain task on a loop being torn down helps nobody.
-            cancelled = True
-            raise
-        except Exception as exc:
-            phase2_reason = "cognify_exception"
-            logger.exception("Evolve scheduler: cognify failed")
-            # A crash in the cognify pass is precisely the failure #27's canary
-            # exists to surface. Recording only clean passes above would leave
-            # the previous verdict standing, so /readyz would read GREEN through
-            # the exact break it is meant to catch. Stamp it unhealthy.
-            _record_canary_verdict(ok=False, error=exc.__class__.__name__)
-        finally:
-            if not cancelled:
-                # Stamp the pass even when a stage failed. This records that the
-                # cycle RAN, which is what the next boot needs to resume the
-                # interval; whether the stages succeeded is already on the
-                # "Evolve finished" line and in /readyz. Recording only clean
-                # passes would make a node with one broken stage restart its
-                # clock forever, which is the bug this fixes (#153). A CANCELLED
-                # pass is the one exception: it did not run, so it must not
-                # stamp (see the CancelledError branch above).
-                cycle_ok = phase1_ok and phase2_ok
-                record_completed(
-                    state_path,
-                    ok=cycle_ok,
-                    reason=None
-                    if cycle_ok
-                    else (phase1_reason or phase2_reason or "scheduled_cycle_failed"),
+                        acquired = False
+                        try:
+                            if writer_lock is not None:
+                                await writer_lock.acquire()
+                                acquired = True
+                            # Phase 1 runs HERE, in the web's own loop, not in a subprocess (#88).
+                            # A second process can never open the graph: cognee holds an exclusive
+                            # OS file lock on cognee_graph_kuzu for the lifetime of whichever
+                            # process opens it, and that is always this one. github_sync and
+                            # linear_sync died on "Could not set lock on file" every hour because
+                            # of it. Add-only for the duration so the per-ingest background
+                            # cognify does not storm the writer lock; Phase 2 below cognifies once
+                            # as the sole writer (#47).
+                            with suppress_inline_cognify():
+                                code = await _run_evolve_stage_group(
+                                    run_evolve_in_loop,
+                                    capture_run_id=capture_run_id,
+                                    stages=_EVOLVE_SOURCE_STAGES,
+                                )
+                            if code == 0:
+                                logger.info(
+                                    "Evolve scheduler: source stages finished (exit=0)"
+                                )
+                            else:
+                                phase1_ok = False
+                                phase1_reason = f"stages_exit_{code}"
+                                # A partial failure is the normal broken case, not an edge one:
+                                # the stage names are already on the "Evolve finished: ...
+                                # failed=..." line, so log at ERROR here to make the cycle
+                                # visibly bad rather than an INFO nobody reads (#89).
+                                logger.error(
+                                    "Evolve scheduler: source stages finished with failures (exit=%s) - "
+                                    "see the 'Evolve finished' line above for which stages failed",
+                                    code,
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            phase1_ok = False
+                            phase1_reason = "stages_exception"
+                            logger.exception("Evolve scheduler: stages failed")
+                        finally:
+                            if acquired:
+                                writer_lock.release()
+                    finally:
+                        await maintenance_ctx.__aexit__(None, None, None)
+            except asyncio.CancelledError:
+                _resume_lifecycle_queue(citadel, include_deferred=True)
+                raise
+            except Exception:
+                phase1_ok = False
+                phase1_reason = "maintenance_exception"
+                logger.exception("Evolve scheduler: maintenance entry failed")
+            if maintenance_ctx is None and phase1_ok:
+                # Bounded Phase 1 entry timed out: another holder still owns
+                # maintenance. Phase 1 did not run, so the pass must not stamp;
+                # resume the paused queue and defer the whole pass. Deferral
+                # consumes the SAME consecutive-skip budget as the orphan guard:
+                # any pass that cannot run Phase 1 is a skip, and without a bound
+                # the scheduler could defer forever while /readyz keeps serving
+                # the last green canary.
+                consecutive_skips += 1
+                max_skips = _evolve_orphan_max_skips()
+                logger.error(
+                    "Evolve scheduler: maintenance busy after %.0fs; pass "
+                    "deferred to the next interval (skip %d/%d)",
+                    _evolve_maintenance_acquire_timeout_seconds(),
+                    consecutive_skips,
+                    max_skips,
                 )
-                # Drain whatever the pass deferred. Projection starts are
-                # suppressed while Phase 1 holds the writer lock, and Phase 2
-                # cognifies directly without touching the lifecycle queue, so
-                # without this kick a job accepted mid-pass waits for the next
-                # external ingest or the next pass. The lock is free and the
-                # suppression scope has ended by this point, and the call is a
-                # no-op when a drain is already running.
+                if consecutive_skips >= max_skips:
+                    logger.critical(
+                        "Evolve scheduler: maintenance stayed busy past the skip "
+                        "budget; flipping the canary unhealthy so /readyz "
+                        "escalates to an operator or healthcheck restart (#27)"
+                    )
+                    _record_canary_verdict(ok=False, error="MaintenanceWedged")
                 try:
                     _resume_lifecycle_queue(citadel, include_deferred=True)
                 except Exception:
-                    logger.exception("Evolve scheduler: post-pass projection resume failed")
+                    logger.exception(
+                        "Evolve scheduler: deferred-pass projection resume failed"
+                    )
+                continue
+            # Kick the projection drain NOW, before Phase 2: the pass paused the
+            # queue above, and a hung Phase 2 (observed live 2026-08-28: cognify
+            # emitted nothing for 25+ minutes) must never park a 12k-job rebuild
+            # behind it. include_deferred=False, and both halves of that matter:
+            # (i) the baseline relational/vector lanes take neither the
+            # maintenance nor the writer lock (kb/cognee_client.py vector_project
+            # is deliberately run_unlocked), so the drain this kick starts can
+            # never park behind Phase 2 — the 2026-08-28 incident closed; (ii)
+            # False does NOT stop an already-running graph-lane task from waking
+            # on the shared projection gate — that interleaving is handled by the
+            # Phase 2 budget (FIFO maintenance lock: at most one graph-lane job
+            # ahead) and the orphan guard, not by this flag. The graph lane is
+            # deliberately (re)started only by cognify_dataset's own
+            # post-graph-write resume (kb/service.py) and the post-pass kick in
+            # the finally below, which stays include_deferred=True.
+            try:
+                _resume_lifecycle_queue(citadel, include_deferred=False)
+            except Exception:
+                logger.exception("Evolve scheduler: source projection resume failed")
+            # Phase 2: Cognify in-loop; the web process is the sole Kuzu writer.
+            force = os.getenv("CITADEL_EVOLVE_COGNIFY_FORCE", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            cognify_enabled = os.getenv(
+                "CITADEL_EVOLVE_COGNIFY_ENABLED", "true"
+            ).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            cancelled = False
+            phase2_ok = False
+            phase2_reason: str | None = None
+            # verify=True runs the end-to-end ingest+cognify+search canary and
+            # records its verdict for /readyz (#27). Bounded by wait_for, but the
+            # cognify itself is shielded: cognee's pipeline rollback fires on
+            # Exception only, so an in-process cancellation here would strand
+            # partial graph/vector/relational writes with the run row stuck
+            # DATASET_PROCESSING_STARTED (P1-B). On timeout the task is left
+            # running as this loop's single orphan and the guard at the top of the
+            # pass takes over.
+            if cognify_enabled:
+                phase2_coro = citadel.cognify_dataset(force=force, verify=True)
+            else:
+                logger.info(
+                    "Evolve scheduler: Phase 2 Cognify skipped "
+                    "(CITADEL_EVOLVE_COGNIFY_ENABLED=false)"
+                )
+                phase2_ok = True
+                phase2_coro = asyncio.sleep(0, result={"ok": True})
+            phase2_task = asyncio.create_task(
+                phase2_coro,
+                name="evolve-phase2-cognify",
+            )
+            _BACKGROUND_TASKS.add(phase2_task)
+            phase2_task.add_done_callback(_forget_background_task)
+            try:
+                # asyncio.timeout, not wait_for: see _acquire_maintenance —
+                # 3.11's wait_for can swallow the teardown cancellation when
+                # the (fast) cognify completes in the same tick, leaving the
+                # loop alive past _stop_evolve_scheduler.
+                async with asyncio.timeout(_evolve_cognify_timeout_seconds()):
+                    result = await asyncio.shield(phase2_task)
+                if cognify_enabled:
+                    verification = result.get("verification") or {}
+                    _record_canary_verdict(
+                        ok=bool(result.get("ok")),
+                        search_hit=verification.get("search_hit"),
+                        graph_grew=result.get("graph_grew"),
+                        marker=verification.get("marker"),
+                        projection_chain_ok=verification.get("projection_chain_ok"),
+                        projection_receipt_count=len(
+                            verification.get("projection_receipts") or []
+                        ),
+                    )
+                    projection_chain_ok = verification.get(
+                        "projection_chain_ok", verification.get("ok", True)
+                    )
+                    phase2_ok = bool(result.get("ok")) and projection_chain_ok is not False
+                    if not phase2_ok:
+                        phase2_reason = "cognify_verification_failed"
+                    logger.info(
+                        "Evolve scheduler: cognify finished (graph_after=%s grew=%s canary_ok=%s)",
+                        result.get("graph_after"),
+                        result.get("graph_grew"),
+                        _LAST_CANARY["ok"] if _LAST_CANARY is not None else None,
+                    )
+            except asyncio.CancelledError:
+                # Teardown landing mid-Phase-2 (the canary can now wait minutes on
+                # its marker's projection, so this window is wide): the pass did
+                # NOT run to completion, so stamping it would make the next boot
+                # wait a full interval instead of re-running the interrupted pass,
+                # and kicking a drain task on a loop being torn down helps nobody.
+                # Teardown DOES cancel the inner task (unchanged semantics from
+                # before the shield): the process is going away either way, and
+                # the next boot repairs any stranded partial write via
+                # recover_stale_cognify_runs.
+                phase2_task.cancel()
+                cancelled = True
+                raise
+            except TimeoutError:
+                # The bound above fired: Phase 2 hung past its budget (observed
+                # live 2026-08-28). The drain already got its post-stages kick and
+                # the canary flips unhealthy; the stamp below lets the next
+                # interval run instead of waiting behind a dead cognify. The task
+                # is NOT cancelled: cancellation could land inside a cognee write
+                # path whose rollback never runs on CancelledError. It becomes the
+                # loop's single orphan; the guard at the top of the pass skips
+                # passes (bounded by CITADEL_EVOLVE_ORPHAN_MAX_SKIPS) while it
+                # lives.
+                phase2_reason = "cognify_timeout"
+                orphan = phase2_task
+                orphan_started = time.monotonic()
+                logger.error(
+                    "Evolve scheduler: cognify timed out after %.0fs; task %s "
+                    "left running un-cancelled",
+                    _evolve_cognify_timeout_seconds(),
+                    phase2_task.get_name(),
+                )
+                _record_canary_verdict(ok=False, error="TimeoutError")
+            except Exception as exc:
+                phase2_reason = "cognify_exception"
+                logger.exception("Evolve scheduler: cognify failed")
+                # A crash in the cognify pass is precisely the failure #27's canary
+                # exists to surface. Recording only clean passes above would leave
+                # the previous verdict standing, so /readyz would read GREEN through
+                # the exact break it is meant to catch. Stamp it unhealthy.
+                _record_canary_verdict(ok=False, error=exc.__class__.__name__)
+            finally:
+                if not cancelled:
+                    if orphan is not None and not orphan.done():
+                        first_barrier_ok = False
+                        first_barrier_reason = "phase2_orphan"
+                        source_job_ids = ()
+                        logger.error(
+                            "Evolve scheduler: projection barrier deferred while "
+                            "the Phase 2 orphan is still running"
+                        )
+                    else:
+                        try:
+                            source_job_ids = _projection_job_ids_for_capture_run(
+                                citadel, capture_run_id
+                            )
+                        except Exception:
+                            first_barrier_ok = False
+                            first_barrier_reason = "projection_query_exception"
+                            logger.exception(
+                                "Evolve scheduler: source projection watermark lookup failed"
+                            )
+                            source_job_ids = ()
+
+                    if first_barrier_ok:
+                        try:
+                            first_barrier = await _wait_for_evolve_projection_barrier(
+                                citadel, source_job_ids
+                            )
+                            first_barrier_ok = first_barrier.complete
+                            if not first_barrier_ok:
+                                first_barrier_reason = "projection_barrier_incomplete"
+                                logger.error(
+                                    "Evolve scheduler: first projection barrier incomplete "
+                                    "(pending=%s failed=%s)",
+                                    first_barrier.pending_job_ids,
+                                    first_barrier.failed_job_ids,
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            first_barrier_ok = False
+                            first_barrier_reason = "projection_barrier_exception"
+                            logger.exception(
+                                "Evolve scheduler: first projection barrier failed"
+                            )
+
+                    if first_barrier_ok:
+                        try:
+                            with suppress_inline_cognify():
+                                post_code = await _run_evolve_stage_group(
+                                    run_evolve_in_loop,
+                                    capture_run_id=capture_run_id,
+                                    stages=_EVOLVE_POST_PROJECTION_STAGES,
+                                )
+                            if post_code != 0:
+                                post_stages_ok = False
+                                post_stages_reason = f"stages_exit_{post_code}"
+                                logger.error(
+                                    "Evolve scheduler: post-projection stages finished "
+                                    "with failures (exit=%s)",
+                                    post_code,
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            post_stages_ok = False
+                            post_stages_reason = "stages_exception"
+                            logger.exception(
+                                "Evolve scheduler: post-projection stages failed"
+                            )
+
+                        try:
+                            all_job_ids = _projection_job_ids_for_capture_run(
+                                citadel, capture_run_id
+                            )
+                            source_ids = set(source_job_ids)
+                            post_job_ids = tuple(
+                                job_id
+                                for job_id in all_job_ids
+                                if job_id not in source_ids
+                            )
+                        except Exception:
+                            second_barrier_ok = False
+                            second_barrier_reason = "projection_query_exception"
+                            post_job_ids = ()
+                            logger.exception(
+                                "Evolve scheduler: post-projection watermark lookup failed"
+                            )
+                        if second_barrier_ok:
+                            try:
+                                second_barrier = (
+                                    await _wait_for_evolve_projection_barrier(
+                                        citadel, post_job_ids
+                                    )
+                                )
+                                second_barrier_ok = second_barrier.complete
+                                if not second_barrier_ok:
+                                    second_barrier_reason = "projection_barrier_incomplete"
+                                    logger.error(
+                                        "Evolve scheduler: second projection barrier "
+                                        "incomplete (pending=%s failed=%s)",
+                                        second_barrier.pending_job_ids,
+                                        second_barrier.failed_job_ids,
+                                    )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                second_barrier_ok = False
+                                second_barrier_reason = "projection_barrier_exception"
+                                logger.exception(
+                                    "Evolve scheduler: second projection barrier failed"
+                                )
+                if not cancelled:
+                    # Stamp the pass even when a stage failed. This records that the
+                    # cycle RAN, which is what the next boot needs to resume the
+                    # interval; whether the stages succeeded is already on the
+                    # "Evolve finished" line and in /readyz. Recording only clean
+                    # passes would make a node with one broken stage restart its
+                    # clock forever, which is the bug this fixes (#153). A CANCELLED
+                    # pass is the one exception: it did not run, so it must not
+                    # stamp (see the CancelledError branch above).
+                    cycle_ok = (
+                        phase1_ok
+                        and phase2_ok
+                        and first_barrier_ok
+                        and post_stages_ok
+                        and second_barrier_ok
+                    )
+                    record_completed(
+                        state_path,
+                        ok=cycle_ok,
+                        reason=None
+                        if cycle_ok
+                        else (
+                            phase1_reason
+                            or phase2_reason
+                            or first_barrier_reason
+                            or post_stages_reason
+                            or second_barrier_reason
+                            or "scheduled_cycle_failed"
+                        ),
+                    )
+                    # Drain whatever the pass deferred. Projection starts are
+                    # suppressed while Phase 1 holds the writer lock, and Phase 2
+                    # cognifies directly without touching the lifecycle queue, so
+                    # without this kick a job accepted mid-pass waits for the next
+                    # external ingest or the next pass. The lock is free and the
+                    # suppression scope has ended by this point, and the call is a
+                    # no-op when a drain is already running.
+                    try:
+                        _resume_lifecycle_queue(citadel, include_deferred=True)
+                    except Exception:
+                        logger.exception("Evolve scheduler: post-pass projection resume failed")
+    finally:
+        # Reap the detached Phase 2 task on the way out. Lifespan awaits only
+        # this scheduler task (_stop_evolve_scheduler), so an in-flight or
+        # orphaned evolve-phase2-cognify left running here would keep writing
+        # (or unwind its cancellation) overlapping shutdown and a later
+        # lifespan. Cancelling an in-flight cognify at shutdown is acceptable
+        # BECAUSE boot-time recover_stale_cognify_runs (min-age guard
+        # neutralized) rolls back the partial run at the next start.
+        for leftover in {t for t in (phase2_task, orphan) if t is not None}:
+            if leftover.done():
+                if not leftover.cancelled():
+                    # Consume so a completed orphan never logs "exception was
+                    # never retrieved" after the loop is gone.
+                    leftover.exception()
+            else:
+                leftover.cancel()
+                try:
+                    # asyncio.timeout, not wait_for: 3.11's wait_for could
+                    # swallow a second teardown cancellation here (see
+                    # _acquire_maintenance).
+                    async with asyncio.timeout(10.0):
+                        await leftover
+                except (asyncio.CancelledError, TimeoutError):
+                    pass
+                except Exception:
+                    logger.exception(
+                        "Evolve scheduler: reaped Phase 2 task %s raised",
+                        leftover.get_name(),
+                    )
+            _BACKGROUND_TASKS.discard(leftover)
 
 
 def _start_evolve_scheduler() -> "asyncio.Task[Any] | None":
@@ -715,6 +1202,29 @@ async def lifespan(app: FastAPI) -> Any:
                 "Seat dataset backfill failed; seats created before provisioning "
                 "may still fail every search (#147)"
             )
+        # Repair cognify runs a previous process abandoned mid-write: teardown
+        # cancellation bypasses cognee's Exception-only rollback, stranding
+        # partial writes and a DATASET_PROCESSING_STARTED run row. The client
+        # runs its own recovery loop (cognee's startup repair ranks per
+        # dataset, so it never sees a run buried under a newer terminal run,
+        # and it swallows its own failures): every run whose own latest
+        # status row is STARTED is rolled back and closed, before any worker
+        # starts so nothing races the rollback. A failed or unverified
+        # recovery ABORTS boot (the raise propagates out of lifespan) with
+        # CogneeStartupRecoveryError naming the dangling runs. Skipping the
+        # boot-time starters instead would not be fail-closed, because live
+        # write paths restart writers while the API is up (legacy remember()
+        # -> schedule_cognify() -> _start_cognify_queue_drain();
+        # /api/linear-sync/run schedules cognify), and any new cognify run
+        # would stack writes on top of the unrecovered partial run. A dead
+        # process retried by the platform restart policy IS the signal.
+        recover = getattr(
+            getattr(get_citadel(), "cognee", None),
+            "recover_stale_cognify_runs",
+            None,
+        )
+        if callable(recover):
+            await recover()
         _start_cognify_queue()
         _start_lifecycle_queue()
         evolve_task = _start_evolve_scheduler()
@@ -722,11 +1232,18 @@ async def lifespan(app: FastAPI) -> Any:
         try:
             yield
         finally:
-            await _stop_lifecycle_queue()
-            await _stop_cognify_queue()
+            # Cancel the schedulers BEFORE stopping the queues: cancelling the
+            # evolve scheduler while it waits in maintenance/Phase 1 hits its
+            # CancelledError handler, which resumes the lifecycle queue
+            # (include_deferred=True) before re-raising. The old order
+            # (lifecycle -> cognify -> evolve) let that resume restart
+            # vector/graph lane tasks after stop_lifecycle_queue had already
+            # returned.
             await _stop_evolve_scheduler(evolve_task)
             # Same cancel-and-await shutdown; the helper is not evolve specific.
             await _stop_evolve_scheduler(repo_stats_task)
+            await _stop_lifecycle_queue()
+            await _stop_cognify_queue()
 
 
 # Single-source the service version and captured deployment identity. The Railway
@@ -1385,6 +1902,7 @@ def get_mesh() -> MeshState:
     if not hasattr(app.state, "mesh"):
         app.state.mesh = MeshState()
     return app.state.mesh
+
 
 
 def get_github_syncer() -> GitHubOrgSyncer:
@@ -3005,8 +3523,21 @@ def document_endpoint_for_result(
     return f"/api/documents/{quote(drilldown_id, safe=':._-')}"
 
 
+_RETRIEVER_SCORE_FIELDS = frozenset(
+    {"distance", "similarity", "retriever_score", "score"}
+)
+
+
 def result_content_sha256(result: dict[str, Any]) -> str:
-    content_basis = {key: value for key, value in result.items() if key != "_citadel"}
+    # A content hash must identify the CHUNK, not the query. Retrieval scores
+    # (Qdrant cosine distance, similarity, token-overlap score) vary per query
+    # for the same chunk, so excluding them keeps content_sha256 stable and lets
+    # retrieval_eval.trust_observations still see per-request metadata drift.
+    content_basis = {
+        key: value
+        for key, value in result.items()
+        if key != "_citadel" and key not in _RETRIEVER_SCORE_FIELDS
+    }
     encoded = json.dumps(content_basis, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -3037,36 +3568,67 @@ def with_result_id(result: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_id, str) and raw_id.strip():
         return result
     idless = {key: value for key, value in result.items() if key != "id"}
-    basis = json.dumps(idless, sort_keys=True, default=str)
+    # Derive the fallback id from content only: retrieval scores vary per query
+    # and would otherwise make the same chunk's synthetic id query-dependent.
+    basis_fields = {
+        key: value
+        for key, value in idless.items()
+        if key not in _RETRIEVER_SCORE_FIELDS
+    }
+    basis = json.dumps(basis_fields, sort_keys=True, default=str)
     derived = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
     return {**idless, "id": f"chunk:{derived}"}
 
 
-def _result_retriever_score(result: dict[str, Any]) -> float | None:
-    """A numeric relevance value the retriever itself attached, if any.
-
-    cognee 1.2.2's CHUNKS retriever returns chunk payload dicts without one —
-    the vector engine's ScoredResult carries a cosine distance, but the
-    retriever hands back ``found_chunk.payload`` only, so the distance is
-    dropped upstream of this repo's client boundary. For cognee hits this is
-    therefore always None. It is checked anyway so that the moment the client
-    boundary starts merging the distance into the payload, hits surface it here
-    without another change. Never invented: absent stays absent.
-
-    The one live producer of a ``score`` today is the github digest fallback
-    (``search_github_sync_state``), whose value is a token-overlap COUNT — an
-    unbounded integer in a different unit. Passing it through here would
-    surface it as ``retriever_score`` and flip ``retriever_scores_available``
-    on exactly the pages whose only signal is lexical, so that path is
-    excluded rather than mislabelled.
-    """
+def _result_retriever_signal(
+    result: dict[str, Any],
+    *,
+    include_envelope: bool = False,
+    lifecycle: dict[str, Any] | None = None,
+) -> tuple[float, str, str] | None:
+    """Return a finite retriever value with its metric meaning."""
     if result.get("source") == "github_sync_state":
         return None
-    for key in ("score", "distance", "similarity"):
+    if include_envelope:
+        envelope = result.get("_citadel")
+        if isinstance(envelope, dict):
+            relevance = envelope.get("relevance")
+            if isinstance(relevance, dict):
+                value = relevance.get("retriever_score")
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and isfinite(float(value))
+                ):
+                    return (
+                        float(value),
+                        str(relevance.get("retriever_score_kind") or "score"),
+                        str(relevance.get("retriever_score_direction") or "unknown"),
+                    )
+    for key, kind, direction in (
+        ("distance", "distance", "lower-is-better"),
+        ("similarity", "similarity", "higher-is-better"),
+        ("retriever_score", "score", "unknown"),
+        ("score", "score", "unknown"),
+    ):
         value = result.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(float(value))
+        ):
+            if key == "score" and (lifecycle or {}).get("backend") == "vector":
+                kind = "cosine-distance"
+                direction = "lower-is-better"
+            return float(value), kind, direction
     return None
+
+
+def _result_retriever_score(
+    result: dict[str, Any], *, include_envelope: bool = False
+) -> float | None:
+    signal = _result_retriever_signal(result, include_envelope=include_envelope)
+    return signal[0] if signal is not None else None
 
 
 def with_result_metadata(
@@ -3089,9 +3651,9 @@ def with_result_metadata(
     the flag falls back to "any id with a backing endpoint" (non-caller-scoped
     callers/tests). Synthetic ``chunk:<hash>`` ids stay non-drillable either way.
 
-    ``query`` (when supplied) adds ``_citadel.relevance``: the retriever's own
-    score when the payload carries one (it does not today — see
-    ``_result_retriever_score``), observable lexical term coverage, and a
+    ``query`` (when supplied) adds ``_citadel.relevance``: lexical term
+    coverage, a typed retriever score when the payload carries one (Qdrant
+    carries cosine distance as ``distance``), and a
     ``match_context`` window around the densest query-term cluster so that a
     caller which truncates ``text`` at the head still shows the part of a long
     document that actually matched.
@@ -3172,9 +3734,15 @@ def with_result_metadata(
             "term_coverage": round(coverage, 3),
             "matched_terms": matched,
         }
-        retriever_score = _result_retriever_score(normalized)
-        if retriever_score is not None:
+        retriever_signal = _result_retriever_signal(
+            normalized,
+            lifecycle=lifecycle if isinstance(lifecycle, dict) else None,
+        )
+        if retriever_signal is not None:
+            retriever_score, retriever_kind, retriever_direction = retriever_signal
             relevance["retriever_score"] = retriever_score
+            relevance["retriever_score_kind"] = retriever_kind
+            relevance["retriever_score_direction"] = retriever_direction
         full_text = first_string(
             normalized.get("text"),
             normalized.get("content"),
@@ -3293,6 +3861,13 @@ def select_public_search_page(
         candidates = apply_query_ranking(candidates, query, mode=mode)
 
     terms = query_terms(query)
+    if ranked_query and filter_kwargs is None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if hit_term_coverage(candidate, terms)[0] > 0
+            or _result_retriever_score(candidate, include_envelope=True) is not None
+        ]
     coverages = [hit_term_coverage(candidate, terms)[0] for candidate in candidates]
     lexical_evidence = any(coverage > 0 for coverage in coverages)
 
@@ -7927,6 +8502,11 @@ async def lifecycle_requeue_failed(
         }
         record("lifecycle.requeue.apply", False, detail)
         raise HTTPException(status_code=409, detail=detail) from exc
+    except LifecycleConflictError as exc:
+        # Base-class catch LAST: route drift under CITADEL_PROJECTION_DIGEST_V2.
+        detail = {"code": "LIFECYCLE_ROUTE_DRIFT", "message": str(exc)}
+        record("lifecycle.requeue.apply", False, detail)
+        raise HTTPException(status_code=409, detail=detail) from exc
 
     resume = getattr(citadel, "resume_lifecycle_queue", None)
     worker_resumed = bool(resume()) if callable(resume) else False
@@ -8996,6 +9576,8 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     relevance_summary = lexical_relevance_summary(
         body.query, coverages, scores_available=retriever_scores_seen
     )
+    if candidates_matched and not normalized and query_terms(body.query):
+        relevance_summary["no_lexical_match"] = True
     payload: dict[str, Any] = {
         "results": normalized,
         "dataset": primary_dataset,
@@ -9036,8 +9618,12 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         }
     if len(search_datasets) > 1:
         payload["datasets"] = search_datasets
-    if not clarification_required and not normalized and body.dataset is None and (
-        not filters_active or candidates_fetched == 0
+    if (
+        not clarification_required
+        and not normalized
+        and candidates_matched == 0
+        and body.dataset is None
+        and (not filters_active or candidates_fetched == 0)
     ):
         # With filters active this fires only when retrieval itself came back
         # empty — an empty page whose candidates the filters excluded gets the
@@ -9047,6 +9633,17 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             "specific source; see known_datasets."
         )
         payload["known_datasets"] = known_datasets(citadel.config)
+    if not clarification_required and not normalized and candidates_matched:
+        payload.update(
+            {
+                "code": CODE_NO_RELEVANT_RESULTS,
+                "answerable": False,
+                "message": (
+                    "No result had verifiable query overlap or a retriever score. "
+                    "Add an exact issue key, repository, file, symbol, or topic."
+                ),
+            }
+        )
     warnings: list[str] = []
     if (
         filters_active

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ from uuid import uuid4
 
 from qdrant_client import QdrantClient, models
 
-from kb.lite_runtime import LiteConfigurationError, acquire_single_instance_lock
+from kb.lite_lock import LiteConfigurationError, acquire_single_instance_lock
 
 
 _MANIFEST_SCHEMA_VERSION = 1
@@ -29,6 +30,32 @@ _PRIVATE_FILE_MODE = 0o600
 
 class GenerationBackupError(RuntimeError):
     pass
+_QDRANT_SNAPSHOT_TIMEOUT_ENV = "CITADEL_QDRANT_SNAPSHOT_TIMEOUT_SECONDS"
+_DEFAULT_QDRANT_SNAPSHOT_TIMEOUT_SECONDS = 900
+_MIN_QDRANT_SNAPSHOT_TIMEOUT_SECONDS = 1
+
+
+def _qdrant_snapshot_timeout_seconds() -> int:
+    raw = os.getenv(_QDRANT_SNAPSHOT_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_QDRANT_SNAPSHOT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise GenerationBackupError(
+            f"{_QDRANT_SNAPSHOT_TIMEOUT_ENV} must be a finite number"
+        ) from error
+    if not math.isfinite(value):
+        raise GenerationBackupError(
+            f"{_QDRANT_SNAPSHOT_TIMEOUT_ENV} must be a finite number"
+        )
+    if value < _MIN_QDRANT_SNAPSHOT_TIMEOUT_SECONDS:
+        raise GenerationBackupError(
+            f"{_QDRANT_SNAPSHOT_TIMEOUT_ENV} must be at least "
+            f"{_MIN_QDRANT_SNAPSHOT_TIMEOUT_SECONDS} second"
+        )
+    return math.ceil(value)
+
 
 
 _CANONICAL_SYSTEM_ROOT = Path("cognee-system")
@@ -324,6 +351,24 @@ def _sqlite_backup(source_path: Path, destination_path: Path) -> None:
         )
 
 
+def _copy_sqlite(source_path: Path, destination_path: Path) -> None:
+    if not source_path.is_file():
+        raise GenerationBackupError(f"required SQLite database is missing: {source_path}")
+    _make_private_directory(destination_path.parent)
+    _prepare_private_file(destination_path)
+    try:
+        shutil.copyfile(source_path, destination_path)
+        destination_path.chmod(_PRIVATE_FILE_MODE)
+        with sqlite3.connect(f"file:{destination_path}?mode=ro", uri=True) as connection:
+            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    except (OSError, sqlite3.Error) as error:
+        raise GenerationBackupError(f"SQLite restore failed for {source_path}") from error
+    if integrity != "ok":
+        raise GenerationBackupError(
+            f"SQLite restore integrity check failed for {source_path}: {integrity}"
+        )
+
+
 def _copy_tree(
     source: Path,
     destination: Path,
@@ -479,11 +524,11 @@ def _restore_lite_state(source_root: Path, target_layout: _LiteStorageLayout) ->
         target_layout.state_root,
         excluded=frozenset(state_excluded),
     )
-    _sqlite_backup(
+    _copy_sqlite(
         source_root / _CANONICAL_DATABASE,
         target_layout.database_file,
     )
-    _sqlite_backup(
+    _copy_sqlite(
         source_root / _CANONICAL_LIFECYCLE,
         target_layout.lifecycle_file,
     )
@@ -812,7 +857,12 @@ class QdrantSnapshotStore:
     def __init__(self, *, url: str, api_key: str | None) -> None:
         self._url = url.rstrip("/")
         self._api_key = api_key
-        self._client = QdrantClient(url=self._url, api_key=api_key)
+        self._snapshot_timeout_seconds = _qdrant_snapshot_timeout_seconds()
+        self._client = QdrantClient(
+            url=self._url,
+            api_key=api_key,
+            timeout=self._snapshot_timeout_seconds,
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -852,7 +902,9 @@ class QdrantSnapshotStore:
         )
         try:
             try:
-                with urlopen(request, timeout=300) as response:  # noqa: S310
+                with urlopen(
+                    request, timeout=self._snapshot_timeout_seconds
+                ) as response:  # noqa: S310
                     with destination.open("wb") as handle:
                         shutil.copyfileobj(response, handle)
             except OSError as error:

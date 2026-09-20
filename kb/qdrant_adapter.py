@@ -611,11 +611,17 @@ class CitadelQdrantAdapter(VectorDBInterface):
         for point in points:
             payload = None
             raw_id = str(point.id)
-            if getattr(point, "payload", None) is not None:
-                raw_id = str(point.payload.get("citadel_original_id", point.id))
-                payload = _serialize({**point.payload, "id": raw_id})
             similarity = getattr(point, "score", None)
             distance = 0.0 if similarity is None else 1.0 - float(similarity)
+            if getattr(point, "payload", None) is not None:
+                raw_id = str(point.payload.get("citadel_original_id", point.id))
+                base = {**point.payload, "id": raw_id}
+                # Only a real query score is a retrieval distance. retrieve() and
+                # scroll() return score-less Records; fabricating distance 0.0
+                # would advertise a perfect match and could clobber a payload key.
+                if similarity is not None:
+                    base["distance"] = distance
+                payload = _serialize(base)
             results.append(
                 ScoredResult(
                     id=parse_id(raw_id),

@@ -24,6 +24,7 @@ from kb.config import CitadelConfig
 from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.lifecycle import LifecycleRequeueDriftError
+from kb.projection_barrier import ProjectionBarrierResult
 from kb.mesh import MeshState
 from kb.models import FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
@@ -3283,6 +3284,9 @@ def test_feedback_rejects_dataset_outside_token_allowlist(tmp_path: Any) -> None
     assert allowed.status_code == 200
 
 
+
+
+
 def test_feedback_rejects_oversized_text(tmp_path: Any) -> None:
     # FeedbackBody.text carries no max_length; the durable-write path needs the
     # same byte cap as /ingest.
@@ -5257,7 +5261,6 @@ def test_search_selection_prefers_relevant_central_hit_over_dataset_reservation(
         "seat-1",
         "seat-2",
         "seat-3",
-        "seat-4",
     ]
 
 
@@ -5292,7 +5295,7 @@ def test_search_selection_drops_unscored_zero_overlap_hits_from_mixed_page() -> 
     assert [hit["id"] for hit in selected] == ["exact-node", "partial-node"]
 
 
-def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
+def test_search_selection_keeps_scored_zero_overlap_semantic_hit() -> None:
     candidates = [
         {
             "id": "lexical",
@@ -5302,6 +5305,12 @@ def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
         {
             "id": "semantic",
             "text": "payment recovery design",
+            "score": 0.82,
+            "_citadel": {"dataset": "masumi-network"},
+        },
+        {
+            "id": "noise",
+            "text": "unrelated quarterly planning",
             "_citadel": {"dataset": "masumi-network"},
         },
     ]
@@ -5310,9 +5319,11 @@ def test_search_selection_keeps_unscored_zero_overlap_semantic_hit() -> None:
         candidates,
         query="checkout retries",
         datasets=["seat:sarthi", "masumi-network"],
-        limit=2,
+        limit=5,
     )
 
+    # The scored semantic hit survives; the unscored zero-overlap noise is
+    # dropped even with room to spare, so removing the gate fails this test.
     assert [hit["id"] for hit in selected] == ["lexical", "semantic"]
 
 
@@ -5507,6 +5518,64 @@ def test_search_genuine_empty_is_a_normal_success() -> None:
     assert "code" not in body
     assert body.get("timed_out") in (None, False)
 
+
+def test_search_selection_keeps_scored_semantic_hit_without_token_overlap() -> None:
+    from kb.server import select_public_search_page, with_result_metadata
+    from kb.search_format import shape_public_search_hit
+
+    semantic = shape_public_search_hit(
+        with_result_metadata(
+            {
+                "id": "vector-hit",
+                "document_id": "document-1",
+                "text": "semantic result without query words",
+                "distance": 0.12,
+            },
+            0,
+            "notes",
+            query="Patrick current work",
+        )
+    )
+    unrelated = shape_public_search_hit(
+        with_result_metadata(
+            {"id": "unrelated", "document_id": "document-2", "text": "other text"},
+            1,
+            "notes",
+            query="Patrick current work",
+        )
+    )
+
+    selected, _fetched, _matched = select_public_search_page(
+        [semantic, unrelated],
+        query="Patrick current work",
+        datasets=["notes"],
+        limit=5,
+    )
+
+    assert [hit["id"] for hit in selected] == ["vector-hit"]
+    relevance = selected[0]["_citadel"]["relevance"]
+    assert relevance["retriever_score"] == 0.12
+    assert relevance["retriever_score_kind"] == "distance"
+    assert relevance["retriever_score_direction"] == "lower-is-better"
+
+
+
+def test_search_without_relevance_signal_returns_typed_empty() -> None:
+    class NoSignalCitadel(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[Any]:
+            return [{"id": "noise", "document_id": "doc-1", "text": "unrelated text"}]
+
+    client = authed_client("test-reader")
+    app.state.citadel = NoSignalCitadel()
+
+    response = client.post("/search", json={"query": "Patrick current work", "top_k": 3})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"] == []
+    assert body["code"] == "NO_RELEVANT_RESULTS"
+    assert body["answerable"] is False
+    assert body["relevance"]["no_lexical_match"] is True
 
 def test_search_qdrant_outage_is_a_typed_failure() -> None:
     class UnavailableCitadel(FakeCitadel):
@@ -6927,7 +6996,7 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     alias_keys = [set(result) for result in payload["results"]]
     search_keys = [set(result) for result in search.json()["results"]]
     assert all(left <= right for left, right in zip(alias_keys, search_keys))
-    assert len(payload["results"]) == 2
+    assert len(payload["results"]) == 1
     assert payload["results"][0]["text"] == "Rotate keys quarterly"
     assert payload["results"][0]["source"] == "https://example.com/runbook"
     assert payload["results"][0]["score"] == 0.92
@@ -6935,8 +7004,6 @@ def test_knowledge_alias_returns_flat_agent_friendly_results() -> None:
     assert payload["results"][0]["document_id"] == "rotate-keys-document"
     assert "metadata" not in payload["results"][0]
     assert "source_user" not in payload["results"][0]
-    assert payload["results"][1]["text"] == "bare string result"
-    assert payload["results"][1]["source"] is None
 
 
 def test_knowledge_alias_validates_query_and_limit() -> None:
@@ -7373,6 +7440,554 @@ def test_start_lifecycle_queue_resumes_due_projection_work(monkeypatch: Any) -> 
     server._start_lifecycle_queue()
 
     assert calls == ["resume"]
+
+
+def _patch_lifespan_boot(monkeypatch: Any, calls: list[str]) -> None:
+    """Stub the MCP session manager and record every worker starter."""
+    import contextlib as contextlib_module
+    from types import SimpleNamespace
+
+    from kb import server
+
+    # FakeCitadel's short test keys would otherwise refuse boot (M4).
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+
+    @contextlib_module.asynccontextmanager
+    async def _null_run() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        server,
+        "mcp_server",
+        SimpleNamespace(session_manager=SimpleNamespace(run=_null_run)),
+    )
+    monkeypatch.setattr(
+        server, "_start_cognify_queue", lambda: calls.append("cognify")
+    )
+    monkeypatch.setattr(
+        server, "_start_lifecycle_queue", lambda: calls.append("lifecycle")
+    )
+    monkeypatch.setattr(
+        server, "_start_evolve_scheduler", lambda: calls.append("evolve")
+    )
+    monkeypatch.setattr(
+        server, "_start_repo_stats_scheduler", lambda: calls.append("repo_stats")
+    )
+
+
+class _SchedulerCitadel(FakeCitadel):
+    def __init__(self) -> None:
+        self.cognify_calls: list[dict[str, Any]] = []
+        self.resume_calls: list[bool] = []
+        self.post_pass_resume = asyncio.Event()
+        self.cognee = SimpleNamespace(writer_lock=None)
+
+    def pause_lifecycle_queue(self) -> None:
+        pass
+
+    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> None:
+        self.resume_calls.append(include_deferred)
+        if include_deferred:
+            self.post_pass_resume.set()
+
+    async def cognify_dataset(
+        self, *, dataset: Any = None, verify: bool = False, force: bool = False
+    ) -> dict[str, Any]:
+        self.cognify_calls.append(
+            {"dataset": dataset, "verify": verify, "force": force}
+        )
+        return {
+            "ok": True,
+            "graph_before": {"nodes": 0, "edges": 0},
+            "graph_after": {"nodes": 1, "edges": 1},
+            "graph_grew": True,
+            "verification": {
+                "marker": "scheduler-test-marker",
+                "search_hit": True,
+                "graph_grew": True,
+                "ok": True,
+            },
+        }
+
+
+async def _run_one_evolve_scheduler_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    citadel: _SchedulerCitadel,
+    state_path: Path,
+) -> None:
+    from kb import server
+    import kb.evolve_state as evolve_state
+    import scripts.run_railway as run_railway
+
+    class _MaintenanceContext:
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    async def _acquire(_citadel: Any, _timeout: float) -> _MaintenanceContext:
+        return _MaintenanceContext()
+
+    async def _stages(**kwargs: Any) -> int:
+        del kwargs
+        return 0
+
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+    monkeypatch.setattr(server, "_acquire_maintenance", _acquire)
+    monkeypatch.setattr(evolve_state, "first_sleep_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(run_railway, "run_evolve_in_loop", _stages)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(3600, str(state_path)),
+        name="test-evolve-scheduler",
+    )
+
+    try:
+        await asyncio.wait_for(citadel.post_pass_resume.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_evolve_scheduler_skips_phase2_cognify_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    caplog.set_level(logging.INFO, logger="kb.server")
+    citadel = _SchedulerCitadel()
+
+    async def _fail_if_called(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError(f"disabled scheduler called cognify_dataset: {kwargs}")
+
+    monkeypatch.setattr(citadel, "cognify_dataset", _fail_if_called)
+    state_path = tmp_path / "evolve-state.json"
+    await _run_one_evolve_scheduler_pass(monkeypatch, citadel, state_path)
+
+    assert citadel.cognify_calls == []
+    assert citadel.resume_calls == [False, True]
+    assert json.loads(state_path.read_text())["last_run_ok"] is True
+    assert any(
+        "Phase 2 Cognify skipped" in record.getMessage()
+        and "CITADEL_EVOLVE_COGNIFY_ENABLED=false" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_evolve_scheduler_preserves_failed_canary_when_phase2_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    citadel = _SchedulerCitadel()
+    failed_canary = {
+        "ok": False,
+        "search_hit": False,
+        "graph_grew": False,
+        "marker": None,
+        "projection_chain_ok": False,
+        "projection_receipt_count": 0,
+        "error": "prior_failure",
+    }
+    monkeypatch.setattr(server_module, "_LAST_CANARY", failed_canary)
+
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert server_module._LAST_CANARY == failed_canary
+
+
+async def test_evolve_scheduler_places_projection_barriers_between_stage_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "false")
+    import kb.evolve_state as evolve_state
+    import scripts.run_railway as run_railway
+
+    events: list[tuple[Any, ...]] = []
+    second_barrier_seen = asyncio.Event()
+    projection = SimpleNamespace(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+    )
+
+    class Store:
+        query_count = 0
+
+        def projection_job_ids_for_capture_run(
+            self,
+            capture_run_id: str,
+            *,
+            generation_id: str,
+            projection_version: str,
+            config_digest: str,
+        ) -> tuple[str, ...]:
+            assert capture_run_id
+            assert (generation_id, projection_version, config_digest) == (
+                projection.generation_id,
+                projection.projection_version,
+                projection.config_digest,
+            )
+            self.query_count += 1
+            return (
+                ("source-job",)
+                if self.query_count == 1
+                else ("source-job", "post-stage-job")
+            )
+
+    class SchedulerCitadel(_SchedulerCitadel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lifecycle_store = Store()
+
+        def _lifecycle_projection_request(self) -> Any:
+            return projection
+
+        def resume_lifecycle_queue(
+            self,
+            *,
+            include_deferred: bool = False,
+            job_ids: Any = None,
+        ) -> None:
+            del job_ids
+            super().resume_lifecycle_queue(include_deferred=include_deferred)
+            if include_deferred:
+                events.append(("resume", include_deferred))
+
+    citadel = SchedulerCitadel()
+
+    async def stages(**kwargs: Any) -> int:
+        events.append(
+            ("stages", tuple(kwargs["stages"]), kwargs["capture_run_id"])
+        )
+        return 0
+
+    async def barrier(
+        barrier_citadel: Any,
+        job_ids: Any,
+        *,
+        timeout_seconds: float,
+    ) -> ProjectionBarrierResult:
+        assert barrier_citadel is citadel
+        assert timeout_seconds > 0
+        ids = tuple(job_ids)
+        events.append(("barrier", ids))
+        if len([event for event in events if event[0] == "barrier"]) == 2:
+            second_barrier_seen.set()
+        return ProjectionBarrierResult(ids, ids, (), (), True)
+
+    class MaintenanceContext:
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    async def acquire(_citadel: Any, _timeout: float) -> MaintenanceContext:
+        return MaintenanceContext()
+
+    def record_completed(
+        _state_path: str,
+        *,
+        ok: bool = True,
+        reason: str | None = None,
+    ) -> None:
+        events.append(("completed", ok, reason))
+
+    monkeypatch.setattr(server_module, "get_citadel", lambda: citadel)
+    monkeypatch.setattr(server_module, "_acquire_maintenance", acquire)
+    monkeypatch.setattr(evolve_state, "first_sleep_seconds", lambda *_args: 0.0)
+    monkeypatch.setattr(evolve_state, "record_completed", record_completed)
+    monkeypatch.setattr(run_railway, "run_evolve_in_loop", stages)
+    monkeypatch.setattr(server_module, "wait_for_projection_barrier", barrier)
+
+    task = asyncio.create_task(
+        server_module._evolve_scheduler_loop(
+            3600, str(tmp_path / "evolve-state.json")
+        )
+    )
+    try:
+        await asyncio.wait_for(second_barrier_seen.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    stage_events = [event for event in events if event[0] == "stages"]
+    barrier_events = [event for event in events if event[0] == "barrier"]
+
+    assert [(event[0], event[1]) for event in events] == [
+        ("stages", ("github_sync", "repo_content_sync", "linear_sync")),
+        ("barrier", ("source-job",)),
+        ("stages", ("self_improve", "promotion")),
+        ("barrier", ("post-stage-job",)),
+        ("completed", True),
+        ("resume", True),
+    ]
+    assert [event[1] for event in stage_events] == [
+        ("github_sync", "repo_content_sync", "linear_sync"),
+        ("self_improve", "promotion"),
+    ]
+    assert stage_events[0][2] == stage_events[1][2]
+    assert [event[1] for event in barrier_events] == [
+        ("source-job",),
+        ("post-stage-job",),
+    ]
+
+
+
+
+@pytest.mark.asyncio
+
+
+
+@pytest.mark.asyncio
+
+
+
+
+
+@pytest.mark.asyncio
+
+
+
+@pytest.mark.asyncio
+async def test_evolve_scheduler_rejects_no_argument_stage_runner() -> None:
+    calls: list[str] = []
+
+    async def no_argument_runner() -> int:
+        calls.append("ran")
+        return 0
+
+    with pytest.raises(TypeError, match="capture_run_id|stages"):
+        await server_module._run_evolve_stage_group(
+            no_argument_runner,
+            capture_run_id="capture:scheduled",
+            stages=("github_sync",),
+        )
+
+    assert calls == []
+
+
+async def test_evolve_scheduler_runs_phase2_cognify_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_COGNIFY_ENABLED", "true")
+    citadel = _SchedulerCitadel()
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert citadel.cognify_calls == [
+        {"dataset": None, "verify": True, "force": False}
+    ]
+    assert citadel.resume_calls == [False, True]
+
+
+async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(
+    monkeypatch: Any,
+) -> None:
+    """Boot must repair cognify runs a previous process abandoned mid-write
+    (teardown cancellation bypasses cognee's Exception-only rollback), and it
+    must do so BEFORE any worker starts so nothing races the rollback. A
+    verified-clean recovery then starts all four workers.
+
+    Drives server.lifespan directly: the hosted-MCP session manager is
+    once-per-process, so a second TestClient boot in the suite would break it.
+    """
+    from kb import server
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
+
+    class _RecoveringCognee:
+        async def recover_stale_cognify_runs(self) -> list[Any]:
+            calls.append("recover")
+            return []
+
+    citadel = FakeCitadel()
+    citadel.cognee = _RecoveringCognee()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+
+    async with server.lifespan(app):
+        pass
+
+    assert calls.count("recover") == 1, "recovery must run exactly once at boot"
+    assert calls.index("recover") < calls.index("lifecycle"), (
+        "recovery must run before the lifecycle queue starts"
+    )
+    assert calls[-4:] == ["cognify", "lifecycle", "evolve", "repo_stats"], (
+        "a verified-clean recovery must start all four workers"
+    )
+
+
+async def test_lifespan_aborts_when_stale_cognify_recovery_raises(
+    monkeypatch: Any,
+) -> None:
+    """A raising recovery must abort boot, not degrade it. Skipping only the
+    boot-time starters is NOT fail-closed: live write paths restart writers
+    while the API is up (legacy remember() -> schedule_cognify() ->
+    _start_cognify_queue_drain(); /api/linear-sync/run schedules cognify), and
+    any new cognify run would bury the unrecovered latest run as
+    no-longer-latest forever. The process must exit so the platform restart
+    policy retries recovery on the next boot; no worker of any kind may start.
+    """
+    from kb import server
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
+
+    class _ExplodingCognee:
+        async def recover_stale_cognify_runs(self) -> None:
+            calls.append("boom")
+            raise RuntimeError("recovery exploded")
+
+    citadel = FakeCitadel()
+    citadel.cognee = _ExplodingCognee()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+
+    with pytest.raises(RuntimeError, match="recovery exploded"):
+        async with server.lifespan(app):
+            raise AssertionError("lifespan must not yield after a failed recovery")
+
+    assert calls == ["boom"], (
+        "a failed recovery must start nothing: no cognify queue, no lifecycle "
+        "queue, no evolve scheduler, no repo-stats task"
+    )
+
+
+async def test_lifespan_aborts_when_recovery_verification_finds_stale_runs(
+    monkeypatch: Any,
+) -> None:
+    """cognee's recovery swallows its own failures, so 'the call returned' is
+    not 'the repair happened'. When the post-recovery probe still finds a
+    latest DATASET_PROCESSING_STARTED run, the client raises
+    CogneeStartupRecoveryError and boot must abort exactly like any other
+    recovery failure.
+    """
+    from kb import server
+    from kb.cognee_client import CogneeStartupRecoveryError
+
+    calls: list[str] = []
+    _patch_lifespan_boot(monkeypatch, calls)
+
+    class _UnverifiedCognee:
+        async def recover_stale_cognify_runs(self) -> None:
+            calls.append("unverified")
+            raise CogneeStartupRecoveryError(
+                "stale cognify-run recovery left 1 dataset(s) with their "
+                "latest run still DATASET_PROCESSING_STARTED: dead-beef"
+            )
+
+    citadel = FakeCitadel()
+    citadel.cognee = _UnverifiedCognee()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+
+    with pytest.raises(CogneeStartupRecoveryError, match="dead-beef"):
+        async with server.lifespan(app):
+            raise AssertionError(
+                "lifespan must not yield while a partial cognify write is "
+                "unrecovered"
+            )
+
+    assert calls == ["unverified"], (
+        "an unverified recovery must start nothing: no cognify queue, no "
+        "lifecycle queue, no evolve scheduler, no repo-stats task"
+    )
+
+
+async def test_lifespan_teardown_stops_evolve_before_the_lifecycle_queue(
+    monkeypatch: Any,
+) -> None:
+    """Cancelling the evolve scheduler while it waits in maintenance/Phase 1
+    hits its CancelledError handler, which resumes the lifecycle queue
+    (include_deferred=True) before re-raising. Teardown must therefore cancel
+    the scheduler (and repo-stats) BEFORE stopping the lifecycle queue: the
+    old order (lifecycle -> cognify -> evolve) let that resume restart
+    vector/graph lane tasks AFTER stop_lifecycle_queue had already returned,
+    leaving live lane tasks behind a stopped queue at shutdown.
+
+    Drives the real _evolve_scheduler_loop, parked inside the bounded
+    maintenance acquire, through the real lifespan teardown.
+    """
+    import contextlib as contextlib_module
+    from types import SimpleNamespace
+
+    from kb import server
+
+    calls: list[str] = []
+    monkeypatch.setenv("CITADEL_ALLOW_WEAK_ACCESS_KEYS", "true")
+
+    @contextlib_module.asynccontextmanager
+    async def _null_run() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        server,
+        "mcp_server",
+        SimpleNamespace(session_manager=SimpleNamespace(run=_null_run)),
+    )
+
+    entered_maintenance = asyncio.Event()
+
+    class _BlockedMaintenance:
+        async def __aenter__(self) -> None:
+            entered_maintenance.set()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _BlockedMaintenanceCognee:
+        def maintenance(self) -> _BlockedMaintenance:
+            return _BlockedMaintenance()
+
+        async def recover_stale_cognify_runs(self) -> list[Any]:
+            return []
+
+    class _TeardownCitadel(FakeCitadel):
+        cognee = _BlockedMaintenanceCognee()
+
+        def pause_lifecycle_queue(self) -> None:
+            calls.append("pause")
+
+        def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
+            calls.append("lane_resume")
+            return True
+
+        async def stop_lifecycle_queue(self) -> None:
+            calls.append("lifecycle_stop")
+
+    citadel = _TeardownCitadel()
+    app.state.citadel = citadel
+    monkeypatch.setattr(server, "get_citadel", lambda: citadel)
+    # The real loop with a near-zero interval so the first pass parks in the
+    # maintenance acquire immediately; the floor in _start_evolve_scheduler
+    # would otherwise delay the pass by 60s.
+    monkeypatch.setattr(
+        server,
+        "_start_evolve_scheduler",
+        lambda: asyncio.create_task(server._evolve_scheduler_loop(0.001, "")),
+    )
+
+    async with server.lifespan(app):
+        await asyncio.wait_for(entered_maintenance.wait(), timeout=5)
+
+    assert "pause" in calls, "the pass never reached its maintenance acquire"
+    assert calls.count("lane_resume") >= 2, (
+        "the cancelled maintenance wait must have fired its lifecycle resume "
+        "(boot start + cancellation-window resume); the regression window was "
+        "never exercised"
+    )
+    stop_at = calls.index("lifecycle_stop")
+    assert "lane_resume" not in calls[stop_at + 1 :], (
+        "a lifecycle lane was restarted after stop_lifecycle_queue returned: "
+        "teardown must cancel the evolve scheduler before stopping the queue"
+    )
 
 
 async def test_stop_lifecycle_queue_awaits_worker_shutdown(monkeypatch: Any) -> None:

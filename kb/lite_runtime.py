@@ -2,27 +2,52 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-import fcntl
 import json
 import os
 from pathlib import Path
 import pwd
-import socket
 import sqlite3
 import sys
 import time
-from typing import IO, Any
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-class LiteConfigurationError(RuntimeError):
-    pass
+from kb.lite_lock import LiteConfigurationError, acquire_single_instance_lock
 
-
-_LOCK_HANDLE: IO[str] | None = None
+__all__ = ["LiteConfigurationError", "acquire_single_instance_lock"]
+# Set this to run one offline generation backup before normal Lite startup.
+LITE_BACKUP_DESTINATION_ENV = "CITADEL_LITE_BACKUP_DESTINATION"
+LITE_PROJECTION_CUTOVER_ROOT_ENV = "CITADEL_LITE_PROJECTION_CUTOVER_ROOT"
+LITE_PROJECTION_CUTOVER_BACKUP_ROOT_ENV = "CITADEL_LITE_PROJECTION_CUTOVER_BACKUP_ROOT"
+LITE_PROJECTION_CUTOVER_MANIFEST_SHA256_ENV = (
+    "CITADEL_LITE_PROJECTION_CUTOVER_MANIFEST_SHA256"
+)
+LITE_PROJECTION_CUTOVER_MANIFEST_ENV = LITE_PROJECTION_CUTOVER_MANIFEST_SHA256_ENV
 _QDRANT_ADAPTER_BASELINE = "7311f4572b3ec328f3c2fe5ba3d49a6a79d6ae29"
+_LITE_PERSISTED_PATH_ENV_NAMES = (
+    # kb/config.py
+    "CITADEL_ACCESS_STORE_PATH",
+    "CITADEL_CONTACT_STORE_PATH",
+    "CITADEL_OBSIDIAN_SYNC_STATE_PATH",
+    "CITADEL_CONFLICTS_STORE_PATH",
+    "CITADEL_GITHUB_SYNC_STATE_PATH",
+    "CITADEL_REPO_STATS_STATE_PATH",
+    "CITADEL_REPO_CONTENT_SYNC_STATE_PATH",
+    "CITADEL_EVOLVE_STATE_PATH",
+    "CITADEL_EVALUATION_GATE_PATH",
+    "CITADEL_REPAIR_JOURNAL_PATH",
+    "CITADEL_COGNIFY_QUEUE_PATH",
+    "CITADEL_LIFECYCLE_STORE_PATH",
+    "CITADEL_BACKUP_MIRROR_ROOT_PATH",
+    "CITADEL_LINEAR_SYNC_STATE_PATH",
+    # kb/embedding_profile.py, kb/skills.py, retrieval_eval.py
+    "CITADEL_EMBEDDING_PROFILE_STATE_PATH",
+    "CITADEL_SKILLS_STATE_PATH",
+    "CITADEL_REPO_STATE_PATH",
+)
 
 
 def _required(name: str) -> str:
@@ -159,6 +184,150 @@ def configure_lite_environment(data_root: Path | None = None) -> Path:
     return root
 
 
+def run_prelock_backup(root: Path) -> dict[str, Any] | None:
+    destination = os.getenv(LITE_BACKUP_DESTINATION_ENV, "").strip()
+    if not destination:
+        return None
+    from kb.generation_backup import QdrantSnapshotStore, create_generation_backup
+
+    generation_id = _required("CITADEL_GENERATION_ID")
+    qdrant_url = _required("VECTOR_DB_URL")
+    qdrant_key = _required("VECTOR_DB_KEY")
+    with QdrantSnapshotStore(url=qdrant_url, api_key=qdrant_key) as snapshot_store:
+        return create_generation_backup(
+            generation_id=generation_id,
+            data_root=root,
+            destination=Path(destination).expanduser(),
+            snapshot_store=snapshot_store,
+        )
+
+def _clear_cognee_config_caches() -> None:
+    try:
+        from kb import cognee_client
+    except Exception:
+        return
+    cognee_client._PREPARED_COGNEE_STORAGE_SIGNATURE = None
+    clear = getattr(cognee_client.CogneePublicClient, "_clear_cognee_config_caches", None)
+    if callable(clear):
+        clear()
+
+
+def _rebind_lite_paths(root: Path) -> Path:
+    previous_root_value = os.getenv("CITADEL_LITE_DATA_ROOT", "").strip() or "/data"
+    previous_root = Path(previous_root_value).expanduser().resolve()
+    def _previous_storage_root(name: str, fallback: str) -> Path:
+        fallback_path = previous_root / fallback
+        configured = Path(
+            os.getenv(name, "").strip() or str(fallback_path)
+        ).expanduser()
+        if not configured.is_absolute():
+            configured = previous_root / configured
+        configured = configured.resolve()
+        return configured if configured.is_relative_to(previous_root) else fallback_path
+
+    previous_state_root = _previous_storage_root("CITADEL_STATE_DIRECTORY", "citadel-state")
+    previous_system_root = _previous_storage_root("SYSTEM_ROOT_DIRECTORY", "cognee-system")
+    previous_data_root = _previous_storage_root("DATA_ROOT_DIRECTORY", "data-storage")
+
+    persisted_values = {
+        name: os.environ.get(name) for name in _LITE_PERSISTED_PATH_ENV_NAMES
+    }
+    root = root.expanduser().resolve()
+    state_root = root / "citadel-state"
+    storage_roots = tuple(
+        sorted(
+            (
+                (previous_state_root, state_root),
+                (previous_system_root, root / "cognee-system"),
+                (previous_data_root, root / "data-storage"),
+            ),
+            key=lambda item: len(item[0].parts),
+            reverse=True,
+        )
+    )
+    fastembed_cache_path = os.environ.get("FASTEMBED_CACHE_PATH")
+    if not fastembed_cache_path or not fastembed_cache_path.strip():
+        fastembed_cache_path = str(root / "cache/fastembed")
+    path_values = {
+        "CITADEL_LITE_DATA_ROOT": root,
+        "SYSTEM_ROOT_DIRECTORY": root / "cognee-system",
+        "DATA_ROOT_DIRECTORY": root / "data-storage",
+        "CACHE_ROOT_DIRECTORY": root / "cache",
+        "FASTEMBED_CACHE_PATH": fastembed_cache_path,
+        "COGNEE_LOGS_DIR": root / "logs",
+        "CITADEL_STATE_DIRECTORY": state_root,
+        "LADYBUG_HOME_DIRECTORY": root / "ladybug-home",
+        "DB_PATH": root / "cognee-system/databases",
+        "DB_NAME": Path("cognee.db"),
+    }
+    for name, value in path_values.items():
+        os.environ[name] = str(value)
+    for name, value in persisted_values.items():
+        if not value or not value.strip():
+            if name == "CITADEL_LIFECYCLE_STORE_PATH":
+                os.environ[name] = str(state_root / "lifecycle.sqlite3")
+            elif name == "CITADEL_COGNIFY_QUEUE_PATH":
+                os.environ[name] = str(state_root / "cognify_queue.json")
+            continue
+        configured = Path(value).expanduser()
+        if not configured.is_absolute():
+            continue
+        try:
+            resolved = configured.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise LiteConfigurationError(
+                f"{name} must resolve as a direct path: {configured}"
+            ) from error
+        if not resolved.is_relative_to(previous_root):
+            continue
+        if name == "CITADEL_LIFECYCLE_STORE_PATH":
+            os.environ[name] = str(state_root / "lifecycle.sqlite3")
+            continue
+        for old_storage_root, new_storage_root in storage_roots:
+            if not resolved.is_relative_to(old_storage_root):
+                continue
+            relative = resolved.relative_to(old_storage_root)
+            os.environ[name] = str(new_storage_root / relative)
+            break
+    _clear_cognee_config_caches()
+    return root
+
+
+def run_prelock_projection_cutover() -> dict[str, Any] | None:
+    configured = {
+        LITE_PROJECTION_CUTOVER_ROOT_ENV: os.getenv(LITE_PROJECTION_CUTOVER_ROOT_ENV, "").strip(),
+        LITE_PROJECTION_CUTOVER_BACKUP_ROOT_ENV: os.getenv(
+            LITE_PROJECTION_CUTOVER_BACKUP_ROOT_ENV, ""
+        ).strip(),
+        LITE_PROJECTION_CUTOVER_MANIFEST_ENV: os.getenv(
+            LITE_PROJECTION_CUTOVER_MANIFEST_ENV, ""
+        ).strip(),
+    }
+    if not any(configured.values()):
+        return None
+    if any(not value for value in configured.values()):
+        raise LiteConfigurationError(
+            "projection cutover requires "
+            f"{LITE_PROJECTION_CUTOVER_ROOT_ENV}, "
+            f"{LITE_PROJECTION_CUTOVER_BACKUP_ROOT_ENV}, and "
+            f"{LITE_PROJECTION_CUTOVER_MANIFEST_ENV}"
+        )
+
+    try:
+        from kb.projection_cutover import prepare_projection_cutover
+
+        result = prepare_projection_cutover(
+            backup_root=Path(configured[LITE_PROJECTION_CUTOVER_BACKUP_ROOT_ENV]).expanduser(),
+            target_root=Path(configured[LITE_PROJECTION_CUTOVER_ROOT_ENV]).expanduser(),
+            generation_id=_required("CITADEL_GENERATION_ID"),
+            manifest_sha256=configured[LITE_PROJECTION_CUTOVER_MANIFEST_ENV],
+        )
+        _rebind_lite_paths(Path(configured[LITE_PROJECTION_CUTOVER_ROOT_ENV]).expanduser())
+    except Exception as error:
+        raise LiteConfigurationError(f"projection cutover failed: {error}") from error
+    return result
+
+
 def sqlite_database_path() -> Path:
     return Path(os.environ["DB_PATH"]) / os.environ["DB_NAME"]
 
@@ -240,29 +409,8 @@ def drop_root_privileges(root: Path, *, user_name: str = "citadel") -> None:
     os.setuid(account.pw_uid)
 
 
-def acquire_single_instance_lock(
-    root: Path,
-    *,
-    state_root: Path | None = None,
-) -> IO[str]:
-    global _LOCK_HANDLE
-    lock_path = (state_root or root / "citadel-state") / "lite-runtime.lock"
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
-        handle.close()
-        raise LiteConfigurationError(
-            "SQLite Lite allows exactly one Citadel process for this data volume"
-        ) from error
-    handle.seek(0)
-    handle.truncate()
-    handle.write(f"pid={os.getpid()} host={socket.gethostname()}\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    os.set_inheritable(handle.fileno(), True)
-    _LOCK_HANDLE = handle
-    return handle
+# acquire_single_instance_lock lives in kb.lite_lock (imported above) so that
+# kb.generation_backup can use it without importing this runtime module.
 
 
 def wait_for_qdrant(*, timeout_seconds: float = 90.0) -> None:
@@ -356,7 +504,21 @@ def web_command() -> list[str]:
 
 def main() -> None:
     try:
-        root = configure_lite_environment()
+        projection_cutover = run_prelock_projection_cutover()
+        if projection_cutover is None:
+            root = configure_lite_environment()
+        else:
+            root = configure_lite_environment(
+                Path(os.environ[LITE_PROJECTION_CUTOVER_ROOT_ENV])
+            )
+            print(json.dumps(projection_cutover, sort_keys=True), flush=True)
+        try:
+            backup = run_prelock_backup(root)
+        except Exception as error:
+            raise SystemExit(f"Citadel Lite pre-lock backup failed: {error}") from error
+        if backup is not None:
+            print(json.dumps(backup, sort_keys=True), flush=True)
+            return
         drop_root_privileges(root)
         acquire_single_instance_lock(root)
         quarantined = quarantine_unreadable_sqlite()

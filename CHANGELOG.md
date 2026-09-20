@@ -6,6 +6,18 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Boot now aborts when startup cognify recovery cannot be verified.** The
+  gateway runs its own stale-run recovery at boot, before any writer starts:
+  every cognify run whose own latest status row is `DATASET_PROCESSING_STARTED`
+  is rolled back (run-scoped, via cognee's `cognify_rollback_handler`) and its
+  event stream closed with a terminal row. This catches runs cognee's own
+  per-dataset startup repair can never see — a run buried under a newer
+  terminal run in the same dataset. Any recovery failure, or a run left
+  dangling (including one whose dataset row is gone), raises
+  `CogneeStartupRecoveryError` and aborts boot; the platform restart policy
+  retries. Previously the failure was swallowed and the writers started on
+  top of unrecovered partial writes.
+
 - **Knowledge-graph inspector now supports long connection lists.** Selected
   nodes render up to 8 neighbor links and a `Show all N connections` control.
   Expanded mode shows the full set with a scrollable list so users can reach

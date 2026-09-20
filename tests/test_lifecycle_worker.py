@@ -33,6 +33,7 @@ class FakeProjectionGateway:
     def __init__(self) -> None:
         self.remember_calls: list[dict[str, Any]] = []
         self.cognify_calls: list[dict[str, Any]] = []
+        self.cognify_selected_data_calls: list[dict[str, Any]] = []
         self.document_id: str | None = None
         self.document_ids: list[str] = []
         self.chunk_count = 2
@@ -50,6 +51,11 @@ class FakeProjectionGateway:
         self.cognify_calls.append(kwargs)
         self.projected = True
         return {"processed": [self.document_id]}
+
+    async def cognify_selected_data(self, **kwargs: Any) -> dict[str, Any]:
+        self.cognify_selected_data_calls.append(kwargs)
+        self.projected = True
+        return {"processed": kwargs["data_ids"]}
 
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
         assert datasets == ["seat:alice"]
@@ -94,6 +100,10 @@ class VectorFirstProjectionGateway(FakeProjectionGateway):
         return {"operation_id": "vector-projection-1"}
 
 
+class DatasetWideOnlyProjectionGateway(VectorFirstProjectionGateway):
+    cognify_selected_data = None
+
+
 class SlowBatchRememberGateway(VectorFirstProjectionGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -132,6 +142,9 @@ class GraphQuotaProjectionGateway(VectorFirstProjectionGateway):
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("OpenRouter free-model daily quota is exhausted")
 
+    async def cognify_selected_data(self, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("OpenRouter free-model daily quota is exhausted")
+
 
 class MalformedGraphProjectionGateway(VectorFirstProjectionGateway):
     def __init__(self) -> None:
@@ -139,6 +152,13 @@ class MalformedGraphProjectionGateway(VectorFirstProjectionGateway):
         self.graph_present = False
 
     async def cognify(self, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError(
+            "1 validation error for KnowledgeGraph: "
+            "edges.1.target_node_id Input should be a valid string "
+            "[type=string_type, input_value=None, input_type=None]"
+        )
+
+    async def cognify_selected_data(self, **kwargs: Any) -> dict[str, Any]:
         raise ValueError(
             "1 validation error for KnowledgeGraph: "
             "edges.1.target_node_id Input should be a valid string "
@@ -245,6 +265,27 @@ class PersistentProjectionGateway:
                 state["graph_ids"].append(document_id)
         self._save(state)
         return {"operation_id": f"cognify-{state['cognify_calls']}"}
+    async def cognify_selected_data(self, **kwargs: Any) -> dict[str, Any]:
+        state = self._load()
+        state["cognify_calls"] += 1
+        state.setdefault("cognify_force", []).append(bool(kwargs.get("force")))
+        state.setdefault("cognify_selected_data_calls", []).append(
+            {
+                "dataset": kwargs["dataset"],
+                "data_ids": list(kwargs["data_ids"]),
+                "force": bool(kwargs.get("force")),
+            }
+        )
+        selected_ids = {str(item) for item in kwargs["data_ids"]}
+        for document_id in state["document_ids"]:
+            if document_id not in selected_ids:
+                continue
+            state["chunk_counts"][document_id] = 1
+            if document_id not in state["graph_ids"]:
+                state["graph_ids"].append(document_id)
+        self._save(state)
+        return {"operation_id": f"cognify-{state['cognify_calls']}"}
+
 
     async def dataset_document_ids(self, datasets: list[str]) -> list[str]:
         return [str(item) for item in self._load()["document_ids"]]
@@ -422,7 +463,14 @@ async def test_worker_projects_retained_source_and_attests_all_backends(
             },
         }
     ]
-    assert gateway.cognify_calls == [{"datasets": ["seat:alice"], "force": False}]
+    assert gateway.cognify_selected_data_calls == [
+        {
+            "dataset": "seat:alice",
+            "data_ids": [accepted.source_revision_id],
+            "force": False,
+        }
+    ]
+    assert gateway.cognify_calls == []
     operation = store.get_operation(accepted.projection_job_id)
     assert operation.state == "searchable"
     assert {receipt.state for receipt in operation.receipts} == {"searchable"}
@@ -474,12 +522,38 @@ async def test_worker_runs_vector_projection_before_llm_graph_enrichment(
             "document_ids": [accepted.source_revision_id],
         }
     ]
-    assert gateway.cognify_calls == [{"datasets": ["seat:alice"], "force": False}]
+    assert gateway.cognify_selected_data_calls == [
+        {
+            "dataset": "seat:alice",
+            "data_ids": [accepted.source_revision_id],
+            "force": False,
+        }
+    ]
+    assert gateway.cognify_calls == []
     assert [receipt.state for receipt in operation.receipts] == [
         "searchable",
         "searchable",
         "searchable",
     ]
+
+
+@pytest.mark.asyncio
+async def test_graph_projection_requires_selected_data_method(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    accepted = _accept_batch_source(store, _batch_projection(), "manual:missing-seam")
+    gateway = DatasetWideOnlyProjectionGateway()
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-missing-selected-data",
+    )
+
+    with pytest.raises(ProjectionVerificationError, match="cognify_selected_data"):
+        await worker.run_once(now=T0)
+
+    assert gateway.cognify_calls == []
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "pending"
 
 
 @pytest.mark.asyncio
@@ -933,7 +1007,7 @@ async def test_worker_reschedules_completed_provider_call_until_read_check_passe
     gateway.chunk_count = 2
     assert await worker.run_once(now=T0.replace(second=5)) is True
     assert store.get_operation(accepted.projection_job_id).state == "searchable"
-    assert len(gateway.cognify_calls) == 1
+    assert len(gateway.cognify_selected_data_calls) == 1
 
 
 async def test_worker_marks_job_failed_after_bounded_attempts(
@@ -1015,11 +1089,13 @@ async def test_worker_marks_job_failed_after_bounded_attempts(
     assert {receipt.state for receipt in retried.operation.receipts} == {"pending"}
 
 
-async def test_worker_tombstones_missing_local_path_without_retry(
+async def test_worker_does_not_tombstone_missing_path_when_content_retained(
     tmp_path: Path,
 ) -> None:
-    """A path-string note dies on FileNotFoundError. Requeue cannot succeed.
-    Treat it as a non-retryable terminal tombstone on the first attempt.
+    """A missing local file must not tombstone a source whose durable
+    retained_content is still stored. accept_tombstone replaces the head
+    globally and rollback cannot restore it, so a systemic FileNotFoundError
+    during a bulk rebuild (or a path-string note) bounded-fails instead.
     """
     store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
     projection = ProjectionRequest(
@@ -1051,30 +1127,96 @@ async def test_worker_tombstones_missing_local_path_without_retry(
         store,
         MissingLocalPathGateway(),
         worker_id="worker-pathfile",
-        max_attempts=5,
+        max_attempts=1,
     )
 
-    assert await worker.run_once(now=T0) is True
+    with pytest.raises(FileNotFoundError):
+        await worker.run_once(now=T0)
 
-    poison = store.get_operation(accepted.projection_job_id)
-    assert poison.job.state == "stale"
-    assert poison.job.last_error_code == "FileNotFoundError"
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "failed"
+    assert operation.job.last_error_code == "FileNotFoundError"
     current = store.current_revisions_for_source(
         capture.dataset,
         capture.source_key,
         include_chunks=False,
     )
     assert len(current) == 1
-    assert current[0].tombstone is True
-    current_jobs = store.generation_census(
-        generation_id=projection.generation_id,
-        projection_version=projection.projection_version,
-        config_digest=projection.config_digest,
+    assert current[0].tombstone is False
+    assert store.read_retained_content(current[0].source_revision_id) == (
+        b"/private/tmp/claude-501/marker3_pathfile.txt"
     )
-    assert current_jobs.current_job_states.get("failed", 0) == 0
-    assert current_jobs.current_job_states.get("pending", 0) == 1
-    assert store.failed_projection_candidates(projection) == ()
-    assert store.next_wakeup_delay(now=T0) is not None
+
+
+async def test_worker_does_not_tombstone_on_reconcile_graph_filenotfound(
+    tmp_path: Path,
+) -> None:
+    """The real bulk-rebuild shape: an existing Cognee Data row reconciles at
+    the relational stage, then the graph-presence read raises a nested
+    FileNotFoundError (e.g. an uncreated Ladybug storage dir). The current head
+    must be preserved, not tombstoned, because rollback cannot restore it.
+    """
+
+    class ReconcileGraphMissingGateway(FakeProjectionGateway):
+        async def corpus_graph_presence(
+            self, document_ids: list[str], *, datasets: list[str] | None = None
+        ) -> set[str]:
+            raise FileNotFoundError(
+                "Storage directory does not exist: '/data/ladybug-home/graph_db'"
+            )
+
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-1",
+        projection_version="projection-v1",
+        config_digest="sha256:config-1",
+        providers={
+            "relational": "sqlite",
+            "vector": "qdrant",
+            "graph": "ladybug",
+        },
+    )
+    capture = CaptureContext(
+        dataset="seat:alice",
+        source_key="manual:existing-row",
+        source_locator=None,
+        media_type="text/plain",
+        capture_actor_id="alice",
+        capture_run_id="run-existing-row",
+        captured_at=T0,
+    )
+    accepted = store.accept_source(
+        b"the actual note body",
+        capture=capture,
+        projection=projection,
+        now=T0,
+    )
+    gateway = ReconcileGraphMissingGateway()
+    # Present the source as an existing Data row so the relational stage
+    # reconciles without an add; the failure then arises in the graph-presence
+    # read, exactly as a bulk rebuild would hit it.
+    gateway.document_ids = [accepted.source_revision_id]
+    worker = LifecycleProjectionWorker(
+        store,
+        gateway,
+        worker_id="worker-existing-row",
+        max_attempts=1,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        await worker.run_once(now=T0)
+
+    assert gateway.remember_calls == []
+    current = store.current_revisions_for_source(
+        capture.dataset,
+        capture.source_key,
+        include_chunks=False,
+    )
+    assert len(current) == 1
+    assert current[0].tombstone is False
+    operation = store.get_operation(accepted.projection_job_id)
+    assert operation.job.state == "failed"
+    assert operation.job.last_error_code == "FileNotFoundError"
 
 
 async def test_worker_projects_tombstone_as_provider_neutral_exclusion(
@@ -1198,6 +1340,18 @@ async def test_empty_generation_rebuild_converges_against_fresh_provider_state(
     )
     provider_state = json.loads(fresh_provider_path.read_text(encoding="utf-8"))
     assert provider_state["cognify_force"] == [True, True]
+    selected_calls = provider_state["cognify_selected_data_calls"]
+    assert len(selected_calls) == len(accepted)
+    assert {
+        (
+            call["dataset"],
+            tuple(call["data_ids"]),
+            call["force"],
+        )
+        for call in selected_calls
+    } == {
+        ("seat:alice", (item.source_revision_id,), True) for item in accepted
+    }
     assert set(provider_state["document_ids"]) == {
         item.source_revision_id for item in accepted
     }

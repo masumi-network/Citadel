@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -32,6 +34,7 @@ from kb.logging_utils import safe_log_value
 from kb.lifecycle import (
     CaptureContext,
     LIFECYCLE_CHUNK_SOURCE_PREFIX,
+    LifecycleConflictError,
     LifecycleNotFoundError,
     LifecycleRequeueDriftError,
     LifecycleRequeueIdentityMismatchError,
@@ -58,6 +61,28 @@ from kb.source_search import search_github_sync_state
 from kb.tags import merge_tags
 
 logger = logging.getLogger(__name__)
+_JOB_IDS_UNSET = object()
+
+_ACTIVE_CAPTURE_RUN_ID: ContextVar[str | None] = ContextVar(
+    "citadel_active_capture_run_id", default=None
+)
+
+
+def current_capture_run_id() -> str | None:
+    """Return the capture watermark bound to the current scheduled stage."""
+    return _ACTIVE_CAPTURE_RUN_ID.get()
+
+
+@contextmanager
+def capture_run_scope(capture_run_id: str):
+    """Bind one capture watermark across all stage-local Citadel instances."""
+    if not isinstance(capture_run_id, str) or not capture_run_id.strip():
+        raise ValueError("capture_run_id must be a non-empty string")
+    token = _ACTIVE_CAPTURE_RUN_ID.set(capture_run_id)
+    try:
+        yield
+    finally:
+        _ACTIVE_CAPTURE_RUN_ID.reset(token)
 
 # Upper bound for search breadth. The HTTP /search route (SearchBody) already rejects
 # top_k outside [1, 100] and the MCP layer clamps to 25, but this is the single
@@ -97,6 +122,25 @@ def _canary_timeout_seconds() -> float:
     return value
 
 
+def _read_llm_routes() -> dict[str, str]:
+    """Snapshot the effective LLM routes for digest attestation.
+
+    Covers every LLM field the digest hashes AND every field
+    ``activate_cognee_free_router_fallback`` rewrites at runtime, so the
+    frozen snapshot and the fallback mutation set stay in lockstep.
+    """
+    return {
+        name: os.getenv(name, "")
+        for name in (
+            "LLM_PROVIDER",
+            "LLM_MODEL",
+            "LLM_EXTRACTION_MODEL",
+            "LLM_SUMMARIZATION_MODEL",
+            "LLM_QUERY_MODEL",
+        )
+    }
+
+
 class Citadel:
     def __init__(
         self,
@@ -114,6 +158,14 @@ class Citadel:
         self._lifecycle_projection_gate = asyncio.Event()
         self._lifecycle_projection_gate.set()
         self._lifecycle_vector_only = False
+        # Freeze the digest-gate decision AND the attested LLM routes for this
+        # process: a mid-process env change (operator edit or the free-router
+        # fallback rewriting LLM_* at runtime) must not let ingest() accept
+        # jobs whose digest the already bound worker will never claim.
+        self._projection_digest_v2 = os.getenv(
+            "CITADEL_PROJECTION_DIGEST_V2", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._projection_llm_routes = _read_llm_routes()
         if self.config.lifecycle_enabled:
             prepare_cognee_environment = getattr(
                 self.cognee, "_prepare_cognee_environment", None
@@ -121,6 +173,9 @@ class Citadel:
             if callable(prepare_cognee_environment):
                 # Bind the lifecycle identity after Cognee applies its routed defaults.
                 prepare_cognee_environment()
+            # Re-freeze AFTER routing so the binding attests the effective
+            # routed models, not the raw pre-routing environment.
+            self._projection_llm_routes = _read_llm_routes()
             self.lifecycle_store = LifecycleStore(self.config.lifecycle_store_path)
             lifecycle_projection = self._lifecycle_projection_request()
             self.lifecycle_store.assert_generation_binding(lifecycle_projection)
@@ -272,6 +327,10 @@ class Citadel:
                 capture_metadata["session_id"] = session_id
             if attestation:
                 capture_metadata["attestation"] = dict(attestation)
+            self._assert_projection_routes_stable()
+            effective_capture_run_id = (
+                current_capture_run_id() or capture_run_id or session_id
+            )
             acceptance = self.lifecycle_store.accept_source(
                 data.encode("utf-8"),
                 capture=CaptureContext(
@@ -280,7 +339,7 @@ class Citadel:
                     source_locator=source_locator,
                     media_type=media_type,
                     capture_actor_id=capture_actor_id or self.config.user_id,
-                    capture_run_id=capture_run_id or session_id,
+                    capture_run_id=effective_capture_run_id,
                     captured_at=captured_at or datetime.now(UTC),
                     metadata=capture_metadata,
                 ),
@@ -383,6 +442,10 @@ class Citadel:
         """Tombstone current exact and optional chunk revisions for one source."""
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        # Tombstones are deliberately NOT route-guarded: they run through the
+        # route-independent worker path (no LLM), and blocking them under v2
+        # route drift would leave deleted content searchable (the Obsidian
+        # delete path does not retry a failed tombstone).
         projection = self._lifecycle_projection_request()
         current = self.lifecycle_store.current_revisions_for_source(
             dataset,
@@ -390,6 +453,7 @@ class Citadel:
             include_chunks=include_chunks,
         )
         results: list[IngestResult] = []
+        effective_capture_run_id = current_capture_run_id() or capture_run_id
         for revision in current:
             if revision.tombstone:
                 continue
@@ -401,7 +465,7 @@ class Citadel:
                     source_locator=source_locator or revision.source_locator,
                     media_type=revision.media_type,
                     capture_actor_id=capture_actor_id or self.config.user_id,
-                    capture_run_id=capture_run_id,
+                    capture_run_id=effective_capture_run_id,
                     captured_at=captured_at or datetime.now(UTC),
                     metadata={
                         "replaces_source_revision_id": revision.source_revision_id,
@@ -467,13 +531,40 @@ class Citadel:
             "generation_id": generation_id,
             "projection_version": projection_version,
             "providers": providers,
-            "llm_provider": os.getenv("LLM_PROVIDER", ""),
-            "llm_model": os.getenv("LLM_MODEL", ""),
+            "llm_provider": self._projection_llm_routes["LLM_PROVIDER"],
+            "llm_model": self._projection_llm_routes["LLM_MODEL"],
             "embedding_provider": os.getenv("EMBEDDING_PROVIDER", ""),
             "embedding_model": os.getenv("EMBEDDING_MODEL", ""),
             "embedding_dimensions": os.getenv("EMBEDDING_DIMENSIONS", ""),
             "chunk_budget_tokens": chunk_window.resolve_chunk_budget(),
         }
+        if self._projection_digest_v2:
+            # Expand/migrate/contract: v2 is opt-in so this code deploys green
+            # against existing generation bindings (expand). The migration flips
+            # CITADEL_PROJECTION_DIGEST_V2 together with a new
+            # CITADEL_GENERATION_ID in one variable change (migrate); a later
+            # change makes v2 unconditional (contract). Rollback is the same
+            # variable change reversed: the old binding still matches v1.
+            #
+            # Why v2 exists: Cognee routes the actual LLM calls through the
+            # stage vars (model_routing.configure_cognee_model_routes), so
+            # receipts must attest the models that really produced the
+            # projection. Changing any of them is a projection config change:
+            # the generation binding rejects it until a new generation is set.
+            digest_fields.update(
+                {
+                    "digest_version": 2,
+                    "llm_extraction_model": self._projection_llm_routes[
+                        "LLM_EXTRACTION_MODEL"
+                    ],
+                    "llm_summarization_model": self._projection_llm_routes[
+                        "LLM_SUMMARIZATION_MODEL"
+                    ],
+                    "llm_query_model": self._projection_llm_routes[
+                        "LLM_QUERY_MODEL"
+                    ],
+                }
+            )
         config_digest = sha256(
             json.dumps(digest_fields, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
@@ -484,6 +575,26 @@ class Citadel:
             projection_version=projection_version or "lifecycle-v1:cognee-1.4.1",
             config_digest=f"sha256:{config_digest}",
             providers=providers,
+        )
+
+    def _assert_projection_routes_stable(self) -> None:
+        """Refuse NEW projection work after a runtime route change under v2.
+
+        Write-path only: the digest builder itself must stay read-safe (search,
+        readyz, tombstone, and requeue also build projection identities), so a
+        route drift must never take read paths down. Accepting NEW jobs would
+        either strand them (frozen digest, live worker) or lie (receipts
+        attesting a model that did not run), so ingest and rebuild fail fast.
+        """
+        if not self._projection_digest_v2:
+            return
+        if _read_llm_routes() == self._projection_llm_routes:
+            return
+        raise LifecycleConflictError(
+            "LLM routes changed at runtime (free-router fallback or "
+            "operator edit) while CITADEL_PROJECTION_DIGEST_V2 pins "
+            "them per generation; restart the node to re-bind, and set "
+            "a new CITADEL_GENERATION_ID if the change is intentional"
         )
 
     @staticmethod
@@ -520,8 +631,12 @@ class Citadel:
         self._lifecycle_projection_task = task
         task.add_done_callback(self._log_lifecycle_task_done)
         return True
-
-    def _start_graph_lifecycle_projection(self) -> bool:
+    def _start_graph_lifecycle_projection(
+        self,
+        *,
+        job_ids: Sequence[str] | None | object = _JOB_IDS_UNSET,
+        job_filter_owner: str | None = None,
+    ) -> bool:
         if (
             not self._lifecycle_vector_only
             or self.lifecycle_store is None
@@ -529,6 +644,14 @@ class Citadel:
         ):
             return False
         task = self._lifecycle_graph_projection_task
+        existing_worker = self.lifecycle_graph_worker
+        if existing_worker is not None and job_ids is not _JOB_IDS_UNSET:
+            requested_job_ids = None if job_ids is None else job_ids
+            if not existing_worker.set_job_filter(
+                requested_job_ids,
+                owner=job_filter_owner,
+            ):
+                return False
         if task is not None and not task.done():
             return True
         try:
@@ -538,6 +661,16 @@ class Citadel:
                 "lifecycle graph projection not started: no running event loop"
             )
             return False
+        if job_ids is _JOB_IDS_UNSET and existing_worker is not None:
+            initial_job_ids = existing_worker.job_ids
+            initial_owner = existing_worker.job_filter_owner
+        else:
+            initial_job_ids = None if job_ids is _JOB_IDS_UNSET else job_ids
+            initial_owner = (
+                None
+                if job_ids is _JOB_IDS_UNSET or job_ids is None
+                else job_filter_owner
+            )
         self.lifecycle_graph_worker = LifecycleProjectionWorker(
             self.lifecycle_store,
             self.cognee,
@@ -548,6 +681,8 @@ class Citadel:
             include_graph=True,
             include_deferred=True,
             deferred_only=True,
+            job_ids=initial_job_ids,
+            job_filter_owner=initial_owner,
         )
         task = loop.create_task(
             self._drain_lifecycle(self.lifecycle_graph_worker),
@@ -603,8 +738,12 @@ class Citadel:
                 config_digest=worker.config_digest,
                 include_deferred=worker.include_deferred,
                 deferred_only=worker.deferred_only,
+                job_ids=worker.job_ids if worker.include_graph else None,
             )
             if delay is None:
+                if worker.deferred_only and worker.job_ids:
+                    await asyncio.sleep(0.05)
+                    continue
                 return processed_count
             if delay > 0:
                 # A long quota backoff must not hide newly accepted work.
@@ -615,12 +754,34 @@ class Citadel:
         self._lifecycle_projection_gate.clear()
         return True
 
-    def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
-        """Resume baseline work and optionally the scheduled graph lane."""
+    def resume_lifecycle_queue(
+        self,
+        *,
+        include_deferred: bool = False,
+        job_ids: Sequence[str] | None | object = _JOB_IDS_UNSET,
+        job_filter_owner: str | None = None,
+    ) -> bool:
+        """Resume lifecycle work without changing an owned exact graph filter."""
+        if include_deferred and job_ids is not _JOB_IDS_UNSET:
+            requested_job_ids = None if job_ids is None else job_ids
+            if not self._lifecycle_vector_only and self.lifecycle_worker is not None:
+                self.lifecycle_worker.set_job_filter(
+                    requested_job_ids,
+                    owner=job_filter_owner,
+                )
         self._lifecycle_projection_gate.set()
         started = self._start_lifecycle_projection()
         if include_deferred:
-            started = self._start_graph_lifecycle_projection() or started
+            if job_ids is _JOB_IDS_UNSET:
+                started = self._start_graph_lifecycle_projection() or started
+            else:
+                started = (
+                    self._start_graph_lifecycle_projection(
+                        job_ids=job_ids,
+                        job_filter_owner=job_filter_owner,
+                    )
+                    or started
+                )
         return started
 
     async def wait_for_lifecycle_idle(self) -> int:
@@ -647,7 +808,7 @@ class Citadel:
             raise ValueError("poll_seconds must be positive")
         if self.lifecycle_store is None:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
-        self._start_lifecycle_projection()
+        self.resume_lifecycle_queue(include_deferred=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         while True:
@@ -679,6 +840,15 @@ class Citadel:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+    def projection_states_for_job_ids(
+        self, job_ids: Sequence[str]
+    ) -> dict[str, Mapping[str, Any]]:
+        """Return exact lifecycle job and receipt states in one store read."""
+        if self.lifecycle_store is None:
+            raise LifecycleNotFoundError("lifecycle v1 is disabled")
+        return self.lifecycle_store.projection_states_for_job_ids(job_ids)
 
     def lifecycle_operation(self, projection_job_id: str) -> dict[str, Any]:
         """Return one bounded source-to-provider operation record."""
@@ -814,6 +984,9 @@ class Citadel:
             or config_digest != projection.config_digest
         ):
             raise LifecycleRequeueIdentityMismatchError(projection)
+        # Drift check AFTER identity validation so stale previews keep their
+        # 409 identity-mismatch contract; the guard protects only the write.
+        self._assert_projection_routes_stable()
         assert self.lifecycle_store is not None
         requeued_ids = self.lifecycle_store.requeue_failed_projections(
             projection,
@@ -987,6 +1160,7 @@ class Citadel:
             raise LifecycleNotFoundError("lifecycle v1 is disabled")
         if not generation_id.strip():
             raise ValueError("generation_id must be a non-empty string")
+        self._assert_projection_routes_stable()
         projection = self._lifecycle_projection_request(
             generation_id=generation_id,
             projection_version=projection_version,

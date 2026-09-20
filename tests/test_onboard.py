@@ -10,6 +10,7 @@ import pytest
 
 from kb.cli import _onboard
 from kb.onboard import (
+    BASE_URL_ENV,
     TOKEN_ENV,
     POLICY_MARKER_END,
     POLICY_MARKER_START,
@@ -191,6 +192,11 @@ def test_merge_claude_settings_adds_then_idempotent(tmp_path: Path) -> None:
     ]
     assert any("kb.hooks.sync_session" in c for c in cmds)
     assert TOKEN_ENV in data["httpHookAllowedEnvVars"]
+    assert BASE_URL_ENV in data["httpHookAllowedEnvVars"]
+    prompt_groups = data["hooks"]["UserPromptSubmit"]
+    prompt_hooks = [h for g in prompt_groups for h in g["hooks"]]
+    assert any("kb.hooks.search_inject" in h["command"] for h in prompt_hooks)
+    assert prompt_hooks[0]["allowedEnvVars"] == [TOKEN_ENV, BASE_URL_ENV]
     start_groups = data["hooks"]["SessionStart"]
     start_cmds = [h["command"] for g in start_groups for h in g["hooks"]]
     assert any("kb.hooks.sync_start" in c for c in start_cmds)
@@ -200,6 +206,7 @@ def test_merge_claude_settings_adds_then_idempotent(tmp_path: Path) -> None:
     data2 = json.loads(path.read_text())
     assert len(data2["hooks"]["SessionEnd"]) == 1  # not duplicated
     assert len(data2["hooks"]["SessionStart"]) == 1  # not duplicated
+    assert len(data2["hooks"]["UserPromptSubmit"]) == 1  # not duplicated
 
 
 def _make_repo(tmp_path: Path) -> Path:
