@@ -73,7 +73,7 @@ Citadel splits always-on policy, how-to guidance, and live tools on purpose:
 
 | Layer | What it is | When it runs |
 |---|---|---|
-| **Rules / SessionStart** | Always-on agent policy (search-first; MCP → CLI → official docs ladder; never claim vault authority / “Citadel confirms X” without a hit title+snippet; never sole authority for Mainnet payment token units; traces are reference-only; share only with approval) | Every session — `AGENTS.md`, Cursor/Windsurf rules, Claude `SessionStart` (`kb.hooks.sync_start`) |
+| **Rules / SessionStart** | Always-on agent policy (search-first; MCP → CLI → official docs ladder; never claim vault authority / “Citadel confirms X” without a hit title+snippet; never sole authority for Mainnet payment token units; traces are reference-only; share only with approval; Claude `SessionStart` may also inject bounded repo-scoped workspace candidates) | Every session — `AGENTS.md`, Cursor/Windsurf rules, Claude `SessionStart` (`kb.hooks.sync_start`) |
 | **Skill** | How-to: connect MCP, onboard, vault workflows, safety | When the agent loads `citadel-archive` / `/skills/connect` / `/skills/vault` |
 | **MCP** | The actual tools (`citadel_search`, `citadel_ingest`, …) | Only when the client has a live MCP connection + token in **process env** |
 

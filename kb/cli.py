@@ -410,6 +410,21 @@ def _result_exit(value: Any) -> int:
 # kb.mcp_server._max_ingest_bytes (not importable here — the mcp extra);
 # same env + default so the two surfaces agree. Keep the two in sync.
 _DEFAULT_MAX_INGEST_BYTES = 200_000
+_MAX_SEARCH_HTTP_ERROR_BODY_BYTES = 64 * 1024
+
+
+def _read_search_http_error_body(
+    exc: urllib.error.HTTPError,
+) -> tuple[str, bool]:
+    """Read a bounded error body and report whether the bound was exceeded."""
+    if not exc.fp:
+        return str(exc.reason), False
+    raw_body = exc.read(_MAX_SEARCH_HTTP_ERROR_BODY_BYTES + 1)
+    if len(raw_body) > _MAX_SEARCH_HTTP_ERROR_BODY_BYTES:
+        return raw_body.decode(errors="replace"), True
+    return raw_body.decode(errors="replace"), False
+
+
 
 
 def _max_ingest_bytes() -> int:
@@ -840,6 +855,8 @@ def _search_item_meta(item: dict[str, Any], *, color: bool) -> str:
 
 
 def _render_search(payload: dict[str, Any], query: str) -> None:
+    from kb.search_format import retrieval_receipt_line
+
     color = supports_color()
     results = payload.get("results") or []
     if not isinstance(results, list):
@@ -851,8 +868,10 @@ def _render_search(payload: dict[str, Any], query: str) -> None:
             print(paint(f"QUERY_CONTEXT_REQUIRED: {detail}", "yellow", enable=color))
             return
         print(paint(f'No results for "{query}".', "dim", enable=color))
+        print(paint(retrieval_receipt_line(payload.get("retrieval_receipt")), "dim", enable=color))
         return
     print(f'{len(results)} result(s) for "{query}":\n')
+    print(paint(retrieval_receipt_line(payload.get("retrieval_receipt")), "dim", enable=color))
     sections = payload.get("sections")
     if isinstance(sections, dict) and any(sections.get(key) for key in _SEARCH_SECTION_ORDER):
         index = 1
@@ -916,13 +935,19 @@ def _emit_search_timeout(
     partial: dict[str, Any] | None = None,
 ) -> int:
     """Report an expired search budget as a typed failure, never empty success."""
-    del partial
+    from kb.search_format import shape_retrieval_receipt
+
+    extra: dict[str, Any] = {"http_status": 504}
+    if isinstance(partial, dict):
+        receipt = shape_retrieval_receipt(partial.get("retrieval_receipt"))
+        if receipt is not None:
+            extra["retrieval_receipt"] = receipt
     return _emit_error(
         "search",
         note or "search timed out",
         as_json=getattr(args, "json", False),
         code="SEARCH_TIMEOUT",
-        extra={"http_status": 504},
+        extra=extra,
     )
 
 
@@ -987,6 +1012,7 @@ async def _search(args: argparse.Namespace) -> int:
         prepare_search_payload_for_agent,
         query_terms,
         shape_search_payload,
+        shape_retrieval_receipt,
     )
     from kb.status import search_node
 
@@ -1023,33 +1049,43 @@ async def _search(args: argparse.Namespace) -> int:
                 mode=shape_kw.get("mode"),
             )
     except urllib.error.HTTPError as exc:
+        raw_detail, body_oversized = _read_search_http_error_body(exc)
         from kb.security_scan import redact_secrets
 
-        raw_detail = exc.read().decode(errors="replace")[:500] if exc.fp else str(exc.reason)
-        detail = redact_secrets(raw_detail, token)
+        detail = redact_secrets(raw_detail, token)[:500]
         error_code = "HTTP_ERROR"
         error_message = f"HTTP {exc.code} {detail}"
         try:
-            error_payload = json.loads(raw_detail)
+            error_payload = None if body_oversized else json.loads(raw_detail)
         except (json.JSONDecodeError, TypeError):
             error_payload = None
-        if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), dict):
-            typed_detail = error_payload["detail"]
-            typed_code = typed_detail.get("code")
-            typed_message = typed_detail.get("message")
-            if isinstance(typed_code, str) and typed_code:
-                error_code = typed_code
-            if isinstance(typed_message, str) and typed_message:
-                error_message = redact_secrets(typed_message, token)
+        typed_detail = (
+            error_payload["detail"]
+            if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), dict)
+            else {}
+        )
+        typed_code = typed_detail.get("code")
+        typed_message = typed_detail.get("message")
+        if isinstance(typed_code, str) and typed_code:
+            error_code = typed_code
+        if isinstance(typed_message, str) and typed_message:
+            error_message = redact_secrets(typed_message, token)[:500]
+        receipt_value = typed_detail.get("retrieval_receipt")
+        if receipt_value is None and isinstance(error_payload, dict):
+            receipt_value = error_payload.get("retrieval_receipt")
+        receipt = shape_retrieval_receipt(receipt_value)
         as_json = getattr(args, "json", False)
         if not as_json:
             _print_auth_hint("search", exc.code)
+        extra = {"http_status": exc.code}
+        if receipt is not None:
+            extra["retrieval_receipt"] = receipt
         return _emit_error(
             "search",
             error_message,
             as_json=as_json,
             code=error_code,
-            extra={"http_status": exc.code},
+            extra=extra,
         )
     except (TimeoutError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
         # TimeoutError and urllib URLError("timed out") share one typed failure path.
