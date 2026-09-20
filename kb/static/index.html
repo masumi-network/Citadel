@@ -542,11 +542,23 @@
                   </button>
                 </div>
                 <div class="canvas-wrap">
+                  <div id="graphControls" class="graph-controls" role="group" aria-label="Graph controls">
+                    <button id="graphZoomIn" class="secondary-button graph-control-button" type="button" title="Zoom in">Zoom in</button>
+                    <button id="graphZoomOut" class="secondary-button graph-control-button" type="button" title="Zoom out">Zoom out</button>
+                    <button id="graphFitAll" class="secondary-button graph-control-button" type="button" title="Fit all nodes in the canvas">Fit all</button>
+                    <button id="graphFitSelection" class="secondary-button graph-control-button" type="button" title="Fit the selected node" disabled>Fit selection</button>
+                    <button id="graphClearSelection" class="secondary-button graph-control-button" type="button" title="Clear selected node">Clear selection</button>
+                  </div>
+                  <p id="graphInstructions" class="graph-instructions">
+                    Drag to pan. Use the wheel or pinch to zoom. Select a node for details.
+                    Keyboard shortcuts: +, -, 0, Home, and Escape.
+                  </p>
                   <div
                     id="graphCanvas"
                     tabindex="0"
                     role="img"
                     aria-label="Vault Activity and Knowledge Mesh visualization"
+                    aria-describedby="graphInstructions"
                   ></div>
                   <div id="canvasEmpty" class="canvas-empty" hidden>
                     <h3>No graph notes yet</h3>
@@ -558,7 +570,15 @@
                   </div>
                   <div id="graphLegend" class="graph-legend" role="group" aria-label="Node kinds" hidden></div>
                 </div>
-                <div id="selectedNode" class="selection" aria-live="polite">
+                <section id="graphNodeDirectory" class="graph-node-directory" aria-labelledby="graphNodeDirectoryTitle">
+                  <div class="graph-node-directory-header">
+                    <h3 id="graphNodeDirectoryTitle">Nodes in this view</h3>
+                    <span id="graphNodeDirectoryCount" class="graph-directory-count">0 loaded</span>
+                  </div>
+                  <ul id="graphNodeDirectoryList" class="graph-node-directory-list"></ul>
+                  <p id="graphSelectionStatus" class="graph-selection-status" aria-live="polite">No node selected.</p>
+                </section>
+                <div id="selectedNode" class="selection">
                   Select a note or node to inspect its links.
                 </div>
               </section>
