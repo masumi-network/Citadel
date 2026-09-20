@@ -17,6 +17,7 @@ overview and quick start, see the [README](../README.md).
 - [Obsidian vault sync](#obsidian-vault-sync)
 - [Knowledge conflicts](#knowledge-conflicts)
 - [Vault backup mirror](#vault-backup-mirror)
+- [Lite generation backup and restore](#lite-generation-backup-and-restore)
 
 ---
 
@@ -341,9 +342,12 @@ hosted API:
 ```bash
 CITADEL_HTTP_BASE_URL=https://citadel.utxo.ag
 CITADEL_MCP_ACCESS_TOKEN=ctdl_...
-CITADEL_MCP_DEFAULT_DATASET=masumi-network
 uv run python -m kb.mcp_server
 ```
+
+`CITADEL_MCP_DEFAULT_DATASET` is not read by `kb/`. Omitting `dataset` on
+`citadel_search` lets the Node resolve it via `CITADEL_SEARCH_DEFAULT_DATASET`
+/ `CITADEL_DEFAULT_DATASET`.
 
 Hosted-MCP environment (Railway web service):
 
@@ -504,6 +508,22 @@ CITADEL_GOOGLE_CHAT_SPACE_NAME=spaces/...
 CITADEL_GOOGLE_CHAT_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
 ```
 
+The same digest path can also post to a generic HTTPS webhook (Discord,
+Mattermost, n8n, Zapier, or a bespoke receiver) via `kb/webhook_gateway.py`.
+These vars are read by `CitadelConfig.from_env()`:
+
+```bash
+CITADEL_WEBHOOK_ENABLED=false
+CITADEL_WEBHOOK_URL=https://example.example/hooks/...
+CITADEL_WEBHOOK_TOKEN=                 # optional bearer for the receiver
+CITADEL_WEBHOOK_MAX_MESSAGE_BYTES=30000
+CITADEL_WEBHOOK_TIMEOUT_SECONDS=20
+```
+
+The webhook adapter refuses redirects, loopback, and private/internal hosts
+(stricter than `kb/secure_http.py`) so a mistyped URL cannot probe the
+internal network with digest content.
+
 Send one controlled test before enabling cron posting:
 
 ```bash
@@ -553,6 +573,36 @@ CITADEL_BACKUP_MIRROR_PUSH_ENABLED=false   # + CITADEL_BACKUP_MIRROR_TOKEN for G
 
 Admin: `GET /api/backup-mirror`, `POST /api/backup-mirror/run` (`{"dry_run": true}`
 by default). Cron via `CITADEL_RUN_MODE=backup-mirror`.
+
+## Lite generation backup and restore
+
+The Lite stack's durable offline backup is separate from the manifest-only
+mirror above. `citadel backup create` and `citadel backup restore` snapshot
+stopped Lite local state (SQLite + lifecycle state under the data root) and
+every Qdrant collection scoped to `CITADEL_GENERATION_ID`.
+
+```bash
+# Required for Lite boot and for backup/restore when not passed as flags:
+CITADEL_GENERATION_ID=citadel-railway-...
+VECTOR_DB_URL=http://qdrant:6333
+VECTOR_DB_KEY=...
+
+# Create (Node / Lite process must be stopped so the volume lock is free):
+citadel backup create /path/to/backup-dir \
+  --data-root /data \
+  --generation-id "$CITADEL_GENERATION_ID" \
+  --qdrant-url "$VECTOR_DB_URL"
+
+# Restore into empty targets (generation id must match the backup manifest):
+citadel backup restore /path/to/backup-dir /path/to/empty-data-root \
+  --generation-id "$CITADEL_GENERATION_ID" \
+  --qdrant-url "$VECTOR_DB_URL"
+```
+
+`--generation-id` and `--qdrant-url` fall back to `CITADEL_GENERATION_ID` and
+`VECTOR_DB_URL`. `VECTOR_DB_KEY` is always taken from the environment.
+`CITADEL_LITE_BACKUP_DESTINATION` on the Lite web process runs one pre-lock
+backup to that path before normal startup (`kb/lite_runtime.py`).
 
 ## Linear context coverage and truthful status
 

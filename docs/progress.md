@@ -1,6 +1,85 @@
 # Citadel Progress
 
-Last updated: 2026-08-22.
+Last updated: 2026-09-15.
+
+## 2026-09-15: Readiness task checkpoint
+
+- [VERIFIED] SPEC.md currently marks T1 and T9 `x`, T2 `~`, and T3-T8 `.`. T2 is not complete because the current readiness implementation still needs per-head current-generation evidence correction before V4 can be claimed.
+- [VERIFIED] T1 is the bounded corpus cap with hard maximum 20,000.
+- [REPORTED] Focused local evidence: `uv run --extra server python -m pytest tests/test_chunk_window.py::test_v11_non_monotonic_prefix_counter_cannot_yield_oversized_piece tests/test_chunk_window.py::test_configured_model_tokenizer_is_offline_and_untruncated tests/test_lifecycle.py::test_local_247_repair_bounds_chunks_and_recalls_tail_from_non_head -q` returned `3 passed, 10 warnings in 7.16s`.
+- [REPORTED] Focused local evidence: `uv run --extra server python -m pytest tests/test_chunk_window.py -q --disable-warnings` returned `51 passed, 10 warnings in 8.02s`.
+- [REPORTED] Focused local evidence: `uv run --extra server python -m pytest tests/test_lifecycle.py tests/test_cognee_client.py tests/test_service.py -q` returned `269 passed, 11 warnings in 36.29s`.
+- [REPORTED] Focused local evidence: `uv run --extra server python -m pytest tests/test_repair_journal.py -q` returned `14 passed in 0.21s`.
+- [REPORTED] Focused local evidence: `uv run ruff check kb/chunk_window.py tests/test_chunk_window.py` returned `All checks passed!`.
+- [REPORTED] Focused local evidence: `python3 -m py_compile kb/chunk_window.py tests/test_chunk_window.py` returned no output with exit code 0.
+- [VERIFIED] The local #247 proof is synthetic only. It does not prove production corpus state, provider behavior, reprocessing, reindexing, or graph rebuild.
+- [VERIFIED] No deployment, production reprocessing, graph rebuild, or live benchmark occurred in this closeout. GitHub triage writes were limited to the already approved PR comments and closures.
+- [NOT DETERMINED] T3-T8, primary-provider production chunk behavior, install-channel implementation, and V1 roadmap checks S2-S9 remain open or unmeasured.
+- [VERIFIED] Current live GitHub search counts were `{"total_count":10,"incomplete_results":false}` for open PR search and `{"total_count":21,"incomplete_results":false}` for open issue search.
+- [PLANNED] Next action: resolve T2 per-head evidence, then continue T3-T8. Keep #247 production repair and install-channel work gated on explicit scope/production approval. Do not claim any issue closure for #228 or #247.
+
+## 2026-09-11: Bounded retrieval, SessionStart continuity, and issue triage
+
+**Status:** Wrapped up. This entry records measured code and focused-test
+evidence only; it does not claim production success.
+
+- [VERIFIED] Search now carries a bounded `retrieval_receipt` on successful and
+  `SEARCH_TIMEOUT` responses, preserving named scope, candidate, execution, and
+  absence fields. `absence.proven=false` remains explicit and unknown upstream
+  completeness remains `null` (`kb/server.py:8476-8493,8725-8736`;
+  `kb/search_format.py:1706-1789,1936-1938`).
+- [VERIFIED] CLI and MCP read bounded HTTP error bodies, redact the captured
+  body before the 500-character display trim, and preserve typed
+  code/status/message plus the allowlisted retrieval receipt
+  (`kb/cli.py:416-425,1051-1082`; `kb/mcp_server.py:745-750,856-892`).
+  This does not establish redaction of embedded search text.
+- [CORRECTED] SessionStart now performs bounded repo-scoped continuity search:
+  its repository-prefix request is `Repo: <repo> Branch: <branch>` with an
+  explicit `repo` filter and `top_k=5` (`kb/hooks/sync_start.py:196-201`;
+  `tests/test_sync_start.py:221-225`). Matching uses explicit repository
+  identity metadata with exact or `/<repo>` suffix semantics, not searchable
+  body text (`kb/hooks/sync_start.py:161-184`). The response is capped at
+  `1,000,000` bytes, with at most three candidates and 180-character snippets
+  plus bounded metadata (`kb/hooks/sync_start.py:213-234,252-307`).
+- [VERIFIED] Six SessionStart documentation edits were made in
+  `kb/onboard.py:250-256`, `skills/citadel-onboard/SKILL.md:30`,
+  `docs/progress.md:28-31`, `docs/mcp/README.md:76`,
+  `docs/superpowers/specs/2026-07-20-shared-session-index-design.md:30,115-118`,
+  and `CONTEXT.md:242`.
+- [VERIFIED] The separate bounded-receipt documentation update was
+  `skills/citadel-search/SKILL.md:102-107`.
+- [VERIFIED] Focused evidence: `.venv/bin/python -m pytest
+  tests/test_sync_start.py -q` returned `14 passed in 0.11s`;
+  `.venv/bin/python -m pytest tests/test_onboard.py tests/test_sync_start.py -q`
+  returned `64 passed in 0.19s`; `.venv/bin/ruff check .` returned
+  `All checks passed!`; and `.venv/bin/python -m py_compile
+  kb/hooks/sync_start.py` returned no output.
+- [VERIFIED] PR #271 (the #272 validation) merged as commit
+  `72b9c4a8241e9815a87b36a2d69ab897459eb4ab`. The focused check
+  `PYTHONDONTWRITEBYTECODE=1 uv run --no-sync python -m pytest -q
+  -p no:cacheprovider tests/test_cognee_client.py -k
+  'test_graph_data_merges_every_provisioned_dataset_store or
+  test_graph_data_skips_failing_store_and_keeps_healthy_totals or
+  test_per_dataset_graph_read_restores_ambient_context'` returned
+  `... [100%]` and `3 passed, 121 deselected, 10 warnings in 3.78s`.
+- [VERIFIED] The focused #286 check
+  `PYTHONDONTWRITEBYTECODE=1 uv run --no-sync python -m pytest -q
+  -p no:cacheprovider tests/test_lifecycle.py -k
+  'test_projection_source_revision_states_tracks_active_and_completed_jobs'`
+  returned `. [100%]` and `1 passed, 44 deselected in 0.21s`.
+- [VERIFIED] Before each close,
+  `gh issue view N --repo masumi-network/Citadel --json number,state`
+  returned `{"number":N,"state":"OPEN"}` for
+  `N=266,272,273,277,283,286,287`. Each
+  `gh issue close N --repo masumi-network/Citadel --reason completed`
+  returned `✓ Closed issue masumi-network/Citadel#N (...)`. The final
+  `gh issue list --repo masumi-network/Citadel --state open --limit 1000
+  --json number,title,url | jq '[.[] | select(.number == 266 or .number ==
+  272 or .number == 273 or .number == 277 or .number == 283 or .number == 286
+  or .number == 287)]'` returned `[]`.
+- [VERIFIED] The other 21 previously triaged unresolved issues were not
+  touched.
+
 
 ## 2026-08-22 - Production retrieval incident audit
 
@@ -593,8 +672,9 @@ policy install. CI gains a **`pip-audit` gate** with uv dependency overrides.
 - **Windsurf** — `.windsurf/rules/citadel-agent-policy.md` (`always_on`) when
   detected.
 - **Gemini CLI** — `GEMINI.md` when detected.
-- **Claude Code** — same policy injected via the **SessionStart** hook
-  (`kb.hooks.sync_start`); SessionEnd hook unchanged (private Node traces).
+- **Claude Code** — same policy is injected via the **SessionStart** hook
+  (`kb.hooks.sync_start`), which may also inject bounded repo-scoped workspace
+  candidates; SessionEnd hook unchanged (private Node traces).
 - Policy: search at task start; trace hits are reference-only; share dead ends
   with `citadel_share_session` only after explicit user approval.
 

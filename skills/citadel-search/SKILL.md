@@ -99,6 +99,13 @@ Read the states separately:
 Top-level `healthy=false` can describe a degraded projection corpus while
 `source_searchable` remains true. Use the specific state for the task.
 
+## Bounded retrieval receipt
+
+Citadel search returns a bounded retrieval receipt in MCP and CLI JSON
+responses. For bounded search, `absence.proven` is `false`.
+`candidate_page.upstream_truncation` is `null` when provider completeness is
+unknown. Projection readiness is separate.
+
 ## Read each result
 
 Check these fields before using a hit:

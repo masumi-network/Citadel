@@ -15,7 +15,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 from uuid import uuid4
 from urllib.parse import quote
@@ -53,7 +53,10 @@ from kb.capture_config import MAX_APPROVED_CAPTURE_ROOTS, matched_capture_root
 from kb.backup_mirror import BackupMirror, BackupMirrorDisabled, BackupMirrorPublishError
 from kb.conflicts import KnowledgeConflictStore, obsidian_push_conflict_candidate
 from kb.tags import normalize_tags
-from kb.cognee_client import assert_cognee_dataset_api
+from kb.cognee_client import (
+    _corpus_health_max_documents,
+    assert_cognee_dataset_api,
+)
 from kb.config import CitadelConfig
 from kb.contact_store import ContactStore
 from kb.github_sync import GitHubOrgSyncer
@@ -78,7 +81,7 @@ from kb.mcp_server import (
     create_mcp_server,
     set_tools_list_session_resolver,
 )
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import FeedbackRequest
 from kb.obsidian_sync import ObsidianSyncStore, SyncPushDocument, normalize_path
 from kb.promotion import PromotionEngine
@@ -1582,6 +1585,18 @@ CONNECTOR_SOURCE_FILTERS = frozenset(
         "linear-workspace",
     }
 )
+_SAFE_RETRIEVAL_RECEIPT_TYPES = frozenset(
+    {
+        "activity",
+        "canonical-docs",
+        "issue",
+        "other",
+        "session-trace",
+        "skill",
+        "spec",
+    }
+)
+_SAFE_RETRIEVAL_RECEIPT_MODES = frozenset({"vector", "lexical_fallback"})
 
 
 class SearchBody(BaseModel):
@@ -3751,13 +3766,22 @@ def with_result_metadata(
     # a full Repository/Source/Commit/Blob header the repo-content syncer wrote,
     # which a text collision cannot fake, so it keeps its own identity.
     #
+    # Dual-written Node copies also carry a durable `Author-Seat:` line stamped
+    # by `force_shared_trace_author_seat` at share time. Prefer that over the
+    # query-scoped text marker so the same `(result_id, content_sha256)` keeps a
+    # stable trust_tier whether or not session-traces were in this recall set
+    # (#249). Elevating trust is still impossible: Author-Seat only demotes.
+    #
     # ADR-0017 applied that exception to `doc_type` but left `trust` demoted
     # unconditionally, so Central documentation still came back labelled as a
     # trace's trust tier. This finishes it: the exception now governs both.
     preview = {**normalized, "_citadel": metadata}
     inferred = infer_doc_type(preview)
     source_linked = inferred == DOC_TYPE_CANONICAL
-    if dataset == SESSION_TRACES_DATASET or (shared_trace and not source_linked):
+    durable_shared_trace = bool(_trace_author_seat(normalized))
+    if dataset == SESSION_TRACES_DATASET or (
+        (shared_trace or durable_shared_trace) and not source_linked
+    ):
         metadata["trust"] = "reference-only"
         author_seat = _trace_author_seat(normalized)
         if author_seat:
@@ -3903,6 +3927,89 @@ def select_public_search_page(
         if isinstance(envelope, dict):
             envelope["rank"] = rank
     return selected, candidates_fetched, candidates_matched
+def _safe_retrieval_receipt_filters(
+    filter_kwargs: Mapping[str, Any],
+    *,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    """Return only bounded, public filter categories for a retrieval receipt.
+
+    Repository paths, arbitrary repository names, and caller-provided type/source
+    strings can contain storage paths or internal identifiers. The receipt is a
+    small scope summary, not an echo of the request, so only the documented
+    categorical filters are retained.
+    """
+    safe: dict[str, Any] = {}
+    types = filter_kwargs.get("types")
+    if isinstance(types, list):
+        public_types = [
+            value
+            for value in types
+            if isinstance(value, str) and value.strip().lower() in _SAFE_RETRIEVAL_RECEIPT_TYPES
+        ]
+        if public_types:
+            safe["types"] = sorted(set(value.strip().lower() for value in public_types))
+    source = filter_kwargs.get("source")
+    if isinstance(source, str) and source.strip().lower() in CONNECTOR_SOURCE_FILTERS:
+        safe["source"] = source.strip().lower()
+    if filter_kwargs.get("canonical_only") is True:
+        safe["canonical_only"] = True
+    if filter_kwargs.get("exclude_ambient") is True:
+        safe["exclude_ambient"] = True
+    if isinstance(mode, str) and mode.strip().lower() in {"docs"}:
+        safe["mode"] = mode.strip().lower()
+    return safe
+
+
+def _observed_retrieval_modes(results: list[dict[str, Any]]) -> list[str]:
+    modes: set[str] = set()
+    for result in results:
+        envelope = result.get("_citadel")
+        retrieval = envelope.get("retrieval") if isinstance(envelope, dict) else None
+        mode = retrieval.get("mode") if isinstance(retrieval, dict) else None
+        if isinstance(mode, str) and mode in _SAFE_RETRIEVAL_RECEIPT_MODES:
+            modes.add(mode)
+    return sorted(modes)
+
+
+def _retrieval_receipt(
+    *,
+    datasets: list[str],
+    filters: Mapping[str, Any],
+    fetch_k: int,
+    candidates_fetched: int | None,
+    candidates_matched: int | None,
+    returned: int | None,
+    selection_trimmed: bool | None,
+    timed_out: bool,
+    degraded: bool,
+    observed_result_modes: list[str],
+) -> dict[str, Any]:
+    return {
+        "scope": {
+            "datasets": list(datasets),
+            "filters": dict(filters),
+        },
+        "candidate_page": {
+            "limit": fetch_k,
+            "fetched": candidates_fetched,
+            "matched": candidates_matched,
+            "returned": returned,
+            "selection_trimmed": selection_trimmed,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": timed_out,
+            "degraded": degraded,
+            "observed_result_modes": list(observed_result_modes),
+        },
+        "absence": {
+            "proven": False,
+            "reason": "search_timeout" if timed_out else "bounded_candidate_page",
+        },
+    }
+
+
 
 
 def _trace_author_seat(result: dict[str, Any]) -> str | None:
@@ -4282,7 +4389,9 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
     if gateway is None:
         if stored:
             logger.info("Partner contact stored from %s (no Chat gateway configured)", client_ip)
-            return {"delivered": True, "stored": True}
+            # Stored is not delivered. Lying with delivered:true hid that no
+            # gateway was configured (#151).
+            return {"delivered": False, "stored": True}
         raise HTTPException(
             status_code=503,
             detail="The contact channel is not configured on this node. Please email us instead.",
@@ -4301,8 +4410,9 @@ async def partner_contact(body: ContactBody, request: Request) -> dict[str, Any]
         logger.exception("Partner contact delivery failed")
         if stored:
             # Chat is down but the enquiry is on disk, so it is not lost and the
-            # sender should not be told to try again and send it twice.
-            return {"delivered": True, "stored": True}
+            # sender should not be told to try again and send it twice. Still
+            # report delivered:false — stored ≠ delivered (#151).
+            return {"delivered": False, "stored": True}
         raise HTTPException(
             status_code=502,
             detail="We could not deliver that right now. Please email us instead.",
@@ -5444,10 +5554,203 @@ async def healthz() -> dict[str, str | bool]:
     return {"ok": True, "service": "citadel"}
 
 
+def _lifecycle_stage_evidence(
+    citadel: Any, generation: Mapping[str, Any]
+) -> dict[str, dict[str, str]]:
+    """Attest source retention and every current head's projection receipts."""
+    unavailable = _readiness_stage("unavailable", "stage_evidence_unavailable")
+    if any(
+        not isinstance(generation.get(field), str) or not generation[field].strip()
+        for field in ("generation_id", "projection_version", "config_digest")
+    ):
+        return {name: dict(unavailable) for name in (
+            "source_searchable", "projection_searchable", "mesh_ready"
+        )}
+    store = getattr(citadel, "lifecycle_store", None)
+    if store is None or not callable(getattr(store, "current_head_evidence", None)):
+        return {name: dict(unavailable) for name in (
+            "source_searchable", "projection_searchable", "mesh_ready"
+        )}
+
+    try:
+        max_documents = _corpus_health_max_documents()
+    except Exception:  # noqa: BLE001 - cap failures stay safe and typed
+        cap_unavailable = _readiness_stage(
+            "unavailable", "stage_head_census_cap_invalid"
+        )
+        return {name: dict(cap_unavailable) for name in (
+            "source_searchable", "projection_searchable", "mesh_ready"
+        )}
+
+    try:
+        with store._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.dataset, revision.source_key
+                FROM source_heads AS head
+                JOIN source_revisions AS revision
+                  ON revision.source_revision_id = head.source_revision_id
+                WHERE revision.tombstone = 0
+                ORDER BY revision.dataset, revision.source_key
+                LIMIT ?
+                """,
+                (max_documents + 1,),
+            ).fetchall()
+        if len(rows) > max_documents:
+            cap_unavailable = _readiness_stage(
+                "unavailable", "stage_head_census_cap_exceeded"
+            )
+            return {name: dict(cap_unavailable) for name in (
+                "source_searchable", "projection_searchable", "mesh_ready"
+            )}
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            dataset = row["dataset"]
+            source_key = row["source_key"]
+            if not isinstance(dataset, str) or not dataset or not isinstance(source_key, str) or not source_key:
+                return {name: dict(unavailable) for name in (
+                    "source_searchable", "projection_searchable", "mesh_ready"
+                )}
+            grouped.setdefault(dataset, []).append(source_key)
+
+        if not grouped:
+            ready = _readiness_stage("ready", "empty_current_head_census")
+            return {name: dict(ready) for name in (
+                "source_searchable", "projection_searchable", "mesh_ready"
+            )}
+
+        evidence: list[Mapping[str, Any]] = []
+        errors: list[Mapping[str, Any]] = []
+        for dataset, source_keys in grouped.items():
+            result = store.current_head_evidence(
+                dataset,
+                source_keys,
+                generation_id=generation["generation_id"],
+                projection_version=generation["projection_version"],
+                config_digest=generation["config_digest"],
+            )
+            if is_dataclass(result) and not isinstance(result, type):
+                result = asdict(result)
+            if not isinstance(result, Mapping):
+                return {name: dict(unavailable) for name in (
+                    "source_searchable", "projection_searchable", "mesh_ready"
+                )}
+            result_evidence = result.get("evidence")
+            result_errors = result.get("errors")
+            if not isinstance(result_evidence, (list, tuple)) or not isinstance(result_errors, (list, tuple)):
+                return {name: dict(unavailable) for name in (
+                    "source_searchable", "projection_searchable", "mesh_ready"
+                )}
+            evidence.extend(item for item in result_evidence if isinstance(item, Mapping))
+            errors.extend(item for item in result_errors if isinstance(item, Mapping))
+
+        source = _readiness_stage("ready", "retained_source_reads_succeeded")
+        projection = _readiness_stage("ready", "all_vector_receipts_searchable")
+        mesh = _readiness_stage("ready", "all_graph_receipts_searchable")
+        for error in errors:
+            code = str(error.get("code"))
+            if code in {"CURRENT_HEAD_MISSING", "CURRENT_HEAD_TOMBSTONED"}:
+                stage = _readiness_stage("unavailable", "stage_head_evidence_missing")
+                source = _merge_readiness_stage(source, stage)
+                projection = _merge_readiness_stage(projection, stage)
+                mesh = _merge_readiness_stage(mesh, stage)
+                continue
+            if code in {"CURRENT_JOB_MISSING", "RECEIPT_SET_MISMATCH"}:
+                projection = _merge_readiness_stage(
+                    projection, _readiness_stage("unavailable", "stage_projection_evidence_missing")
+                )
+                mesh = _merge_readiness_stage(
+                    mesh, _readiness_stage("unavailable", "stage_mesh_evidence_missing")
+                )
+                continue
+            if code in {"CURRENT_JOB_MISMATCH", "CURRENT_JOB_AMBIGUOUS"}:
+                failed = _readiness_stage("failed", "projection_identity_mismatch")
+                projection = _merge_readiness_stage(projection, failed)
+                mesh = _merge_readiness_stage(mesh, failed)
+                continue
+            backend_states = {
+                str(key): str(value)
+                for key, value in (error.get("backend_states") or {}).items()
+            }
+            job_state = str(error.get("job_state"))
+            for backend, stage_name in (("vector", "projection"), ("graph", "mesh")):
+                state = backend_states.get(backend, job_state)
+                if state in {"pending", "running", "deferred"}:
+                    stage = _readiness_stage("pending", f"{backend}_receipt_pending")
+                elif state == "failed":
+                    stage = _readiness_stage("failed", f"{backend}_receipt_failed")
+                else:
+                    stage = _readiness_stage("failed", f"{backend}_receipt_unsearchable")
+                if stage_name == "projection":
+                    projection = _merge_readiness_stage(projection, stage)
+                else:
+                    mesh = _merge_readiness_stage(mesh, stage)
+
+        for item in evidence:
+            if (
+                item.get("generation_id") != generation["generation_id"]
+                or item.get("projection_version") != generation["projection_version"]
+                or item.get("config_digest") != generation["config_digest"]
+            ):
+                failed = _readiness_stage("failed", "projection_identity_mismatch")
+                source = _merge_readiness_stage(source, failed)
+                projection = _merge_readiness_stage(projection, failed)
+                mesh = _merge_readiness_stage(mesh, failed)
+                continue
+            try:
+                store.read_retained_content(str(item["source_revision_id"])).decode("utf-8")
+            except Exception:  # noqa: BLE001 - stage reports only safe reason
+                return {
+                    "source_searchable": dict(unavailable),
+                    "projection_searchable": dict(unavailable),
+                    "mesh_ready": dict(unavailable),
+                }
+
+        for item in evidence:
+            receipts = item.get("receipts")
+            if not isinstance(receipts, (list, tuple)):
+                stage = _readiness_stage("unavailable", "stage_receipts_unavailable")
+                projection = _merge_readiness_stage(projection, stage)
+                mesh = _merge_readiness_stage(mesh, stage)
+                continue
+            states = {
+                str(receipt.get("backend")): str(receipt.get("state"))
+                for receipt in receipts
+                if isinstance(receipt, Mapping)
+            }
+            if states.get("vector") != "searchable":
+                projection = _merge_readiness_stage(
+                    projection,
+                    _readiness_stage(
+                        "pending" if states.get("vector") in {"pending", "running", "deferred"} else "failed",
+                        "vector_receipt_pending" if states.get("vector") in {"pending", "running", "deferred"} else "vector_receipt_failed",
+                    ),
+                )
+            if states.get("graph") != "searchable":
+                mesh = _merge_readiness_stage(
+                    mesh,
+                    _readiness_stage(
+                        "pending" if states.get("graph") in {"pending", "running", "deferred"} else "failed",
+                        "graph_receipt_pending" if states.get("graph") in {"pending", "running", "deferred"} else "graph_receipt_failed",
+                    ),
+                )
+        return {
+            "source_searchable": source,
+            "projection_searchable": projection,
+            "mesh_ready": mesh,
+        }
+    except Exception:  # noqa: BLE001 - do not expose store or provider details
+        return {name: dict(unavailable) for name in (
+            "source_searchable", "projection_searchable", "mesh_ready"
+        )}
 def lifecycle_health(citadel: Any) -> dict[str, Any]:
     """Return a no-content lifecycle census plus relational invariant checks."""
     if not citadel.config.lifecycle_enabled:
-        return {"enabled": False, "ok": True}
+        return {
+            "enabled": False,
+            "ok": True,
+            "stage_evidence": getattr(citadel, "readiness_stage_evidence", {}),
+        }
     try:
         census = citadel.lifecycle_census()
     except Exception as exc:  # noqa: BLE001 - readiness reports typed failure
@@ -5509,11 +5812,22 @@ def lifecycle_health(citadel: Any) -> dict[str, Any]:
             )
         if current_failed_jobs or current_failed_receipts:
             invariant_errors.append("failed_projection")
+    provided_stage_evidence = getattr(citadel, "readiness_stage_evidence", None)
+    stage_evidence = (
+        provided_stage_evidence
+        if isinstance(provided_stage_evidence, Mapping)
+        else (
+            _lifecycle_stage_evidence(citadel, current_generation)
+            if isinstance(current_generation, Mapping)
+            else {}
+        )
+    )
     return {
         "enabled": True,
         "ok": not invariant_errors,
         **census,
         "invariant_errors": invariant_errors,
+        "stage_evidence": stage_evidence,
     }
 
 
@@ -5627,15 +5941,16 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
         }
 
     docs_total = sum(int(s.get("documents") or 0) for s in sources)
-    lifecycle = await _bounded_lifecycle_health(get_citadel())
-    service_ok = lifecycle.get("ok") is not False
+    readiness = await _readiness_payload()
+    ready_ok = readiness["ok"] is True
     return {
-        "ok": service_ok,
+        "ok": ready_ok,
         "service": "Citadel Archive",
         "version": _SERVICE_VERSION,
         "build_id": _BUILD_ID,
         "deployment_id": _DEPLOYMENT_ID,
-        "healthy": service_ok,
+        "healthy": ready_ok,
+        "stages": readiness["stages"],
         "sources": sources,
         "totals": {
             "documents": docs_total,
@@ -5643,7 +5958,7 @@ async def public_state(request: Request, response: Response) -> dict[str, Any]:
             "linear_issues": int(ln.get("issue_count", 0) or 0) if ln else 0,
             "linear_context_records": int(ln.get("context_record_count", 0) or 0) if ln else 0,
         },
-        "lifecycle": lifecycle,
+        "lifecycle": readiness["lifecycle"],
         "repo": repo_block,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -6105,6 +6420,84 @@ async def _bounded_lifecycle_health(citadel: Any) -> dict[str, Any]:
             _complete_lifecycle_health_task(id(citadel), task)
 
 
+_READINESS_STAGE_STATUSES = frozenset({"ready", "pending", "failed", "unavailable"})
+
+
+def _readiness_stage(status: str, reason: str) -> dict[str, str]:
+    """Build one safe readiness stage diagnostic."""
+    if status not in _READINESS_STAGE_STATUSES:
+        status = "unavailable"
+        reason = "invalid_stage_evidence"
+    return {"status": status, "reason": reason}
+
+
+_READINESS_STAGE_PRECEDENCE = {"ready": 0, "pending": 1, "failed": 2, "unavailable": 3}
+
+
+def _merge_readiness_stage(
+    current: dict[str, str], candidate: dict[str, str]
+) -> dict[str, str]:
+    """Keep the most severe stage status and its safe reason."""
+    if _READINESS_STAGE_PRECEDENCE[candidate["status"]] > _READINESS_STAGE_PRECEDENCE[current["status"]]:
+        return candidate
+    return current
+
+def _bounded_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _stage_evidence_state(value: Any) -> str | None:
+    if isinstance(value, str) and value in {"pending", "running", "deferred"}:
+        return "pending"
+    if value is False:
+        return "failed"
+    if value is True:
+        return "ready"
+    if isinstance(value, Mapping):
+        nested = value.get("status")
+        if nested in _READINESS_STAGE_STATUSES:
+            return nested
+        if value.get("ok") is False:
+            return "failed"
+        if value.get("ok") is True:
+            return "ready"
+    return None
+
+
+def _readiness_stages(
+    lifecycle: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Return four safe stage records from explicit per-head evidence."""
+    names = (
+        "process_alive",
+        "source_searchable",
+        "projection_searchable",
+        "mesh_ready",
+    )
+    unavailable = _readiness_stage("unavailable", "stage_evidence_unavailable")
+    stages: dict[str, dict[str, str]] = {
+        "process_alive": _readiness_stage("ready", "readiness_payload_valid"),
+        **{name: dict(unavailable) for name in names[1:]},
+    }
+    if lifecycle.get("error_type") or lifecycle.get("degraded"):
+        return stages
+    evidence = lifecycle.get("stage_evidence")
+    if not isinstance(evidence, Mapping):
+        return stages
+    for name in names[1:]:
+        item = evidence.get(name)
+        if not isinstance(item, Mapping):
+            continue
+        status = item.get("status")
+        reason = item.get("reason")
+        if not isinstance(status, str) or status not in _READINESS_STAGE_STATUSES:
+            continue
+        if not isinstance(reason, str) or not reason.isascii() or not reason.replace("_", "").replace("-", "").isalnum():
+            continue
+        stages[name] = _readiness_stage(status, reason)
+    return stages
 async def _readiness_payload() -> dict[str, Any]:
     """Return the detailed readiness state used by authenticated operators."""
     citadel = get_citadel()
@@ -6114,10 +6507,12 @@ async def _readiness_payload() -> dict[str, Any]:
         _bounded_lifecycle_health(citadel),
     )
     canary = _LAST_CANARY
+    stages = _readiness_stages(lifecycle)
     ok = (
-        corpus["ok"]
+        all(stage["status"] == "ready" for stage in stages.values())
+        and corpus["ok"]
         and lifecycle["ok"]
-        and (canary is None or bool(canary.get("ok", True)))
+        and (canary is None or canary.get("ok") is True)
     )
     return {
         "ok": ok,
@@ -6129,25 +6524,23 @@ async def _readiness_payload() -> dict[str, Any]:
         "corpus": corpus,
         "lifecycle": lifecycle,
         "canary": canary,
+        "stages": stages,
     }
 
 
 @app.get("/health/ready")
 async def deployment_readiness() -> Any:
-    """Return detail-free dependency readiness for the Railway deploy gate."""
+    """Return the detail-free combined readiness gate for the Railway deploy."""
     if _CORPUS_HEALTH_CACHE_TTL_SECONDS <= 0:
         return JSONResponse(
             {"ok": False, "service": "citadel"},
             status_code=503,
         )
     payload = await _readiness_payload()
-    dependency_ok = (
-        "degraded" not in payload["corpus"]
-        and "error_type" not in payload["lifecycle"]
-    )
+    ok = payload["ok"] is True
     return JSONResponse(
-        {"ok": dependency_ok, "service": "citadel"},
-        status_code=200 if dependency_ok else 503,
+        {"ok": ok, "service": "citadel"},
+        status_code=200 if ok else 503,
     )
 
 
@@ -8862,6 +9255,10 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
     search_datasets = resolve_search_datasets(actor, body.dataset, citadel.config)
     search_sessions = resolve_search_sessions(actor, body.session_id, search_datasets)
     filter_kw = body.filter_kwargs()
+    receipt_filters = _safe_retrieval_receipt_filters(
+        filter_kw,
+        mode=body.cleaned_mode(),
+    )
     filters_active = any(filter_kw.values())
     clarification = search_query_clarification(body.query)
     clarification_required = clarification is not None
@@ -8960,6 +9357,18 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
             detail={
                 "code": "SEARCH_TIMEOUT",
                 "message": "Search exceeded the configured server budget.",
+                "retrieval_receipt": _retrieval_receipt(
+                    datasets=search_datasets,
+                    filters=receipt_filters,
+                    fetch_k=fetch_k,
+                    candidates_fetched=None,
+                    candidates_matched=None,
+                    returned=None,
+                    selection_trimmed=None,
+                    timed_out=True,
+                    degraded=False,
+                    observed_result_modes=[],
+                ),
             },
         )
 
@@ -9194,6 +9603,18 @@ async def search(body: SearchBody, request: Request, response: Response) -> Any:
         "docs_mode": docs_mode,
         "spec_mode": is_spec_mode_query(body.query) and not docs_mode,
         "relevance": relevance_summary,
+        "retrieval_receipt": _retrieval_receipt(
+            datasets=search_datasets,
+            filters=receipt_filters,
+            fetch_k=fetch_k,
+            candidates_fetched=candidates_fetched,
+            candidates_matched=candidates_matched,
+            returned=len(normalized),
+            selection_trimmed=len(normalized) < candidates_matched,
+            timed_out=False,
+            degraded=degraded,
+            observed_result_modes=_observed_retrieval_modes(normalized),
+        ),
     }
     if clarification is not None:
         payload.update(clarification)

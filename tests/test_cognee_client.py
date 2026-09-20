@@ -14,7 +14,11 @@ import pytest
 
 from kb import chunk_window
 from kb.cognify_queue import CognifyRetryQueue
-from kb.cognee_client import CogneePublicClient
+from kb.cognee_client import (
+    CogneePublicClient,
+    MAX_REPAIR_SNAPSHOTS,
+    _corpus_health_max_documents,
+)
 
 
 COGNEE_ENV_KEYS = (
@@ -236,6 +240,21 @@ async def test_vector_project_uses_chunk_embedding_pipeline_without_llm(
     monkeypatch: Any,
 ) -> None:
     import cognee
+    from kb.embedding_profile import PRIMARY_EMBEDDING_PROFILE, active_embedding_profile
+
+    for key in (
+        "CITADEL_EMBEDDING_PROFILE",
+        "CITADEL_EMBEDDING_PROFILE_STATE_PATH",
+        "CITADEL_STATE_DIRECTORY",
+        "EMBEDDING_PROVIDER",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_DIMENSIONS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    assert active_embedding_profile() == PRIMARY_EMBEDDING_PROFILE
+
+    def unavailable() -> Any:
+        raise AssertionError("primary projection must not resolve a local tokenizer")
 
     captured: list[dict[str, Any]] = []
 
@@ -250,6 +269,7 @@ async def test_vector_project_uses_chunk_embedding_pipeline_without_llm(
     monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
     monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
     monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(chunk_window, "configured_embedding_tokenizer", unavailable)
     monkeypatch.setattr(cognee, "run_custom_pipeline", run_custom_pipeline)
 
     result = await client.vector_project(datasets=["notes"], force=False)
@@ -264,6 +284,187 @@ async def test_vector_project_uses_chunk_embedding_pipeline_without_llm(
         "extract_chunks_from_documents",
         "index_data_points",
     ]
+    assert "chunker" not in captured[0]["tasks"][1].default_params["kwargs"]
+
+@pytest.mark.asyncio
+async def test_vector_project_uses_bounded_chunker_for_non_head_chunk(
+    monkeypatch: Any,
+) -> None:
+    import cognee
+    from cognee.modules.data.processing.document_types.Document import Document
+
+    monkeypatch.setenv("CITADEL_EMBEDDING_PROFILE", "fastembed")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    tail_marker = "TAIL_MARKER_247_VECTOR_SEAM"
+    document_id = str(uuid4())
+    source = "HEAD_MARKER " + ("filler text " * 900) + tail_marker
+    document = Document(
+        id=UUID(document_id),
+        name="synthetic-247.txt",
+        raw_data_location="synthetic-247",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+    captured: dict[str, Any] = {}
+    projected_chunks: list[Any] = []
+
+    async def get_text():
+        yield source
+
+    async def run_custom_pipeline(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        chunk_task = kwargs["tasks"][1]
+        chunker_class = chunk_task.default_params["kwargs"]["chunker"]
+        chunker = chunker_class(
+            document,
+            get_text,
+            max_chunk_size=chunk_task.default_params["kwargs"]["max_chunk_size"],
+        )
+        async for chunk in chunker.read():
+            projected_chunks.append(chunk)
+        return {"status": "completed"}
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    async def vector_projection_data(**kwargs: Any) -> list[Any]:
+        assert kwargs == {"dataset": "notes", "document_ids": [document_id]}
+        return [document]
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_vector_projection_data", vector_projection_data)
+    monkeypatch.setattr(chunk_window, "resolve_chunk_budget", lambda: 64)
+    monkeypatch.setattr(cognee, "run_custom_pipeline", run_custom_pipeline)
+
+    result = await client.vector_project(
+        datasets=["notes"],
+        document_ids=[document_id],
+    )
+
+    assert result == [{"status": "completed"}]
+    assert captured["data"] == [document]
+    chunk_task = captured["tasks"][1]
+    assert chunk_task.default_params["kwargs"]["max_chunk_size"] == 64
+    assert chunk_task.default_params["kwargs"]["chunker"].__name__ == "BoundedTextChunker"
+    assert len(projected_chunks) > 1
+    assert "".join(chunk.text for chunk in projected_chunks) == source
+    assert all(chunk.chunk_size <= 64 for chunk in projected_chunks)
+    tail_chunk = next(chunk for chunk in projected_chunks if tail_marker in chunk.text)
+    assert tail_chunk.chunk_index > 0
+
+
+@pytest.mark.asyncio
+async def test_vector_project_uses_cached_bge_window_for_tail_retrieval(
+    monkeypatch: Any,
+) -> None:
+    """Legacy truncation loses the tail; bounded model-token chunks retrieve it offline."""
+    import cognee
+    from cognee.modules.data.processing.document_types.Document import Document
+    from tokenizers import Tokenizer
+    monkeypatch.setenv("CITADEL_EMBEDDING_PROFILE", "fastembed")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    configured = chunk_window.configured_embedding_tokenizer()
+    embedding_window = configured.window
+    tail_marker = "TAIL_MARKER_247_CACHED_BGE_VECTOR"
+    source = "HEAD_MARKER " + ("filler text " * 900) + tail_marker
+    tail_ids = configured.tokenizer.encode(
+        " " + tail_marker, add_special_tokens=False
+    ).ids
+
+    class _OfflineVectorProvider:
+        def __init__(self) -> None:
+            self.rows: list[tuple[Any, tuple[int, ...]]] = []
+            self.truncated_tokenizer = Tokenizer.from_str(configured.tokenizer.to_str())
+            self.truncated_tokenizer.enable_truncation(max_length=embedding_window)
+
+        def embed(self, text: str) -> tuple[int, ...]:
+            return tuple(self.truncated_tokenizer.encode(text).ids)
+
+        def index(self, chunk: Any) -> None:
+            self.rows.append((chunk, self.embed(chunk.text)))
+
+        def search(self, query: str) -> list[Any]:
+            query_tokens = tuple(
+                configured.tokenizer.encode(" " + query, add_special_tokens=False).ids
+            )
+            return [
+                chunk
+                for chunk, vector in self.rows
+                if any(
+                    vector[index : index + len(query_tokens)] == query_tokens
+                    for index in range(len(vector) - len(query_tokens) + 1)
+                )
+            ]
+
+    legacy_provider = _OfflineVectorProvider()
+    legacy_vector = legacy_provider.embed(source)
+    assert len(configured.tokenizer.encode(source).ids) > embedding_window
+    assert len(legacy_vector) == embedding_window
+    assert not any(
+        legacy_vector[index : index + len(tail_ids)] == tuple(tail_ids)
+        for index in range(len(legacy_vector) - len(tail_ids) + 1)
+    )
+    legacy_provider.index(SimpleNamespace(text=source, chunk_index=0))
+    assert legacy_provider.search(tail_marker) == []
+
+    document_id = str(uuid4())
+    document = Document(
+        id=UUID(document_id),
+        name="synthetic-247.txt",
+        raw_data_location="synthetic-247",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+    provider = _OfflineVectorProvider()
+
+    async def get_text():
+        yield source
+
+    async def run_custom_pipeline(**kwargs: Any) -> dict[str, Any]:
+        chunk_task = kwargs["tasks"][1]
+        chunker_class = chunk_task.default_params["kwargs"]["chunker"]
+        chunker = chunker_class(
+            document,
+            get_text,
+            max_chunk_size=chunk_task.default_params["kwargs"]["max_chunk_size"],
+        )
+        async for chunk in chunker.read():
+            provider.index(chunk)
+        return {"status": "completed"}
+
+    async def ensure_ready(_cognee: Any) -> None:
+        return None
+
+    async def vector_projection_data(**kwargs: Any) -> list[Any]:
+        assert kwargs == {"dataset": "notes", "document_ids": [document_id]}
+        return [document]
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", ensure_ready)
+    monkeypatch.setattr(client, "_vector_projection_data", vector_projection_data)
+    monkeypatch.setattr(chunk_window, "resolve_chunk_budget", lambda: embedding_window)
+    monkeypatch.setattr(cognee, "run_custom_pipeline", run_custom_pipeline)
+
+    result = await client.vector_project(
+        datasets=["notes"],
+        document_ids=[document_id],
+    )
+
+    assert result == [{"status": "completed"}]
+    assert len(provider.rows) > 1
+    assert all(
+        configured.count_tokens(chunk.text) <= embedding_window
+        for chunk, _ in provider.rows
+    )
+    assert all(len(vector) == chunk.chunk_size for chunk, vector in provider.rows)
+    hits = provider.search(tail_marker)
+    assert hits
+    assert any(tail_marker in chunk.text and chunk.chunk_index > 0 for chunk in hits)
 
 
 @pytest.mark.asyncio
@@ -556,6 +757,97 @@ async def test_cognify_selected_data_scopes_rows_and_validates_before_write(
                 data_ids=[str(uuid4())],
             )
         assert len(captured) == 1
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_cognify_selected_data_hands_local_chunker_to_tasks(
+    monkeypatch: Any,
+) -> None:
+    """#247: on the selected-data path under the local profile, the bounded
+    chunker and budget must reach get_default_tasks, not be silently dropped."""
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.pipelines as pipelines_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+
+    import kb.cognee_client as cognee_client_module
+    from kb import embedding_profile
+
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+
+    user_id, tenant_id, notes_id, selected_id = uuid4(), uuid4(), uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(id=notes_id, name="notes", owner_id=user_id, tenant_id=tenant_id),
+                Data(id=selected_id, name="selected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    task_calls: list[dict[str, Any]] = []
+
+    async def get_default_tasks(**kwargs: Any) -> list[Any]:
+        task_calls.append(kwargs)
+        return []
+
+    async def run_pipeline(**kwargs: Any) -> Any:
+        yield SimpleNamespace(dataset_id=notes_id)
+
+    # A stand-in with a `chunker` parameter so the custom-chunker probe passes.
+    async def fake_public_cognify(*, chunker: Any = None, chunk_size: Any = None, **_: Any) -> Any:
+        raise AssertionError("selected-data path must not call public cognee.cognify")
+
+    class _Sentinel:
+        __name__ = "BoundedTextChunker"
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(relational_module, "get_relational_engine", lambda: FakeRelationalEngine())
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(pipelines_module, "run_pipeline", run_pipeline)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(cognee, "cognify", fake_public_cognify)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(chunk_window, "resolve_chunk_budget", lambda: 64)
+    monkeypatch.setattr(cognee_client_module, "_bounded_cognee_chunker", lambda: _Sentinel)
+    monkeypatch.setattr(
+        embedding_profile,
+        "active_embedding_profile",
+        lambda: SimpleNamespace(name=embedding_profile.LOCAL_PROFILE),
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+
+    try:
+        await client.cognify_selected_data(dataset="notes", data_ids=[str(selected_id)])
+        assert task_calls, "get_default_tasks was never called on the selected-data path"
+        assert task_calls[0].get("chunker") is _Sentinel
+        assert task_calls[0].get("chunk_size") == 64
     finally:
         await engine.dispose()
 
@@ -1784,6 +2076,98 @@ async def test_source_manifest_requires_readable_matching_raw_source(
         }
     }
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 20_000),
+        ("7", 7),
+        ("20000", 20_000),
+    ],
+)
+async def test_corpus_health_cap_accepts_bounded_values(
+    monkeypatch: Any, raw: str | None, expected: int
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", raising=False)
+    else:
+        monkeypatch.setenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", raw)
+
+    calls: list[str] = []
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, int]:
+        calls.append("corpus_totals")
+        return {"documents": 0}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        calls.append("corpus_page")
+        return []
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+
+    assert _corpus_health_max_documents() == expected
+    report = await client.corpus_health()
+
+    assert report["probe_max_documents"] == expected
+    assert calls == ["corpus_totals"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    ["20001", "malformed", "1.0", "0", "-1", "inf", "unlimited"],
+)
+async def test_corpus_health_cap_rejects_invalid_values_before_enumeration(
+    monkeypatch: Any, raw: str
+) -> None:
+    monkeypatch.setenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", raw)
+    calls: list[str] = []
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, int]:
+        calls.append("corpus_totals")
+        raise AssertionError("invalid cap must fail before corpus_totals")
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        calls.append("corpus_page")
+        raise AssertionError("invalid cap must fail before corpus_page")
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+
+    with pytest.raises(RuntimeError):
+        await client.corpus_health()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_corpus_health_cap_breach_keeps_response_shape(monkeypatch: Any) -> None:
+    monkeypatch.setenv("CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS", "2")
+    calls: list[str] = []
+    client = CogneePublicClient()
+
+    async def corpus_totals() -> dict[str, int]:
+        calls.append("corpus_totals")
+        return {"documents": 3}
+
+    async def corpus_page(**_: Any) -> list[dict[str, Any]]:
+        calls.append("corpus_page")
+        return []
+
+    monkeypatch.setattr(client, "corpus_totals", corpus_totals)
+    monkeypatch.setattr(client, "corpus_page", corpus_page)
+
+    report = await client.corpus_health()
+
+    assert report["relational_documents"] == 3
+    assert report["probe_max_documents"] == 2
+    assert report["probe_cap_exceeded"] is True
+    assert report["probe_complete"] is False
+    assert report["probe_documents"] == 0
+    assert calls == ["corpus_totals"]
 
 @pytest.mark.asyncio
 async def test_zero_chunk_census_walks_pages_and_filters_datasets(monkeypatch: Any) -> None:
@@ -5422,7 +5806,7 @@ async def test_corpus_health_walks_keyset_pages_and_unions_projection_checks(
     assert health == {
         "relational_documents": 3,
         "probe_limit": 2,
-        "probe_max_documents": 10_000,
+        "probe_max_documents": 20_000,
         "probe_documents": 3,
         "probe_pages": 2,
         "probe_complete": True,
@@ -5538,7 +5922,7 @@ async def test_corpus_health_empty_corpus_is_complete(monkeypatch: Any) -> None:
     assert health == {
         "relational_documents": 0,
         "probe_limit": 64,
-        "probe_max_documents": 10_000,
+        "probe_max_documents": 20_000,
         "probe_documents": 0,
         "probe_pages": 0,
         "probe_complete": True,
@@ -6137,6 +6521,26 @@ async def test_cognify_violations_fail_even_when_missing_ids_are_in_flight(
     assert "still in lifecycle projection" in message
 
 
+@pytest.mark.asyncio
+async def test_repair_snapshot_selection_is_bounded_and_released() -> None:
+    client = CogneePublicClient()
+
+    tokens = [
+        client._store_repair_snapshot({"document_ids": [f"doc-{index}"]})
+        for index in range(MAX_REPAIR_SNAPSHOTS)
+    ]
+
+    assert len(client._repair_snapshots) == MAX_REPAIR_SNAPSHOTS
+    with pytest.raises(RuntimeError, match="repair snapshot capacity exhausted"):
+        client._store_repair_snapshot({"document_ids": ["overflow"]})
+    assert len(client._repair_snapshots) == MAX_REPAIR_SNAPSHOTS
+
+    assert await client.discard_document_chunk_snapshot(
+        {"snapshot_token": tokens[0]}
+    ) is True
+    replacement = client._store_repair_snapshot({"document_ids": ["replacement"]})
+    assert replacement in client._repair_snapshots
+    assert len(client._repair_snapshots) == MAX_REPAIR_SNAPSHOTS
 # ---------------------------------------------------------------------------
 # Startup recovery of dangling cognify runs.
 #

@@ -1,3 +1,14 @@
+"""Vault Activity: live ephemeral projection of vault operations.
+
+Implements the CONTEXT.md **Vault Activity** concept — source syncs, searches,
+ingests, and index updates surfaced on the Operations Dashboard and the
+``citadel activity`` CLI. Operational signal only: not Structured Knowledge
+and not the Knowledge Mesh (:mod:`kb.knowledge_mesh`). Resets with the service.
+
+HTTP routes ``/api/mesh`` (this module's MeshState) and ``/api/mesh/graph``
+(Knowledge Mesh) stay as public path names; only the Python module is renamed.
+"""
+
 from __future__ import annotations
 
 import asyncio

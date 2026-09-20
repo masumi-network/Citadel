@@ -27,7 +27,7 @@ existing config (never clobbering) and safe to re-run:
 |---|---|---|
 | **Token** | Prompts for your `ctdl_…` seat token, writes `export CITADEL_MCP_ACCESS_TOKEN=…` to your shell rc (once) | yes |
 | **Git pre-push hook** | Installs `.git/hooks/pre-push` → commit snapshots to your **Node** | yes |
-| **Session hooks** | Merges the Claude Code `SessionEnd` + `SessionStart` hooks into user-scope `.claude/settings.json` (SessionEnd → private Node trace; SessionStart → proactive policy reminder) | yes |
+| **Session hooks** | Merges the Claude Code `SessionEnd` + `SessionStart` hooks into user-scope `.claude/settings.json` (SessionEnd → private Node trace; SessionStart → policy and may inject bounded repo-scoped workspace candidates) | yes |
 | **Agent policy** | Same three-rule proactive policy for every coding agent you use — see [Proactive agent policy](#proactive-agent-policy-after-onboard) | yes |
 | **MCP server** | Adds the `citadel` HTTP MCP server to `.mcp.json` (in-session `citadel_search`, `citadel_ingest`, `citadel_share_session`) | optional, default on (`--no-mcp` to skip) |
 | **Coding tools** | Wires Claude Code, Cursor, Codex, Gemini, Windsurf when detected (`citadel mcp add`). Interactive: checkbox. Non-interactive: write-tier defaults. macOS: `launchctl setenv` until logout. | optional, default on (`--no-tools` to skip) |

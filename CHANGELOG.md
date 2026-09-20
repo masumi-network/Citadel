@@ -18,6 +18,28 @@ All notable changes to `citadel-archive` are documented here. Format follows
   retries. Previously the failure was swallowed and the writers started on
   top of unrecovered partial writes.
 
+- **Offline embedding path hardens the image and refuses a broken tokenizer.**
+  The Dockerfile bakes fastembed ONNX weights under `/opt/fastembed-cache`,
+  proves an offline embed at build time, and restores `HF_HUB_OFFLINE=1`. Boot
+  refuses to start when the exact gpt-4o tokenizer used for cognify sizing is
+  unavailable, so a missing cache fails closed instead of writing unmeasured
+  chunks.
+
+- **Evolve Phase 1 honors the inline-cognify suppression context variable.**
+  `suppress_inline_cognify()` marks the Phase 1 task tree add-only. The guard
+  previously read only `CITADEL_SUPPRESS_INLINE_COGNIFY` from the environment,
+  so an in-process Phase 1 still started the drain mid-pass and stalled on the
+  graph writer lock. The context variable is now checked first; Phase 2 still
+  cognifies on the owner loop.
+
+- **Cognify canary waits on the marker's lifecycle projection before search.**
+  Under lifecycle v1 the verify marker is an async projection job and search
+  excludes undrained revisions, so a seconds-scale re-search loop was a
+  deterministic miss. When a lifecycle store and `projection_job_id` are
+  present, verify awaits `wait_for_lifecycle_operation` (timeout from
+  `CITADEL_CANARY_TIMEOUT_SECONDS`, default 600s), then runs one confirming
+  search.
+
 - **Knowledge-graph inspector now supports long connection lists.** Selected
   nodes render up to 8 neighbor links and a `Show all N connections` control.
   Expanded mode shows the full set with a scrollable list so users can reach
