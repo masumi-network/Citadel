@@ -123,6 +123,101 @@ def test_shape_timeout_sets_code() -> None:
     assert shaped["timed_out"] is True
 
 
+
+def test_shape_search_payload_preserves_bounded_retrieval_receipt() -> None:
+    receipt = {
+        "scope": {
+            "datasets": ["central", "seat:alice"],
+            "filters": {
+                "types": ["spec"],
+                "source": "repo-content",
+                "canonical_only": True,
+                "exclude_ambient": True,
+                "mode": "docs",
+                "repo": "private/repo",
+                "path": "/Volumes/private/secret.txt",
+                "dataset": "seat:alice",
+                "top_k": 5,
+                "limit": 15,
+                "server_only": "drop",
+            },
+        },
+        "candidate_page": {
+            "limit": 15,
+            "fetched": 4,
+            "matched": 3,
+            "returned": 3,
+            "selection_trimmed": True,
+            "upstream_truncation": None,
+            "server_only": "drop",
+        },
+        "execution": {
+            "timed_out": False,
+            "degraded": True,
+            "observed_result_modes": ["vector", "lexical_fallback"],
+        },
+        "absence": {"proven": False, "reason": "bounded_candidate_page"},
+        "server_only": "drop",
+    }
+
+    shaped = shape_search_payload(
+        {"results": [], "retrieval_receipt": receipt},
+        query="missing answer",
+    )
+
+    assert shaped["retrieval_receipt"] == {
+        "scope": {
+            "datasets": ["central", "seat:alice"],
+            "filters": {
+                "types": ["spec"],
+                "source": "repo-content",
+                "canonical_only": True,
+                "exclude_ambient": True,
+                "mode": "docs",
+            },
+        },
+        "candidate_page": {
+            "limit": 15,
+            "fetched": 4,
+            "matched": 3,
+            "returned": 3,
+            "selection_trimmed": True,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": False,
+            "degraded": True,
+            "observed_result_modes": ["vector", "lexical_fallback"],
+        },
+        "absence": {"proven": False, "reason": "bounded_candidate_page"},
+    }
+
+
+def test_agent_payload_preserves_bounded_retrieval_receipt() -> None:
+    receipt = {
+        "scope": {"datasets": ["central"], "filters": {}},
+        "candidate_page": {
+            "limit": 10,
+            "fetched": 0,
+            "matched": 0,
+            "returned": 0,
+            "selection_trimmed": False,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": False,
+            "degraded": False,
+            "observed_result_modes": [],
+        },
+        "absence": {"proven": False, "reason": "bounded_candidate_page"},
+    }
+
+    compacted = compact_search_payload_for_agent(
+        {"results": [], "retrieval_receipt": receipt}
+    )
+
+    assert compacted["retrieval_receipt"] == receipt
+
 def test_agent_payload_drops_dashboard_section_copies() -> None:
     payload = {
         "results": [

@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from kb import chunk_window
 from kb.lifecycle import (
     CaptureContext,
     LifecycleConflictError,
@@ -19,6 +20,7 @@ from kb.lifecycle import (
     LifecycleStore,
     ProjectionLeaseError,
     ProjectionRequest,
+    lifecycle_chunk_source_key,
 )
 
 
@@ -1558,3 +1560,66 @@ def test_failed_missing_path_candidates_select_file_not_found_jobs(
     assert candidates[0]["source_key"] == "manual:marker3-pathfile"
     assert candidates[0]["dataset"] == "seat:citadel-dev-team"
     assert candidates[0]["error_code"] == "FileNotFoundError"
+
+def test_local_247_repair_bounds_chunks_and_recalls_tail_from_non_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_EMBEDDING_PROFILE", "fastembed")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    configured = chunk_window.configured_embedding_tokenizer()
+    budget = configured.window
+    tail_marker = "TAIL_MARKER_247_DISTINCTIVE"
+    document = "HEAD_MARKER " + ("filler text " * 900) + tail_marker
+    chunks = list(
+        chunk_window.iter_budget_chunks(
+            document,
+            budget=budget,
+            count_tokens=configured.count_tokens,
+        )
+    )
+
+    assert len(chunks) > 1
+    assert "".join(text for text, _ in chunks) == document
+    assert all(configured.count_tokens(text) <= budget for text, _ in chunks)
+    assert all(token_count <= budget for _, token_count in chunks)
+    tail_index = next(index for index, (text, _) in enumerate(chunks) if tail_marker in text)
+    assert tail_index > 0
+
+    store = LifecycleStore(tmp_path / "lifecycle.sqlite3")
+    projection = ProjectionRequest(
+        generation_id="generation-247",
+        projection_version="projection-v1",
+        config_digest="sha256:config-247",
+        providers={"relational": "sqlite", "vector": "qdrant", "graph": "ladybug"},
+    )
+    parent_key = "manual:synthetic-247"
+    for chunk_index, (chunk_text, _) in enumerate(chunks):
+        store.accept_source(
+            chunk_text.encode("utf-8"),
+            capture=CaptureContext(
+                dataset="synthetic",
+                source_key=lifecycle_chunk_source_key(parent_key, chunk_index),
+                source_locator=None,
+                media_type="text/plain",
+                capture_actor_id="t9-test",
+                capture_run_id="run-247",
+                captured_at=T0,
+                metadata={
+                    "title": "synthetic #247 fixture",
+                    "lifecycle_parent_source_key": parent_key,
+                    "lifecycle_chunk_index": chunk_index,
+                },
+            ),
+            projection=projection,
+            now=T0,
+        )
+
+    hits = store.lexical_search(
+        tail_marker, dataset="synthetic", projection=projection, top_k=5
+    )
+    assert hits
+    hit = next(item for item in hits if tail_marker in item["text"])
+    assert hit["metadata"]["lifecycle_chunk_index"] == tail_index
+    assert hit["metadata"]["lifecycle_chunk_index"] > 0

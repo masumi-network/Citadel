@@ -250,9 +250,10 @@ def merge_mcp_config(path: Path, base_url: str = DEFAULT_NODE_URL) -> str:
 def merge_claude_settings(path: Path, python: str | None = None) -> str:
     """Merge the SessionEnd + SessionStart hooks into .claude/settings.json.
 
-    SessionEnd distills the closing session to the dev's node; SessionStart
-    injects a recent-activity digest. Both are idempotent (detected by module
-    marker) so the merge never duplicates them on re-run.
+    SessionEnd distills the closing session to the dev's Node; SessionStart
+    emits the agent policy and may emit bounded repo-scoped workspace candidates for
+    session context. Both are idempotent (detected by module marker) so the
+    merge never duplicates them on re-run.
     """
     data = _load_json_object(path)
     hooks = data.setdefault("hooks", {})

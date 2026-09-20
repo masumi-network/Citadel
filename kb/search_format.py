@@ -1703,6 +1703,163 @@ def token_asset_authority_warning(query: str) -> str | None:
     )
 
 
+_RETRIEVAL_RECEIPT_FILTER_KEYS = frozenset(
+    {
+        "types",
+        "source",
+        "canonical_only",
+        "exclude_ambient",
+        "mode",
+    }
+)
+_RETRIEVAL_RECEIPT_CANDIDATE_KEYS = (
+    "limit",
+    "fetched",
+    "matched",
+    "returned",
+    "selection_trimmed",
+    "upstream_truncation",
+)
+_RETRIEVAL_RECEIPT_EXECUTION_KEYS = (
+    "timed_out",
+    "degraded",
+    "observed_result_modes",
+)
+_RETRIEVAL_RECEIPT_ABSENCE_KEYS = ("proven", "reason")
+
+
+def _shape_retrieval_receipt_section(
+    value: Any,
+    keys: tuple[str, ...],
+    *,
+    filters: bool = False,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    shaped: dict[str, Any] = {}
+    for key in keys:
+        if key not in value:
+            continue
+        field = value[key]
+        if field is None:
+            # ``None`` is an explicit unknown in the retrieval contract. Keep
+            # it instead of inventing a zero/false default.
+            shaped[key] = None
+        elif filters:
+            if key == "types":
+                if isinstance(field, list):
+                    shaped[key] = [
+                        item.strip()
+                        for item in field
+                        if isinstance(item, str) and item.strip()
+                    ]
+            elif key in {"canonical_only", "exclude_ambient"}:
+                if isinstance(field, bool):
+                    shaped[key] = field
+            elif key == "mode":
+                if isinstance(field, str) and field.strip().lower() == "docs":
+                    shaped[key] = "docs"
+            elif isinstance(field, str) and field.strip():
+                shaped[key] = field.strip()
+        elif key == "datasets":
+            if isinstance(field, list):
+                shaped[key] = [
+                    item for item in field if isinstance(item, str) and item.strip()
+                ]
+        elif key in {"limit", "fetched", "matched", "returned"}:
+            if isinstance(field, int) and not isinstance(field, bool):
+                shaped[key] = field
+        elif key in {
+            "selection_trimmed",
+            "upstream_truncation",
+            "timed_out",
+            "degraded",
+            "proven",
+        }:
+            if isinstance(field, bool):
+                shaped[key] = field
+        elif key == "observed_result_modes":
+            if isinstance(field, list):
+                shaped[key] = [
+                    item for item in field if isinstance(item, str) and item.strip()
+                ]
+        elif key == "reason":
+            if isinstance(field, str) and field.strip():
+                shaped[key] = field.strip()
+    return shaped
+
+
+def shape_retrieval_receipt(value: Any) -> dict[str, Any] | None:
+    """Return only the documented, bounded-search receipt fields.
+
+    Receipt values are evidence about the candidate page, not projection
+    readiness. Explicit ``null`` values remain explicit so an agent can
+    distinguish unknown measurements from measured zero/false values.
+    """
+    if not isinstance(value, dict):
+        return None
+    shaped: dict[str, Any] = {}
+    raw_scope = value.get("scope")
+    if isinstance(raw_scope, dict):
+        scope: dict[str, Any] = {}
+        if "datasets" in raw_scope:
+            datasets = _shape_retrieval_receipt_section(
+                {"datasets": raw_scope["datasets"]},
+                ("datasets",),
+            )
+            if datasets and "datasets" in datasets:
+                scope["datasets"] = datasets["datasets"]
+        if "filters" in raw_scope:
+            raw_filters = raw_scope["filters"]
+            if raw_filters is None:
+                scope["filters"] = None
+            else:
+                filters = _shape_retrieval_receipt_section(
+                    raw_filters,
+                    tuple(sorted(_RETRIEVAL_RECEIPT_FILTER_KEYS)),
+                    filters=True,
+                )
+                if filters is not None:
+                    scope["filters"] = filters
+        shaped["scope"] = scope
+    for section_name, keys in (
+        ("candidate_page", _RETRIEVAL_RECEIPT_CANDIDATE_KEYS),
+        ("execution", _RETRIEVAL_RECEIPT_EXECUTION_KEYS),
+        ("absence", _RETRIEVAL_RECEIPT_ABSENCE_KEYS),
+    ):
+        section = _shape_retrieval_receipt_section(value.get(section_name), keys)
+        if section is not None:
+            shaped[section_name] = section
+    return shaped or None
+
+
+def _receipt_value(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def retrieval_receipt_line(receipt: Any) -> str:
+    """Short human-readable bounded-retrieval summary for CLI output."""
+    shaped = shape_retrieval_receipt(receipt)
+    if not shaped:
+        return "Bounded retrieval: receipt unavailable; absence is not proven."
+    candidate = shaped.get("candidate_page")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    return (
+        "Bounded retrieval: "
+        f"limit {_receipt_value(candidate.get('limit'))}; "
+        f"fetched {_receipt_value(candidate.get('fetched'))}; "
+        f"matched {_receipt_value(candidate.get('matched'))}; "
+        f"returned {_receipt_value(candidate.get('returned'))}; "
+        f"selection trimmed {_receipt_value(candidate.get('selection_trimmed'))}; "
+        f"upstream truncation {_receipt_value(candidate.get('upstream_truncation'))}; "
+        "absence is not proven."
+    )
+
+
 def shape_search_payload(
     payload: dict[str, Any],
     *,
@@ -1776,6 +1933,9 @@ def shape_search_payload(
         "warnings": warnings,
         "ok": True,
     }
+    receipt = shape_retrieval_receipt(payload.get("retrieval_receipt"))
+    if receipt is not None:
+        out["retrieval_receipt"] = receipt
     if payload.get("clarification_required") is True:
         out["clarification_required"] = True
     if payload.get("answerable") is False:
@@ -1799,6 +1959,12 @@ def compact_search_payload_for_agent(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
     compacted = dict(payload)
+    if "retrieval_receipt" in payload:
+        receipt = shape_retrieval_receipt(payload.get("retrieval_receipt"))
+        if receipt is None:
+            compacted.pop("retrieval_receipt", None)
+        else:
+            compacted["retrieval_receipt"] = receipt
     primary_dataset = compacted.pop("dataset", None)
     searched_datasets = compacted.pop("datasets", None)
     if primary_dataset is not None:

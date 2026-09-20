@@ -25,6 +25,7 @@ from kb.cli import (
     _maybe_prompt_update,
     _operation,
     _search,
+    _render_search,
     _skills,
     _should_prompt_update,
     _token_set,
@@ -210,6 +211,40 @@ def test_search_http_renders_results(monkeypatch, capsys) -> None:
     assert out["results"][0]["text"] == "hello vault"
     assert "snippet" not in out["results"][0]
     assert out["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "results",
+    [[], [{"id": "doc-1", "text": "bounded result"}]],
+)
+def test_human_search_renders_bounded_receipt_for_empty_and_nonempty(
+    capsys, results
+) -> None:
+    _render_search(
+        {
+            "results": results,
+            "retrieval_receipt": {
+                "candidate_page": {
+                    "limit": 20,
+                    "fetched": 4,
+                    "matched": 2,
+                    "returned": len(results),
+                    "selection_trimmed": True,
+                    "upstream_truncation": None,
+                },
+                "absence": {"proven": False, "reason": "bounded_candidate_page"},
+            },
+        },
+        "bounded query",
+    )
+
+    output = capsys.readouterr().out
+    assert "Bounded retrieval" in output
+    assert "limit 20" in output
+    assert "fetched 4" in output
+    assert "upstream truncation unknown" in output
+    assert "absence is not proven" in output
+    assert "exhaustive" not in output.lower()
 
 
 def test_skills_command_lists_and_shows_management_skill(capsys) -> None:
@@ -692,6 +727,96 @@ def test_search_json_preserves_typed_server_error(
         "code": code,
         "http_status": status,
     }
+
+
+def test_search_json_redacts_known_secret_before_display_cap(monkeypatch, capsys) -> None:
+    secret = "opaque-access-key-9f31c4d8e7b6"
+    message = ("x" * 490) + secret
+    assert message.index(secret) == 490
+    monkeypatch.setattr("kb.cli.capture_token", lambda: secret)
+
+    def boom(*_a, **_k):
+        body = json.dumps(
+            {"detail": {"code": "SEARCH_TIMEOUT", "message": message}}
+        ).encode()
+        raise urllib.error.HTTPError(
+            "https://node.example",
+            504,
+            "Gateway Timeout",
+            {},
+            BytesIO(body),
+        )
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    rc = asyncio.run(_search(_search_args(query="hi")))
+
+    rendered = capsys.readouterr().out
+    out = json.loads(rendered)
+    assert rc == 1
+    assert secret not in rendered
+    assert secret[:12] not in rendered
+    assert "[REDACTED]" in out["error"]
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["http_status"] == 504
+
+
+def test_v10_search_json_preserves_large_typed_timeout_receipt(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
+    message = "Search exceeded the configured server budget."
+    receipt = {
+        "scope": {
+            "datasets": [f"seat-{index}-" + ("x" * 40) for index in range(12)],
+            "filters": {
+                "types": ["canonical-docs", "skill"],
+                "source": "github-activity",
+                "canonical_only": True,
+                "exclude_ambient": True,
+                "mode": "docs",
+            },
+        },
+        "candidate_page": {
+            "limit": 100,
+            "fetched": None,
+            "matched": None,
+            "returned": None,
+            "selection_trimmed": None,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": True,
+            "degraded": False,
+            "observed_result_modes": ["lexical_fallback"],
+        },
+        "absence": {"proven": False, "reason": "search_timeout"},
+    }
+    body = json.dumps(
+        {"detail": {"code": "SEARCH_TIMEOUT", "message": message, "retrieval_receipt": receipt}}
+    ).encode()
+    assert len(body) > 500
+
+    def boom(*_a, **_k):
+        raise urllib.error.HTTPError(
+            "https://node.example",
+            504,
+            "Gateway Timeout",
+            {},
+            BytesIO(body),
+        )
+
+    monkeypatch.setattr("kb.status.search_node", boom)
+    rc = asyncio.run(_search(_search_args(query="hi")))
+
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["code"] == "SEARCH_TIMEOUT"
+    assert out["error"] == message
+    assert out["http_status"] == 504
+    assert out["retrieval_receipt"] == receipt
+    assert out["retrieval_receipt"]["absence"]["proven"] is False
+    assert out["retrieval_receipt"]["candidate_page"]["upstream_truncation"] is None
 
 
 def test_ingest_json_connection_error_emits_json(monkeypatch, capsys) -> None:

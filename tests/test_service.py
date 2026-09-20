@@ -2156,6 +2156,65 @@ async def test_reconcile_corpus_repairs_mixed_candidates_once_and_holds_lock(tmp
 
 
 @pytest.mark.asyncio
+async def test_reconcile_corpus_journals_only_selected_repair_ids(tmp_path) -> None:
+    selected = ["doc-a", "doc-b"]
+
+    def census(*, needs_repair: bool) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "census_complete": True,
+            "cap_exceeded": False,
+            "zero_chunk_count": len(selected) if needs_repair else 0,
+            "zero_chunk_document_ids": selected if needs_repair else [],
+            "oversized_document_count": 0,
+            "oversized_chunk_count": 0,
+            "oversized_document_ids": [],
+            "zero_repair_document_ids": selected if needs_repair else [],
+            "oversized_repair_document_ids": [],
+            "repair_document_ids": selected if needs_repair else [],
+            "repair_document_datasets": (
+                {document_id: ["notes"] for document_id in selected}
+                if needs_repair
+                else {}
+            ),
+            "repair_datasets": ["notes"] if needs_repair else [],
+            "unassigned_zero_chunk_document_count": 0,
+            "unassigned_oversized_document_count": 0,
+            "orphan_oversized_document_count": 0,
+            "missing_document_id_violation_count": 0,
+            "stored_chunk_budget": {
+                "ok": True,
+                "violation_count": 0,
+                "missing_document_id_violation_count": 0,
+            },
+        }
+
+    class JournalGateway(FakeCognee):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reports = [census(needs_repair=True), census(needs_repair=False)]
+
+        async def corpus_reconciliation_census(self, **_: Any) -> dict[str, Any]:
+            return self.reports.pop(0)
+
+    journal_path = tmp_path / "repair.jsonl"
+    kb = Citadel(
+        CitadelConfig(default_dataset="notes", repair_journal_path=str(journal_path)),
+        cognee=JournalGateway(),
+    )
+
+    result = await kb.reconcile_corpus(apply=True)
+
+    assert result["ok"] is True
+    records = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert records
+    assert all(record["repair_document_ids"] == selected for record in records)
+    assert max(len(record["repair_document_ids"]) for record in records) == len(selected)
+    assert all("doc-healthy" not in record["repair_document_ids"] for record in records)
+    assert all("text" not in record for record in records)
+
+
+@pytest.mark.asyncio
 async def test_reconcile_corpus_refuses_apply_when_source_manifest_fails(tmp_path) -> None:
     class UnreadableSourceGateway(FakeCognee):
         def __init__(self) -> None:

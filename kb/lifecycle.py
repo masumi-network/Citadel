@@ -1432,21 +1432,6 @@ class LifecycleStore:
                         continue
 
                     state = self._operation_state(job, receipts)
-                    if state != "searchable" or any(
-                        receipt.state != "searchable" for receipt in receipts
-                    ):
-                        errors.append(
-                            CurrentHeadEvidenceError(
-                                code="RECEIPT_NOT_SEARCHABLE",
-                                source_key=source_key,
-                                source_revision_id=source.source_revision_id,
-                                projection_job_ids=(job.projection_job_id,),
-                                job_state=job.state,
-                                backend_states=backend_states,
-                            )
-                        )
-                        continue
-
                     evidence.append(
                         CurrentHeadProjectionEvidence(
                             source_key=source_key,
@@ -1468,6 +1453,25 @@ class LifecycleStore:
                             ),
                         )
                     )
+                    # The current head is always recorded as diagnostic evidence,
+                    # carrying its own pending/failed state. A non-searchable head
+                    # also raises an error so it never counts as ready, but it is
+                    # kept so callers can read its retained content and never fall
+                    # back to a superseded revision's searchable projection.
+                    if state != "searchable" or any(
+                        receipt.state != "searchable" for receipt in receipts
+                    ):
+                        errors.append(
+                            CurrentHeadEvidenceError(
+                                code="RECEIPT_NOT_SEARCHABLE",
+                                source_key=source_key,
+                                source_revision_id=source.source_revision_id,
+                                projection_job_ids=(job.projection_job_id,),
+                                job_state=job.state,
+                                backend_states=backend_states,
+                            )
+                        )
+                        continue
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")

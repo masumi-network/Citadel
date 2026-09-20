@@ -1404,3 +1404,5 @@ async def test_slow_provider_write_renews_lease_before_second_worker_can_claim(
         assert operation.job.lease_owner is None
         assert operation.job.leased_until is None
         assert {receipt.state for receipt in operation.receipts} == {"pending"}
+
+

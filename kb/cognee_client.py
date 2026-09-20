@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import contextlib
 import contextvars
+import copy
+import inspect
 from hashlib import md5
 import json
 import logging
@@ -41,7 +42,7 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 10_000
+DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS = 20_000
 MAX_ZERO_CHUNK_REPORT_DOCUMENTS = 1_000
 MAX_OVERSIZED_CHUNK_REPORT_DOCUMENTS = 1_000
 MAX_REPAIR_SNAPSHOTS = 32
@@ -56,11 +57,11 @@ def _corpus_health_max_documents() -> int:
         value = int(raw)
     except ValueError as exc:
         raise RuntimeError(
-            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer <= 20000"
         ) from exc
-    if value < 1:
+    if value < 1 or value > DEFAULT_CORPUS_HEALTH_MAX_DOCUMENTS:
         raise RuntimeError(
-            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer"
+            "CITADEL_CORPUS_HEALTH_MAX_DOCUMENTS must be a positive integer <= 20000"
         )
     return value
 
@@ -92,6 +93,47 @@ def _cognify_data_ids(result: Any) -> list[str]:
             if data_id is not None:
                 data_ids.append(str(data_id))
     return list(dict.fromkeys(data_ids))
+
+
+def _bounded_cognee_chunker() -> type[Any]:
+    """Build the verified local BGE bounded chunker.
+
+    The primary Nemotron profile retains Cognee's stock chunker until an
+    official compatible tokenizer is packaged locally.
+    """
+    from cognee.modules.chunking.Chunker import Chunker
+    from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
+
+    class BoundedTextChunker(Chunker):
+        async def read(self):
+            document_id = str(self.document.id)
+            document_name = self.document.name or Path(
+                self.document.raw_data_location
+            ).name
+            model_tokenizer = chunk_window.configured_embedding_tokenizer()
+            budget = min(self.max_chunk_size, model_tokenizer.window)
+            async for content_text in self.get_text():
+                for chunk_text, chunk_size in chunk_window.iter_budget_chunks(
+                    content_text,
+                    budget=budget,
+                    count_tokens=model_tokenizer.count_tokens,
+                ):
+                    yield DocumentChunk(
+                        id=uuid5(NAMESPACE_OID, f"{document_id}-{self.chunk_index}"),
+                        text=chunk_text,
+                        chunk_size=chunk_size,
+                        chunk_index=self.chunk_index,
+                        cut_type="budget",
+                        is_part_of=self.document,
+                        contains=[],
+                        importance_weight=self.document.importance_weight,
+                        document_id=document_id,
+                        document_name=document_name,
+                        metadata={"index_fields": ["text"]},
+                    )
+                    self.chunk_index += 1
+
+    return BoundedTextChunker
 
 
 def _cognify_data_ids_by_dataset(
@@ -4832,7 +4874,6 @@ class CogneePublicClient:
                 )
             await self._ensure_cognee_ready(cognee)
 
-            from cognee.modules.chunking.TextChunker import TextChunker
             from cognee.modules.pipelines.tasks.task import Task
             from cognee.tasks.documents import (
                 classify_documents,
@@ -4840,12 +4881,18 @@ class CogneePublicClient:
             )
             from cognee.tasks.storage.index_data_points import index_data_points
 
+            from kb.embedding_profile import LOCAL_PROFILE, active_embedding_profile
+
+            chunk_task_kwargs: dict[str, Any] = {
+                "max_chunk_size": chunk_window.resolve_chunk_budget(),
+            }
+            if active_embedding_profile().name == LOCAL_PROFILE:
+                chunk_task_kwargs["chunker"] = _bounded_cognee_chunker()
             tasks = [
                 Task(classify_documents),
                 Task(
                     extract_chunks_from_documents,
-                    max_chunk_size=chunk_window.resolve_chunk_budget(),
-                    chunker=TextChunker,
+                    **chunk_task_kwargs,
                 ),
                 Task(index_data_points, task_config={"batch_size": 32}),
             ]
@@ -4918,11 +4965,26 @@ class CogneePublicClient:
             *, incremental_loading: bool, data_cache: bool
         ) -> Any:
             async with self.writer_lock:
-                cognify_result = await cognee.cognify(
-                    datasets=datasets,
-                    incremental_loading=incremental_loading,
-                    data_cache=data_cache,
-                )
+                cognify_kwargs: dict[str, Any] = {
+                    "datasets": datasets,
+                    "incremental_loading": incremental_loading,
+                    "data_cache": data_cache,
+                }
+                try:
+                    supports_custom_chunker = "chunker" in inspect.signature(
+                        cognee.cognify
+                    ).parameters
+                except (TypeError, ValueError):
+                    supports_custom_chunker = False
+                from kb.embedding_profile import LOCAL_PROFILE, active_embedding_profile
+
+                if (
+                    supports_custom_chunker
+                    and active_embedding_profile().name == LOCAL_PROFILE
+                ):
+                    cognify_kwargs["chunker"] = _bounded_cognee_chunker()
+                    cognify_kwargs["chunk_size"] = chunk_window.resolve_chunk_budget()
+                cognify_result = await cognee.cognify(**cognify_kwargs)
                 self._invalidate_graph_data_cache()
                 return cognify_result
 
