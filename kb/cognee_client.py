@@ -5653,7 +5653,11 @@ class CogneePublicClient:
                         run_pipeline_blocking,
                     )
 
-                    tasks = await get_default_tasks()
+                    task_kwargs: dict[str, Any] = {}
+                    if "chunker" in cognify_kwargs:
+                        task_kwargs["chunker"] = cognify_kwargs["chunker"]
+                        task_kwargs["chunk_size"] = cognify_kwargs["chunk_size"]
+                    tasks = await get_default_tasks(**task_kwargs)
                     cognify_result = await run_pipeline_blocking(
                         pipeline=run_pipeline,
                         tasks=tasks,

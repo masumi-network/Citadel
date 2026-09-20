@@ -761,6 +761,97 @@ async def test_cognify_selected_data_scopes_rows_and_validates_before_write(
         await engine.dispose()
 
 @pytest.mark.asyncio
+async def test_cognify_selected_data_hands_local_chunker_to_tasks(
+    monkeypatch: Any,
+) -> None:
+    """#247: on the selected-data path under the local profile, the bounded
+    chunker and budget must reach get_default_tasks, not be silently dropped."""
+    from contextlib import asynccontextmanager
+    from importlib import import_module
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import cognee
+    import cognee.infrastructure.databases.relational as relational_module
+    import cognee.modules.pipelines as pipelines_module
+    import cognee.modules.users.methods as users_methods
+    from cognee.modules.data.models import Data, Dataset, DatasetData
+
+    import kb.cognee_client as cognee_client_module
+    from kb import embedding_profile
+
+    cognify_module = import_module("cognee.api.v1.cognify.cognify")
+
+    user_id, tenant_id, notes_id, selected_id = uuid4(), uuid4(), uuid4(), uuid4()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Data.__table__.create)
+        await conn.run_sync(Dataset.__table__.create)
+        await conn.run_sync(DatasetData.__table__.create)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add_all(
+            [
+                Dataset(id=notes_id, name="notes", owner_id=user_id, tenant_id=tenant_id),
+                Data(id=selected_id, name="selected"),
+                DatasetData(dataset_id=notes_id, data_id=selected_id),
+            ]
+        )
+        await session.commit()
+
+    class FakeRelationalEngine:
+        @asynccontextmanager
+        async def get_async_session(self) -> Any:
+            async with maker() as session:
+                yield session
+
+    async def get_default_user() -> Any:
+        return SimpleNamespace(id=user_id, tenant_id=tenant_id)
+
+    task_calls: list[dict[str, Any]] = []
+
+    async def get_default_tasks(**kwargs: Any) -> list[Any]:
+        task_calls.append(kwargs)
+        return []
+
+    async def run_pipeline(**kwargs: Any) -> Any:
+        yield SimpleNamespace(dataset_id=notes_id)
+
+    # A stand-in with a `chunker` parameter so the custom-chunker probe passes.
+    async def fake_public_cognify(*, chunker: Any = None, chunk_size: Any = None, **_: Any) -> Any:
+        raise AssertionError("selected-data path must not call public cognee.cognify")
+
+    class _Sentinel:
+        __name__ = "BoundedTextChunker"
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(relational_module, "get_relational_engine", lambda: FakeRelationalEngine())
+    monkeypatch.setattr(users_methods, "get_default_user", get_default_user)
+    monkeypatch.setattr(pipelines_module, "run_pipeline", run_pipeline)
+    monkeypatch.setattr(cognify_module, "get_default_tasks", get_default_tasks)
+    monkeypatch.setattr(cognee, "cognify", fake_public_cognify)
+    monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
+    monkeypatch.setattr(chunk_window, "resolve_chunk_budget", lambda: 64)
+    monkeypatch.setattr(cognee_client_module, "_bounded_cognee_chunker", lambda: _Sentinel)
+    monkeypatch.setattr(
+        embedding_profile,
+        "active_embedding_profile",
+        lambda: SimpleNamespace(name=embedding_profile.LOCAL_PROFILE),
+    )
+
+    client = CogneePublicClient()
+    monkeypatch.setattr(client, "_prepare_cognee_environment", lambda: None)
+    monkeypatch.setattr(client, "_ensure_cognee_ready", lambda _: asyncio.sleep(0))
+
+    try:
+        await client.cognify_selected_data(dataset="notes", data_ids=[str(selected_id)])
+        assert task_calls, "get_default_tasks was never called on the selected-data path"
+        assert task_calls[0].get("chunker") is _Sentinel
+        assert task_calls[0].get("chunk_size") == 64
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "receipt_shape",
     ["inner", "outer"],
