@@ -475,7 +475,10 @@ def test_the_info_preview_ships_the_last_published_figures() -> None:
     """
     body = _client().get("/next/info").text
 
-    assert "Live · v0.5.0" in body
+    # The health pill hydrates from /api/state; the prerendered HTML must not
+    # claim Live before that read settles (regression: null → false-green Live).
+    assert "Loading" in body
+    assert "Live · v0.5.0" not in body
     assert "Window: v0.2.0 → v0.5.0" in body
     assert "Window: v0.2.0 → v0.4.1" not in body
     assert "~$23–$58/mo" in body
