@@ -155,6 +155,12 @@ class LearningAgent:
             "gateways": gateway_results,
             "google_chat": gateway_results.get("google_chat", {"enabled": False}),
         }
+        chat = result["notifications"]["google_chat"]
+        if not chat.get("sent"):
+            logger.info(
+                "Learning agent digest not posted: reason=%s",
+                chat.get("reason") or "not_sent",
+            )
         logger.info(
             "Learning agent run finished: ingested=%s, improved=%s, digest_meaningful=%s",
             result.get("ingested"),

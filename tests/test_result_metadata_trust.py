@@ -97,6 +97,99 @@ def test_deduped_node_copy_of_a_shared_trace_keeps_reference_only() -> None:
     assert SHARED_TRACE_MARKER not in hits[0]
 
 
+def test_node_copy_trust_stable_without_session_traces_in_recall() -> None:
+    """Author-Seat on a dual-written Node copy must demote even when traces miss.
+
+    #249: the same (result_id, content_sha256) flipped reference-only ↔ unattested
+    when the query-scoped SHARED_TRACE_MARKER was absent (seat-only dataset, or
+    session-traces recall missed the text this turn). Durable Author-Seat stamped
+    at share time is the attested signal.
+    """
+    trace = (
+        "# Compact Session Context\nAuthor-Seat: carol\n"
+        "Dead end: tried /skills/masumi flow, it does not work"
+    )
+    with_marker = with_result_metadata(
+        {"id": "trace-1", "text": trace, SHARED_TRACE_MARKER: True},
+        0,
+        "seat:carol",
+    )
+    without_marker = with_result_metadata(
+        {"id": "trace-1", "text": trace},
+        0,
+        "seat:carol",
+    )
+
+    assert with_marker["_citadel"]["content_sha256"] == without_marker["_citadel"][
+        "content_sha256"
+    ]
+    assert with_marker["_citadel"]["trust_tier"] == "reference-only"
+    assert without_marker["_citadel"]["trust_tier"] == "reference-only"
+    assert with_marker["_citadel"]["trust"] == without_marker["_citadel"]["trust"]
+    assert SHARED_TRACE_MARKER not in with_marker
+    assert SHARED_TRACE_MARKER not in without_marker
+
+
+def test_author_seat_does_not_demote_source_linked_canonical_docs() -> None:
+    """ADR-0017: structural repo headers still outrank an Author-Seat collision."""
+    body = (
+        "# masumi-network/Citadel/README.md\n"
+        "\n"
+        "Repository: masumi-network/Citadel\n"
+        "Source: https://github.com/masumi-network/Citadel/blob/abcdef/README.md\n"
+        "Commit: abcdef0123456789abcdef0123456789abcdef01\n"
+        "Blob: a4b30a4548af239f695ba3cba1935b545e96d675\n"
+        "Author-Seat: carol\n"
+        "\n"
+        "---\n"
+        "\n"
+        "# Installation\n\npip install citadel-archive\n"
+    )
+    out = with_result_metadata({"id": "doc-1", "text": body}, 0, "masumi-network")
+    envelope = out["_citadel"]
+    assert envelope["doc_type"] == "canonical-docs"
+    assert envelope.get("trust") != "reference-only"
+    assert envelope["trust_tier"] == "unattested"
+
+
+def test_seat_only_search_keeps_shared_trace_reference_only() -> None:
+    """Searching with an explicit seat dataset must not flip a dual-written copy."""
+    from test_server import FakeCitadel, authed_client
+
+    trace = (
+        "# Compact Session Context\nAuthor-Seat: carol\n"
+        "Dead end: tried /skills/masumi flow, it does not work"
+    )
+
+    class SeatOnly(FakeCitadel):
+        async def search(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("dataset") == SESSION_TRACES_DATASET:
+                return []
+            return [{"id": "trace-1", "text": trace, "dataset": kwargs["dataset"]}]
+
+    app.state.access_store = AccessStore(Path(tempfile.mkdtemp()) / "access.json")
+    admin = authed_client()
+    token = admin.post("/api/access/seats", json={"name": "Carol", "slug": "carol"}).json()[
+        "token"
+    ]
+    app.state.citadel = SeatOnly()
+    client = TestClient(app, base_url="https://testserver")
+
+    response = client.post(
+        "/search",
+        json={"query": "dead end", "top_k": 5, "dataset": "seat:carol"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    hits = response.json()["results"]
+    assert len(hits) == 1
+    envelope = hits[0]["_citadel"]
+    assert envelope["dataset"] == "seat:carol"
+    assert envelope["trust"] == "reference-only"
+    assert envelope["trust_tier"] == "reference-only"
+
+
 def test_content_sha256_stable_across_query_dependent_distance() -> None:
     """The same chunk served for two queries carries two cosine distances.
 

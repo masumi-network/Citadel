@@ -102,7 +102,7 @@ def _post_json(
 
 async def _run_local(*, dry_run: bool) -> dict[str, Any]:
     from kb.access import AccessStore
-    from kb.mesh import MeshState
+    from kb.vault_activity import MeshState
     from kb.self_improve import SelfImprovement
     from kb.service import Citadel
 

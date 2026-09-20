@@ -27,7 +27,7 @@ from kb.llm_enrichment import (
 )
 from kb.improvement_policy import central_improvement_dataset
 from kb.model_routing import route_for
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.service import Citadel
 
 logger = logging.getLogger(__name__)
