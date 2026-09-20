@@ -22,6 +22,7 @@ from kb.cognee_client import (
     _suppress_inline_cognify,
 )
 from kb.capture_policy import merged_deny_globs, path_is_denied
+from kb.feedback_store import FeedbackStore
 from kb.config import CitadelConfig
 from kb.filters import PreIngestFilter
 from kb.improvement_policy import (
@@ -59,6 +60,7 @@ from kb.security_scan import (
 )
 from kb.source_search import search_github_sync_state
 from kb.tags import merge_tags
+from kb.search_feedback import durable_explicit_event
 
 logger = logging.getLogger(__name__)
 _JOB_IDS_UNSET = object()
@@ -149,6 +151,7 @@ class Citadel:
         cognee: CogneeGateway | None = None,
     ) -> None:
         self.config = config or CitadelConfig.from_env()
+        self.feedback_store: FeedbackStore | None = None
         self.cognee = cognee or CogneePublicClient(queue_path=self.config.cognify_queue_path)
         self.lifecycle_store: LifecycleStore | None = None
         self.lifecycle_worker: LifecycleProjectionWorker | None = None
@@ -1519,6 +1522,25 @@ class Citadel:
         """
         session_id = request.session_id or self.config.default_session
         dataset = request.dataset or self.config.default_dataset
+        try:
+            feedback_store = self.feedback_store
+            if feedback_store is None:
+                feedback_store = FeedbackStore(self.config.feedback_store_path)
+                self.feedback_store = feedback_store
+            await asyncio.to_thread(
+                feedback_store.record_event,
+                durable_explicit_event(
+                    qa_id=request.qa_id,
+                    result_id=request.result_id,
+                    search_id=request.search_id,
+                    actor_id=request.actor_id or self.config.user_id,
+                    dataset=dataset,
+                    score=request.score,
+                    text_present=bool(request.text),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - durable feedback is best-effort
+            logger.warning("durable feedback event write failed: %s", exc)
         # Try cognee's per-session QA cache first (preserves the QA linkage when a
         # live session match exists). Since #54 durable recall bypasses that cache,
         # add_feedback usually finds no matching qa_id and returns False — which

@@ -328,6 +328,10 @@ def test_evolve_runs_all_stages_in_chain_order(monkeypatch: Any) -> None:
     ]
 
 
+def test_standalone_evolve_does_not_run_unbarriered_feedback() -> None:
+    assert "feedback" not in [name for name, _, _ in run_railway.evolve_stages()]
+
+
 def test_evolve_stage_toggles_disable_individual_stages(monkeypatch: Any) -> None:
     _clear_evolve_env(monkeypatch)
     monkeypatch.setenv("CITADEL_EVOLVE_SELF_IMPROVE_ENABLED", "false")
@@ -335,7 +339,6 @@ def test_evolve_stage_toggles_disable_individual_stages(monkeypatch: Any) -> Non
     monkeypatch.setenv("CITADEL_EVOLVE_LINEAR_SYNC_ENABLED", "false")
     calls: list[str] = []
     _patch_evolve_stages(monkeypatch, calls)
-
     assert run_railway.run("evolve") == 0
     assert calls == ["github_sync", "repo_content_sync", "cognify"]
 
@@ -423,7 +426,6 @@ def test_evolve_exits_nonzero_when_all_enabled_stages_fail(monkeypatch: Any) -> 
 
     assert run_railway.run("evolve") == 1
     assert calls == ["github_sync"]
-
 
 # --- Evolve cognify stage routing -------------------------------------------
 
@@ -519,10 +521,14 @@ def test_evolve_stage_lists_stay_in_sync() -> None:
     ]
 
     assert [name for name, _ in sync_stages if name != "cognify"] == [
-        name for name, _ in async_stages
+        name for name, _ in async_stages if name != "feedback"
     ]
     assert "cognify" in dict(sync_stages), "the sync list still owns the cognify stage"
+    assert "feedback" not in dict(sync_stages), "standalone evolve must stay unbarriered"
+    assert dict(async_stages)["feedback"] is True
     for name, enabled in async_stages:
+        if name == "feedback":
+            continue
         assert dict(sync_stages)[name] == enabled, f"{name} toggle drifted"
 
 
