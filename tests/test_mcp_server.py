@@ -1408,6 +1408,105 @@ def test_search_tool_error_carries_typed_server_error(
     assert message in error
 
 
+def test_typed_search_error_redacts_known_secret_before_display_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_RETRY_MAX_ATTEMPTS", "1")
+    secret = "opaque-access-key-9f31c4d8e7b6"
+    message = ("x" * 490) + secret
+    assert message.index(secret) == 490
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        body = json.dumps(
+            {"detail": {"code": "SEARCH_TIMEOUT", "message": message}}
+        ).encode()
+        raise HTTPError(request.full_url, 504, "Gateway Timeout", {}, BytesIO(body))
+
+    monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
+    server = create_mcp_server(
+        CitadelHttpClient(base_url="http://localhost:8000", access_token=secret)
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        run_tool(server, "citadel_search", "absent", None)
+
+    error = str(exc_info.value)
+    assert secret not in error
+    assert secret[:12] not in error
+    assert "[REDACTED]" in error
+    assert "code=SEARCH_TIMEOUT" in error
+    assert "http_status=504" in error
+
+def test_v10_search_timeout_error_preserves_bounded_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CITADEL_RETRY_MAX_ATTEMPTS", "1")
+    receipt = {
+        "scope": {
+            "datasets": ["masumi-network", "session-traces", "seat:alice"],
+            "filters": {
+                "types": [
+                    "activity",
+                    "canonical-docs",
+                    "issue",
+                    "other",
+                    "session-trace",
+                    "skill",
+                    "spec",
+                ],
+                "source": "repo-content",
+                "canonical_only": True,
+                "exclude_ambient": True,
+                "mode": "docs",
+            },
+        },
+        "candidate_page": {
+            "limit": 25,
+            "fetched": None,
+            "matched": None,
+            "returned": None,
+            "selection_trimmed": None,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": True,
+            "degraded": False,
+            "observed_result_modes": ["vector", "lexical_fallback"],
+        },
+        "absence": {"proven": False, "reason": "search_timeout"},
+    }
+
+    def fake_urlopen(request: Any, timeout: float) -> Any:
+        body = json.dumps(
+            {
+                "detail": {
+                    "code": "SEARCH_TIMEOUT",
+                    "message": "Search budget expired.",
+                    "retrieval_receipt": receipt,
+                }
+            }
+        ).encode()
+        assert len(body) > 500
+        raise HTTPError(request.full_url, 504, "Gateway Timeout", {}, BytesIO(body))
+
+    monkeypatch.setattr(mcp_server, "urlopen", fake_urlopen)
+    server = create_mcp_server(
+        CitadelHttpClient(base_url="http://localhost:8000", access_token="ctdl_t")
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        run_tool(server, "citadel_search", "absent", None)
+
+    error = str(exc_info.value)
+    assert "code=SEARCH_TIMEOUT" in error
+    assert "http_status=504" in error
+    assert "absence" in error
+    visible_receipt = json.loads(error.split("retrieval_receipt=", 1)[1].removesuffix(")"))
+    assert visible_receipt == receipt
+    assert visible_receipt["absence"]["proven"] is False
+    assert visible_receipt["candidate_page"]["upstream_truncation"] is None
+
+
 def test_search_genuine_empty_is_a_normal_mcp_result() -> None:
     class EmptySearchClient(FakeHttpClient):
         def post(
@@ -1737,6 +1836,51 @@ def test_search_compaction_leaves_unexpected_shapes_alone() -> None:
     assert _compact_search_for_agent({"sections": None}) == {"sections": None}
     assert _compact_search_for_agent("not a dict") == "not a dict"
     assert _compact_search_for_agent(None) is None
+
+
+def test_search_compaction_preserves_bounded_retrieval_receipt() -> None:
+    from kb.mcp_server import _compact_search_for_agent
+
+    receipt = {
+        "scope": {"datasets": ["central"], "filters": {"source": "repo-content"}},
+        "candidate_page": {
+            "limit": 20,
+            "fetched": 2,
+            "matched": 1,
+            "returned": 1,
+            "selection_trimmed": True,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": False,
+            "degraded": False,
+            "observed_result_modes": ["vector"],
+        },
+        "absence": {"proven": False, "reason": "bounded_candidate_page"},
+        "internal_field": "drop",
+    }
+
+    compacted = _compact_search_for_agent(
+        {"results": [], "retrieval_receipt": receipt}
+    )
+
+    assert compacted["retrieval_receipt"] == {
+        "scope": {"datasets": ["central"], "filters": {"source": "repo-content"}},
+        "candidate_page": {
+            "limit": 20,
+            "fetched": 2,
+            "matched": 1,
+            "returned": 1,
+            "selection_trimmed": True,
+            "upstream_truncation": None,
+        },
+        "execution": {
+            "timed_out": False,
+            "degraded": False,
+            "observed_result_modes": ["vector"],
+        },
+        "absence": {"proven": False, "reason": "bounded_candidate_page"},
+    }
 
 
 def test_search_compaction_keeps_unscored_zero_overlap_semantic_candidate() -> None:
