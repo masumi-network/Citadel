@@ -25,7 +25,7 @@ from kb.conflicts import KnowledgeConflictStore
 from kb.knowledge_mesh import KnowledgeMesh
 from kb.lifecycle import LifecycleRequeueDriftError
 from kb.projection_barrier import ProjectionBarrierResult
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import FeedbackResult, IngestResult
 from kb.obsidian_sync import ObsidianSyncStore
 from kb.server import app
@@ -11448,7 +11448,7 @@ def test_api_mesh_publishes_the_real_graph_edge_total_not_the_projection() -> No
     """`stats.edges` must come from the graph, not from the in-memory projection.
 
     This pins the PRODUCER half of the #232 fix. `_corpus_health` supplies
-    `indexed_edges` and `kb/mesh.py` consumes it with a silent fallback to
+    `indexed_edges` and `kb/vault_activity.py` consumes it with a silent fallback to
     `len(self.edges)`, so reverting the producer alone changes nothing that any
     other test observes: every mesh unit test injects the corpus dict directly.
     That is the shape a guard takes when it ships inert.
@@ -11484,7 +11484,7 @@ def test_api_mesh_publishes_the_real_graph_edge_total_not_the_projection() -> No
     assert stats["edges"] == real_edges, (
         f"stats.edges is {stats['edges']}, the in-memory projection, not the "
         f"graph's {real_edges}. _corpus_health stopped supplying indexed_edges "
-        "and kb/mesh.py fell back silently."
+        "and kb/vault_activity.py fell back silently."
     )
     assert stats["tracked_sources"] == 318
 

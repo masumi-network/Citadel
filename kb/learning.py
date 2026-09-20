@@ -20,7 +20,7 @@ from typing import Any, Literal
 from kb.conflicts import KnowledgeConflictStore, detect_contribution_conflict
 from kb.llm_enrichment import EnrichedChunk, EnrichmentOutcome, enrich_source_material
 from kb.lifecycle import lifecycle_chunk_source_key
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.security_scan import SecretContentError, SecurityScanEntry, scan_text_entries
 from kb.models import IngestResult
 from kb.improvement_policy import (

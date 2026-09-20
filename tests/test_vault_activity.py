@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from kb.config import CitadelConfig
-from kb.mesh import MeshState
+from kb.vault_activity import MeshState
 from kb.models import FeedbackResult, IngestResult
 
 CONFIG = CitadelConfig(tenant_id="test", default_dataset="notes")
