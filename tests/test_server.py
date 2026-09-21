@@ -11333,6 +11333,9 @@ class FakeCorpusCognee:
         graph_ids: set[str] | None = None,
         graph_ids_by_dataset: dict[str, set[str]] | None = None,
         chunk_lookup_raises: bool = False,
+        oversized_ids: set[str] | None = None,
+        budget_lookup_raises: bool = False,
+        budget_lookup_unavailable: bool = False,
     ) -> None:
         self.rows = rows
         self.totals = totals
@@ -11340,6 +11343,9 @@ class FakeCorpusCognee:
         self.graph_ids = graph_ids
         self.graph_ids_by_dataset = graph_ids_by_dataset
         self.chunk_lookup_raises = chunk_lookup_raises
+        self.oversized_ids = set() if oversized_ids is None else set(oversized_ids)
+        self.budget_lookup_raises = budget_lookup_raises
+        self.budget_lookup_unavailable = budget_lookup_unavailable
         self.seen_after: list[tuple[str | None, str | None]] = []
         self.graph_calls: list[tuple[list[str], list[str] | None]] = []
 
@@ -11377,6 +11383,31 @@ class FakeCorpusCognee:
             document_id: self.chunk_counts[document_id]
             for document_id in document_ids
             if document_id in self.chunk_counts
+        }
+
+    async def stored_chunk_budget_check(
+        self,
+        document_ids: list[str] | None = None,
+        *,
+        budget: int | None = None,
+        datasets: list[str] | None = None,
+        document_ids_by_dataset: Any = None,
+    ) -> dict[str, Any] | None:
+        del budget, datasets, document_ids_by_dataset
+        if self.budget_lookup_raises:
+            raise RuntimeError("chunk budget lookup unavailable")
+        if self.budget_lookup_unavailable:
+            return None
+        wanted = [str(document_id) for document_id in document_ids or []]
+        violation_ids = [
+            document_id
+            for document_id in wanted
+            if document_id in self.oversized_ids
+        ]
+        return {
+            "ok": True,
+            "violation_document_ids": violation_ids,
+            "violation_count": len(violation_ids),
         }
 
     async def corpus_graph_presence(
@@ -11466,9 +11497,11 @@ def test_corpus_census_reports_rows_presence_and_totals() -> None:
     assert first["datasets"] == ["masumi-network"]
     assert first["chunk_count"] == 3
     assert first["in_graph"] is True
+    assert first["oversized"] is False
     # doc-b was measured and has nothing indexed: 0/False, not null.
     assert second["chunk_count"] == 0
     assert second["in_graph"] is False
+    assert second["oversized"] is False
     assert body["notes"] == []
 
 

@@ -770,8 +770,29 @@ class TestCorpusCensus:
         # Denominator is every walked document, matching the published
         # "892 of 2867 (31.1%)" definition; unmeasured rows make it a floor.
         assert census["chunk_count_zero_ratio"] == pytest.approx(2 / 5)
+        # Rows without an oversized flag count as unmeasured (#247).
+        assert census["oversized_document_count"] == 0
+        assert census["oversized_unmeasured"] == 5
         assert census["pages"] == 2
         assert census["truncated"] is False
+
+    def test_census_counts_oversized_documents(self):
+        pages = [
+            self._page(
+                [
+                    {"id": "d1", "chunk_count": 2, "oversized": True},
+                    {"id": "d2", "chunk_count": 2, "oversized": False},
+                    {"id": "d3", "chunk_count": 2, "oversized": None},
+                ],
+                next_cursor=None,
+                total=3,
+            ),
+        ]
+
+        census = sb.corpus_census(lambda _cursor: pages[0])
+        assert census["oversized_document_count"] == 1
+        assert census["oversized_unmeasured"] == 1
+        assert census["oversized_document_ratio"] == pytest.approx(0.3333)
 
     def test_census_http_error_degrades_to_error_dict(self):
         import urllib.error
@@ -1007,6 +1028,9 @@ def make_run(
             "chunk_count_zero": 892,
             "chunk_count_unmeasured": 0,
             "chunk_count_zero_ratio": 0.3111,
+            "oversized_document_count": 0,
+            "oversized_unmeasured": 0,
+            "oversized_document_ratio": 0.0,
             "pages": 3,
             "truncated": False,
         }
@@ -1069,6 +1093,9 @@ def make_run(
 def make_enforce_run():
     run = make_run()
     run["fingerprint"]["census"]["chunk_count_zero"] = 0
+    run["fingerprint"]["census"]["oversized_document_count"] = 0
+    run["fingerprint"]["census"]["oversized_unmeasured"] = 0
+    run["fingerprint"]["census"]["oversized_document_ratio"] = 0.0
     run["fingerprint"]["ground_truth"] = {"sha256": "g" * 64}
     run["summary"]["window"] = {
         "tail_recall_given_head_at_5": 1.0,
@@ -1192,6 +1219,15 @@ class TestEnforce:
 
         assert any("must be 0" in failure for failure in failures)
         assert any("must be 1.0" in failure for failure in failures)
+
+    def test_enforce_rejects_oversized_document_regression(self):
+        baseline = make_enforce_run()
+        candidate = make_enforce_run()
+        candidate["fingerprint"]["census"]["oversized_document_count"] = 1
+
+        _comparable, _verdicts, failures = sb.enforce_acceptance(baseline, candidate)
+
+        assert any("oversized_document_count" in failure for failure in failures)
 
     def test_enforce_requires_matching_ground_truth_cache(self):
         baseline = make_enforce_run()

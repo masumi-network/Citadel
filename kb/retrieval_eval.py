@@ -1125,6 +1125,10 @@ def corpus_census(
     that share overstates what retrieval covers. chunk_count null means "not
     measured", never zero, and is counted separately.
 
+    A row with ``oversized: true`` has at least one stored chunk past the
+    embedding window (#247): search may return the head while the tail is
+    unreachable. ``oversized`` null means not measured.
+
     chunk_count_zero_ratio divides by every walked document (matching the
     published "892 of 2867" definition); unmeasured rows make the zero count a
     floor, which the report says next to the number.
@@ -1135,6 +1139,7 @@ def corpus_census(
     """
     started = time.perf_counter()
     walked = zero = unmeasured = 0
+    oversized = oversized_unmeasured = 0
     documents_total: Any = None
     cursor: str | None = None
     pages = 0
@@ -1175,6 +1180,11 @@ def corpus_census(
                 unmeasured += 1
             elif int(count) == 0:
                 zero += 1
+            oversized_flag = row.get("oversized")
+            if oversized_flag is None:
+                oversized_unmeasured += 1
+            elif oversized_flag is True:
+                oversized += 1
         if body.get("documents_total") is not None:
             documents_total = body.get("documents_total")
         next_cursor = body.get("next_cursor")
@@ -1191,6 +1201,11 @@ def corpus_census(
         "chunk_count_zero": zero,
         "chunk_count_unmeasured": unmeasured,
         "chunk_count_zero_ratio": round(zero / walked, 4) if walked else None,
+        "oversized_document_count": oversized,
+        "oversized_unmeasured": oversized_unmeasured,
+        "oversized_document_ratio": (
+            round(oversized / walked, 4) if walked else None
+        ),
         "pages": pages,
         "truncated": truncated,
         "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 1),
@@ -2637,11 +2652,12 @@ def _nonnegative_count(value: Any) -> bool:
 
 def _enforce_run_evidence(
     run: dict[str, Any], label: str
-) -> tuple[list[str], dict[str, float], int | None]:
+) -> tuple[list[str], dict[str, float], int | None, int | None]:
     """Validate evidence required before accepting one saved benchmark run."""
     failures: list[str] = []
     metrics: dict[str, float] = {}
     zero_chunks: int | None = None
+    oversized_docs: int | None = None
 
     fingerprint = run.get("fingerprint")
     if not isinstance(fingerprint, dict):
@@ -2687,6 +2703,23 @@ def _enforce_run_evidence(
             )
         else:
             zero_chunks = zero_value
+        oversized_unmeasured = census.get("oversized_unmeasured")
+        if not _nonnegative_count(oversized_unmeasured):
+            failures.append(
+                f"{label} census oversized_unmeasured is missing or invalid"
+            )
+        elif oversized_unmeasured:
+            failures.append(
+                f"{label} census has {oversized_unmeasured} document(s) "
+                "without an oversized measurement"
+            )
+        oversized_value = census.get("oversized_document_count")
+        if not _nonnegative_count(oversized_value):
+            failures.append(
+                f"{label} census oversized_document_count is missing or invalid"
+            )
+        else:
+            oversized_docs = oversized_value
 
     ground_truth = fingerprint.get("ground_truth")
     ground_truth_sha = (
@@ -2748,7 +2781,7 @@ def _enforce_run_evidence(
             f"{label} contains unstable trust metadata on {unstable} chunk(s)"
         )
 
-    return failures, metrics, zero_chunks
+    return failures, metrics, zero_chunks, oversized_docs
 
 
 DEFAULT_MAX_P95_REGRESSION_PERCENT = 20.0
@@ -3069,11 +3102,11 @@ def enforce_acceptance(
     if not comparable:
         failures.append("fingerprints are not comparable")
 
-    baseline_failures, baseline_metrics, baseline_zero = _enforce_run_evidence(
-        baseline, "baseline"
+    baseline_failures, baseline_metrics, baseline_zero, baseline_oversized = (
+        _enforce_run_evidence(baseline, "baseline")
     )
-    candidate_failures, candidate_metrics, candidate_zero = _enforce_run_evidence(
-        candidate, "candidate"
+    candidate_failures, candidate_metrics, candidate_zero, candidate_oversized = (
+        _enforce_run_evidence(candidate, "candidate")
     )
     failures.extend(baseline_failures)
     failures.extend(candidate_failures)
@@ -3097,6 +3130,20 @@ def enforce_acceptance(
         if candidate_zero != 0:
             failures.append(
                 f"candidate chunk_count_zero must be 0, got {candidate_zero}"
+            )
+        if (
+            baseline_oversized is not None
+            and candidate_oversized is not None
+            and candidate_oversized > baseline_oversized
+        ):
+            failures.append(
+                "candidate oversized_document_count regressed: "
+                f"{baseline_oversized} -> {candidate_oversized}"
+            )
+        if candidate_oversized != 0:
+            failures.append(
+                "candidate oversized_document_count must be 0, "
+                f"got {candidate_oversized}"
             )
         candidate_tail = candidate_metrics.get("tail_recall_given_head_at_5")
         if candidate_tail != 1.0:

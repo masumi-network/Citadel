@@ -981,13 +981,20 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                 else:
                                     logger.info(
                                         "Evolve scheduler: Phase 3 reconcile finished "
-                                        "(reason=%s zero_before=%s zero_after=%s)",
+                                        "(reason=%s zero_before=%s zero_after=%s "
+                                        "oversized_before=%s oversized_after=%s)",
                                         reconcile_result.get("reason"),
                                         (reconcile_result.get("before") or {}).get(
                                             "zero_chunk_count"
                                         ),
                                         (reconcile_result.get("after") or {}).get(
                                             "zero_chunk_count"
+                                        ),
+                                        (reconcile_result.get("before") or {}).get(
+                                            "oversized_document_count"
+                                        ),
+                                        (reconcile_result.get("after") or {}).get(
+                                            "oversized_document_count"
                                         ),
                                     )
                             except asyncio.CancelledError:
@@ -1000,11 +1007,27 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     "after %.0fs",
                                     _evolve_reconcile_timeout_seconds(),
                                 )
-                            except Exception:
+                                _record_canary_verdict(
+                                    ok=False, error="CorpusReconcileTimeout"
+                                )
+                            except Exception as exc:
                                 phase3_ok = False
                                 phase3_reason = "reconcile_exception"
                                 logger.exception(
                                     "Evolve scheduler: Phase 3 reconcile failed"
+                                )
+                                _record_canary_verdict(
+                                    ok=False, error=exc.__class__.__name__
+                                )
+                            if not phase3_ok and phase3_reason not in {
+                                "reconcile_timeout",
+                                "reconcile_exception",
+                            }:
+                                # Census/repair refused: keep /readyz red so an
+                                # unrepaired oversized/#228 scar cannot hide
+                                # behind a green Cognify canary (#247).
+                                _record_canary_verdict(
+                                    ok=False, error="CorpusReconcileFailed"
                                 )
                         else:
                             logger.info(
@@ -5049,6 +5072,8 @@ async def corpus_census(
     accepts content, and marks each row with whether the vector store
     (``chunk_count``) and the graph (``in_graph``) have actually seen it —
     the difference between "accepted but never indexed" and "indexed".
+    ``oversized`` is true when at least one stored chunk exceeds the embedding
+    window (#247); null means the budget check was unavailable.
 
     Presence flags degrade to null with a top-level note, never to 0: a 0 is a
     measurement ("we looked, nothing there") and null is "this node could not
@@ -5111,6 +5136,42 @@ async def corpus_census(
                 "lookup unavailable); null means not measured, not zero"
             )
 
+        oversized_ids: set[str] | None = None
+        try:
+            budget_check = getattr(cognee_client, "stored_chunk_budget_check", None)
+            if callable(budget_check) and document_ids:
+                ids_by_dataset: dict[str, list[str]] = {}
+                for row in rows:
+                    row_id = str(row.get("id") or "")
+                    if not row_id:
+                        continue
+                    datasets = row.get("datasets")
+                    if not isinstance(datasets, list):
+                        continue
+                    for dataset in datasets:
+                        dataset_name = str(dataset).strip()
+                        if dataset_name:
+                            ids_by_dataset.setdefault(dataset_name, []).append(row_id)
+                report = await budget_check(
+                    document_ids,
+                    document_ids_by_dataset=ids_by_dataset or None,
+                )
+                if isinstance(report, dict) and report.get("ok") is True:
+                    violation_ids = report.get("violation_document_ids")
+                    if isinstance(violation_ids, list):
+                        oversized_ids = {
+                            str(document_id)
+                            for document_id in violation_ids
+                            if document_id
+                        }
+        except Exception:  # noqa: BLE001 - degrade to "not measured", never to false
+            logger.exception("corpus census: oversized-chunk lookup failed")
+        if oversized_ids is None and document_ids:
+            notes.append(
+                "oversized was not determined for this page (chunk-budget "
+                "lookup unavailable); null means not measured, not compliant"
+            )
+
         in_graph_ids: set[str] | None = None
         try:
             graph_presence_read = getattr(cognee_client, "corpus_graph_presence", None)
@@ -5168,6 +5229,9 @@ async def corpus_census(
             row_id = str(row.get("id"))
             row["chunk_count"] = (
                 None if chunk_counts is None else int(chunk_counts.get(row_id, 0))
+            )
+            row["oversized"] = (
+                None if oversized_ids is None else (row_id in oversized_ids)
             )
             row["in_graph"] = (
                 None if in_graph_ids is None else (row_id in in_graph_ids)

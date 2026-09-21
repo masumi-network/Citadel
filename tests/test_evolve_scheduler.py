@@ -328,6 +328,9 @@ async def test_evolve_scheduler_marks_cycle_failed_when_phase3_fails(
     assert stamp["last_run_reason"] == (
         "reconciliation_candidates_not_fully_assigned"
     )
+    assert server._LAST_CANARY is not None
+    assert server._LAST_CANARY["ok"] is False
+    assert server._LAST_CANARY.get("error") == "CorpusReconcileFailed"
 
 
 async def test_evolve_scheduler_does_not_resume_after_phase2_cancellation(
