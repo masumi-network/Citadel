@@ -1741,6 +1741,10 @@ class IngestBody(BaseModel):
     dataset: str | None = None
     tags: list[str] = Field(default_factory=list)
     session_id: str | None = None
+    # Optional durable provenance (#104). Sync writers and capture populate
+    # these; free-form text ingest may omit them and stay ``unattested``.
+    source_key: str | None = Field(default=None, max_length=512)
+    source_locator: str | None = Field(default=None, max_length=2000)
     # User ingest is capture-only. The scheduled knowledge-base job owns vector
     # projection and graph enrichment. ``true`` remains accepted by the schema
     # only so the endpoint can return a clear migration error to old clients.
@@ -3669,9 +3673,17 @@ def result_provenance(result: dict[str, Any]) -> dict[str, str]:
         if header_used:
             if not provenance.get("source"):
                 provenance["source"] = header.get("kind")
-            provenance["basis"] = "content-header"
-    if connector_source and provenance.get("source") == connector_source:
-        provenance.setdefault("basis", "lifecycle-source-key")
+            # Content-header fills are author-controlled body text. Prefer a
+            # lifecycle source-key basis when the connector already identified
+            # the hit; otherwise mark content-header so trust never elevates.
+            if not connector_source:
+                provenance["basis"] = "content-header"
+    if connector_source and (
+        provenance.get("source") == connector_source or not provenance.get("source")
+    ):
+        if not provenance.get("source"):
+            provenance["source"] = connector_source
+        provenance["basis"] = "lifecycle-source-key"
     return {key: value for key, value in provenance.items() if value}
 
 
@@ -3890,6 +3902,8 @@ def with_result_metadata(
         "rank": index + 1,
         "dataset": dataset,
         "result_id": result_id,
+        # Transit integrity over the shaped hit (query-stable). Distinct from
+        # the capture-time fingerprint stamped below when lifecycle retained it.
         "content_sha256": result_content_sha256(normalized),
         "provenance": provenance,
         "retrieval": {
@@ -3898,6 +3912,19 @@ def with_result_metadata(
             "document_drilldown_available": drilldown_available,
         },
     }
+    result_metadata = (
+        normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+    )
+    attested_sha = first_string(result_metadata.get("content_sha256"))
+    if (
+        attested_sha
+        and len(attested_sha) == 64
+        and isinstance(lifecycle, dict)
+        and first_string(lifecycle.get("source_revision_id"))
+    ):
+        # Capture-time fingerprint the node committed before this query
+        # (ADR-0022 / #104). Never overwrite the transit digest above.
+        metadata["attested_content_sha256"] = attested_sha
     references = result_references(normalized)
     metadata["retrieval"]["citations_available"] = bool(
         references or provenance.get("source_url") or drilldown_available
@@ -8534,6 +8561,8 @@ async def ingest(body: IngestBody, request: Request) -> Any:
     write_targets = resolve_write_targets(actor, body.dataset, body.tags, citadel.config)
     session_id = resolve_session_id(actor, body.session_id)
     primary_dataset = write_targets[0].dataset
+    source_key = (body.source_key or "").strip() or None
+    source_locator = (body.source_locator or "").strip() or None
     try:
         outcome, _ = await execute_learning_writes(
             learning,
@@ -8542,6 +8571,8 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             tags=body.tags,
             session_id=session_id,
             operation="ingest",
+            source_key=source_key,
+            source_locator=source_locator,
             capture_actor_id=actor.actor_id,
             capture_run_id=session_id,
             defer_cognify=True,

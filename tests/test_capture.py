@@ -54,6 +54,8 @@ def test_build_capture_payload_appends_capture_tag_and_dedupes() -> None:
     payload = build_capture_payload(CaptureRoot(path="/x", tags=("org-work", "capture")))
     assert payload["tags"] == ["org-work", "capture"]
     assert payload["data"].startswith("# Capture summary")
+    assert payload["source_key"] == "capture:path:/x"
+    assert payload["source_locator"] == "/x"
 
 
 def test_capture_dry_run_prints_payloads_without_network(tmp_path: Path, capsys) -> None:

@@ -6,6 +6,16 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Capture-time fingerprints and ingest locators unlock `verified` trust (#104).**
+  Lifecycle-backed hits expose `_citadel.attested_content_sha256` (distinct from
+  the transit `content_sha256`). `infer_trust_tier` assigns `verified` only when
+  that server-written record (or `source_revision_id` /
+  `basis: lifecycle-source-key`) is present — never from content headers.
+  `/ingest` and capture accept `source_key` / `source_locator`; CLI file ingest
+  and capture roots populate them. Document drill-down returns the same
+  attested fingerprint. The signed evidence chain from ADR-0022 remains a
+  follow-up.
+
 - **Chunk budget applies when the embedding tokenizer is cached (#247).**
   Cognify passes the bounded chunker whenever `configured_embedding_tokenizer()`
   succeeds (local always; primary/nemotron when cached). `GET /api/corpus` rows
