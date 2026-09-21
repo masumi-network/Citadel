@@ -6,11 +6,21 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 - **Stale reindex/cognify apply docs marked corrected.** The 2026-08-04 reindex
   runbook and execution-plan chunk-budget section still held HTTP/`citadel
   cognify --force` instructions and "no budget in kb/" claims that contradict
   `LLM_SCHEDULED_ONLY` and `OBSERVED_CHUNK_BUDGET_TOKENS`. CLI `reindex`
   help no longer says `--apply` repairs.
+=======
+- **Chunk budget applies on every embedding profile, not only local (#247).**
+  Cognify now always passes the bounded chunker when Cognee accepts a
+  `chunker` kwarg. Primary/nemotron previously fell through to stock Cognee
+  chunking and could still persist over-window rows. `GET /api/corpus` rows
+  expose `oversized`; the bench census and `enforce` gate require
+  `oversized_document_count == 0`. Phase 3 reconcile failure flips the
+  Cognify canary so `/readyz` cannot stay green over an unrepaired scar.
+>>>>>>> 96b59ad (fix(chunk): bound every profile and gate oversized census (#247))
 
 - **Evolve Phase 3 runs journaled corpus reconcile after Cognify (#228).**
   Zero-chunk and oversized projections are repaired on the scheduled evolve

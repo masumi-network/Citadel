@@ -761,11 +761,17 @@ async def test_cognify_selected_data_scopes_rows_and_validates_before_write(
         await engine.dispose()
 
 @pytest.mark.asyncio
-async def test_cognify_selected_data_hands_local_chunker_to_tasks(
+@pytest.mark.parametrize(
+    "profile_name",
+    ["fastembed", "nemotron"],
+    ids=["local-fastembed", "primary-nemotron"],
+)
+async def test_cognify_selected_data_hands_bounded_chunker_to_tasks(
     monkeypatch: Any,
+    profile_name: str,
 ) -> None:
-    """#247: on the selected-data path under the local profile, the bounded
-    chunker and budget must reach get_default_tasks, not be silently dropped."""
+    """#247: on the selected-data path, the bounded chunker and budget must
+    reach get_default_tasks for every embedding profile, not only local."""
     from contextlib import asynccontextmanager
     from importlib import import_module
 
@@ -836,7 +842,7 @@ async def test_cognify_selected_data_hands_local_chunker_to_tasks(
     monkeypatch.setattr(
         embedding_profile,
         "active_embedding_profile",
-        lambda: SimpleNamespace(name=embedding_profile.LOCAL_PROFILE),
+        lambda: SimpleNamespace(name=profile_name),
     )
 
     client = CogneePublicClient()

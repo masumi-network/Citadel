@@ -5628,14 +5628,24 @@ class CogneePublicClient:
                     ).parameters
                 except (TypeError, ValueError):
                     supports_custom_chunker = False
-                from kb.embedding_profile import LOCAL_PROFILE, active_embedding_profile
+                from kb.embedding_profile import active_embedding_profile
 
-                if (
-                    supports_custom_chunker
-                    and active_embedding_profile().name == LOCAL_PROFILE
-                ):
+                # Always hand Cognee the bounded chunker when the public API
+                # accepts one. Local (fastembed) and primary (nemotron) both
+                # embed into a fixed window; without this, primary fell back to
+                # stock Cognee chunking and could still persist over-budget
+                # rows (#247). Budget still comes from resolve_chunk_budget().
+                if supports_custom_chunker:
                     cognify_kwargs["chunker"] = _bounded_cognee_chunker()
                     cognify_kwargs["chunk_size"] = chunk_window.resolve_chunk_budget()
+                else:
+                    # Probe failed: keep the active profile visible in logs so
+                    # an unsupported Cognee build is diagnosable.
+                    logger.info(
+                        "cognify: Cognee build has no chunker kwarg "
+                        "(profile=%s); relying on EMBEDDING_MAX_COMPLETION_TOKENS",
+                        active_embedding_profile().name,
+                    )
 
                 if selected_data is None:
                     cognify_result = await cognee.cognify(**cognify_kwargs)
