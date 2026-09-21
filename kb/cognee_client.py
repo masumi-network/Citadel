@@ -110,10 +110,12 @@ def _cognify_data_ids(result: Any) -> list[str]:
 
 
 def _bounded_cognee_chunker() -> type[Any]:
-    """Build the verified local BGE bounded chunker.
+    """Build the verified bounded Cognee chunker for the active embedding model.
 
-    The primary Nemotron profile retains Cognee's stock chunker until an
-    official compatible tokenizer is packaged locally.
+    Callers must confirm ``configured_embedding_tokenizer()`` succeeds first.
+    When the tokenizer is not cached (common for primary/nemotron on slim
+    images), cognify falls back to Cognee's stock chunker instead of calling
+    this factory.
     """
     from cognee.modules.chunking.Chunker import Chunker
     from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
@@ -5630,17 +5632,28 @@ class CogneePublicClient:
                     supports_custom_chunker = False
                 from kb.embedding_profile import active_embedding_profile
 
-                # Always hand Cognee the bounded chunker when the public API
-                # accepts one. Local (fastembed) and primary (nemotron) both
-                # embed into a fixed window; without this, primary fell back to
-                # stock Cognee chunking and could still persist over-budget
-                # rows (#247). Budget still comes from resolve_chunk_budget().
+                # Prefer the bounded chunker whenever its tokenizer is available.
+                # Local (fastembed) ships a cached tokenizer; primary (nemotron)
+                # uses the same path when the model is cached. If the tokenizer
+                # is missing (mock/openai live fixtures, incomplete image), fall
+                # back to stock Cognee + EMBEDDING_MAX_COMPLETION_TOKENS rather
+                # than aborting cognify (#247).
                 if supports_custom_chunker:
-                    cognify_kwargs["chunker"] = _bounded_cognee_chunker()
-                    cognify_kwargs["chunk_size"] = chunk_window.resolve_chunk_budget()
+                    try:
+                        chunk_window.configured_embedding_tokenizer()
+                    except chunk_window.ChunkBudgetValidationError as exc:
+                        logger.warning(
+                            "cognify: bounded chunker unavailable for profile=%s "
+                            "(%s); using stock Cognee chunker with env budget",
+                            active_embedding_profile().name,
+                            exc,
+                        )
+                    else:
+                        cognify_kwargs["chunker"] = _bounded_cognee_chunker()
+                        cognify_kwargs["chunk_size"] = (
+                            chunk_window.resolve_chunk_budget()
+                        )
                 else:
-                    # Probe failed: keep the active profile visible in logs so
-                    # an unsupported Cognee build is diagnosable.
                     logger.info(
                         "cognify: Cognee build has no chunker kwarg "
                         "(profile=%s); relying on EMBEDDING_MAX_COMPLETION_TOKENS",
