@@ -1972,7 +1972,7 @@ def test_ingest_timeout_flag_reaches_request(monkeypatch, capsys) -> None:
     monkeypatch.setattr("kb.cli.capture_token", lambda: "ctdl_x")
     seen: dict = {}
 
-    def fake_ingest(base_url, token, data, tags, cognify=False, *, timeout=None):
+    def fake_ingest(base_url, token, data, tags, cognify=False, *, timeout=None, **_kwargs):
         seen["timeout"] = timeout
         return {"accepted": True, "dataset": "seat:alice"}
 

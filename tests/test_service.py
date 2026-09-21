@@ -1045,7 +1045,7 @@ async def test_exact_linear_search_uses_retained_identity_without_vector(
     )
     assert document["provenance"] == {
         "source": "linear-issue",
-        "basis": "content-header",
+        "basis": "lifecycle-source-key",
         "issue": "SOK-563",
         "source_url": (
             "https://linear.app/masumi/issue/SOK-563/subscription-credits"
