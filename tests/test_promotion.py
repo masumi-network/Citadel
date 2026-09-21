@@ -12,7 +12,7 @@ from kb.access import AccessStore, AccessIdentity, seat_dataset
 from kb.config import CitadelConfig
 from kb.learning import LearningOutcome
 from kb.models import IngestResult
-from kb.promotion import PromotionEngine, _coerce_classification
+from kb.promotion import PromotionEngine, _coerce_classification, _coerce_decision
 import kb.promotion as promotion
 
 SEAT = seat_dataset("alice")
@@ -133,6 +133,98 @@ def test_coerce_classification_rejects_malformed() -> None:
     assert _coerce_classification({"relevant": True, "sensitive": False, "score": 2, "reason": "ok"}) is None
     assert _coerce_classification({"relevant": True, "sensitive": False, "score": 0.8}) is None
     assert _coerce_classification("not a dict") is None
+
+
+def test_coerce_decision_maps_noul_confidences() -> None:
+    result = _coerce_decision(
+        {
+            "relevant": {"type": "noul", "noul": 0.9},
+            "sensitive": {"type": "noul", "noul": 0.1},
+        }
+    )
+    assert result is not None
+    assert result.relevant is True
+    assert result.sensitive is False
+    assert result.score == pytest.approx(0.9 * (1.0 - 0.1))
+    assert "system-one" in result.reason
+
+
+def test_coerce_decision_applies_half_threshold_and_score() -> None:
+    result = _coerce_decision(
+        {"relevant": {"noul": 0.4}, "sensitive": {"noul": 0.8}}
+    )
+    assert result is not None
+    assert result.relevant is False
+    assert result.sensitive is True
+    assert result.score == pytest.approx(0.4 * (1.0 - 0.8))
+
+
+def test_coerce_decision_rejects_malformed() -> None:
+    assert _coerce_decision("nope") is None
+    assert _coerce_decision({"relevant": {"noul": 0.9}}) is None
+    assert _coerce_decision({"relevant": {"noul": 1.5}, "sensitive": {"noul": 0.1}}) is None
+    assert _coerce_decision({"relevant": {"noul": True}, "sensitive": {"noul": 0.1}}) is None
+    assert _coerce_decision({"relevant": {}, "sensitive": {"noul": 0.1}}) is None
+
+
+def test_classify_uses_decision_model_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CITADEL_PROMOTION_DECISION_MODEL", "typesafe/jev-1.13")
+    captured: dict[str, Any] = {}
+
+    def fake_decide(state: Any, questions: Any, *, model: str, operation: str, **_: Any) -> dict[str, Any]:
+        captured["model"] = model
+        captured["questions"] = questions
+        return {"relevant": {"noul": 0.95}, "sensitive": {"noul": 0.05}}
+
+    def exploding_chat(*_: Any, **__: Any) -> str:
+        raise AssertionError("chat classifier must not run when a decision model is set")
+
+    monkeypatch.setattr(promotion, "openrouter_decide", fake_decide)
+    monkeypatch.setattr(promotion, "openrouter_chat", exploding_chat)
+    engine, _learning, _store = _engine(tmp_path, [])
+
+    result = engine.classify("Org roadmap note")
+
+    assert result is not None
+    assert result.relevant is True
+    assert result.sensitive is False
+    assert captured["model"] == "typesafe/jev-1.13"
+    assert set(captured["questions"]) == {"relevant", "sensitive"}
+
+
+def test_classify_decision_failure_skips_without_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CITADEL_PROMOTION_DECISION_MODEL", "typesafe/jev-1.13")
+    monkeypatch.setattr(promotion, "openrouter_decide", lambda *a, **k: None)
+
+    def exploding_chat(*_: Any, **__: Any) -> str:
+        raise AssertionError("a failed decision must skip, never fall back to chat")
+
+    monkeypatch.setattr(promotion, "openrouter_chat", exploding_chat)
+    engine, _learning, _store = _engine(tmp_path, [])
+
+    assert engine.classify("Org note") is None
+
+
+def test_classify_uses_chat_when_no_decision_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CITADEL_PROMOTION_DECISION_MODEL", raising=False)
+
+    def exploding_decide(*_: Any, **__: Any) -> dict[str, Any]:
+        raise AssertionError("the decision path must not run without the env")
+
+    monkeypatch.setattr(promotion, "openrouter_decide", exploding_decide)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+    engine, _learning, _store = _engine(tmp_path, [])
+
+    result = engine.classify("Org note")
+
+    assert result is not None
+    assert result.reason == "stubbed"
 
 
 async def test_dry_run_proposes_but_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
