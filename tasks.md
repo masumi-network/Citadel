@@ -1,5 +1,43 @@
 # Citadel Tasks
 
+## Task Index (live cut only) — added 2026-09-21
+
+Small, actionable items pulled from the live sections below. Everything
+further down is unchanged history. Provenance is from this session's view:
+[VERIFIED] = confirmed this session; [REPORTED] = from `docs/progress.md` or
+the sections below, not re-checked here.
+
+### V1 PR stack — closeout (source: `docs/progress.md`, 2026-09-20)
+
+- [ ] Update `v1/boundary-hardening` (#324) onto current `main` before merge. [REPORTED]
+- [ ] Update `v1/feedback-web-key` (#325) onto current `main` before merge. [REPORTED]
+- [ ] Update `v1/install-packaging` (#326) onto current `main` before merge. [REPORTED]
+- [ ] Confirm #326 Docker test target passes (still pending at closeout). [REPORTED]
+- [ ] Merge in order #323 → #324 → #325 → #326; update each behind branch between merges, never batch-merge. [REPORTED]
+- [ ] Post-merge: continue SPEC T2 per-head evidence, then T3-T8 (branch `fix/cognee-projection-readiness`). [REPORTED]
+
+Note: `fix326` is now at `4fb1b60` (main merged this session), ahead of the
+closeout's `5f70bc9`. [VERIFIED] `tests/test_dashboard_contract_gaps.py`: 31
+passed. [VERIFIED] Full suite: 2792 passed, 6 skipped, 4 failed. 3 of the 4
+(two cognee retry tests + `test_projection_barrier` batch-read) pass on
+isolated rerun, so they are order/load flakes. The 4th,
+`test_cognee_client.py::test_failed_acknowledgement_retries_without_external_activity`,
+fails even solo with `ModuleNotFoundError: No module named 'cognee.infrastructure'; 'cognee' is not a package`
+in `install_cognee_retry_guard`: a consistent failure, not a flake. Not
+determined whether it pre-dates this merge. None relate to this docs change. [VERIFIED]
+
+### Data plane (0.5.1 cut, source: § Current 2026-08-19)
+
+- [ ] #228 accepted-but-unindexed documents: make ingest prove content landed. [REPORTED open]
+- [ ] #247 tail recall 0 of 11: fix recall on a reachable document. [REPORTED open]
+- [ ] Write-to-mesh visibility: capture `projection_job_id` from `/ingest`, poll `/api/operations/{id}`, validate `outcome.projection_state` and `/api/mesh` node growth for `seat:<slug>`.
+
+### Release + bench (source: § Current 2026-08-19)
+
+- [ ] Publish GHCR `citadel:0.5.1` (publish run skipped the OCI stage). Promote only after owner yes. [REPORTED not-found]
+- [ ] Inside quality number: run the 105-question `citadel bench run` against our own corpus.
+- [ ] Outside bench: write a custom `add`/`search` adapter, pick one rival (Mem0/Zep/Letta) before running.
+
 ## Current (2026-08-19, after 0.5.1 PyPI)
 
 PyPI `citadel-archive==0.5.1` is live. Public node:
