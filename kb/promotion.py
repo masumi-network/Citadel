@@ -22,6 +22,7 @@ import asyncio
 from dataclasses import dataclass
 from hashlib import sha256
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from kb.config import CitadelConfig
 from kb.learning import LearningProcess
 from kb.llm_enrichment import (
     openrouter_chat,
+    openrouter_decide,
     parse_json_payload,
     redacted_preview,
 )
@@ -204,6 +206,66 @@ def _coerce_classification(parsed: Any) -> Classification | None:
     )
 
 
+DECISION_QUESTIONS: dict[str, dict[str, str]] = {
+    "relevant": {
+        "type": "noul",
+        "instructions": (
+            "Is this content organization-relevant: useful to teammates, about "
+            "the company's projects, products, or shared work?"
+        ),
+    },
+    "sensitive": {
+        "type": "noul",
+        "instructions": (
+            "Is this content sensitive: personal, private, secret, credentials, "
+            "financial, health, or otherwise unsafe to share organization-wide?"
+        ),
+    },
+}
+
+
+def promotion_decision_model() -> str:
+    """The System One decision model for promotion, or '' to use the chat classifier."""
+    return os.getenv("CITADEL_PROMOTION_DECISION_MODEL", "").strip()
+
+
+def _decision_noul(answer: Any) -> float | None:
+    """Read a 0..1 noul confidence from one System One answer; None if malformed."""
+    if not isinstance(answer, dict):
+        return None
+    value = answer.get("noul")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if not 0.0 <= confidence <= 1.0:
+        return None
+    return confidence
+
+
+def _coerce_decision(answers: Any) -> Classification | None:
+    """Map a System One answers map (relevant + sensitive nouls) to a Classification.
+
+    ``score`` is the confidence the content is both relevant AND safe to promote,
+    matching the chat classifier's contract: ``relevant * (1 - sensitive)``. Any
+    missing or malformed answer yields ``None`` so the caller SKIPs.
+    """
+    if not isinstance(answers, dict):
+        return None
+    relevant_conf = _decision_noul(answers.get("relevant"))
+    sensitive_conf = _decision_noul(answers.get("sensitive"))
+    if relevant_conf is None or sensitive_conf is None:
+        return None
+    return Classification(
+        relevant=relevant_conf >= 0.5,
+        sensitive=sensitive_conf >= 0.5,
+        score=relevant_conf * (1.0 - sensitive_conf),
+        reason=(
+            f"system-one decision: relevant={relevant_conf:.2f}, "
+            f"sensitive={sensitive_conf:.2f}"
+        ),
+    )
+
+
 def _central_write_key(text: str) -> str:
     """sha256 of the raw text: exactly the key ``Citadel.ingest`` dedupes on.
 
@@ -332,17 +394,47 @@ class PromotionEngine:
         return candidates[:cap]
 
     def classify(self, text: str) -> Classification | None:
-        """Classify one candidate via the OpenRouter direct-HTTP helper.
+        """Classify one candidate: a System One decision when configured, else chat.
 
-        Returns ``None`` on ANY failure (missing key, HTTP/URL/timeout error,
-        unparseable output, or a missing/malformed field) so the caller can
-        deterministically SKIP. Never raises.
+        When ``CITADEL_PROMOTION_DECISION_MODEL`` names an OpenRouter System One
+        decision model (e.g. ``typesafe/jev-1.13``), the relevance/sensitivity
+        verdict comes ONLY from that model's typed decision: a decision failure
+        returns ``None`` (SKIP), never a chat verdict, so a failed decision can
+        never promote. Without that env the free chat classifier is used. Both
+        paths return ``None`` on ANY failure so the caller deterministically
+        SKIPs; neither raises.
 
         Synchronous by design (plain urllib under run_with_retries, a 60s
         timeout per attempt plus backoff sleeps). Callers running on the event
         loop must dispatch it via ``asyncio.to_thread``; awaiting it inline
         stalls every other request for the duration of the call.
         """
+        decision_model = promotion_decision_model()
+        if decision_model:
+            return self._classify_via_decision(text, decision_model)
+        return self._classify_via_chat(text)
+
+    def _classify_via_decision(self, text: str, model: str) -> Classification | None:
+        """Classify via a System One decision model (Jev). None on any failure."""
+        try:
+            answers = openrouter_decide(
+                text[:CLASSIFIER_MAX_INPUT_CHARS],
+                DECISION_QUESTIONS,
+                model=model,
+                operation="promotion.decide",
+            )
+        except Exception as exc:  # pragma: no cover - openrouter_decide is itself guarded.
+            logger.warning(
+                "promotion.decide call raised %s; skipping candidate",
+                exc.__class__.__name__,
+            )
+            return None
+        if answers is None:
+            return None
+        return _coerce_decision(answers)
+
+    def _classify_via_chat(self, text: str) -> Classification | None:
+        """Classify via the free OpenRouter chat classifier. None on any failure."""
         try:
             route = route_for("promotion")
             content = openrouter_chat(

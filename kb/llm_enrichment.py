@@ -170,6 +170,69 @@ def openrouter_chat(
     return content
 
 
+def openrouter_decide(
+    state: Any,
+    questions: dict[str, Any],
+    *,
+    model: str,
+    operation: str,
+    timeout: int = 60,
+) -> dict[str, Any] | None:
+    """One OpenRouter System One (decisions) request; returns the answers map or None.
+
+    Wraps OpenRouter's ``POST /systemone`` endpoint for TypeSafe System One
+    models such as Jev, which return typed decisions rather than text. Shares the
+    OpenRouter credential, endpoint, secure-HTTP transport, retry, and redaction
+    policy with :func:`openrouter_chat`. ``state`` is the material to judge;
+    ``questions`` is the typed question map (``noul``/``choice``/``score``). The
+    return value is the response ``answers`` map, or ``None`` on ANY failure so
+    callers fail closed. Never raises.
+    """
+    api_key = openrouter_api_key()
+    if not api_key:
+        return None
+    payload = {"model": model, "state": state, "questions": questions}
+    request = Request(
+        f"{openrouter_endpoint()}/systemone",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "citadel-llm",
+        },
+        method="POST",
+    )
+
+    def fetch() -> dict[str, Any]:
+        with open_secure(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    try:
+        body = run_with_retries(fetch, operation=operation)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "%s decision call failed with %s: %s",
+            operation,
+            exc.__class__.__name__,
+            redacted_preview(str(exc)),
+        )
+        return None
+
+    selected_model = body.get("model")
+    if isinstance(selected_model, str) and selected_model:
+        logger.info(
+            "%s decision route selected: requested=%s selected=%s",
+            operation,
+            model,
+            selected_model,
+        )
+    answers = body.get("answers")
+    if not isinstance(answers, dict) or not answers:
+        return None
+    return answers
+
+
 def parse_json_payload(content: str) -> Any | None:
     """Parse model output defensively: tolerate fences and surrounding prose."""
     text = (content or "").strip()
