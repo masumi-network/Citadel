@@ -682,6 +682,11 @@ backup to that path before normal startup (`kb/lite_runtime.py`).
 - [VERIFIED] Railway currently exposes
   `CITADEL_EVOLVE_SCHEDULER_ENABLED=true` and
   `CITADEL_EVOLVE_INTERVAL_SECONDS=3600`.
+- [VERIFIED] Each scheduled pass runs Phase 2 Cognify (when enabled) then
+  Phase 3 journaled corpus reconcile (`CITADEL_EVOLVE_RECONCILE_ENABLED`,
+  default on; `CITADEL_EVOLVE_RECONCILE_FORCE` / recover default on). That is
+  the apply path for zero-chunk (#228) and oversized (#247) repair; HTTP and
+  CLI still return `LLM_SCHEDULED_ONLY` for `apply`.
 - [VERIFIED] Railway exposes no exact variables with the
   `CITADEL_PIPELINE_*`, `CITADEL_GITHUB_SYNC_*`, `CITADEL_LINEAR_SYNC_*`,
   `CITADEL_REPO_CONTENT_SYNC_*`, or `CITADEL_SELF_IMPROVE_*` prefixes in the

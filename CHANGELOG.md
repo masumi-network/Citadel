@@ -6,6 +6,12 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Evolve Phase 3 runs journaled corpus reconcile after Cognify (#228).**
+  Zero-chunk and oversized projections are repaired on the scheduled evolve
+  pass (`CITADEL_EVOLVE_RECONCILE_ENABLED`, default on; force/recover default
+  on). HTTP/CLI/MCP still refuse apply (`LLM_SCHEDULED_ONLY`); this is the
+  automated re-processing path those surfaces were waiting on.
+
 - **Boot now aborts when startup cognify recovery cannot be verified.** The
   gateway runs its own stale-run recovery at boot, before any writer starts:
   every cognify run whose own latest status row is `DATASET_PROCESSING_STARTED`

@@ -7513,6 +7513,7 @@ class _SchedulerCitadel(FakeCitadel):
     def __init__(self) -> None:
         self.cognify_calls: list[dict[str, Any]] = []
         self.resume_calls: list[bool] = []
+        self.reconcile_calls: list[dict[str, Any]] = []
         self.post_pass_resume = asyncio.Event()
         self.cognee = SimpleNamespace(writer_lock=None)
 
@@ -7541,6 +7542,29 @@ class _SchedulerCitadel(FakeCitadel):
                 "graph_grew": True,
                 "ok": True,
             },
+        }
+
+    async def reconcile_corpus(
+        self,
+        *,
+        dataset: Any = None,
+        apply: bool = False,
+        force: bool = False,
+        recover: bool = False,
+    ) -> dict[str, Any]:
+        self.reconcile_calls.append(
+            {
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "recover": recover,
+            }
+        )
+        return {
+            "ok": True,
+            "reason": "no_repair_required",
+            "before": {"zero_chunk_count": 0, "oversized_document_count": 0},
+            "after": {"zero_chunk_count": 0, "oversized_document_count": 0},
         }
 
 
@@ -7922,7 +7946,45 @@ async def test_evolve_scheduler_runs_phase2_cognify_when_enabled(
     assert citadel.cognify_calls == [
         {"dataset": None, "verify": True, "force": False}
     ]
+    assert citadel.reconcile_calls == [
+        {"dataset": None, "apply": True, "force": True, "recover": True}
+    ]
     assert citadel.resume_calls == [False, True]
+
+
+async def test_evolve_scheduler_skips_phase3_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_RECONCILE_ENABLED", "false")
+    caplog.set_level(logging.INFO, logger="kb.server")
+    citadel = _SchedulerCitadel()
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert citadel.reconcile_calls == []
+    assert any(
+        "Phase 3 reconcile skipped" in record.getMessage()
+        and "CITADEL_EVOLVE_RECONCILE_ENABLED=false" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_evolve_scheduler_phase3_respects_force_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CITADEL_EVOLVE_RECONCILE_FORCE", "false")
+    citadel = _SchedulerCitadel()
+    await _run_one_evolve_scheduler_pass(
+        monkeypatch, citadel, tmp_path / "evolve-state.json"
+    )
+
+    assert citadel.reconcile_calls == [
+        {"dataset": None, "apply": True, "force": False, "recover": False}
+    ]
 
 
 async def test_lifespan_runs_stale_cognify_recovery_before_lifecycle_start(

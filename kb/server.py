@@ -493,6 +493,53 @@ def _evolve_cognify_timeout_seconds() -> float:
     return max(value, floor)
 
 
+def _evolve_reconcile_enabled() -> bool:
+    """Whether the evolve pass runs journaled corpus repair after Phase 2 (#228).
+
+    HTTP/CLI/MCP refuse ``apply`` (``LLM_SCHEDULED_ONLY``). The scheduler is the
+    only automated path allowed to repair zero-chunk and oversized projections.
+    Default on: a healthy corpus returns ``no_repair_required`` cheaply; a scar
+    needs this pass to clear.
+    """
+    return os.getenv("CITADEL_EVOLVE_RECONCILE_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _evolve_reconcile_force() -> bool:
+    """Force flag for scheduled corpus reconcile.
+
+    Oversized / combined repairs refuse apply without force (see
+    ``Citadel.reconcile_corpus``). Default on so zero-chunk (#228) and oversized
+    (#247) candidates share one journaled pass instead of failing closed every
+    cycle when both populations exist.
+    """
+    return os.getenv("CITADEL_EVOLVE_RECONCILE_FORCE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _evolve_reconcile_timeout_seconds() -> float:
+    """Upper bound for one Phase 3 corpus reconcile pass."""
+    raw = os.getenv("CITADEL_EVOLVE_RECONCILE_TIMEOUT_SECONDS", "").strip()
+    default = 1800.0
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not isfinite(value) or value <= 0:
+        return default
+    return max(value, 60.0)
+
+
 def _evolve_maintenance_acquire_timeout_seconds() -> float:
     """Bound for Phase 1's maintenance-lock acquire.
 
@@ -574,8 +621,9 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
     Source sync runs first with inline Cognify suppressed. The first projection
     barrier gates self-improvement and promotion. A second barrier drains jobs
     created by those consumer stages. Phase 2 runs one Cognify pass when enabled.
-    The first pass waits for the remaining interval so a redeploy does not start
-    heavy work.
+    Phase 3 runs journaled corpus reconcile (zero-chunk + oversized) when enabled
+    — the only automated apply path for #228/#247. The first pass waits for the
+    remaining interval so a redeploy does not start heavy work.
     """
     from kb.cognee_client import suppress_inline_cognify
     from scripts.run_railway import run_evolve_in_loop
@@ -652,6 +700,8 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
             second_barrier_ok = True
             second_barrier_reason: str | None = None
             phase1_reason: str | None = None
+            phase3_ok = True
+            phase3_reason: str | None = None
             # Phase 1 - heavy stages, in this loop. Hold the maintenance lock before
             # the writer lock so lifecycle cannot claim a lease and then wait inside
             # Cognee while this pass owns the graph. Entry is bounded: a holder
@@ -896,6 +946,72 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                             "the Phase 2 orphan is still running"
                         )
                     else:
+                        # Phase 3: journaled corpus reconcile (#228 / #247). HTTP
+                        # and CLI refuse apply; this is the scheduled repair path.
+                        # Runs before the first projection barrier so repair-driven
+                        # lifecycle jobs are included in the watermark wait.
+                        if _evolve_reconcile_enabled():
+                            reconcile_force = _evolve_reconcile_force()
+                            try:
+                                async with asyncio.timeout(
+                                    _evolve_reconcile_timeout_seconds()
+                                ):
+                                    reconcile_result = await citadel.reconcile_corpus(
+                                        apply=True,
+                                        force=reconcile_force,
+                                        recover=reconcile_force,
+                                    )
+                                phase3_ok = bool(reconcile_result.get("ok"))
+                                if not phase3_ok:
+                                    phase3_reason = str(
+                                        reconcile_result.get("reason")
+                                        or "reconcile_failed"
+                                    )
+                                    logger.error(
+                                        "Evolve scheduler: Phase 3 reconcile failed "
+                                        "(reason=%s zero_before=%s oversized_before=%s)",
+                                        phase3_reason,
+                                        (reconcile_result.get("before") or {}).get(
+                                            "zero_chunk_count"
+                                        ),
+                                        (reconcile_result.get("before") or {}).get(
+                                            "oversized_document_count"
+                                        ),
+                                    )
+                                else:
+                                    logger.info(
+                                        "Evolve scheduler: Phase 3 reconcile finished "
+                                        "(reason=%s zero_before=%s zero_after=%s)",
+                                        reconcile_result.get("reason"),
+                                        (reconcile_result.get("before") or {}).get(
+                                            "zero_chunk_count"
+                                        ),
+                                        (reconcile_result.get("after") or {}).get(
+                                            "zero_chunk_count"
+                                        ),
+                                    )
+                            except asyncio.CancelledError:
+                                raise
+                            except TimeoutError:
+                                phase3_ok = False
+                                phase3_reason = "reconcile_timeout"
+                                logger.error(
+                                    "Evolve scheduler: Phase 3 reconcile timed out "
+                                    "after %.0fs",
+                                    _evolve_reconcile_timeout_seconds(),
+                                )
+                            except Exception:
+                                phase3_ok = False
+                                phase3_reason = "reconcile_exception"
+                                logger.exception(
+                                    "Evolve scheduler: Phase 3 reconcile failed"
+                                )
+                        else:
+                            logger.info(
+                                "Evolve scheduler: Phase 3 reconcile skipped "
+                                "(CITADEL_EVOLVE_RECONCILE_ENABLED=false)"
+                            )
+
                         try:
                             source_job_ids = _projection_job_ids_for_capture_run(
                                 citadel, capture_run_id
@@ -1009,6 +1125,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                     cycle_ok = (
                         phase1_ok
                         and phase2_ok
+                        and phase3_ok
                         and first_barrier_ok
                         and post_stages_ok
                         and second_barrier_ok
@@ -1021,6 +1138,7 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                         else (
                             phase1_reason
                             or phase2_reason
+                            or phase3_reason
                             or first_barrier_reason
                             or post_stages_reason
                             or second_barrier_reason
