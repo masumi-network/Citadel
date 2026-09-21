@@ -601,6 +601,8 @@ def ingest_node(
     cognify: bool = False,
     *,
     timeout: float | None = None,
+    source_key: str | None = None,
+    source_locator: str | None = None,
 ) -> dict[str, Any]:
     """POST a note to the Node's /ingest (same endpoint MCP citadel_ingest uses).
 
@@ -617,12 +619,16 @@ def ingest_node(
         "cognify": False,
         "idempotency_key": hashlib.sha256(
             json.dumps(
-                ["citadel-ingest", data, tag_list],
+                ["citadel-ingest", data, tag_list, source_key or "", source_locator or ""],
                 separators=(",", ":"),
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest(),
     }
+    if source_key:
+        payload["source_key"] = source_key
+    if source_locator:
+        payload["source_locator"] = source_locator
     resolved = timeout if timeout is not None else _INGEST_TIMEOUT
     return _request(
         "POST",

@@ -2239,7 +2239,7 @@ class Citadel:
             source_locator = source.source_locator or header.get("source_url")
             provenance: dict[str, Any] = {
                 "source": source_type,
-                "basis": "content-header",
+                "basis": "lifecycle-source-key",
             }
             for key in ("repo", "path", "issue", "commit", "activity_type"):
                 value = header.get(key)
@@ -2253,7 +2253,11 @@ class Citadel:
                 "dataset": source.dataset,
                 "source_key": source.source_key,
                 "media_type": source.media_type,
+                # Capture-time fingerprint (ADR-0022). Same value search stamps
+                # as ``_citadel.attested_content_sha256``.
                 "content_sha256": source.content_sha256,
+                "attested_content_sha256": source.content_sha256,
+                "source_revision_id": source.source_revision_id,
             }
             if isinstance(source_locator, str) and source_locator:
                 metadata["source_locator"] = source_locator
@@ -2266,6 +2270,7 @@ class Citadel:
                 "source_locator": source_locator,
                 "url": source_locator,
                 "provenance": provenance,
+                "attested_content_sha256": source.content_sha256,
                 "body": content,
                 "content": content,
                 "text": content,

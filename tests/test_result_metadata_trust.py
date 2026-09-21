@@ -207,6 +207,54 @@ def test_content_sha256_stable_across_query_dependent_distance() -> None:
     assert far["distance"] == 0.90
 
 
+def test_lifecycle_attested_fingerprint_earns_verified() -> None:
+    """A capture-time fingerprint on a lifecycle hit raises trust_tier (#104)."""
+    attested = "b" * 64
+    out = with_result_metadata(
+        {
+            "id": "doc-readme",
+            "document_id": "doc-readme",
+            "text": (
+                "# masumi-network/Citadel/README.md\n"
+                "\n"
+                "Repository: masumi-network/Citadel\n"
+                "Source: https://github.com/masumi-network/Citadel/blob/main/README.md\n"
+                "Commit: abcdef\n"
+                "Blob: deadbeef\n"
+                "\n"
+                "---\n"
+                "\n"
+                "hello\n"
+            ),
+            "metadata": {
+                "source_key": "github:masumi-network/Citadel:path:README.md",
+                "source_locator": (
+                    "https://github.com/masumi-network/Citadel/blob/main/README.md"
+                ),
+                "content_sha256": attested,
+            },
+            "_lifecycle": {
+                "source_revision_id": "rev-readme",
+                "projection_receipt_id": "receipt-1",
+                "generation_id": "gen-1",
+                "backend": "vector",
+                "provider": "qdrant",
+                "projection_version": "lifecycle-v1",
+                "state": "searchable",
+            },
+        },
+        0,
+        "masumi-network",
+    )
+    envelope = out["_citadel"]
+    assert envelope["attested_content_sha256"] == attested
+    assert envelope["content_sha256"] != attested  # transit digest stays distinct
+    assert envelope["source_revision_id"] == "rev-readme"
+    assert envelope["provenance"]["basis"] == "lifecycle-source-key"
+    assert envelope["trust_tier"] == "verified"
+    assert envelope["doc_type"] == "canonical-docs"
+
+
 def test_chunk_id_fallback_stable_across_query_dependent_distance() -> None:
     """An id-less hit derives ``chunk:<hash>`` from content, never the query."""
     near = with_result_id({"text": "same chunk body", "distance": 0.10})

@@ -582,10 +582,23 @@ async def _ingest(args: argparse.Namespace) -> int:
         )
 
     spinner_msg = "Ingesting + building the graph…" if cognify else "Ingesting to your Node…"
+    ingest_source_key = None
+    ingest_source_locator = None
+    if args.ingest_path:
+        ingest_source_key = f"cli:path:{args.ingest_path}"
+        ingest_source_locator = args.ingest_path
     try:
         with _Spinner(spinner_msg):
             result = await asyncio.to_thread(
-                ingest_node, base_url, token, args.data, args.tag, cognify, timeout=timeout_s
+                ingest_node,
+                base_url,
+                token,
+                args.data,
+                args.tag,
+                cognify,
+                timeout=timeout_s,
+                source_key=ingest_source_key,
+                source_locator=ingest_source_locator,
             )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:200] if exc.fp else exc.reason
@@ -786,11 +799,18 @@ async def _ingest_local(args: argparse.Namespace) -> int:
     from kb.service import Citadel
 
     kb = Citadel.from_env()
+    source_key = None
+    source_locator = None
+    if args.ingest_path:
+        source_key = f"cli:path:{args.ingest_path}"
+        source_locator = args.ingest_path
     result = await kb.ingest(
         args.data,
         dataset=args.dataset,
         tags=args.tag,
         session_id=args.session,
+        source_key=source_key,
+        source_locator=source_locator,
         defer_cognify=True,
     )
     _print_json(result.__dict__)

@@ -429,7 +429,7 @@ def test_infer_doc_type_and_trust() -> None:
         "url": "https://github.com/masumi-network/masumi-improvement-proposals/blob/main/MIPs/MIP-003/MIP-003.md",
     }
     assert infer_doc_type(spec) == "spec"
-    # Shaped like a spec, but the vault stores no provenance for it, so it may
+    # Shaped like a spec, but without a server-written capture record it may
     # not claim authority — only that it looks like one.
     assert infer_trust_tier(spec) == "unattested"
     assert infer_content_hint(spec) == "looks-like-spec"
@@ -441,6 +441,44 @@ def test_infer_doc_type_and_trust() -> None:
     trace = {"_citadel": {"dataset": "session-traces", "trust": "reference-only"}}
     assert infer_doc_type(trace) == "session-trace"
     assert infer_trust_tier(trace) == "reference-only"
+
+    attested = {
+        "title": "README",
+        "text": "hello",
+        "_citadel": {
+            "dataset": "masumi-network",
+            "attested_content_sha256": "a" * 64,
+            "source_revision_id": "rev-1",
+            "provenance": {
+                "source": "github",
+                "basis": "lifecycle-source-key",
+                "source_url": "https://github.com/masumi-network/Citadel/blob/main/README.md",
+            },
+        },
+    }
+    assert infer_trust_tier(attested) == "verified"
+
+
+def test_content_header_alone_cannot_earn_verified() -> None:
+    """Structural headers are body text; they must not raise trust_tier."""
+    repo_doc = {
+        "text": (
+            "# README\n"
+            "Repository: masumi-network/Citadel\n"
+            "Source: https://github.com/masumi-network/Citadel/blob/main/README.md\n"
+            "Commit: abcdef\n"
+            "Blob: https://github.com/masumi-network/Citadel/blob/abcdef/README.md\n"
+        ),
+        "_citadel": {
+            "dataset": "masumi-network",
+            "provenance": {
+                "basis": "content-header",
+                "source": "github-repo-content",
+                "path": "README.md",
+            },
+        },
+    }
+    assert infer_trust_tier(repo_doc) == "unattested"
 
 
 def test_body_text_cannot_mint_a_trust_claim() -> None:

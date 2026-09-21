@@ -53,10 +53,11 @@ documents, each labelled with whatever was requested (see Consequences).
 Split the two questions that were conflated into one field.
 
 **`trust_tier` answers "what did the server attest?"** and may never be derived
-from content. Today exactly one value can be attested — `reference-only`, from
-the dataset a hit was read out of — so the tier is `reference-only` or
-`unattested`. A tier stored by an older build is recomputed rather than echoed
-back, so a persisted `canonical` cannot re-enter the system.
+from content. Values the server can attest: `reference-only` (session-traces
+dataset), `verified` (retained capture fingerprint / lifecycle source
+revision — see Follow-up / #104), or `unattested`. A tier stored by an older
+build is recomputed rather than echoed back, so a forged `canonical` cannot
+re-enter the system.
 
 **`content_hint` answers "what does this text look like?"** (`looks-like-spec`,
 `looks-like-skill`, …, `unclassified`). It is body-derived and therefore
@@ -102,8 +103,10 @@ and is tracked separately.
 
 ## Follow-up
 
-Provenance at ingest is the change that would let a hit earn a tier above
-`unattested`: `Citadel.ingest` would take `path` / `source_url` / `source`, the
-sync writers would populate them, and `trust_tier` could then be derived from a
-record the server wrote. Until then, `canonical` and `verified` remain defined
-constants that nothing assigns.
+Provenance at ingest (#104) lets a hit earn `verified` when the server retained
+a capture-time fingerprint / source revision (`attested_content_sha256`,
+`source_revision_id`, or `basis: lifecycle-source-key`). Sync writers and
+capture populate `source_key` / `source_locator` on ingest. Content-header
+locators remain display-only and never raise the tier. `canonical` is still
+defined and unassigned; the signed evidence chain in ADR-0022 is the next
+attestation step beyond the fingerprint.

@@ -182,10 +182,26 @@ def build_capture_payload(root: CaptureRoot) -> dict[str, Any]:
 
     The summary is capped to ``CITADEL_MCP_MAX_INGEST_BYTES`` so an oversized
     README or commit log can never produce an unbounded POST body.
+
+    ``source_key`` / ``source_locator`` are durable provenance (#104): the Node
+    stores them with the revision so search hits can earn ``verified`` instead
+    of remaining ``unattested``.
     """
     tags = list(normalize_tags([*root.tags, CAPTURE_TAG]))
     data = _truncate_utf8(summarize_root(root), _max_ingest_bytes())
-    return {"data": data, "tags": tags}
+    path = Path(root.path)
+    source_key = f"capture:path:{root.path}"
+    source_locator = root.path
+    if path.exists() and (path / ".git").exists():
+        remote = _git(root.path, "remote", "get-url", "origin")
+        if remote:
+            source_locator = _redact_url_userinfo(remote)
+    return {
+        "data": data,
+        "tags": tags,
+        "source_key": source_key,
+        "source_locator": source_locator,
+    }
 
 
 def post_capture(
