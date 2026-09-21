@@ -53,6 +53,7 @@ PROMOTION_TAG = "org-ready"
 PERSONAL_CAPTURE_TAG = "personal"
 ORG_WORK_CAPTURE_TAG = "org-work"
 CAPTURE_SUMMARY_MARKER = "# capture summary:"
+DEFAULT_PROMOTION_DECISION_MODEL = "typesafe/jev-1.13"
 
 # Broad seed queries used to enumerate a seat node. cognee.recall is semantic,
 # not an exhaustive listing, so a few complementary seeds widen coverage; the
@@ -225,8 +226,15 @@ DECISION_QUESTIONS: dict[str, dict[str, str]] = {
 
 
 def promotion_decision_model() -> str:
-    """The System One decision model for promotion, or '' to use the chat classifier."""
-    return os.getenv("CITADEL_PROMOTION_DECISION_MODEL", "").strip()
+    """The promotion decision model id.
+
+    Defaults to Jev (``typesafe/jev-1.13``), a calibrated decision model suited
+    to this typed relevance/sensitivity call. Set ``CITADEL_PROMOTION_DECISION_MODEL``
+    empty to use the free chat classifier instead.
+    """
+    return os.getenv(
+        "CITADEL_PROMOTION_DECISION_MODEL", DEFAULT_PROMOTION_DECISION_MODEL
+    ).strip()
 
 
 def _decision_noul(answer: Any) -> float | None:
@@ -394,15 +402,17 @@ class PromotionEngine:
         return candidates[:cap]
 
     def classify(self, text: str) -> Classification | None:
-        """Classify one candidate: a System One decision when configured, else chat.
+        """Classify one candidate: a System One decision, else the chat classifier.
 
-        When ``CITADEL_PROMOTION_DECISION_MODEL`` names an OpenRouter System One
-        decision model (e.g. ``typesafe/jev-1.13``), the relevance/sensitivity
-        verdict comes ONLY from that model's typed decision: a decision failure
-        returns ``None`` (SKIP), never a chat verdict, so a failed decision can
-        never promote. Without that env the free chat classifier is used. Both
-        paths return ``None`` on ANY failure so the caller deterministically
-        SKIPs; neither raises.
+        ``CITADEL_PROMOTION_DECISION_MODEL`` selects the decision model and
+        defaults to Jev (``typesafe/jev-1.13``); set it empty to use the free
+        chat classifier only. A real Jev verdict is always respected: a "no"
+        comes back as valid confidences and is returned as-is. The chat
+        classifier is used only when Jev yields NO usable verdict (transport or
+        parse failure), so a provider outage degrades to the free classifier
+        instead of halting promotion, and a genuine Jev decision is never
+        overridden. Every path returns ``None`` on failure so the caller
+        deterministically SKIPs; neither raises.
 
         Synchronous by design (plain urllib under run_with_retries, a 60s
         timeout per attempt plus backoff sleeps). Callers running on the event
@@ -411,11 +421,14 @@ class PromotionEngine:
         """
         decision_model = promotion_decision_model()
         if decision_model:
-            return self._classify_via_decision(text, decision_model)
+            decided = self._classify_via_decision(text, decision_model)
+            if decided is not None:
+                return decided
         return self._classify_via_chat(text)
 
     def _classify_via_decision(self, text: str, model: str) -> Classification | None:
-        """Classify via a System One decision model (Jev). None on any failure."""
+        """Decide via a System One model (Jev). ``None`` when it yields no usable
+        verdict, so the caller can fall back to the free chat classifier."""
         try:
             answers = openrouter_decide(
                 text[:CLASSIFIER_MAX_INPUT_CHARS],
@@ -425,7 +438,7 @@ class PromotionEngine:
             )
         except Exception as exc:  # pragma: no cover - openrouter_decide is itself guarded.
             logger.warning(
-                "promotion.decide call raised %s; skipping candidate",
+                "promotion.decide call raised %s; falling back to the chat classifier",
                 exc.__class__.__name__,
             )
             return None

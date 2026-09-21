@@ -194,28 +194,76 @@ def test_classify_uses_decision_model_when_configured(
     assert set(captured["questions"]) == {"relevant", "sensitive"}
 
 
-def test_classify_decision_failure_skips_without_chat(
+def test_classify_falls_back_to_chat_when_jev_yields_no_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CITADEL_PROMOTION_DECISION_MODEL", "typesafe/jev-1.13")
     monkeypatch.setattr(promotion, "openrouter_decide", lambda *a, **k: None)
+    _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+    engine, _learning, _store = _engine(tmp_path, [])
+
+    result = engine.classify("Org note")
+
+    assert result is not None
+    assert result.reason == "stubbed"
+
+
+def test_classify_respects_a_jev_no_without_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CITADEL_PROMOTION_DECISION_MODEL", "typesafe/jev-1.13")
+    monkeypatch.setattr(
+        promotion,
+        "openrouter_decide",
+        lambda *a, **k: {"relevant": {"noul": 0.1}, "sensitive": {"noul": 0.1}},
+    )
 
     def exploding_chat(*_: Any, **__: Any) -> str:
-        raise AssertionError("a failed decision must skip, never fall back to chat")
+        raise AssertionError("a real Jev verdict must not be overridden by chat")
 
     monkeypatch.setattr(promotion, "openrouter_chat", exploding_chat)
     engine, _learning, _store = _engine(tmp_path, [])
 
-    assert engine.classify("Org note") is None
+    result = engine.classify("Personal note")
+
+    assert result is not None
+    assert result.relevant is False
 
 
-def test_classify_uses_chat_when_no_decision_model(
+def test_promotion_decision_model_defaults_to_jev(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CITADEL_PROMOTION_DECISION_MODEL", raising=False)
+    assert promotion.promotion_decision_model() == "typesafe/jev-1.13"
+
+
+def test_classify_uses_jev_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("CITADEL_PROMOTION_DECISION_MODEL", raising=False)
+    monkeypatch.setattr(
+        promotion,
+        "openrouter_decide",
+        lambda *a, **k: {"relevant": {"noul": 0.95}, "sensitive": {"noul": 0.05}},
+    )
+
+    def exploding_chat(*_: Any, **__: Any) -> str:
+        raise AssertionError("Jev is the default; chat must not run")
+
+    monkeypatch.setattr(promotion, "openrouter_chat", exploding_chat)
+    engine, _learning, _store = _engine(tmp_path, [])
+
+    result = engine.classify("Org roadmap note")
+
+    assert result is not None
+    assert result.relevant is True
+
+
+def test_empty_env_uses_chat_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CITADEL_PROMOTION_DECISION_MODEL", "")
 
     def exploding_decide(*_: Any, **__: Any) -> dict[str, Any]:
-        raise AssertionError("the decision path must not run without the env")
+        raise AssertionError("empty env disables the decision path")
 
     monkeypatch.setattr(promotion, "openrouter_decide", exploding_decide)
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
