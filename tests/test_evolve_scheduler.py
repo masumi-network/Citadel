@@ -106,6 +106,7 @@ class _FakeCitadel:
     def __init__(self, cognify_calls: list[bool]) -> None:
         self._cognify_calls = cognify_calls
         self.resume_calls: list[bool] = []
+        self.reconcile_calls: list[dict[str, Any]] = []
         self.cognee = _FakeCognee()
 
     def resume_lifecycle_queue(self, *, include_deferred: bool = False) -> bool:
@@ -131,6 +132,29 @@ class _FakeCitadel:
                 "projection_chain_ok": None,
                 "ok": True,
             },
+        }
+
+    async def reconcile_corpus(
+        self,
+        *,
+        dataset: str | None = None,
+        apply: bool = False,
+        force: bool = False,
+        recover: bool = False,
+    ) -> dict[str, Any]:
+        self.reconcile_calls.append(
+            {
+                "dataset": dataset,
+                "apply": apply,
+                "force": force,
+                "recover": recover,
+            }
+        )
+        return {
+            "ok": True,
+            "reason": "no_repair_required",
+            "before": {"zero_chunk_count": 0, "oversized_document_count": 0},
+            "after": {"zero_chunk_count": 0, "oversized_document_count": 0},
         }
 
 
@@ -217,6 +241,11 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     assert suppressed and all(suppressed)
     # Phase 2: cognify ran in-loop afterwards.
     assert len(cognify_calls) >= 2
+    # Phase 3: journaled corpus reconcile runs after Phase 2 (#228).
+    assert fake_citadel.reconcile_calls
+    assert fake_citadel.reconcile_calls[0]["apply"] is True
+    assert fake_citadel.reconcile_calls[0]["force"] is True
+    assert fake_citadel.reconcile_calls[0]["recover"] is True
     # The verify canary verdict is recorded for /readyz (#27).
     assert server._LAST_CANARY is not None and server._LAST_CANARY["ok"] is True
     # Every pass ends by kicking the projection drain: starts are suppressed
@@ -224,6 +253,81 @@ async def test_evolve_scheduler_loop_runs_stages_in_loop_then_cognifies(
     # without draining the lifecycle queue, so a job accepted mid-pass would
     # otherwise wait for the next external ingest or the next pass.
     assert len(fake_citadel.resume_calls) >= 1
+
+
+async def test_evolve_scheduler_skips_phase3_reconcile_when_disabled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import kb.server as server
+
+    monkeypatch.setenv("CITADEL_EVOLVE_RECONCILE_ENABLED", "false")
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+    fake_citadel = _FakeCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(tmp_path / "evolve_state.json"))
+    )
+    try:
+        for _ in range(300):
+            if cognify_calls:
+                break
+            await asyncio.sleep(0.01)
+        # Give the finally-block Phase 3 decision a beat to run.
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert cognify_calls
+    assert fake_citadel.reconcile_calls == []
+
+
+async def test_evolve_scheduler_marks_cycle_failed_when_phase3_fails(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import json as json_module
+
+    import kb.server as server
+
+    _patch_phase1(monkeypatch)
+    cognify_calls: list[bool] = []
+
+    class _FailingReconcileCitadel(_FakeCitadel):
+        async def reconcile_corpus(self, **kwargs: Any) -> dict[str, Any]:
+            await super().reconcile_corpus(**kwargs)
+            return {
+                "ok": False,
+                "reason": "reconciliation_candidates_not_fully_assigned",
+                "before": {"zero_chunk_count": 3, "oversized_document_count": 0},
+                "after": None,
+            }
+
+    fake_citadel = _FailingReconcileCitadel(cognify_calls)
+    monkeypatch.setattr(server, "get_citadel", lambda: fake_citadel)
+    state_path = tmp_path / "evolve_state.json"
+
+    task = asyncio.create_task(
+        server._evolve_scheduler_loop(0.001, str(state_path))
+    )
+    try:
+        for _ in range(400):
+            if state_path.exists():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert fake_citadel.reconcile_calls
+    stamp = json_module.loads(state_path.read_text())
+    assert stamp["last_run_ok"] is False
+    assert stamp["last_run_reason"] == (
+        "reconciliation_candidates_not_fully_assigned"
+    )
 
 
 async def test_evolve_scheduler_does_not_resume_after_phase2_cancellation(

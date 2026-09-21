@@ -80,8 +80,9 @@ writes within a process.
   attached to the process holding the execution lock. Forked Python children
   close inherited guard descriptors before running child code.
 - A production repair and post-repair census are still required for historical
-  zero-chunk documents. This decision does not close that operational part of
-  #228.
+  zero-chunk documents. Evolve Phase 3 (`CITADEL_EVOLVE_RECONCILE_*`) is the
+  scheduled apply path for that repair; closing #228 still needs a post-deploy
+  census that shows `zero_chunk_count == 0`.
 
 ## Verification
 
