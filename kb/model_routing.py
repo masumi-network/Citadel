@@ -253,8 +253,27 @@ def _clear_cognee_embedding_caches() -> None:
             clear_cache()
 
 
+def cognee_llm_model_override() -> str | None:
+    """An explicit cognify model id (LiteLLM form) that bypasses the free-only
+    guard, or ``None``.
+
+    Set ``CITADEL_COGNEE_LLM_MODEL`` to pin one reliable (possibly paid) model
+    for the Cognee extraction/summarization/query stages when free
+    structured-output models are unavailable or overloaded. Empty keeps the
+    free-only routing. This affects ONLY the Cognee stage models, never the
+    free-first direct-call routing (:func:`route_for`).
+    """
+    value = os.getenv("CITADEL_COGNEE_LLM_MODEL", "").strip()
+    return value or None
+
+
 def configure_cognee_model_routes() -> dict[str, str]:
-    """Set free-only Cognee routes in LiteLLM form."""
+    """Set Cognee routes in LiteLLM form.
+
+    Free-only by default. When ``CITADEL_COGNEE_LLM_MODEL`` is set, that model
+    is used verbatim for every Cognee stage, bypassing the free-only guard for
+    operators who accept the cost for reliability.
+    """
 
     routes: dict[str, str] = {}
     model_defaults = {
@@ -265,12 +284,16 @@ def configure_cognee_model_routes() -> dict[str, str]:
     }
     os.environ["LLM_PROVIDER"] = "custom"
     routes["LLM_PROVIDER"] = "custom"
+    override = cognee_llm_model_override()
     for name, fallback in model_defaults.items():
-        os.environ[name] = enforce_free_openrouter_model(
-            os.environ.get(name),
-            fallback=fallback,
-            litellm=True,
-        )
+        if override is not None:
+            os.environ[name] = override
+        else:
+            os.environ[name] = enforce_free_openrouter_model(
+                os.environ.get(name),
+                fallback=fallback,
+                litellm=True,
+            )
         routes[name] = os.environ[name]
 
     profile = active_embedding_profile()

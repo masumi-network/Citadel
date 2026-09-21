@@ -25,6 +25,7 @@ def _clear_routing_env(monkeypatch) -> None:
         "LLM_EXTRACTION_MODEL",
         "LLM_SUMMARIZATION_MODEL",
         "LLM_QUERY_MODEL",
+        "CITADEL_COGNEE_LLM_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -77,6 +78,26 @@ def test_cognee_route_replaces_paid_stage_overrides(monkeypatch) -> None:
 
     assert routes["LLM_MODEL"] == DEFAULT_COGNEE_FREE_ROUTER_MODEL
     assert routes["LLM_QUERY_MODEL"] == "openrouter/qwen/qwen3-coder:free"
+
+
+def test_cognee_route_uses_paid_override_when_set(monkeypatch) -> None:
+    _clear_routing_env(monkeypatch)
+    monkeypatch.setenv("CITADEL_COGNEE_LLM_MODEL", "openrouter/openai/gpt-4o-mini")
+    # A pinned free stage value must be replaced by the override, proving the
+    # override wins over the free-only guard for every Cognee stage.
+    monkeypatch.setenv("LLM_EXTRACTION_MODEL", "openrouter/openrouter/free")
+
+    routes = configure_cognee_model_routes()
+
+    for name in (
+        "LLM_MODEL",
+        "LLM_EXTRACTION_MODEL",
+        "LLM_SUMMARIZATION_MODEL",
+        "LLM_QUERY_MODEL",
+    ):
+        assert routes[name] == "openrouter/openai/gpt-4o-mini"
+        assert os.environ[name] == "openrouter/openai/gpt-4o-mini"
+    assert os.environ["LLM_PROVIDER"] == "custom"
 
 
 def test_disabled_router_still_rejects_paid_models(monkeypatch) -> None:
