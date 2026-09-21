@@ -45,7 +45,14 @@ Done looks like: an ingest through **MCP** that returns a result the caller can 
 ### 2.2 Then fix retrieval at the bottom, before re-indexing anything
 
 **4. #227, chunk size exceeds the embedder's input window.**
-Position: strictly before #228. Re-indexing 892 documents at a chunk budget the embedder cannot consume produces 892 documents that are indexed and still not retrievable, and the work has to be done a second time at the corrected budget. **INFERRED** from the two issue titles plus the deployed embedder setting: `.env.example:238-240` sets `EMBEDDING_PROVIDER=fastembed`, `EMBEDDING_MODEL=BAAI/bge-small-en-v1.5`, `EMBEDDING_DIMENSIONS=384` (**VERIFIED** by reading `.env.example` on 2026-08-04). The chunk budget itself is not set anywhere in `kb/`: a grep for `chunk_size`, `max_chunk_tokens` and `CHUNK` across `kb/` returns only enrichment character limits (`kb/llm_enrichment.py:36`, `DEFAULT_MAX_CHUNK_CHARS = 4000`) and search-format prose (**VERIFIED**, same grep). So the effective budget comes from the retrieval engine's default, which makes this issue and the cognee upgrade in section 3 the same conversation.
+Position: strictly before #228. Re-indexing 892 documents at a chunk budget the embedder cannot consume produces 892 documents that are indexed and still not retrievable, and the work has to be done a second time at the corrected budget.
+**[CORRECTED 2026-09-21]** The claim that "the chunk budget itself is not set
+anywhere in `kb/`" is obsolete. PR #242 set `OBSERVED_CHUNK_BUDGET_TOKENS = 256`
+in `kb/chunk_window.py`; `.env.example` documents `CITADEL_CHUNK_BUDGET_TOKENS`
+and embedding profile defaults. New writes are gated; historical oversize is
+repaired by evolve Phase 3 (`reconcile_corpus`, #358) and gated by the
+`oversized_document_count` census (#247). The 2026-08-04 greps below are
+historical evidence only.
 Unblocks: #228, and any honest before/after on retrieval quality.
 Done looks like: a measured chunk budget expressed in the embedder's own token units, and a sampled document whose tail text is retrievable by a token that appears only in that tail.
 

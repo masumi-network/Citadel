@@ -1,7 +1,15 @@
 # Re-index runbook
 
 **Date:** 2026-08-04
-**Status:** not started. Nothing below has been executed. This document exists so the run can be scheduled from evidence rather than from optimism.
+**Status:** [CORRECTED 2026-09-21] Historical planning arithmetic below is retained.
+  **Do not follow Step 5's HTTP/`citadel cognify --force` apply instructions.**
+  Cognify and corpus repair apply are `LLM_SCHEDULED_ONLY` (HTTP 409 / CLI
+  `llm_scheduled_only`). The live path is evolve **Phase 3**
+  (`CITADEL_EVOLVE_RECONCILE_*`, default on after #358): journaled
+  `reconcile_corpus(apply=True)` after Phase 2 Cognify. Dry-run census remains
+  available via `POST /api/corpus/reconcile` without `apply` and
+  `citadel reindex` without `--apply`. See `docs/operations.md` (Autonomous
+  scheduler state) and [ADR-0025](../../adr/0025-durable-cognify-retry-queue.md).
 **Decides nothing about the graph store.** [ADR-0020](../../adr/0020-graph-store-on-postgres-and-dataset-scoped-reads.md) already decided that, and the [graph store migration runbook](2026-08-04-graph-store-migration-runbook.md) already turns it into nine gates. Its gate 9 is the re-cognify. **This document is gate 9's detail and nothing else.** Gates 1 through 8 stay where they are; do not re-litigate them here.
 
 Gate 9 as written answers four questions and explicitly leaves five open: it says the rebuild is one job with issue #228, that it sequences after #227, that the runtime must be estimated before scheduling, and that the figure "is **not determined** here". This document supplies the estimate, the scope argument, the progress signal, the verification command and the rollback position. Where it and gate 9 disagree, gate 9 wins on sequencing and this document wins on arithmetic, because the arithmetic was measured after gate 9 was written.
@@ -230,18 +238,43 @@ The next section is the one that decides whether a broken run is noticed. It is 
 
 ### Step 5: run it, one dataset at a time
 
-```
+> **[CORRECTED 2026-09-21]** The HTTP and CLI apply paths below are **refused**.
+> Use the evolve scheduler Phase 3 reconcile instead (see the status banner).
+> Keep the measured arithmetic and census checks; only the *trigger* changed.
+
+~~```
 POST /api/cognify/run
 {"dataset": "<name>", "force": true, "verify": false}
+```~~
+
+**Current apply path:** enable `CITADEL_EVOLVE_SCHEDULER_ENABLED=true` and let
+a scheduled pass run Phase 2 Cognify then Phase 3
+`reconcile_corpus(apply=True, force=True, recover=True)`. Dry-run only:
+
+```
+POST /api/corpus/reconcile
+{"apply": false}
 ```
 
-Body model at `kb/server.py:987-990`, handler at `kb/server.py:5765-5771`, scope `admin` or `sources:sync` (`kb/server.py:5767`). **VERIFIED.**
+or `citadel reindex` without `--apply`. `--apply` / `apply: true` return
+`llm_scheduled_only` / HTTP 409.
 
-Three operational facts about that call:
+Body model and handler citations in the struck section below were accurate on
+2026-08-04 and are retained as historical evidence only.
 
-1. **The CLI can now do this.** `citadel cognify` accepts `--dataset`, `--verify`, and `--force`; `_cognify` passes all three to `cognify_dataset` (`kb/cli.py:853-863`, `kb/cli.py:3180-3194`). **VERIFIED.** `--force` reprocesses the whole selected dataset, so use the same backup, canary, and census controls as the HTTP path. The HTTP endpoint remains available for admin-scoped remote recovery.
-2. **The response's `ok` field proves nothing when `verify` is false.** `cognify_dataset` returns `"ok": True if verification is None else bool(verification["ok"])` (`kb/service.py:370`). **VERIFIED.** With `verify: false` it is unconditionally true. Read `graph_before` and `graph_after` in the same payload for a number that is at least a measurement, and read the census for one that is authoritative.
-3. **One request will not survive the window.** At the section 3.3 timings a single dataset's force cognify runs for hours, and a client timeout says nothing about whether the write succeeded. Issue #229 recorded that exact confusion and is closed, but the property remains: a timed-out client and a failed write look the same from the client.
+Three operational facts about the **old** call (no longer executable):
+
+1. **The CLI no longer applies cognify.** `citadel cognify` returns
+   `llm_scheduled_only`. Historical note: it once accepted `--dataset`,
+   `--verify`, and `--force`.
+2. **The response's `ok` field proves nothing when `verify` is false.**
+   `cognify_dataset` returns `"ok": True if verification is None else bool(verification["ok"])`.
+   With `verify: false` it is unconditionally true. Read `graph_before` and
+   `graph_after` in the same payload for a number that is at least a
+   measurement, and read the census for one that is authoritative.
+3. **One request will not survive the window.** At the section 3.3 timings a
+   single dataset's force cognify runs for hours. Prefer the scheduled evolve
+   pass (which has its own Phase 2 / Phase 3 timeouts) over a long-lived curl.
 
    Issue that request from something that outlives your terminal, for example:
 
