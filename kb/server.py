@@ -1007,25 +1007,33 @@ async def _evolve_scheduler_loop(interval_seconds: int, state_path: str) -> None
                                     "after %.0fs",
                                     _evolve_reconcile_timeout_seconds(),
                                 )
-                                _record_canary_verdict(
-                                    ok=False, error="CorpusReconcileTimeout"
-                                )
+                                if phase2_ok:
+                                    _record_canary_verdict(
+                                        ok=False, error="CorpusReconcileTimeout"
+                                    )
                             except Exception as exc:
                                 phase3_ok = False
                                 phase3_reason = "reconcile_exception"
                                 logger.exception(
                                     "Evolve scheduler: Phase 3 reconcile failed"
                                 )
-                                _record_canary_verdict(
-                                    ok=False, error=exc.__class__.__name__
-                                )
-                            if not phase3_ok and phase3_reason not in {
-                                "reconcile_timeout",
-                                "reconcile_exception",
-                            }:
-                                # Census/repair refused: keep /readyz red so an
-                                # unrepaired oversized/#228 scar cannot hide
-                                # behind a green Cognify canary (#247).
+                                if phase2_ok:
+                                    _record_canary_verdict(
+                                        ok=False, error=exc.__class__.__name__
+                                    )
+                            if (
+                                not phase3_ok
+                                and phase2_ok
+                                and phase3_reason
+                                not in {
+                                    "reconcile_timeout",
+                                    "reconcile_exception",
+                                }
+                            ):
+                                # Census/repair refused after a green Cognify
+                                # canary: keep /readyz red so an unrepaired
+                                # oversized/#228 scar cannot hide (#247). Do not
+                                # overwrite a Phase 2 failure's error class.
                                 _record_canary_verdict(
                                     ok=False, error="CorpusReconcileFailed"
                                 )

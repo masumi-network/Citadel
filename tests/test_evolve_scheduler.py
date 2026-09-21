@@ -438,12 +438,8 @@ async def test_hung_phase2_is_bounded_and_still_stamps(
         await _cancel_phase2_orphans()
 
 
-class _RaisingCitadel:
+class _RaisingCitadel(_FakeCitadel):
     """cognify_dataset raises, i.e. the #27 failure the canary exists to catch."""
-
-    def __init__(self, cognify_calls: list[bool]) -> None:
-        self._cognify_calls = cognify_calls
-        self.cognee = _FakeCognee()
 
     async def cognify_dataset(self, *, force: bool = False, verify: bool = False) -> dict[str, Any]:
         self._cognify_calls.append(force)
