@@ -838,6 +838,11 @@ async def test_cognify_selected_data_hands_bounded_chunker_to_tasks(
     monkeypatch.setattr(cognee, "cognify", fake_public_cognify)
     monkeypatch.setattr(chunk_window, "require_bpe_encoding", lambda: None)
     monkeypatch.setattr(chunk_window, "resolve_chunk_budget", lambda: 64)
+    monkeypatch.setattr(
+        chunk_window,
+        "configured_embedding_tokenizer",
+        lambda: SimpleNamespace(window=64, count_tokens=lambda text: len(text.split())),
+    )
     monkeypatch.setattr(cognee_client_module, "_bounded_cognee_chunker", lambda: _Sentinel)
     monkeypatch.setattr(
         embedding_profile,
