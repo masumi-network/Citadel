@@ -4537,23 +4537,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     reindex = subcommands.add_parser(
         "reindex",
-        help="Audit and optionally repair accepted documents with missing or oversized chunks",
+        help=(
+            "Audit accepted documents with missing or oversized chunks "
+            "(dry-run; --apply is scheduled-only via evolve Phase 3)"
+        ),
     )
     reindex.add_argument("--dataset")
     reindex.add_argument(
         "--oversized",
         action="store_true",
-        help="Compatibility mode: audit and repair only over-budget chunks",
+        help="Compatibility mode: audit only over-budget chunks",
     )
     reindex.add_argument(
         "--apply",
         action="store_true",
-        help="Run the repair after the census (default is read-only)",
+        help=(
+            "Refused: repair apply runs only in the scheduled evolve job "
+            "(returns llm_scheduled_only)"
+        ),
     )
     reindex.add_argument(
         "--force",
         action="store_true",
-        help="Force dataset reprocessing; requires --apply",
+        help="Would force dataset reprocessing with --apply; apply is scheduled-only",
     )
     reindex.add_argument(
         "--recover",

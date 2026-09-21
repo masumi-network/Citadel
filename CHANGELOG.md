@@ -6,6 +6,12 @@ All notable changes to `citadel-archive` are documented here. Format follows
 
 ## [Unreleased]
 
+- **Stale reindex/cognify apply docs marked corrected.** The 2026-08-04 reindex
+  runbook and execution-plan chunk-budget section still held HTTP/`citadel
+  cognify --force` instructions and "no budget in kb/" claims that contradict
+  `LLM_SCHEDULED_ONLY` and `OBSERVED_CHUNK_BUDGET_TOKENS`. CLI `reindex`
+  help no longer says `--apply` repairs.
+
 - **Evolve Phase 3 runs journaled corpus reconcile after Cognify (#228).**
   Zero-chunk and oversized projections are repaired on the scheduled evolve
   pass (`CITADEL_EVOLVE_RECONCILE_ENABLED`, default on; force/recover default
