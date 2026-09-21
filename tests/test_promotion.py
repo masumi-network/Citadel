@@ -24,6 +24,15 @@ CENTRAL = "masumi-network"  # CitadelConfig.github_sync_dataset default
 SECRET_TEXT = "deploy creds " + "AKIA" + "ABCDEFGHIJKLMNOP" + " rotate me"
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_promotion_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Jev is the production default for the promotion decision. Default every
+    test to no live decision call, so a shell or CI with OPENROUTER_API_KEY set
+    can never place paid Jev requests. Tests that exercise the decision path
+    override this stub."""
+    monkeypatch.setattr(promotion, "openrouter_decide", lambda *a, **k: None)
+
+
 class FakeCitadel:
     def __init__(self, config: CitadelConfig, nodes: list[str], *, central_hits: bool = False) -> None:
         self.config = config
@@ -265,8 +274,8 @@ def test_empty_env_uses_chat_only(
     def exploding_decide(*_: Any, **__: Any) -> dict[str, Any]:
         raise AssertionError("empty env disables the decision path")
 
-    monkeypatch.setattr(promotion, "openrouter_decide", exploding_decide)
     _stub_llm(monkeypatch, relevant=True, sensitive=False, score=0.9)
+    monkeypatch.setattr(promotion, "openrouter_decide", exploding_decide)
     engine, _learning, _store = _engine(tmp_path, [])
 
     result = engine.classify("Org note")
