@@ -52,6 +52,7 @@ from kb.search_format import (
     linear_issue_identifier,
     parse_content_header,
     query_terms,
+    source_key_descriptor,
 )
 from kb.security_scan import (
     SecretContentError,
@@ -2231,7 +2232,12 @@ class Citadel:
         """
         def retained_document(source: Any, content: str) -> dict[str, Any]:
             header = parse_content_header(content, chunk_index=0)
-            source_type = str(header.get("kind") or "lifecycle")
+            descriptor = source_key_descriptor(source.source_key)
+            connector = descriptor.get("source")
+            # Connector identity comes from the stored source key. A header in
+            # the body is author-controlled and must not rename the source or
+            # raise the basis to lifecycle-source-key.
+            source_type = connector or str(header.get("kind") or "lifecycle")
             title = str(header.get("title") or source.source_key)
             issue = header.get("issue")
             if isinstance(issue, str) and issue:
@@ -2239,11 +2245,17 @@ class Citadel:
             source_locator = source.source_locator or header.get("source_url")
             provenance: dict[str, Any] = {
                 "source": source_type,
-                "basis": "lifecycle-source-key",
+                "basis": "lifecycle-source-key" if connector else (
+                    "content-header" if header else "lifecycle-revision"
+                ),
             }
+            for key in ("repo", "path"):
+                value = descriptor.get(key)
+                if isinstance(value, str) and value:
+                    provenance[key] = value
             for key in ("repo", "path", "issue", "commit", "activity_type"):
                 value = header.get(key)
-                if isinstance(value, str) and value:
+                if isinstance(value, str) and value and not provenance.get(key):
                     provenance[key] = value
             if isinstance(source_locator, str) and source_locator:
                 provenance["source_url"] = source_locator
