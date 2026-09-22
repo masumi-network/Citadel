@@ -8556,13 +8556,25 @@ async def ingest(body: IngestBody, request: Request) -> Any:
             status_code=422,
             detail="User ingest is capture-only; scheduled projection runs separately.",
         )
+    source_key = (body.source_key or "").strip() or None
+    source_locator = (body.source_locator or "").strip() or None
+    # A seat can otherwise store github: or linear: and come back as verified
+    # repo content. Sync writers bypass the dataset allowlist. cli: and
+    # capture: keys do not parse as connectors, so they stay allowed.
+    if (
+        source_key
+        and source_key_descriptor(source_key)
+        and not can_bypass_dataset_allowlist(actor)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Connector source keys are reserved for organization sync.",
+        )
     citadel = get_citadel()
     learning = get_learning_process()
     write_targets = resolve_write_targets(actor, body.dataset, body.tags, citadel.config)
     session_id = resolve_session_id(actor, body.session_id)
     primary_dataset = write_targets[0].dataset
-    source_key = (body.source_key or "").strip() or None
-    source_locator = (body.source_locator or "").strip() or None
     try:
         outcome, _ = await execute_learning_writes(
             learning,

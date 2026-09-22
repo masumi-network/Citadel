@@ -481,6 +481,61 @@ def test_content_header_alone_cannot_earn_verified() -> None:
     assert infer_trust_tier(repo_doc) == "unattested"
 
 
+def test_revision_id_or_raw_metadata_cannot_earn_verified() -> None:
+    """A stored id or a caller-supplied hash is not a connector attestation."""
+    revision_only = {
+        "text": "hello",
+        "_citadel": {
+            "dataset": "masumi-network",
+            "source_revision_id": "rev-1",
+            "trust_tier": "verified",
+        },
+    }
+    assert infer_trust_tier(revision_only) == "unattested"
+
+    raw_metadata = {
+        "text": "hello",
+        "metadata": {
+            "source_key": "github:masumi-network/Citadel:path:README.md",
+            "content_sha256": "a" * 64,
+        },
+        "_citadel": {"dataset": "masumi-network"},
+    }
+    assert infer_trust_tier(raw_metadata) == "unattested"
+
+
+def test_public_hit_verifies_only_with_fingerprint_and_connector_basis() -> None:
+    from kb.search_format import shape_public_search_hit
+
+    forged = shape_public_search_hit(
+        {
+            "text": "hello",
+            "_citadel": {
+                "dataset": "masumi-network",
+                "source_revision_id": "rev-1",
+                "attested_content_sha256": "a" * 64,
+                "trust_tier": "verified",
+            },
+        }
+    )
+    assert forged["_citadel"]["trust_tier"] == "unattested"
+
+    attested = shape_public_search_hit(
+        {
+            "text": "hello",
+            "_citadel": {
+                "dataset": "masumi-network",
+                "attested_content_sha256": "a" * 64,
+                "provenance": {
+                    "basis": "lifecycle-source-key",
+                    "source": "repo-content",
+                },
+            },
+        }
+    )
+    assert attested["_citadel"]["trust_tier"] == "verified"
+
+
 def test_body_text_cannot_mint_a_trust_claim() -> None:
     """The whole point of the attested-only tier.
 

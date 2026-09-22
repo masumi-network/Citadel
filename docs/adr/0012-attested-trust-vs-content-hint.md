@@ -54,10 +54,10 @@ Split the two questions that were conflated into one field.
 
 **`trust_tier` answers "what did the server attest?"** and may never be derived
 from content. Values the server can attest: `reference-only` (session-traces
-dataset), `verified` (retained capture fingerprint / lifecycle source
-revision — see Follow-up / #104), or `unattested`. A tier stored by an older
-build is recomputed rather than echoed back, so a forged `canonical` cannot
-re-enter the system.
+dataset), `verified` (server hash plus a GitHub or Linear source key — see
+Follow-up / #104), or `unattested`. A tier stored by an older build is
+recomputed rather than echoed back, so a forged `canonical` cannot re-enter
+the system.
 
 **`content_hint` answers "what does this text look like?"** (`looks-like-spec`,
 `looks-like-skill`, …, `unclassified`). It is body-derived and therefore
@@ -103,10 +103,10 @@ and is tracked separately.
 
 ## Follow-up
 
-Provenance at ingest (#104) lets a hit earn `verified` when the server retained
-a capture-time fingerprint / source revision (`attested_content_sha256`,
-`source_revision_id`, or `basis: lifecycle-source-key`). Sync writers and
-capture populate `source_key` / `source_locator` on ingest. Content-header
-locators remain display-only and never raise the tier. `canonical` is still
-defined and unassigned; the signed evidence chain in ADR-0022 is the next
-attestation step beyond the fingerprint.
+Provenance at ingest (#104) lets a hit earn `verified` only when the server
+stored both a capture-time fingerprint (`attested_content_sha256`) and a
+GitHub or Linear source key (`basis: lifecycle-source-key`). A revision id
+alone, a content header, or a connector key supplied by a seat ingest does
+not raise the tier. CLI and capture locators are stored and stay
+`unattested`. `canonical` is still defined and unassigned; the signed
+evidence chain in ADR-0022 is the next attestation step beyond the fingerprint.

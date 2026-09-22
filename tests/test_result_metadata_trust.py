@@ -255,6 +255,51 @@ def test_lifecycle_attested_fingerprint_earns_verified() -> None:
     assert envelope["doc_type"] == "canonical-docs"
 
 
+def test_manual_lifecycle_revision_stays_unattested() -> None:
+    """A pasted note has a server hash. It is not a GitHub or Linear source."""
+    attested = "c" * 64
+    out = with_result_metadata(
+        {
+            "id": "note-1",
+            "text": "hello from a seat",
+            "metadata": {
+                "source_key": "manual:seat:carol:" + attested,
+                "content_sha256": attested,
+            },
+            "_lifecycle": {"source_revision_id": "rev-note"},
+        },
+        0,
+        "seat:carol",
+    )
+    envelope = out["_citadel"]
+    assert envelope["attested_content_sha256"] == attested
+    assert envelope["provenance"].get("basis") != "lifecycle-source-key"
+    assert envelope["trust_tier"] == "unattested"
+
+
+def test_seat_ingest_rejects_connector_source_key() -> None:
+    from test_server import authed_client
+
+    app.state.access_store = AccessStore(Path(tempfile.mkdtemp()) / "access.json")
+    admin = authed_client()
+    token = admin.post("/api/access/seats", json={"name": "Carol", "slug": "carol"}).json()[
+        "token"
+    ]
+    client = TestClient(app, base_url="https://testserver")
+    response = client.post(
+        "/ingest",
+        json={
+            "data": "not the readme",
+            "source_key": "github:masumi-network/Citadel:path:README.md",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "Connector source keys are reserved for organization sync."
+    )
+
+
 def test_chunk_id_fallback_stable_across_query_dependent_distance() -> None:
     """An id-less hit derives ``chunk:<hash>`` from content, never the query."""
     near = with_result_id({"text": "same chunk body", "distance": 0.10})

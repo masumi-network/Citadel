@@ -597,38 +597,32 @@ def infer_content_hint(item: dict[str, Any], doc_type: str | None = None) -> str
 def _has_server_attested_provenance(
     item: dict[str, Any], envelope: Mapping[str, Any]
 ) -> bool:
-    """True when the server stamped durable capture provenance on this hit.
+    """True only for a connector revision the server hashed.
 
-    Lifecycle enrichment writes ``source_revision_id`` and the capture-time
-    fingerprint. Content-header locators alone never qualify — those are
-    author-controlled body text (ADR-0012 / ADR-0017).
+    ``verified`` needs both the capture-time fingerprint and
+    ``basis: lifecycle-source-key``. That basis is set only when
+    ``source_key_descriptor`` recognized the stored key (GitHub or Linear
+    sync). A bare ``source_revision_id``, a content header, or a hash sitting
+    on raw hit metadata does not qualify. ``item`` stays in the signature so
+    callers cannot smuggle metadata past the envelope.
     """
+    del item
     attested = envelope.get("attested_content_sha256")
-    if isinstance(attested, str) and len(attested) == 64:
-        return True
-    revision_id = envelope.get("source_revision_id")
-    if isinstance(revision_id, str) and revision_id.strip():
-        return True
+    if not isinstance(attested, str) or re.fullmatch(r"[0-9a-f]{64}", attested) is None:
+        return False
     provenance = envelope.get("provenance")
-    if isinstance(provenance, dict) and provenance.get("basis") == "lifecycle-source-key":
-        return True
-    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-    # Lifecycle search enrichment copies source_key onto metadata; ignore bare
-    # body-derived keys that never rode a source revision.
-    if isinstance(metadata.get("source_key"), str) and metadata["source_key"].strip():
-        if isinstance(metadata.get("content_sha256"), str) and len(
-            metadata["content_sha256"]
-        ) == 64:
-            return True
-    return False
+    return (
+        isinstance(provenance, dict)
+        and provenance.get("basis") == "lifecycle-source-key"
+    )
 
 
 def infer_trust_tier(item: dict[str, Any], doc_type: str | None = None) -> str:
     """Attested provenance only. Body text can never raise this.
 
     ``reference-only`` comes from the dataset a hit was read out of (session
-    traces). ``verified`` is earned only when the server retained a capture-time
-    fingerprint / source revision (ADR-0012 follow-up, #104). Everything else is
+    traces). ``verified`` is earned only when the server hashed a GitHub or
+    Linear source key (ADR-0012 follow-up, #104). Everything else is
     ``unattested``. ``canonical`` remains defined but unassigned.
     """
     envelope = item.get("_citadel") if isinstance(item.get("_citadel"), dict) else {}
@@ -1066,21 +1060,6 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
         if isinstance(value, str) and value:
             public[key] = value
 
-    # Trust is a closed public contract, not an arbitrary provider string.
-    # ``reference-only`` is a safe downgrade and is also how the server marks
-    # the Node-side copy of a shared trace. ``verified`` crosses only when the
-    # sanitized envelope still carries server-stamped capture provenance
-    # (``attested_content_sha256`` / ``source_revision_id``); forged
-    # ``canonical`` / ``verified`` claims without that record re-derive to
-    # ``unattested``.
-    if envelope.get("trust") == TRUST_REFERENCE:
-        public["trust"] = TRUST_REFERENCE
-    inferred_tier = infer_trust_tier({"_citadel": public})
-    if envelope.get("trust_tier") == TRUST_REFERENCE and inferred_tier == TRUST_REFERENCE:
-        public["trust_tier"] = TRUST_REFERENCE
-    else:
-        public["trust_tier"] = inferred_tier
-
     endpoint = envelope.get("document_endpoint")
     if isinstance(endpoint, str) and endpoint.startswith("/api/documents/"):
         public["document_endpoint"] = endpoint
@@ -1192,6 +1171,17 @@ def _public_search_envelope(envelope: Any) -> dict[str, Any]:
             ):
                 clean_relevance["match_context"] = {"offset": offset, "text": text}
         public["relevance"] = clean_relevance
+
+    # Trust is derived after provenance is copied. ``verified`` needs the
+    # fingerprint and ``basis: lifecycle-source-key`` together. A forged
+    # ``trust_tier`` on the raw envelope cannot survive this pass.
+    if envelope.get("trust") == TRUST_REFERENCE:
+        public["trust"] = TRUST_REFERENCE
+    inferred_tier = infer_trust_tier({"_citadel": public})
+    if envelope.get("trust_tier") == TRUST_REFERENCE and inferred_tier == TRUST_REFERENCE:
+        public["trust_tier"] = TRUST_REFERENCE
+    else:
+        public["trust_tier"] = inferred_tier
     return public
 
 
