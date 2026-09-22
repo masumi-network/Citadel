@@ -250,18 +250,29 @@ async def test_large_pending_watermark_uses_one_batch_read_per_interval(
 
     fake = BatchCitadel()
     sleep_calls: list[float] = []
-    original_sleep = barrier_module.asyncio.sleep
+    # The barrier reads asyncio loop time, then sleeps one poll interval while
+    # time remains. A wall-clock budget of poll+20ms skips that sleep when the
+    # 1000-id batch is slow, which the Docker job hit as an empty sleep list.
+    clock = {"now": 1_000.0}
+
+    class ClockLoop:
+        def time(self) -> float:
+            return clock["now"]
+
+    monkeypatch.setattr(
+        barrier_module.asyncio, "get_running_loop", lambda: ClockLoop()
+    )
 
     async def record_sleep(delay: float) -> None:
         sleep_calls.append(delay)
-        await original_sleep(delay)
+        clock["now"] += delay
+
     monkeypatch.setattr(barrier_module.asyncio, "sleep", record_sleep)
     result = await wait_for_projection_barrier(
         fake,
         job_ids,
-        timeout_seconds=0.52,
+        timeout_seconds=1.2,
     )
-
 
     assert result.job_ids == job_ids
     assert result.searchable_job_ids == ()
@@ -269,10 +280,9 @@ async def test_large_pending_watermark_uses_one_batch_read_per_interval(
     assert result.failed_job_ids == ()
     assert result.complete is False
     assert fake.operation_calls == []
-    assert fake.batch_calls
     assert all(call == job_ids for call in fake.batch_calls)
+    assert sleep_calls == [barrier_module._POLL_SECONDS, barrier_module._POLL_SECONDS]
     assert len(fake.batch_calls) == len(sleep_calls) + 1
-    assert sleep_calls[0] >= 0.5
 
 
 @pytest.mark.asyncio
