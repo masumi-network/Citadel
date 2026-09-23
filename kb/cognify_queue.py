@@ -656,16 +656,21 @@ class CognifyRetryQueue:
     ) -> dict[str, Any]:
         if not isinstance(lease, CognifyLease):
             raise TypeError("lease must be a CognifyLease")
+        # INVARIANT: this lease_id check must stay ABOVE the allow_expired
+        # bypass below. It, not the execution lock, is what makes finalizing an
+        # expired lease safe. lease_id is a fresh uuid on every claim and is
+        # cleared to None by any reclaim, recover, or enqueue-side recovery, so
+        # a record that still carries the caller's lease_id was neither reclaimed
+        # nor re-run. Moving the expiry check above this line, or letting
+        # allow_expired skip it, turns the bypass into a stale-write vector.
         record = state["jobs"].get(lease.job_id)
         if record is None or record["lease_id"] != lease.lease_id:
             raise CognifyLeaseError(f"lease {lease.lease_id} is no longer active")
         leased_until = record["leased_until"]
-        # A worker that still holds the matching lease_id owns the record even if
-        # the lease clock expired: the queue-wide execution lock keeps a single
-        # drainer, so nobody reclaimed it. reschedule/acknowledge pass
-        # allow_expired so a slow cognify still records its outcome (backoff,
-        # terminal marking, completion) instead of hot-looping. renew stays
-        # strict, because a lost lease must stop active graph work.
+        # reschedule/acknowledge pass allow_expired so a slow cognify that
+        # overran the lease clock still records its outcome (backoff, terminal
+        # marking, completion) instead of hot-looping through recover_stale.
+        # renew stays strict, because a lost lease must stop active graph work.
         if not allow_expired and (
             leased_until is None
             or _parse_timestamp(leased_until, field_name="leased_until") <= now
