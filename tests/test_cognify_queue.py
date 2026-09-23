@@ -184,6 +184,55 @@ def test_expired_lease_can_be_reclaimed(tmp_path: Path) -> None:
     assert second.attempt == 2
 
 
+def test_reschedule_after_expiry_still_applies_backoff(tmp_path: Path) -> None:
+    # A slow cognify can let the lease expire before the worker reschedules.
+    # The single-drainer execution lock means nobody else reclaimed it, so the
+    # failure outcome (backoff, attempt, last_error) must still be recorded.
+    queue = CognifyRetryQueue(
+        tmp_path / "queue.json",
+        lease_seconds=10,
+        backoff_seconds=5,
+        max_backoff_seconds=12,
+    )
+    queue.enqueue(("central",), now=T0)
+    lease = queue.claim(now=T0)
+    assert lease is not None
+
+    late = T0 + timedelta(seconds=11)
+    failed = queue.reschedule(lease, error="boom", now=late)
+    assert failed.leased is False
+    assert failed.attempt == 1
+    assert failed.last_error == "boom"
+    assert _at(failed.available_at) == late + timedelta(seconds=5)
+
+
+def test_acknowledge_after_expiry_completes_without_requeue(tmp_path: Path) -> None:
+    # A successful cognify whose lease expired just before ack must still clear
+    # the job, not leave it leased for recover-stale to re-run.
+    queue = CognifyRetryQueue(tmp_path / "queue.json", lease_seconds=10)
+    queue.enqueue(("central",), now=T0)
+    lease = queue.claim(now=T0)
+    assert lease is not None
+
+    queue.acknowledge(lease, now=T0 + timedelta(seconds=11))
+    assert queue.snapshot() == ()
+
+
+def test_reschedule_rejected_after_reclaim(tmp_path: Path) -> None:
+    # Tolerating an expired lease must not weaken ownership: once another claim
+    # supersedes it, the stale lease_id can no longer reschedule the job.
+    queue = CognifyRetryQueue(tmp_path / "queue.json", lease_seconds=10)
+    queue.enqueue(("central",), now=T0)
+    first = queue.claim(now=T0)
+    assert first is not None
+    second = queue.claim(now=T0 + timedelta(seconds=11))
+    assert second is not None
+    assert second.lease_id != first.lease_id
+
+    with pytest.raises(CognifyLeaseError, match="no longer active"):
+        queue.reschedule(first, error="late", now=T0 + timedelta(seconds=12))
+
+
 def test_malformed_state_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "queue.json"
     path.write_text("{\"version\": 1,", encoding="utf-8")

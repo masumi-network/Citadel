@@ -513,7 +513,7 @@ class CognifyRetryQueue:
         current = self._resolve_now(now)
         with self._exclusive():
             state = self._load()
-            record = self._leased_record(state, lease, current)
+            record = self._leased_record(state, lease, current, allow_expired=True)
             claimed = set(record["lease_datasets"])
             remaining = [dataset for dataset in record["datasets"] if dataset not in claimed]
             if remaining:
@@ -549,7 +549,7 @@ class CognifyRetryQueue:
         current = self._resolve_now(now)
         with self._exclusive():
             state = self._load()
-            record = self._leased_record(state, lease, current)
+            record = self._leased_record(state, lease, current, allow_expired=True)
             terminal = record["attempt"] >= self.max_attempts or _is_free_quota_error(failure)
             if terminal:
                 failure = f"{TERMINAL_ERROR_PREFIX}{failure}"
@@ -651,6 +651,8 @@ class CognifyRetryQueue:
         state: dict[str, Any],
         lease: CognifyLease,
         now: datetime,
+        *,
+        allow_expired: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(lease, CognifyLease):
             raise TypeError("lease must be a CognifyLease")
@@ -658,7 +660,16 @@ class CognifyRetryQueue:
         if record is None or record["lease_id"] != lease.lease_id:
             raise CognifyLeaseError(f"lease {lease.lease_id} is no longer active")
         leased_until = record["leased_until"]
-        if leased_until is None or _parse_timestamp(leased_until, field_name="leased_until") <= now:
+        # A worker that still holds the matching lease_id owns the record even if
+        # the lease clock expired: the queue-wide execution lock keeps a single
+        # drainer, so nobody reclaimed it. reschedule/acknowledge pass
+        # allow_expired so a slow cognify still records its outcome (backoff,
+        # terminal marking, completion) instead of hot-looping. renew stays
+        # strict, because a lost lease must stop active graph work.
+        if not allow_expired and (
+            leased_until is None
+            or _parse_timestamp(leased_until, field_name="leased_until") <= now
+        ):
             raise CognifyLeaseError(f"lease {lease.lease_id} has expired")
         if tuple(record["lease_datasets"]) != lease.datasets:
             raise CognifyLeaseError(f"lease {lease.lease_id} dataset snapshot does not match")
