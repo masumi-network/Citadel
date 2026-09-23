@@ -63,7 +63,7 @@ citadel = "kb.cli:main"
 [dependency-groups]
 dev = [
     "build==1.6.1",
-    "hatchling==1.32.3",
+    "hatchling==1.31.0",
     "pip-audit>=2.7.0,<3",
     "pytest>=9.0.3,<10",
     "pytest-asyncio>=0.21.1,<2",
@@ -88,7 +88,7 @@ override-dependencies = [
 ]
 
 [build-system]
-requires = ["hatchling==1.32.3"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
