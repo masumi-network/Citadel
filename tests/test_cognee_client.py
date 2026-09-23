@@ -3469,6 +3469,10 @@ async def test_execution_guard_blocks_reclaim_until_cancellation_cleanup_stops(
 
     release_cleanup.set()
     await asyncio.wait_for(asyncio.shield(first_task), timeout=wait_timeout)
+    # The lease-loss failure now reschedules with backoff instead of raising on
+    # the expired lease and hot-looping. Advance the manual clock past the
+    # backoff so the job is due for the replacement drain.
+    clock_now += timedelta(seconds=1)
     second_client._cancel_cognify_retry()
     second_client.resume_cognify_queue()
     replacement_task = second_client._cognify_queue_task
