@@ -3330,11 +3330,21 @@ async def test_failed_lease_renewal_cancels_cognify_before_retry(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
     path = tmp_path / "queue.json"
+    # Freeze the queue clock. A real 1s lease can expire before the cancelled
+    # cognify reschedules under a loaded runner, so reschedule() would raise
+    # "lease has expired" and leave the job leased. A fixed clock keeps the
+    # lease valid and makes the reschedule deterministic.
+    clock_now = datetime.now(UTC)
+
+    def manual_clock() -> datetime:
+        return clock_now
+
     queue = CognifyRetryQueue(
         path,
         lease_seconds=1,
         backoff_seconds=30,
         max_backoff_seconds=30,
+        clock=manual_clock,
     )
     monkeypatch.setenv("LLM_API_KEY", "k")
     started = asyncio.Event()
