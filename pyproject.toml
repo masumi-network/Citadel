@@ -39,7 +39,7 @@ server = [
     "transformers==5.17.0",
     "huggingface-hub==1.32.0",
     "tokenizers==0.23.2",
-    "cryptography==50.0.1",
+    "cryptography==50.0.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
     "mcp>=1.28.1,<2.0.0",
@@ -77,7 +77,7 @@ override-dependencies = [
     # Cognee 1.4.1 declares cryptography <50. Runtime and adapter tests pass
     # against 50.0.0, which fixes CVE-2026-69247. Remove this override when
     # Cognee publishes corrected metadata.
-    "cryptography==50.0.1",
+    "cryptography==50.0.0",
     "pillow>=12.3.0",
     "pypdf>=6.16.1",
     "python-multipart>=0.0.31",
