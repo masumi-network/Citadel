@@ -19,6 +19,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 COGNEE_VERSION = "1.4.1"
 CRYPTOGRAPHY_VERSION = "50.0.0"
 LADYBUG_VERSION = "0.18.2"
+SECURITY_BOUNDS = {
+    "aiohttp": ("3.14.3", "3.14.4"),
+    "certifi": ("2026.5.20", "2026.10.19"),
+    "filelock": ("3.29.0", "4.2.1"),
+    "fsspec": ("2026.4.0", "2026.6.0"),
+    "litellm": ("1.87.0", "1.88.6"),
+    "mcp": ("1.28.1", "1.30.0"),
+    "multidict": ("6.7.1", "6.9.1"),
+    "pillow": ("12.3.0", "13.0.0"),
+    "pyjwt": ("2.13.0", "2.15.0"),
+    "pypdf": ("6.19.0", "6.21.2"),
+    "urllib3": ("2.7.0", "2.8.0"),
+}
 
 
 def _cognee_requirement(lines: list[str]) -> str:
@@ -129,3 +142,24 @@ def test_installed_cognee_141_metadata_accepts_secure_cryptography() -> None:
             f"{cryptography_requirements}. uv override is also missing a matching rule in "
             "pyproject.toml tool.uv.override-dependencies."
         )
+
+
+def test_server_install_paths_exclude_audited_vulnerable_versions() -> None:
+    """The lockfile audit does not cover plain pip or a published wheel."""
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    server = {
+        Requirement(item).name.lower(): Requirement(item)
+        for item in pyproject["project"]["optional-dependencies"]["server"]
+    }
+    plain = {
+        Requirement(line).name.lower(): Requirement(line)
+        for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    for package, (vulnerable, fixed) in SECURITY_BOUNDS.items():
+        for label, requirements in (("server extra", server), ("requirements.txt", plain)):
+            assert package in requirements, f"{label} does not constrain {package}"
+            specifier = requirements[package].specifier
+            assert fixed in specifier, f"{label} rejects fixed {package} {fixed}"
+            assert vulnerable not in specifier, f"{label} accepts vulnerable {package} {vulnerable}"

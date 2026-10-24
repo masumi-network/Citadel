@@ -29,7 +29,7 @@ dependencies = []
 [project.optional-dependencies]
 # `pip install citadel-archive[server]` — run the Node/MCP server + sync jobs.
 server = [
-    "aiohttp>=3.14.3,<4.0.0",
+    "aiohttp>=3.14.4,<4.0.0",
     # Exact pin required because Citadel reads Cognee private dataset APIs and
     # registers its audited Qdrant adapter against Cognee's internal maps.
     "cognee[fastembed]==1.4.1",
@@ -40,15 +40,24 @@ server = [
     "huggingface-hub==1.27.0",
     "tokenizers==0.22.2",
     "cryptography==50.0.0",
+    "certifi>=2026.10.19",
+    "filelock>=4.2.1,<5.0.0",
+    "fsspec>=2026.6.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
-    "mcp>=1.28.1,<2.0.0",
+    "litellm>=1.88.6,<1.89.0",
+    "mcp>=1.30.0,<2.0.0",
+    "multidict>=6.9.1,<7.0.0",
+    "pillow>=13.0.0,<14.0.0",
     "pydantic>=2.10.5,<3.0.0",
+    "pyjwt>=2.15.0,<3.0.0",
+    "pypdf>=6.21.2,<7.0.0",
     "python-dotenv>=1.0.1,<2.0.0",
     "qdrant-client==1.19.0",
     "requests>=2.32.0,<3.0.0",
     "starlette>=1.3.1,<2.0.0",
     "tiktoken==0.13.0",
+    "urllib3>=2.8.0,<3.0.0",
     "uvicorn[standard]>=0.34.0,<1.0.0",
 ]
 
@@ -62,6 +71,7 @@ citadel = "kb.cli:main"
 
 [dependency-groups]
 dev = [
+    "black>=26.10.1",
     "build==1.5.0",
     "hatchling==1.31.0",
     "pip-audit>=2.7.0,<3",
@@ -78,8 +88,11 @@ override-dependencies = [
     # against 50.0.0, which fixes CVE-2026-69247. Remove this override when
     # Cognee publishes corrected metadata.
     "cryptography==50.0.0",
-    "pillow>=12.3.0",
-    "pypdf>=6.16.1",
+    # Cognee 1.4.1 and FastEmbed 0.8.0 use checksum-verified local wheel
+    # metadata patches so the fixed major releases also work with plain pip.
+    "filelock>=4.2.1,<5.0.0",
+    "pillow>=13.0.0,<14.0.0",
+    "pypdf>=6.21.2,<7.0.0",
     "python-multipart>=0.0.31",
     # Ten CVEs disclosed against 0.59.0 after main last ran CI on 2026-07-24.
     # Pulled in transitively; the highest fix version among them is 0.64.0.
