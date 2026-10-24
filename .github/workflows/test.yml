@@ -198,7 +198,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22.23.4"
           cache: npm
 
       - name: Install locked frontend dependencies
