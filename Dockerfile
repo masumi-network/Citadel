@@ -13,6 +13,7 @@ WORKDIR /src
 RUN python -m pip install build==1.5.0 hatchling==1.31.0
 COPY . .
 RUN python scripts/build_secure_cognee.py --output /wheels
+RUN python scripts/build_secure_fastembed.py --output /wheels
 RUN python -m build --no-isolation --wheel --outdir /wheels .
 RUN RAILWAY_GIT_COMMIT_SHA="$RAILWAY_GIT_COMMIT_SHA" \
     CITADEL_BUILD_ID="$CITADEL_BUILD_ID" \
@@ -46,6 +47,7 @@ RUN install -d /opt/citadel \
     && test -n "$CITADEL_WHEEL" \
     && install -m 0444 /wheels/citadel-build-id /opt/citadel/build-id \
     && python -m pip install /wheels/cognee-1.4.1-py3-none-any.whl \
+    /wheels/fastembed-0.8.0-py3-none-any.whl \
     "${CITADEL_WHEEL}[server]" \
     && python -m pip check \
     && python -c "from importlib.metadata import version; assert (version('cognee'), version('ladybug'), version('qdrant-client')) == ('1.4.1', '0.18.2', '1.19.0')" \

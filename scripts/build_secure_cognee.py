@@ -25,10 +25,16 @@ SOURCE_URL = (
     "cognee-1.4.1.tar.gz"
 )
 SOURCE_SHA256 = "9206075539935ef0adfab82cf410af6799e83c42969ba7c8fae5065de9aba7c9"
-WHEEL_SHA256 = "890a5a5c7d4bce9053faa45e4ce5f19aa1f7dbce235c3d4ea6ab3c3b77bb873c"
+WHEEL_SHA256 = "913bd8e9515cd3883d055eb6eeea5278f12a29d72221f6dff769bc6e3e5e7735"
 HATCHLING_VERSION = "1.31.0"
 ORIGINAL_REQUIREMENT = '    "cryptography>=43.0.0,<50",'
 PATCHED_REQUIREMENT = '    "cryptography>=43.0.0,<51",'
+ORIGINAL_FILELOCK_REQUIREMENT = (
+    '    "filelock>=3.12.0,<4.0.0",  # cross-process migration lock for SQLite (Linux/macOS/Windows)'
+)
+PATCHED_FILELOCK_REQUIREMENT = (
+    '    "filelock>=4.2.1,<5",  # cross-process migration lock for SQLite (Linux/macOS/Windows)'
+)
 PATCH_NOTICE = (
     "    # Modified by Citadel on 2026-08-08. Cryptography 50.0.0 fixes "
     "CVE-2026-69247."
@@ -174,11 +180,18 @@ def patch_pyproject(source_root: Path) -> Path:
     content = pyproject.read_text(encoding="utf-8")
     if content.count(ORIGINAL_REQUIREMENT) != 1:
         raise RuntimeError("Cognee cryptography requirement did not match the audited source")
+    if content.count(ORIGINAL_FILELOCK_REQUIREMENT) != 1:
+        raise RuntimeError("Cognee filelock requirement did not match the audited source")
     if PATCH_NOTICE in content or PATCHED_REQUIREMENT in content:
         raise RuntimeError("Cognee source already contains the Citadel metadata patch")
     content = content.replace(
         ORIGINAL_REQUIREMENT,
         f"{PATCH_NOTICE}\n{PATCHED_REQUIREMENT}",
+        1,
+    )
+    content = content.replace(
+        ORIGINAL_FILELOCK_REQUIREMENT,
+        PATCHED_FILELOCK_REQUIREMENT,
         1,
     )
     pyproject.write_text(content, encoding="utf-8")
@@ -246,6 +259,9 @@ def verify_wheel(wheel_path: Path) -> dict[str, str]:
         cryptography = [item for item in requirements if item.lower().startswith("cryptography")]
         if len(cryptography) != 1 or "<51" not in cryptography[0] or "<50" in cryptography[0]:
             raise RuntimeError(f"Cognee wheel has unsafe cryptography metadata: {cryptography}")
+        filelock = [item for item in requirements if item.lower().startswith("filelock")]
+        if filelock != ["filelock<5,>=4.2.1"]:
+            raise RuntimeError(f"Cognee wheel has unsafe filelock metadata: {filelock}")
         basenames = {Path(name).name for name in names}
         if "LICENSE" not in basenames or "NOTICE.md" not in basenames:
             raise RuntimeError("Cognee wheel is missing LICENSE or NOTICE.md")
@@ -282,6 +298,7 @@ def verify_wheel(wheel_path: Path) -> dict[str, str]:
         "name": str(metadata["Name"]),
         "version": str(metadata["Version"]),
         "cryptography_requirement": cryptography[0],
+        "filelock_requirement": filelock[0],
         "wheel_sha256": sha256_file(wheel_path),
     }
 
@@ -311,6 +328,9 @@ def build(output_dir: Path) -> tuple[Path, Path]:
         "source_sha256": SOURCE_SHA256,
         "hatchling_version": HATCHLING_VERSION,
         "patch": f"{ORIGINAL_REQUIREMENT} -> {PATCHED_REQUIREMENT}",
+        "filelock_patch": (
+            f"{ORIGINAL_FILELOCK_REQUIREMENT} -> {PATCHED_FILELOCK_REQUIREMENT}"
+        ),
         "ladybug_home_patch": [
             LADYBUG_HELPER_PATH.as_posix(),
             LADYBUG_WORKER_PATH.as_posix(),

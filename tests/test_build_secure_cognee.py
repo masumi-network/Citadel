@@ -20,12 +20,15 @@ def _write_audited_ladybug_sources(source: Path) -> None:
         path.write_text("\n".join(blocks), encoding="utf-8")
 
 
-def test_patch_changes_only_the_audited_requirement(tmp_path: Path) -> None:
+def test_patch_changes_only_the_audited_requirements(tmp_path: Path) -> None:
     source = tmp_path / "cognee-1.4.1"
     source.mkdir()
     pyproject = source / "pyproject.toml"
     pyproject.write_text(
-        f"[project]\ndependencies = [\n{build_secure_cognee.ORIGINAL_REQUIREMENT}\n]\n",
+        "[project]\ndependencies = [\n"
+        f"{build_secure_cognee.ORIGINAL_REQUIREMENT}\n"
+        '    "filelock>=3.12.0,<4.0.0",  # cross-process migration lock for SQLite (Linux/macOS/Windows)\n'
+        "]\n",
         encoding="utf-8",
     )
 
@@ -34,10 +37,30 @@ def test_patch_changes_only_the_audited_requirement(tmp_path: Path) -> None:
     assert pyproject.read_text(encoding="utf-8") == (
         "[project]\ndependencies = [\n"
         f"{build_secure_cognee.PATCH_NOTICE}\n"
-        f"{build_secure_cognee.PATCHED_REQUIREMENT}\n]\n"
+        f"{build_secure_cognee.PATCHED_REQUIREMENT}\n"
+        '    "filelock>=4.2.1,<5",  # cross-process migration lock for SQLite (Linux/macOS/Windows)\n'
+        "]\n"
     )
     with pytest.raises(RuntimeError, match="audited source"):
         build_secure_cognee.patch_pyproject(source)
+
+
+def test_patch_rejects_filelock_drift_before_writing(tmp_path: Path) -> None:
+    source = tmp_path / "cognee-1.4.1"
+    source.mkdir()
+    pyproject = source / "pyproject.toml"
+    original = (
+        "[project]\ndependencies = [\n"
+        f"{build_secure_cognee.ORIGINAL_REQUIREMENT}\n"
+        '    "filelock>=3.12.0,<3.9.0",  # cross-process migration lock for SQLite (Linux/macOS/Windows)\n'
+        "]\n"
+    )
+    pyproject.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="filelock.*audited source"):
+        build_secure_cognee.patch_pyproject(source)
+
+    assert pyproject.read_text(encoding="utf-8") == original
 
 
 def test_extract_rejects_parent_path(tmp_path: Path) -> None:
@@ -92,13 +115,23 @@ def test_patch_ladybug_home_rejects_source_drift_before_writing(tmp_path: Path) 
     assert helper.read_text(encoding="utf-8") == original_helper
 
 
-def test_verify_wheel_requires_patched_metadata_and_notices(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("filelock_requirement", "accepted"),
+    [
+        ("filelock<5,>=4.2.1", True),
+        ("filelock<4.0.0,>=3.12.0", False),
+    ],
+)
+def test_verify_wheel_requires_patched_metadata_and_notices(
+    tmp_path: Path, filelock_requirement: str, accepted: bool
+) -> None:
     wheel_path = tmp_path / "cognee-1.4.1-py3-none-any.whl"
     metadata = (
         "Metadata-Version: 2.4\n"
         "Name: cognee\n"
         "Version: 1.4.1\n"
-        "Requires-Dist: cryptography<51,>=43.0.0\n\n"
+        "Requires-Dist: cryptography<51,>=43.0.0\n"
+        f"Requires-Dist: {filelock_requirement}\n\n"
     )
     with zipfile.ZipFile(wheel_path, "w") as archive:
         archive.writestr("cognee-1.4.1.dist-info/METADATA", metadata)
@@ -122,11 +155,17 @@ def test_verify_wheel_requires_patched_metadata_and_notices(tmp_path: Path) -> N
             'self.connection.execute("LOAD EXTENSION JSON;")\n',
         )
 
+    if not accepted:
+        with pytest.raises(RuntimeError, match="unsafe filelock metadata"):
+            build_secure_cognee.verify_wheel(wheel_path)
+        return
+
     evidence = build_secure_cognee.verify_wheel(wheel_path)
 
     assert evidence["name"] == "cognee"
     assert evidence["version"] == "1.4.1"
     assert evidence["cryptography_requirement"] == "cryptography<51,>=43.0.0"
+    assert evidence["filelock_requirement"] == "filelock<5,>=4.2.1"
     assert len(evidence["wheel_sha256"]) == 64
 
 

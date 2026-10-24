@@ -1,13 +1,13 @@
-# Candidate v0.5 stack. Build and install the audited Cognee wheel with
-# scripts/build_secure_cognee.py before resolving this file. The source wheel
-# carries the reviewed one-line cryptography metadata correction.
+# Candidate v0.5 stack. Build and install the audited Cognee and FastEmbed
+# wheels with scripts/build_secure_cognee.py and scripts/build_secure_fastembed.py
+# before resolving this file. Their metadata permits the fixed dependency versions.
 cognee[fastembed]==1.4.1
 ladybug==0.18.2
 fastapi>=0.116.2,<1.0.0
 google-auth>=2.40.0,<3.0.0
-aiohttp>=3.14.3,<4.0.0
+aiohttp>=3.14.4,<4.0.0
 cryptography==50.0.0
-mcp>=1.28.1,<2.0.0
+mcp>=1.30.0,<2.0.0
 pydantic>=2.10.5,<3.0.0
 python-dotenv>=1.0.1,<2.0.0
 qdrant-client==1.19.0
@@ -29,3 +29,15 @@ uvicorn[standard]>=0.34.0,<1.0.0
 # deploy path and uv.lock is not. No conflict is possible: cognee sets no upper
 # bound.
 datamodel-code-generator>=0.64.0
+
+# These floors cover advisories in transitive packages for the plain pip path.
+# Cognee and FastEmbed need their verified local wheel metadata patches first.
+certifi>=2026.10.19
+filelock>=4.2.1,<5.0.0
+fsspec>=2026.6.0
+litellm>=1.88.6,<1.89.0
+multidict>=6.9.1,<7.0.0
+pillow>=13.0.0,<14.0.0
+pyjwt>=2.15.0,<3.0.0
+pypdf>=6.21.2,<7.0.0
+urllib3>=2.8.0,<3.0.0
