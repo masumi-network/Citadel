@@ -45,13 +45,13 @@ server = [
     "fsspec>=2026.6.0",
     "fastapi>=0.116.2,<1.0.0",
     "google-auth>=2.40.0,<3.0.0",
-    "litellm>=1.88.6,<1.89.0",
+    "litellm>=1.108.4,<1.109.0",
     "mcp>=1.30.0,<2.0.0",
     "multidict>=6.9.1,<7.0.0",
     "pillow>=13.0.0,<14.0.0",
     "pydantic>=2.10.5,<3.0.0",
     "pyjwt>=2.15.0,<3.0.0",
-    "pypdf>=6.21.2,<7.0.0",
+    "pypdf>=6.21.4,<7.0.0",
     "python-dotenv>=1.0.1,<2.0.0",
     "qdrant-client==1.19.0",
     "requests>=2.32.0,<3.0.0",
@@ -92,11 +92,12 @@ override-dependencies = [
     # metadata patches so the fixed major releases also work with plain pip.
     "filelock>=4.2.1,<5.0.0",
     "pillow>=13.0.0,<14.0.0",
-    "pypdf>=6.21.2,<7.0.0",
+    "pypdf>=6.21.4,<7.0.0",
     "python-multipart>=0.0.31",
     # Ten CVEs disclosed against 0.59.0 after main last ran CI on 2026-07-24.
     # Pulled in transitively; the highest fix version among them is 0.64.0.
-    "datamodel-code-generator>=0.64.0",
+    # PYSEC-2026-4205 later raised the floor to 0.81.0.
+    "datamodel-code-generator>=0.81.0",
     "pip>=26.2",
 ]
 
